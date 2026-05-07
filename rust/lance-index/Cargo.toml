@@ -12,6 +12,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-ord.workspace = true

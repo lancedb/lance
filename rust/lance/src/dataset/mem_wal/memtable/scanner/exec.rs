@@ -6,7 +6,7 @@
 //! This module contains execution nodes for:
 //! - `MemTableScanExec` - Full table scan with MVCC visibility
 //! - `BTreeIndexExec` - BTree index queries
-//! - `VectorIndexExec` - IVF-PQ vector search
+//! - `VectorIndexExec` - HNSW vector search
 //! - `FtsIndexExec` - Full-text search
 
 mod btree;

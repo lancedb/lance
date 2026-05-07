@@ -27,6 +27,7 @@ use lance_table::format::{IndexFile, list_index_files_with_sizes};
 use object_store::path::Path;
 use std::cmp::min;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
 /// An index store that serializes scalar indices using the lance format
@@ -219,6 +220,35 @@ impl IndexReader for current_reader::FileReader {
             .await?;
         assert_eq!(batches.len(), 1);
         Ok(batches[0].clone())
+    }
+
+    async fn read_range_stream(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
+        if range.is_empty() {
+            return Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
+                Arc::new(self.schema().as_ref().into()),
+                futures::stream::empty(),
+            )));
+        }
+        let projection = if let Some(projection) = projection {
+            ReaderProjection::from_column_names(
+                self.metadata().version(),
+                self.schema(),
+                projection,
+            )?
+        } else {
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+        };
+        self.read_stream_projected(
+            ReadBatchParams::Range(range),
+            4096,
+            2,
+            projection,
+            FilterExpression::no_filter(),
+        )
     }
 
     // V2 format has removed the row group concept,

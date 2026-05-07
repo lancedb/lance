@@ -191,35 +191,24 @@ impl BitmapIndex {
 
         let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
         let mut null_map = Arc::new(RowAddrTreeMap::default());
-        let mut value_type: Option<DataType> = None;
         let mut null_location: Option<usize> = None;
-        let mut row_offset = 0;
+        let value_type = page_lookup_file.schema().fields[0].data_type();
 
-        for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
-            let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
-            let chunk = page_lookup_file
-                .read_range(start_row..end_row, Some(&["keys"]))
-                .await?;
-
-            if chunk.num_rows() == 0 {
-                continue;
-            }
-
-            if value_type.is_none() {
-                value_type = Some(chunk.schema().field(0).data_type().clone());
-            }
-
-            let dict_keys = chunk.column(0);
-
-            for idx in 0..chunk.num_rows() {
+        // Stream keys in bounded batches to avoid loading the entire keys
+        // column into memory at once.
+        let mut keys_stream = page_lookup_file
+            .read_range_stream(0..total_rows, Some(&["keys"]))
+            .await?;
+        let mut row_offset: usize = 0;
+        while let Some(keys_batch) = keys_stream.try_next().await? {
+            let dict_keys = keys_batch.column(0);
+            for idx in 0..keys_batch.num_rows() {
                 let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
-
                 if key.0.is_null() {
                     null_location = Some(row_offset);
                 } else {
                     index_map.insert(key, row_offset);
                 }
-
                 row_offset += 1;
             }
         }
@@ -245,12 +234,10 @@ impl BitmapIndex {
             null_map = Arc::new(bitmap);
         }
 
-        let final_value_type = value_type.expect_ok()?;
-
         Ok(Arc::new(Self::new(
             index_map,
             null_map,
-            final_value_type,
+            value_type,
             store,
             WeakLanceCache::from(index_cache),
             frag_reuse_index,
@@ -1495,7 +1482,11 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(index_name, false)))
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            false,
+        )))
     }
 
     async fn train_index(

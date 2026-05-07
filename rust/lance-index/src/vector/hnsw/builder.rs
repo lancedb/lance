@@ -173,6 +173,30 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
+    /// Construct an HNSW from its constituent parts. Used by the online
+    /// builder when finalizing.
+    pub(crate) fn from_parts(
+        params: HnswBuildParams,
+        nodes: Vec<GraphBuilderNode>,
+        level_count: Vec<usize>,
+        entry_point: u32,
+    ) -> Self {
+        let queue_size = get_num_compute_intensive_cpus().max(1) * 2;
+        let visited_generator_queue = Arc::new(ArrayQueue::new(queue_size));
+        for _ in 0..queue_size {
+            let _ = visited_generator_queue.push(VisitedGenerator::new(0));
+        }
+        Self {
+            inner: Arc::new(HnswCore {
+                params,
+                nodes: Arc::new(nodes),
+                level_count,
+                entry_point,
+                visited_generator_queue,
+            }),
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             inner: Arc::new(HnswCore {
@@ -217,7 +241,8 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
-        let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
+        let entry = self.inner.entry_point;
+        let mut ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
         let nodes = self.inner.nodes.as_ref();
         for level in (0..self.max_level()).rev() {
             let cur_level = ImmutableHnswLevelView::new(level, nodes);

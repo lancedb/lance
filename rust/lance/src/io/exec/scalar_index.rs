@@ -303,6 +303,8 @@ impl MapIndexExec {
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: column_name,
             index_name,
+            // Internal IndexedLookup-style query — type is unknown at this layer
+            index_type: String::new(),
             query: Arc::new(SargableQuery::IsIn(index_vals)),
             needs_recheck: false,
         });
@@ -803,6 +805,7 @@ mod tests {
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "ordered".to_string(),
             index_name: "ordered_idx".to_string(),
+            index_type: "BTree".to_string(),
             query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
@@ -841,6 +844,7 @@ mod tests {
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "ordered".to_string(),
             index_name: "ordered_idx".to_string(),
+            index_type: "BTree".to_string(),
             query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),

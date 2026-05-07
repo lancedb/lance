@@ -307,7 +307,7 @@ async fn setup_benchmark(
     let manifest = writer.manifest().await.unwrap();
 
     // Get active memtable reference
-    let active_memtable_ref = writer.active_memtable_ref().await;
+    let active_memtable_ref = writer.active_memtable_ref().await.unwrap();
 
     // Build shard snapshot
     let mut shard_snapshot = ShardSnapshot::new(shard_id);
@@ -906,7 +906,7 @@ async fn setup_vector_benchmark(
     }
 
     let manifest = writer.manifest().await.unwrap();
-    let active_memtable_ref = writer.active_memtable_ref().await;
+    let active_memtable_ref = writer.active_memtable_ref().await.unwrap();
 
     let mut shard_snapshot = ShardSnapshot::new(shard_id);
     if let Some(ref m) = manifest {

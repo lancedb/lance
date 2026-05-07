@@ -28,10 +28,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
-    StringArray,
+    FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -45,8 +43,6 @@ use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
-use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
 #[cfg(target_os = "linux")]
@@ -175,107 +171,38 @@ fn generate_random_ids(max_id: i64, count: usize) -> Vec<i64> {
     (0..count).map(|_| rng.random_range(0..max_id)).collect()
 }
 
-/// Train IVF centroids and PQ codebook from vectors.
-fn train_ivf_pq_models(
-    batches: &[RecordBatch],
-    vector_dim: usize,
-    num_partitions: usize,
-    num_sub_vectors: usize,
-    distance_type: DistanceType,
-) -> (IvfModel, lance_index::vector::pq::ProductQuantizer) {
-    // Collect all vectors into a single array
-    let mut all_vectors: Vec<f32> = Vec::new();
-    for batch in batches {
-        let vector_col = batch.column_by_name("vector").unwrap();
-        let fsl = vector_col
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
-        let values = fsl
-            .values()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap();
-        all_vectors.extend_from_slice(values.values());
-    }
-
-    let vectors_array = Float32Array::from(all_vectors);
-
-    // Train IVF centroids
-    let kmeans_params = KMeansParams::new(None, 50, 1, distance_type);
-    let kmeans = train_kmeans::<Float32Type>(
-        &vectors_array,
-        kmeans_params,
-        vector_dim,
-        num_partitions,
-        256,
-    )
-    .unwrap();
-
-    // kmeans.centroids is a flat Float32Array, need to convert to FixedSizeListArray
-    let centroids_flat = kmeans
-        .centroids
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .expect("Centroids should be Float32Array")
-        .clone();
-
-    let centroids_fsl =
-        FixedSizeListArray::try_new_from_values(centroids_flat, vector_dim as i32).unwrap();
-
-    let ivf_model = IvfModel::new(centroids_fsl, None);
-
-    // Train PQ codebook
-    let vectors_fsl =
-        FixedSizeListArray::try_new_from_values(vectors_array, vector_dim as i32).unwrap();
-
-    let pq_params = PQBuildParams::new(num_sub_vectors, 8);
-    let pq = pq_params.build(&vectors_fsl, distance_type).unwrap();
-
-    (ivf_model, pq)
-}
-
-/// Setup MemTable with all indexes (BTree on id, FTS on text, IVF-PQ on vector).
+/// Setup MemTable with all indexes (BTree on id, FTS on text, HNSW on vector).
 async fn setup_memtable(
     batches: Vec<RecordBatch>,
-    vector_dim: usize,
-    num_partitions: usize,
-    num_sub_vectors: usize,
+    _vector_dim: usize,
+    _num_partitions: usize,
+    _num_sub_vectors: usize,
 ) -> MemTable {
     let schema = batches[0].schema();
     let num_batches = batches.len();
 
-    // Train IVF-PQ models from the data
-    let (ivf_model, pq) = train_ivf_pq_models(
-        &batches,
-        vector_dim,
-        num_partitions,
-        num_sub_vectors,
-        DistanceType::L2,
-    );
+    // Compute total rows for HNSW capacity sizing.
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-    // Create index store
     // Field IDs: id=0, text=1, vector=2
     let mut index_store = IndexStore::new();
     index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
     index_store.add_fts("text_idx".to_string(), 1, "text".to_string());
-    index_store.add_ivf_pq(
+    index_store.add_hnsw(
         "vector_idx".to_string(),
         2,
         "vector".to_string(),
-        ivf_model,
-        pq,
         DistanceType::L2,
+        total_rows.max(1),
+        num_batches.max(1),
     );
 
-    // Create MemTable with capacity for all batches (add 10% buffer)
     let batch_capacity = ((num_batches as f64) * 1.1) as usize;
     let mut memtable =
         MemTable::with_capacity(schema, 1, vec![0], CacheConfig::default(), batch_capacity)
             .unwrap();
     memtable.set_indexes(index_store);
 
-    // Insert batches
     for batch in batches.into_iter() {
         memtable.insert(batch).await.unwrap();
     }

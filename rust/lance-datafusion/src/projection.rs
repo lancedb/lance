@@ -75,6 +75,10 @@ impl ProjectionBuilder {
         self.check_duplicate_column(output_name)?;
 
         let expr = self.planner.parse_expr(raw_expr)?;
+        // Run simplification + coercion so that expressions like `coalesce(...)`
+        // (which DataFusion's physical evaluator expects to have been rewritten
+        // into a `CASE` expression by the simplifier) work correctly.
+        let expr = self.planner.optimize_expr(expr)?;
 
         // If the expression is a bare column reference to a system column, mark that we need it
         if let Expr::Column(Column {
@@ -455,7 +459,44 @@ impl ProjectionPlan {
 mod tests {
     use super::*;
 
+    use arrow_array::Int64Array;
     use lance_arrow::json::{is_json_field, json_field};
+
+    #[tokio::test]
+    async fn test_coalesce_in_column_map() {
+        // Regression test: `coalesce` in a column-map expression used to fail with
+        // "coalesce should have been simplified to case" because the parsed expression
+        // was passed straight to `create_physical_expr` without running the simplifier.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("col_a", DataType::Int64, true),
+            ArrowField::new("col_b", DataType::Int64, true),
+        ]));
+        let base_schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let base = Arc::new(base_schema);
+
+        let plan =
+            ProjectionPlan::from_expressions(base, &[("foo", "coalesce(col_a, col_b)")]).unwrap();
+
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3), None])),
+                Arc::new(Int64Array::from(vec![Some(10), Some(20), None, None])),
+            ],
+        )
+        .unwrap();
+
+        let projected = plan.project_batch(batch).await.unwrap();
+        let foo = projected
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            foo.iter().collect::<Vec<_>>(),
+            vec![Some(1), Some(20), Some(3), None],
+        );
+    }
 
     #[test]
     fn test_output_schema_preserves_json_extension_metadata() {

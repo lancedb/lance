@@ -981,7 +981,7 @@ impl MemTableScanner {
 
     /// Check if a vector index exists for a column.
     fn has_vector_index(&self, column: &str) -> bool {
-        self.indexes.get_ivf_pq_by_column(column).is_some()
+        self.indexes.get_hnsw_by_column(column).is_some()
     }
 
     /// Check if an FTS index exists for a column.

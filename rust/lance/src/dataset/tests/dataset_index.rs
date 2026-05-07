@@ -1954,6 +1954,246 @@ async fn test_prewarm_index_with_position_validation() {
     );
 }
 
+/// Cache backend that exercises the serialization codec on every insert and
+/// returns deserialized entries on every get. Items without a codec fall
+/// through to an in-memory passthrough so that non-FTS cache traffic still
+/// works during the test.
+///
+/// Mirrors the helper in `rust/lance/src/index/vector/ivf/v2.rs` tests; if a
+/// third user appears, lift this into a shared test utility.
+mod fts_serializing_backend {
+    use std::collections::HashMap;
+    use std::pin::Pin;
+
+    use futures::Future;
+    use lance_core::Result;
+    use lance_core::cache::{
+        CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend,
+    };
+
+    type SerializedEntry = (bytes::Bytes, CacheCodec, usize);
+
+    #[derive(Debug)]
+    pub struct SerializingBackend {
+        serialized: tokio::sync::Mutex<HashMap<InternalCacheKey, SerializedEntry>>,
+        passthrough: MokaCacheBackend,
+    }
+
+    impl SerializingBackend {
+        pub fn new() -> Self {
+            Self {
+                serialized: tokio::sync::Mutex::new(HashMap::new()),
+                passthrough: MokaCacheBackend::with_capacity(256 * 1024 * 1024),
+            }
+        }
+
+        pub async fn serialized_entry_count(&self) -> usize {
+            self.serialized.lock().await.len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CacheBackend for SerializingBackend {
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            let guard = self.serialized.lock().await;
+            if let Some((bytes, stored_codec, _)) = guard.get(key) {
+                return Some(
+                    stored_codec
+                        .deserialize(&bytes.clone())
+                        .expect("deserialization should succeed"),
+                );
+            }
+            drop(guard);
+            self.passthrough.get(key, codec).await
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            size_bytes: usize,
+            codec: Option<CacheCodec>,
+        ) {
+            if let Some(codec) = codec {
+                let mut bytes = Vec::new();
+                codec
+                    .serialize(&entry, &mut bytes)
+                    .expect("serialization should succeed");
+                self.serialized
+                    .lock()
+                    .await
+                    .insert(key.clone(), (bytes::Bytes::from(bytes), codec, size_bytes));
+            } else {
+                self.passthrough.insert(key, entry, size_bytes, None).await;
+            }
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            if let Some(entry) = self.get(key, codec).await {
+                return Ok((entry, true));
+            }
+            let (entry, size) = loader.await?;
+            self.insert(key, entry.clone(), size, codec).await;
+            Ok((entry, false))
+        }
+
+        async fn invalidate_prefix(&self, prefix: &str) {
+            self.serialized
+                .lock()
+                .await
+                .retain(|k, _| !k.starts_with(prefix));
+            self.passthrough.invalidate_prefix(prefix).await;
+        }
+
+        async fn clear(&self) {
+            self.serialized.lock().await.clear();
+            self.passthrough.clear().await;
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.serialized.lock().await.len() + self.passthrough.num_entries().await
+        }
+
+        async fn size_bytes(&self) -> usize {
+            let serialized: usize = self
+                .serialized
+                .lock()
+                .await
+                .values()
+                .map(|(_, _, s)| *s)
+                .sum();
+            serialized + self.passthrough.size_bytes().await
+        }
+    }
+}
+
+/// Validates the OSS-741 contract: after FTS prewarm through a serializing
+/// cache backend, FTS queries serve results without any further IO. The
+/// serializing backend forces every cache hit through the new
+/// `CacheCodec` impls, so this also smoke-tests the round-trip path under
+/// realistic data shapes (compressed posting blocks + shared position
+/// stream when positions are enabled).
+#[tokio::test]
+async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "lance search engine",
+        "lance search with tail",
+        "phrase query example",
+        "search query terms",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Re-open the dataset on a session whose cache backend serializes every
+    // entry through its codec. Set a generous capacity so nothing is evicted
+    // before we query.
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // Reset IO counters to isolate prewarm + query traffic from open/load.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap();
+
+    // The FTS codec must have been exercised. Posting lists and positions
+    // enter the serialized store; non-FTS entries (e.g. the unsized
+    // `ScalarIndexCacheKey` for the index itself) legitimately fall through
+    // to the in-memory passthrough — those cannot have a codec by design.
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed FTS entries (PostingList / Positions) through CacheCodec, \
+         but the serializing store was empty"
+    );
+
+    // After prewarm, a phrase query (which exercises both posting lists and
+    // positions, deserializing them from bytes via the codec) must not hit
+    // disk.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    // Project `_rowid` so the scan does not need to read a data column from
+    // the dataset's parquet/lance files; the index path alone determines
+    // whether the FTS cache is doing its job.
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        2,
+        "phrase query should still return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "FTS query should not perform IO after prewarm; the serializing cache \
+         backend must serve every posting list and positions entry from memory"
+    );
+}
+
 #[tokio::test]
 async fn test_fts_phrase_query_with_removed_stop_words() {
     let tmpdir = TempStrDir::default();

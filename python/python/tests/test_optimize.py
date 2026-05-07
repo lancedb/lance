@@ -9,6 +9,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
 from lance.lance import Compaction
 from lance.optimize import RewriteResult
 from lance.vector import vec_to_table
@@ -321,6 +322,41 @@ def test_defer_index_remap(tmp_path: Path):
     dataset = lance.dataset(base_dir)
     indices = dataset.describe_indices()
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_describe_indices_matches_list_indices_for_frag_reuse(tmp_path: Path):
+    """describe_indices() and list_indices() must agree on the index_type
+    string for every index, including the __lance_frag_reuse system index
+    that defer_index_remap produces.
+
+    list_indices() special-cases system indices via infer_system_index_type()
+    in python/src/dataset.rs. describe_indices() in
+    rust/lance/src/index.rs::IndexDescriptionImpl::try_new does not, so it
+    falls through to a plugin lookup that has no entry for
+    FragmentReuseIndexDetails and reports 'Unknown' instead.
+    """
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    dataset.delete("i < 500")
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
+    )
+
+    dataset = lance.dataset(base_dir)
+    described = {d.name: d.index_type for d in dataset.describe_indices()}
+    listed = {idx["name"]: idx["type"] for idx in dataset.list_indices()}
+
+    assert "__lance_frag_reuse" in listed, (
+        "test precondition: defer_index_remap should produce a frag-reuse index"
+    )
+    assert described == listed, (
+        "describe_indices and list_indices disagree on index_type:\n"
+        f"  describe_indices: {described}\n"
+        f"  list_indices:     {listed}"
+    )
 
 
 def test_dataset_distributed_optimize(tmp_path: Path):

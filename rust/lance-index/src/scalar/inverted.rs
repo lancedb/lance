@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod builder;
+mod cache_codec;
 mod encoding;
 mod index;
 mod iter;
@@ -235,7 +236,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         };
 
         if Self::can_accelerate_queries(&index_details) {
-            Some(Box::new(FtsQueryParser::new(index_name)))
+            Some(Box::new(FtsQueryParser::new(
+                index_name,
+                self.name().to_string(),
+            )))
         } else {
             None
         }

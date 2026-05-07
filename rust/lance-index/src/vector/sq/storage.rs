@@ -16,7 +16,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{DistanceType, dot_distance, l2_distance_uint_scalar};
+use lance_linalg::distance::{DistanceType, dot_distance, l2_u8::l2_u8};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -427,9 +427,7 @@ impl DistCalculator for SQDistCalculator<'_> {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
         let dist = match self.storage.distance_type {
-            DistanceType::L2 | DistanceType::Cosine => {
-                l2_distance_uint_scalar(sq_code, &self.query_sq_code)
-            }
+            DistanceType::L2 | DistanceType::Cosine => l2_u8(sq_code, &self.query_sq_code) as f32,
             DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         };
@@ -446,7 +444,7 @@ impl DistCalculator for SQDistCalculator<'_> {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
-                        .map(|sq_codes| l2_distance_uint_scalar(sq_codes, &self.query_sq_code))
+                        .map(|sq_codes| l2_u8(sq_codes, &self.query_sq_code) as f32)
                 })
                 .map(|dist| dist * self.scale)
                 .collect(),
