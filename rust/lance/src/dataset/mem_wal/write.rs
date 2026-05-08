@@ -370,6 +370,12 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
             })
             .collect();
 
+        // A single failing message must not bring down the dispatcher:
+        // the WAL flusher and MemTable flusher both run on this loop,
+        // and dropping their channels deadlocks all subsequent puts
+        // (and panics any task waiting on the corresponding watch).
+        // Log and keep draining; the worst case for a transient flush
+        // failure is replay from the WAL on next open.
         let result = loop {
             if ticker_intervals.is_empty() {
                 tokio::select! {
@@ -383,7 +389,6 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
                             Some(message) => {
                                 if let Err(e) = self.handler.handle(message).await {
                                     error!("Task '{}' error handling message: {}", self.name, e);
-                                    break Err(e);
                                 }
                             }
                             None => {
@@ -407,7 +412,6 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
                         let message = (ticker_intervals[0].1)();
                         if let Err(e) = self.handler.handle(message).await {
                             error!("Task '{}' error handling ticker message: {}", self.name, e);
-                            break Err(e);
                         }
                     }
                     msg = self.rx.recv() => {
@@ -415,7 +419,6 @@ impl<T: Send + Debug + 'static> TaskDispatcher<T> {
                             Some(message) => {
                                 if let Err(e) = self.handler.handle(message).await {
                                     error!("Task '{}' error handling message: {}", self.name, e);
-                                    break Err(e);
                                 }
                             }
                             None => {
@@ -1537,8 +1540,13 @@ impl ShardWriter {
             )?;
             let mut reader = reader;
             match reader.await_value().await {
-                Ok(_) => {}
-                Err(msg) => return Err(Error::io(msg)),
+                Some(Ok(_)) => {}
+                Some(Err(msg)) => return Err(Error::io(msg)),
+                None => {
+                    return Err(Error::io(
+                        "WAL flush handler exited before reporting durability",
+                    ));
+                }
             }
         }
 
@@ -1982,10 +1990,15 @@ impl MemTableFlushHandler {
         // The TriggerWalFlush message was sent by freeze_memtable to ensure
         // strict ordering of WAL entries.
         if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
-            completion_reader
-                .await_value()
-                .await
-                .map_err(|e| Error::io(format!("WAL flush failed: {}", e)))?;
+            match completion_reader.await_value().await {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(Error::io(format!("WAL flush failed: {}", e))),
+                None => {
+                    return Err(Error::io(
+                        "WAL flush handler exited before reporting completion",
+                    ));
+                }
+            }
         }
 
         // Step 2: Flush the memtable to Lance storage
@@ -2504,6 +2517,215 @@ mod tests {
         assert!(
             stats.generation > initial_gen,
             "Generation should increment after auto-flush"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Regression for #6713: a single failing `handle()` must not kill
+    /// the dispatcher. Earlier the loop would `break Err(e)` on the
+    /// first message error, dropping the rx side and stranding
+    /// subsequent senders. The flusher tasks need to survive transient
+    /// errors so the writer keeps making forward progress.
+    #[tokio::test]
+    async fn test_task_dispatcher_survives_handle_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FlakyHandler {
+            call_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MessageHandler<u32> for FlakyHandler {
+            async fn handle(&mut self, message: u32) -> Result<()> {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(Error::io("first message intentionally fails"))
+                } else {
+                    let _ = message;
+                    Ok(())
+                }
+            }
+        }
+
+        let executor = TaskExecutor::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::unbounded_channel::<u32>();
+        executor
+            .add_handler(
+                "flaky".to_string(),
+                Box::new(FlakyHandler {
+                    call_count: call_count.clone(),
+                }),
+                rx,
+            )
+            .unwrap();
+
+        // Send three messages: the first errors, the next two should
+        // still be delivered to the (still-alive) handler.
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+
+        for _ in 0..50 {
+            if call_count.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            call_count.load(Ordering::SeqCst) >= 3,
+            "dispatcher exited after the first error; only {} message(s) were handled",
+            call_count.load(Ordering::SeqCst)
+        );
+
+        executor.shutdown_all().await.ok();
+    }
+
+    /// Same as the local-fs test but against memory:// — closer to S3
+    /// semantics (conditional PUT, list-prefix consistency).
+    #[tokio::test]
+    async fn test_shard_writer_auto_flush_repeatedly_memory_store() {
+        let base_uri = "memory:///bench_test_flush";
+        let (store, base_path) = ObjectStore::from_uri(base_uri).await.unwrap();
+        let base_uri = base_uri.to_string();
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+
+        for i in 0..1000 {
+            let batch = create_test_batch(&schema, i * 10, 10);
+            writer.put(vec![batch]).await.unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.generation >= initial_gen + 50,
+            "expected many flushes; generation went {} → {}",
+            initial_gen,
+            stats.generation
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Regression for #6713: with durable_write=true and a memtable
+    /// size threshold that fires frequently, the memtable flush task
+    /// hit "Dataset already exists: …_gen_1" once the second flush
+    /// started.
+    #[tokio::test]
+    async fn test_shard_writer_auto_flush_repeatedly_stress() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            // Tiny size threshold — every batch crosses it.
+            max_memtable_size: 64,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+
+        // Every put crosses the size threshold, so each one queues a
+        // freeze. We want to catch any bug where two flushes collide on
+        // path/generation. Drive 1000 puts so we get ≥ 100 flushes —
+        // enough rope for the bug to show up.
+        for i in 0..1000 {
+            let batch = create_test_batch(&schema, i * 10, 10);
+            writer.put(vec![batch]).await.unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.generation >= initial_gen + 50,
+            "expected many successful auto-flushes; generation went {} → {}",
+            initial_gen,
+            stats.generation
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Regression: the memtable flush should successfully fire many
+    /// times in a row. A bug where every flush wrote the same path was
+    /// caught by lance-format/lance#6713.
+    #[tokio::test]
+    async fn test_shard_writer_auto_flush_repeatedly() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        // durable_write=true matches the LSM `merge_insert` defaults and
+        // is the configuration that surfaced #6713 in the wild.
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            // Tiny size threshold so a few batches cross it.
+            max_memtable_size: 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+
+        // Drive enough write traffic to trigger several auto-flushes.
+        // durable_write=true means each put waits for the WAL flush, so
+        // we don't need explicit yields between puts.
+        for i in 0..200 {
+            let batch = create_test_batch(&schema, i * 10, 10);
+            writer.put(vec![batch]).await.unwrap();
+        }
+
+        // Wait for the background memtable flushes to drain.
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Generation should have advanced by at least 3 — i.e. we want to
+        // confirm multiple flushes succeeded back to back, not just one.
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.generation >= initial_gen + 3,
+            "expected ≥ 3 successful auto-flushes; generation went {} → {}",
+            initial_gen,
+            stats.generation
         );
 
         writer.close().await.unwrap();
