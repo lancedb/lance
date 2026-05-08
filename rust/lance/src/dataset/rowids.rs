@@ -559,7 +559,7 @@ mod test {
         let expected: Vec<i32> = (0..60)
             .filter(|&i| i != 2 && i != 3 && i != 5 && i != 9)
             .collect();
-        assert_eq!(id_set, expected.iter().cloned().collect());
+        assert_eq!(id_set, expected.iter().cloned().collect::<HashSet<_>>());
 
         // get the row_id where i == 15
         let mut scan = dataset.scan();
