@@ -266,7 +266,7 @@ const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION
 const ENV_LANCE_INLINE_SCHEDULING_THRESHOLD: &str = "LANCE_INLINE_SCHEDULING_THRESHOLD";
 
 // If a request is for at most this many rows we skip the scheduler-task spawn
-// and run scheduling inline as part of the stream's first poll.
+// and run scheduling inline as part of the `schedule_and_decode` await.
 const DEFAULT_INLINE_SCHEDULING_THRESHOLD: u64 = 16 * 1024;
 
 fn default_cache_repetition_index() -> bool {
@@ -2238,9 +2238,9 @@ pub async fn schedule_and_decode(
     column_indices: Vec<u32>,
     target_schema: Arc<Schema>,
     config: SchedulerDecoderConfig,
-) -> BoxStream<'static, ReadBatchTask> {
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if requested_rows.num_rows() == 0 {
-        return stream::empty().boxed();
+        return Ok(stream::empty().boxed());
     }
 
     // If the user requested any ranges that are empty, ignore them.  They are pointless and
@@ -2249,7 +2249,7 @@ pub async fn schedule_and_decode(
 
     let io = config.io.clone();
 
-    match create_scheduler_decoder(
+    let stream = create_scheduler_decoder(
         column_infos,
         requested_rows,
         filter,
@@ -2257,18 +2257,11 @@ pub async fn schedule_and_decode(
         target_schema,
         config,
     )
-    .await
-    {
-        // Keep the io alive until the stream is dropped or finishes.  Otherwise the
-        // I/O drops as soon as the scheduling is finished and the I/O loop terminates.
-        Ok(stream) => stream.finally(move || drop(io)).boxed(),
-        // If the initialization failed make it look like a failed task
-        Err(e) => stream::once(std::future::ready(ReadBatchTask {
-            num_rows: 0,
-            task: std::future::ready(Err(e)).boxed(),
-        }))
-        .boxed(),
-    }
+    .await?;
+
+    // Keep the io alive until the stream is dropped or finishes.  Otherwise the
+    // I/O drops as soon as the scheduling is finished and the I/O loop terminates.
+    Ok(stream.finally(move || drop(io)).boxed())
 }
 
 pub static WAITER_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {

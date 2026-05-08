@@ -945,7 +945,7 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
@@ -953,7 +953,7 @@ impl FileReader {
             projection.schema,
             config,
         )
-        .await)
+        .await
     }
 
     async fn read_range(
@@ -1013,7 +1013,7 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Indices(indices);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
@@ -1021,7 +1021,7 @@ impl FileReader {
             projection.schema,
             config,
         )
-        .await)
+        .await
     }
 
     async fn take_rows(
@@ -1081,7 +1081,7 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(ranges);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
@@ -1089,7 +1089,7 @@ impl FileReader {
             projection.schema,
             config,
         )
-        .await)
+        .await
     }
 
     async fn read_ranges(

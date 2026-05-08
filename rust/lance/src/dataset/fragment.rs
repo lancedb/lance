@@ -3133,6 +3133,7 @@ mod tests {
             for valid_range in [0..40, 20..40] {
                 reader
                     .take_range(valid_range, 100)
+                    .await
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -3140,7 +3141,7 @@ mod tests {
                     .unwrap();
             }
             for invalid_range in [0..41, 41..42] {
-                assert!(reader.take_range(invalid_range, 100).is_err());
+                assert!(reader.take_range(invalid_range, 100).await.is_err());
             }
         }
 
@@ -3195,6 +3196,7 @@ mod tests {
             for valid_range in [0..40, 20..40] {
                 reader
                     .take_range(valid_range, 100)
+                    .await
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -3202,7 +3204,7 @@ mod tests {
                     .unwrap();
             }
             for invalid_range in [0..41, 41..42] {
-                assert!(reader.take_range(invalid_range, 100).is_err());
+                assert!(reader.take_range(invalid_range, 100).await.is_err());
             }
         }
 
@@ -3288,11 +3290,8 @@ mod tests {
         } else {
             let to_batches = |range: Range<u32>| {
                 let batch_size = range.len() as u32;
-                reader
-                    .take_range(range, batch_size)
-                    .unwrap()
-                    .buffered(1)
-                    .try_collect::<Vec<_>>()
+                let fut = reader.take_range(range, batch_size);
+                async move { fut.await.unwrap().buffered(1).try_collect::<Vec<_>>().await }
             };
 
             // Since the first batch is all deleted, it will return all nulls row ids.
