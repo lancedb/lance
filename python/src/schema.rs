@@ -72,6 +72,21 @@ impl LanceField {
             .filter(|&pos| pos > 0)
     }
 
+    /// Check if this field is part of an unenforced clustering key.
+    pub fn is_unenforced_clustering_key(&self) -> bool {
+        self.0.is_unenforced_clustering_key()
+    }
+
+    /// Get the position of this field within a composite clustering key.
+    ///
+    /// Returns the 1-based position if explicitly set, or None if not part of
+    /// a clustering key or using schema field id ordering.
+    pub fn unenforced_clustering_key_position(&self) -> Option<u32> {
+        self.0
+            .unenforced_clustering_key_position
+            .filter(|&pos| pos > 0)
+    }
+
     pub fn to_arrow(&self) -> PyArrowType<arrow_schema::Field> {
         PyArrowType((&self.0).into())
     }
@@ -170,6 +185,26 @@ impl LanceSchema {
 
     pub fn fields(&self) -> PyResult<Vec<LanceField>> {
         Ok(self.0.fields.iter().cloned().map(LanceField).collect())
+    }
+
+    /// Get the unenforced primary key fields, ordered by position.
+    pub fn unenforced_primary_key(&self) -> Vec<LanceField> {
+        self.0
+            .unenforced_primary_key()
+            .into_iter()
+            .cloned()
+            .map(LanceField)
+            .collect()
+    }
+
+    /// Get the unenforced clustering key fields, ordered by position.
+    pub fn unenforced_clustering_key(&self) -> Vec<LanceField> {
+        self.0
+            .unenforced_clustering_key()
+            .into_iter()
+            .cloned()
+            .map(LanceField)
+            .collect()
     }
 
     /// Get a field by name or path.

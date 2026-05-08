@@ -263,26 +263,11 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
 const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
-const ENV_LANCE_INLINE_SCHEDULING_THRESHOLD: &str = "LANCE_INLINE_SCHEDULING_THRESHOLD";
-
-// If a request is for at most this many rows we skip the scheduler-task spawn
-// and run scheduling inline as part of the stream's first poll.
-const DEFAULT_INLINE_SCHEDULING_THRESHOLD: u64 = 16 * 1024;
 
 fn default_cache_repetition_index() -> bool {
     static DEFAULT_CACHE_REPETITION_INDEX: OnceLock<bool> = OnceLock::new();
     *DEFAULT_CACHE_REPETITION_INDEX
         .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, true))
-}
-
-fn inline_scheduling_threshold() -> u64 {
-    static THRESHOLD: OnceLock<u64> = OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        std::env::var(ENV_LANCE_INLINE_SCHEDULING_THRESHOLD)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_INLINE_SCHEDULING_THRESHOLD)
-    })
 }
 
 /// Top-level encoding message for a page.  Wraps both the
@@ -1971,16 +1956,6 @@ pub struct DecoderConfig {
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
-    /// Override the strategy used to dispatch the scheduling work in
-    /// [`schedule_and_decode`].
-    ///
-    /// * `None` - default behavior: scheduling runs inline on the stream's
-    ///   first poll when the request is small (controlled by the
-    ///   `LANCE_INLINE_SCHEDULING_THRESHOLD` env var) and on a spawned task
-    ///   otherwise.
-    /// * `Some(true)` - always run scheduling inline.
-    /// * `Some(false)` - always spawn a task for scheduling.
-    pub inline_scheduling: Option<bool>,
 }
 
 impl Default for DecoderConfig {
@@ -1988,7 +1963,6 @@ impl Default for DecoderConfig {
         Self {
             cache_repetition_index: default_cache_repetition_index(),
             validate_on_decode: false,
-            inline_scheduling: None,
         }
     }
 }
@@ -2146,17 +2120,7 @@ fn create_scheduler_decoder(
         config.batch_size_bytes,
     )?;
 
-    // For small requests the scheduling cost is dwarfed by the overhead of
-    // spawning a task, so run scheduling inline as part of the stream's first
-    // poll instead.  The threshold is configurable via
-    // `LANCE_INLINE_SCHEDULING_THRESHOLD`, and callers can force either
-    // strategy via `DecoderConfig::inline_scheduling`.
-    let inline_scheduling = config
-        .decoder_config
-        .inline_scheduling
-        .unwrap_or_else(|| num_rows <= inline_scheduling_threshold());
-
-    let scheduling = async move {
+    let scheduler_handle = tokio::task::spawn(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
             &column_indices,
@@ -2186,19 +2150,9 @@ fn create_scheduler_decoder(
                 decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
         }
-    };
+    });
 
-    if inline_scheduling {
-        Ok(async move {
-            scheduling.await;
-            decode_stream
-        }
-        .flatten_stream()
-        .boxed())
-    } else {
-        let scheduler_handle = tokio::task::spawn(scheduling);
-        Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
-    }
+    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
 }
 
 /// Launches a scheduler on a dedicated (spawned) task and creates a decoder to
