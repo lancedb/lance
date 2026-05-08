@@ -734,8 +734,6 @@ impl LanceFileReader {
         batch_size: u32,
         batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        // read_stream awaits the decode scheduler's `initialize` step, so it
-        // needs to be run in the context of a tokio runtime.
         let inner = self.inner.clone();
         let stream = rt().block_on(None, async move {
             inner

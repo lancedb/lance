@@ -2154,12 +2154,10 @@ async fn create_scheduler_decoder(
         config.batch_size_bytes,
     )?;
 
-    // The scheduler's `initialize` call performs the metadata I/O that the
-    // scheduling logic needs (chunk metadata, dictionaries, repetition
-    // index, ...).  We always await it here so the caller can choose where
-    // that I/O happens (e.g. inside a `tokio::spawn`'d fragment task).  This
-    // keeps the work explicit instead of smuggling it into the first poll
-    // of the returned stream.
+    // The scheduler's `initialize` may perform I/O to load column metadata
+    // unless that metadata is already in the cache.  This metadata loading
+    // happens as part of this call and should be parallelized if reading
+    // multiple files.
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         target_schema.as_ref(),
         &column_indices,
@@ -2221,12 +2219,8 @@ async fn create_scheduler_decoder(
 ///
 /// # Why is this async?
 ///
-/// Constructing the scheduler runs `initialize`, which performs the metadata
-/// I/O the scheduler needs (chunk metadata, dictionaries, repetition index,
-/// ...).  We await that I/O here rather than smuggling it into the first
-/// poll of the returned stream so the caller can place the I/O on whichever
-/// task it likes (typically a per-fragment `tokio::spawn`), and so that
-/// errors surface from the await instead of from the first stream item.
+/// Constructing the scheduler runs `initialize` which will perform I/O
+/// unless the data required is already in the file metadata cache.
 ///
 /// When `DecoderConfig::inline_scheduling` resolves to `true`, the
 /// subsequent (synchronous) scheduling work also runs before this function
