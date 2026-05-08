@@ -539,18 +539,20 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
         .unwrap_or(0);
     let mut counts = ExecutionSummaryCounts::default();
     collect_execution_metrics(plan, &mut counts);
-    tracing::info!(
-        target: TRACE_EXECUTION,
-        r#type = EXECUTION_PLAN_RUN,
-        plan_summary = display_plan_one_liner(plan),
-        output_rows,
-        iops = counts.iops,
-        requests = counts.requests,
-        bytes_read = counts.bytes_read,
-        indices_loaded = counts.indices_loaded,
-        parts_loaded = counts.parts_loaded,
-        index_comparisons = counts.index_comparisons,
-    );
+    if !options.skip_logging {
+        tracing::info!(
+            target: TRACE_EXECUTION,
+            r#type = EXECUTION_PLAN_RUN,
+            plan_summary = display_plan_one_liner(plan),
+            output_rows,
+            iops = counts.iops,
+            requests = counts.requests,
+            bytes_read = counts.bytes_read,
+            indices_loaded = counts.indices_loaded,
+            parts_loaded = counts.parts_loaded,
+            index_comparisons = counts.index_comparisons,
+        );
+    }
     if let Some(callback) = options.execution_stats_callback.as_ref() {
         callback(&counts);
     }
@@ -611,7 +613,7 @@ pub fn execute_plan(
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
-        if !options.skip_logging {
+        if !options.skip_logging || options.execution_stats_callback.is_some() {
             report_plan_summary_metrics(plan.as_ref(), &options);
         }
     });
