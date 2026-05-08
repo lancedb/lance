@@ -1748,6 +1748,37 @@ impl ShardWriter {
                         let _ = reader.await_value().await;
                     }
                 }
+
+                // Freeze the active memtable (if any rows) so it joins the
+                // pending-flush queue, then wait for every frozen
+                // memtable's flush to complete. Without this, close() left
+                // any rows that hadn't crossed the size/batch trigger
+                // sitting in memory at shutdown — they were durable in the
+                // WAL but never produced a Lance fragment, which is
+                // surprising for callers who reasonably expect close() to
+                // make all data fully durable in the LSM sense (and which
+                // makes flush-cost benchmarks impossible to measure).
+                //
+                // Propagate any freeze error: at close time the caller
+                // has explicitly asked for full durability, so silently
+                // dropping a freeze failure would lose data without any
+                // signal. If freeze fails, surface the error rather than
+                // continuing on to drain only the pre-existing frozen
+                // memtables (whose flushes can still be waited on, but
+                // the caller now knows the close was incomplete).
+                let watchers: Vec<_> = {
+                    let mut st = state.write().await;
+                    if st.memtable.row_count() > 0 {
+                        writer_state.freeze_memtable(&mut st)?;
+                    }
+                    st.frozen_flush_watchers
+                        .iter()
+                        .map(|(_, w)| w.clone())
+                        .collect()
+                };
+                for mut w in watchers {
+                    let _ = w.await_value().await;
+                }
             }
             WriterMode::WalOnly {
                 state,
@@ -2676,6 +2707,103 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// Regression: `close()` must flush the active memtable (not just
+    /// drain the WAL). Earlier, with a `max_memtable_size` set well
+    /// above the workload, no auto-flush would fire and `close()`
+    /// would return without producing a Lance fragment — data was
+    /// durable in the WAL but no LSM-level generation existed,
+    /// surprising callers and making flush-cost benchmarks impossible.
+    ///
+    /// The test verifies, end-to-end:
+    /// 1. close() returns Ok (a freeze/flush error must propagate, not
+    ///    be silently dropped).
+    /// 2. The persisted shard manifest's `current_generation` has
+    ///    advanced past the initial generation — direct evidence that
+    ///    a MemTable flush + manifest commit happened during close()
+    ///    rather than the active memtable being dropped on the floor.
+    /// (Verifying replay's post-flush behavior is tangled with
+    /// independent replay logic and is exercised by the dedicated
+    /// `test_memtable_replay_*` tests.)
+    #[tokio::test]
+    async fn test_close_flushes_active_memtable() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        // Reuse the same shard_id when reopening so we observe state
+        // produced by the first writer's `close()`.
+        let shard_id = Uuid::new_v4();
+        // Huge size threshold so puts never trigger an auto-flush.
+        let config = ShardWriterConfig {
+            shard_id,
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: usize::MAX,
+            max_unflushed_memtable_bytes: usize::MAX,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+
+        for i in 0..50 {
+            let batch = create_test_batch(&schema, i * 10, 10);
+            writer.put(vec![batch]).await.unwrap();
+        }
+
+        // Pre-close sanity: no auto-flush should have fired.
+        let stats_before = writer.memtable_stats().await.unwrap();
+        assert_eq!(
+            stats_before.generation, initial_gen,
+            "no flush should have fired during puts (size threshold is usize::MAX)"
+        );
+        assert!(
+            stats_before.row_count > 0,
+            "memtable should hold the rows we just inserted"
+        );
+
+        // close() must succeed; any freeze/flush error must propagate.
+        writer
+            .close()
+            .await
+            .expect("close() must succeed and propagate any freeze/flush error");
+
+        // Reopen the same shard and read the persisted manifest. The
+        // active memtable from the closed writer was frozen + flushed
+        // inside close(), which must have committed a new manifest
+        // recording the advanced generation.
+        let reopened =
+            ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+                .await
+                .unwrap();
+        let manifest = reopened
+            .manifest()
+            .await
+            .unwrap()
+            .expect("reopened shard must have a persisted manifest");
+        assert!(
+            manifest.current_generation > initial_gen,
+            "expected manifest current_generation to advance past {} after close() flushed the active memtable; got {}",
+            initial_gen,
+            manifest.current_generation,
+        );
+
+        reopened.close().await.unwrap();
     }
 
     /// Regression: the memtable flush should successfully fire many
