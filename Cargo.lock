@@ -4404,6 +4404,7 @@ version = "7.0.0-beta.7"
 dependencies = [
  "all_asserts",
  "approx",
+ "arc-swap",
  "arrow",
  "arrow-arith",
  "arrow-array",
