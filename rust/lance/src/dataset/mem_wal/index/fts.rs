@@ -378,9 +378,11 @@ struct TermChunk {
     batch_position: usize,
     row_positions: Vec<u64>,
     frequencies: Vec<u32>,
-    /// Present iff `params.has_positions()` was true at construction time.
-    /// Independent of that, in-memory phrase queries always work when
-    /// positions were tracked at insert time.
+    /// Per-doc token positions. Always `Some` in the current
+    /// implementation (the writer tracks positions unconditionally so
+    /// in-memory phrase queries work even when `params.has_positions()`
+    /// is false). Kept as `Option` for forward compatibility with a
+    /// future "no-positions" mode that drops the allocation.
     positions: Option<Positions>,
 }
 
@@ -456,11 +458,11 @@ impl BatchMeta {
 struct Snapshot {
     /// Number of batches visible to readers. `0` means empty index.
     visible_count: usize,
-    /// Visible-batch metadata. `batches.len() >= visible_count`; the writer
-    /// may have already appended a still-invisible batch to this list, but
-    /// readers walk only `batches[0..visible_count]`. In the publication
-    /// order described in the module docs, readers never observe
-    /// `visible_count` exceeding the actual length.
+    /// Visible-batch metadata, written to in publish order. Always
+    /// `batches.len() == visible_count` for any snapshot the writer has
+    /// stored (each `publish_batch` appends a single entry and bumps
+    /// `visible_count` by one). The slice is kept exactly the visible
+    /// length so readers can iterate it directly without re-bounding.
     batches: Arc<[Arc<BatchMeta>]>,
     /// `Σ batches[i].rows` for `i < visible_count`.
     cumulative_doc_count: u64,
@@ -479,8 +481,12 @@ impl Snapshot {
     }
 
     fn batch_for(&self, batch_position: usize) -> Option<&Arc<BatchMeta>> {
-        // Visible batches are densely numbered starting at 0 in the order
-        // they were inserted. Use direct index when possible.
+        // The fast path assumes batch_position equals the index in
+        // `batches` (true when callers use the no-arg `insert()` and let
+        // the index assign sequential positions). When callers pass
+        // explicit positions to `insert_with_batch_position`, those
+        // positions can be sparse / out of order, so we fall back to a
+        // linear search through visible batches.
         self.batches
             .get(batch_position)
             .filter(|m| m.batch_position == batch_position)
@@ -660,17 +666,22 @@ impl FtsMemIndex {
         self.snapshot.load().visible_count == 0
     }
 
-    /// Total number of (term, doc) postings currently stored.
+    /// Total number of visible (term, doc) postings.
     ///
-    /// Counts every chunk regardless of visibility — the writer's invariant
-    /// is that chunks become visible together with the snapshot bump, so
-    /// in steady state this equals the number of visible postings.
+    /// Sums posting counts only over chunks whose batch is visible per the
+    /// current snapshot, so this matches what readers can actually walk.
     pub fn entry_count(&self) -> usize {
+        let visible = self.snapshot.load().visible_count;
         self.terms
             .iter()
             .map(|e| {
                 let slice = e.value().load();
-                slice.chunks.iter().map(|c| c.doc_count()).sum::<usize>()
+                slice
+                    .chunks
+                    .iter()
+                    .filter(|c| c.batch_position < visible)
+                    .map(|c| c.doc_count())
+                    .sum::<usize>()
             })
             .sum()
     }
@@ -849,19 +860,30 @@ impl FtsMemIndex {
     /// use `search_with_options` for sorted/limited output.
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let snap = self.snapshot.load_full();
+        self.search_with_snapshot(term, &snap)
+    }
+
+    fn search_with_snapshot(&self, term: &str, snap: &Arc<Snapshot>) -> Vec<FtsEntry> {
         if snap.visible_count == 0 {
             return Vec::new();
         }
-
         let tokens = self.tokenize_for_search(term);
-
-        score_terms(&snap, &self.terms, &tokens)
+        score_terms(snap, &self.terms, &tokens)
     }
 
     /// Search for documents containing an exact phrase, optionally allowing
     /// `slop` intervening tokens between consecutive query tokens.
     pub fn search_phrase(&self, phrase: &str, slop: u32) -> Vec<FtsEntry> {
         let snap = self.snapshot.load_full();
+        self.search_phrase_with_snapshot(phrase, slop, &snap)
+    }
+
+    fn search_phrase_with_snapshot(
+        &self,
+        phrase: &str,
+        slop: u32,
+        snap: &Arc<Snapshot>,
+    ) -> Vec<FtsEntry> {
         if snap.visible_count == 0 {
             return Vec::new();
         }
@@ -873,7 +895,7 @@ impl FtsMemIndex {
         if tokens.len() == 1 {
             // Same shortcut as the previous implementation: a single-token
             // phrase reduces to a regular term search.
-            return score_terms(&snap, &self.terms, &tokens);
+            return score_terms(snap, &self.terms, &tokens);
         }
 
         // Gather visible chunks per token.
@@ -961,7 +983,7 @@ impl FtsMemIndex {
                     continue;
                 }
 
-                let dl = lookup_dl(&snap, row_position).unwrap_or(1) as f32;
+                let dl = lookup_dl(snap, row_position).unwrap_or(1) as f32;
                 let mut score = 0.0f32;
                 for (ti, _tok) in tokens.iter().enumerate() {
                     let tf = frequencies[ti] as f32;
@@ -987,7 +1009,17 @@ impl FtsMemIndex {
         max_distance: u32,
         max_expansions: usize,
     ) -> Vec<(String, u32)> {
-        let snap = self.snapshot.load();
+        let snap = self.snapshot.load_full();
+        self.expand_fuzzy_with_snapshot(term, max_distance, max_expansions, &snap)
+    }
+
+    fn expand_fuzzy_with_snapshot(
+        &self,
+        term: &str,
+        max_distance: u32,
+        max_expansions: usize,
+        snap: &Arc<Snapshot>,
+    ) -> Vec<(String, u32)> {
         let mut matches: Vec<(String, u32)> = Vec::new();
 
         if max_distance == 0 {
@@ -1022,6 +1054,16 @@ impl FtsMemIndex {
         max_expansions: usize,
     ) -> Vec<FtsEntry> {
         let snap = self.snapshot.load_full();
+        self.search_fuzzy_with_snapshot(query, fuzziness, max_expansions, &snap)
+    }
+
+    fn search_fuzzy_with_snapshot(
+        &self,
+        query: &str,
+        fuzziness: Option<u32>,
+        max_expansions: usize,
+        snap: &Arc<Snapshot>,
+    ) -> Vec<FtsEntry> {
         if snap.visible_count == 0 {
             return Vec::new();
         }
@@ -1034,7 +1076,8 @@ impl FtsMemIndex {
         let mut expanded: Vec<String> = Vec::new();
         for tok in &tokens {
             let max_dist = fuzziness.unwrap_or_else(|| auto_fuzziness(tok));
-            for (matched, _) in self.expand_fuzzy(tok, max_dist, max_expansions) {
+            for (matched, _) in self.expand_fuzzy_with_snapshot(tok, max_dist, max_expansions, snap)
+            {
                 expanded.push(matched);
             }
         }
@@ -1042,19 +1085,33 @@ impl FtsMemIndex {
             return Vec::new();
         }
 
-        score_terms(&snap, &self.terms, &expanded)
+        score_terms(snap, &self.terms, &expanded)
     }
 
     /// Execute a query expression and return matching documents with scores.
+    ///
+    /// Snapshots the index state once at entry so the entire compound
+    /// query — including every leaf invoked recursively from `Boolean` /
+    /// `Boost` — sees the same `Snapshot`. This preserves the per-batch
+    /// monotonic visibility contract for compound queries.
     pub fn search_query(&self, query: &FtsQueryExpr) -> Vec<FtsEntry> {
+        let snap = self.snapshot.load_full();
+        self.search_query_with_snapshot(query, &snap)
+    }
+
+    fn search_query_with_snapshot(
+        &self,
+        query: &FtsQueryExpr,
+        snap: &Arc<Snapshot>,
+    ) -> Vec<FtsEntry> {
         match query {
             FtsQueryExpr::Match { query, boost } => {
-                let mut results = self.search(query);
+                let mut results = self.search_with_snapshot(query, snap);
                 apply_boost(&mut results, *boost);
                 results
             }
             FtsQueryExpr::Phrase { query, slop, boost } => {
-                let mut results = self.search_phrase(query, *slop);
+                let mut results = self.search_phrase_with_snapshot(query, *slop, snap);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1064,7 +1121,8 @@ impl FtsMemIndex {
                 max_expansions,
                 boost,
             } => {
-                let mut results = self.search_fuzzy(query, *fuzziness, *max_expansions);
+                let mut results =
+                    self.search_fuzzy_with_snapshot(query, *fuzziness, *max_expansions, snap);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1072,12 +1130,12 @@ impl FtsMemIndex {
                 must,
                 should,
                 must_not,
-            } => self.search_boolean(must, should, must_not),
+            } => self.search_boolean(must, should, must_not, snap),
             FtsQueryExpr::Boost {
                 positive,
                 negative,
                 negative_boost,
-            } => self.search_boost(positive, negative.as_deref(), *negative_boost),
+            } => self.search_boost(positive, negative.as_deref(), *negative_boost, snap),
         }
     }
 
@@ -1087,7 +1145,8 @@ impl FtsMemIndex {
         query: &FtsQueryExpr,
         options: SearchOptions,
     ) -> Vec<FtsEntry> {
-        let mut results = self.search_query(query);
+        let snap = self.snapshot.load_full();
+        let mut results = self.search_query_with_snapshot(query, &snap);
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1116,12 +1175,13 @@ impl FtsMemIndex {
         positive: &FtsQueryExpr,
         negative: Option<&FtsQueryExpr>,
         negative_boost: f32,
+        snap: &Arc<Snapshot>,
     ) -> Vec<FtsEntry> {
-        let mut results = self.search_query(positive);
+        let mut results = self.search_query_with_snapshot(positive, snap);
         let Some(neg) = negative else {
             return results;
         };
-        let negative_results = self.search_query(neg);
+        let negative_results = self.search_query_with_snapshot(neg, snap);
         let negative_set: HashSet<RowPosition> = negative_results
             .into_iter()
             .map(|e| e.row_position)
@@ -1139,29 +1199,30 @@ impl FtsMemIndex {
         must: &[FtsQueryExpr],
         should: &[FtsQueryExpr],
         must_not: &[FtsQueryExpr],
+        snap: &Arc<Snapshot>,
     ) -> Vec<FtsEntry> {
         let excluded: HashSet<RowPosition> = must_not
             .iter()
-            .flat_map(|q| self.search_query(q))
+            .flat_map(|q| self.search_query_with_snapshot(q, snap))
             .map(|e| e.row_position)
             .collect();
 
         let mut result_map: HashMap<RowPosition, f32> = if must.is_empty() {
             let mut map: HashMap<RowPosition, f32> = HashMap::new();
             for q in should {
-                for entry in self.search_query(q) {
+                for entry in self.search_query_with_snapshot(q, snap) {
                     *map.entry(entry.row_position).or_default() += entry.score;
                 }
             }
             map
         } else {
-            let first_results = self.search_query(&must[0]);
+            let first_results = self.search_query_with_snapshot(&must[0], snap);
             let mut map: HashMap<RowPosition, f32> = first_results
                 .into_iter()
                 .map(|e| (e.row_position, e.score))
                 .collect();
             for q in must.iter().skip(1) {
-                let results = self.search_query(q);
+                let results = self.search_query_with_snapshot(q, snap);
                 let result_set: HashMap<RowPosition, f32> = results
                     .into_iter()
                     .map(|e| (e.row_position, e.score))
@@ -1172,7 +1233,7 @@ impl FtsMemIndex {
                     .collect();
             }
             for q in should {
-                for entry in self.search_query(q) {
+                for entry in self.search_query_with_snapshot(q, snap) {
                     if let Some(score) = map.get_mut(&entry.row_position) {
                         *score += entry.score;
                     }
@@ -1595,6 +1656,7 @@ mod tests {
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn create_test_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
@@ -2477,7 +2539,6 @@ mod tests {
         // phrase tokens. Since `search_phrase` only returns rows where
         // every token's position constraint holds, any returned entry
         // implicitly proves both tokens were visible together.
-        use std::sync::Arc;
         let schema = create_test_schema();
         let index = Arc::new(FtsMemIndex::new(1, "description".to_string()));
 
@@ -2521,8 +2582,6 @@ mod tests {
 
     #[test]
     fn test_swmr_visibility_torture() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
         let schema = create_test_schema();
         let index = Arc::new(FtsMemIndex::new(1, "description".to_string()));
         let stop = Arc::new(AtomicBool::new(false));
