@@ -264,14 +264,17 @@ impl ShuffleReader for IvfShufflerReader {
         )
         .await?;
         let schema: Schema = reader.schema().as_ref().into();
-        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
-            Arc::new(schema),
-            reader.read_stream(
+        let stream = reader
+            .read_stream(
                 lance_io::ReadBatchParams::RangeFull,
                 u32::MAX,
                 16,
                 FilterExpression::no_filter(),
-            )?,
+            )
+            .await?;
+        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
+            Arc::new(schema),
+            stream,
         ))))
     }
 
@@ -629,12 +632,15 @@ impl TwoFileShuffleReader {
         }
         let positions = UInt32Array::from(positions);
         let num_positions = positions.len() as u32;
-        let offsets_stream = self.offsets_reader.read_stream(
-            ReadBatchParams::Indices(positions),
-            num_positions,
-            1,
-            FilterExpression::no_filter(),
-        )?;
+        let offsets_stream = self
+            .offsets_reader
+            .read_stream(
+                ReadBatchParams::Indices(positions),
+                num_positions,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await?;
         let schema = offsets_stream.schema().clone();
         let offsets = offsets_stream.try_collect::<Vec<_>>().await?;
         let offsets = if offsets.is_empty() {
@@ -681,14 +687,18 @@ impl ShuffleReader for TwoFileShuffleReader {
         }
 
         let schema: Schema = self.file_reader.schema().as_ref().into();
-        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
-            Arc::new(schema),
-            self.file_reader.read_stream(
+        let stream = self
+            .file_reader
+            .read_stream(
                 ReadBatchParams::Ranges(ranges.into()),
                 u32::MAX,
                 16,
                 FilterExpression::no_filter(),
-            )?,
+            )
+            .await?;
+        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
+            Arc::new(schema),
+            stream,
         ))))
     }
 

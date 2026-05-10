@@ -535,6 +535,21 @@ def test_blob_extension_write_external(tmp_path):
         assert f.read() == b"hello"
 
 
+@pytest.mark.parametrize(
+    ("position", "size"),
+    [
+        pytest.param(None, None, id="explicit_none"),
+        pytest.param(1, 3, id="slice"),
+    ],
+)
+def test_blob_from_uri_accepts_optional_slice_metadata(position, size):
+    blob = Blob.from_uri("file:///tmp/blob.bin", position=position, size=size)
+
+    assert blob.uri == "file:///tmp/blob.bin"
+    assert blob.position == position
+    assert blob.size == size
+
+
 def test_blob_extension_write_external_ingest(tmp_path):
     blob_path = tmp_path / "external_blob.bin"
     blob_path.write_bytes(b"hello")
