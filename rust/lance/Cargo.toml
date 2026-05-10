@@ -68,7 +68,6 @@ rayon.workspace = true
 futures.workspace = true
 uuid.workspace = true
 arrow.workspace = true
-arc-swap.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true
 datafusion-functions.workspace = true
@@ -235,6 +234,10 @@ harness = false
 
 [[bench]]
 name = "mem_wal_shard_writer_backpressure"
+harness = false
+
+[[bench]]
+name = "mem_wal_fineweb_fts"
 harness = false
 
 [lints]
