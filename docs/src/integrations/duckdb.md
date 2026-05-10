@@ -28,7 +28,7 @@ We're now ready to begin querying Lance using DuckDB! First, install the extensi
 === "SQL"
 
     ```sql
-    INSTALL lance FROM community;
+    INSTALL lance;
     LOAD lance;
     ```
 
@@ -39,7 +39,7 @@ We're now ready to begin querying Lance using DuckDB! First, install the extensi
 
     duckdb.sql(
         """
-        INSTALL lance FROM community;
+        INSTALL lance;
         LOAD lance;
         """
     )
