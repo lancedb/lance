@@ -101,6 +101,7 @@ pub async fn read_lance_file(
 
     let batch_stream = file_reader
         .read_stream(ReadBatchParams::RangeFull, 1024, 16, filter)
+        .await
         .unwrap();
 
     batch_stream.try_collect().await.unwrap()

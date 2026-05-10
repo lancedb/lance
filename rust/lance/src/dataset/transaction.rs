@@ -18,6 +18,7 @@ use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
+use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
@@ -1418,16 +1419,24 @@ impl Operation {
         match (self, other) {
             (
                 Self::UpdateConfig {
+                    table_metadata_updates,
                     schema_metadata_updates,
                     field_metadata_updates,
                     ..
                 },
                 Self::UpdateConfig {
+                    table_metadata_updates: other_table_metadata,
                     schema_metadata_updates: other_schema_metadata,
                     field_metadata_updates: other_field_metadata,
                     ..
                 },
             ) => {
+                if Self::update_maps_conflict(
+                    table_metadata_updates.as_ref(),
+                    other_table_metadata.as_ref(),
+                ) {
+                    return true;
+                }
                 if schema_metadata_updates.is_some() && other_schema_metadata.is_some() {
                     return true;
                 }
@@ -1442,6 +1451,24 @@ impl Operation {
             }
             _ => false,
         }
+    }
+
+    fn update_maps_conflict(left: Option<&UpdateMap>, right: Option<&UpdateMap>) -> bool {
+        let (Some(left), Some(right)) = (left, right) else {
+            return false;
+        };
+        if left.replace || right.replace {
+            return true;
+        }
+        let left_keys = left
+            .update_entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<HashSet<_>>();
+        right
+            .update_entries
+            .iter()
+            .any(|entry| left_keys.contains(entry.key.as_str()))
     }
 
     /// Check whether another operation upserts a key that is referenced by another operation
@@ -2358,6 +2385,20 @@ impl Transaction {
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
+                        // Also set unenforced primary key based on updated field metadata.
+                        field.unenforced_primary_key_position = field
+                            .metadata
+                            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .or_else(|| {
+                                field
+                                    .metadata
+                                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                                    .filter(|s| {
+                                        matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
+                                    })
+                                    .map(|_| 0)
+                            });
                     } else {
                         return Err(Error::invalid_input_source(
                             format!("Field with id {} does not exist", field_id).into(),
@@ -5890,5 +5931,29 @@ mod tests {
         assert_eq!(runs[1].version, 2);
         assert_eq!(runs[2].version, 1);
         assert_eq!(runs[3].version, 2);
+    }
+
+    fn table_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: Some(UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace,
+            }),
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_table_metadata_conflicts_on_same_key() {
+        let left = table_metadata_update(vec![("key", Some("1"))], false);
+        let same_key = table_metadata_update(vec![("key", Some("2"))], false);
+        let different_key = table_metadata_update(vec![("other", Some("2"))], false);
+        let replace = table_metadata_update(vec![("other", Some("2"))], true);
+
+        assert!(left.modifies_same_metadata(&same_key));
+        assert!(!left.modifies_same_metadata(&different_key));
+        assert!(left.modifies_same_metadata(&replace));
     }
 }

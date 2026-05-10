@@ -41,7 +41,6 @@ use super::RowPosition;
 /// Composite key for FTS index.
 ///
 /// By combining (token, row_position), each entry is unique.
-/// This follows the same pattern as IndexKey and IvfPqKey.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FtsKey {
     /// The indexed token (lowercase).

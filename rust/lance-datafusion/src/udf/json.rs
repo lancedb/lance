@@ -378,44 +378,39 @@ fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<
 
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
     let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
-    match selector.select_values(&json_path) {
-        Ok(values) => {
-            if values.is_empty() {
-                Ok(None)
-            } else {
-                // Get the first matched value
-                let owned_value = &values[0];
-                let raw = owned_value.as_raw();
+    match selector.select_value(&json_path) {
+        Ok(Some(owned_value)) => {
+            let raw = owned_value.as_raw();
 
-                // Determine type using JsonbType enum
-                let jsonb_type = if raw.is_null().unwrap_or(false) {
-                    JsonbType::Null
-                } else if raw.is_boolean().unwrap_or(false) {
-                    JsonbType::Boolean
-                } else if raw.is_number().unwrap_or(false) {
-                    let is_float_storage =
-                        matches!(raw.as_number(), Ok(Some(jsonb::Number::Float64(_))));
-                    if !is_float_storage && raw.is_i64().unwrap_or(false) {
-                        JsonbType::Int64
-                    } else {
-                        JsonbType::Float64
-                    }
-                } else if raw.is_string().unwrap_or(false) {
-                    JsonbType::String
-                } else if raw.is_array().unwrap_or(false) {
-                    JsonbType::Array
-                } else if raw.is_object().unwrap_or(false) {
-                    JsonbType::Object
+            // Determine type using JsonbType enum
+            let jsonb_type = if raw.is_null().unwrap_or(false) {
+                JsonbType::Null
+            } else if raw.is_boolean().unwrap_or(false) {
+                JsonbType::Boolean
+            } else if raw.is_number().unwrap_or(false) {
+                let is_float_storage =
+                    matches!(raw.as_number(), Ok(Some(jsonb::Number::Float64(_))));
+                if !is_float_storage && raw.is_i64().unwrap_or(false) {
+                    JsonbType::Int64
                 } else {
-                    JsonbType::String // default to string
-                };
+                    JsonbType::Float64
+                }
+            } else if raw.is_string().unwrap_or(false) {
+                JsonbType::String
+            } else if raw.is_array().unwrap_or(false) {
+                JsonbType::Array
+            } else if raw.is_object().unwrap_or(false) {
+                JsonbType::Object
+            } else {
+                JsonbType::String // default to string
+            };
 
-                // Return the JSONB bytes and type tag as u8
-                Ok(Some((owned_value.clone().to_vec(), jsonb_type.as_u8())))
-            }
+            // Return the JSONB bytes and type tag as u8
+            Ok(Some((owned_value.to_vec(), jsonb_type.as_u8())))
         }
+        Ok(None) => Ok(None),
         Err(e) => Err(common::execution_error(format!(
-            "Failed to select values from path '{}': {}",
+            "Failed to select value from path '{}': {}",
             path, e
         ))),
     }
@@ -423,23 +418,17 @@ fn extract_json_path_with_type(jsonb_bytes: &[u8], path: &str) -> Result<Option<
 
 /// Extract value from JSONB using JSONPath
 ///
-/// Note: Uses `select_values` instead of the deprecated `select_by_path` method
+/// Note: Uses `select_value` so JSONPath expressions matching multiple values
+/// return a JSON array instead of silently dropping all but the first match.
 fn extract_json_path(jsonb_bytes: &[u8], path: &str) -> Result<Option<String>> {
     let json_path = common::parse_json_path(path)?;
 
     let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
     let mut selector = jsonb::jsonpath::Selector::new(raw_jsonb);
-    match selector.select_values(&json_path) {
-        Ok(values) => {
-            if values.is_empty() {
-                Ok(None)
-            } else {
-                // Return the first matched value
-                Ok(Some(values[0].to_string()))
-            }
-        }
+    match selector.select_value(&json_path) {
+        Ok(value) => Ok(value.map(|value| value.to_string())),
         Err(e) => Err(common::execution_error(format!(
-            "Failed to select values from path '{}': {}",
+            "Failed to select value from path '{}': {}",
             path, e
         ))),
     }
@@ -1011,10 +1000,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_extract_udf() -> Result<()> {
-        let json = r#"{"user": {"name": "Alice", "age": 30}}"#;
+        let json = r#"{"user": {"name": "Alice", "age": 30}, "tags": ["python", "ml"]}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
+        binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_value(&jsonb_bytes);
         binary_builder.append_null();
@@ -1023,16 +1013,18 @@ mod tests {
         let path_array = Arc::new(StringArray::from(vec![
             Some("$.user.name"),
             Some("$.user.age"),
+            Some("$.tags[*]"),
             Some("$.user.name"),
         ]));
 
         let result = json_extract_impl(&[jsonb_array, path_array])?;
         let string_array = result.as_any().downcast_ref::<StringArray>().unwrap();
 
-        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.len(), 4);
         assert_eq!(string_array.value(0), "\"Alice\"");
         assert_eq!(string_array.value(1), "30");
-        assert!(string_array.is_null(2));
+        assert_eq!(string_array.value(2), "[\"python\",\"ml\"]");
+        assert!(string_array.is_null(3));
 
         Ok(())
     }
@@ -1318,6 +1310,41 @@ mod tests {
                 .unwrap();
             assert_eq!(type_tags.value(0), expected.as_u8());
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_extract_with_wildcard() -> Result<()> {
+        use arrow_array::StructArray;
+        use arrow_array::UInt8Array;
+
+        let json = r#"{"items": [{"price": 1}, {"price": 2}]}"#;
+        let jsonb_bytes = create_test_jsonb(json);
+
+        let mut binary_builder = LargeBinaryBuilder::new();
+        binary_builder.append_value(&jsonb_bytes);
+
+        let jsonb_array: ArrayRef = Arc::new(binary_builder.finish());
+        let path_array: ArrayRef = Arc::new(StringArray::from(vec![Some("$.items[*].price")]));
+
+        let result = json_extract_with_type_impl(&[jsonb_array, path_array])?;
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = struct_array
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        let type_tags = struct_array
+            .column_by_name("type_tag")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+
+        assert_eq!(jsonb::RawJsonb::new(values.value(0)).to_string(), "[1,2]");
+        assert_eq!(type_tags.value(0), JsonbType::Array.as_u8());
 
         Ok(())
     }

@@ -321,7 +321,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     u32::MAX,
                     1,
                     FilterExpression::no_filter(),
-                )?
+                )
+                .await?
                 .try_collect::<Vec<_>>()
                 .await?;
             let schema = Arc::new(self.reader.schema().as_ref().into());

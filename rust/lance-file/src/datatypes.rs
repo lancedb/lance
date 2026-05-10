@@ -51,6 +51,11 @@ impl From<&pb::Field> for Field {
             } else {
                 None
             },
+            unenforced_clustering_key_position: if field.unenforced_clustering_key_position > 0 {
+                Some(field.unenforced_clustering_key_position)
+            } else {
+                None
+            },
         }
     }
 }
@@ -84,6 +89,10 @@ impl From<&Field> for pb::Field {
             r#type: 0,
             unenforced_primary_key: field.unenforced_primary_key_position.is_some(),
             unenforced_primary_key_position: field.unenforced_primary_key_position.unwrap_or(0),
+            unenforced_clustering_key: false,
+            unenforced_clustering_key_position: field
+                .unenforced_clustering_key_position
+                .unwrap_or(0),
         }
     }
 }
@@ -310,5 +319,49 @@ mod tests {
 
         let schema = Schema::from(fields_with_meta);
         assert_eq!(expected_schema, schema);
+    }
+
+    #[test]
+    fn test_clustering_key_roundtrip() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("region", DataType::Utf8, true).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-clustering-key:position".to_owned(),
+                    "1".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("date", DataType::Int32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-clustering-key:position".to_owned(),
+                    "2".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("value", DataType::Float64, true),
+        ]);
+
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let ck = schema.unenforced_clustering_key();
+        assert_eq!(ck.len(), 2);
+        assert_eq!(ck[0].name, "region");
+        assert_eq!(ck[1].name, "date");
+
+        // Round-trip through protobuf
+        let fields_with_meta: FieldsWithMeta = (&schema).into();
+        let restored = Schema::from(fields_with_meta);
+
+        let ck2 = restored.unenforced_clustering_key();
+        assert_eq!(ck2.len(), 2);
+        assert_eq!(ck2[0].name, "region");
+        assert_eq!(ck2[1].name, "date");
+        assert_eq!(ck2[0].unenforced_clustering_key_position, Some(1));
+        assert_eq!(ck2[1].unenforced_clustering_key_position, Some(2));
+
+        // Non-clustering-key field should not have position
+        let value_field = restored.field("value").unwrap();
+        assert!(!value_field.is_unenforced_clustering_key());
     }
 }

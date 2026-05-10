@@ -201,7 +201,7 @@ impl PyRegionWriter {
                 // Snapshot stats before close so the captured state reflects
                 // what was written, not any internal bookkeeping done by close().
                 let stats_snapshot = stats_handle.snapshot();
-                let memtable_stats_before_close = writer.memtable_stats().await;
+                let memtable_stats_before_close = writer.memtable_stats().await?;
                 writer.close().await?;
                 let closed_memtable_stats = closed_memtable_stats(memtable_stats_before_close);
                 let mut closed_guard = closed_state.lock().await;
@@ -255,7 +255,7 @@ impl PyRegionWriter {
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
-                    Some(w) => Ok(w.memtable_stats().await),
+                    Some(w) => w.memtable_stats().await,
                     None => {
                         let closed_guard = closed_state.lock().await;
                         closed_guard
@@ -267,7 +267,7 @@ impl PyRegionWriter {
                     }
                 }
             })?
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))?;
 
         memtable_stats_to_pydict(py, &stats)
     }
@@ -296,7 +296,7 @@ impl PyRegionWriter {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
                     Some(w) => {
-                        let active_ref = w.active_memtable_ref().await;
+                        let active_ref = w.active_memtable_ref().await?;
                         let writer_snapshot = w
                             .manifest()
                             .await?

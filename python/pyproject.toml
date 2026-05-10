@@ -1,7 +1,7 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.7.2,<0.8"]
+dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.7.5,<0.8"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
@@ -114,6 +114,8 @@ filterwarnings = [
     'ignore:.*`np\\.object` will be defined as the corresponding NumPy scalar\\..*:FutureWarning',
     # Boto3
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
+    # Hugging Face Hub calls this deprecated hf-xet API internally.
+    'ignore:.*hf_xet\.download_files\(\) is deprecated.*:DeprecationWarning',
     # Pandas 2.2 on Python 2.12
     'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
     # Pytorch 2.2 on Python 3.12
@@ -123,6 +125,8 @@ filterwarnings = [
     'ignore:.*the load_module\(\) method is deprecated.*:DeprecationWarning',
     # Pytorch uses deprecated jit.script_method internally (torch/utils/mkldnn.py)
     'ignore:.*torch\.jit\.script_method.*is deprecated.*:DeprecationWarning',
+    # huggingface_hub still calls the deprecated hf_xet.download_files() during Xet downloads
+    'ignore:.*hf_xet\.download_files\(\) is deprecated.*:DeprecationWarning',
     # TensorFlow/Keras import can emit NumPy deprecation FutureWarnings in some environments.
     # Keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
     'ignore:.*np\.object.*:FutureWarning',

@@ -59,7 +59,7 @@ impl Updater {
     ///
     /// If the schemas are not known, they can be None and will be inferred from
     /// the first batch of results.
-    pub(super) fn try_new(
+    pub(super) async fn try_new(
         fragment: FileFragment,
         reader: FragmentReader,
         deletion_vector: DeletionVector,
@@ -83,7 +83,7 @@ impl Updater {
             (None, None) => get_default_batch_size().unwrap_or(1024) as u32,
         };
 
-        let input_stream = reader.read_all(batch_size)?;
+        let input_stream = reader.read_all(batch_size).await?;
 
         Ok(Self {
             fragment,

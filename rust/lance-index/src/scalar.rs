@@ -14,6 +14,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{Column, scalar::ScalarValue};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use datafusion_expr::Expr;
@@ -22,6 +23,7 @@ use deepsize::DeepSizeOf;
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result};
+use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 
@@ -206,6 +208,25 @@ pub trait IndexReader: Send + Sync {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
+    /// Read a range of rows as a stream of record batches.
+    ///
+    /// This allows the caller to process rows incrementally without loading the
+    /// entire range into memory at once.
+    ///
+    /// The default implementation falls back to [`Self::read_range`] and wraps
+    /// the result in a single-item stream.
+    async fn read_range_stream(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+        let batch = self.read_range(range, projection).await?;
+        let schema = batch.schema();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok(batch) }),
+        )))
+    }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file

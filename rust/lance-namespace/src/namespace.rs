@@ -9,7 +9,8 @@ use lance_core::{Error, Result};
 
 use lance_namespace_reqwest_client::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
-    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
@@ -29,10 +30,11 @@ use lance_namespace_reqwest_client::models::{
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
-    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
+    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
+    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 /// Base trait for Lance Namespace implementations.
@@ -422,6 +424,26 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<AlterTableDropColumnsResponse> {
         Err(Error::not_supported(
             "alter_table_drop_columns not implemented",
+        ))
+    }
+
+    /// Trigger an async backfill job for a computed column.
+    async fn alter_table_backfill_columns(
+        &self,
+        _request: AlterTableBackfillColumnsRequest,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        Err(Error::not_supported(
+            "alter_table_backfill_columns not implemented",
+        ))
+    }
+
+    /// Trigger an async materialized view refresh.
+    async fn refresh_materialized_view(
+        &self,
+        _request: RefreshMaterializedViewRequest,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        Err(Error::not_supported(
+            "refresh_materialized_view not implemented",
         ))
     }
 

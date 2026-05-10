@@ -4670,7 +4670,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_rows: Optional[int] = None,
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
-        ivf_index_partition_capacity_safety_factor: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
         async_index_buffer_rows: Optional[int] = None,
         async_index_interval_ms: Optional[int] = None,
@@ -4704,8 +4703,6 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum batches per MemTable (default: 8 000).
         max_unflushed_memtable_bytes : int, optional
             Maximum unflushed bytes before backpressure (default: 1 GB).
-        ivf_index_partition_capacity_safety_factor : int, optional
-            Safety factor for IVF partition capacity (default: 8).
         manifest_scan_batch_size : int, optional
             Batch size for manifest scans (default: 2).
         async_index_buffer_rows : int, optional
@@ -4759,10 +4756,6 @@ class LanceDataset(pa.dataset.Dataset):
                 ("max_memtable_rows", max_memtable_rows),
                 ("max_memtable_batches", max_memtable_batches),
                 ("max_unflushed_memtable_bytes", max_unflushed_memtable_bytes),
-                (
-                    "ivf_index_partition_capacity_safety_factor",
-                    ivf_index_partition_capacity_safety_factor,
-                ),
                 ("manifest_scan_batch_size", manifest_scan_batch_size),
                 ("async_index_buffer_rows", async_index_buffer_rows),
                 ("async_index_interval_ms", async_index_interval_ms),

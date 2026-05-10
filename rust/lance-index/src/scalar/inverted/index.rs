@@ -39,7 +39,7 @@ use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, iter_str_array};
-use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -1927,10 +1927,12 @@ impl PostingListReader {
                             Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                             e => e,
                         })?;
-                    let bytes = batch[COMPRESSED_POSITION_COL]
-                        .as_binary::<i64>()
-                        .value(0)
-                        .to_vec();
+                    let bytes = bytes::Bytes::from(
+                        batch[COMPRESSED_POSITION_COL]
+                            .as_binary::<i64>()
+                            .value(0)
+                            .to_vec(),
+                    );
                     let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
                         .as_list::<i32>()
                         .value(0)
@@ -1985,7 +1987,7 @@ impl PostingListReader {
 /// New type just to allow Positions implement DeepSizeOf so it can be put
 /// in the cache.
 #[derive(Clone)]
-pub struct Positions(CompressedPositionStorage);
+pub struct Positions(pub(super) CompressedPositionStorage);
 
 impl DeepSizeOf for Positions {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
@@ -2014,6 +2016,10 @@ impl CacheKey for PostingListKey {
     fn type_name() -> &'static str {
         "PostingList"
     }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<PostingList>())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2030,6 +2036,10 @@ impl CacheKey for PositionKey {
 
     fn type_name() -> &'static str {
         "Position"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<Positions>())
     }
 }
 
@@ -2052,11 +2062,14 @@ impl DeepSizeOf for CompressedPositionStorage {
 pub struct SharedPositionStream {
     codec: PositionStreamCodec,
     block_offsets: Vec<u32>,
-    bytes: Vec<u8>,
+    // Stored as `Bytes` so that the cache deserialization path can hand
+    // ownership of an IPC-decoded slice in without copying. Cloning the
+    // stream is then an `Arc` bump rather than an O(N) buffer copy.
+    bytes: bytes::Bytes,
 }
 
 impl SharedPositionStream {
-    pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: Vec<u8>) -> Self {
+    pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
             codec,
             block_offsets,
@@ -2096,7 +2109,7 @@ impl SharedPositionStream {
     }
 
     pub fn size(&self) -> usize {
-        self.block_offsets.capacity() * std::mem::size_of::<u32>() + self.bytes.capacity()
+        self.block_offsets.capacity() * std::mem::size_of::<u32>() + self.bytes.len()
     }
 }
 
@@ -2443,7 +2456,7 @@ impl CompressedPostingList {
             .as_binary::<i64>()
             .clone();
         let positions = if let Some(col) = batch.column_by_name(COMPRESSED_POSITION_COL) {
-            let bytes = col.as_binary::<i64>().value(0).to_vec();
+            let bytes = bytes::Bytes::from(col.as_binary::<i64>().value(0).to_vec());
             let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
                 .as_list::<i32>()
                 .value(0)
@@ -2602,7 +2615,11 @@ impl EncodedPositionBlocks {
     }
 
     fn into_stream(self) -> SharedPositionStream {
-        SharedPositionStream::new(PositionStreamCodec::PackedDelta, self.offsets, self.bytes)
+        SharedPositionStream::new(
+            PositionStreamCodec::PackedDelta,
+            self.offsets,
+            bytes::Bytes::from(self.bytes),
+        )
     }
 }
 

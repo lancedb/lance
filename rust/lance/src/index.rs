@@ -46,7 +46,7 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex};
 use lance_index::{
-    IndexCriteria, is_system_index,
+    IndexCriteria, infer_system_index_type, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -633,8 +633,26 @@ impl IndexDescriptionImpl {
         let field_ids_vec: Vec<u32> = field_ids.iter().map(|id| *id as u32).collect();
 
         // This should not fail as we have already filtered out indexes without index details.
-        let index_details = example_metadata.index_details.as_ref().ok_or(Error::index("Index details are required for index description.  This index must be retrained to support this method."
-            .to_string()))?;
+        let index_details = example_metadata.index_details.as_ref().ok_or_else(|| {
+            let fields = field_ids
+                .iter()
+                .map(|id| {
+                    dataset
+                        .schema()
+                        .field_by_id(*id)
+                        .map(|f| format!("{}({})", f.name, id))
+                        .unwrap_or_else(|| format!("<unknown>({})", id))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            Error::index(format!(
+                "Index details are required for index description. This index must be retrained to support this method. (index_name={}, uuid={}, fields=[{}])",
+                name,
+                example_metadata.uuid,
+                fields
+            ))
+        })?;
         let type_url = &index_details.type_url;
         if !segments.iter().all(|shard| {
             shard
@@ -651,8 +669,14 @@ impl IndexDescriptionImpl {
         let details = IndexDetails(index_details.clone());
         let mut rows_indexed = 0;
 
-        // Vector indices need to be opened to get the correct type
-        let index_type = if details.is_vector() {
+        // System indices (e.g. __lance_frag_reuse, __lance_mem_wal) are
+        // identified by name and have no entry in the scalar plugin registry,
+        // so resolve them up front. This mirrors `load_indices` in
+        // python/src/dataset.rs, keeping the two listing methods in agreement.
+        let index_type = if let Some(system_type) = infer_system_index_type(example_metadata) {
+            system_type.to_string()
+        } else if details.is_vector() {
+            // Vector indices need to be opened to get the correct type
             let column = field_ids
                 .first()
                 .and_then(|id| dataset.schema().field_by_id(*id))

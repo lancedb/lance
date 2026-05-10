@@ -468,6 +468,13 @@ The garbage collector removes obsolete data from shard directories. Flushed MemT
 2. All maintained indexes have caught up (`generation <= min(index_catchup[I].caught_up_generation)`)
 3. No retained base table version references the generation for time travel
 
+!!!warning
+    Deleting WAL files weakens [writer fencing](#writer-fencing) and can lead to silent acknowledgement of lost writes.
+
+    Fencing detects a stalled writer when its `put-if-not-exists` for the next WAL entry collides with a newer writer's entry at the same position — only that collision triggers the epoch check. If GC has already removed the WAL file at that position, the stalled writer's PUT lands on empty space and succeeds against its old `writer_epoch`. The entry is acknowledged to the client, but the new manifest's `replay_after_wal_entry_position` has already advanced past it, so the data is never replayed.
+
+    Implementations that GC WAL files must compensate, for example by re-checking fence state after each successful WAL write, encoding the writer epoch into the WAL filename so positions are partitioned by epoch, or otherwise guaranteeing a stalled writer cannot land at a position that has been or will be GC'd.
+
 ## Reader Expectations
 
 ### LSM Tree Merging Read

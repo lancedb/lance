@@ -213,6 +213,7 @@ fn file_reader_take(
                             16,
                             FilterExpression::no_filter(),
                         )
+                        .await
                         .unwrap();
                     stream.fold(Vec::new(), |mut acc, item| async move {
                         acc.push(item);

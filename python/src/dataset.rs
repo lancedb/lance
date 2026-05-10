@@ -989,7 +989,15 @@ impl Dataset {
                 })? {
                     Ok(r) => r,
                     Err(error) => {
-                        log::warn!("Cannot derive index type for {:?}: {}", idx, error);
+                        log::warn!(
+                            "Cannot derive index type for index {} (uuid={}, type_url={:?}, version={}) on dataset {}: {}",
+                            idx.name,
+                            idx.uuid,
+                            idx.index_details.as_ref().map(|d| d.type_url.as_str()),
+                            idx.index_version,
+                            self_.ds.uri(),
+                            error,
+                        );
                         // mark the type as unknown for any new index type
                         "Unknown".to_owned()
                     }
@@ -3208,7 +3216,6 @@ impl Dataset {
         max_memtable_rows=None,
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
-        ivf_index_partition_capacity_safety_factor=None,
         manifest_scan_batch_size=None,
         async_index_buffer_rows=None,
         async_index_interval_ms=None,
@@ -3227,7 +3234,6 @@ impl Dataset {
         max_memtable_rows: Option<usize>,
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
-        ivf_index_partition_capacity_safety_factor: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
         async_index_buffer_rows: Option<usize>,
         async_index_interval_ms: Option<u64>,
@@ -3263,9 +3269,6 @@ impl Dataset {
         }
         if let Some(v) = max_unflushed_memtable_bytes {
             config = config.with_max_unflushed_memtable_bytes(v);
-        }
-        if let Some(v) = ivf_index_partition_capacity_safety_factor {
-            config = config.with_ivf_index_partition_capacity_safety_factor(v);
         }
         if let Some(v) = manifest_scan_batch_size {
             config = config.with_manifest_scan_batch_size(v);

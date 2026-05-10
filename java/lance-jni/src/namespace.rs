@@ -2314,6 +2314,40 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTableDro
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_alterTableBackfillColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_backfill_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_refreshMaterializedViewNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.refresh_materialized_view(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_listTableTagsNative(
     mut env: JNIEnv,
     _obj: JObject,
@@ -3216,6 +3250,40 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTableDropColu
         env,
         call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
             RT.block_on(namespace_client.inner.alter_table_drop_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_alterTableBackfillColumnsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.alter_table_backfill_columns(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_refreshMaterializedViewNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.refresh_materialized_view(req))
         }),
         std::ptr::null_mut()
     )
