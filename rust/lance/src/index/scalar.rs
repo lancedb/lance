@@ -281,6 +281,89 @@ pub async fn compute_zonemap_batch(
     builder.zonemap_stats_as_batch()
 }
 
+/// Driver-side companion to [`compute_zonemap_batch`]: take a pre-computed (typically
+/// coordinator-concatenated) zone-stats batch and persist it as a single uncommitted zonemap
+/// index segment, returning the [`IndexMetadata`] that the caller can later commit via
+/// `Dataset::commit_existing_index_segments`.
+///
+/// This is the path that completes build-time consolidation: parallel workers each produce a
+/// per-fragment-subset batch via `compute_zonemap_batch`; the coordinator concatenates them
+/// and hands the result here. The output is one `zonemap.lance` file under a fresh UUID-named
+/// directory in the dataset's `indices/` tree, and an `IndexMetadata` whose `fragment_bitmap`
+/// is the union of every fragment id appearing in the batch's `fragment_id` column. No
+/// manifest write happens here — that is `commit_existing_index_segments`' job.
+///
+/// `batch` must conform to [`zonemap_stats_schema`](lance_index::scalar::zonemap::zonemap_stats_schema)
+/// (this is enforced by the inner writer).
+pub async fn write_consolidated_zonemap_segment(
+    dataset: &Dataset,
+    name: &str,
+    column: &str,
+    batch: arrow_array::RecordBatch,
+    params: &lance_index::scalar::zonemap::ZoneMapIndexBuilderParams,
+) -> Result<IndexMetadata> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt64Type;
+    use lance_index::scalar::IndexStore;
+    use lance_index::scalar::zonemap::{ZONEMAP_INDEX_VERSION, write_zonemap_index_from_batch};
+    use roaring::RoaringBitmap;
+    use uuid::Uuid;
+
+    // Validate the indexed column exists in the dataset schema and capture its field id for
+    // IndexMetadata.fields. We deliberately do NOT cross-check the batch's min/max type
+    // against the column type — write_zonemap_index_from_batch validates structural shape, and
+    // value-type adaptation (dict→primitive etc.) is the writer's domain.
+    let field = dataset.schema().field(column).ok_or_else(|| {
+        Error::invalid_input_source(format!("No column with name {}", column).into())
+    })?;
+    let field_id = field.id;
+
+    // Derive fragment bitmap from the batch's fragment_id column BEFORE consuming the batch
+    // in write_zonemap_index_from_batch. The schema validator inside the writer will reject a
+    // missing column, but we need values here to build the bitmap, so a missing column shows
+    // up as a clearer error than the inner validator's "expected column 5 to be ..." message.
+    let frag_col = batch.column_by_name("fragment_id").ok_or_else(|| {
+        Error::invalid_input_source(
+            "consolidated zonemap batch missing 'fragment_id' column".into(),
+        )
+    })?;
+    let frag_array = frag_col.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+        Error::invalid_input_source(
+            "consolidated zonemap batch 'fragment_id' must be UInt64".into(),
+        )
+    })?;
+    let mut fragment_bitmap = RoaringBitmap::new();
+    for f in frag_array.values() {
+        if *f > u32::MAX as u64 {
+            return Err(Error::invalid_input_source(
+                format!("fragment_id {} exceeds u32::MAX", f).into(),
+            ));
+        }
+        fragment_bitmap.insert(*f as u32);
+    }
+
+    let uuid = Uuid::new_v4();
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid.to_string())?;
+    write_zonemap_index_from_batch(batch, params, &index_store).await?;
+
+    let index_details =
+        prost_types::Any::from_msg(&lance_index::pbold::ZoneMapIndexDetails::default())
+            .map_err(|e| Error::internal(format!("failed to encode ZoneMapIndexDetails: {}", e)))?;
+
+    Ok(IndexMetadata {
+        uuid,
+        fields: vec![field_id],
+        name: name.to_string(),
+        dataset_version: dataset.version_id(),
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: Some(Arc::new(index_details)),
+        index_version: ZONEMAP_INDEX_VERSION as i32,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(index_store.list_files_with_sizes().await?),
+    })
+}
+
 // TODO: Allow users to register their own plugins
 static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
     LazyLock::new(IndexPluginRegistry::with_default_plugins);
@@ -1123,22 +1206,14 @@ mod tests {
         let params = ZoneMapIndexBuilderParams::new(ROWS_PER_ZONE);
 
         // 1. Compute per-fragment-subset batches.
-        let batch_0_1 = compute_zonemap_batch(
-            &dataset,
-            "values",
-            Some(vec![0u32, 1]),
-            params.clone(),
-        )
-        .await
-        .unwrap();
-        let batch_2_3 = compute_zonemap_batch(
-            &dataset,
-            "values",
-            Some(vec![2u32, 3]),
-            params.clone(),
-        )
-        .await
-        .unwrap();
+        let batch_0_1 =
+            compute_zonemap_batch(&dataset, "values", Some(vec![0u32, 1]), params.clone())
+                .await
+                .unwrap();
+        let batch_2_3 =
+            compute_zonemap_batch(&dataset, "values", Some(vec![2u32, 3]), params.clone())
+                .await
+                .unwrap();
 
         // Each batch must validate against the canonical schema.
         validate_zonemap_stats_schema(batch_0_1.schema().as_ref()).unwrap();
@@ -1201,6 +1276,74 @@ mod tests {
             read_batch.num_rows(),
             (zones_per_frag * 4),
             "consolidated batch total zone count must equal zones_per_frag × num_fragments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_consolidated_zonemap_segment_end_to_end() {
+        // End-to-end check of the driver-side helper: per-fragment compute → concat → write →
+        // returned IndexMetadata captures (a) every input fragment in the bitmap, (b) the
+        // correct field id for the indexed column, (c) the canonical ZoneMap index_version
+        // and (d) at least one file entry under the freshly allocated UUID directory.
+        use crate::index::scalar::{compute_zonemap_batch, write_consolidated_zonemap_segment};
+        use arrow::compute::concat_batches;
+        use lance_index::scalar::zonemap::{ZONEMAP_INDEX_VERSION, ZoneMapIndexBuilderParams};
+
+        let dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let params = ZoneMapIndexBuilderParams::new(4);
+        let batch_0_1 =
+            compute_zonemap_batch(&dataset, "values", Some(vec![0u32, 1]), params.clone())
+                .await
+                .unwrap();
+        let batch_2_3 =
+            compute_zonemap_batch(&dataset, "values", Some(vec![2u32, 3]), params.clone())
+                .await
+                .unwrap();
+        let canonical = lance_index::scalar::zonemap::zonemap_stats_schema(&DataType::Int32);
+        let concatenated = concat_batches(&canonical, [&batch_0_1, &batch_2_3]).unwrap();
+
+        let metadata = write_consolidated_zonemap_segment(
+            &dataset,
+            "values_zm",
+            "values",
+            concatenated,
+            &params,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metadata.name, "values_zm");
+        assert_eq!(metadata.index_version as u32, ZONEMAP_INDEX_VERSION);
+        assert_eq!(metadata.dataset_version, dataset.version_id());
+        assert!(metadata.created_at.is_some());
+
+        let field_id = dataset.schema().field("values").unwrap().id;
+        assert_eq!(metadata.fields, vec![field_id]);
+
+        let bitmap = metadata.fragment_bitmap.expect("bitmap must be set");
+        let frags: Vec<u32> = bitmap.iter().collect();
+        assert_eq!(
+            frags,
+            vec![0, 1, 2, 3],
+            "bitmap must cover every fragment in the input batches"
+        );
+
+        // The writer should have produced at least zonemap.lance under the new UUID.
+        let files = metadata
+            .files
+            .expect("files must be populated for a freshly written segment");
+        assert!(
+            files.iter().any(|f| f
+                .path
+                .ends_with(lance_index::scalar::zonemap::ZONEMAP_FILENAME)),
+            "freshly written segment must contain {}; got {:?}",
+            lance_index::scalar::zonemap::ZONEMAP_FILENAME,
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
     }
 

@@ -53,7 +53,11 @@ const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 /// name the read path expects.
 pub const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
-const ZONEMAP_INDEX_VERSION: u32 = 0;
+/// On-disk format version for zonemap indices. Public so external coordinators that
+/// assemble an [`IndexMetadata`](lance_table::format::IndexMetadata) for a freshly written
+/// consolidated zonemap segment can populate the `index_version` field consistently with
+/// what the plugin's `train_index` emits — without duplicating the literal.
+pub const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Canonical schema of a zone-stats record batch. The on-disk `zonemap.lance` file's record
 /// layout, the in-memory `ZoneMapIndexBuilder::zonemap_stats_as_batch` output, and any externally-
