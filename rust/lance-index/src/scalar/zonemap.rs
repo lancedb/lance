@@ -48,9 +48,34 @@ use roaring::RoaringBitmap;
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
-const ZONEMAP_FILENAME: &str = "zonemap.lance";
+/// Filename of the on-disk zonemap index file written under `<index-uuid>/`. Public because
+/// external coordinators (e.g. JNI bindings, custom writers) need to refer to it by the same
+/// name the read path expects.
+pub const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
+
+/// Canonical schema of a zone-stats record batch. The on-disk `zonemap.lance` file's record
+/// layout, the in-memory `ZoneMapIndexBuilder::zonemap_stats_as_batch` output, and any externally-
+/// produced batch fed into [`write_zonemap_index_from_batch`] all share this schema. Treat the
+/// column names and order as a stability contract: the on-disk reader matches columns by name,
+/// and [`validate_zonemap_stats_schema`] enforces full conformance up front so writes whose
+/// batch deviates from this shape fail before producing an unloadable file.
+///
+/// `min` / `max` are nullable because an entire batch may be all-NULL; the caller supplies the
+/// indexed column's type via `value_type`. The remaining metadata columns (`null_count`,
+/// `nan_count`, `fragment_id`, `zone_start`, `zone_length`) have fixed types and are non-nullable.
+pub fn zonemap_stats_schema(value_type: &DataType) -> Arc<arrow_schema::Schema> {
+    Arc::new(arrow_schema::Schema::new(vec![
+        Field::new("min", value_type.clone(), true),
+        Field::new("max", value_type.clone(), true),
+        Field::new("null_count", DataType::UInt32, false),
+        Field::new("nan_count", DataType::UInt32, false),
+        Field::new("fragment_id", DataType::UInt64, false),
+        Field::new("zone_start", DataType::UInt64, false),
+        Field::new("zone_length", DataType::UInt64, false),
+    ]))
+}
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
@@ -765,7 +790,14 @@ impl ZoneMapIndexBuilder {
         Ok(())
     }
 
-    fn zonemap_stats_as_batch(&self) -> Result<RecordBatch> {
+    /// Drain the in-memory zone statistics into a record batch with the canonical zonemap schema
+    /// (`min`, `max`, `null_count`, `nan_count`, `fragment_id`, `zone_start`, `zone_length`).
+    ///
+    /// Public so external coordinators consolidating per-fragment zone batches from parallel
+    /// workers can extract the trained state without forcing the in-place file write that
+    /// [`Self::write_index`] performs. The companion [`write_zonemap_index_from_batch`] free
+    /// function consumes the same shape.
+    pub fn zonemap_stats_as_batch(&self) -> Result<RecordBatch> {
         // Flush self.maps as a RecordBatch
         let mins = if self.maps.is_empty() {
             new_empty_array(&self.items_type)
@@ -791,16 +823,7 @@ impl ZoneMapIndexBuilder {
         let zone_starts =
             UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.start));
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            // min and max can be null if the entire batch is null values
-            Field::new("min", self.items_type.clone(), true),
-            Field::new("max", self.items_type.clone(), true),
-            Field::new("null_count", DataType::UInt32, false),
-            Field::new("nan_count", DataType::UInt32, false),
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
-        ]));
+        let schema = zonemap_stats_schema(&self.items_type);
 
         let columns: Vec<ArrayRef> = vec![
             mins,
@@ -816,19 +839,117 @@ impl ZoneMapIndexBuilder {
 
     pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
         let record_batch = self.zonemap_stats_as_batch()?;
-
-        let mut file_schema = record_batch.schema().as_ref().clone();
-        file_schema.metadata.insert(
-            ZONEMAP_SIZE_META_KEY.to_string(),
-            self.options.rows_per_zone.to_string(),
-        );
-
-        let mut index_file = index_store
-            .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
-            .await?;
-        index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await
+        write_zonemap_index_from_batch(record_batch, &self.options, index_store).await
     }
+}
+
+/// Write a `zonemap.lance` file from a pre-computed zone-stats record batch.
+///
+/// The record batch must conform to the canonical zonemap stats schema (see
+/// [`zonemap_stats_schema`]). Column names, order, and types are validated up front, and the
+/// fixed-type metadata columns are also required to be non-nullable; a mismatched batch returns
+/// an `invalid_input` error rather than silently writing a file the read path cannot load.
+/// `min` and `max` may carry any data type as long as both share the indexed column's type;
+/// their nullability is not constrained (the canonical schema declares them nullable so an
+/// all-NULL batch is representable, but a caller whose data has no nulls may pass non-nullable
+/// fields).
+///
+/// Underlying writer extracted from [`ZoneMapIndexBuilder::write_index`] so external coordinators
+/// that consolidate per-fragment zone batches produced by parallel workers can write a single
+/// consolidated file without re-running the train phase. `params` is taken by reference rather
+/// than `rows_per_zone: u64` so future ZoneMap knobs that affect on-disk metadata can extend
+/// the parameter set without breaking this signature.
+pub async fn write_zonemap_index_from_batch(
+    record_batch: RecordBatch,
+    params: &ZoneMapIndexBuilderParams,
+    index_store: &dyn IndexStore,
+) -> Result<IndexFile> {
+    validate_zonemap_stats_schema(record_batch.schema().as_ref())?;
+
+    let mut file_schema = record_batch.schema().as_ref().clone();
+    file_schema.metadata.insert(
+        ZONEMAP_SIZE_META_KEY.to_string(),
+        params.rows_per_zone().to_string(),
+    );
+
+    let mut index_file = index_store
+        .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
+        .await?;
+    index_file.write_record_batch(record_batch).await?;
+    index_file.finish().await
+}
+
+/// Validate that `schema` matches the canonical zonemap stats shape: 7 columns in canonical
+/// order, the metadata columns at fixed types and non-nullable, and `min`/`max` sharing one
+/// (caller-determined) data type. Public so coordinators can validate locally before calling
+/// [`write_zonemap_index_from_batch`] (which would discover the mismatch only after opening
+/// the output index file).
+pub fn validate_zonemap_stats_schema(schema: &arrow_schema::Schema) -> Result<()> {
+    let fields = schema.fields();
+    const EXPECTED_NAMES: [&str; 7] = [
+        "min",
+        "max",
+        "null_count",
+        "nan_count",
+        "fragment_id",
+        "zone_start",
+        "zone_length",
+    ];
+    if fields.len() != EXPECTED_NAMES.len() {
+        return Err(Error::invalid_input(format!(
+            "zonemap stats batch has {} columns, expected {}: {:?}",
+            fields.len(),
+            EXPECTED_NAMES.len(),
+            EXPECTED_NAMES
+        )));
+    }
+    for (i, expected) in EXPECTED_NAMES.iter().enumerate() {
+        if fields[i].name() != expected {
+            return Err(Error::invalid_input(format!(
+                "zonemap stats batch column {} is '{}', expected '{}'",
+                i,
+                fields[i].name(),
+                expected
+            )));
+        }
+    }
+
+    // min and max: both share the indexed column type (caller-determined); both nullable
+    // (an all-NULL batch is legitimate).
+    if fields[0].data_type() != fields[1].data_type() {
+        return Err(Error::invalid_input(format!(
+            "zonemap stats batch 'min' type {:?} != 'max' type {:?}",
+            fields[0].data_type(),
+            fields[1].data_type()
+        )));
+    }
+
+    // Fixed-type non-nullable metadata columns. Allowing nullable here would let null values
+    // silently coerce to 0 in the read path's UInt{32,64}Array::value() calls, producing
+    // corrupted zone stats with no error.
+    fn check_metadata_field(field: &Field, expected_ty: &DataType) -> Result<()> {
+        if field.data_type() != expected_ty {
+            return Err(Error::invalid_input(format!(
+                "zonemap stats batch column '{}' has type {:?}, expected {:?}",
+                field.name(),
+                field.data_type(),
+                expected_ty
+            )));
+        }
+        if field.is_nullable() {
+            return Err(Error::invalid_input(format!(
+                "zonemap stats batch column '{}' must be non-nullable",
+                field.name()
+            )));
+        }
+        Ok(())
+    }
+    check_metadata_field(&fields[2], &DataType::UInt32)?; // null_count
+    check_metadata_field(&fields[3], &DataType::UInt32)?; // nan_count
+    check_metadata_field(&fields[4], &DataType::UInt64)?; // fragment_id
+    check_metadata_field(&fields[5], &DataType::UInt64)?; // zone_start
+    check_metadata_field(&fields[6], &DataType::UInt64)?; // zone_length
+    Ok(())
 }
 
 /// Index-specific processor that computes min/max statistics for each zone while the
@@ -2635,5 +2756,94 @@ mod tests {
         assert_eq!(compute_next_prefix("ab\u{10FFFF}"), Some("ac".to_string()));
         // All max characters
         assert_eq!(compute_next_prefix("\u{10FFFF}\u{10FFFF}"), None);
+    }
+
+    /// Build a schema with the canonical column ordering, then mutate via `mutate` and return.
+    /// Used by the validate_zonemap_stats_schema rejection-branch tests below.
+    fn canonical_with(
+        value_type: DataType,
+        mutate: impl FnOnce(Vec<Field>) -> Vec<Field>,
+    ) -> Schema {
+        let canonical = super::zonemap_stats_schema(&value_type);
+        let fields = canonical
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        Schema::new(mutate(fields))
+    }
+
+    #[test]
+    fn test_validate_schema_accepts_canonical() {
+        let schema = super::zonemap_stats_schema(&DataType::Int32);
+        super::validate_zonemap_stats_schema(schema.as_ref())
+            .expect("canonical schema must validate");
+    }
+
+    #[test]
+    fn test_validate_schema_rejects_wrong_column_count() {
+        let schema = Schema::new(vec![Field::new("min", DataType::Int32, true)]);
+        let err = super::validate_zonemap_stats_schema(&schema)
+            .expect_err("schema with wrong column count must be rejected");
+        assert!(err.to_string().contains("expected 7"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_schema_rejects_wrong_name() {
+        let schema = canonical_with(DataType::Int32, |mut f| {
+            f[2] = Field::new("nullCount", DataType::UInt32, false);
+            f
+        });
+        let err = super::validate_zonemap_stats_schema(&schema)
+            .expect_err("schema with renamed metadata column must be rejected");
+        assert!(err.to_string().contains("'nullCount'"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_schema_rejects_min_max_type_mismatch() {
+        let schema = canonical_with(DataType::Int32, |mut f| {
+            f[1] = Field::new("max", DataType::Int64, true);
+            f
+        });
+        let err = super::validate_zonemap_stats_schema(&schema)
+            .expect_err("min/max with different types must be rejected");
+        assert!(err.to_string().contains("'min' type"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_schema_rejects_wrong_metadata_type() {
+        let schema = canonical_with(DataType::Int32, |mut f| {
+            f[4] = Field::new("fragment_id", DataType::UInt32, false);
+            f
+        });
+        let err = super::validate_zonemap_stats_schema(&schema)
+            .expect_err("metadata column with wrong type must be rejected");
+        assert!(err.to_string().contains("fragment_id"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_schema_rejects_nullable_metadata() {
+        let schema = canonical_with(DataType::Int32, |mut f| {
+            f[2] = Field::new("null_count", DataType::UInt32, true);
+            f
+        });
+        let err = super::validate_zonemap_stats_schema(&schema)
+            .expect_err("nullable metadata column must be rejected");
+        assert!(err.to_string().contains("non-nullable"), "got: {}", err);
+    }
+
+    /// The validator's doc claims min/max nullability is not constrained (an all-NULL batch
+    /// is legitimate, but a caller producing a batch where the column happens to have no NULLs
+    /// may also declare those fields non-nullable). This test locks in that contract — both
+    /// the all-nullable canonical and a non-nullable-min/max variant must validate.
+    #[test]
+    fn test_validate_schema_accepts_non_nullable_min_max() {
+        let schema = canonical_with(DataType::Int32, |mut f| {
+            f[0] = Field::new("min", DataType::Int32, false);
+            f[1] = Field::new("max", DataType::Int32, false);
+            f
+        });
+        super::validate_zonemap_stats_schema(&schema)
+            .expect("non-nullable min/max with matching types must validate");
     }
 }

@@ -234,6 +234,53 @@ pub(crate) async fn load_training_data(
     }
 }
 
+/// Compute the zone-stats record batch for a column over the given fragments WITHOUT writing
+/// the result to a file.
+///
+/// Companion to [`lance_index::scalar::zonemap::write_zonemap_index_from_batch`]. Together they
+/// support a build-time-consolidation pipeline: parallel workers each call this for a fragment
+/// subset, the resulting batches are concatenated by a coordinator, and one consolidated
+/// `zonemap.lance` is written. Compared to the standard `build_scalar_index` flow — which trains
+/// AND writes a per-fragment file — returning the in-memory batch lets the coordinator avoid the
+/// per-segment read-time round-trips that scale linearly with fragment count.
+///
+/// `fragment_ids = None` indexes every fragment in the dataset, mirroring `build_scalar_index`.
+pub async fn compute_zonemap_batch(
+    dataset: &Dataset,
+    column: &str,
+    fragment_ids: Option<Vec<u32>>,
+    params: lance_index::scalar::zonemap::ZoneMapIndexBuilderParams,
+) -> Result<arrow_array::RecordBatch> {
+    // Validate the column exists up front for a clear error; the value type itself is taken
+    // from the post-scan stream below, NOT from the dataset schema. This matches the plugin's
+    // train_zonemap_index path: scan-time type adaptation (dictionary -> primitive, extension
+    // type unwrap, nullability changes) means the dataset schema and the actual data stream
+    // can disagree, and the builder must be configured for the latter.
+    if dataset.schema().field(column).is_none() {
+        return Err(Error::invalid_input_source(
+            format!("No column with name {}", column).into(),
+        ));
+    }
+
+    // ZoneMap requires row-address ordering during scan so per-zone bounds correspond to
+    // contiguous physical row ranges (the same TrainingCriteria the plugin's TrainingRequest
+    // sets up internally — see ZoneMapIndexTrainingRequest::new).
+    let criteria = TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr();
+
+    let training_data =
+        load_training_data(dataset, column, &criteria, None, true, fragment_ids).await?;
+
+    // Derive value_type from the actual stream schema, matching ZoneMapIndexPlugin's
+    // train_zonemap_index. The first field is the scanned column (subsequent fields like
+    // _rowaddr are training-criteria additions).
+    let value_type = training_data.schema().field(0).data_type().clone();
+
+    let mut builder =
+        lance_index::scalar::zonemap::ZoneMapIndexBuilder::try_new(params, value_type)?;
+    builder.train(training_data).await?;
+    builder.zonemap_stats_as_batch()
+}
+
 // TODO: Allow users to register their own plugins
 static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
     LazyLock::new(IndexPluginRegistry::with_default_plugins);
@@ -1036,6 +1083,125 @@ mod tests {
             },
             other => panic!("expected Map type, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_compute_zonemap_batch_round_trip() {
+        // Round-trip the new build-time-consolidation API surface:
+        //   1. Per-fragment compute_zonemap_batch produces conformant batches
+        //   2. Concatenated batches feed write_zonemap_index_from_batch successfully
+        //   3. The resulting zonemap.lance is readable via IndexStore::open_index_file with
+        //      the canonical schema preserved
+        //   4. Read-back fragment_id column equals the union of input fragment ids
+        use arrow::compute::concat_batches;
+        use lance_index::scalar::IndexStore;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_index::scalar::zonemap::{
+            ZONEMAP_FILENAME, ZoneMapIndexBuilderParams, validate_zonemap_stats_schema,
+            write_zonemap_index_from_batch, zonemap_stats_schema,
+        };
+
+        // 4 fragments × 10 rows. We deliberately pick rows_per_zone=4 (not the default) so each
+        // fragment spans multiple zones (10/4 = 3 zones — two full + one trailing). This
+        // exercises the path that matters for the consolidation claim: a zonemap batch where
+        // fragment_id repeats across consecutive rows. A previous version of this test used the
+        // default rows_per_zone (8192), which only ever produced one zone per fragment — a
+        // pathological case that hides per-fragment-multi-zone bugs.
+        const ROWS_PER_FRAG: u64 = 10;
+        const ROWS_PER_ZONE: u64 = 4;
+        let zones_per_frag = ROWS_PER_FRAG.div_ceil(ROWS_PER_ZONE) as usize; // 3
+
+        let dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_ram_dataset(
+                FragmentCount::from(4),
+                FragmentRowCount::from(ROWS_PER_FRAG as u32),
+            )
+            .await
+            .unwrap();
+
+        let params = ZoneMapIndexBuilderParams::new(ROWS_PER_ZONE);
+
+        // 1. Compute per-fragment-subset batches.
+        let batch_0_1 = compute_zonemap_batch(
+            &dataset,
+            "values",
+            Some(vec![0u32, 1]),
+            params.clone(),
+        )
+        .await
+        .unwrap();
+        let batch_2_3 = compute_zonemap_batch(
+            &dataset,
+            "values",
+            Some(vec![2u32, 3]),
+            params.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Each batch must validate against the canonical schema.
+        validate_zonemap_stats_schema(batch_0_1.schema().as_ref()).unwrap();
+        validate_zonemap_stats_schema(batch_2_3.schema().as_ref()).unwrap();
+
+        // 2. Concatenate. The canonical schema with the actual value type is the join target.
+        let canonical = zonemap_stats_schema(&DataType::Int32);
+        let concatenated = concat_batches(&canonical, [&batch_0_1, &batch_2_3]).unwrap();
+
+        // 3. Write a consolidated zonemap.lance.
+        let test_dir = TempStrDir::default();
+        let object_store = Arc::new(lance_io::object_store::ObjectStore::local());
+        let index_dir = object_store::path::Path::parse(test_dir.as_str()).unwrap();
+        let store = LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.clone(),
+            Arc::new(lance_core::cache::LanceCache::no_cache()),
+        );
+        write_zonemap_index_from_batch(concatenated.clone(), &params, &store)
+            .await
+            .unwrap();
+
+        // 4. The written file should round-trip read with the same schema and row count, AND
+        // the fragment-id column should produce the exact multiset of fragment ids from the
+        // inputs. We compare counts (not just set membership) so a regression that accidentally
+        // duplicated a fragment row — same union, wrong cardinality — would fail loudly.
+        let read_back = store.open_index_file(ZONEMAP_FILENAME).await.unwrap();
+        let read_batch = read_back
+            .read_range(0..read_back.num_rows(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_batch.num_rows(),
+            concatenated.num_rows(),
+            "round-trip read row count must match consolidated batch"
+        );
+        validate_zonemap_stats_schema(read_batch.schema().as_ref()).unwrap();
+        let mut frag_counts: std::collections::BTreeMap<u64, usize> =
+            std::collections::BTreeMap::new();
+        for fid in read_batch
+            .column_by_name("fragment_id")
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+        {
+            *frag_counts.entry(fid).or_insert(0) += 1;
+        }
+        // With ROWS_PER_FRAG=10 and ROWS_PER_ZONE=4 each fragment contributes
+        // ceil(10/4) = 3 zones; total 4 × 3 = 12 zones across the consolidated batch.
+        let expected: std::collections::BTreeMap<u64, usize> =
+            (0u64..4u64).map(|f| (f, zones_per_frag)).collect();
+        assert_eq!(
+            frag_counts, expected,
+            "consolidated zonemap must contain ceil(ROWS_PER_FRAG/ROWS_PER_ZONE) zones per \
+             input fragment"
+        );
+        assert_eq!(
+            read_batch.num_rows(),
+            (zones_per_frag * 4),
+            "consolidated batch total zone count must equal zones_per_frag × num_fragments"
+        );
     }
 
     #[tokio::test]
