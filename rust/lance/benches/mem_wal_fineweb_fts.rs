@@ -532,18 +532,19 @@ async fn ingest_via_shard_writer(
             );
         }
     }
-    // Wait for index update to catch up if sync_indexed_write didn't fully drain.
-    let target_batch_pos = total_batches.saturating_sub(1);
-    loop {
-        let active = writer.active_memtable_ref().await?;
-        if active.index_store.max_indexed_batch_position() >= target_batch_pos {
-            break;
-        }
-        drop(active);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Close the writer to drain the final WAL/memtable flush. With
+    // sync_indexed_write = true the inline index update is already
+    // complete, but auto-flush leaves background memtable->disk work
+    // outstanding that close() awaits. We deliberately include close()
+    // in the elapsed measurement so the reported throughput reflects
+    // "rows fully ingested + their pending flush", not just "puts
+    // returned". This is the apples-to-apples figure across configs
+    // with different `max_memtable_rows` (which drive the flush
+    // cadence). The previous post-ingest spin on
+    // `max_indexed_batch_position` was incorrect under auto-flush
+    // because the counter resets on each new active memtable.
+    writer.close().await?;
     let elapsed = start.elapsed();
-    drop(writer);
 
     put_latencies.sort_unstable();
     let p50 = put_latencies[put_latencies.len() / 2] as f64 / 1000.0;
