@@ -4084,6 +4084,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "env_logger",
+ "futures",
  "jni 0.21.1",
  "lance",
  "lance-core",
@@ -4120,6 +4121,7 @@ dependencies = [
  "lance-core",
  "num-traits",
  "rand 0.9.4",
+ "rayon",
 ]
 
 [[package]]
