@@ -15,7 +15,6 @@ readme = "README.md"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 lance-arrow-scalar = { workspace = true }
-half = { workspace = true }
 
 [dev-dependencies]
 arrow-select = { workspace = true }

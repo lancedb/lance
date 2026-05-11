@@ -68,7 +68,6 @@ lance-io = { version = "=7.0.0-beta.8", path = "./rust/lance-io", default-featur
 lance-linalg = { version = "=7.0.0-beta.8", path = "./rust/lance-linalg" }
 lance-namespace = { version = "=7.0.0-beta.8", path = "./rust/lance-namespace" }
 lance-namespace-impls = { version = "=7.0.0-beta.8", path = "./rust/lance-namespace-impls" }
-lance-namespace-datafusion = { version = "=7.0.0-beta.8", path = "./rust/lance-namespace-datafusion" }
 lance-namespace-reqwest-client = "0.7.5"
 lance-tokenizer = { version = "=7.0.0-beta.8", path = "./rust/lance-tokenizer" }
 lance-table = { version = "=7.0.0-beta.8", path = "./rust/lance-table" }
@@ -78,7 +77,6 @@ approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "58.0.0", optional = false, features = ["prettyprint"] }
 lance-arrow-scalar = { version = "=58.0.0", path = "./rust/arrow-scalar" }
-lance-arrow-stats = { version = "=58.0.0", path = "./rust/arrow-stats" }
 arrow-arith = "58.0.0"
 arrow-array = "58.0.0"
 arrow-buffer = "58.0.0"
@@ -132,8 +130,6 @@ datafusion-functions = { version = "53.0.0", features = ["regex_expressions"] }
 datafusion-sql = "53.0.0"
 datafusion-expr = "53.0.0"
 datafusion-ffi = "53.0.0"
-datafusion-execution = "53.0.0"
-datafusion-optimizer = "53.0.0"
 datafusion-physical-expr = "53.0.0"
 datafusion-physical-plan = "53.0.0"
 datafusion-substrait = "53.0.0"
@@ -179,12 +175,10 @@ rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.11"
 rstest = "0.23.0"
-rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
 serial_test = "3"
-slatedb = "0.3"
 snafu = "0.9"
 strum = "0.26"
 lindera = { version = "3.0.7" }

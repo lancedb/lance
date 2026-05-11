@@ -42,7 +42,6 @@ moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 serde.workspace = true
-snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
@@ -51,7 +50,6 @@ rand.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
 io-uring = { workspace = true }
 
 [dev-dependencies]

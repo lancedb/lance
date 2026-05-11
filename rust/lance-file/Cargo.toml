@@ -34,15 +34,12 @@ num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
 prost-types.workspace = true
-snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 lance-datagen.workspace = true
-lance-testing.workspace = true
 criterion.workspace = true
-rand.workspace = true
 rstest.workspace = true
 proptest.workspace = true
 pretty_assertions.workspace = true

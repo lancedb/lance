@@ -4013,7 +4013,6 @@ dependencies = [
  "lance-datafusion",
  "lance-encoding",
  "lance-file",
- "lance-geo",
  "lance-index",
  "lance-io",
  "lance-linalg",
@@ -4021,7 +4020,6 @@ dependencies = [
  "lance-table",
  "lance-tokenizer",
  "log",
- "moka",
  "object_store",
  "permutation",
  "pin-project",
@@ -4048,7 +4046,6 @@ version = "7.0.0-beta.8"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
- "arrow-cast",
  "arrow-data",
  "arrow-ipc",
  "arrow-ord",
@@ -4082,7 +4079,6 @@ dependencies = [
  "async-trait",
  "byteorder",
  "bytes",
- "chrono",
  "datafusion-common",
  "datafusion-sql",
  "deepsize",
@@ -4091,7 +4087,6 @@ dependencies = [
  "lance-arrow",
  "libc",
  "log",
- "mock_instant",
  "moka",
  "num_cpus",
  "object_store",
@@ -4137,8 +4132,6 @@ dependencies = [
  "pin-project",
  "prost",
  "prost-build",
- "snafu",
- "substrait",
  "tokio",
  "tracing",
 ]
@@ -4188,9 +4181,7 @@ dependencies = [
  "num-traits",
  "prost",
  "prost-build",
- "prost-types",
  "rand 0.9.4",
- "snafu",
  "strum 0.26.3",
  "tokio",
  "tracing",
@@ -4225,7 +4216,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "snafu",
  "tokio",
  "tracing",
 ]
@@ -4267,7 +4257,6 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-physical-expr",
- "datafusion-sql",
  "deepsize",
  "dirs",
  "fst",
@@ -4306,7 +4295,6 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "snafu",
  "tempfile",
  "tokio",
  "tracing",
@@ -4340,7 +4328,6 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-namespace",
- "libc",
  "log",
  "moka",
  "object_store",
@@ -4351,7 +4338,6 @@ dependencies = [
  "prost",
  "rand 0.9.4",
  "serde",
- "snafu",
  "tempfile",
  "tokio",
  "tracing",
@@ -4383,7 +4369,6 @@ dependencies = [
  "bytes",
  "lance-core",
  "lance-namespace-reqwest-client",
- "serde",
  "snafu",
 ]
 
@@ -4397,7 +4382,6 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
- "chrono",
  "futures",
  "lance",
  "lance-core",
@@ -4412,7 +4396,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "snafu",
  "tokio",
  "tower",
  "tower-http 0.5.2",
@@ -4838,12 +4821,6 @@ dependencies = [
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "mock_instant"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
 name = "moka"
@@ -5936,17 +5913,14 @@ dependencies = [
  "prost-types",
  "pyo3",
  "pythonize",
- "regex",
  "roaring",
  "serde",
  "serde_json",
  "serde_yaml",
- "snafu",
  "tokio",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
- "url",
  "uuid",
 ]
 
