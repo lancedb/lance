@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod binary;
+pub mod delta;
 #[cfg(feature = "bitpacking")]
 pub mod bitpacking;
 pub mod block;

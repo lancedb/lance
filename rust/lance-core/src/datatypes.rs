@@ -37,6 +37,18 @@ pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 pub static BLOB_DESC_TYPE: LazyLock<DataType> =
     LazyLock::new(|| DataType::Struct(BLOB_DESC_FIELDS.clone()));
 
+pub static DELTA_BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("position", DataType::UInt64, false),
+        ArrowField::new("size", DataType::UInt64, false),
+        ArrowField::new("kind", DataType::UInt8, false),
+        ArrowField::new("base_offset", DataType::UInt32, false),
+    ])
+});
+
+pub static DELTA_BLOB_DESC_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(DELTA_BLOB_DESC_FIELDS.clone()));
+
 pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
     ArrowField::new("description", BLOB_DESC_TYPE.clone(), true).with_metadata(HashMap::from([(
         lance_arrow::BLOB_META_KEY.to_string(),
@@ -424,6 +436,13 @@ pub enum BlobKind {
     /// External blobs can have a position and a size. If the position is not set,
     /// it defaults to 0, which points to the beginning of the blob.
     External = 3,
+    /// Base value in a delta-encoded group. Stored as-is like Inline.
+    /// `position`/`size` point into the out-of-line buffer.
+    DeltaBase = 4,
+    /// Delta-encoded value. `position`/`size` point to the delta bytes in the
+    /// out-of-line buffer. `blob_id` stores the row offset to the base value
+    /// within the delta group.
+    Delta = 5,
 }
 
 impl TryFrom<u8> for BlobKind {
@@ -435,6 +454,8 @@ impl TryFrom<u8> for BlobKind {
             1 => Ok(Self::Packed),
             2 => Ok(Self::Dedicated),
             3 => Ok(Self::External),
+            4 => Ok(Self::DeltaBase),
+            5 => Ok(Self::Delta),
             other => Err(Error::invalid_input_source(
                 format!("Unknown blob kind {other:?}").into(),
             )),

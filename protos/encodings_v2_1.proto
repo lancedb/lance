@@ -194,6 +194,18 @@ message BlobLayout {
   repeated RepDefLayer layers = 2;
 }
 
+// A layout where large binary data is delta-encoded against a base value.
+// The descriptions contain (position, size, kind, base_offset) tuples.
+// kind indicates whether the value is a base (stored as-is) or a delta
+// (stored as copy/insert instructions relative to the previous value in the chain).
+// base_offset is the row distance back to the base value in the group.
+message DeltaBlobLayout {
+  // The inner layout used to store the descriptions
+  PageLayout inner_layout = 1;
+  // The meaning of each repdef layer
+  repeated RepDefLayer layers = 2;
+}
+
 // Describes the structural encoding of a page
 message PageLayout {
   oneof layout {
@@ -206,6 +218,8 @@ message PageLayout {
     // A layout where large binary data is encoded externally
     // and only the descriptions are put in the page
     BlobLayout blob_layout = 4;
+    // A layout where large binary data is delta-encoded
+    DeltaBlobLayout delta_blob_layout = 5;
   }
 }
 

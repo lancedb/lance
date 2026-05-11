@@ -662,6 +662,25 @@ macro_rules! impl_common_protobuf_utils {
                 }
             }
 
+            pub fn delta_blob_layout(
+                inner_layout: crate::format::$module::PageLayout,
+                def_meaning: &[DefinitionInterpretation],
+            ) -> crate::format::$module::PageLayout {
+                crate::format::$module::PageLayout {
+                    layout: Some(
+                        crate::format::$module::page_layout::Layout::DeltaBlobLayout(Box::new(
+                            crate::format::$module::DeltaBlobLayout {
+                                inner_layout: Some(Box::new(inner_layout)),
+                                layers: def_meaning
+                                    .iter()
+                                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                                    .collect(),
+                            },
+                        )),
+                    ),
+                }
+            }
+
 
         }
     };

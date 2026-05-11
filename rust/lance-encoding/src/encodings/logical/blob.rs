@@ -383,6 +383,11 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                                 "".to_string(),
                             )
                         }
+                        BlobKind::DeltaBase | BlobKind::Delta => {
+                            return Err(Error::invalid_input_source(
+                                "DeltaBase/Delta blob kinds are not supported in BlobV2StructuralEncoder; use DeltaBlobStructuralEncoder".into(),
+                            ));
+                        }
                     }
                 };
 
@@ -417,6 +422,260 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         self.descriptor_encoder.flush(external_buffers)
+    }
+
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        self.descriptor_encoder.finish(external_buffers)
+    }
+
+    fn num_columns(&self) -> u32 {
+        self.descriptor_encoder.num_columns()
+    }
+}
+
+/// Delta-encoded blob structural encoder.
+///
+/// Groups consecutive blob values and stores the first as a base, then
+/// encodes subsequent values as binary deltas (copy/insert instructions)
+/// relative to the previous value in the group. Chain depth is bounded
+/// by `max_chain_depth`; after that many deltas a new base is emitted.
+///
+/// Falls back to storing a value as a new base when the delta is not
+/// smaller than the raw value.
+pub struct DeltaBlobStructuralEncoder {
+    descriptor_encoder: Box<dyn FieldEncoder>,
+    def_meaning: Option<Arc<[DefinitionInterpretation]>>,
+    /// Maximum number of chained deltas before forcing a new base.
+    max_chain_depth: usize,
+}
+
+impl DeltaBlobStructuralEncoder {
+    pub fn new(
+        field: &Field,
+        column_index: u32,
+        options: &crate::encoder::EncodingOptions,
+        compression_strategy: Arc<dyn crate::compression::CompressionStrategy>,
+        max_chain_depth: usize,
+    ) -> Result<Self> {
+        let mut descriptor_metadata = HashMap::with_capacity(1);
+        descriptor_metadata.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+
+        let descriptor_data_type = DataType::Struct(Fields::from(vec![
+            ArrowField::new("position", DataType::UInt64, false),
+            ArrowField::new("size", DataType::UInt64, false),
+            ArrowField::new("kind", DataType::UInt8, false),
+            ArrowField::new("base_offset", DataType::UInt32, false),
+        ]));
+
+        let descriptor_field = Field::try_from(
+            ArrowField::new(&field.name, descriptor_data_type, field.nullable)
+                .with_metadata(descriptor_metadata),
+        )?;
+
+        let descriptor_encoder = Box::new(PrimitiveStructuralEncoder::try_new(
+            options,
+            compression_strategy,
+            column_index,
+            descriptor_field,
+            Arc::new(HashMap::new()),
+        )?);
+
+        Ok(Self {
+            descriptor_encoder,
+            def_meaning: None,
+            max_chain_depth: max_chain_depth.max(1),
+        })
+    }
+
+    fn wrap_tasks_delta(
+        tasks: Vec<EncodeTask>,
+        def_meaning: Arc<[DefinitionInterpretation]>,
+    ) -> Vec<EncodeTask> {
+        tasks
+            .into_iter()
+            .map(|task| {
+                let def_meaning = def_meaning.clone();
+                task.then(|encoded_page| async move {
+                    let encoded_page = encoded_page?;
+
+                    let PageEncoding::Structural(inner_layout) = encoded_page.description else {
+                        return Err(Error::internal(
+                            "Expected inner encoding to return structural layout".to_string(),
+                        ));
+                    };
+
+                    let wrapped = ProtobufUtils21::delta_blob_layout(inner_layout, &def_meaning);
+                    Ok(EncodedPage {
+                        column_idx: encoded_page.column_idx,
+                        data: encoded_page.data,
+                        description: PageEncoding::Structural(wrapped),
+                        num_rows: encoded_page.num_rows,
+                        row_number: encoded_page.row_number,
+                    })
+                })
+                .boxed()
+            })
+            .collect::<Vec<_>>()
+    }
+}
+
+impl FieldEncoder for DeltaBlobStructuralEncoder {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        mut repdef: RepDefBuilder,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        use crate::encodings::physical::delta::create_delta;
+
+        if let Some(validity) = array.nulls() {
+            repdef.add_validity_bitmap(validity.clone());
+        } else {
+            repdef.add_no_null(array.len());
+        }
+
+        let binary_array = array.as_binary_opt::<i64>().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Expected LargeBinary array, got {}", array.data_type()).into(),
+            )
+        })?;
+
+        let repdef = RepDefBuilder::serialize(vec![repdef]);
+        let rep = repdef.repetition_levels.as_ref();
+        let def = repdef.definition_levels.as_ref();
+        let def_meaning: Arc<[DefinitionInterpretation]> = repdef.def_meaning.into();
+
+        match self.def_meaning.as_ref() {
+            None => {
+                self.def_meaning = Some(def_meaning.clone());
+            }
+            Some(existing) => {
+                debug_assert_eq!(existing, &def_meaning);
+            }
+        }
+
+        let mut positions = Vec::with_capacity(binary_array.len());
+        let mut sizes = Vec::with_capacity(binary_array.len());
+        let mut kinds = Vec::with_capacity(binary_array.len());
+        let mut base_offsets = Vec::with_capacity(binary_array.len());
+
+        // Track the current base value and chain depth within this batch
+        let mut current_base: Option<Vec<u8>> = None;
+        let mut current_base_idx: usize = 0;
+        let mut chain_depth: usize = 0;
+        // Track the previous value in the chain for chained deltas
+        let mut prev_value: Option<Vec<u8>> = None;
+
+        for i in 0..binary_array.len() {
+            if binary_array.is_null(i) {
+                let mut repdef_val = (def.expect_ok()?[i] as u64) << 16;
+                if let Some(rep) = rep {
+                    repdef_val += rep[i] as u64;
+                }
+                debug_assert_ne!(repdef_val, 0);
+                positions.push(repdef_val);
+                sizes.push(0);
+                kinds.push(BlobKind::Inline as u8);
+                base_offsets.push(0u32);
+                continue;
+            }
+
+            let value = binary_array.value(i);
+
+            if value.is_empty() {
+                positions.push(0);
+                sizes.push(0);
+                kinds.push(BlobKind::Inline as u8);
+                base_offsets.push(0u32);
+                continue;
+            }
+
+            let should_start_new_base =
+                current_base.is_none() || chain_depth >= self.max_chain_depth;
+
+            if should_start_new_base {
+                // Store as base
+                let position =
+                    external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
+                positions.push(position);
+                sizes.push(value.len() as u64);
+                kinds.push(BlobKind::DeltaBase as u8);
+                base_offsets.push(0u32);
+                current_base = Some(value.to_vec());
+                current_base_idx = i;
+                chain_depth = 0;
+                prev_value = Some(value.to_vec());
+            } else {
+                // Try delta against previous value in chain
+                let reference = prev_value.as_ref().unwrap();
+                match create_delta(reference, value) {
+                    Some(delta_bytes) => {
+                        let position = external_buffers
+                            .add_buffer(LanceBuffer::from(Buffer::from(&delta_bytes[..])));
+                        positions.push(position);
+                        sizes.push(delta_bytes.len() as u64);
+                        kinds.push(BlobKind::Delta as u8);
+                        // Store offset back to the base within this batch
+                        base_offsets.push((i - current_base_idx) as u32);
+                        chain_depth += 1;
+                        prev_value = Some(value.to_vec());
+                    }
+                    None => {
+                        // Delta not beneficial — store as new base
+                        let position =
+                            external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
+                        positions.push(position);
+                        sizes.push(value.len() as u64);
+                        kinds.push(BlobKind::DeltaBase as u8);
+                        base_offsets.push(0u32);
+                        current_base = Some(value.to_vec());
+                        current_base_idx = i;
+                        chain_depth = 0;
+                        prev_value = Some(value.to_vec());
+                    }
+                }
+            }
+        }
+
+        let descriptor_array = Arc::new(StructArray::new(
+            Fields::from(vec![
+                ArrowField::new("position", DataType::UInt64, false),
+                ArrowField::new("size", DataType::UInt64, false),
+                ArrowField::new("kind", DataType::UInt8, false),
+                ArrowField::new("base_offset", DataType::UInt32, false),
+            ]),
+            vec![
+                Arc::new(UInt64Array::from(positions)) as ArrayRef,
+                Arc::new(UInt64Array::from(sizes)) as ArrayRef,
+                Arc::new(arrow_array::UInt8Array::from(kinds)) as ArrayRef,
+                Arc::new(arrow_array::UInt32Array::from(base_offsets)) as ArrayRef,
+            ],
+            None,
+        ));
+
+        let encode_tasks = self.descriptor_encoder.maybe_encode(
+            descriptor_array,
+            external_buffers,
+            RepDefBuilder::default(),
+            row_number,
+            num_rows,
+        )?;
+
+        Ok(Self::wrap_tasks_delta(encode_tasks, def_meaning))
+    }
+
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
+        let encode_tasks = self.descriptor_encoder.flush(external_buffers)?;
+        let def_meaning = self
+            .def_meaning
+            .clone()
+            .unwrap_or_else(|| Arc::new([DefinitionInterpretation::AllValidItem]));
+        Ok(Self::wrap_tasks_delta(encode_tasks, def_meaning))
     }
 
     fn finish(
@@ -798,6 +1057,119 @@ mod tests {
             Some(Arc::new(expected_descriptor)),
             &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
             blob_metadata,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_delta_blob_round_trip_similar_values() {
+        let delta_blob_metadata = HashMap::from([
+            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
+        ]);
+
+        // Simulate successive versions of a source file
+        let v1 = b"fn main() {\n    println!(\"hello world\");\n    let x = 1;\n    let y = 2;\n}\n";
+        let v2 = b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 2;\n}\n";
+        let v3 = b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 3;\n}\n";
+        let v4 = b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 3;\n    let z = 4;\n}\n";
+
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(v1.as_ref()),
+            Some(v2.as_ref()),
+            Some(v3.as_ref()),
+            Some(v4.as_ref()),
+        ]));
+
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_1)
+                .with_max_file_version(LanceFileVersion::V2_1),
+            delta_blob_metadata,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_delta_blob_round_trip_with_nulls() {
+        let delta_blob_metadata = HashMap::from([
+            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
+        ]);
+
+        let v1: &[u8] = b"line 1\nline 2\nline 3\n";
+        let v2: &[u8] = b"line 1\nline 2 modified\nline 3\n";
+
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(v1),
+            None,
+            Some(v2),
+        ]));
+
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_1)
+                .with_max_file_version(LanceFileVersion::V2_1),
+            delta_blob_metadata,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_delta_blob_round_trip_completely_different() {
+        let delta_blob_metadata = HashMap::from([
+            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
+        ]);
+
+        // Completely different values — delta won't help, should fall back to base
+        let v1: &[u8] = &vec![0xAAu8; 256];
+        let v2: &[u8] = &vec![0xBBu8; 256];
+        let v3: &[u8] = &vec![0xCCu8; 256];
+
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(v1),
+            Some(v2),
+            Some(v3),
+        ]));
+
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_1)
+                .with_max_file_version(LanceFileVersion::V2_1),
+            delta_blob_metadata,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_delta_blob_round_trip_larger_source_code() {
+        let delta_blob_metadata = HashMap::from([
+            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
+        ]);
+
+        let mut base = String::new();
+        for i in 0..50 {
+            base.push_str(&format!("line {}: the quick brown fox jumps over the lazy dog\n", i));
+        }
+        let mut v2 = base.clone();
+        v2 = v2.replace("line 10:", "line 10 MODIFIED:");
+        let mut v3 = v2.clone();
+        v3 = v3.replace("line 25:", "line 25 MODIFIED:");
+        v3.push_str("// appended line\n");
+
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(base.as_bytes()),
+            Some(v2.as_bytes()),
+            Some(v3.as_bytes()),
+        ]));
+
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_1)
+                .with_max_file_version(LanceFileVersion::V2_1),
+            delta_blob_metadata,
         )
         .await;
     }

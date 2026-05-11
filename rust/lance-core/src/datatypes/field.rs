@@ -20,7 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{
-    ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
+    ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DELTA_BLOB_META_KEY, DataTypeExt,
     json::{is_arrow_json_field, is_json_field},
 };
 
@@ -522,11 +522,17 @@ impl Field {
     /// Blob fields will load descriptions by default
     pub fn is_blob(&self) -> bool {
         self.metadata.contains_key(BLOB_META_KEY)
+            || self.metadata.contains_key(DELTA_BLOB_META_KEY)
             || self
                 .metadata
                 .get(ARROW_EXT_NAME_KEY)
                 .map(|name| name == BLOB_V2_EXT_NAME)
                 .unwrap_or(false)
+    }
+
+    /// Returns true if the field is marked for delta blob encoding.
+    pub fn is_delta_blob(&self) -> bool {
+        self.metadata.contains_key(DELTA_BLOB_META_KEY)
     }
 
     /// Returns true if the field is explicitly marked as blob v2 extension.

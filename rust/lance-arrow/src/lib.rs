@@ -47,6 +47,8 @@ pub const ARROW_EXT_META_KEY: &str = "ARROW:extension:metadata";
 /// Key used by lance to mark a field as a blob
 /// TODO: Use Arrow extension mechanism instead?
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+/// Metadata key to enable delta encoding for blob columns
+pub const DELTA_BLOB_META_KEY: &str = "lance-encoding:delta-blob";
 /// Arrow extension type name for Lance blob v2 columns
 pub const BLOB_V2_EXT_NAME: &str = "lance.blob.v2";
 /// Metadata key for overriding the dedicated blob size threshold (in bytes)

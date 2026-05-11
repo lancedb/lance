@@ -17,7 +17,7 @@ use crate::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     },
     data::DictionaryDataBlock,
-    encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
+    encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler, DeltaBlobPageScheduler},
     format::{
         ProtobufUtils21,
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
@@ -3346,6 +3346,26 @@ impl StructuralPrimitiveFieldScheduler {
                         def_meaning.into(),
                     ))
                 }
+            }
+            Layout::DeltaBlobLayout(delta_blob) => {
+                let inner_scheduler = Self::page_layout_to_scheduler(
+                    page_info,
+                    delta_blob.inner_layout.as_ref().expect_ok()?.as_ref(),
+                    decompressors,
+                    cache_repetition_index,
+                    target_field,
+                )?;
+                let def_meaning = delta_blob
+                    .layers
+                    .iter()
+                    .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
+                    .collect::<Vec<_>>();
+                Box::new(DeltaBlobPageScheduler::new(
+                    inner_scheduler,
+                    page_info.priority,
+                    page_info.num_rows,
+                    def_meaning.into(),
+                ))
             }
         })
     }

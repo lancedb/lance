@@ -762,6 +762,8 @@ impl CoreFieldDecoderStrategy {
                             page.encoding,
                             PageEncoding::Structural(pb21::PageLayout {
                                 layout: Some(pb21::page_layout::Layout::BlobLayout(_))
+                            }) | PageEncoding::Structural(pb21::PageLayout {
+                                layout: Some(pb21::page_layout::Layout::DeltaBlobLayout(_))
                             })
                         )
                     }) {

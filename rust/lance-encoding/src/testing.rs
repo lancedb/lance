@@ -666,6 +666,11 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
                     collect_page_encoding(inner_layout.as_ref(), actual_chain)?
                 }
             }
+            Layout::DeltaBlobLayout(delta_blob) => {
+                if let Some(inner_layout) = &delta_blob.inner_layout {
+                    collect_page_encoding(inner_layout.as_ref(), actual_chain)?
+                }
+            }
         }
     }
 

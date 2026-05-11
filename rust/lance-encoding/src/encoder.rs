@@ -28,7 +28,7 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
 use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
-use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder};
+use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder, DeltaBlobStructuralEncoder};
 use crate::encodings::logical::fixed_size_list::FixedSizeListStructuralEncoder;
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::map::MapStructuralEncoder;
@@ -392,6 +392,29 @@ impl StructuralEncodingStrategy {
 
         // Check if field is marked as blob
         if field.is_blob() {
+            // Delta blob encoding takes priority if marked
+            if field.is_delta_blob() {
+                match data_type {
+                    DataType::Binary | DataType::LargeBinary => {
+                        return Ok(Box::new(DeltaBlobStructuralEncoder::new(
+                            field,
+                            column_index.next_column_index(field.id as u32),
+                            options,
+                            self.compression_strategy.clone(),
+                            4, // default max chain depth
+                        )?));
+                    }
+                    _ => {
+                        return Err(Error::invalid_input_source(
+                            format!(
+                                "Delta blob encoding only supports Binary/LargeBinary, got {}",
+                                data_type
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+            }
             match data_type {
                 DataType::Binary | DataType::LargeBinary => {
                     return Ok(Box::new(BlobStructuralEncoder::new(
