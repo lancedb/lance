@@ -3646,3 +3646,117 @@ fn inner_get_zonemap_stats<'local>(
 
     Ok(array_list)
 }
+
+/////////////////////////////////////////////
+// Build-time consolidation: compute batch //
+/////////////////////////////////////////////
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeComputeZonemapBatch(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jcolumn_name: JString,
+    jfragment_ids: JObject,
+    jparams_json: JString,
+    array_addr: jlong,
+    schema_addr: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_compute_zonemap_batch(
+            &mut env,
+            java_dataset,
+            jcolumn_name,
+            jfragment_ids,
+            jparams_json,
+            array_addr,
+            schema_addr,
+        )
+    )
+}
+
+fn inner_compute_zonemap_batch(
+    env: &mut JNIEnv<'_>,
+    java_dataset: JObject,
+    jcolumn_name: JString,
+    jfragment_ids: JObject,
+    jparams_json: JString,
+    array_addr: jlong,
+    schema_addr: jlong,
+) -> Result<()> {
+    use arrow::array::StructArray;
+    use arrow::ffi::FFI_ArrowArray;
+    use arrow_array::Array;
+    use jni::objects::JLongArray;
+    use lance::index::scalar::compute_zonemap_batch;
+    use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
+
+    let column_name: String = jcolumn_name.extract(env)?;
+    let params_json: String = jparams_json.extract(env)?;
+
+    // Empty/missing params JSON means "use defaults". Mirrors the Rust plugin's
+    // unwrap_or_default() so callers without configuration overrides don't have to
+    // hand-serialize a default object.
+    let params: ZoneMapIndexBuilderParams = if params_json.is_empty() {
+        ZoneMapIndexBuilderParams::default()
+    } else {
+        serde_json::from_str(&params_json)
+            .map_err(|e| Error::input_error(format!("Invalid zonemap params JSON: {}", e)))?
+    };
+
+    // null fragment_ids array means "all fragments" (matches the Rust Option<Vec<u32>>
+    // contract where None covers every fragment).
+    let fragment_ids: Option<Vec<u32>> = if jfragment_ids.is_null() {
+        None
+    } else {
+        let jarr = JLongArray::from(jfragment_ids);
+        let len = env.get_array_length(&jarr)? as usize;
+        let mut buf = vec![0i64; len];
+        env.get_long_array_region(&jarr, 0, &mut buf)?;
+        // Lance fragment ids are u32 on disk; reject negative values from Java rather
+        // than silently wrapping.
+        let ids = buf
+            .into_iter()
+            .map(|v| {
+                if v < 0 || v > u32::MAX as i64 {
+                    Err(Error::input_error(format!(
+                        "fragment id {} out of u32 range",
+                        v
+                    )))
+                } else {
+                    Ok(v as u32)
+                }
+            })
+            .collect::<Result<Vec<u32>>>()?;
+        Some(ids)
+    };
+
+    let dataset = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.clone()
+    };
+
+    let batch = RT
+        .block_on(async move {
+            compute_zonemap_batch(&dataset, &column_name, fragment_ids, params).await
+        })
+        .map_err(Error::from)?;
+
+    // Export to the Java-allocated FFI buffers. The Java consumer reconstructs a
+    // VectorSchemaRoot via Data.importVectorSchemaRoot(allocator, ArrowArray, ArrowSchema, null),
+    // which expects the FFI array to be a struct array over the batch's columns and the
+    // FFI schema to describe the batch's top-level Schema.
+    let schema = batch.schema();
+    let struct_array: StructArray = batch.into();
+    let array_data = struct_array.into_data();
+    let ffi_array = FFI_ArrowArray::new(&array_data);
+    let ffi_schema = FFI_ArrowSchema::try_from(schema.as_ref())?;
+
+    unsafe {
+        std::ptr::write_unaligned(array_addr as *mut FFI_ArrowArray, ffi_array);
+        std::ptr::write_unaligned(schema_addr as *mut FFI_ArrowSchema, ffi_schema);
+    }
+    Ok(())
+}
+

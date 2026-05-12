@@ -38,12 +38,14 @@ import org.lance.schema.LanceSchema;
 import org.lance.schema.SqlExpressions;
 import org.lance.util.JsonUtils;
 
+import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -1490,6 +1492,99 @@ public class Dataset implements Closeable {
   }
 
   private native List<ZoneStats> nativeGetZonemapStats(String columnName);
+
+  /**
+   * Compute the zonemap stats batch for a column over the given fragments WITHOUT writing it to
+   * disk. Worker-side entry point for build-time consolidation: a coordinator (e.g. a Spark driver)
+   * fans this call out across worker tasks with disjoint fragment id subsets, then concatenates the
+   * returned batches and writes a single consolidated zonemap index, bypassing the per-segment
+   * commit shape that scales poorly with fragment count at plan time.
+   *
+   * @param columnName the column to scan
+   * @param fragmentIds fragment ids to include, or {@code null} for every fragment in the dataset.
+   *     An explicit empty array ({@code new long[0]}) is rejected — pass {@code null} when you mean
+   *     "every fragment", and a non-empty array when you mean a specific subset. The all-fragments
+   *     and zero-fragments cases mean different things and confusing them is almost always a
+   *     coordinator bug.
+   * @param paramsJson serialized {@code ZoneMapIndexBuilderParams} (e.g. {@code
+   *     "{\"rows_per_zone\": 8192}"}) or empty string for defaults
+   * @param allocator buffer allocator that will own the returned VectorSchemaRoot
+   * @return a VectorSchemaRoot containing zone records (one row per zone) over the requested
+   *     fragments, with the canonical zonemap stats schema ({@code min}, {@code max}, {@code
+   *     null_count}, {@code nan_count}, {@code fragment_id}, {@code zone_start}, {@code
+   *     zone_length}). Caller owns and must close.
+   */
+  public VectorSchemaRoot computeZonemapBatch(
+      String columnName, long[] fragmentIds, String paramsJson, BufferAllocator allocator) {
+    Preconditions.checkArgument(
+        columnName != null && !columnName.isEmpty(), "columnName cannot be null or empty");
+    Preconditions.checkArgument(
+        fragmentIds == null || fragmentIds.length > 0,
+        "fragmentIds must be null (all fragments) or non-empty; got an empty array");
+    Preconditions.checkNotNull(allocator, "allocator cannot be null");
+    String params = paramsJson == null ? "" : paramsJson;
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      // Track each handle inside the try block so an OOM on the second allocation cannot
+      // strand the first one unreleased. Previously the second allocateNew() sat outside any
+      // exception handler — the same anti-pattern R21 fixed in writeZonemapIndexFromBatches.
+      ArrowSchema arrowSchema = null;
+      ArrowArray arrowArray = null;
+      boolean importedOk = false;
+      try {
+        arrowSchema = ArrowSchema.allocateNew(allocator);
+        arrowArray = ArrowArray.allocateNew(allocator);
+        nativeComputeZonemapBatch(
+            columnName,
+            fragmentIds,
+            params,
+            arrowArray.memoryAddress(),
+            arrowSchema.memoryAddress());
+        VectorSchemaRoot root =
+            Data.importVectorSchemaRoot(allocator, arrowArray, arrowSchema, null);
+        importedOk = true;
+        return root;
+      } finally {
+        // Cleanup contract notes:
+        // - ArrowSchema: Data.importVectorSchemaRoot internally calls importField, whose own
+        //   try/finally always calls release() + close() on the schema — including on the
+        //   failure path. So we MUST NOT call schema.release() ourselves; doing so on the
+        //   failure path would call memoryAddress() on a wrapper with data=null and throw
+        //   NullPointerException ("ArrowArray is already closed" — Arrow Java's
+        //   Preconditions.checkNotNull message), masking the underlying exception. close()
+        //   alone is idempotent (no-op if already closed), so it's safe to call defensively
+        //   in case native threw before the import step ran.
+        // - ArrowArray: the import consumes it on success (release callback nulled by
+        //   from_raw, struct closed by the consumer). On a partial failure inside
+        //   importIntoVectorSchemaRoot the array may still carry a live producer callback;
+        //   release()-then-close() fires it. If the array was already consumed and closed,
+        //   release() throws NullPointerException via the same Preconditions.checkNotNull
+        //   path — swallow it so the original cause propagates.
+        if (arrowArray != null) {
+          if (!importedOk) {
+            try {
+              arrowArray.release();
+            } catch (NullPointerException alreadyConsumed) {
+              // Import path consumed the array before throwing — release callback already
+              // ran via the consumer's drop. The NPE comes from Arrow Java's
+              // Preconditions.checkNotNull(data, "ArrowArray is already closed").
+            }
+          }
+          arrowArray.close();
+        }
+        if (arrowSchema != null) {
+          arrowSchema.close();
+        }
+      }
+    }
+  }
+
+  private native void nativeComputeZonemapBatch(
+      String columnName,
+      long[] fragmentIds,
+      String paramsJson,
+      long arrayAddress,
+      long schemaAddress);
 
   /**
    * Get the table config of the dataset.
