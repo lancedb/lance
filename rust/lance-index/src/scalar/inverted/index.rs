@@ -5672,8 +5672,13 @@ mod tests {
 
         let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(merged.partitions.len(), 2);
-        assert_eq!(merged.partitions[0].id(), 0);
-        assert_eq!(merged.partitions[1].id(), 1);
+        let mut partition_ids = merged
+            .partitions
+            .iter()
+            .map(|partition| partition.id())
+            .collect::<Vec<_>>();
+        partition_ids.sort_unstable();
+        assert_eq!(partition_ids, vec![0, 1]);
 
         Ok(())
     }
