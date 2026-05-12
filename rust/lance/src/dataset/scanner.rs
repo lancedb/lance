@@ -1981,6 +1981,14 @@ impl Scanner {
         execute_plan(plan, options)
     }
 
+    pub(crate) fn execution_options(&self) -> LanceExecutionOptions {
+        LanceExecutionOptions {
+            batch_size: self.batch_size,
+            execution_stats_callback: self.scan_stats_callback.clone(),
+            ..Default::default()
+        }
+    }
+
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
         let stream = self.try_into_stream().await?;
         let schema = stream.schema();
