@@ -9,8 +9,9 @@ use crate::namespace::{
 use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
-    build_compaction_options, extract_storage_options, extract_write_params,
-    get_scalar_index_params, get_vector_index_params, to_java_map, to_rust_map,
+    build_compaction_options, extract_base_store_params, extract_storage_options,
+    extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map,
+    to_rust_map,
 };
 use crate::{RT, traits::IntoJava};
 use arrow::array::RecordBatchReader;
@@ -144,6 +145,7 @@ impl BlockingDataset {
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
+        base_store_params: HashMap<String, ObjectStoreParams>,
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
         session: Option<Arc<LanceSession>>,
@@ -182,6 +184,10 @@ impl BlockingDataset {
         };
 
         let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
+
+        for (base_path, store_params) in base_store_params {
+            builder = builder.with_base_store_params(base_path, store_params);
+        }
 
         if let Some(ver) = version {
             builder = builder.with_version(ver);
@@ -425,6 +431,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     data_storage_version: JObject,     // Optional<String>
     enable_v2_manifest_paths: JObject, // Optional<Boolean>
     storage_options_obj: JObject,      // Map<String, String>
+    base_store_params_obj: JObject,    // Map<String, Map<String, String>>
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -444,6 +451,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             data_storage_version,
             enable_v2_manifest_paths,
             storage_options_obj,
+            base_store_params_obj,
             initial_bases,
             target_bases,
             allow_external_blob_outside_bases,
@@ -465,6 +473,7 @@ fn inner_create_with_ffi_schema<'local>(
     data_storage_version: JObject,     // Optional<String>
     enable_v2_manifest_paths: JObject, // Optional<Boolean>
     storage_options_obj: JObject,      // Map<String, String>
+    base_store_params_obj: JObject,    // Map<String, Map<String, String>>
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -486,6 +495,7 @@ fn inner_create_with_ffi_schema<'local>(
         data_storage_version,
         enable_v2_manifest_paths,
         storage_options_obj,
+        base_store_params_obj,
         initial_bases,
         target_bases,
         allow_external_blob_outside_bases,
@@ -543,6 +553,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     data_storage_version: JObject,                 // Optional<String>
     enable_v2_manifest_paths: JObject,             // Optional<Boolean>
     storage_options_obj: JObject,                  // Map<String, String>
+    base_store_params_obj: JObject,                // Map<String, Map<String, String>>
     initial_bases: JObject,                        // Optional<List<BasePath>>
     target_bases: JObject,                         // Optional<List<String>>
     allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
@@ -565,6 +576,7 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             data_storage_version,
             enable_v2_manifest_paths,
             storage_options_obj,
+            base_store_params_obj,
             initial_bases,
             target_bases,
             allow_external_blob_outside_bases,
@@ -589,6 +601,7 @@ fn inner_create_with_ffi_stream<'local>(
     data_storage_version: JObject,              // Optional<String>
     enable_v2_manifest_paths: JObject,          // Optional<Boolean>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
     initial_bases: JObject,                     // Optional<List<BasePath>>
     target_bases: JObject,                      // Optional<List<String>>
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -614,6 +627,7 @@ fn inner_create_with_ffi_stream<'local>(
         data_storage_version,
         enable_v2_manifest_paths,
         storage_options_obj,
+        base_store_params_obj,
         initial_bases,
         target_bases,
         allow_external_blob_outside_bases,
@@ -641,6 +655,7 @@ fn create_dataset<'local>(
     data_storage_version: JObject,
     enable_v2_manifest_paths: JObject,
     storage_options_obj: JObject,
+    base_store_params_obj: JObject,
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject,
@@ -661,6 +676,7 @@ fn create_dataset<'local>(
         &data_storage_version,
         Some(&enable_v2_manifest_paths),
         &storage_options_obj,
+        &base_store_params_obj,
         &initial_bases,
         &target_bases,
         &allow_external_blob_outside_bases,
@@ -1371,6 +1387,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,                  // Map<String, String>
+    base_store_params_obj: JObject,                // Map<String, Map<String, String>>
     serialized_manifest: JObject,                  // Optional<ByteBuffer>
     session_handle: jlong,                         // Session handle, 0 means no session
     namespace_obj: JObject,                        // LanceNamespace object, null if no namespace
@@ -1387,6 +1404,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             index_cache_size_bytes,
             metadata_cache_size_bytes,
             storage_options_obj,
+            base_store_params_obj,
             serialized_manifest,
             session_handle,
             namespace_obj,
@@ -1405,6 +1423,7 @@ fn inner_open_native<'local>(
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,              // Map<String, String>
+    base_store_params_obj: JObject,            // Map<String, Map<String, String>>
     serialized_manifest: JObject,              // Optional<ByteBuffer>
     session_handle: jlong,                     // Session handle, 0 means no session
     namespace_obj: JObject,                    // LanceNamespace object, null if no namespace
@@ -1416,6 +1435,7 @@ fn inner_open_native<'local>(
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+    let base_store_params = extract_base_store_params(env, &base_store_params_obj)?;
 
     // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
@@ -1445,6 +1465,7 @@ fn inner_open_native<'local>(
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
+        base_store_params,
         serialized_manifest,
         storage_options_provider_arc,
         session,

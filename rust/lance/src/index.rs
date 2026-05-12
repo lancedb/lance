@@ -1253,6 +1253,19 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
+            // Scalar indices have no rebalance concept, so skip them entirely
+            // when every fragment is already covered and the caller hasn't
+            // asked for retrain or an explicit delta merge. Vector indices
+            // fall through and use a rebalance-aware no-op check inside
+            // merge_indices_with_unindexed_frags.
+            if !options.retrain
+                && options.num_indices_to_merge.is_none_or(|n| n == 0)
+                && index_group_is_scalar(self, deltas)
+                && index_group_has_no_unindexed(self, deltas)
+            {
+                continue;
+            }
+
             let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
@@ -1333,6 +1346,32 @@ impl DatasetIndexExt for Dataset {
             .read_partition(partition_id, with_vector)
             .await
     }
+}
+
+fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+    let Some(field_id) = deltas.first().and_then(|d| d.fields.first()) else {
+        return false;
+    };
+    match dataset.schema().field_by_id(*field_id) {
+        Some(field) => !is_vector_field(field.data_type()),
+        None => false,
+    }
+}
+
+fn index_group_has_no_unindexed(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+    let mut indexed = RoaringBitmap::new();
+    for idx in deltas {
+        if let Some(bitmap) = idx.fragment_bitmap.as_ref() {
+            indexed |= bitmap;
+        } else {
+            // Pre-0.8 indices have no fragment bitmap; treat as needing optimize.
+            return false;
+        }
+    }
+    dataset
+        .fragments()
+        .iter()
+        .all(|frag| indexed.contains(frag.id as u32))
 }
 
 fn sum_indexed_rows_per_delta(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Result<Vec<usize>> {

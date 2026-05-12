@@ -70,6 +70,7 @@ public class WriteDatasetBuilder {
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
+  private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private boolean ignoreNamespaceStorageOptions = false;
   private Optional<Integer> maxRowsPerFile = Optional.empty();
   private Optional<Integer> maxRowsPerGroup = Optional.empty();
@@ -203,6 +204,21 @@ public class WriteDatasetBuilder {
    */
   public WriteDatasetBuilder storageOptions(Map<String, String> storageOptions) {
     this.storageOptions = new HashMap<>(storageOptions);
+    return this;
+  }
+
+  /**
+   * Sets runtime-only object store parameters for registered base paths.
+   *
+   * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+   * Each value is used as-is for that base. These params are not persisted in the manifest. If a
+   * base has no explicit entry, the write-level storage options are used as a fallback.
+   *
+   * @param baseStoreParams object store parameters keyed by base path URI
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder baseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+    this.baseStoreParams = new HashMap<>(baseStoreParams);
     return this;
   }
 
@@ -430,7 +446,10 @@ public class WriteDatasetBuilder {
 
     // Build WriteParams with merged storage options
     WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(mergedStorageOptions);
+        new WriteParams.Builder()
+            .withMode(mode)
+            .withStorageOptions(mergedStorageOptions)
+            .withBaseStoreParams(baseStoreParams);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
@@ -465,7 +484,10 @@ public class WriteDatasetBuilder {
 
   private Dataset executeWithUri() {
     WriteParams.Builder paramsBuilder =
-        new WriteParams.Builder().withMode(mode).withStorageOptions(storageOptions);
+        new WriteParams.Builder()
+            .withMode(mode)
+            .withStorageOptions(storageOptions)
+            .withBaseStoreParams(baseStoreParams);
 
     maxRowsPerFile.ifPresent(paramsBuilder::withMaxRowsPerFile);
     maxRowsPerGroup.ifPresent(paramsBuilder::withMaxRowsPerGroup);
