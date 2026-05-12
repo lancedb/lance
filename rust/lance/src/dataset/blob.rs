@@ -1984,6 +1984,11 @@ async fn collect_blob_entries_v2(
                     ),
                 });
             }
+            BlobKind::DeltaBase | BlobKind::Delta => {
+                return Err(Error::not_supported(
+                    "Delta-encoded blobs are not yet supported in the dataset blob reader",
+                ));
+            }
         }
     }
 

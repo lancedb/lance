@@ -415,8 +415,14 @@ pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
 pub enum DeltaError {
     Truncated,
     VarIntOverflow,
-    SourceSizeMismatch { expected: usize, actual: usize },
-    TargetSizeMismatch { expected: usize, actual: usize },
+    SourceSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    TargetSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
     CopyOutOfBounds {
         offset: usize,
         size: usize,
@@ -469,10 +475,7 @@ mod tests {
     #[test]
     fn test_varint_truncated() {
         assert!(matches!(decode_varint(&[]), Err(DeltaError::Truncated)));
-        assert!(matches!(
-            decode_varint(&[0x80]),
-            Err(DeltaError::Truncated)
-        ));
+        assert!(matches!(decode_varint(&[0x80]), Err(DeltaError::Truncated)));
     }
 
     #[test]
