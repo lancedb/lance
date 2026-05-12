@@ -187,6 +187,11 @@ impl InvertedIndexBuilder {
         self
     }
 
+    pub fn with_token_set_format(mut self, token_set_format: TokenSetFormat) -> Self {
+        self.token_set_format = token_set_format;
+        self
+    }
+
     pub fn with_progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
         self
@@ -262,6 +267,8 @@ impl InvertedIndexBuilder {
         old_segments: &[Arc<InvertedIndex>],
         old_data_filter: Option<&crate::scalar::OldIndexDataFilter>,
     ) -> Result<()> {
+        let num_workers = resolve_num_workers(&self.params);
+        let memory_limit_bytes = resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let mut merged: Option<InnerBuilder> = None;
         for index in old_segments {
             if old_data_filter.is_none() {
@@ -277,18 +284,53 @@ impl InvertedIndexBuilder {
                     continue;
                 }
                 match &mut merged {
-                    Some(merged) => merged.merge_from(partition_builder)?,
+                    Some(merged) => {
+                        let would_exceed_memory = merged
+                            .memory_size()
+                            .saturating_add(partition_builder.memory_size())
+                            >= memory_limit_bytes;
+                        let would_exceed_doc_ids = merged
+                            .docs
+                            .len()
+                            .saturating_add(partition_builder.docs.len())
+                            > u32::MAX as usize;
+                        if would_exceed_memory || would_exceed_doc_ids {
+                            let builder = std::mem::replace(merged, partition_builder);
+                            self.write_new_partition(dest_store, builder).await?;
+                        } else {
+                            merged.merge_from(partition_builder)?;
+                        }
+                    }
                     None => merged = Some(partition_builder),
                 }
             }
         }
 
-        if let Some(mut builder) = merged {
-            let partition_id = builder.id();
-            builder.write(dest_store).await?;
-            self.new_partitions.push(partition_id);
+        if let Some(builder) = merged {
+            self.write_new_partition(dest_store, builder).await?;
         }
         Ok(())
+    }
+
+    async fn write_new_partition(
+        &mut self,
+        dest_store: &dyn IndexStore,
+        mut builder: InnerBuilder,
+    ) -> Result<()> {
+        let partition_id = self.next_partition_id() | self.fragment_mask.unwrap_or(0);
+        builder.set_id(partition_id);
+        builder.write(dest_store).await?;
+        self.new_partitions.push(partition_id);
+        Ok(())
+    }
+
+    fn next_partition_id(&self) -> u64 {
+        self.partitions
+            .iter()
+            .chain(self.new_partitions.iter())
+            .map(|id| id + 1)
+            .max()
+            .unwrap_or(0)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -309,13 +351,7 @@ impl InvertedIndexBuilder {
             token_set_format: self.token_set_format,
             worker_memory_limit_bytes,
         };
-        let next_id = self
-            .partitions
-            .iter()
-            .chain(self.new_partitions.iter())
-            .map(|id| id + 1)
-            .max()
-            .unwrap_or(0);
+        let next_id = self.next_partition_id();
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
@@ -682,6 +718,10 @@ impl InnerBuilder {
         self.id
     }
 
+    fn set_id(&mut self, id: u64) {
+        self.id = id;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.docs.is_empty()
     }
@@ -825,6 +865,18 @@ impl InnerBuilder {
         }
 
         Ok(())
+    }
+
+    fn memory_size(&self) -> u64 {
+        let posting_lists_overhead =
+            self.posting_lists.capacity() * std::mem::size_of::<PostingListBuilder>();
+        let posting_lists_size: u64 = self
+            .posting_lists
+            .iter()
+            .map(|posting| posting.size())
+            .sum();
+        (self.tokens.memory_size() + self.docs.memory_size() + posting_lists_overhead) as u64
+            + posting_lists_size
     }
 
     pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {

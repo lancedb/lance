@@ -499,6 +499,7 @@ impl InvertedIndex {
 
         let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
         builder = builder
+            .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version())
             .with_posting_tail_codec(first.posting_tail_codec());
         builder
@@ -4337,7 +4338,9 @@ mod tests {
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
     use crate::scalar::ScalarIndex;
-    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
+    use crate::scalar::inverted::builder::{
+        InnerBuilder, InvertedIndexBuilder, PositionRecorder, inverted_list_schema,
+    };
     use crate::scalar::inverted::encoding::{
         compress_positions, compress_posting_list_with_tail_codec,
         decompress_posting_list_with_tail_codec, encode_position_stream_block_into,
@@ -4352,6 +4355,57 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    async fn write_single_partition_index(
+        store: Arc<LanceIndexStore>,
+        params: InvertedIndexParams,
+        token_set_format: TokenSetFormat,
+        token: &str,
+        row_id: u64,
+    ) -> Result<Arc<InvertedIndex>> {
+        let mut partition = InnerBuilder::new_with_format_version(
+            0,
+            false,
+            token_set_format,
+            InvertedListFormatVersion::V1,
+        );
+        partition.tokens.add(token.to_owned());
+        let mut posting_list =
+            PostingListBuilder::new_with_posting_tail_codec(false, PostingTailCodec::Fixed32);
+        posting_list.add(0, PositionRecorder::Count(1));
+        partition.posting_lists.push(posting_list);
+        partition.docs.append(row_id, 1);
+        partition.write(store.as_ref()).await?;
+
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            ("params".to_owned(), serde_json::to_string(&params).unwrap()),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                token_set_format.to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await?;
+        writer.finish_with_metadata(metadata).await?;
+
+        InvertedIndex::load(store, None, &LanceCache::no_cache()).await
+    }
+
+    fn empty_doc_stream() -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(Vec::<datafusion::error::Result<RecordBatch>>::new()),
+        ))
+    }
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
@@ -5513,6 +5567,113 @@ mod tests {
                 posting_tail_codec
             );
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let index = write_single_partition_index(
+            src_store,
+            InvertedIndexParams::default(),
+            TokenSetFormat::Arrow,
+            "hello",
+            100,
+        )
+        .await?;
+        let created = InvertedIndex::merge_segments(
+            &[index],
+            empty_doc_stream(),
+            dest_store.as_ref(),
+            None,
+            crate::progress::noop_progress(),
+        )
+        .await?;
+
+        assert_eq!(created.index_version, 0);
+        let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
+
+        let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+        let (row_ids, _) = merged
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
+            .await?;
+        assert_eq!(row_ids, vec![100]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()> {
+        let src_dir_1 = TempObjDir::default();
+        let src_dir_2 = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store_1 = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir_1.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let src_store_2 = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir_2.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let params = InvertedIndexParams::default().memory_limit_mb(0);
+        let first = write_single_partition_index(
+            src_store_1,
+            params.clone(),
+            TokenSetFormat::default(),
+            "alpha",
+            100,
+        )
+        .await?;
+        let second = write_single_partition_index(
+            src_store_2,
+            params,
+            TokenSetFormat::default(),
+            "beta",
+            200,
+        )
+        .await?;
+
+        let mut builder =
+            InvertedIndexBuilder::new(InvertedIndexParams::default().memory_limit_mb(0))
+                .with_token_set_format(TokenSetFormat::default());
+        builder
+            .update_from_segments(
+                empty_doc_stream(),
+                dest_store.as_ref(),
+                &[first, second],
+                None,
+            )
+            .await?;
+
+        let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(merged.partitions.len(), 2);
+        assert_eq!(merged.partitions[0].id(), 0);
+        assert_eq!(merged.partitions[1].id(), 1);
 
         Ok(())
     }
