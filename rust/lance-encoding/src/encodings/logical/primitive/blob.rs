@@ -722,7 +722,6 @@ impl StructuralPageScheduler for DeltaBlobPageScheduler {
             let exp_positions = positions.clone();
             let exp_sizes = sizes.clone();
             let exp_kinds = kinds.clone();
-            let exp_base_offsets = base_offsets.clone();
             let def_meaning = self.def_meaning.clone();
             let req_start = range.start;
             let req_end = range.end;
@@ -737,8 +736,11 @@ impl StructuralPageScheduler for DeltaBlobPageScheduler {
                     row_bytes.insert(idx, b);
                 }
 
-                // Reconstruct all values in expanded range
-                let mut reconstructed: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+                // Reconstruct all values in expanded range, tracking the
+                // last reconstructed row to handle nulls/empties in the chain.
+                let mut reconstructed: std::collections::HashMap<u64, Vec<u8>> =
+                    std::collections::HashMap::new();
+                let mut last_reconstructed_row: Option<u64> = None;
 
                 for row in exp_start..req_end {
                     let kind = BlobKind::try_from(exp_kinds.value(row as usize))
@@ -748,32 +750,40 @@ impl StructuralPageScheduler for DeltaBlobPageScheduler {
                         BlobKind::DeltaBase => {
                             if let Some(b) = row_bytes.get(&row) {
                                 reconstructed.insert(row, b.to_vec());
+                                last_reconstructed_row = Some(row);
                             }
                         }
                         BlobKind::Delta => {
-                            let _base_off = exp_base_offsets.value(row as usize) as u64;
-                            // Walk back: this delta is against (row - 1)'s reconstructed value
-                            // base_offset tells us how far back the BASE is, but the delta is
-                            // against the previous value in the chain
-                            let prev_row = row - 1;
-                            let prev_data = reconstructed.get(&prev_row)
-                                .ok_or_else(|| Error::internal(
-                                    format!("Delta at row {row} references row {prev_row} which is not reconstructed")
-                                ))?;
-                            let delta_bytes = row_bytes.get(&row)
-                                .ok_or_else(|| Error::internal(
-                                    format!("Missing delta bytes for row {row}")
-                                ))?;
+                            let prev_row = last_reconstructed_row.ok_or_else(|| {
+                                Error::internal(format!(
+                                    "Delta at row {row} has no preceding reconstructed value"
+                                ))
+                            })?;
+                            let prev_data =
+                                reconstructed.get(&prev_row).ok_or_else(|| {
+                                    Error::internal(format!(
+                                    "Delta at row {row} references row {prev_row} which is not reconstructed"
+                                ))
+                                })?;
+                            let delta_bytes = row_bytes.get(&row).ok_or_else(|| {
+                                Error::internal(format!("Missing delta bytes for row {row}"))
+                            })?;
 
-                            let restored = crate::encodings::physical::delta::apply_delta(
-                                prev_data,
-                                delta_bytes,
-                            )
-                            .map_err(|e| Error::internal(format!("Delta apply failed at row {row}: {e}")))?;
+                            let restored =
+                                crate::encodings::physical::delta::apply_delta(
+                                    prev_data,
+                                    delta_bytes,
+                                )
+                                .map_err(|e| {
+                                    Error::internal(format!(
+                                        "Delta apply failed at row {row}: {e}"
+                                    ))
+                                })?;
                             reconstructed.insert(row, restored);
+                            last_reconstructed_row = Some(row);
                         }
                         BlobKind::Inline => {
-                            // size == 0: null or empty
+                            // size == 0: null or empty — do not update last_reconstructed_row
                         }
                         _ => {
                             return Err(Error::internal(

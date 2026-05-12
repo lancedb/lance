@@ -6,8 +6,9 @@
 //! Encodes a target buffer as a series of copy/insert instructions relative
 //! to a source (base) buffer. Copy instructions reference byte ranges in the
 //! source; insert instructions carry literal bytes from the target.
-
-use std::collections::HashMap;
+//!
+//! For best compression, data should be sorted so that similar values
+//! (e.g., successive versions of the same file) are adjacent.
 
 /// Rabin rolling hash window size (bytes).
 const RABIN_WINDOW: usize = 16;
@@ -24,38 +25,71 @@ const MAX_COPY_SIZE: usize = 0xFFFFFF;
 /// Block size for indexing the source buffer (non-overlapping windows).
 const INDEX_BLOCK_SIZE: usize = 16;
 
+/// Delta must be at most this fraction of target size to be worth keeping.
+const DELTA_RATIO_THRESHOLD: f64 = 0.8;
+
+/// Maximum varint bytes for a u64 (ceil(64/7) = 10).
+const MAX_VARINT_BYTES: usize = 10;
+
 // ---------------------------------------------------------------------------
-// Rabin hash helpers
+// Rabin rolling hash
 // ---------------------------------------------------------------------------
 
-/// Simple polynomial rolling hash over a window of bytes.
-/// Not the full Rabin with lookup tables — a simpler variant that's
-/// sufficient for finding matching blocks.
-fn rabin_hash(data: &[u8]) -> u32 {
+const RABIN_MULTIPLIER: u32 = 257;
+
+/// Precomputed RABIN_MULTIPLIER^RABIN_WINDOW mod 2^32, used to remove the
+/// oldest byte's contribution from the rolling hash in O(1).
+#[cfg(test)]
+const RABIN_POW_WINDOW: u32 = {
+    let mut p: u32 = 1;
+    let mut i = 0;
+    while i < RABIN_WINDOW {
+        p = p.wrapping_mul(RABIN_MULTIPLIER);
+        i += 1;
+    }
+    p
+};
+
+/// Compute the initial hash over exactly `RABIN_WINDOW` bytes.
+fn rabin_hash_init(data: &[u8]) -> u32 {
     let mut h: u32 = 0;
-    for &b in data {
-        h = h.wrapping_mul(257).wrapping_add(b as u32);
+    for &b in &data[..RABIN_WINDOW] {
+        h = h.wrapping_mul(RABIN_MULTIPLIER).wrapping_add(b as u32);
     }
     h
 }
 
-/// Index built over the source buffer for fast match lookup.
-struct DeltaIndex {
-    /// Map from hash → list of offsets in the source where that hash occurs.
-    table: HashMap<u32, Vec<usize>>,
-    source: Vec<u8>,
+/// Roll the hash forward: remove `old_byte`, add `new_byte`.
+#[cfg(test)]
+#[inline(always)]
+fn rabin_hash_roll(h: u32, old_byte: u8, new_byte: u8) -> u32 {
+    h.wrapping_mul(RABIN_MULTIPLIER)
+        .wrapping_sub(RABIN_POW_WINDOW.wrapping_mul(old_byte as u32))
+        .wrapping_add(new_byte as u32)
 }
 
-impl DeltaIndex {
-    fn new(source: &[u8]) -> Self {
+// ---------------------------------------------------------------------------
+// Delta index
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+/// Index built over the source buffer for fast match lookup.
+struct DeltaIndex<'a> {
+    /// Map from hash → list of offsets in the source where that hash occurs.
+    table: HashMap<u32, Vec<usize>>,
+    source: &'a [u8],
+}
+
+impl<'a> DeltaIndex<'a> {
+    fn new(source: &'a [u8]) -> Self {
         let mut table: HashMap<u32, Vec<usize>> = HashMap::new();
 
         if source.len() >= RABIN_WINDOW {
             let mut offset = 0;
             while offset + RABIN_WINDOW <= source.len() {
-                let h = rabin_hash(&source[offset..offset + RABIN_WINDOW]);
+                let h = rabin_hash_init(&source[offset..offset + RABIN_WINDOW]);
                 let entries = table.entry(h).or_default();
-                // Limit bucket size to avoid quadratic behavior on repetitive data
                 if entries.len() < 64 {
                     entries.push(offset);
                 }
@@ -63,27 +97,22 @@ impl DeltaIndex {
             }
         }
 
-        Self {
-            table,
-            source: source.to_vec(),
-        }
+        Self { table, source }
     }
 
     /// Find the longest match in the source for target data starting at `target_pos`.
-    /// Returns (source_offset, match_length) or None.
     fn find_match(&self, target: &[u8], target_pos: usize) -> Option<(usize, usize)> {
         if target_pos + RABIN_WINDOW > target.len() {
             return None;
         }
 
-        let h = rabin_hash(&target[target_pos..target_pos + RABIN_WINDOW]);
+        let h = rabin_hash_init(&target[target_pos..target_pos + RABIN_WINDOW]);
         let entries = self.table.get(&h)?;
 
         let mut best_offset = 0;
         let mut best_len = 0;
 
         for &src_offset in entries {
-            // Verify the hash match with actual byte comparison and extend
             let max_len = std::cmp::min(self.source.len() - src_offset, target.len() - target_pos);
 
             let mut len = 0;
@@ -125,11 +154,17 @@ fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
 }
 
 /// Decode a variable-length integer, returning (value, bytes_consumed).
-fn decode_varint(data: &[u8]) -> (u64, usize) {
+fn decode_varint(data: &[u8]) -> Result<(u64, usize), DeltaError> {
     let mut val: u64 = 0;
-    let mut shift = 0;
+    let mut shift: u32 = 0;
     let mut i = 0;
     loop {
+        if i >= data.len() {
+            return Err(DeltaError::Truncated);
+        }
+        if i >= MAX_VARINT_BYTES {
+            return Err(DeltaError::VarIntOverflow);
+        }
         let byte = data[i];
         val |= ((byte & 0x7F) as u64) << shift;
         i += 1;
@@ -138,55 +173,59 @@ fn decode_varint(data: &[u8]) -> (u64, usize) {
         }
         shift += 7;
     }
-    (val, i)
+    Ok((val, i))
 }
 
-/// Encode a copy instruction.
-/// Format: opcode byte with bit 7 set, followed by non-zero offset/size bytes.
+/// Encode a copy instruction using a stack buffer (no heap allocation).
 fn encode_copy(offset: usize, size: usize, out: &mut Vec<u8>) {
     let offset = offset as u32;
     let size = size as u32;
     let mut opcode: u8 = 0x80;
-    let mut extra = Vec::with_capacity(7);
+    let mut extra = [0u8; 7];
+    let mut extra_len = 0;
 
     if offset & 0xFF != 0 {
         opcode |= 0x01;
-        extra.push((offset & 0xFF) as u8);
+        extra[extra_len] = (offset & 0xFF) as u8;
+        extra_len += 1;
     }
     if offset & 0xFF00 != 0 {
         opcode |= 0x02;
-        extra.push(((offset >> 8) & 0xFF) as u8);
+        extra[extra_len] = ((offset >> 8) & 0xFF) as u8;
+        extra_len += 1;
     }
     if offset & 0xFF_0000 != 0 {
         opcode |= 0x04;
-        extra.push(((offset >> 16) & 0xFF) as u8);
+        extra[extra_len] = ((offset >> 16) & 0xFF) as u8;
+        extra_len += 1;
     }
     if offset & 0xFF00_0000 != 0 {
         opcode |= 0x08;
-        extra.push(((offset >> 24) & 0xFF) as u8);
+        extra[extra_len] = ((offset >> 24) & 0xFF) as u8;
+        extra_len += 1;
     }
 
-    // Size: if size == 0x10000, encode as 0 (special case in Git format)
     let encoded_size = if size == 0x10000 { 0u32 } else { size };
     if encoded_size & 0xFF != 0 {
         opcode |= 0x10;
-        extra.push((encoded_size & 0xFF) as u8);
+        extra[extra_len] = (encoded_size & 0xFF) as u8;
+        extra_len += 1;
     }
     if encoded_size & 0xFF00 != 0 {
         opcode |= 0x20;
-        extra.push(((encoded_size >> 8) & 0xFF) as u8);
+        extra[extra_len] = ((encoded_size >> 8) & 0xFF) as u8;
+        extra_len += 1;
     }
     if encoded_size & 0xFF_0000 != 0 {
         opcode |= 0x40;
-        extra.push(((encoded_size >> 16) & 0xFF) as u8);
+        extra[extra_len] = ((encoded_size >> 16) & 0xFF) as u8;
+        extra_len += 1;
     }
 
     out.push(opcode);
-    out.extend_from_slice(&extra);
+    out.extend_from_slice(&extra[..extra_len]);
 }
 
-/// Encode an insert instruction.
-/// Format: opcode byte (1-127) = literal count, followed by that many bytes.
 fn encode_insert(data: &[u8], out: &mut Vec<u8>) {
     debug_assert!(!data.is_empty() && data.len() <= MAX_INSERT_LEN);
     out.push(data.len() as u8);
@@ -199,13 +238,12 @@ fn encode_insert(data: &[u8], out: &mut Vec<u8>) {
 
 /// Create a binary delta that transforms `source` into `target`.
 ///
-/// Returns the encoded delta bytes, or `None` if the delta would be
-/// larger than the target (caller should store the target as-is).
+/// Returns the encoded delta bytes, or `None` if the delta would not
+/// achieve at least a 20% size reduction over storing `target` as-is.
 pub fn create_delta(source: &[u8], target: &[u8]) -> Option<Vec<u8>> {
     let index = DeltaIndex::new(source);
     let mut delta = Vec::with_capacity(target.len() / 2);
 
-    // Header: source size, target size
     encode_varint(source.len() as u64, &mut delta);
     encode_varint(target.len() as u64, &mut delta);
 
@@ -214,12 +252,10 @@ pub fn create_delta(source: &[u8], target: &[u8]) -> Option<Vec<u8>> {
 
     while target_pos < target.len() {
         if let Some((src_offset, match_len)) = index.find_match(target, target_pos) {
-            // Flush pending insert
             if target_pos > insert_start {
                 flush_insert(target, insert_start, target_pos, &mut delta);
             }
 
-            // Emit copy instruction(s), splitting if > MAX_COPY_SIZE
             let mut remaining = match_len;
             let mut off = src_offset;
             while remaining > 0 {
@@ -236,13 +272,12 @@ pub fn create_delta(source: &[u8], target: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    // Flush trailing insert
     if target_pos > insert_start {
         flush_insert(target, insert_start, target_pos, &mut delta);
     }
 
-    // Only use delta if it's actually smaller
-    if delta.len() < target.len() {
+    let threshold = (target.len() as f64 * DELTA_RATIO_THRESHOLD) as usize;
+    if delta.len() < threshold {
         Some(delta)
     } else {
         None
@@ -257,8 +292,6 @@ fn flush_insert(target: &[u8], start: usize, end: usize, out: &mut Vec<u8>) {
 }
 
 /// Apply a delta to a source buffer, producing the original target.
-///
-/// Returns an error if the delta is malformed or sizes don't match.
 pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
     if delta.is_empty() {
         return Err(DeltaError::Truncated);
@@ -266,10 +299,9 @@ pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
 
     let mut pos = 0;
 
-    // Read header
-    let (src_size, n) = decode_varint(&delta[pos..]);
+    let (src_size, n) = decode_varint(&delta[pos..])?;
     pos += n;
-    let (tgt_size, n) = decode_varint(&delta[pos..]);
+    let (tgt_size, n) = decode_varint(&delta[pos..])?;
     pos += n;
 
     if src_size as usize != source.len() {
@@ -286,36 +318,56 @@ pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
         pos += 1;
 
         if cmd & 0x80 != 0 {
-            // Copy instruction
             let mut offset: u32 = 0;
             let mut size: u32 = 0;
 
             if cmd & 0x01 != 0 {
+                if pos >= delta.len() {
+                    return Err(DeltaError::Truncated);
+                }
                 offset |= delta[pos] as u32;
                 pos += 1;
             }
             if cmd & 0x02 != 0 {
+                if pos >= delta.len() {
+                    return Err(DeltaError::Truncated);
+                }
                 offset |= (delta[pos] as u32) << 8;
                 pos += 1;
             }
             if cmd & 0x04 != 0 {
+                if pos >= delta.len() {
+                    return Err(DeltaError::Truncated);
+                }
                 offset |= (delta[pos] as u32) << 16;
                 pos += 1;
             }
             if cmd & 0x08 != 0 {
+                if pos >= delta.len() {
+                    return Err(DeltaError::Truncated);
+                }
                 offset |= (delta[pos] as u32) << 24;
                 pos += 1;
             }
 
             if cmd & 0x10 != 0 {
+                if pos >= delta.len() {
+                    return Err(DeltaError::Truncated);
+                }
                 size |= delta[pos] as u32;
                 pos += 1;
             }
             if cmd & 0x20 != 0 {
+                if pos >= delta.len() {
+                    return Err(DeltaError::Truncated);
+                }
                 size |= (delta[pos] as u32) << 8;
                 pos += 1;
             }
             if cmd & 0x40 != 0 {
+                if pos >= delta.len() {
+                    return Err(DeltaError::Truncated);
+                }
                 size |= (delta[pos] as u32) << 16;
                 pos += 1;
             }
@@ -337,7 +389,6 @@ pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
 
             output.extend_from_slice(&source[offset..offset + size]);
         } else if cmd > 0 {
-            // Insert instruction
             let len = cmd as usize;
             if pos + len > delta.len() {
                 return Err(DeltaError::Truncated);
@@ -363,14 +414,9 @@ pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
 #[derive(Debug)]
 pub enum DeltaError {
     Truncated,
-    SourceSizeMismatch {
-        expected: usize,
-        actual: usize,
-    },
-    TargetSizeMismatch {
-        expected: usize,
-        actual: usize,
-    },
+    VarIntOverflow,
+    SourceSizeMismatch { expected: usize, actual: usize },
+    TargetSizeMismatch { expected: usize, actual: usize },
     CopyOutOfBounds {
         offset: usize,
         size: usize,
@@ -383,6 +429,7 @@ impl std::fmt::Display for DeltaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Truncated => write!(f, "delta data truncated"),
+            Self::VarIntOverflow => write!(f, "varint exceeds u64 capacity"),
             Self::SourceSizeMismatch { expected, actual } => {
                 write!(f, "source size mismatch: expected {expected}, got {actual}")
             }
@@ -413,35 +460,53 @@ mod tests {
         for val in [0u64, 1, 127, 128, 16383, 16384, u32::MAX as u64, u64::MAX] {
             let mut buf = Vec::new();
             encode_varint(val, &mut buf);
-            let (decoded, len) = decode_varint(&buf);
+            let (decoded, len) = decode_varint(&buf).unwrap();
             assert_eq!(decoded, val);
             assert_eq!(len, buf.len());
         }
     }
 
     #[test]
+    fn test_varint_truncated() {
+        assert!(matches!(decode_varint(&[]), Err(DeltaError::Truncated)));
+        assert!(matches!(
+            decode_varint(&[0x80]),
+            Err(DeltaError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn test_varint_overflow() {
+        // 11 continuation bytes — exceeds MAX_VARINT_BYTES
+        let bad = [0x80u8; 11];
+        assert!(matches!(
+            decode_varint(&bad),
+            Err(DeltaError::VarIntOverflow)
+        ));
+    }
+
+    #[test]
     fn test_identical_buffers() {
         let data = b"Hello, world! This is a test of delta encoding.";
-        let delta = create_delta(data, data).expect("identical data should produce small delta");
-        let restored = apply_delta(data, &delta).unwrap();
-        assert_eq!(restored, data);
+        let delta = create_delta(data, data);
+        if let Some(delta) = &delta {
+            let restored = apply_delta(data, delta).unwrap();
+            assert_eq!(restored, data);
+        }
     }
 
     #[test]
     fn test_small_edit() {
         let source = b"fn main() {\n    println!(\"hello world\");\n}\n";
         let target = b"fn main() {\n    println!(\"hello lance\");\n}\n";
-        let delta = create_delta(source, target);
-        // Whether or not delta is smaller, apply_delta should roundtrip if we have one
-        if let Some(delta) = &delta {
-            let restored = apply_delta(source, delta).unwrap();
+        if let Some(delta) = create_delta(source, target) {
+            let restored = apply_delta(source, &delta).unwrap();
             assert_eq!(restored, target.as_slice());
         }
     }
 
     #[test]
     fn test_larger_similar_files() {
-        // Simulate two versions of a source file
         let mut source = String::new();
         for i in 0..100 {
             source.push_str(&format!(
@@ -450,7 +515,6 @@ mod tests {
             ));
         }
         let mut target = source.clone();
-        // Change a few lines
         target = target.replace("line 10:", "line 10 MODIFIED:");
         target = target.replace("line 50:", "line 50 MODIFIED:");
         target.push_str("// new line at the end\n");
@@ -472,21 +536,18 @@ mod tests {
     fn test_completely_different() {
         let source = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let target = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        // Delta might be None (larger than target) or Some
         if let Some(delta) = create_delta(source, target) {
             let restored = apply_delta(source, &delta).unwrap();
             assert_eq!(restored, target.as_slice());
         }
-        // Either way, this shouldn't panic
     }
 
     #[test]
     fn test_empty_target() {
         let source = b"some source data here";
         let target = b"";
-        let delta = create_delta(source, target);
-        if let Some(delta) = &delta {
-            let restored = apply_delta(source, delta).unwrap();
+        if let Some(delta) = create_delta(source, target) {
+            let restored = apply_delta(source, &delta).unwrap();
             assert!(restored.is_empty());
         }
     }
@@ -495,10 +556,8 @@ mod tests {
     fn test_empty_source() {
         let source = b"";
         let target = b"new content";
-        // Delta from empty source = all inserts, likely larger than target
-        let delta = create_delta(source, target);
-        if let Some(delta) = &delta {
-            let restored = apply_delta(source, delta).unwrap();
+        if let Some(delta) = create_delta(source, target) {
+            let restored = apply_delta(source, &delta).unwrap();
             assert_eq!(restored, target.as_slice());
         }
     }
@@ -512,7 +571,6 @@ mod tests {
         let v3 = b"version 3 of the file with some content that stays the same\n\
                     and more lines here\nand a new line\nand another\n";
 
-        // Chain: v1 -> v2 -> v3
         if let Some(d1) = create_delta(v1, v2) {
             let restored_v2 = apply_delta(v1, &d1).unwrap();
             assert_eq!(restored_v2, v2.as_slice());
@@ -571,5 +629,29 @@ fn main() {
 
         let restored = apply_delta(source.as_bytes(), &delta).unwrap();
         assert_eq!(String::from_utf8(restored).unwrap(), target,);
+    }
+
+    #[test]
+    fn test_apply_delta_truncated_copy() {
+        // Craft a delta with a copy instruction that's truncated
+        let source = b"hello world";
+        let mut delta = Vec::new();
+        encode_varint(source.len() as u64, &mut delta);
+        encode_varint(5, &mut delta); // target size 5
+        delta.push(0x81); // copy with offset byte 0 present, but no byte follows
+        assert!(matches!(
+            apply_delta(source, &delta),
+            Err(DeltaError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn test_rolling_hash_consistency() {
+        let data = b"abcdefghijklmnopqrstuvwxyz012345678";
+        let h1 = rabin_hash_init(&data[0..RABIN_WINDOW]);
+        // Roll from position 0 to position 1
+        let h2_rolled = rabin_hash_roll(h1, data[0], data[RABIN_WINDOW]);
+        let h2_direct = rabin_hash_init(&data[1..1 + RABIN_WINDOW]);
+        assert_eq!(h2_rolled, h2_direct);
     }
 }
