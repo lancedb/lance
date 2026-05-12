@@ -1587,6 +1587,140 @@ public class Dataset implements Closeable {
       long schemaAddress);
 
   /**
+   * Write a consolidated zonemap index segment from one or more worker-computed batches and return
+   * its {@link Index} metadata, WITHOUT committing the manifest.
+   *
+   * <p>Driver-side entry point for build-time zonemap consolidation. The coordinator calls {@link
+   * #computeZonemapBatch} on each worker to obtain per-fragment-subset {@code VectorSchemaRoot}s,
+   * hands the full list here, and the call (a) concatenates them Rust-side against the canonical
+   * zonemap stats schema, (b) writes a single {@code zonemap.lance} file under a freshly allocated
+   * UUID directory, and (c) returns an {@code Index} whose {@code fragment_bitmap} is the union of
+   * every fragment id appearing in the input batches.
+   *
+   * <p>The returned {@code Index} is uncommitted — to land it in the manifest, pass it (along with
+   * any other segments) to {@link #commitExistingIndexSegments(String, String, List)}.
+   *
+   * <p>Each batch is exported to the Rust side through the Arrow C Data Interface. The export
+   * creates a separate Arrow C view that shares buffers with the source via refcount; the source
+   * {@code VectorSchemaRoot}s remain valid and usable after this method returns. Callers manage
+   * their lifecycle normally (typically try-with-resources at the worker call site) — no special
+   * handling around this method.
+   *
+   * <p>{@code paramsJson} should match the params each worker passed to {@link
+   * #computeZonemapBatch}. The actual zones in the batch have already been laid out by the worker
+   * pass; the driver value is written into the file metadata header so downstream readers see the
+   * same {@code rows_per_zone} the workers configured. Passing a different value here records a lie
+   * in the file header and will mislead consumers — it is not a supported way to "rewrite" the zone
+   * layout.
+   *
+   * <p>Pre-flight validation (null / empty list, null elements) runs before any FFI export, so
+   * rejection on those grounds leaves all input batches untouched. Once the export loop begins, an
+   * allocation or export failure mid-loop leaves the partial state visible only through the
+   * exception's stack trace; FFI handles allocated up to that point are released in {@code
+   * finally}. Callers may safely retry against the same source {@code VectorSchemaRoot} instances
+   * since the export does not mutate them.
+   *
+   * <p>Fragment id coverage is whatever the {@code fragment_id} column in the concatenated batch
+   * contains. The driver does NOT enforce that worker batches cover disjoint fragment subsets —
+   * overlapping fragment ids across workers will produce duplicated zone rows in the consolidated
+   * segment and surface as confused stats at read time. Coordinators are responsible for
+   * partitioning fragments cleanly.
+   *
+   * @param indexName the logical index name
+   * @param column the indexed column name. <strong>This MUST be the same column every worker passed
+   *     to {@link #computeZonemapBatch}.</strong> The method does NOT verify the provenance of the
+   *     batch's min/max values — only that the column exists in the dataset schema. Passing column
+   *     "B" with batches that were computed against column "A" produces a silently-corrupted
+   *     segment: the manifest records that the index applies to B, but the on-disk stats are A's,
+   *     and there is no read-time marker that can detect the mismatch. Coordinators must thread the
+   *     column name consistently from the {@code computeZonemapBatch} call sites through to this
+   *     call.
+   * @param batches per-worker zonemap batches, typically returned by {@link #computeZonemapBatch}.
+   *     Every batch must share the same schema (the case when all workers used the same params and
+   *     the same indexed column on the same Dataset version, which is the only supported
+   *     configuration). Must be non-null and non-empty.
+   * @param paramsJson serialized {@code ZoneMapIndexBuilderParams} matching the workers' params, or
+   *     empty string for defaults
+   * @param allocator buffer allocator used to allocate the FFI export buffers
+   * @return the {@link Index} metadata for the freshly written, uncommitted segment
+   */
+  public Index writeZonemapIndexFromBatches(
+      String indexName,
+      String column,
+      List<VectorSchemaRoot> batches,
+      String paramsJson,
+      BufferAllocator allocator) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        column != null && !column.isEmpty(), "column cannot be null or empty");
+    Preconditions.checkNotNull(batches, "batches cannot be null");
+    Preconditions.checkArgument(!batches.isEmpty(), "batches cannot be empty");
+    Preconditions.checkNotNull(allocator, "allocator cannot be null");
+    String params = paramsJson == null ? "" : paramsJson;
+
+    // Validate every batch reference up front. Mixing the null check with the FFI export
+    // would half-execute the export loop on a mid-list NPE — earlier elements have already
+    // had ArrowArray/ArrowSchema handles allocated and refcount-shared via
+    // Data.exportVectorSchemaRoot, and unwinding through the finally block would leave the
+    // caller wondering whether the source list had been partially traversed. Two-pass keeps
+    // the "rejection-on-input-validation leaves all batches and allocator state untouched"
+    // invariant intact.
+    for (int i = 0; i < batches.size(); i++) {
+      Preconditions.checkNotNull(batches.get(i), "batches[%s] is null", i);
+    }
+
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+
+      // Allocate one (ArrowArray, ArrowSchema) pair per batch. Track them in two parallel
+      // lists so the close-loop runs in finally whether the native call succeeds or not.
+      List<ArrowArray> arrays = new java.util.ArrayList<>(batches.size());
+      List<ArrowSchema> schemas = new java.util.ArrayList<>(batches.size());
+      try {
+        long[] arrayAddrs = new long[batches.size()];
+        long[] schemaAddrs = new long[batches.size()];
+        for (int i = 0; i < batches.size(); i++) {
+          VectorSchemaRoot root = batches.get(i);
+          // Track each handle in the cleanup list IMMEDIATELY after allocation, before any
+          // subsequent allocation can throw. Previously the ArrowSchema.allocateNew call
+          // could OOM with the just-allocated ArrowArray sitting untracked, leaking it past
+          // the finally block.
+          ArrowArray a = ArrowArray.allocateNew(allocator);
+          arrays.add(a);
+          ArrowSchema s = ArrowSchema.allocateNew(allocator);
+          schemas.add(s);
+          Data.exportVectorSchemaRoot(allocator, root, null, a, s);
+          arrayAddrs[i] = a.memoryAddress();
+          schemaAddrs[i] = s.memoryAddress();
+        }
+        return nativeWriteZonemapIndexFromBatches(
+            indexName, column, arrayAddrs, schemaAddrs, params);
+      } finally {
+        // For each FFI handle: release() fires the producer-side release callback that
+        // Data.exportVectorSchemaRoot set (so any retained ref to source buffers is dropped),
+        // then close() frees the 80-byte struct holder itself. close() alone only frees the
+        // holder — if Rust never consumed the handle via from_raw (e.g. JNI errored before
+        // the import loop ran), close() would leak the producer-side private_data and its
+        // retained buffer refs. release() is safe to call after from_raw consumed the struct
+        // because from_raw nulls the release pointer; the underlying releaseArray JNI call
+        // no-ops on a null release callback.
+        for (ArrowArray a : arrays) {
+          a.release();
+          a.close();
+        }
+        for (ArrowSchema s : schemas) {
+          s.release();
+          s.close();
+        }
+      }
+    }
+  }
+
+  private native Index nativeWriteZonemapIndexFromBatches(
+      String indexName, String column, long[] arrayAddrs, long[] schemaAddrs, String paramsJson);
+
+  /**
    * Get the table config of the dataset.
    *
    * @return the table config

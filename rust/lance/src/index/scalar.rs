@@ -286,6 +286,21 @@ pub async fn compute_zonemap_batch(
 ///
 /// `batch` must conform to [`zonemap_stats_schema`](lance_index::scalar::zonemap::zonemap_stats_schema)
 /// (this is enforced by the inner writer).
+///
+/// **Returned `IndexMetadata` fields that survive commit:** only `uuid`, `fragment_bitmap`,
+/// `index_details`, and `index_version` are carried into the committed manifest by
+/// `commitExistingIndexSegments`. `name`, `dataset_version`, `created_at`, `files`, and
+/// `base_id` are re-derived by the commit path from the segment template + the dataset's
+/// current state. Callers should not depend on round-tripping the returned `name` etc.
+/// through commit unchanged.
+///
+/// **Column-provenance contract:** `column` MUST be the same column every batch's stats
+/// were computed against (via [`compute_zonemap_batch`]). This function only verifies that
+/// `column` exists in the dataset schema; it cannot detect a coordinator that fed batches
+/// computed for column A into a write call for column B. The resulting segment's
+/// `IndexMetadata.fields` would point at B's field id while the on-disk stats describe A,
+/// and there is NO read-time marker that would reveal the mismatch. Coordinators must thread
+/// the column name through consistently.
 pub async fn write_consolidated_zonemap_segment(
     dataset: &Dataset,
     name: &str,
