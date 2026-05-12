@@ -130,7 +130,7 @@ pub(crate) async fn write_transaction_file(
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
-    object_store.inner.put(&path, buf.into()).await?;
+    object_store.put(&path, &buf).await?;
 
     Ok(file_name)
 }
