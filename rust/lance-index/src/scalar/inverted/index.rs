@@ -68,11 +68,12 @@ use super::{
 };
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
+use crate::progress::IndexBuildProgress;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
-    ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
+    OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
 use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -455,6 +456,62 @@ impl InvertedIndex {
     /// fragments and prune them at search time (merge-on-read).
     pub fn deleted_fragments(&self) -> &RoaringBitmap {
         &self.deleted_fragments
+    }
+
+    pub async fn merge_segments(
+        segments: &[Arc<InvertedIndex>],
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let Some(first) = segments.first() else {
+            return Err(Error::invalid_input(
+                "cannot merge inverted index without at least one source segment".to_string(),
+            ));
+        };
+
+        for segment in segments.iter().skip(1) {
+            if segment.params != first.params {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different parameters".to_string(),
+                ));
+            }
+            if segment.token_set_format != first.token_set_format {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different token set formats"
+                        .to_string(),
+                ));
+            }
+            if segment.format_version() != first.format_version() {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different format versions"
+                        .to_string(),
+                ));
+            }
+            if segment.posting_tail_codec() != first.posting_tail_codec() {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different posting tail codecs"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
+        builder = builder
+            .with_format_version(first.format_version())
+            .with_posting_tail_codec(first.posting_tail_codec());
+        builder
+            .update_from_segments(new_data, dest_store, segments, old_data_filter)
+            .await?;
+
+        let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: first.index_version(),
+            files: Some(dest_store.list_files_with_sizes().await?),
+        })
     }
 
     pub fn bm25_base_scorer(&self, query_tokens: &Tokens) -> MemBM25Scorer {
@@ -1146,7 +1203,7 @@ impl InvertedPartition {
             self.token_set_format,
             self.inverted_list.posting_tail_codec(),
         );
-        builder.tokens = self.tokens;
+        builder.tokens = self.tokens.into_mutable();
         builder.docs = self.docs;
 
         builder
@@ -1448,6 +1505,33 @@ impl TokenSet {
         self.next_id += 1;
         self.total_length += token.len();
         next_id
+    }
+
+    pub(crate) fn into_mutable(self) -> Self {
+        let Self {
+            tokens,
+            next_id,
+            total_length,
+        } = self;
+        match tokens {
+            TokenMap::HashMap(_) => Self {
+                tokens,
+                next_id,
+                total_length,
+            },
+            TokenMap::Fst(map) => {
+                let mut mutable = HashMap::new();
+                let mut stream = map.stream();
+                while let Some((token, token_id)) = stream.next() {
+                    mutable.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+                Self {
+                    tokens: TokenMap::HashMap(mutable),
+                    next_id,
+                    total_length,
+                }
+            }
+        }
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
@@ -3846,11 +3930,13 @@ impl DocSet {
         let len = self.len();
         let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
         let num_tokens = std::mem::replace(&mut self.num_tokens, Vec::with_capacity(len));
+        self.total_tokens = 0;
         for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
             match mapping.get(&row_id) {
                 Some(Some(new_row_id)) => {
                     self.row_ids.push(*new_row_id);
                     self.num_tokens.push(num_token);
+                    self.total_tokens += num_token as u64;
                 }
                 Some(None) => {
                     removed.push(doc_id as u32);
@@ -3858,6 +3944,7 @@ impl DocSet {
                 None => {
                     self.row_ids.push(row_id);
                     self.num_tokens.push(num_token);
+                    self.total_tokens += num_token as u64;
                 }
             }
         }
