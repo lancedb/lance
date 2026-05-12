@@ -459,7 +459,7 @@ impl InvertedIndex {
     }
 
     pub async fn merge_segments(
-        segments: &[Arc<InvertedIndex>],
+        segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,

@@ -1010,7 +1010,9 @@ def test_fts_optimize_num_indices_to_merge(tmp_path):
 
     ds.optimize.optimize_indices(num_indices_to_merge=2)
     assert num_indices(ds) == 2
-    assert ds.to_table(full_text_query=PhraseQuery("eta theta", "text"))["id"].to_pylist() == [4]
+    assert ds.to_table(full_text_query=PhraseQuery("eta theta", "text"))[
+        "id"
+    ].to_pylist() == [4]
 
     ds = append_rows({"id": [5], "text": ["iota kappa phrase"]})
     ds.optimize.optimize_indices(num_indices_to_merge=0)
