@@ -523,7 +523,7 @@ impl DecodePageTask for BlobDecodePageTask {
 // Delta blob decoding
 // ---------------------------------------------------------------------------
 
-use arrow_array::{UInt32Array, UInt8Array};
+use arrow_array::{UInt8Array, UInt32Array};
 use lance_core::datatypes::{BlobKind, DELTA_BLOB_DESC_TYPE};
 
 struct DeltaBlobCacheableState {
@@ -605,10 +605,38 @@ impl StructuralPageScheduler for DeltaBlobPageScheduler {
             let descs = make_array(descs.data.into_arrow(DELTA_BLOB_DESC_TYPE.clone(), true)?);
             let descs = descs.as_struct();
 
-            let positions = Arc::new(descs.column(0).as_any().downcast_ref::<UInt64Array>().unwrap().clone());
-            let sizes = Arc::new(descs.column(1).as_any().downcast_ref::<UInt64Array>().unwrap().clone());
-            let kinds = Arc::new(descs.column(2).as_any().downcast_ref::<UInt8Array>().unwrap().clone());
-            let base_offsets = Arc::new(descs.column(3).as_any().downcast_ref::<UInt32Array>().unwrap().clone());
+            let positions = Arc::new(
+                descs
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .clone(),
+            );
+            let sizes = Arc::new(
+                descs
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .clone(),
+            );
+            let kinds = Arc::new(
+                descs
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<UInt8Array>()
+                    .unwrap()
+                    .clone(),
+            );
+            let base_offsets = Arc::new(
+                descs
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .clone(),
+            );
 
             self.positions = Some(positions.clone());
             self.sizes = Some(sizes.clone());
@@ -688,7 +716,7 @@ impl StructuralPageScheduler for DeltaBlobPageScheduler {
 
             let first_row_number = expanded_start + self.row_number;
             let read_fut = io.submit_request(ranges_to_read, first_row_number);
-            let num_output_rows = (range.end - range.start) as u64;
+            let num_output_rows = range.end - range.start;
 
             // Clone the descriptor arrays for the expanded range
             let exp_positions = positions.clone();

@@ -28,7 +28,9 @@ use crate::buffer::LanceBuffer;
 use crate::compression::{CompressionStrategy, DefaultCompressionStrategy};
 use crate::compression_config::CompressionParams;
 use crate::decoder::PageEncoding;
-use crate::encodings::logical::blob::{BlobStructuralEncoder, BlobV2StructuralEncoder, DeltaBlobStructuralEncoder};
+use crate::encodings::logical::blob::{
+    BlobStructuralEncoder, BlobV2StructuralEncoder, DeltaBlobStructuralEncoder,
+};
 use crate::encodings::logical::fixed_size_list::FixedSizeListStructuralEncoder;
 use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::map::MapStructuralEncoder;

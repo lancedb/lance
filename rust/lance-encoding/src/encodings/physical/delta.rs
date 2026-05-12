@@ -84,15 +84,10 @@ impl DeltaIndex {
 
         for &src_offset in entries {
             // Verify the hash match with actual byte comparison and extend
-            let max_len = std::cmp::min(
-                self.source.len() - src_offset,
-                target.len() - target_pos,
-            );
+            let max_len = std::cmp::min(self.source.len() - src_offset, target.len() - target_pos);
 
             let mut len = 0;
-            while len < max_len
-                && self.source[src_offset + len] == target[target_pos + len]
-            {
+            while len < max_len && self.source[src_offset + len] == target[target_pos + len] {
                 len += 1;
             }
 
@@ -368,8 +363,14 @@ pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
 #[derive(Debug)]
 pub enum DeltaError {
     Truncated,
-    SourceSizeMismatch { expected: usize, actual: usize },
-    TargetSizeMismatch { expected: usize, actual: usize },
+    SourceSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    TargetSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
     CopyOutOfBounds {
         offset: usize,
         size: usize,
@@ -443,7 +444,10 @@ mod tests {
         // Simulate two versions of a source file
         let mut source = String::new();
         for i in 0..100 {
-            source.push_str(&format!("line {}: the quick brown fox jumps over the lazy dog\n", i));
+            source.push_str(&format!(
+                "line {}: the quick brown fox jumps over the lazy dog\n",
+                i
+            ));
         }
         let mut target = source.clone();
         // Change a few lines
@@ -566,9 +570,6 @@ fn main() {
         assert!(delta.len() < target.len());
 
         let restored = apply_delta(source.as_bytes(), &delta).unwrap();
-        assert_eq!(
-            String::from_utf8(restored).unwrap(),
-            target,
-        );
+        assert_eq!(String::from_utf8(restored).unwrap(), target,);
     }
 }

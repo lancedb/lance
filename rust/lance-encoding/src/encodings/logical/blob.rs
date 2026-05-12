@@ -324,72 +324,74 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let mut uri_builder = StringBuilder::with_capacity(row_count, row_count * 16);
 
         for i in 0..row_count {
-            let (kind_value, position_value, size_value, blob_id_value, uri_value) =
-                if struct_arr.is_null(i) || kind_col.is_null(i) {
-                    (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
-                } else {
-                    let kind_val = BlobKind::try_from(kind_col.value(i))?;
-                    match kind_val {
-                        BlobKind::Dedicated => (
-                            BlobKind::Dedicated as u8,
-                            0,
-                            blob_size_col.value(i),
-                            blob_id_col.value(i),
-                            "".to_string(),
-                        ),
-                        BlobKind::External => {
-                            let uri = uri_col.value(i).to_string();
-                            let position = if packed_position_col.is_null(i) {
-                                0
-                            } else {
-                                packed_position_col.value(i)
-                            };
-                            let size = if blob_size_col.is_null(i) {
-                                0
-                            } else {
-                                blob_size_col.value(i)
-                            };
-                            let external_base_id = if blob_id_col.is_null(i) {
-                                0
-                            } else {
-                                blob_id_col.value(i)
-                            };
-                            (
-                                BlobKind::External as u8,
-                                position,
-                                size,
-                                external_base_id,
-                                uri,
-                            )
-                        }
-                        BlobKind::Packed => (
-                            BlobKind::Packed as u8,
-                            packed_position_col.value(i),
-                            blob_size_col.value(i),
-                            blob_id_col.value(i),
-                            "".to_string(),
-                        ),
-                        BlobKind::Inline => {
-                            let data_val = data_col.value(i);
-                            let blob_len = data_val.len() as u64;
-                            let position = external_buffers
-                                .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
+            let (kind_value, position_value, size_value, blob_id_value, uri_value) = if struct_arr
+                .is_null(i)
+                || kind_col.is_null(i)
+            {
+                (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
+            } else {
+                let kind_val = BlobKind::try_from(kind_col.value(i))?;
+                match kind_val {
+                    BlobKind::Dedicated => (
+                        BlobKind::Dedicated as u8,
+                        0,
+                        blob_size_col.value(i),
+                        blob_id_col.value(i),
+                        "".to_string(),
+                    ),
+                    BlobKind::External => {
+                        let uri = uri_col.value(i).to_string();
+                        let position = if packed_position_col.is_null(i) {
+                            0
+                        } else {
+                            packed_position_col.value(i)
+                        };
+                        let size = if blob_size_col.is_null(i) {
+                            0
+                        } else {
+                            blob_size_col.value(i)
+                        };
+                        let external_base_id = if blob_id_col.is_null(i) {
+                            0
+                        } else {
+                            blob_id_col.value(i)
+                        };
+                        (
+                            BlobKind::External as u8,
+                            position,
+                            size,
+                            external_base_id,
+                            uri,
+                        )
+                    }
+                    BlobKind::Packed => (
+                        BlobKind::Packed as u8,
+                        packed_position_col.value(i),
+                        blob_size_col.value(i),
+                        blob_id_col.value(i),
+                        "".to_string(),
+                    ),
+                    BlobKind::Inline => {
+                        let data_val = data_col.value(i);
+                        let blob_len = data_val.len() as u64;
+                        let position =
+                            external_buffers.add_buffer(LanceBuffer::from(Buffer::from(data_val)));
 
-                            (
-                                BlobKind::Inline as u8,
-                                position,
-                                blob_len,
-                                0,
-                                "".to_string(),
-                            )
-                        }
-                        BlobKind::DeltaBase | BlobKind::Delta => {
-                            return Err(Error::invalid_input_source(
+                        (
+                            BlobKind::Inline as u8,
+                            position,
+                            blob_len,
+                            0,
+                            "".to_string(),
+                        )
+                    }
+                    BlobKind::DeltaBase | BlobKind::Delta => {
+                        return Err(Error::invalid_input_source(
                                 "DeltaBase/Delta blob kinds are not supported in BlobV2StructuralEncoder; use DeltaBlobStructuralEncoder".into(),
                             ));
-                        }
                     }
-                };
+                }
+            };
 
             kind_builder.append_value(kind_value);
             position_builder.append_value(position_value);
@@ -600,8 +602,7 @@ impl FieldEncoder for DeltaBlobStructuralEncoder {
 
             if should_start_new_base {
                 // Store as base
-                let position =
-                    external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
+                let position = external_buffers.add_buffer(LanceBuffer::from(Buffer::from(value)));
                 positions.push(position);
                 sizes.push(value.len() as u64);
                 kinds.push(BlobKind::DeltaBase as u8);
@@ -1063,14 +1064,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_delta_blob_round_trip_similar_values() {
-        let delta_blob_metadata = HashMap::from([
-            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
-        ]);
+        let delta_blob_metadata = HashMap::from([(
+            lance_arrow::DELTA_BLOB_META_KEY.to_string(),
+            "true".to_string(),
+        )]);
 
         // Simulate successive versions of a source file
-        let v1 = b"fn main() {\n    println!(\"hello world\");\n    let x = 1;\n    let y = 2;\n}\n";
-        let v2 = b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 2;\n}\n";
-        let v3 = b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 3;\n}\n";
+        let v1 =
+            b"fn main() {\n    println!(\"hello world\");\n    let x = 1;\n    let y = 2;\n}\n";
+        let v2 =
+            b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 2;\n}\n";
+        let v3 =
+            b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 3;\n}\n";
         let v4 = b"fn main() {\n    println!(\"hello lance\");\n    let x = 1;\n    let y = 3;\n    let z = 4;\n}\n";
 
         let array = Arc::new(LargeBinaryArray::from(vec![
@@ -1092,18 +1097,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_delta_blob_round_trip_with_nulls() {
-        let delta_blob_metadata = HashMap::from([
-            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
-        ]);
+        let delta_blob_metadata = HashMap::from([(
+            lance_arrow::DELTA_BLOB_META_KEY.to_string(),
+            "true".to_string(),
+        )]);
 
         let v1: &[u8] = b"line 1\nline 2\nline 3\n";
         let v2: &[u8] = b"line 1\nline 2 modified\nline 3\n";
 
-        let array = Arc::new(LargeBinaryArray::from(vec![
-            Some(v1),
-            None,
-            Some(v2),
-        ]));
+        let array = Arc::new(LargeBinaryArray::from(vec![Some(v1), None, Some(v2)]));
 
         check_round_trip_encoding_of_data(
             vec![array],
@@ -1117,20 +1119,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_delta_blob_round_trip_completely_different() {
-        let delta_blob_metadata = HashMap::from([
-            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
-        ]);
+        let delta_blob_metadata = HashMap::from([(
+            lance_arrow::DELTA_BLOB_META_KEY.to_string(),
+            "true".to_string(),
+        )]);
 
         // Completely different values — delta won't help, should fall back to base
         let v1: &[u8] = &vec![0xAAu8; 256];
         let v2: &[u8] = &vec![0xBBu8; 256];
         let v3: &[u8] = &vec![0xCCu8; 256];
 
-        let array = Arc::new(LargeBinaryArray::from(vec![
-            Some(v1),
-            Some(v2),
-            Some(v3),
-        ]));
+        let array = Arc::new(LargeBinaryArray::from(vec![Some(v1), Some(v2), Some(v3)]));
 
         check_round_trip_encoding_of_data(
             vec![array],
@@ -1144,13 +1143,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_delta_blob_round_trip_larger_source_code() {
-        let delta_blob_metadata = HashMap::from([
-            (lance_arrow::DELTA_BLOB_META_KEY.to_string(), "true".to_string()),
-        ]);
+        let delta_blob_metadata = HashMap::from([(
+            lance_arrow::DELTA_BLOB_META_KEY.to_string(),
+            "true".to_string(),
+        )]);
 
         let mut base = String::new();
         for i in 0..50 {
-            base.push_str(&format!("line {}: the quick brown fox jumps over the lazy dog\n", i));
+            base.push_str(&format!(
+                "line {}: the quick brown fox jumps over the lazy dog\n",
+                i
+            ));
         }
         let mut v2 = base.clone();
         v2 = v2.replace("line 10:", "line 10 MODIFIED:");

@@ -17,7 +17,9 @@ use crate::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     },
     data::DictionaryDataBlock,
-    encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler, DeltaBlobPageScheduler},
+    encodings::logical::primitive::blob::{
+        BlobDescriptionPageScheduler, BlobPageScheduler, DeltaBlobPageScheduler,
+    },
     format::{
         ProtobufUtils21,
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
