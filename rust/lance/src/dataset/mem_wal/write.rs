@@ -4104,6 +4104,95 @@ mod shard_writer_tests {
         writer.close().await.expect("Failed to close");
     }
 
+    #[tokio::test]
+    async fn test_shard_writer_with_vector_index_searches_active_memtable() {
+        let vector_dim = 32;
+        let batch_size = 20;
+        let target_id = 1_000i64 + 37;
+
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_shard_writer_hnsw_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 256, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .expect("Failed to create base vector index");
+
+        dataset
+            .initialize_mem_wal(MemWalConfig {
+                shard_spec: None,
+                maintained_indexes: vec!["vector_idx".to_string()],
+            })
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
+            .with_durable_write(true)
+            .with_sync_indexed_write(true);
+
+        let writer = dataset
+            .mem_wal_writer(shard_id, config)
+            .await
+            .expect("Failed to create writer");
+
+        let batches: Vec<RecordBatch> = (0..4)
+            .map(|i| {
+                create_test_batch(
+                    &schema,
+                    1_000 + (i * batch_size) as i64,
+                    batch_size,
+                    vector_dim,
+                )
+            })
+            .collect();
+        writer.put(batches).await.expect("Failed to write");
+
+        let query = Float32Array::from_iter_values(
+            (0..vector_dim as usize).map(|d| (target_id as f32 * 0.1 + d as f32 * 0.01).sin()),
+        );
+        let mut scanner = writer.scan().await.unwrap();
+        scanner.nearest("vector", Arc::new(query), 80);
+        let result = scanner.try_into_batch().await.expect("Failed to scan");
+
+        assert!(result.num_rows() > 0, "vector query returned no rows");
+        let id_col = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let dist_col = result
+            .column_by_name("_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let target_idx = (0..result.num_rows())
+            .find(|&idx| id_col.value(idx) == target_id)
+            .expect("target vector was not returned by active MemTable HNSW search");
+        assert!(
+            dist_col.value(target_idx) < 1e-6,
+            "expected self-match distance near zero, got {}",
+            dist_col.value(target_idx)
+        );
+
+        writer.close().await.expect("Failed to close");
+    }
+
     /// Test shard writer against S3 with IVF-PQ, BTree, and FTS indexes (requires DATASET_PREFIX env var)
     /// Run with: DATASET_PREFIX=s3://bucket/path cargo test -p lance --release shard_writer_tests::test_shard_writer_s3_ivfpq -- --nocapture --ignored
     #[tokio::test]

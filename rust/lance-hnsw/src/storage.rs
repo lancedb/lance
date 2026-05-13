@@ -199,6 +199,11 @@ impl ArrowFixedSizeListVectorStore {
         self.committed_len.load(Ordering::Acquire)
     }
 
+    /// Number of `f32` values per vector.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
     /// Append one Arrow `FixedSizeList<Float32>` batch by reference.
     pub fn append_batch(
         &self,
