@@ -1184,7 +1184,7 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
-        dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1329,6 +1329,24 @@ mod tests {
 
         async fn create_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Create).await
+        }
+
+        // Auto-cleanup is disabled by default; this helper creates a dataset
+        // with auto-cleanup enabled using the default interval/older_than.
+        async fn create_some_data_with_auto_cleanup(&self) -> Result<()> {
+            Dataset::write(
+                some_batch(),
+                &self.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(self.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    auto_cleanup: Some(AutoCleanupParams::default()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+            Ok(())
         }
 
         async fn overwrite_some_data(&self) -> Result<()> {
@@ -1907,7 +1925,7 @@ mod tests {
         // commit.
         let fixture = MockDatasetFixture::try_new().unwrap();
 
-        fixture.create_some_data().await.unwrap();
+        fixture.create_some_data_with_auto_cleanup().await.unwrap();
 
         let dataset_config = &fixture.open().await.unwrap().manifest.config;
         let cleanup_interval: usize = dataset_config
