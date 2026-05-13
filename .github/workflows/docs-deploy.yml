@@ -33,7 +33,8 @@ jobs:
       - name: Checkout lance-namespace
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          repository: lancedb/lance-namespace
+          repository: jackye1995/lance-namespace
+          ref: ns-catalog-split
           path: lance-namespace
       - name: Checkout lance-ray
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
