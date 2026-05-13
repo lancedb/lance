@@ -777,6 +777,7 @@ pub struct ComplexAllNullScheduler {
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
+    max_rep: u16,
     max_visible_level: u16,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
@@ -793,6 +794,7 @@ impl ComplexAllNullScheduler {
         num_rep_values: u64,
         num_def_values: u64,
     ) -> Self {
+        let max_rep = def_meaning.iter().filter(|l| l.is_list()).count() as u16;
         let max_visible_level = def_meaning
             .iter()
             .take_while(|l| !l.is_list())
@@ -802,6 +804,7 @@ impl ComplexAllNullScheduler {
             buffer_offsets_and_sizes,
             def_meaning,
             repdef: None,
+            max_rep,
             max_visible_level,
             rep_decompressor,
             def_decompressor,
@@ -940,7 +943,10 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             def: self.repdef.as_ref().unwrap().def.clone(),
             num_rows,
             def_meaning: self.def_meaning.clone(),
+            max_rep: self.max_rep,
             max_visible_level: self.max_visible_level,
+            cursor_row: 0,
+            cursor_level: 0,
         }) as Box<dyn StructuralPageDecoder>;
         let page_load_task = PageLoadTask {
             decoder_fut: std::future::ready(Ok(decoder)).boxed(),
@@ -957,7 +963,10 @@ pub struct ComplexAllNullPageDecoder {
     def: Option<ScalarBuffer<u16>>,
     num_rows: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_rep: u16,
     max_visible_level: u16,
+    cursor_row: u64,
+    cursor_level: usize,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -978,13 +987,80 @@ impl ComplexAllNullPageDecoder {
         }
         ranges
     }
+
+    fn take_row(&mut self) -> Result<(Range<usize>, u64)> {
+        let start = self.cursor_level;
+        let end = if let Some(rep) = &self.rep {
+            if start >= rep.len() {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: repetition buffer too short",
+                ));
+            }
+            if rep[start] != self.max_rep {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: row did not start at max repetition level",
+                ));
+            }
+            let mut end = start + 1;
+            while end < rep.len() && rep[end] != self.max_rep {
+                end += 1;
+            }
+            end
+        } else {
+            start + 1
+        };
+
+        let visible = if let Some(def) = &self.def {
+            if end > def.len() {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: definition buffer too short",
+                ));
+            }
+            def[start..end]
+                .iter()
+                .filter(|d| **d <= self.max_visible_level)
+                .count() as u64
+        } else {
+            (end - start) as u64
+        };
+
+        self.cursor_level = end;
+        self.cursor_row += 1;
+        Ok((start..end, visible))
+    }
+
+    fn skip_to_row(&mut self, target_row: u64) -> Result<()> {
+        while self.cursor_row < target_row {
+            self.take_row()?;
+        }
+        Ok(())
+    }
 }
 
 impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
+        let mut level_slices: Vec<Range<usize>> = Vec::new();
+        let mut visible_items_total = 0;
+
+        for range in drained_ranges {
+            self.skip_to_row(range.start)?;
+            for _ in range.start..range.end {
+                let (level_range, visible) = self.take_row()?;
+                visible_items_total += visible;
+                if let Some(last) = level_slices.last_mut()
+                    && last.end == level_range.start
+                {
+                    last.end = level_range.end;
+                    continue;
+                }
+                level_slices.push(level_range);
+            }
+        }
+
         Ok(Box::new(DecodeComplexAllNullTask {
-            ranges: drained_ranges,
+            level_slices,
+            visible_items_total,
             rep: self.rep.clone(),
             def: self.def.clone(),
             def_meaning: self.def_meaning.clone(),
@@ -997,11 +1073,12 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     }
 }
 
-/// We use `ranges` to slice into `rep` and `def` and create rep/def buffers
+/// We use `level_slices` to slice into `rep` and `def` and create rep/def buffers
 /// for the null data.
 #[derive(Debug)]
 pub struct DecodeComplexAllNullTask {
-    ranges: Vec<Range<u64>>,
+    level_slices: Vec<Range<usize>>,
+    visible_items_total: u64,
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
@@ -1009,19 +1086,16 @@ pub struct DecodeComplexAllNullTask {
 }
 
 impl DecodeComplexAllNullTask {
-    fn decode_level(
-        &self,
-        levels: &Option<ScalarBuffer<u16>>,
-        num_values: u64,
-    ) -> Option<Vec<u16>> {
+    fn decode_level(&self, levels: &Option<ScalarBuffer<u16>>) -> Option<Vec<u16>> {
         levels.as_ref().map(|levels| {
-            let mut referenced_levels = Vec::with_capacity(num_values as usize);
-            for range in &self.ranges {
-                referenced_levels.extend(
-                    levels[range.start as usize..range.end as usize]
-                        .iter()
-                        .copied(),
-                );
+            let num_levels = self
+                .level_slices
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum();
+            let mut referenced_levels = Vec::with_capacity(num_levels);
+            for range in &self.level_slices {
+                referenced_levels.extend(levels[range.start..range.end].iter().copied());
             }
             referenced_levels
         })
@@ -1030,9 +1104,8 @@ impl DecodeComplexAllNullTask {
 
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let rep = self.decode_level(&self.rep, num_values);
-        let def = self.decode_level(&self.def, num_values);
+        let rep = self.decode_level(&self.rep);
+        let def = self.decode_level(&self.def);
 
         // If there are definition levels there may be empty / null lists which are not visible
         // in the items array.  We need to account for that here to figure out how many values
@@ -1040,7 +1113,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         let num_values = if let Some(def) = &def {
             def.iter().filter(|&d| *d <= self.max_visible_level).count() as u64
         } else {
-            num_values
+            self.visible_items_total
         };
 
         let data = DataBlock::AllNull(AllNullDataBlock { num_values });
