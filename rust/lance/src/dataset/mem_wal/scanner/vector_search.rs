@@ -11,9 +11,11 @@ use arrow_array::FixedSizeListArray;
 use arrow_schema::SortOptions;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use lance_core::Result;
@@ -181,30 +183,45 @@ impl LsmVectorSearchPlanner {
             return self.empty_plan(projection);
         }
 
+        let has_bloom = !self.bloom_filters.is_empty();
+        let canonical_schema = self.canonical_output_schema(projection);
+
         let mut knn_plans = Vec::new();
         for source in &sources {
             let generation = source.generation();
             let knn = self
                 .build_knn_plan(source, query_vector, k, nprobes, projection)
                 .await?;
-            let tagged: Arc<dyn ExecutionPlan> = Arc::new(MemtableGenTagExec::new(knn, generation));
-            knn_plans.push(tagged);
+            // Normalize each source to a canonical [projection..., _distance] schema.
+            // The base/flushed arms emit an extra `_rowid` (from fast_search) and the
+            // active arm doesn't — without this step, UnionExec rejects the mismatched
+            // schemas and the query panics before _distance reaches the caller.
+            let normalized = project_to_canonical(knn, &canonical_schema)?;
+            let plan: Arc<dyn ExecutionPlan> = if has_bloom {
+                Arc::new(MemtableGenTagExec::new(normalized, generation))
+            } else {
+                normalized
+            };
+            knn_plans.push(plan);
         }
 
         #[allow(deprecated)]
         let union: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
 
-        let filtered: Arc<dyn ExecutionPlan> = if !self.bloom_filters.is_empty() {
-            Arc::new(FilterStaleExec::new(
+        let merged: Arc<dyn ExecutionPlan> = if has_bloom {
+            let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterStaleExec::new(
                 union,
                 self.pk_columns.clone(),
                 self.bloom_filters.clone(),
-            ))
+            ));
+            // FilterStaleExec needs `_memtable_gen`; drop it before returning so the
+            // output matches `empty_plan` and excludes internal LSM bookkeeping cols.
+            project_to_canonical(filtered, &canonical_schema)?
         } else {
             union
         };
 
-        let distance_idx = filtered.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
+        let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
             lance_core::Error::invalid_input(format!(
                 "Column '{}' not found in schema",
                 DISTANCE_COLUMN
@@ -223,10 +240,39 @@ impl LsmVectorSearchPlanner {
             lance_core::Error::internal("Failed to create LexOrdering".to_string())
         })?;
 
-        let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, filtered));
+        // UnionExec emits one partition per input source, but our final SortExec
+        // doesn't merge across partitions on its own — without coalescing, rows
+        // from all-but-the-first partition (and their `_distance` values) silently
+        // vanish in the output. Coalesce into a single partition so the sort and
+        // limit see every KNN candidate.
+        let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(merged));
+        let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, coalesced));
         let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sorted, 0, Some(k)));
 
         Ok(limited)
+    }
+
+    /// Build the canonical output schema for this search: projection cols + `_distance`.
+    ///
+    /// Matches `empty_plan` so callers see the same shape regardless of whether
+    /// any source actually produced rows.
+    fn canonical_output_schema(&self, projection: Option<&[String]>) -> SchemaRef {
+        let cols = self.build_projection_for_knn(projection);
+        let mut fields: Vec<Arc<Field>> = cols
+            .iter()
+            .filter_map(|name| {
+                self.base_schema
+                    .field_with_name(name)
+                    .ok()
+                    .map(|f| Arc::new(f.clone()))
+            })
+            .collect();
+        fields.push(Arc::new(Field::new(
+            DISTANCE_COLUMN,
+            DataType::Float32,
+            true,
+        )));
+        Arc::new(Schema::new(fields))
     }
 
     /// Build KNN plan for a single data source.
@@ -283,9 +329,11 @@ impl LsmVectorSearchPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-                if let Some(cols) = projection {
-                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-                }
+                // Use the same projection (PK auto-included) the base/flushed arms use,
+                // otherwise the active arm produces a different schema and the staleness
+                // filter loses the PK column it needs for bloom-filter hashing.
+                let cols = self.build_projection_for_knn(projection);
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 let query_arr: Arc<dyn Array> = Arc::new(query_vector.clone());
                 scanner.nearest(&self.vector_column, query_arr, k);
                 scanner.nprobes(nprobes);
@@ -342,6 +390,42 @@ impl LsmVectorSearchPlanner {
         let schema = Arc::new(Schema::new(fields));
         Ok(Arc::new(EmptyExec::new(schema)))
     }
+}
+
+/// Project `plan` to match `target_schema` exactly, by column name.
+///
+/// Used to reconcile per-source KNN outputs (e.g. Lance's `fast_search` adds
+/// `_rowid`, the MemTable scanner doesn't) and to strip internal LSM columns
+/// like `_memtable_gen` before returning.
+fn project_to_canonical(
+    plan: Arc<dyn ExecutionPlan>,
+    target_schema: &SchemaRef,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let input_schema = plan.schema();
+    let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(target_schema.fields().len());
+    for field in target_schema.fields() {
+        let name = field.name();
+        let (idx, _) = input_schema.column_with_name(name).ok_or_else(|| {
+            lance_core::Error::internal(format!(
+                "Column '{}' missing from KNN source schema (have: {:?})",
+                name,
+                input_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>()
+            ))
+        })?;
+        project_exprs.push((
+            Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>,
+            name.clone(),
+        ));
+    }
+    let projection_exec = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!("Failed to build canonical ProjectionExec: {}", e))
+    })?;
+    Ok(Arc::new(projection_exec))
 }
 
 /// Convert a (typically single-row) FixedSizeList query into the array shape
@@ -482,6 +566,364 @@ mod tests {
 
         assert!(cols.contains(&"vector".to_string()));
         assert!(cols.contains(&"id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_base_plus_active_returns_distance() {
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base_batch = create_test_batch(&schema, &[10, 20, 30]);
+        let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
+
+        // Active memtable with HNSW index over the "vector" column.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let batch = create_test_batch(&schema, &[1, 2, 3, 4]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_active_memtable(
+            shard_id,
+            ActiveMemTableRef {
+                batch_store,
+                index_store,
+                schema: schema.clone(),
+                generation: 1,
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 3, 1, None)
+            .await
+            .expect("planner should produce a plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "expected at least one result row");
+
+        let out_schema = batches[0].schema();
+        let out_cols: Vec<String> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            out_schema.field_with_name(DISTANCE_COLUMN).is_ok(),
+            "output schema is missing `_distance` column. Got: {:?}",
+            out_cols
+        );
+        // Internal columns must not leak: `_rowid` (added by Lance's fast_search
+        // in the base/flushed arms) and `_memtable_gen` (added by the LSM merge
+        // when bloom filters are present) are bookkeeping, not API.
+        assert!(
+            out_schema.field_with_name("_rowid").is_err(),
+            "`_rowid` leaked into output: {:?}",
+            out_cols
+        );
+        assert!(
+            out_schema
+                .field_with_name(super::super::exec::MEMTABLE_GEN_COLUMN)
+                .is_err(),
+            "`_memtable_gen` leaked into output: {:?}",
+            out_cols
+        );
+
+        // The nearest neighbor to the query vector should be id=1 (exact match),
+        // and its `_distance` must be ~0 — verifying both the column is present
+        // and the values are correct.
+        let id_col = batches[0]
+            .column_by_name("id")
+            .expect("id column missing")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32");
+        let dist_col = batches[0]
+            .column_by_name(DISTANCE_COLUMN)
+            .expect("_distance column missing")
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .expect("_distance column should be Float32");
+        assert_eq!(id_col.value(0), 1, "expected id=1 as nearest neighbor");
+        assert!(
+            dist_col.value(0).abs() < 1e-3,
+            "expected near-zero distance for self-match, got {}",
+            dist_col.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_active_memtable_with_projection_returns_distance_and_pk() {
+        // Regression for: active arm previously did NOT call `build_projection_for_knn`,
+        // so when the caller passed `projection=Some([...])`, the active arm's output
+        // dropped the PK column (and the staleness/dedup pipeline lost its hash input).
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let batch = create_test_batch(&schema, &[1, 2, 3, 4]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_active_memtable(
+                shard_id,
+                ActiveMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        // Caller asks for ONLY "vector"; PK "id" must still be in output because
+        // canonical_output_schema auto-includes it.
+        let query = create_query_vector();
+        let projection = vec!["vector".to_string()];
+        let plan = planner
+            .plan_search(&query, 3, 1, Some(&projection))
+            .await
+            .expect("planner should produce a plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "expected at least one result row");
+
+        let out_schema = batches[0].schema();
+        assert!(
+            out_schema.field_with_name("id").is_ok(),
+            "PK column `id` should be auto-included even when user projects only `vector`"
+        );
+        assert!(out_schema.field_with_name("vector").is_ok());
+        assert!(out_schema.field_with_name(DISTANCE_COLUMN).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_with_bloom_filter_strips_memtable_gen() {
+        // Regression for: when bloom filters are configured, FilterStaleExec preserves
+        // its `_memtable_gen` input column. Without the post-filter projection that
+        // strips it, the column would leak into the user-visible output.
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::scalar::bloomfilter::sbbf::Sbbf;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let batch = create_test_batch(&schema, &[1, 2, 3, 4]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_active_memtable(
+                shard_id,
+                ActiveMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+            );
+
+        // An empty bloom filter — no IDs marked, so FilterStaleExec keeps everything.
+        // The point of this test isn't filtering correctness, it's verifying the
+        // post-filter projection strips `_memtable_gen` from the output.
+        let bloom = Arc::new(Sbbf::with_ndv_fpp(8, 0.01).unwrap());
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        )
+        .with_bloom_filter(2, bloom);
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 3, 1, None)
+            .await
+            .expect("planner should produce a plan");
+
+        // Plan must include FilterStaleExec (proves bloom-filter path was taken).
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_str.contains("FilterStaleExec"),
+            "expected bloom-filter path with FilterStaleExec, got:\n{}",
+            plan_str
+        );
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "expected at least one result row");
+
+        let out_schema = batches[0].schema();
+        assert!(out_schema.field_with_name(DISTANCE_COLUMN).is_ok());
+        assert!(
+            out_schema
+                .field_with_name(super::super::exec::MEMTABLE_GEN_COLUMN)
+                .is_err(),
+            "`_memtable_gen` leaked into output when bloom filters were configured: {:?}",
+            out_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_active_memtable_returns_distance() {
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // Active memtable with HNSW index over the "vector" column.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let batch = create_test_batch(&schema, &[1, 2, 3, 4]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_active_memtable(
+                shard_id,
+                ActiveMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 3, 1, None)
+            .await
+            .expect("planner should produce a plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "expected at least one result row");
+
+        let out_schema = batches[0].schema();
+        assert!(
+            out_schema.field_with_name(DISTANCE_COLUMN).is_ok(),
+            "output schema is missing `_distance` column. Got: {:?}",
+            out_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
