@@ -49,7 +49,8 @@ jobs:
       - name: Checkout lance-namespace-impls
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          repository: lance-format/lance-namespace-impls
+          repository: jackye1995/lance-namespace-impls
+          ref: jack/ns-catalog-split
           path: lance-namespace-impls
       - name: Checkout lance-duckdb
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
