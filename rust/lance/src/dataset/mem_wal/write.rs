@@ -1709,6 +1709,64 @@ impl ShardWriter {
         }
     }
 
+    /// Seal the active memtable so it's queued for L0 flush. No-op when
+    /// the active memtable is empty. Errors in WAL-only mode. Pair with
+    /// [`Self::wait_for_flush_drain`] to wait for the queued flush.
+    #[instrument(name = "sw_force_seal_active", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
+    pub async fn force_seal_active(&self) -> Result<()> {
+        match &self.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                ..
+            } => {
+                let mut state = state.write().await;
+                if state.memtable.batch_count() == 0 {
+                    return Ok(());
+                }
+                writer_state.freeze_memtable(&mut state)?;
+                Ok(())
+            }
+            WriterMode::WalOnly { .. } => Err(Error::invalid_input(
+                "force_seal_active not available in WAL-only mode (no MemTable)",
+            )),
+        }
+    }
+
+    /// Block until every frozen memtable in the L0 flush queue has
+    /// landed and been recorded in the manifest. Does not wait on the
+    /// active memtable — call [`Self::force_seal_active`] first if you
+    /// want everything-on-disk. Errors in WAL-only mode.
+    #[instrument(name = "sw_wait_for_flush_drain", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
+    pub async fn wait_for_flush_drain(&self) -> Result<()> {
+        let state_lock = match &self.mode {
+            WriterMode::MemTable { state, .. } => state,
+            WriterMode::WalOnly { .. } => {
+                return Err(Error::invalid_input(
+                    "wait_for_flush_drain not available in WAL-only mode (no MemTable)",
+                ));
+            }
+        };
+
+        loop {
+            let watchers: Vec<DurabilityWatcher> = {
+                let st = state_lock.read().await;
+                st.frozen_flush_watchers
+                    .iter()
+                    .map(|(_, w)| w.clone())
+                    .collect()
+            };
+            if watchers.is_empty() {
+                return Ok(());
+            }
+            for mut w in watchers {
+                // `None` from the cell means the writer is shutting
+                // down; treat as drained.
+                let _ = w.await_value().await;
+            }
+        }
+    }
+
     /// Close the writer gracefully.
     ///
     /// Flushes pending data and shuts down background tasks.
@@ -3495,6 +3553,58 @@ mod tests {
             snapshot.index_update_count, 0,
             "WAL-only mode must never trigger an index update"
         );
+    }
+
+    #[tokio::test]
+    async fn test_force_seal_active_and_wait_for_flush_drain() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        // Thresholds high enough that auto-flush won't fire; the seal is
+        // the only thing that should rotate the memtable.
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+        let flushed_before = writer
+            .manifest()
+            .await
+            .unwrap()
+            .map(|m| m.flushed_generations.len())
+            .unwrap_or(0);
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(stats.generation, initial_gen + 1);
+        assert_eq!(stats.batch_count, 0);
+
+        let manifest = writer
+            .manifest()
+            .await
+            .unwrap()
+            .expect("manifest should exist after flush");
+        assert_eq!(manifest.flushed_generations.len(), flushed_before + 1);
+
+        writer.close().await.unwrap();
     }
 }
 
