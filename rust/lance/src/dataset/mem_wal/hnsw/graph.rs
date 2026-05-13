@@ -17,7 +17,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::VectorSource;
+use super::storage::VectorSource;
 
 const HNSW_METADATA_KEY: &str = "lance:hnsw";
 const VECTOR_ID_COL: &str = "__vector_id";
@@ -1194,8 +1194,8 @@ mod tests {
     use lance_index::vector::v3::subindex::IvfSubIndex;
     use lance_linalg::distance::DistanceType;
 
+    use super::super::{ArrowFixedSizeListVectorStore, VectorSource};
     use super::*;
-    use crate::{ArrowFixedSizeListVectorStore, VectorSource};
 
     fn fsl(rows: usize, dim: usize) -> Arc<FixedSizeListArray> {
         let mut values = Vec::with_capacity(rows * dim);

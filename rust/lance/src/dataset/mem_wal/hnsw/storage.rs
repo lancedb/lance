@@ -13,7 +13,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use lance_core::{Error, ROW_ID, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2, cosine_distance};
 
-use crate::ScoredPoint;
+use super::graph::ScoredPoint;
 
 /// Vector column name used by Lance's flat vector storage batches.
 pub const FLAT_COLUMN: &str = "flat";

@@ -3,10 +3,10 @@
 
 //! In-memory HNSW index for vector similarity search.
 //!
-//! This is the MemWAL adapter around `lance-hnsw`.  Vectors are retained by
-//! reference from the writer's Arrow batches, inserts are published under a
-//! multi-reader / single-writer contract, and flush snapshots are emitted in
-//! Lance's on-disk HNSW + FLAT storage format.
+//! This is the MemWAL adapter around the local HNSW graph. Vectors are
+//! retained by reference from the writer's Arrow batches, inserts are
+//! published under a multi-reader / single-writer contract, and flush
+//! snapshots are emitted in Lance's on-disk HNSW + FLAT storage format.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -15,11 +15,11 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use lance_core::{Error, Result};
-use lance_hnsw::{ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams};
 use lance_index::vector::hnsw::{HNSW, builder::HnswBuildParams};
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
 
+use super::super::hnsw::{ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams};
 use super::super::memtable::batch_store::StoredBatch;
 
 pub use super::RowPosition;

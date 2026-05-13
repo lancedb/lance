@@ -29,12 +29,12 @@ fi
 mkdir -p "$REPO_ROOT/target/release"
 
 echo "=== Building Lance HNSW benchmark ==="
-cargo build --release -p lance-hnsw --bin lance_hnsw_bench
+cargo bench -p lance --bench mem_wal_hnsw_bench --no-run
 
 echo "=== Building hnswlib benchmark ==="
 g++ -std=c++17 -O3 -march=native -DNDEBUG -pthread \
     -I "$HNSWLIB_DIR" \
-    "$SCRIPT_DIR/hnswlib_bench.cpp" \
+    "$SCRIPT_DIR/mem_wal_hnswlib_bench.cpp" \
     -o "$REPO_ROOT/target/release/hnswlib_bench"
 
 COMMON_ARGS=(
@@ -53,7 +53,7 @@ COMMON_ARGS=(
 )
 
 echo "=== Running Lance HNSW ==="
-"$REPO_ROOT/target/release/lance_hnsw_bench" "${COMMON_ARGS[@]}"
+"$(find "$REPO_ROOT/target/release/deps" -maxdepth 1 -type f -perm -111 -name 'mem_wal_hnsw_bench-*' | sort | tail -n 1)" "${COMMON_ARGS[@]}"
 
 echo "=== Running hnswlib ==="
 "$REPO_ROOT/target/release/hnswlib_bench" "${COMMON_ARGS[@]}"

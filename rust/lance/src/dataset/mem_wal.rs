@@ -33,6 +33,7 @@
 //! monotonically increasing writer epochs in the shard manifest.
 
 mod api;
+mod hnsw;
 mod index;
 mod manifest;
 pub mod memtable;

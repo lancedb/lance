@@ -8,7 +8,6 @@ members = [
     "rust/lance-encoding",
     "rust/lance-file",
     "rust/lance-geo",
-    "rust/lance-hnsw",
     "rust/lance-index",
     "rust/lance-io",
     "rust/lance-linalg",
@@ -64,7 +63,6 @@ lance-datagen = { version = "=7.0.0-beta.9", path = "./rust/lance-datagen" }
 lance-encoding = { version = "=7.0.0-beta.9", path = "./rust/lance-encoding" }
 lance-file = { version = "=7.0.0-beta.9", path = "./rust/lance-file" }
 lance-geo = { version = "=7.0.0-beta.9", path = "./rust/lance-geo" }
-lance-hnsw = { version = "=7.0.0-beta.9", path = "./rust/lance-hnsw" }
 lance-index = { version = "=7.0.0-beta.9", path = "./rust/lance-index" }
 lance-io = { version = "=7.0.0-beta.9", path = "./rust/lance-io", default-features = false }
 lance-linalg = { version = "=7.0.0-beta.9", path = "./rust/lance-linalg" }

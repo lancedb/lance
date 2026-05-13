@@ -4325,6 +4325,7 @@ version = "7.0.0-beta.9"
 dependencies = [
  "all_asserts",
  "approx",
+ "arc-swap",
  "arrow",
  "arrow-arith",
  "arrow-array",
@@ -4347,6 +4348,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "crossbeam-queue",
  "crossbeam-skiplist",
  "dashmap",
  "datafusion",
@@ -4371,7 +4373,6 @@ dependencies = [
  "lance-datagen",
  "lance-encoding",
  "lance-file",
- "lance-hnsw",
  "lance-index",
  "lance-io",
  "lance-linalg",
@@ -4395,6 +4396,7 @@ dependencies = [
  "prost-types",
  "protobuf-src",
  "rand 0.9.4",
+ "rayon",
  "reqwest 0.12.28",
  "roaring",
  "rstest",
@@ -4686,23 +4688,6 @@ dependencies = [
  "geodatafusion",
  "lance-core",
  "serde",
-]
-
-[[package]]
-name = "lance-hnsw"
-version = "7.0.0-beta.8"
-dependencies = [
- "arc-swap",
- "arrow-array",
- "arrow-schema",
- "crossbeam-queue",
- "lance-core",
- "lance-index",
- "lance-linalg",
- "rand 0.9.4",
- "rayon",
- "serde",
- "serde_json",
 ]
 
 [[package]]

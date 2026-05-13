@@ -9,11 +9,13 @@ use std::time::Instant;
 
 use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow_schema::{DataType, Field};
-use lance_hnsw::{
-    ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams, VectorSource,
-};
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
+
+#[path = "../src/dataset/mem_wal/hnsw/mod.rs"]
+mod hnsw;
+
+use hnsw::{ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams, VectorSource};
 
 #[derive(Debug, Clone)]
 struct Args {
