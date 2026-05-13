@@ -251,5 +251,9 @@ harness = false
 name = "manifest_commit"
 harness = false
 
+[[bench]]
+name = "concurrent_append"
+harness = false
+
 [lints]
 workspace = true
