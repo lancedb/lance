@@ -905,6 +905,56 @@ public class DatasetTest {
   }
 
   @Test
+  void testTakeRows(@TempDir Path tempDir) throws IOException, ClosedChannelException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        // For a single-fragment dataset, physical row IDs match row offsets
+        List<Long> rowIds = Arrays.asList(1L, 4L);
+        List<String> columns = Arrays.asList("id", "name");
+        try (ArrowReader reader = dataset2.takeRows(rowIds, columns)) {
+          while (reader.loadNextBatch()) {
+            VectorSchemaRoot result = reader.getVectorSchemaRoot();
+            assertNotNull(result);
+            assertEquals(rowIds.size(), result.getRowCount());
+
+            for (int i = 0; i < rowIds.size(); i++) {
+              assertEquals(rowIds.get(i).intValue(), result.getVector("id").getObject(i));
+              assertNotNull(result.getVector("name").getObject(i));
+            }
+          }
+        }
+
+        // Verify input order is preserved: reversed input yields reversed output
+        List<Long> reversed = Arrays.asList(4L, 1L);
+        try (ArrowReader reader = dataset2.takeRows(reversed, columns)) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertEquals(4, result.getVector("id").getObject(0));
+          assertEquals(1, result.getVector("id").getObject(1));
+        }
+
+        // Empty row IDs should be rejected
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              dataset2.takeRows(Collections.emptyList(), columns);
+            });
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              dataset2.takeRows(null, columns);
+            });
+      }
+    }
+  }
+
+  @Test
   void testSample(@TempDir Path tempDir) throws IOException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();

@@ -791,6 +791,42 @@ public class Dataset implements Closeable {
   private native byte[] nativeTake(List<Long> indices, List<String> columns);
 
   /**
+   * Select rows of data by their physical row IDs.
+   *
+   * <p>Row IDs are stable, globally unique identifiers assigned to each row in the dataset. They
+   * persist across dataset versions and can be obtained from scan results that include the {@code
+   * _rowid} system column.
+   *
+   * <p>Unlike {@link #take(List, List)}, which accepts logical row offsets (positions), this method
+   * accepts physical row IDs that remain valid even after compaction or deletion.
+   *
+   * @param rowIds the physical row IDs to retrieve (from the _rowid column)
+   * @param columns the columns to include in the result
+   * @return an ArrowReader containing the requested rows in input order
+   * @throws IOException if a row ID does not exist or an I/O error occurs
+   */
+  public ArrowReader takeRows(List<Long> rowIds, List<String> columns) throws IOException {
+    Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    Preconditions.checkArgument(
+        rowIds != null && !rowIds.isEmpty(), "rowIds cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      byte[] arrowData = nativeTakeRows(rowIds, columns);
+      ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
+      ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
+      return new ArrowStreamReader(readChannel, allocator) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          readChannel.close();
+          byteArrayInputStream.close();
+        }
+      };
+    }
+  }
+
+  private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
+
+  /**
    * Randomly sample n rows from the dataset.
    *
    * <p>The returned rows are in row-id order (not random order), which allows the underlying take
