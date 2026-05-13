@@ -250,8 +250,15 @@ impl LsmVectorSearchPlanner {
         // the pre-sorted streams (also capped at k), producing the final top-k.
         // This avoids serializing the merge on a single thread and pushes the k-limit
         // into per-partition work, where it actually helps.
-        let per_partition_sorted: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(lex_ordering.clone(), merged).with_fetch(Some(k)));
+        //
+        // `with_preserve_partitioning(true)` is load-bearing: without it, SortExec
+        // declares it needs a SinglePartition input but doesn't coalesce on its own —
+        // execute(0) silently reads only partition 0 of the union and drops the rest.
+        let per_partition_sorted: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(lex_ordering.clone(), merged)
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(k)),
+        );
         let merged_sorted: Arc<dyn ExecutionPlan> = Arc::new(
             SortPreservingMergeExec::new(lex_ordering, per_partition_sorted).with_fetch(Some(k)),
         );
