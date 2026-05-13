@@ -27,6 +27,7 @@ theme:
   features:
     - navigation.tabs
     - navigation.sections
+    - navigation.expand
     - navigation.instant
     - navigation.indexes
     - navigation.tracking
