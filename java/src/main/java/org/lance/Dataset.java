@@ -793,13 +793,6 @@ public class Dataset implements Closeable {
   /**
    * Select rows of data by their physical row IDs.
    *
-   * <p>Row IDs are stable, globally unique identifiers assigned to each row in the dataset. They
-   * persist across dataset versions and can be obtained from scan results that include the {@code
-   * _rowid} system column.
-   *
-   * <p>Unlike {@link #take(List, List)}, which accepts logical row offsets (positions), this method
-   * accepts physical row IDs that remain valid even after compaction or deletion.
-   *
    * @param rowIds the physical row IDs to retrieve (from the _rowid column)
    * @param columns the columns to include in the result
    * @return an ArrowReader containing the requested rows in input order
