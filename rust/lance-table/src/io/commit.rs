@@ -306,7 +306,7 @@ struct VersionHint {
 /// so the hint would only add a write per commit for nothing. We write (and
 /// read) it only on stores where listing is not lexicographically ordered —
 /// S3 Express and the local filesystem.
-fn uses_version_hint(object_store: &ObjectStore) -> bool {
+pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
     !object_store.list_is_lexically_ordered
 }
 

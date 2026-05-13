@@ -9546,8 +9546,9 @@ mod tests {
             .await
             .unwrap();
 
-        // table_exists first checks __manifest (one list on __manifest/_versions),
-        // then falls back to the table directory (one list_with_delimiter on test_table.lance).
+        // table_exists first checks __manifest (which on local FS uses the
+        // version hint and does no list call), then falls back to the table
+        // directory (one list_with_delimiter on test_table.lance).
         listing_count.store(0, Ordering::SeqCst);
 
         let mut exists_req = TableExistsRequest::new();
@@ -9556,9 +9557,9 @@ mod tests {
 
         let count = listing_count.load(Ordering::SeqCst);
         assert_eq!(
-            count, 2,
-            "Expected exactly 2 listing calls for table_exists with migration mode \
-             (manifest reload + table directory fallback), but got {}",
+            count, 1,
+            "Expected exactly 1 listing call for table_exists with migration mode \
+             (table directory fallback; manifest reload uses the version hint), but got {}",
             count
         );
 
@@ -9571,9 +9572,9 @@ mod tests {
 
         let count = listing_count.load(Ordering::SeqCst);
         assert_eq!(
-            count, 2,
-            "Expected exactly 2 listing calls for describe_table with migration mode \
-             (manifest reload + table directory fallback), but got {}",
+            count, 1,
+            "Expected exactly 1 listing call for describe_table with migration mode \
+             (table directory fallback; manifest reload uses the version hint), but got {}",
             count
         );
     }
