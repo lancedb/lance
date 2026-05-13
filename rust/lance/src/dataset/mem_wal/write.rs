@@ -726,15 +726,15 @@ async fn replay_memtable_from_wal(
     manifest: &ShardManifest,
     memtable: &mut MemTable,
 ) -> Result<u64> {
-    // Fresh shards (no flushes yet) start replay at position 0; otherwise
-    // start one past the last covered position. Distinguishing "no flushes"
-    // from "flushed up to position 0" requires `flushed_generations` since
-    // `replay_after_wal_entry_position` defaults to 0 in both cases.
-    let start_position = if manifest.flushed_generations.is_empty() {
-        0
-    } else {
-        manifest.replay_after_wal_entry_position.saturating_add(1)
-    };
+    // WAL positions are 1-based (see `FIRST_WAL_ENTRY_POSITION`), so a
+    // cursor of 0 means "no flush has ever stamped this shard" and replay
+    // starts at position 1. After flushing position N the cursor holds N
+    // and replay starts at N+1. The arithmetic collapses to a single
+    // saturating_add(1) in both cases — we deliberately do not consult
+    // `flushed_generations` here, since an external compactor may
+    // legitimately drain that vector back to empty after merging its
+    // contents into the base table.
+    let start_position = manifest.replay_after_wal_entry_position.saturating_add(1);
 
     // The MemTable is always freshly built before this function runs, so
     // any existing BatchStore entries can only have come from this replay
@@ -1270,9 +1270,21 @@ impl ShardWriter {
             .seed_next_position(next_wal_position)
             .await;
 
+        // Seed the writer's covered-WAL cursor from the post-replay tip:
+        // `next_wal_position` is one past the highest WAL entry we just
+        // replayed into the active memtable, so everything strictly below
+        // it is durably reflected in this writer's memtable. We can't
+        // seed from `manifest.wal_entry_position_last_seen` — that field
+        // is bumped on every successful tailer read by other readers, so
+        // it may sit above what's actually covered by any flushed
+        // generation. Subtracting 1 from a fresh shard's `next_wal_position`
+        // of `FIRST_WAL_ENTRY_POSITION` (= 1) yields 0, which correctly
+        // means "no entry covered yet."
+        let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
+
         let state = Arc::new(RwLock::new(WriterState {
             memtable,
-            last_flushed_wal_entry_position: manifest.wal_entry_position_last_seen,
+            last_flushed_wal_entry_position: initial_covered_wal_entry_position,
             frozen_memtable_bytes: 0,
             frozen_flush_watchers: VecDeque::new(),
             flush_requested: false,
@@ -1871,6 +1883,23 @@ impl MessageHandler<TriggerWalFlush> for WalFlushHandler {
 
         let result = self.do_flush(source, end_batch_position).await;
 
+        // Propagate the just-appended WAL entry position back into the
+        // writer state so a subsequent MemTable freeze can stamp the
+        // correct `covered_wal_entry_position` into the manifest. Without
+        // this, `replay_after_wal_entry_position` stays at 0 and replay
+        // re-reads already-flushed entries after restart.
+        //
+        // Always update state before signalling the completion cell so any
+        // waiter that reads state immediately after the cell fires sees
+        // the new position.
+        if let (Ok(flush_result), Some(state_lock)) = (&result, &self.memtable_state)
+            && let Some(entry) = &flush_result.entry
+        {
+            let mut state = state_lock.write().await;
+            state.last_flushed_wal_entry_position =
+                state.last_flushed_wal_entry_position.max(entry.position);
+        }
+
         // Notify completion if requested
         if let Some(cell) = done {
             cell.write(result.map_err(|e| e.to_string()));
@@ -2019,21 +2048,39 @@ impl MemTableFlushHandler {
 
         // Step 1: Wait for WAL flush completion (already queued at freeze time)
         // The TriggerWalFlush message was sent by freeze_memtable to ensure
-        // strict ordering of WAL entries.
-        if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
-            match completion_reader.await_value().await {
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(Error::io(format!("WAL flush failed: {}", e))),
-                None => {
-                    return Err(Error::io(
-                        "WAL flush handler exited before reporting completion",
-                    ));
+        // strict ordering of WAL entries. If the freeze didn't trigger a
+        // flush (no pending WAL range), there's no completion cell and the
+        // memtable was already WAL-flushed by an earlier put.
+        let wal_flushed_position =
+            if let Some(mut completion_reader) = memtable.take_wal_flush_completion() {
+                match completion_reader.await_value().await {
+                    Some(Ok(flush_result)) => flush_result.entry.map(|e| e.position),
+                    Some(Err(e)) => return Err(Error::io(format!("WAL flush failed: {}", e))),
+                    None => {
+                        return Err(Error::io(
+                            "WAL flush handler exited before reporting completion",
+                        ));
+                    }
                 }
-            }
-        }
+            } else {
+                None
+            };
 
-        // Step 2: Flush the memtable to Lance storage
-        let result = self.flusher.flush(&memtable, self.epoch).await?;
+        // Step 2: Flush the memtable to Lance storage. The covered WAL
+        // entry position is either the one we just appended (per-memtable,
+        // from the completion cell — authoritative even when concurrent
+        // flushes have raced ahead in `state.last_flushed_wal_entry_position`)
+        // or, when no flush was triggered at freeze time, the memtable's
+        // frozen-at marker captured at freeze. Stamping this into the
+        // manifest is what lets replay-on-reopen skip entries this
+        // generation covers.
+        let covered_wal_entry_position = wal_flushed_position
+            .or_else(|| memtable.frozen_at_wal_entry_position())
+            .unwrap_or(0);
+        let result = self
+            .flusher
+            .flush(&memtable, self.epoch, covered_wal_entry_position)
+            .await?;
 
         // Step 3: Signal completion and update backpressure tracking
         // Signal memtable flush completion for backpressure watchers
@@ -3003,13 +3050,14 @@ mod tests {
 
         writer.close().await.unwrap();
 
-        // Read back via WalTailer.
+        // Read back via WalTailer. WAL positions are 1-based, so two
+        // entries from a fresh shard land at 1 and 2.
         let tailer = WalTailer::new(store, base_path, shard_id);
-        assert_eq!(tailer.first_position().await.unwrap(), 0);
-        assert_eq!(tailer.next_position().await.unwrap(), 2);
+        assert_eq!(tailer.first_position().await.unwrap(), 1);
+        assert_eq!(tailer.next_position().await.unwrap(), 3);
 
-        let e0 = tailer.read_entry(0).await.unwrap().unwrap();
-        let e1 = tailer.read_entry(1).await.unwrap().unwrap();
+        let e0 = tailer.read_entry(1).await.unwrap().unwrap();
+        let e1 = tailer.read_entry(2).await.unwrap().unwrap();
         assert_eq!(e0.batches.len(), 1);
         assert_eq!(e0.batches[0].num_rows(), 4);
         assert_eq!(e1.batches.len(), 1);
@@ -3133,10 +3181,11 @@ mod tests {
 
         writer.close().await.unwrap();
 
-        // All three puts should be in a single WAL entry at position 0.
+        // All three puts should be in a single WAL entry at position 1
+        // (WAL positions are 1-based).
         let tailer = WalTailer::new(store, base_path, shard_id);
-        assert_eq!(tailer.next_position().await.unwrap(), 1);
-        let entry = tailer.read_entry(0).await.unwrap().unwrap();
+        assert_eq!(tailer.next_position().await.unwrap(), 2);
+        let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.batches.len(), 3);
         for (i, batch) in entry.batches.iter().enumerate() {
             assert_eq!(batch.num_rows(), 10, "batch {i}");
@@ -3312,6 +3361,108 @@ mod tests {
         writer.close().await.unwrap();
     }
 
+    /// Regression for the OSS-WAL compactor-drain bug: after a flush
+    /// records its generation in the manifest and an external compactor
+    /// later drains `flushed_generations` back to empty (the legitimate
+    /// outcome of merging the generation into the base table), reopening
+    /// the writer must not re-replay the already-flushed WAL entry into
+    /// the active memtable.
+    ///
+    /// Under the pre-fix logic, replay disambiguated "fresh shard" from
+    /// "flushed-then-compacted" with `flushed_generations.is_empty()`,
+    /// which collapsed both cases into start-at-0. With 1-based WAL
+    /// positions and a default cursor of 0 meaning "no flush stamped",
+    /// the flush-then-drain sequence leaves `replay_after_wal_entry_position`
+    /// pinned at the flushed position, so replay correctly starts past it.
+    #[tokio::test]
+    async fn test_memtable_replay_skips_entries_after_external_compaction() {
+        use crate::dataset::mem_wal::ShardManifestStore;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Writer A: write 5 rows, close (forces a flush of the active
+        // memtable). The manifest now records a flushed generation and
+        // pins `replay_after_wal_entry_position` to the covered WAL entry.
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                memtable_config_with_pk(shard_id),
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 0, 5)])
+                .await
+                .unwrap();
+            writer_a.close().await.unwrap();
+        }
+
+        // Simulate an external compactor merging the flushed generation
+        // into the base table: drain `flushed_generations` to empty via a
+        // direct manifest commit. The cursor stays where the flush put it.
+        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let pre = manifest_store.read_latest().await.unwrap().unwrap();
+        assert!(
+            !pre.flushed_generations.is_empty(),
+            "writer A's close() should have stamped a flushed generation"
+        );
+        let cursor_at_flush = pre.replay_after_wal_entry_position;
+        assert!(
+            cursor_at_flush >= 1,
+            "expected cursor to land on a 1-based WAL position after flush, got {cursor_at_flush}"
+        );
+        // Bump the epoch (claim_epoch) so we can commit_update without
+        // being fenced; this also mirrors how a compactor process would
+        // hold its own writer claim.
+        let (compactor_epoch, _) = manifest_store.claim_epoch(pre.shard_spec_id).await.unwrap();
+        manifest_store
+            .commit_update(compactor_epoch, |current| ShardManifest {
+                version: current.version + 1,
+                flushed_generations: vec![],
+                ..current.clone()
+            })
+            .await
+            .unwrap();
+        let post = manifest_store.read_latest().await.unwrap().unwrap();
+        assert!(
+            post.flushed_generations.is_empty(),
+            "compactor drain should have left flushed_generations empty"
+        );
+        assert_eq!(
+            post.replay_after_wal_entry_position, cursor_at_flush,
+            "compactor must not touch the replay cursor"
+        );
+
+        // Writer B reopens. Pre-fix: replay saw flushed_generations empty,
+        // restarted at WAL position 0, and re-inserted writer A's rows.
+        // Post-fix: replay starts at cursor + 1, finds no entry, and the
+        // memtable stays empty.
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let stats = writer_b.memtable_stats().await.unwrap();
+        assert_eq!(
+            stats.row_count, 0,
+            "memtable must not re-replay compacted WAL entries; got {} rows",
+            stats.row_count
+        );
+        assert_eq!(stats.batch_count, 0);
+        writer_b.close().await.unwrap();
+    }
+
     /// Replay aborts the open with a clear fence error if it encounters a
     /// WAL entry written with an epoch strictly greater than ours. Simulate
     /// the race where another writer wrote an entry with a higher epoch
@@ -3326,7 +3477,7 @@ mod tests {
         let schema = schema_with_pk();
         let shard_id = Uuid::new_v4();
 
-        // Writer A: write one durable batch (claims epoch 1, writes entry at position 0).
+        // Writer A: write one durable batch (claims epoch 1, writes entry at position 1).
         {
             let writer_a = ShardWriter::open(
                 store.clone(),
@@ -3523,8 +3674,8 @@ mod tests {
         let schema = create_test_schema();
         let shard_id = Uuid::new_v4();
 
-        // Writer A claims epoch 1, writes one entry (takes WAL position 0,
-        // caches its next-position as 1 internally).
+        // Writer A claims epoch 1, writes one entry (takes WAL position 1,
+        // caches its next-position as 2 internally).
         let writer_a = Arc::new(
             ShardWriter::open(
                 store.clone(),

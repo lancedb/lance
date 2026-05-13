@@ -396,9 +396,12 @@ async fn measure_flush(
     let (epoch, _) = manifest_store.claim_epoch(0).await?;
     let flusher = MemTableFlusher::new(store, base_path, uri, shard_id, manifest_store);
 
+    // total_batches WAL entries were stamped at positions 1..=total_batches
+    // by the mark_wal_flushed loop above (1-based positions).
+    let covered_wal_entry_position = total_batches as u64;
     let t = Instant::now();
     let _result = flusher
-        .flush_with_indexes(&memtable, epoch, index_configs)
+        .flush_with_indexes(&memtable, epoch, index_configs, covered_wal_entry_position)
         .await?;
     let elapsed = t.elapsed();
 

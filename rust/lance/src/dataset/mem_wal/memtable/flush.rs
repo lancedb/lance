@@ -79,8 +79,19 @@ impl MemTableFlusher {
     }
 
     /// Flush the MemTable to storage (data files, indexes, bloom filter).
+    ///
+    /// `covered_wal_entry_position` is stamped into the manifest's
+    /// `replay_after_wal_entry_position` so post-restart replay skips the
+    /// WAL entries this generation captures. Pass 0 only for shards that
+    /// have not yet appended any WAL entry — non-zero positions are
+    /// 1-based (see `FIRST_WAL_ENTRY_POSITION`).
     #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count()))]
-    pub async fn flush(&self, memtable: &MemTable, epoch: u64) -> Result<FlushResult> {
+    pub async fn flush(
+        &self,
+        memtable: &MemTable,
+        epoch: u64,
+        covered_wal_entry_position: u64,
+    ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
 
         if memtable.row_count() == 0 {
@@ -113,9 +124,13 @@ impl MemTableFlusher {
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
 
-        let last_wal_entry_position = memtable.last_flushed_wal_entry_position();
         let new_manifest = self
-            .update_manifest(epoch, generation, &gen_folder_name, last_wal_entry_position)
+            .update_manifest(
+                epoch,
+                generation,
+                &gen_folder_name,
+                covered_wal_entry_position,
+            )
             .await?;
 
         info!(
@@ -129,7 +144,7 @@ impl MemTableFlusher {
                 path: gen_folder_name,
             },
             rows_flushed,
-            covered_wal_entry_position: last_wal_entry_position,
+            covered_wal_entry_position,
         })
     }
 
@@ -184,12 +199,16 @@ impl MemTableFlusher {
     }
 
     /// Flush the MemTable to storage with indexes.
+    ///
+    /// See [`MemTableFlusher::flush`] for `covered_wal_entry_position`
+    /// semantics.
     #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_configs.len()))]
     pub async fn flush_with_indexes(
         &self,
         memtable: &MemTable,
         epoch: u64,
         index_configs: &[MemIndexConfig],
+        covered_wal_entry_position: u64,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
 
@@ -288,9 +307,13 @@ impl MemTableFlusher {
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
 
-        let last_wal_entry_position = memtable.last_flushed_wal_entry_position();
         let new_manifest = self
-            .update_manifest(epoch, generation, &gen_folder_name, last_wal_entry_position)
+            .update_manifest(
+                epoch,
+                generation,
+                &gen_folder_name,
+                covered_wal_entry_position,
+            )
             .await?;
 
         info!(
@@ -304,7 +327,7 @@ impl MemTableFlusher {
                 path: gen_folder_name,
             },
             rows_flushed: memtable.row_count(),
-            covered_wal_entry_position: last_wal_entry_position,
+            covered_wal_entry_position,
         })
     }
 
@@ -883,7 +906,7 @@ mod tests {
         assert!(!memtable.all_flushed_to_wal());
 
         let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
-        let result = flusher.flush(&memtable, epoch).await;
+        let result = flusher.flush(&memtable, epoch, 0).await;
 
         assert!(result.is_err());
         assert!(
@@ -912,7 +935,7 @@ mod tests {
         let memtable = MemTable::new(schema, 1, vec![]).unwrap();
 
         let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
-        let result = flusher.flush(&memtable, epoch).await;
+        let result = flusher.flush(&memtable, epoch, 0).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty MemTable"));
@@ -950,7 +973,7 @@ mod tests {
             shard_id,
             manifest_store.clone(),
         );
-        let result = flusher.flush(&memtable, epoch).await.unwrap();
+        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
 
         assert_eq!(result.generation.generation, 1);
         assert_eq!(result.rows_flushed, 10);
@@ -1011,7 +1034,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs)
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
             .await
             .unwrap();
 
@@ -1144,7 +1167,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs)
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
             .await
             .unwrap();
 
@@ -1271,7 +1294,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs)
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
             .await
             .unwrap();
 
