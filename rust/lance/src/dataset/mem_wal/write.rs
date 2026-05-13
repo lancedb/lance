@@ -887,7 +887,6 @@ impl SharedWriterState {
 
         let frozen_size = old_memtable.estimated_size();
         state.frozen_memtable_bytes += frozen_size;
-        state.last_flushed_wal_entry_position = last_wal_entry_position;
 
         let flush_watcher = old_memtable
             .get_memtable_flush_watcher()
