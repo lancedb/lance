@@ -38,7 +38,7 @@ Lance provides storage-native and service-oriented catalog options. The [Directo
 
 ### Namespace Client Spec
 
-The [Namespace Client Spec](namespace/index.md) defines a unified interface that engines use to interact with any catalog implementation. This abstraction allows applications to switch between directory-based, REST-based, or third-party catalogs without changing their code.
+The [Namespace Client Spec](namespace/index.md) provides a unified interface for engines to interact with any catalog implementation, across both Lance native catalog specs and third-party catalog systems, in any programming language. This abstraction allows applications to switch between directory-based, REST-based, or third-party catalogs without changing their code.
 
 ## Specifications
 
