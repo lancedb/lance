@@ -14,9 +14,9 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use lance_core::Result;
 use lance_index::scalar::bloomfilter::sbbf::Sbbf;
@@ -36,14 +36,14 @@ pub const DISTANCE_COLUMN: &str = "_distance";
 ///
 /// 1. **FilterStaleExec**: Filters out results with newer versions in higher generations
 /// 2. **UnionExec**: Combines results from all sources
-/// 3. **SortExec**: Sorts by distance
-/// 4. **GlobalLimitExec**: Returns top-K results
+/// 3. **SortExec (per partition, fetch=k)**: Sorts each source's candidates by distance, in parallel
+/// 4. **SortPreservingMergeExec (fetch=k)**: K-way merge of sorted streams, early-terminates at k
 ///
 /// # Query Plan Structure
 ///
 /// ```text
-/// GlobalLimitExec: limit=k
-///   SortExec: order_by=[_distance ASC]
+/// SortPreservingMergeExec: order_by=[_distance ASC], fetch=k
+///   SortExec: order_by=[_distance ASC], fetch=k  (per partition, parallel)
 ///     FilterStaleExec: bloom_filters=[gen3, gen2, gen1]
 ///       UnionExec
 ///         MemtableGenTagExec: gen=3
@@ -244,16 +244,19 @@ impl LsmVectorSearchPlanner {
             lance_core::Error::internal("Failed to create LexOrdering".to_string())
         })?;
 
-        // UnionExec emits one partition per input source, but our final SortExec
-        // doesn't merge across partitions on its own — without coalescing, rows
-        // from all-but-the-first partition (and their `_distance` values) silently
-        // vanish in the output. Coalesce into a single partition so the sort and
-        // limit see every KNN candidate.
-        let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(merged));
-        let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, coalesced));
-        let limited: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sorted, 0, Some(k)));
+        // Sort each partition's candidates in parallel, capped at k via `with_fetch`
+        // so each partition early-terminates instead of materializing every candidate
+        // into a global sort. SortPreservingMergeExec then does a p-way heap merge of
+        // the pre-sorted streams (also capped at k), producing the final top-k.
+        // This avoids serializing the merge on a single thread and pushes the k-limit
+        // into per-partition work, where it actually helps.
+        let per_partition_sorted: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(lex_ordering.clone(), merged).with_fetch(Some(k)));
+        let merged_sorted: Arc<dyn ExecutionPlan> = Arc::new(
+            SortPreservingMergeExec::new(lex_ordering, per_partition_sorted).with_fetch(Some(k)),
+        );
 
-        Ok(limited)
+        Ok(merged_sorted)
     }
 
     /// Build the canonical output schema for this search: projection cols + `_distance`.
@@ -855,6 +858,32 @@ mod tests {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>()
+        );
+
+        // Verify active-memtable rows survived the bloom-filter path. The collector
+        // emits base as partition 0 and the active memtable as partition 1+ of the
+        // UnionExec. FilterStaleExec declares 1 output partition but reads only
+        // partition 0 of its input — so without the CoalescePartitionsExec inserted
+        // ahead of it, partitions 1+ are silently dropped. The active memtable holds
+        // ids 1..=4; the base holds id 10. Asserting that at least one id in 1..=4
+        // is present directly proves partition-1+ data made it through.
+        let mut all_ids: Vec<i32> = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column_by_name("id")
+                .expect("id column missing")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id column should be Int32");
+            for i in 0..batch.num_rows() {
+                all_ids.push(id_col.value(i));
+            }
+        }
+        assert!(
+            all_ids.iter().any(|&id| (1..=4).contains(&id)),
+            "expected at least one active-memtable row (id in 1..=4) — none found, so \
+             active partitions were silently dropped. Got ids: {:?}",
+            all_ids
         );
     }
 }
