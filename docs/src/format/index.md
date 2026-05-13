@@ -1,6 +1,6 @@
 # Lance Lakehouse Format Specification
 
-Lance is an Arrow-native lakehouse format designed as a stack of interoperating specifications instead of a single file or metadata layout. The storage-facing layers are the file format, table format, index formats, and catalog specifications, with a unified namespace interface sitting above them.
+Lance is a lakehouse format designed as a stack of interoperating specifications instead of a single file or metadata layout. The storage-facing layers are the file format, table format, index formats, and catalog specifications, with a unified namespace interface sitting above them.
 
 ## Architecture Overview
 
@@ -16,7 +16,7 @@ At a high level:
 - The **catalog specs** define how tables are discovered, registered, and coordinated across engines and services.
 - The **namespace client spec** provides a unified interface for engines to interact with any catalog implementation.
 
-The architecture is designed around Apache Arrow boundaries. Once data is in memory, Arrow is the interchange format. Only table readers, table writers, and index readers or writers need to know the on-disk Lance file layout.
+The layers are designed so that only table readers, table writers, and index readers or writers need to know the on-disk Lance file layout.
 
 ## Design Themes
 
