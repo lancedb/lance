@@ -14,26 +14,31 @@ At a high level:
 - The **table format** manages fragments, manifests, deletions, schema evolution, and ACID commits.
 - The **index formats** define redundant search structures such as scalar, vector, full-text, and system indices.
 - The **catalog specs** define how tables are discovered, registered, and coordinated across engines and services.
+- The **namespace client spec** provides a unified interface for engines to interact with any catalog implementation.
 
 The architecture is designed around Apache Arrow boundaries. Once data is in memory, Arrow is the interchange format. Only table readers, table writers, and index readers or writers need to know the on-disk Lance file layout.
 
 ## Design Themes
 
-### File Layer
+### File Format
 
-The Lance file format is optimized for cloud object storage and highly selective reads. It avoids Parquet-style row groups, uses structural encodings that support efficient random access, and keeps statistics and search structures out of the file layer so those concerns can evolve as independent indices.
+The Lance file format is optimized for cloud object storage and highly selective reads. It avoids Parquet-style row groups, uses structural encodings that support efficient random access, and keeps statistics and search structures out of the file format so those concerns can evolve as independent indices.
 
-### Table Layer
+### Table Format
 
 The Lance table format stores data in two dimensions: rows are grouped into fragments, and each fragment can contain multiple data files that each contribute a subset of columns. This makes column additions and backfills metadata-heavy instead of rewrite-heavy, which is especially useful for feature engineering and embedding workflows.
 
-### Index Layer
+### Index Formats
 
 Indices are first-class table objects. Lance tables define how indices are discovered, versioned, and coordinated transactionally, while the index formats themselves remain decoupled from both the file encoding and the table manifest structure.
 
-### Catalog Layer
+### Catalog Specs
 
-Lance provides storage-native and service-oriented catalog options. The [Directory Catalog](catalog/dir/index.md) supports zero-infrastructure deployments directly on object stores, while the [REST Catalog](catalog/rest/index.md) standardizes enterprise-facing APIs and can act as an external manifest store. The [Namespace Client Spec](namespace/index.md) gives engines a single interface across both models.
+Lance provides storage-native and service-oriented catalog options. The [Directory Catalog](catalog/dir/index.md) supports zero-infrastructure deployments directly on object stores, while the [REST Catalog](catalog/rest/index.md) standardizes enterprise-facing APIs and can act as an external manifest store.
+
+### Namespace Client Spec
+
+The [Namespace Client Spec](namespace/index.md) defines a unified interface that engines use to interact with any catalog implementation. This abstraction allows applications to switch between directory-based, REST-based, or third-party catalogs without changing their code.
 
 ## Specifications
 
