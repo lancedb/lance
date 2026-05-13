@@ -561,6 +561,7 @@ mod tests {
             // Should see 2 IOPs:
             // 1. Write the transaction files
             // 2. Write (conditional put) the manifest
+            // (the version hint is only written on non-lexically-ordered stores)
             assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest, i = {}", i);
         }
 
@@ -629,7 +630,7 @@ mod tests {
         // Assert io requests
         let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
         // This could be zero, if we decided to be optimistic. However, that
-        // would mean two wasted write requests (txn + manifest) if there was
+        // would mean wasted write requests (txn + manifest) if there was
         // a conflict. We choose to be pessimistic for more consistent performance.
         assert_io_eq!(io_stats, read_iops, 1);
         assert_io_eq!(io_stats, write_iops, 2);
@@ -785,5 +786,83 @@ mod tests {
             matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
         );
         assert_eq!(transaction.read_version, 1);
+    }
+
+    /// On non-lexically-ordered stores (e.g. S3 Express) a commit should use the
+    /// version hint (a few HEAD probes, O(k)) instead of a full O(n) listing.
+    #[tokio::test]
+    async fn test_commit_uses_version_hint_on_non_lexical_store() {
+        // Make `list` artificially slow per entry so a full listing would be
+        // obvious; HEAD/GET/PUT stay fast.
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_list_per_entry: Duration::from_millis(50),
+                wait_get_per_call: Duration::from_millis(1),
+                wait_put_per_call: Duration::from_millis(1),
+                ..Default::default()
+            },
+        });
+        let session = Arc::new(Session::default());
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                list_is_lexically_ordered: Some(false),
+                ..Default::default()
+            }),
+            session: Some(session.clone()),
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        };
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let mut dataset = Arc::new(
+            InsertBuilder::new("memory://test_version_hint")
+                .with_params(&write_params)
+                .execute(vec![batch])
+                .await
+                .unwrap(),
+        );
+
+        // Build up many versions so a full listing would be expensive.
+        for _ in 0..50 {
+            dataset = Arc::new(
+                CommitBuilder::new(dataset.clone())
+                    .execute(sample_transaction(dataset.manifest().version))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(dataset.manifest().version, 51);
+
+        dataset.object_store.as_ref().io_stats_incremental();
+
+        let start = std::time::Instant::now();
+        let new_ds = CommitBuilder::new(dataset.clone())
+            .execute(sample_transaction(dataset.manifest().version))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // A full listing of ~52 entries at 50ms each would take ~2.6s.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "commit took {elapsed:?}; the version hint path was likely not used"
+        );
+
+        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        assert!(
+            io_stats.read_iops < 10,
+            "read_iops = {}; a full listing was likely used",
+            io_stats.read_iops
+        );
     }
 }

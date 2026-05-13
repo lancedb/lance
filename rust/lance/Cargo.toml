@@ -247,5 +247,9 @@ name = "mem_wal_fts_bench"
 path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
 harness = false
 
+[[bench]]
+name = "manifest_commit"
+harness = false
+
 [lints]
 workspace = true
