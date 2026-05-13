@@ -4688,6 +4688,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-hnsw"
+version = "7.0.0-beta.7"
+dependencies = [
+ "arc-swap",
+ "arrow-array",
+ "arrow-schema",
+ "crossbeam-queue",
+ "lance-core",
+ "lance-index",
+ "lance-linalg",
+ "rand 0.9.4",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lance-index"
 version = "7.0.0-beta.9"
 dependencies = [
