@@ -37,7 +37,7 @@ mod index;
 mod manifest;
 pub mod memtable;
 pub mod scanner;
-mod util;
+pub mod util;
 mod wal;
 pub mod write;
 

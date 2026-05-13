@@ -20,6 +20,13 @@ use super::data_source::ShardSnapshot;
 use super::planner::LsmScanPlanner;
 use crate::dataset::Dataset;
 
+/// Either a base Lance table, or an explicit base path used to resolve
+/// flushed-generation directories when no base dataset is configured.
+enum BaseSource {
+    Table(Arc<Dataset>),
+    PathOnly(String),
+}
+
 /// Scanner for LSM tree data spanning base table, flushed MemTables, and active MemTable.
 ///
 /// This scanner provides a unified interface for querying data across multiple
@@ -43,7 +50,11 @@ use crate::dataset::Dataset;
 /// ```
 pub struct LsmScanner {
     // Data sources
-    base_table: Arc<Dataset>,
+    base: BaseSource,
+    /// Schema used for projection, empty plans, and filter parsing.
+    /// Derived from the base dataset when one is present, otherwise supplied
+    /// explicitly by [`Self::without_base_table`].
+    schema: SchemaRef,
     shard_snapshots: Vec<ShardSnapshot>,
     active_memtables: HashMap<Uuid, ActiveMemTableRef>,
 
@@ -74,8 +85,47 @@ impl LsmScanner {
         shard_snapshots: Vec<ShardSnapshot>,
         pk_columns: Vec<String>,
     ) -> Self {
+        let lance_schema = base_table.schema();
+        let arrow_schema: arrow_schema::Schema = lance_schema.into();
         Self {
-            base_table,
+            base: BaseSource::Table(base_table),
+            schema: Arc::new(arrow_schema),
+            shard_snapshots,
+            active_memtables: HashMap::new(),
+            projection: None,
+            filter: None,
+            limit: None,
+            offset: None,
+            with_row_address: false,
+            with_memtable_gen: false,
+            pk_columns,
+        }
+    }
+
+    /// Create a scanner that reads only the fresh tier (active memtable and
+    /// flushed generations) without including a base Lance table.
+    ///
+    /// This is useful when the caller owns the base read path separately and
+    /// only needs the WAL's contribution: active memtable ∪ L0 flushed
+    /// generations. Deduplication semantics are unchanged — newer generations
+    /// still win on PK conflicts.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - Schema used for projection, filter parsing, and empty plans.
+    ///   Should match the schema flushed generations were written with.
+    /// * `base_path` - Table-root URI used to resolve relative flushed paths.
+    /// * `shard_snapshots` - Snapshots of shard states from MemWAL index.
+    /// * `pk_columns` - Primary key column names for deduplication.
+    pub fn without_base_table(
+        schema: SchemaRef,
+        base_path: impl Into<String>,
+        shard_snapshots: Vec<ShardSnapshot>,
+        pk_columns: Vec<String>,
+    ) -> Self {
+        Self {
+            base: BaseSource::PathOnly(base_path.into()),
+            schema,
             shard_snapshots,
             active_memtables: HashMap::new(),
             projection: None,
@@ -112,9 +162,10 @@ impl LsmScanner {
     /// The filter is pushed down to each data source when possible.
     pub fn filter(mut self, filter_expr: &str) -> Result<Self> {
         let ctx = SessionContext::new();
-        let lance_schema = self.base_table.schema();
-        let arrow_schema: arrow_schema::Schema = lance_schema.into();
-        let df_schema = arrow_schema
+        let df_schema = self
+            .schema
+            .as_ref()
+            .clone()
             .to_dfschema()
             .map_err(|e| Error::invalid_input(format!("Failed to create DFSchema: {}", e)))?;
         let expr = ctx.parse_sql_expr(filter_expr, &df_schema).map_err(|e| {
@@ -157,11 +208,9 @@ impl LsmScanner {
 
     /// Get the output schema.
     pub fn schema(&self) -> SchemaRef {
-        // For now, return base schema. Full implementation would compute
-        // the projected schema with optional _gen/_rowaddr columns.
-        let lance_schema = self.base_table.schema();
-        let arrow_schema: arrow_schema::Schema = lance_schema.into();
-        Arc::new(arrow_schema)
+        // For now, return the configured schema. Full implementation would
+        // compute the projected schema with optional _gen/_rowaddr columns.
+        self.schema.clone()
     }
 
     /// Create the execution plan.
@@ -222,8 +271,15 @@ impl LsmScanner {
 
     /// Build the data source collector.
     fn build_collector(&self) -> LsmDataSourceCollector {
-        let mut collector =
-            LsmDataSourceCollector::new(self.base_table.clone(), self.shard_snapshots.clone());
+        let mut collector = match &self.base {
+            BaseSource::Table(dataset) => {
+                LsmDataSourceCollector::new(dataset.clone(), self.shard_snapshots.clone())
+            }
+            BaseSource::PathOnly(path) => LsmDataSourceCollector::without_base_table(
+                path.clone(),
+                self.shard_snapshots.clone(),
+            ),
+        };
 
         for (shard_id, memtable) in &self.active_memtables {
             collector = collector.with_active_memtable(*shard_id, memtable.clone());
@@ -235,8 +291,12 @@ impl LsmScanner {
 
 impl std::fmt::Debug for LsmScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (label, value) = match &self.base {
+            BaseSource::Table(dataset) => ("base_table", dataset.uri().to_string()),
+            BaseSource::PathOnly(path) => ("base_path", path.clone()),
+        };
         f.debug_struct("LsmScanner")
-            .field("base_table", &self.base_table.uri())
+            .field(label, &value)
             .field("num_shards", &self.shard_snapshots.len())
             .field("num_active_memtables", &self.active_memtables.len())
             .field("projection", &self.projection)

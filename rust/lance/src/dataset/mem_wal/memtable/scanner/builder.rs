@@ -243,7 +243,7 @@ impl ScalarPredicate {
 ///
 /// # Index Visibility Model
 ///
-/// The scanner captures `max_indexed_batch_position` from the `IndexStore` at
+/// The scanner captures `max_visible_batch_position` from the `IndexStore` at
 /// construction time. This frozen visibility ensures queries only see data
 /// that has been indexed, providing consistent results.
 ///
@@ -262,7 +262,7 @@ pub struct MemTableScanner {
     indexes: Arc<IndexStore>,
     schema: SchemaRef,
     /// Frozen visibility captured at scanner construction time.
-    /// This is the `max_indexed_batch_position` from the IndexStore.
+    /// This is the `max_visible_batch_position` from the IndexStore.
     max_visible_batch_position: usize,
     projection: Option<Vec<String>>,
     filter: Option<Expr>,
@@ -283,17 +283,19 @@ pub struct MemTableScanner {
 impl MemTableScanner {
     /// Create a new scanner.
     ///
-    /// Captures `max_indexed_batch_position` from the `IndexStore` at construction
+    /// Captures `max_visible_batch_position` from the `IndexStore` at construction
     /// time to ensure consistent query visibility.
     ///
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing the data
-    /// * `indexes` - Index registry (required for visibility tracking)
+    /// * `indexes` - Index registry (carries the visibility watermark)
     /// * `schema` - Schema of the data
     pub fn new(batch_store: Arc<BatchStore>, indexes: Arc<IndexStore>, schema: SchemaRef) -> Self {
-        // Capture max_indexed_batch_position at construction time
-        let max_visible_batch_position = indexes.max_indexed_batch_position();
+        // Snapshot the visibility cursor at construction time. The cursor is
+        // advanced by `flush_from_batch_store` after the WAL append succeeds,
+        // so this snapshot reflects WAL-durable data.
+        let max_visible_batch_position = indexes.max_visible_batch_position();
 
         Self {
             batch_store,
@@ -1086,7 +1088,7 @@ mod tests {
         let indexes = Arc::new(index_store);
         let scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
         let result = scanner.try_into_batch().await.unwrap();
-        // max_indexed_batch_position is 1, so we see batches 0 and 1 (20 rows)
+        // max_visible_batch_position is 1, so we see batches 0 and 1 (20 rows)
         assert_eq!(result.num_rows(), 20);
     }
 

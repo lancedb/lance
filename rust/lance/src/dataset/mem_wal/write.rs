@@ -1658,7 +1658,7 @@ impl ShardWriter {
     /// The scanner provides read access to all data currently in the MemTable,
     /// with optional filtering, projection, and index support.
     ///
-    /// The scanner captures the current `max_indexed_batch_position` from the
+    /// The scanner captures the current `max_visible_batch_position` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
     /// Returns an error in WAL-only mode.
