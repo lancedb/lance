@@ -3101,9 +3101,7 @@ def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
         enable_stable_row_ids=True,
     )
 
-    update_dict = dataset.update(
-        updates=dict(name_3="'xxxx'"), where="name_1 = '7'"
-    )
+    update_dict = dataset.update(updates=dict(name_3="'xxxx'"), where="name_1 = '7'")
     check_update_stats(update_dict, (1,))
 
     expected = pa.table(
