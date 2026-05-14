@@ -189,6 +189,7 @@ async fn run_writer(
     uri: String,
     appends: usize,
     rows_per_append: usize,
+    deadline: Option<Instant>,
     session: Arc<Session>,
     store_params: Option<ObjectStoreParams>,
 ) -> WriterStats {
@@ -211,6 +212,11 @@ async fn run_writer(
     // Disjoint id ranges per writer so the data inserted is identifiable.
     let id_base = 1_000_000 + writer_id * appends * rows_per_append;
     for i in 0..appends {
+        if let Some(d) = deadline
+            && Instant::now() >= d
+        {
+            break;
+        }
         let batch = batch(id_base + i * rows_per_append, rows_per_append);
         let params = write_params(session.clone(), store_params.clone());
         let start = Instant::now();
@@ -262,6 +268,11 @@ fn bench_concurrent_append(c: &mut Criterion) {
     let rows_per_append = env_usize("ROWS_PER_APPEND", DEFAULT_ROWS_PER_APPEND);
     let base_rows = env_usize("BASE_ROWS", DEFAULT_BASE_ROWS);
     let keep_dataset = env_bool("KEEP_DATASET");
+    // Per-writer wall-clock budget. When non-zero, each writer stops looping
+    // once this many seconds have elapsed since the run started, even if it
+    // hasn't issued `APPENDS_PER_WRITER` commits yet. Lets us bound run time
+    // at high concurrency where conflict retries make commits arbitrarily slow.
+    let max_wall_secs = env_usize("MAX_WALL_SECS", 0);
 
     let uri = format!(
         "{}/concurrent_append_{}",
@@ -305,6 +316,14 @@ fn bench_concurrent_append(c: &mut Criterion) {
 
     println!("Starting {num_writers} concurrent writers...");
     let wall_start = Instant::now();
+    let deadline =
+        (max_wall_secs > 0).then(|| wall_start + Duration::from_secs(max_wall_secs as u64));
+    if let Some(d) = deadline {
+        println!(
+            "Per-writer wall budget: {max_wall_secs}s (deadline {:?} from now)",
+            d.duration_since(wall_start)
+        );
+    }
     let all_stats: Vec<WriterStats> = runtime.block_on(async {
         let mut tasks = Vec::with_capacity(num_writers);
         for writer_id in 0..num_writers {
@@ -317,6 +336,7 @@ fn bench_concurrent_append(c: &mut Criterion) {
                     uri,
                     appends_per_writer,
                     rows_per_append,
+                    deadline,
                     session,
                     store_params,
                 )
