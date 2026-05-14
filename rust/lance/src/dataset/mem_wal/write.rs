@@ -1661,11 +1661,20 @@ impl ShardWriter {
     pub async fn memtable_stats(&self) -> Result<MemTableStats> {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
+        let batch_store = state.memtable.batch_store();
+        let pending_wal = batch_store.pending_wal_flush_stats();
         Ok(MemTableStats {
             row_count: state.memtable.row_count(),
             batch_count: state.memtable.batch_count(),
             estimated_size: state.memtable.estimated_size(),
             generation: state.memtable.generation(),
+            max_buffered_batch_position: batch_store.max_buffered_batch_position(),
+            max_flushed_batch_position: batch_store.max_flushed_batch_position(),
+            pending_wal_start_batch_position: pending_wal.start_batch_position,
+            pending_wal_end_batch_position: pending_wal.end_batch_position,
+            pending_wal_batch_count: pending_wal.batch_count,
+            pending_wal_row_count: pending_wal.row_count,
+            pending_wal_estimated_bytes: pending_wal.estimated_bytes,
         })
     }
 
@@ -1921,6 +1930,13 @@ pub struct MemTableStats {
     pub batch_count: usize,
     pub estimated_size: usize,
     pub generation: u64,
+    pub max_buffered_batch_position: Option<usize>,
+    pub max_flushed_batch_position: Option<usize>,
+    pub pending_wal_start_batch_position: Option<usize>,
+    pub pending_wal_end_batch_position: Option<usize>,
+    pub pending_wal_batch_count: usize,
+    pub pending_wal_row_count: usize,
+    pub pending_wal_estimated_bytes: usize,
 }
 
 /// WAL statistics.

@@ -123,6 +123,7 @@ struct Args {
     num_sub_vectors: usize,
     threads: usize,
     tokio_threads: usize,
+    skip_close: bool,
     output: Option<PathBuf>,
 }
 
@@ -151,6 +152,7 @@ impl Default for Args {
             num_sub_vectors: 8,
             threads,
             tokio_threads: threads,
+            skip_close: false,
             output: None,
         }
     }
@@ -195,7 +197,7 @@ async fn run(args: Args) -> Result<()> {
     };
 
     println!(
-        "bench=mem_wal_shard_writer_backpressure uri={} mode={} seed_rows={} batch_rows={} calls={} vector_dim={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={}",
+        "bench=mem_wal_shard_writer_backpressure uri={} mode={} seed_rows={} batch_rows={} calls={} vector_dim={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={} skip_close={}",
         uri,
         args.mode.as_str(),
         args.seed_rows,
@@ -211,6 +213,7 @@ async fn run(args: Args) -> Result<()> {
         args.max_wal_flush_interval_ms,
         rayon::current_num_threads(),
         args.tokio_threads,
+        args.skip_close,
     );
 
     let schema = fineweb_schema(args.vector_dim);
@@ -327,37 +330,78 @@ async fn run(args: Args) -> Result<()> {
         }
     }
     let elapsed_puts_s = puts_start.elapsed().as_secs_f64();
+    let final_memtable_stats = writer.memtable_stats().await.ok();
     push_sample(
         &mut samples,
         "puts_done",
         puts_start.elapsed(),
         &stats_handle.snapshot(),
-        writer.memtable_stats().await.ok(),
+        final_memtable_stats.clone(),
     );
 
-    let close_start = Instant::now();
-    writer.close().await?;
-    let elapsed_drain_s = close_start.elapsed().as_secs_f64();
-    let elapsed_total_s = puts_start.elapsed().as_secs_f64();
-    let stats = stats_handle.snapshot();
-    push_sample(&mut samples, "closed", puts_start.elapsed(), &stats, None);
+    let (elapsed_drain_s, elapsed_total_s, stats) = if args.skip_close {
+        let stats = stats_handle.snapshot();
+        push_sample(
+            &mut samples,
+            "close_skipped",
+            puts_start.elapsed(),
+            &stats,
+            final_memtable_stats.clone(),
+        );
+        (0.0, elapsed_puts_s, stats)
+    } else {
+        let close_start = Instant::now();
+        writer.close().await?;
+        let elapsed_drain_s = close_start.elapsed().as_secs_f64();
+        let elapsed_total_s = puts_start.elapsed().as_secs_f64();
+        let stats = stats_handle.snapshot();
+        push_sample(&mut samples, "closed", puts_start.elapsed(), &stats, None);
+        (elapsed_drain_s, elapsed_total_s, stats)
+    };
 
     let rows = args.calls * args.batch_rows;
     let puts_rows_s = rows as f64 / elapsed_puts_s;
     let total_rows_s = rows as f64 / elapsed_total_s;
     let puts_mb_s = puts_rows_s * args.row_bytes as f64 / 1_000_000.0;
     let total_mb_s = total_rows_s * args.row_bytes as f64 / 1_000_000.0;
+    let result_rows_s = if args.skip_close {
+        puts_rows_s
+    } else {
+        total_rows_s
+    };
+    let result_mb_s = if args.skip_close {
+        puts_mb_s
+    } else {
+        total_mb_s
+    };
 
     let p50_ms = percentile(&latencies_ms, 50.0);
     let p90_ms = percentile(&latencies_ms, 90.0);
     let p99_ms = percentile(&latencies_ms, 99.0);
     let slow_puts_1s = latencies_ms.iter().filter(|ms| **ms >= 1_000.0).count();
     let slow_puts_10s = latencies_ms.iter().filter(|ms| **ms >= 10_000.0).count();
+    let final_wal_pending_batches = final_memtable_stats
+        .as_ref()
+        .map_or(0, |stats| stats.pending_wal_batch_count);
+    let final_wal_pending_rows = final_memtable_stats
+        .as_ref()
+        .map_or(0, |stats| stats.pending_wal_row_count);
+    let final_wal_pending_mb = final_memtable_stats.as_ref().map_or(0.0, |stats| {
+        stats.pending_wal_estimated_bytes as f64 / 1_000_000.0
+    });
+    let final_memtable_rows = final_memtable_stats
+        .as_ref()
+        .map_or(0, |stats| stats.row_count);
+    let final_memtable_batches = final_memtable_stats
+        .as_ref()
+        .map_or(0, |stats| stats.batch_count);
 
     println!(
-        "result mode={} rows={} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} index_update_s={:.3} memtable_flush_s={:.3}",
+        "result mode={} rows={} result_rows_s={:.1} result_mb_s={:.2} puts_rows_s={:.1} drained_rows_s={:.1} puts_mb_s={:.2} drained_mb_s={:.2} setup_s={:.3} index_setup_s={:.3} batch_build_s={:.3} puts_s={:.3} drain_s={:.3} total_s={:.3} skip_close={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} slow_puts_1s={} slow_puts_10s={} wal_flushes={} final_wal_pending_batches={} final_wal_pending_rows={} final_wal_pending_mb={:.2} final_memtable_rows={} final_memtable_batches={} index_update_s={:.3} memtable_flush_s={:.3}",
         args.mode.as_str(),
         rows,
+        result_rows_s,
+        result_mb_s,
         puts_rows_s,
         total_rows_s,
         puts_mb_s,
@@ -368,12 +412,18 @@ async fn run(args: Args) -> Result<()> {
         elapsed_puts_s,
         elapsed_drain_s,
         elapsed_total_s,
+        args.skip_close,
         p50_ms,
         p90_ms,
         p99_ms,
         slow_puts_1s,
         slow_puts_10s,
         stats.wal_flush_count,
+        final_wal_pending_batches,
+        final_wal_pending_rows,
+        final_wal_pending_mb,
+        final_memtable_rows,
+        final_memtable_batches,
         stats.index_update_time.as_secs_f64(),
         stats.memtable_flush_time.as_secs_f64(),
     );
@@ -400,12 +450,15 @@ async fn run(args: Args) -> Result<()> {
         "max_wal_flush_interval_ms": args.max_wal_flush_interval_ms,
         "async_index_buffer_rows": args.async_index_buffer_rows,
         "sample_interval_ms": args.sample_interval_ms,
+        "skip_close": args.skip_close,
         "setup_seconds": setup_s,
         "index_setup_seconds": index_setup_s,
         "batch_build_seconds": batch_build_s,
         "elapsed_puts_seconds": elapsed_puts_s,
         "elapsed_drain_seconds": elapsed_drain_s,
         "elapsed_total_seconds": elapsed_total_s,
+        "result_rows_per_sec": result_rows_s,
+        "result_mb_per_sec": result_mb_s,
         "throughput_puts_rows_per_sec": puts_rows_s,
         "throughput_rows_per_sec": total_rows_s,
         "throughput_puts_mb_per_sec": puts_mb_s,
@@ -415,6 +468,7 @@ async fn run(args: Args) -> Result<()> {
         "p99_ms": p99_ms,
         "slow_puts_1s": slow_puts_1s,
         "slow_puts_10s": slow_puts_10s,
+        "final_memtable_stats": memtable_stats_json(final_memtable_stats.as_ref()),
         "puts": puts,
         "samples": samples,
         "write_stats": {
@@ -486,7 +540,33 @@ fn push_sample(
         "active_memtable_batches": memtable.as_ref().map(|stats| stats.batch_count),
         "active_memtable_bytes": memtable.as_ref().map(|stats| stats.estimated_size),
         "active_memtable_generation": memtable.as_ref().map(|stats| stats.generation),
+        "active_memtable_max_buffered_batch_position": memtable.as_ref().and_then(|stats| stats.max_buffered_batch_position),
+        "active_memtable_max_flushed_batch_position": memtable.as_ref().and_then(|stats| stats.max_flushed_batch_position),
+        "wal_queue_pending_batches": memtable.as_ref().map(|stats| stats.pending_wal_batch_count),
+        "wal_queue_pending_rows": memtable.as_ref().map(|stats| stats.pending_wal_row_count),
+        "wal_queue_pending_bytes": memtable.as_ref().map(|stats| stats.pending_wal_estimated_bytes),
+        "wal_queue_pending_start_batch_position": memtable.as_ref().and_then(|stats| stats.pending_wal_start_batch_position),
+        "wal_queue_pending_end_batch_position": memtable.as_ref().and_then(|stats| stats.pending_wal_end_batch_position),
     }));
+}
+
+fn memtable_stats_json(memtable: Option<&MemTableStats>) -> serde_json::Value {
+    match memtable {
+        Some(stats) => json!({
+            "row_count": stats.row_count,
+            "batch_count": stats.batch_count,
+            "estimated_size": stats.estimated_size,
+            "generation": stats.generation,
+            "max_buffered_batch_position": stats.max_buffered_batch_position,
+            "max_flushed_batch_position": stats.max_flushed_batch_position,
+            "wal_queue_pending_start_batch_position": stats.pending_wal_start_batch_position,
+            "wal_queue_pending_end_batch_position": stats.pending_wal_end_batch_position,
+            "wal_queue_pending_batches": stats.pending_wal_batch_count,
+            "wal_queue_pending_rows": stats.pending_wal_row_count,
+            "wal_queue_pending_bytes": stats.pending_wal_estimated_bytes,
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn fineweb_schema(vector_dim: usize) -> Arc<ArrowSchema> {
@@ -615,6 +695,10 @@ fn parse_args() -> Result<Args> {
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
         if flag == "--bench" {
+            continue;
+        }
+        if flag == "--skip-close" {
+            args.skip_close = true;
             continue;
         }
         let value = iter.next().ok_or_else(|| {
