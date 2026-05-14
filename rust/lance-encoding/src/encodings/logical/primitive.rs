@@ -4671,7 +4671,7 @@ impl PrimitiveStructuralEncoder {
         fixed: FixedWidthDataBlock,
         mut repdef: ControlWordIterator,
         num_values: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
         let len = fixed.data.len() + repdef.bytes_per_word() * num_values as usize;
         let mut zipped_data = Vec::with_capacity(len);
 
@@ -4684,13 +4684,18 @@ impl PrimitiveStructuralEncoder {
         let mut rep_index_builder =
             BytepackedIntegerEncoder::with_capacity(num_values as usize + 1, max_rep_index_val);
 
-        // I suppose we can just pad to the nearest byte but I'm not sure we need to worry about this anytime soon
-        // because it is unlikely compression of large values is going to yield a result that is not byte aligned
-        assert_eq!(
-            fixed.bits_per_value % 8,
-            0,
-            "Non-byte aligned full-zip compression not yet supported"
-        );
+        // Sub-byte widths should be widened upstream (see `encode_full_zip` for
+        // the boolean path). Return an error instead of panicking — this code
+        // is reached over the JNI boundary where a Rust panic aborts the JVM.
+        if !fixed.bits_per_value.is_multiple_of(8) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "Non-byte aligned full-zip compression not yet supported ({} bits per value)",
+                    fixed.bits_per_value
+                )
+                .into(),
+            ));
+        }
 
         let bytes_per_value = fixed.bits_per_value as usize / 8;
         let mut offset = 0;
@@ -4738,10 +4743,10 @@ impl PrimitiveStructuralEncoder {
         } else {
             Some(LanceBuffer::from(rep_index))
         };
-        SerializedFullZip {
+        Ok(SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
-        }
+        })
     }
 
     // For variable-size data we encode < control word | length | data > for each value
@@ -4751,13 +4756,17 @@ impl PrimitiveStructuralEncoder {
         variable: VariableWidthBlock,
         mut repdef: ControlWordIterator,
         num_items: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
         let bytes_per_offset = variable.bits_per_offset as usize / 8;
-        assert_eq!(
-            variable.bits_per_offset % 8,
-            0,
-            "Only byte-aligned offsets supported"
-        );
+        if !variable.bits_per_offset.is_multiple_of(8) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "Only byte-aligned offsets supported in full-zip ({} bits per offset)",
+                    variable.bits_per_offset
+                )
+                .into(),
+            ));
+        }
         let len = variable.data.len()
             + repdef.bytes_per_word() * num_items as usize
             + bytes_per_offset * variable.num_values as usize;
@@ -4815,7 +4824,11 @@ impl PrimitiveStructuralEncoder {
                     rep_offset = buf.len();
                 }
             }
-            _ => panic!("Unsupported offset size"),
+            n => {
+                return Err(Error::not_supported_source(
+                    format!("Unsupported offset size in full-zip: {} bytes", n).into(),
+                ));
+            }
         }
 
         // We might have saved a few bytes by not copying lengths when the length was zero.  However,
@@ -4831,10 +4844,10 @@ impl PrimitiveStructuralEncoder {
         let rep_index = rep_index_builder.into_data();
         debug_assert!(!rep_index.is_empty());
         let rep_index = Some(LanceBuffer::from(rep_index));
-        SerializedFullZip {
+        Ok(SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
-        }
+        })
     }
 
     /// Serializes data into a single buffer according to the full-zip format which zips
@@ -4843,7 +4856,7 @@ impl PrimitiveStructuralEncoder {
         compressed_data: PerValueDataBlock,
         repdef: ControlWordIterator,
         num_items: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
         match compressed_data {
             PerValueDataBlock::Fixed(fixed) => {
                 Self::serialize_full_zip_fixed(fixed, repdef, num_items)
@@ -4898,6 +4911,17 @@ impl PrimitiveStructuralEncoder {
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
 
+        // Full-zip interleaves each value with its rep/def control word and so
+        // requires byte-aligned values. Booleans arrive as a 1-bit-per-value
+        // Arrow bitmap; expand them to one byte per value here. The matching
+        // re-pack happens in FixedWidthDataBlock::do_into_arrow on read.
+        let data = match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(fixed.expand_bitmap_to_bytes())
+            }
+            other => other,
+        };
+
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
@@ -4922,7 +4946,7 @@ impl PrimitiveStructuralEncoder {
             ),
         };
 
-        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items);
+        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items)?;
 
         let data = if let Some(repindex) = zipped.repetition_index {
             vec![zipped.values, repindex]

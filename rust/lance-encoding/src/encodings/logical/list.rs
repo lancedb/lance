@@ -302,6 +302,28 @@ mod tests {
         check_basic_random(field).await;
     }
 
+    // Regression test for lance-format/lance-spark#529.
+    //
+    // Booleans arrive as a 1-bit-per-value Arrow bitmap. When a boolean column
+    // is nested deeply enough that its rep/def levels are too sparse for
+    // miniblock encoding, the encoder falls back to full-zip — which used to
+    // panic on sub-byte values and abort the JVM via JNI.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_list_of_booleans(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+        let field =
+            Field::new("", make_list_type(DataType::Boolean), true).with_metadata(field_metadata);
+        check_basic_random(field).await;
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);

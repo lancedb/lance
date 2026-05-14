@@ -169,13 +169,69 @@ pub struct FixedWidthDataBlock {
 }
 
 impl FixedWidthDataBlock {
+    /// Expands a 1-bit-per-value bitmap into a byte-per-value buffer.
+    ///
+    /// Each input bit becomes a byte whose value is 0 or 1. Used by encoders
+    /// (notably full-zip) that require byte-aligned data when the source is an
+    /// Arrow boolean bitmap. Round-trip pair: [`Self::pack_bytes_to_bitmap`].
+    pub fn expand_bitmap_to_bytes(self) -> Self {
+        assert_eq!(
+            self.bits_per_value, 1,
+            "expand_bitmap_to_bytes called on non-bitmap block"
+        );
+        let num_values = self.num_values as usize;
+        let bitmap = self.data.as_ref();
+        let mut expanded = Vec::with_capacity(num_values);
+        for i in 0..num_values {
+            expanded.push((bitmap[i / 8] >> (i % 8)) & 1);
+        }
+        Self {
+            data: LanceBuffer::from(expanded),
+            bits_per_value: 8,
+            num_values: self.num_values,
+            block_info: BlockInfo::new(),
+        }
+    }
+
+    /// Re-packs a byte-per-value buffer (each byte 0 or 1) back into a bitmap.
+    ///
+    /// Inverse of [`Self::expand_bitmap_to_bytes`].
+    pub fn pack_bytes_to_bitmap(self) -> Self {
+        assert_eq!(
+            self.bits_per_value, 8,
+            "pack_bytes_to_bitmap called on non-byte block"
+        );
+        let num_values = self.num_values as usize;
+        let bytes = self.data.as_ref();
+        let mut bitmap = vec![0u8; num_values.div_ceil(8)];
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != 0 {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Self {
+            data: LanceBuffer::from(bitmap),
+            bits_per_value: 1,
+            num_values: self.num_values,
+            block_info: BlockInfo::new(),
+        }
+    }
+
     fn do_into_arrow(
         self,
         data_type: DataType,
         num_values: u64,
         validate: bool,
     ) -> Result<ArrayData> {
-        let data_buffer = self.data.into_buffer();
+        // Full-zip encoding stores booleans as one byte per value (it cannot
+        // interleave sub-byte values with rep/def control words). Re-pack to a
+        // bitmap before handing the buffer to Arrow.
+        let block = if matches!(data_type, DataType::Boolean) && self.bits_per_value == 8 {
+            self.pack_bytes_to_bitmap()
+        } else {
+            self
+        };
+        let data_buffer = block.data.into_buffer();
         let builder = ArrayDataBuilder::new(data_type)
             .add_buffer(data_buffer)
             .len(num_values as usize)
