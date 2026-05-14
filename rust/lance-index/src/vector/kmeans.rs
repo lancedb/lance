@@ -44,6 +44,8 @@ use {
     lance_linalg::kernels::argmin_value,
 };
 
+use ndarray::ArrayView2;
+
 use crate::vector::utils::SimpleIndex;
 use crate::{Error, Result};
 
@@ -324,6 +326,91 @@ pub trait KMeansAlgo<T: Num> {
     ) -> KMeans;
 }
 
+/// Compute L2 nearest-centroid assignment via a single batched matrix multiplication.
+///
+/// Uses the identity `||a - b||² = ||a||² - 2⟨a,b⟩ + ||b||²`:
+///
+/// 1. Precompute `||centroid_j||²` for all K centroids once: `O(K×D)`, reused for all N queries.
+/// 2. Compute the full inner-product matrix `inner[N, K] = data[N,D] × centroids[K,D].T`
+///    in one GEMM call via `ndarray`'s `matrixmultiply` backend (pure Rust, SIMD-accelerated,
+///    cache-blocked Goto algorithm — no vendor BLAS required).
+/// 3. Parallel argmin over rows: each of N rayon tasks reads one contiguous row of `inner`.
+///
+/// Why GEMM beats the scalar `par_chunks` path:
+/// - The scalar path processes (query, centroid) pairs independently; each pair reloads the
+///   centroid data from cache.  For N=50k, K=256, D=8 that is 50k × 256 × 8 = 102 M random
+///   byte reads against the same 8 KB centroid block.
+/// - GEMM tiles the computation so each centroid block is loaded once and reused across a
+///   full tile of queries, turning random-access into streaming reads.
+///
+/// Enabled when **all** hold: `DistanceType::L2`, `T::Native` is `f32`,
+/// `N × K × 4 ≤ LANCE_SGEMM_THRESHOLD` (default 64 MiB), no `SimpleIndex`.
+/// Set `LANCE_SGEMM_THRESHOLD=0` to force the scalar path regardless.
+fn compute_l2_sgemm(
+    data: &[f32],
+    centroids: &[f32],
+    dimension: usize,
+    balance_factor: f32,
+    cluster_sizes: Option<&[usize]>,
+) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+    let n = data.len() / dimension;
+    let k = centroids.len() / dimension;
+
+    // Build zero-copy ndarray views over the existing slices.
+    let data_mat = ArrayView2::from_shape((n, dimension), data).expect("data shape");
+    let c_mat = ArrayView2::from_shape((k, dimension), centroids).expect("centroids shape");
+
+    // Precompute ||centroid_j||² for all K centroids once: O(K × D).
+    let norms_c: Vec<f32> = centroids
+        .chunks_exact(dimension)
+        .map(|c| c.iter().map(|x| x * x).sum())
+        .collect();
+
+    // GEMM: inner[i,j] = <data[i], centroid[j]>  →  shape [N, K], C-contiguous.
+    // matrixmultiply (the ndarray backend) uses a cache-blocked Goto-style algorithm
+    // with SIMD kernels on x86-64 (SSE2/AVX) and ARM64 (NEON).
+    let inner = data_mat.dot(&c_mat.t());
+    let (inner_flat, offset) = inner.into_raw_vec_and_offset();
+    // `dot()` always returns a freshly-allocated C-contiguous array with offset 0.
+    // The assert is a correctness guard; if it ever fires for a future ndarray
+    // version, inner_flat[i * k..] would silently use wrong memory, so we treat
+    // a non-zero or absent offset as a hard error.
+    assert_eq!(
+        offset,
+        Some(0),
+        "dot() result must be C-contiguous (offset={offset:?})"
+    );
+
+    // Parallel argmin: each rayon task owns one contiguous row of inner_flat.
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let norm_q: f32 = data[i * dimension..(i + 1) * dimension]
+                .iter()
+                .map(|x| x * x)
+                .sum();
+            let row = &inner_flat[i * k..(i + 1) * k];
+
+            // Match the scalar path: NaN query vector → no assignment.
+            if norm_q.is_nan() {
+                return (None, None);
+            }
+
+            let (mut best_idx, mut best_score) = (0u32, f32::MAX);
+            for j in 0..k {
+                // ||a - b||² = ||a||² - 2⟨a,b⟩ + ||b||²
+                let dist = norm_q - 2.0 * row[j] + norms_c[j];
+                let score = dist + cluster_sizes.map_or(0.0, |s| balance_factor * s[j] as f32);
+                if score < best_score {
+                    best_score = score;
+                    best_idx = j as u32;
+                }
+            }
+            (Some(best_idx), Some(best_score))
+        })
+        .unzip()
+}
+
 pub struct KMeansAlgoFloat<T: ArrowNumericType>
 where
     T::Native: Float + Num,
@@ -345,6 +432,51 @@ where
         cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+        // SGEMM fast path: always-on for L2 + f32 when the N×K result matrix fits
+        // within the configured memory budget.
+        //
+        // Budget: `LANCE_SGEMM_THRESHOLD` bytes (default 64 MiB = 67_108_864).
+        // Set to 0 to disable entirely (equivalent to the old LANCE_NO_SGEMM=1).
+        //
+        // `size_of::<T::Native>() == 4` is true only for f32 among the Float types
+        // handled by KMeansAlgoFloat (f16 = 2, f64 = 8 bytes), so the pointer cast
+        // below is sound.
+        const DEFAULT_THRESHOLD_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+        let threshold_bytes: usize = std::env::var("LANCE_SGEMM_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_THRESHOLD_BYTES);
+        let n = data.len() / dimension.max(1);
+        let k = centroids.len() / dimension.max(1);
+        // Guard: n == 0 or k == 0 means nothing to do (empty result).  Also
+        // skip when matrix_bytes == 0 to avoid activating SGEMM for trivial
+        // edge-cases (e.g. empty centroids during incremental index builds).
+        let matrix_bytes = n
+            .saturating_mul(k)
+            .saturating_mul(std::mem::size_of::<f32>());
+        if index.is_none()
+            && distance_type == DistanceType::L2
+            && std::mem::size_of::<T::Native>() == std::mem::size_of::<f32>()
+            && n > 0
+            && k > 0
+            && threshold_bytes > 0
+            && matrix_bytes <= threshold_bytes
+        {
+            // SAFETY: T::Native is f32 (verified by size_of check above).
+            let data_f32: &[f32] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()) };
+            let centroids_f32: &[f32] = unsafe {
+                std::slice::from_raw_parts(centroids.as_ptr() as *const f32, centroids.len())
+            };
+            return compute_l2_sgemm(
+                data_f32,
+                centroids_f32,
+                dimension,
+                balance_factor,
+                cluster_sizes,
+            );
+        }
+
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -1615,5 +1747,195 @@ mod tests {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
             assert!(val != f16::ZERO);
         }
+    }
+
+    // ── SGEMM fast-path tests ──────────────────────────────────────────────────
+
+    fn make_f32_ramp(n: usize, d: usize) -> Vec<f32> {
+        (0..n * d).map(|i| (i % 97) as f32 / 97.0).collect()
+    }
+
+    /// Force scalar path by setting LANCE_SGEMM_THRESHOLD=0.
+    fn membership_scalar(data: &[f32], cents: &[f32], dim: usize) -> Vec<Option<u32>> {
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::set_var("LANCE_SGEMM_THRESHOLD", "0") };
+        let (m, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            cents,
+            data,
+            dim,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+        unsafe { std::env::remove_var("LANCE_SGEMM_THRESHOLD") };
+        m
+    }
+
+    /// Use the default (budget-based) path.
+    fn membership_auto(data: &[f32], cents: &[f32], dim: usize) -> Vec<Option<u32>> {
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::remove_var("LANCE_SGEMM_THRESHOLD") };
+        let (m, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            cents,
+            data,
+            dim,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+        m
+    }
+
+    /// L2 distance of the SGEMM-assigned centroid must be ≤ the scalar-assigned
+    /// centroid's distance + epsilon.
+    ///
+    /// We do NOT assert bit-identical assignments because the two formulations
+    /// of L2 distance are algebraically equivalent but numerically distinct:
+    ///   scalar: sum((a_i − b_i)²)
+    ///   SGEMM:  ||a||² − 2⟨a,b⟩ + ||b||²
+    /// Near-equidistant centroids can break ties differently, but *both* choices
+    /// are correct (minimal L2 distance up to floating-point rounding).
+    fn l2_dist(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>()
+    }
+
+    fn assert_sgemm_is_optimal(data: &[f32], cents: &[f32], dim: usize) {
+        let scalar_m = membership_scalar(data, cents, dim);
+        let sgemm_m = membership_auto(data, cents, dim);
+        let eps = 1e-4_f32;
+        for i in 0..data.len() / dim {
+            let vec = &data[i * dim..(i + 1) * dim];
+            let scalar_c = scalar_m[i].unwrap() as usize;
+            let sgemm_c = sgemm_m[i].unwrap() as usize;
+            let scalar_d = l2_dist(vec, &cents[scalar_c * dim..(scalar_c + 1) * dim]);
+            let sgemm_d = l2_dist(vec, &cents[sgemm_c * dim..(sgemm_c + 1) * dim]);
+            assert!(
+                sgemm_d <= scalar_d + eps,
+                "row {i}: SGEMM chose centroid {sgemm_c} (d={sgemm_d:.6})                  but scalar centroid {scalar_c} (d={scalar_d:.6}) is strictly closer"
+            );
+        }
+    }
+
+    /// SGEMM must assign each point to a centroid with L2 distance no worse
+    /// than the scalar path (up to floating-point rounding).
+    #[test]
+    fn test_sgemm_matches_scalar() {
+        for &(n, k, d) in &[(200, 8, 8), (500, 16, 16), (1000, 32, 32)] {
+            let data = make_f32_ramp(n, d);
+            let cents = make_f32_ramp(k, d);
+            assert_sgemm_is_optimal(&data, &cents, d);
+        }
+    }
+
+    /// When LANCE_SGEMM_THRESHOLD=0, the path is disabled; results must match
+    /// the always-scalar helper.
+    #[test]
+    fn test_sgemm_disabled_by_threshold_zero() {
+        let (n, k, d) = (200, 8, 8);
+        let data = make_f32_ramp(n, d);
+        let cents = make_f32_ramp(k, d);
+        // membership_scalar already sets LANCE_SGEMM_THRESHOLD=0, so both calls
+        // exercise the scalar path → results must be identical.
+        assert_eq!(
+            membership_scalar(&data, &cents, d),
+            membership_scalar(&data, &cents, d)
+        );
+    }
+
+    /// LANCE_SGEMM_THRESHOLD=0 forces the scalar path; must agree with natural scalar.
+    #[test]
+    fn test_sgemm_env_toggle() {
+        let (n, k, d) = (300, 16, 8);
+        let data = make_f32_ramp(n, d);
+        let cents = make_f32_ramp(k, d);
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::set_var("LANCE_SGEMM_THRESHOLD", "0") };
+        let (toggled, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &cents,
+            &data,
+            d,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+        unsafe { std::env::remove_var("LANCE_SGEMM_THRESHOLD") };
+        assert_eq!(membership_scalar(&data, &cents, d), toggled);
+    }
+
+    /// When N×K×4 exceeds the configured budget, SGEMM must not activate and the
+    /// result must be identical to the always-scalar path.
+    ///
+    /// We use a tiny custom threshold (just below the actual matrix size) so the
+    /// test runs without allocating a large matrix.
+    #[test]
+    fn test_sgemm_budget_boundary() {
+        let (n, k, d) = (200, 8, 8); // matrix = 200 × 8 × 4 = 6 400 bytes
+        let data = make_f32_ramp(n, d);
+        let cents = make_f32_ramp(k, d);
+
+        let run_with_threshold = |threshold: &str| {
+            // SAFETY: single-threaded test context.
+            unsafe { std::env::set_var("LANCE_SGEMM_THRESHOLD", threshold) };
+            let (m, _) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                &cents,
+                &data,
+                d,
+                DistanceType::L2,
+                0.0,
+                None,
+                None,
+            );
+            unsafe { std::env::remove_var("LANCE_SGEMM_THRESHOLD") };
+            m
+        };
+
+        // Threshold exactly 1 byte below the matrix size (6 400 bytes) → scalar path.
+        let matrix_bytes = n * k * std::mem::size_of::<f32>(); // 6 400
+        let below_threshold = (matrix_bytes - 1).to_string();
+        let scalar_m = run_with_threshold(&below_threshold);
+
+        // Threshold exactly at matrix size → SGEMM path.
+        let at_threshold = matrix_bytes.to_string();
+        let sgemm_m = run_with_threshold(&at_threshold);
+
+        // Both paths must assign every point to a valid centroid.
+        assert_eq!(scalar_m.len(), n);
+        assert_eq!(sgemm_m.len(), n);
+        scalar_m
+            .iter()
+            .for_each(|m| assert!(m.is_some(), "scalar left a point unassigned"));
+        sgemm_m
+            .iter()
+            .for_each(|m| assert!(m.is_some(), "sgemm left a point unassigned"));
+
+        // Results are distance-optimal: SGEMM centroid must be ≤ scalar + eps.
+        let eps = 1e-4_f32;
+        for i in 0..n {
+            let vec = &data[i * d..(i + 1) * d];
+            let sc = scalar_m[i].unwrap() as usize;
+            let sg = sgemm_m[i].unwrap() as usize;
+            let d_sc = l2_dist(vec, &cents[sc * d..(sc + 1) * d]);
+            let d_sg = l2_dist(vec, &cents[sg * d..(sg + 1) * d]);
+            assert!(
+                d_sg <= d_sc + eps,
+                "row {i}: SGEMM centroid {sg} (d={d_sg:.6}) worse than scalar {sc} (d={d_sc:.6})"
+            );
+        }
+    }
+
+    /// Edge cases: single vector, single centroid, dim=1.
+    #[test]
+    fn test_sgemm_edge_cases() {
+        let r = compute_l2_sgemm(&[0.5_f32], &[0.3_f32], 1, 0.0, None);
+        assert_eq!(r.0, vec![Some(0u32)]);
+
+        // Nearest centroid should be 0 (exact match).
+        let data = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let cents = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let r = compute_l2_sgemm(&data, &cents, 4, 0.0, None);
+        assert_eq!(r.0[0], Some(0u32));
     }
 }

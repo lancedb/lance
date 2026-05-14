@@ -501,12 +501,17 @@ async fn prepare_query_filter_dataset() -> Dataset {
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
 
-    // Create index
-    let params = VectorIndexParams::with_ivf_pq_params(
-        MetricType::L2,
-        IvfBuildParams::new(2),
-        PQBuildParams::new(4, 8),
-    );
+    // Create index.
+    //
+    // Disable the SGEMM fast path during index construction so that the
+    // hybrid FTS + ANN tests below produce bit-deterministic results
+    // regardless of the current LANCE_SGEMM_THRESHOLD default. These tests
+    // verify FTS + vector search correctness, not SGEMM performance.
+    // SAFETY: single-threaded async test setup.
+    unsafe { std::env::set_var("LANCE_SGEMM_THRESHOLD", "0") };
+    let pq_params = PQBuildParams::new(4, 8);
+    let params =
+        VectorIndexParams::with_ivf_pq_params(MetricType::L2, IvfBuildParams::new(2), pq_params);
     dataset
         .create_index(&["vector"], IndexType::Vector, None, &params, true)
         .await
@@ -522,6 +527,10 @@ async fn prepare_query_filter_dataset() -> Dataset {
         )
         .await
         .unwrap();
+
+    // Restore the default SGEMM setting for any subsequent code in the tests.
+    // SAFETY: single-threaded async test setup.
+    unsafe { std::env::remove_var("LANCE_SGEMM_THRESHOLD") };
 
     dataset
 }

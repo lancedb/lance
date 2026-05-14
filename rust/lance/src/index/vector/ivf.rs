@@ -4219,10 +4219,18 @@ mod tests {
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::Cosine, 50);
+        // This test checks cosine normalization and recall quality with synthetic
+        // data in a very narrow range [1000, 1001]. After normalization, vectors
+        // cluster tightly, making K-means sensitive to floating-point tie-breaking.
+        // Disable SGEMM here so the test remains deterministic regardless of the
+        // configured LANCE_SGEMM_THRESHOLD. This does not affect production recall.
+        // SAFETY: single-threaded async test.
+        unsafe { std::env::set_var("LANCE_SGEMM_THRESHOLD", "0") };
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
+        unsafe { std::env::remove_var("LANCE_SGEMM_THRESHOLD") };
         let indices = dataset.load_indices().await.unwrap();
         let idx = dataset
             .open_generic_index(

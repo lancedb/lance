@@ -4728,7 +4728,11 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
         assert index.num_rows_indexed == 50
 
 
-def test_vector_filter_fts_search(tmp_path):
+def test_vector_filter_fts_search(tmp_path, monkeypatch):
+    # Disable SGEMM (threshold=0) so PQ codebook training is deterministic and
+    # the ordering assertions below are stable regardless of SIMD availability.
+    monkeypatch.setenv("LANCE_SGEMM_THRESHOLD", "0")
+
     # Create test data
     ids = list(range(1, 301))
     vectors = [[float(i)] * 4 for i in ids]

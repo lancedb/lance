@@ -185,3 +185,61 @@ impl PQBuildParams {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::FixedSizeListArray;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_testing::datagen::generate_random_array_with_seed;
+
+    /// Smoke test: PQ codebook must have correct shape and all-finite values.
+    ///
+    /// SGEMM is now always active when the N×K budget allows (default 64 MiB).
+    /// This test simply verifies both code paths (SGEMM-on via default, SGEMM-off
+    /// via LANCE_SGEMM_THRESHOLD=0) produce a valid codebook with finite values.
+    #[test]
+    fn test_pq_build_sgemm_produces_finite_codebook() {
+        const ROWS: usize = 1024;
+        const DIM: usize = 16;
+        const NUM_SUB_VECTORS: usize = 2;
+        const NUM_BITS: usize = 8;
+        const NUM_CENTROIDS: usize = 1 << NUM_BITS;
+
+        let values = generate_random_array_with_seed::<Float32Type>(ROWS * DIM, [42; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let build = || -> ProductQuantizer {
+            let params = PQBuildParams::new(NUM_SUB_VECTORS, NUM_BITS);
+            params.build(&fsl, DistanceType::L2).unwrap()
+        };
+
+        // Default path (SGEMM enabled when budget allows).
+        let pq = build();
+        assert_eq!(pq.codebook.len(), NUM_CENTROIDS);
+        assert_eq!(pq.dimension, DIM);
+        let centroids = pq.codebook.values().as_primitive::<Float32Type>().values();
+        for &v in centroids.iter() {
+            assert!(v.is_finite(), "codebook contains non-finite value: {v}");
+        }
+
+        // Forced scalar path via LANCE_SGEMM_THRESHOLD=0.
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::set_var("LANCE_SGEMM_THRESHOLD", "0") };
+        let pq_scalar = build();
+        unsafe { std::env::remove_var("LANCE_SGEMM_THRESHOLD") };
+        assert_eq!(pq_scalar.codebook.len(), NUM_CENTROIDS);
+        assert_eq!(pq_scalar.dimension, DIM);
+        let scalar_centroids = pq_scalar
+            .codebook
+            .values()
+            .as_primitive::<Float32Type>()
+            .values();
+        for &v in scalar_centroids.iter() {
+            assert!(
+                v.is_finite(),
+                "scalar codebook contains non-finite value: {v}"
+            );
+        }
+    }
+}

@@ -3007,7 +3007,11 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
         assert np.allclose(a, b, atol=1e-6)
 
 
-def test_fts_filter_vector_search(tmp_path):
+def test_fts_filter_vector_search(tmp_path, monkeypatch):
+    # Disable SGEMM (threshold=0) so PQ codebook training is deterministic and
+    # the ordering assertions below are stable regardless of SIMD availability.
+    monkeypatch.setenv("LANCE_SGEMM_THRESHOLD", "0")
+
     # Create dataset with vector and text columns
     ids = list(range(1, 301))
     vectors = [[float(i)] * 4 for i in ids]
