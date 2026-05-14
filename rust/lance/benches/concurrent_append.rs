@@ -142,7 +142,14 @@ async fn create_base_dataset(
     session: Arc<Session>,
     store_params: Option<ObjectStoreParams>,
 ) -> Dataset {
-    let initial = batch(0, rows_per_append);
+    // When `base_rows == 0` the dataset starts empty: one create commit with a
+    // zero-row batch so the writers begin at version 1 with no data.
+    let initial_rows = if base_rows == 0 {
+        0
+    } else {
+        rows_per_append.min(base_rows)
+    };
+    let initial = batch(0, initial_rows);
     let reader = RecordBatchIterator::new(vec![Ok(initial)], schema());
     let create_params = WriteParams {
         mode: WriteMode::Create,
@@ -157,7 +164,7 @@ async fn create_base_dataset(
 
     // Top up to BASE_ROWS in chunks so we don't allocate one huge batch.
     let chunk = 10_000.min(base_rows);
-    let mut written = rows_per_append;
+    let mut written = initial_rows;
     while written < base_rows {
         let to_write = chunk.min(base_rows - written);
         let batch = batch(written, to_write);
