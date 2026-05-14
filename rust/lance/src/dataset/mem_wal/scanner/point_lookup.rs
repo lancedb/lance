@@ -19,6 +19,7 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
+use super::projection::{build_scanner_projection, canonical_output_schema, project_to_canonical};
 
 /// Plans point lookup queries over LSM data.
 ///
@@ -199,29 +200,36 @@ impl LsmPointLookupPlanner {
     }
 
     /// Build scan plan for a single data source.
+    ///
+    /// Each source's output is projected to the canonical schema so that
+    /// system columns the user requested (`_rowid`, `_rowaddr`, …) appear
+    /// at the user's specified position — filled with NULL when the
+    /// underlying source doesn't produce them, since per-source values
+    /// aren't comparable across LSM levels.
     async fn build_source_scan(
         &self,
         source: &LsmDataSource,
         projection: Option<&[String]>,
         filter: &Expr,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        match source {
+        let cols = build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+        let target =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+        let scan: Arc<dyn ExecutionPlan> = match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
-                let cols = self.build_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await
+                scanner.create_plan().await?
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
                 let dataset = crate::dataset::DatasetBuilder::from_uri(path)
                     .load()
                     .await?;
                 let mut scanner = dataset.scan();
-                let cols = self.build_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await
+                scanner.create_plan().await?
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -233,55 +241,20 @@ impl LsmPointLookupPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-                if let Some(cols) = projection {
-                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-                }
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await
+                scanner.create_plan().await?
             }
-        }
-    }
-
-    /// Build projection list ensuring PK columns are included.
-    fn build_projection(&self, projection: Option<&[String]>) -> Vec<String> {
-        let mut cols: Vec<String> = if let Some(p) = projection {
-            p.to_vec()
-        } else {
-            self.base_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect()
         };
-
-        for pk in &self.pk_columns {
-            if !cols.contains(pk) {
-                cols.push(pk.clone());
-            }
-        }
-
-        cols
+        project_to_canonical(scan, &target)
     }
 
-    /// Create an empty execution plan.
+    /// Create an empty execution plan with the canonical output schema.
     fn empty_plan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
-        use arrow_schema::{Field, Schema};
         use datafusion::physical_plan::empty::EmptyExec;
 
-        let fields: Vec<Arc<Field>> = if let Some(cols) = projection {
-            cols.iter()
-                .filter_map(|name| {
-                    self.base_schema
-                        .field_with_name(name)
-                        .ok()
-                        .map(|f| Arc::new(f.clone()))
-                })
-                .collect()
-        } else {
-            self.base_schema.fields().iter().cloned().collect()
-        };
-
-        let schema = Arc::new(Schema::new(fields));
+        let schema =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
         Ok(Arc::new(EmptyExec::new(schema)))
     }
 }
@@ -454,5 +427,127 @@ mod tests {
             expr_str.contains("id"),
             "Expression should contain column name"
         );
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_without_base_table() {
+        use futures::TryStreamExt;
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+
+        // No base dataset is created. We still need a base URI so the collector
+        // can resolve flushed-generation paths.
+        let base_uri = format!("{}/base", base_path);
+
+        // Create a flushed generation under {base_uri}/_mem_wal/{shard}/gen_1
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let gen1_batch = create_test_batch(&schema, &[2, 3], "gen1");
+        create_dataset(&gen1_uri, vec![gen1_batch]).await;
+
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        // id=3 lives in the flushed generation
+        let pk_values = vec![ScalarValue::Int32(Some(3))];
+        let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
+
+        let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            !plan_str.contains("base/data"),
+            "Plan must not scan base table, got: {}",
+            plan_str
+        );
+        assert!(plan_str.contains("gen_1"));
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1);
+
+        // id=99 doesn't exist anywhere → empty
+        let plan = planner
+            .plan_lookup(&[ScalarValue::Int32(Some(99))], None)
+            .await
+            .unwrap();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_projection_with_system_columns() {
+        // Regression: passing system columns (`_rowid`, `_rowaddr`, `_rowoffset`)
+        // in the projection used to either error in the active-arm
+        // MemTableScanner or be silently dropped. They must now be honored at
+        // the user's specified position with NULL values across LSM sources.
+        use futures::TryStreamExt;
+        use lance_core::is_system_column;
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base_batch = create_test_batch(&schema, &[1, 2, 3], "base");
+        let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
+
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        // User requests `_rowaddr` between `id` and `name`, plus `_rowoffset` at end.
+        let projection = vec![
+            "id".to_string(),
+            "_rowaddr".to_string(),
+            "name".to_string(),
+            "_rowoffset".to_string(),
+        ];
+        let pk_values = vec![ScalarValue::Int32(Some(2))];
+        let plan = planner
+            .plan_lookup(&pk_values, Some(&projection))
+            .await
+            .expect("planner must accept system columns in projection");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "expected exactly one matching row");
+
+        let out_schema = batches[0].schema();
+        let out_cols: Vec<String> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            out_cols,
+            vec![
+                "id".to_string(),
+                "_rowaddr".to_string(),
+                "name".to_string(),
+                "_rowoffset".to_string(),
+            ],
+            "system columns must appear at the user's requested position"
+        );
+
+        // System columns must be present and NULL across LSM sources (not
+        // comparable across base/flushed/active).
+        for col in ["_rowaddr", "_rowoffset"] {
+            assert!(is_system_column(col));
+            let array = batches[0].column_by_name(col).unwrap();
+            assert!(
+                array.is_null(0),
+                "{} should be NULL in cross-LSM output, got: {:?}",
+                col,
+                array
+            );
+        }
     }
 }

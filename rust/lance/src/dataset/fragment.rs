@@ -20,7 +20,7 @@ use arrow_array::{
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
-use futures::future::try_join_all;
+use futures::future::{BoxFuture, try_join_all};
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
@@ -87,6 +87,13 @@ pub struct FileFragment {
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
 
 /// A trait for file readers to be implemented by both the v1 and v2 readers
+///
+/// The `read_*_tasks` methods are async because for v2 files they drive
+/// the decode scheduler's `initialize` step (and, for small reads, the
+/// synchronous scheduling that follows) before returning the stream.
+/// Doing that work here keeps it on whichever task awaits this call —
+/// typically a per-fragment `tokio::spawn` — instead of smuggling it
+/// into the first poll of the returned stream.
 #[allow(clippy::len_without_is_empty)]
 pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     /// Reads the requested range of rows from the file, returning as a stream
@@ -96,20 +103,20 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         range: Range<u64>,
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
-    ) -> Result<ReadBatchTaskStream>;
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
     /// Reads the requested ranges of rows from the file, only supported by v2
     fn read_ranges_tasks(
         &self,
         ranges: Arc<[Range<u64>]>,
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
-    ) -> Result<ReadBatchTaskStream>;
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
     /// Reads all rows from the file, returning as a stream of tasks
     fn read_all_tasks(
         &self,
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
-    ) -> Result<ReadBatchTaskStream>;
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
     /// Take specific rows from the file, returning as a stream of tasks
     fn take_all_tasks(
         &self,
@@ -117,7 +124,7 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         batch_size: u32,
         projection: Arc<lance_core::datatypes::Schema>,
         take_priority: Option<u32>,
-    ) -> Result<ReadBatchTaskStream>;
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
 
     /// Return the number of rows in the file
     fn len(&self) -> u32;
@@ -199,7 +206,7 @@ impl GenericFileReader for V1Reader {
         range: Range<u64>,
         batch_size: u32,
         projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let mut to_skip = range.start as u32;
         let mut remaining = range.end as u32 - to_skip;
         let mut ranges = Vec::new();
@@ -221,14 +228,15 @@ impl GenericFileReader for V1Reader {
                 ranges.push((next_batch_idx, (chunk_start as usize..chunk_end as usize)));
             }
         }
-        Ok(ranges_to_tasks(&self.reader, ranges, projection))
+        let stream = ranges_to_tasks(&self.reader, ranges, projection);
+        async move { Ok(stream) }.boxed()
     }
 
     fn read_all_tasks(
         &self,
         batch_size: u32,
         projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let ranges = (0..self.reader.num_batches())
             .flat_map(move |batch_idx| {
                 let rows_in_batch = self.reader.num_rows_in_batch(batch_idx as i32);
@@ -240,7 +248,8 @@ impl GenericFileReader for V1Reader {
                     })
             })
             .collect::<Vec<_>>();
-        Ok(ranges_to_tasks(&self.reader, ranges, projection))
+        let stream = ranges_to_tasks(&self.reader, ranges, projection);
+        async move { Ok(stream) }.boxed()
     }
 
     fn read_ranges_tasks(
@@ -248,10 +257,13 @@ impl GenericFileReader for V1Reader {
         _ranges: Arc<[Range<u64>]>,
         _batch_size: u32,
         _projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
-        Err(Error::internal(
-            "Attempt to perform FilteredRead on v1 files".to_string(),
-        ))
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
+        async move {
+            Err(Error::internal(
+                "Attempt to perform FilteredRead on v1 files".to_string(),
+            ))
+        }
+        .boxed()
     }
 
     fn take_all_tasks(
@@ -260,17 +272,22 @@ impl GenericFileReader for V1Reader {
         _batch_size: u32,
         projection: Arc<Schema>,
         _take_priority: Option<u32>,
-    ) -> Result<ReadBatchTaskStream> {
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let indices_vec = indices.to_vec();
         let reader = self.reader.clone();
-        // In the new path the row id is added by the fragment and not the file
-        let task_fut = async move { reader.take(&indices_vec, projection.as_ref()).await }.boxed();
-        let task = std::future::ready(ReadBatchTask {
-            task: task_fut,
-            num_rows: indices.len() as u32,
-        })
-        .boxed();
-        Ok(futures::stream::once(task).boxed())
+        let num_rows = indices.len() as u32;
+        async move {
+            // In the new path the row id is added by the fragment and not the file
+            let task_fut =
+                async move { reader.take(&indices_vec, projection.as_ref()).await }.boxed();
+            let task = std::future::ready(ReadBatchTask {
+                task: task_fut,
+                num_rows,
+            })
+            .boxed();
+            Ok(futures::stream::once(task).boxed())
+        }
+        .boxed()
     }
 
     fn projection(&self) -> &Arc<Schema> {
@@ -343,25 +360,29 @@ mod v2_adapter {
             range: Range<u64>,
             batch_size: u32,
             projection: Arc<Schema>,
-        ) -> Result<ReadBatchTaskStream> {
-            let projection = ReaderProjection::from_field_ids(
-                self.reader.metadata().version(),
-                projection.as_ref(),
-                self.field_id_to_column_idx.as_ref(),
-            )?;
-            Ok(self
-                .reader
-                .read_tasks(
-                    ReadBatchParams::Range(range.start as usize..range.end as usize),
-                    batch_size,
-                    Some(projection),
-                    FilterExpression::no_filter(),
-                )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
-                    num_rows: v2_task.num_rows,
-                })
-                .boxed())
+        ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
+            async move {
+                let projection = ReaderProjection::from_field_ids(
+                    self.reader.metadata().version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                Ok(self
+                    .reader
+                    .read_tasks(
+                        ReadBatchParams::Range(range.start as usize..range.end as usize),
+                        batch_size,
+                        Some(projection),
+                        FilterExpression::no_filter(),
+                    )
+                    .await?
+                    .map(|v2_task| ReadBatchTask {
+                        task: v2_task.task.map_err(Error::from).boxed(),
+                        num_rows: v2_task.num_rows,
+                    })
+                    .boxed())
+            }
+            .boxed()
         }
 
         fn read_ranges_tasks(
@@ -369,50 +390,58 @@ mod v2_adapter {
             ranges: Arc<[Range<u64>]>,
             batch_size: u32,
             projection: Arc<Schema>,
-        ) -> Result<ReadBatchTaskStream> {
-            let projection = ReaderProjection::from_field_ids(
-                self.reader.metadata().version(),
-                projection.as_ref(),
-                self.field_id_to_column_idx.as_ref(),
-            )?;
-            Ok(self
-                .reader
-                .read_tasks(
-                    ReadBatchParams::Ranges(ranges),
-                    batch_size,
-                    Some(projection),
-                    FilterExpression::no_filter(),
-                )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
-                    num_rows: v2_task.num_rows,
-                })
-                .boxed())
+        ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
+            async move {
+                let projection = ReaderProjection::from_field_ids(
+                    self.reader.metadata().version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                Ok(self
+                    .reader
+                    .read_tasks(
+                        ReadBatchParams::Ranges(ranges),
+                        batch_size,
+                        Some(projection),
+                        FilterExpression::no_filter(),
+                    )
+                    .await?
+                    .map(|v2_task| ReadBatchTask {
+                        task: v2_task.task.map_err(Error::from).boxed(),
+                        num_rows: v2_task.num_rows,
+                    })
+                    .boxed())
+            }
+            .boxed()
         }
 
         fn read_all_tasks(
             &self,
             batch_size: u32,
             projection: Arc<Schema>,
-        ) -> Result<ReadBatchTaskStream> {
-            let projection = ReaderProjection::from_field_ids(
-                self.reader.metadata().version(),
-                projection.as_ref(),
-                self.field_id_to_column_idx.as_ref(),
-            )?;
-            Ok(self
-                .reader
-                .read_tasks(
-                    ReadBatchParams::RangeFull,
-                    batch_size,
-                    Some(projection),
-                    FilterExpression::no_filter(),
-                )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
-                    num_rows: v2_task.num_rows,
-                })
-                .boxed())
+        ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
+            async move {
+                let projection = ReaderProjection::from_field_ids(
+                    self.reader.metadata().version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                Ok(self
+                    .reader
+                    .read_tasks(
+                        ReadBatchParams::RangeFull,
+                        batch_size,
+                        Some(projection),
+                        FilterExpression::no_filter(),
+                    )
+                    .await?
+                    .map(|v2_task| ReadBatchTask {
+                        task: v2_task.task.map_err(Error::from).boxed(),
+                        num_rows: v2_task.num_rows,
+                    })
+                    .boxed())
+            }
+            .boxed()
         }
 
         fn take_all_tasks(
@@ -421,37 +450,41 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
             take_priority: Option<u32>,
-        ) -> Result<ReadBatchTaskStream> {
+        ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             let indices = UInt32Array::from(indices.to_vec());
-            let projection = ReaderProjection::from_field_ids(
-                self.reader.metadata().version(),
-                projection.as_ref(),
-                self.field_id_to_column_idx.as_ref(),
-            )?;
+            async move {
+                let projection = ReaderProjection::from_field_ids(
+                    self.reader.metadata().version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
 
-            let reader = if let Some(take_priority) = take_priority {
-                let op_priority = ((take_priority as u64) << 32) | self.default_priority as u64;
-                let scheduler = self.file_scheduler.with_priority(op_priority);
-                Arc::new(
-                    self.reader
-                        .with_scheduler(Arc::new(LanceEncodingsIo::new(scheduler))),
-                )
-            } else {
-                self.reader.clone()
-            };
+                let reader = if let Some(take_priority) = take_priority {
+                    let op_priority = ((take_priority as u64) << 32) | self.default_priority as u64;
+                    let scheduler = self.file_scheduler.with_priority(op_priority);
+                    Arc::new(
+                        self.reader
+                            .with_scheduler(Arc::new(LanceEncodingsIo::new(scheduler))),
+                    )
+                } else {
+                    self.reader.clone()
+                };
 
-            Ok(reader
-                .read_tasks(
-                    ReadBatchParams::Indices(indices),
-                    batch_size,
-                    Some(projection),
-                    FilterExpression::no_filter(),
-                )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
-                    num_rows: v2_task.num_rows,
-                })
-                .boxed())
+                Ok(reader
+                    .read_tasks(
+                        ReadBatchParams::Indices(indices),
+                        batch_size,
+                        Some(projection),
+                        FilterExpression::no_filter(),
+                    )
+                    .await?
+                    .map(|v2_task| ReadBatchTask {
+                        task: v2_task.task.map_err(Error::from).boxed(),
+                        num_rows: v2_task.num_rows,
+                    })
+                    .boxed())
+            }
+            .boxed()
         }
 
         fn storage_stats(&self) -> Vec<(u32, u64)> {
@@ -531,7 +564,7 @@ impl GenericFileReader for NullReader {
         range: Range<u64>,
         batch_size: u32,
         projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         self.read_ranges_tasks(vec![range].into(), batch_size, projection)
     }
 
@@ -540,7 +573,7 @@ impl GenericFileReader for NullReader {
         ranges: Arc<[Range<u64>]>,
         batch_size: u32,
         projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
 
@@ -559,14 +592,14 @@ impl GenericFileReader for NullReader {
             Some(task)
         });
 
-        Ok(futures::stream::iter(task_iter).boxed())
+        async move { Ok(futures::stream::iter(task_iter).boxed()) }.boxed()
     }
 
     fn read_all_tasks(
         &self,
         batch_size: u32,
         projection: Arc<Schema>,
-    ) -> Result<ReadBatchTaskStream> {
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         self.read_ranges_tasks(vec![0..self.num_rows as u64].into(), batch_size, projection)
     }
 
@@ -576,7 +609,7 @@ impl GenericFileReader for NullReader {
         batch_size: u32,
         projection: Arc<Schema>,
         _take_priority: Option<u32>,
-    ) -> Result<ReadBatchTaskStream> {
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
         let num_rows = indices.len() as u64;
         self.read_ranges_tasks(vec![0..num_rows].into(), batch_size, projection)
     }
@@ -1546,7 +1579,7 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size)
+        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size).await
     }
 
     pub async fn merge_columns(
@@ -2361,12 +2394,15 @@ impl FragmentReader {
         Ok(result.project_by_schema(&output_schema)?)
     }
 
-    fn new_read_impl(
-        &self,
+    async fn new_read_impl<'a, F>(
+        &'a self,
         params: ReadBatchParams,
         batch_size: u32,
-        read_fn: impl Fn(&dyn GenericFileReader) -> Result<ReadBatchTaskStream>,
-    ) -> Result<ReadBatchFutStream> {
+        read_fn: F,
+    ) -> Result<ReadBatchFutStream>
+    where
+        F: Fn(&'a dyn GenericFileReader) -> BoxFuture<'a, Result<ReadBatchTaskStream>>,
+    {
         let total_num_rows = self.num_physical_rows as u32;
         // Note that the fragment length might be considerably smaller if there are deleted rows.
         // E.g. if a fragment has 100 rows but rows 0..10 are deleted we still need to make
@@ -2404,21 +2440,23 @@ impl FragmentReader {
             // Read each data file, these reads should produce streams of equal sized
             // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
             // of 10 rows from one data file we should get the same from the other.
-            let read_streams = self
-                .readers
-                .iter()
-                .filter_map(|reader| {
-                    // Normally we filter out empty readers in the open_readers method
-                    // However, we will keep the first empty reader to use for row id
-                    // purposes on some legacy paths and so we need to filter that out
-                    // here.
-                    if reader.projection().fields.is_empty() {
-                        None
-                    } else {
-                        Some(read_fn(reader.as_ref()))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
+            //
+            // We launch all readers' scheduling work concurrently — for v2 files
+            // this is where the decode scheduler's `initialize` I/O happens, so
+            // running them in parallel keeps the per-file scheduling I/Os from
+            // serializing.
+            let read_futs = self.readers.iter().filter_map(|reader| {
+                // Normally we filter out empty readers in the open_readers method
+                // However, we will keep the first empty reader to use for row id
+                // purposes on some legacy paths and so we need to filter that out
+                // here.
+                if reader.projection().fields.is_empty() {
+                    None
+                } else {
+                    Some(read_fn(reader.as_ref()))
+                }
+            });
+            let read_streams = futures::future::try_join_all(read_futs).await?;
             // Merge the streams, this merges the generated batches
             lance_table::utils::stream::merge_streams(read_streams)
         };
@@ -2472,7 +2510,7 @@ impl FragmentReader {
         start..end
     }
 
-    fn do_read_range(
+    async fn do_read_range(
         &self,
         mut range: Range<u32>,
         batch_size: u32,
@@ -2492,6 +2530,7 @@ impl FragmentReader {
                 )
             },
         )
+        .await
     }
 
     fn num_system_cols(&self) -> usize {
@@ -2505,28 +2544,48 @@ impl FragmentReader {
     ///
     /// This function interprets the request as the Xth to the Nth row of the fragment (after deletions)
     /// and will always return range.len().min(self.num_rows()) rows.
-    pub fn read_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
-        self.do_read_range(range, batch_size, true)
+    ///
+    /// This is async because it drives the per-data-file decode scheduler
+    /// `initialize` work before returning the stream — see
+    /// [`GenericFileReader`].
+    pub async fn read_range(
+        &self,
+        range: Range<u32>,
+        batch_size: u32,
+    ) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, true).await
     }
 
     /// Takes a range of rows from the fragment
     ///
     /// Unlike [`Self::read_range`], this function will NOT skip deleted rows.  If rows are deleted they will
     /// be filtered or set to null.  This function may return less than range.len() rows as a result.
-    pub fn take_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
-        self.do_read_range(range, batch_size, false)
+    ///
+    /// This is async for the same reason as [`Self::read_range`].
+    pub async fn take_range(
+        &self,
+        range: Range<u32>,
+        batch_size: u32,
+    ) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, false).await
     }
 
-    pub fn read_all(&self, batch_size: u32) -> Result<ReadBatchFutStream> {
+    /// Reads all rows from the fragment.
+    ///
+    /// This is async for the same reason as [`Self::read_range`].
+    pub async fn read_all(&self, batch_size: u32) -> Result<ReadBatchFutStream> {
         self.new_read_impl(ReadBatchParams::RangeFull, batch_size, move |reader| {
             reader.read_all_tasks(batch_size, reader.projection().clone())
         })
+        .await
     }
 
     // This method is a clone of new_read_impl but returns tasks instead of batches
     //
     // It also only supports v2 files
-    pub fn read_ranges(
+    ///
+    /// This is async for the same reason as [`Self::read_range`].
+    pub async fn read_ranges(
         &self,
         ranges: Arc<[Range<u64>]>,
         batch_size: u32,
@@ -2561,17 +2620,13 @@ impl FragmentReader {
             // Read each data file, these reads should produce streams of equal sized
             // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
             // of 10 rows from one data file we should get the same from the other.
-            let read_streams = self
-                .readers
-                .iter()
-                .map(|reader| {
-                    reader.read_ranges_tasks(
-                        ranges.clone(),
-                        batch_size,
-                        reader.projection().clone(),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
+            //
+            // Run all readers' scheduling concurrently so the per-file
+            // `initialize` I/Os overlap.
+            let read_futs = self.readers.iter().map(|reader| {
+                reader.read_ranges_tasks(ranges.clone(), batch_size, reader.projection().clone())
+            });
+            let read_streams = futures::future::try_join_all(read_futs).await?;
             // Merge the streams, this merges the generated batches
             lance_table::utils::stream::merge_streams(read_streams)
         };
@@ -2618,7 +2673,8 @@ impl FragmentReader {
             .take_range(
                 range.start as u32..range.end as u32,
                 DEFAULT_BATCH_READ_SIZE,
-            )?
+            )
+            .await?
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
@@ -2645,6 +2701,7 @@ impl FragmentReader {
                 )
             },
         )
+        .await
     }
 
     /// Take rows from this fragment, will perform a copy if the underlying reader returns multiple
@@ -3076,6 +3133,7 @@ mod tests {
             for valid_range in [0..40, 20..40] {
                 reader
                     .take_range(valid_range, 100)
+                    .await
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -3083,7 +3141,7 @@ mod tests {
                     .unwrap();
             }
             for invalid_range in [0..41, 41..42] {
-                assert!(reader.take_range(invalid_range, 100).is_err());
+                assert!(reader.take_range(invalid_range, 100).await.is_err());
             }
         }
 
@@ -3099,6 +3157,7 @@ mod tests {
             for valid_range in [0..20, 0..10, 10..20] {
                 reader
                     .read_range(valid_range, 100)
+                    .await
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -3106,7 +3165,7 @@ mod tests {
                     .unwrap();
             }
             for invalid_range in [0..21, 21..22] {
-                assert!(reader.read_range(invalid_range, 100).is_err());
+                assert!(reader.read_range(invalid_range, 100).await.is_err());
             }
         }
     }
@@ -3137,6 +3196,7 @@ mod tests {
             for valid_range in [0..40, 20..40] {
                 reader
                     .take_range(valid_range, 100)
+                    .await
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -3144,7 +3204,7 @@ mod tests {
                     .unwrap();
             }
             for invalid_range in [0..41, 41..42] {
-                assert!(reader.take_range(invalid_range, 100).is_err());
+                assert!(reader.take_range(invalid_range, 100).await.is_err());
             }
         }
 
@@ -3162,6 +3222,7 @@ mod tests {
             for valid_range in [0..20, 0..10, 10..20] {
                 reader
                     .read_range(valid_range, 100)
+                    .await
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -3169,7 +3230,7 @@ mod tests {
                     .unwrap();
             }
             for invalid_range in [0..21, 21..22] {
-                assert!(reader.read_range(invalid_range, 100).is_err());
+                assert!(reader.read_range(invalid_range, 100).await.is_err());
             }
         }
     }
@@ -3229,11 +3290,8 @@ mod tests {
         } else {
             let to_batches = |range: Range<u32>| {
                 let batch_size = range.len() as u32;
-                reader
-                    .take_range(range, batch_size)
-                    .unwrap()
-                    .buffered(1)
-                    .try_collect::<Vec<_>>()
+                let fut = reader.take_range(range, batch_size);
+                async move { fut.await.unwrap().buffered(1).try_collect::<Vec<_>>().await }
             };
 
             // Since the first batch is all deleted, it will return all nulls row ids.
@@ -3295,7 +3353,7 @@ mod tests {
             // Using batch_size=20 here.  If we use batch_size=range.len() we get
             // multiple batches because we might have to read from a larger range
             // to satisfy the request
-            let mut stream = reader.read_range(range, 20).unwrap();
+            let mut stream = reader.read_range(range, 20).await.unwrap();
             let mut batches = Vec::new();
             while let Some(next) = stream.next().await {
                 batches.push(next.await.unwrap());
@@ -3872,6 +3930,7 @@ mod tests {
 
         let actual_data = reader
             .read_range(0..3, 3)
+            .await
             .unwrap()
             .next()
             .await
@@ -4047,6 +4106,7 @@ mod tests {
             .unwrap();
         let mut data = reader
             .read_all(1024)
+            .await
             .unwrap()
             .buffered(1)
             .try_collect::<Vec<_>>()

@@ -69,11 +69,9 @@ For more detailed configuration methods, see the lindera documentation at https:
 ```yaml
 segmenter:
     mode: "normal"
-    dictionary:
-        # Note: in lance, the `kind` field is not supported. You need to specify the model path using the `path` field instead.
-        path: /path/to/lindera/ipadic/main
+    dictionary: /path/to/lindera/ipadic/main
 ```
 
 ## Create your own language model
 
-Put your language model into `LANCE_LANGUAGE_MODEL_HOME`. 
+Put your language model into `LANCE_LANGUAGE_MODEL_HOME`.

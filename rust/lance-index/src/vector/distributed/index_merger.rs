@@ -341,12 +341,14 @@ pub async fn write_partition_rows(
     w: &mut FileWriter,
     range: Range<usize>,
 ) -> Result<()> {
-    let mut stream = reader.read_stream(
-        lance_io::ReadBatchParams::Range(range),
-        u32::MAX,
-        4,
-        lance_encoding::decoder::FilterExpression::no_filter(),
-    )?;
+    let mut stream = reader
+        .read_stream(
+            lance_io::ReadBatchParams::Range(range),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
     use futures::StreamExt as _;
     while let Some(rb) = stream.next().await {
         let rb = rb?;
@@ -626,12 +628,15 @@ async fn read_shard_window_partitions(
         return Ok(per_partition_batches);
     }
 
-    let mut stream = shard_job.reader.read_stream(
-        lance_io::ReadBatchParams::Range(shard_job.start_offset..shard_job.end_offset),
-        u32::MAX,
-        4,
-        lance_encoding::decoder::FilterExpression::no_filter(),
-    )?;
+    let mut stream = shard_job
+        .reader
+        .read_stream(
+            lance_io::ReadBatchParams::Range(shard_job.start_offset..shard_job.end_offset),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
 
     let mut rel_partition = 0usize;
     while rel_partition < window_len && shard_job.window_lengths[rel_partition] == 0 {
@@ -1823,6 +1828,7 @@ mod tests {
                 4,
                 lance_encoding::decoder::FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
         while let Some(batch) = stream.next().await {
             total_rows += batch.unwrap().num_rows();
@@ -2368,6 +2374,7 @@ mod tests {
                 4,
                 lance_encoding::decoder::FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
         while let Some(batch) = stream.next().await {
             total_rows += batch.unwrap().num_rows();
@@ -2556,6 +2563,7 @@ mod tests {
                 4,
                 lance_encoding::decoder::FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         let mut row_ids = Vec::new();

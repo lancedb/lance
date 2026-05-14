@@ -256,7 +256,7 @@ async fn main() -> lance_core::Result<()> {
             let mut spins = 0u64;
             loop {
                 let active = writer.active_memtable_ref().await?;
-                if active.index_store.max_indexed_batch_position() >= target_batch_pos {
+                if active.index_store.max_visible_batch_position() >= target_batch_pos {
                     break;
                 }
                 drop(active);

@@ -78,4 +78,6 @@ copyright: © 2025 Lance Format. All rights reserved.
 
 extra_css:
   - assets/stylesheets/home.css
+extra_javascript:
+  - assets/javascripts/nav-expand.js
 

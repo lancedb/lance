@@ -8,13 +8,12 @@
 use std::sync::Arc;
 
 use arrow_array::FixedSizeListArray;
+use arrow_schema::SchemaRef;
 use arrow_schema::SortOptions;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -25,9 +24,9 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FilterStaleExec, GenerationBloomFilter, MemtableGenTagExec};
-
-/// Column name for distance in vector search results.
-pub const DISTANCE_COLUMN: &str = "_distance";
+use super::projection::{
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, project_to_canonical,
+};
 
 /// Plans vector search queries over LSM data.
 ///
@@ -184,7 +183,12 @@ impl LsmVectorSearchPlanner {
         }
 
         let has_bloom = !self.bloom_filters.is_empty();
-        let canonical_schema = self.canonical_output_schema(projection);
+        let canonical_schema = canonical_output_schema(
+            projection,
+            &self.base_schema,
+            &self.pk_columns,
+            true, // include _distance — KNN always produces it
+        );
 
         let mut knn_plans = Vec::new();
         for source in &sources {
@@ -192,10 +196,10 @@ impl LsmVectorSearchPlanner {
             let knn = self
                 .build_knn_plan(source, query_vector, k, nprobes, projection)
                 .await?;
-            // Normalize each source to a canonical [projection..., _distance] schema.
+            // Normalize each source to the canonical schema.
             // The base/flushed arms emit an extra `_rowid` (from fast_search) and the
-            // active arm doesn't — without this step, UnionExec rejects the mismatched
-            // schemas and the query panics before _distance reaches the caller.
+            // active arm doesn't; user-requested system columns are filled with NULL
+            // here when a source doesn't produce them.
             let normalized = project_to_canonical(knn, &canonical_schema)?;
             let plan: Arc<dyn ExecutionPlan> = if has_bloom {
                 Arc::new(MemtableGenTagExec::new(normalized, generation))
@@ -266,29 +270,6 @@ impl LsmVectorSearchPlanner {
         Ok(merged_sorted)
     }
 
-    /// Build the canonical output schema for this search: projection cols + `_distance`.
-    ///
-    /// Matches `empty_plan` so callers see the same shape regardless of whether
-    /// any source actually produced rows.
-    fn canonical_output_schema(&self, projection: Option<&[String]>) -> SchemaRef {
-        let cols = self.build_projection_for_knn(projection);
-        let mut fields: Vec<Arc<Field>> = cols
-            .iter()
-            .filter_map(|name| {
-                self.base_schema
-                    .field_with_name(name)
-                    .ok()
-                    .map(|f| Arc::new(f.clone()))
-            })
-            .collect();
-        fields.push(Arc::new(Field::new(
-            DISTANCE_COLUMN,
-            DataType::Float32,
-            true,
-        )));
-        Arc::new(Schema::new(fields))
-    }
-
     /// Build KNN plan for a single data source.
     async fn build_knn_plan(
         &self,
@@ -301,7 +282,8 @@ impl LsmVectorSearchPlanner {
         match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
-                let cols = self.build_projection_for_knn(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
@@ -322,7 +304,8 @@ impl LsmVectorSearchPlanner {
                     .load()
                     .await?;
                 let mut scanner = dataset.scan();
-                let cols = self.build_projection_for_knn(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
@@ -346,7 +329,8 @@ impl LsmVectorSearchPlanner {
                 // Use the same projection (PK auto-included) the base/flushed arms use,
                 // otherwise the active arm produces a different schema and the staleness
                 // filter loses the PK column it needs for bloom-filter hashing.
-                let cols = self.build_projection_for_knn(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 let query_arr: Arc<dyn Array> = Arc::new(query_vector.clone());
                 scanner.nearest(&self.vector_column, query_arr, k);
@@ -357,89 +341,13 @@ impl LsmVectorSearchPlanner {
         }
     }
 
-    /// Build projection list for KNN ensuring required columns are included.
-    fn build_projection_for_knn(&self, projection: Option<&[String]>) -> Vec<String> {
-        let mut cols: Vec<String> = if let Some(p) = projection {
-            p.to_vec()
-        } else {
-            self.base_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect()
-        };
-
-        for pk in &self.pk_columns {
-            if !cols.contains(pk) {
-                cols.push(pk.clone());
-            }
-        }
-
-        cols
-    }
-
-    /// Create an empty execution plan.
+    /// Create an empty execution plan with the canonical KNN output schema.
     fn empty_plan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
-        let mut fields: Vec<Arc<Field>> = if let Some(cols) = projection {
-            cols.iter()
-                .filter_map(|name| {
-                    self.base_schema
-                        .field_with_name(name)
-                        .ok()
-                        .map(|f| Arc::new(f.clone()))
-                })
-                .collect()
-        } else {
-            self.base_schema.fields().iter().cloned().collect()
-        };
-
-        fields.push(Arc::new(Field::new(
-            DISTANCE_COLUMN,
-            DataType::Float32,
-            false,
-        )));
-
-        let schema = Arc::new(Schema::new(fields));
+        let schema = canonical_output_schema(projection, &self.base_schema, &self.pk_columns, true);
         Ok(Arc::new(EmptyExec::new(schema)))
     }
-}
-
-/// Project `plan` to match `target_schema` exactly, by column name.
-///
-/// Used to reconcile per-source KNN outputs (e.g. Lance's `fast_search` adds
-/// `_rowid`, the MemTable scanner doesn't) and to strip internal LSM columns
-/// like `_memtable_gen` before returning.
-fn project_to_canonical(
-    plan: Arc<dyn ExecutionPlan>,
-    target_schema: &SchemaRef,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let input_schema = plan.schema();
-    let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(target_schema.fields().len());
-    for field in target_schema.fields() {
-        let name = field.name();
-        let (idx, _) = input_schema.column_with_name(name).ok_or_else(|| {
-            lance_core::Error::internal(format!(
-                "Column '{}' missing from KNN source schema (have: {:?})",
-                name,
-                input_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .collect::<Vec<_>>()
-            ))
-        })?;
-        project_exprs.push((
-            Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>,
-            name.clone(),
-        ));
-    }
-    let projection_exec = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
-        lance_core::Error::internal(format!("Failed to build canonical ProjectionExec: {}", e))
-    })?;
-    Ok(Arc::new(projection_exec))
 }
 
 /// Convert a (typically single-row) FixedSizeList query into the array shape
@@ -567,16 +475,17 @@ mod tests {
 
         let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
 
-        let planner = LsmVectorSearchPlanner::new(
+        let _planner = LsmVectorSearchPlanner::new(
             collector,
             vec!["id".to_string()],
-            schema,
+            schema.clone(),
             "vector".to_string(),
             lance_linalg::distance::DistanceType::L2,
         );
 
         // Project only "vector" - should also include "id" for staleness detection
-        let cols = planner.build_projection_for_knn(Some(&["vector".to_string()]));
+        let cols =
+            build_scanner_projection(Some(&["vector".to_string()]), &schema, &["id".to_string()]);
 
         assert!(cols.contains(&"vector".to_string()));
         assert!(cols.contains(&"id".to_string()));
@@ -772,6 +681,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_vector_search_projection_with_explicit_distance_and_rowid() {
+        // Callers may include `_distance` and/or `_rowid` in their projection
+        // (e.g. to surface them in the output or attempt to control column
+        // order). The planner auto-manages `_distance` (always appended at
+        // the end) and does not expose cross-source `_rowid`, so these names
+        // must be tolerated as projection inputs without breaking the plan,
+        // and `_distance` must not be duplicated in the output.
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base_batch = create_test_batch(&schema, &[10]);
+        let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let batch = create_test_batch(&schema, &[1, 2, 3, 4]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_active_memtable(
+            shard_id,
+            ActiveMemTableRef {
+                batch_store,
+                index_store,
+                schema: schema.clone(),
+                generation: 1,
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        // Caller explicitly puts `_distance` and `_rowid` in projection.
+        let projection = vec![
+            "_distance".to_string(),
+            "vector".to_string(),
+            "_rowid".to_string(),
+        ];
+        let plan = planner
+            .plan_search(&query, 3, 1, Some(&projection))
+            .await
+            .expect(
+                "planner must accept `_distance`/`_rowid` in projection without breaking the plan",
+            );
+
+        let ctx = SessionContext::new();
+        let stream = plan
+            .execute(0, ctx.task_ctx())
+            .expect("plan must execute when `_distance`/`_rowid` are in projection");
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "expected at least one result row");
+
+        let out_schema = batches[0].schema();
+        // `_distance` must appear exactly once — auto-managed, never duplicated.
+        let distance_count = out_schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() == DISTANCE_COLUMN)
+            .count();
+        assert_eq!(
+            distance_count,
+            1,
+            "`_distance` must appear exactly once in output, got schema: {:?}",
+            out_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>()
+        );
+        // User columns are still present.
+        assert!(out_schema.field_with_name("vector").is_ok());
+        // PK auto-included for staleness detection.
+        assert!(out_schema.field_with_name("id").is_ok());
+    }
+
+    #[tokio::test]
     async fn test_vector_search_with_bloom_filter_strips_memtable_gen() {
         // Regression for: when bloom filters are configured, FilterStaleExec preserves
         // its `_memtable_gen` input column. Without the post-filter projection that
@@ -892,5 +901,55 @@ mod tests {
              active partitions were silently dropped. Got ids: {:?}",
             all_ids
         );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_without_base_table() {
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // No base dataset written. Plan construction must still succeed and
+        // exclude any base-table scan node.
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 10, 8, None)
+            .await
+            .expect("planner should produce a plan without a base table");
+
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_str.contains("base/data"),
+            "Plan must not scan base table, got: {}",
+            plan_str
+        );
+
+        // Execute the plan so runtime issues (schema mismatches, missing
+        // sources, etc.) surface here rather than at the call site.
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan
+            .execute(0, ctx.task_ctx())
+            .expect("plan should execute without a base table");
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .expect("collecting batches should succeed");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "fresh tier with no sources should yield no rows");
     }
 }

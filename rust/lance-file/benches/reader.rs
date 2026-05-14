@@ -89,6 +89,7 @@ fn bench_reader(c: &mut Criterion) {
                             None,
                             FilterExpression::no_filter(),
                         )
+                        .await
                         .unwrap();
                     let stats = Arc::new(Mutex::new((0, 0)));
                     let mut stream = stream
@@ -305,6 +306,7 @@ fn read_task(
                 None,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
         let stats = Arc::new(Mutex::new((0, 0)));
         let mut stream = stream.then(|batch_task| {

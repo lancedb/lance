@@ -1116,7 +1116,8 @@ impl FilteredReadStream {
             .read_ranges(
                 fragment_read_task.ranges.into(),
                 fragment_read_task.batch_size,
-            )?
+            )
+            .await?
             .map(move |batch_fut: ReadBatchFut| {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();

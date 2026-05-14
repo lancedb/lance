@@ -225,7 +225,7 @@ For example, version 5 becomes `101000000000000000000000000000000000000000000000
 
 ## MemWAL Index Details
 
-The MemWAL Index uses the [standard index storage](index/index.md#index-storage) at `_indices/{UUID}/`.
+The MemWAL Index uses the [standard index storage](../index/index.md#index-storage) at `_indices/{UUID}/`.
 
 The index stores its data in two parts:
 

@@ -810,6 +810,40 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_list_of_struct_with_all_null_child() {
+        use arrow_array::StringArray;
+
+        let a_array = StringArray::from(vec![Some("w"), Some("x"), Some("y"), Some("z")]);
+        let b_array = StringArray::from(vec![None::<&str>, None, None, None]);
+        let struct_fields = Fields::from(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(a_array), Arc::new(b_array)],
+            None,
+        );
+
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 2, 4]));
+        let list_field = Field::new("item", DataType::Struct(struct_fields), true);
+        let list_array =
+            ListArray::new(Arc::new(list_field), offsets, Arc::new(struct_array), None);
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array)],
+            &TestCases::default()
+                .with_range(0..1)
+                .with_range(1..2)
+                .with_indices(vec![0])
+                .with_indices(vec![1])
+                .with_min_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_ragged_scheduling() {
         // This test covers scheduling when batches straddle page boundaries
 

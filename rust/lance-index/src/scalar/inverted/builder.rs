@@ -23,6 +23,7 @@ use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::mask::RowSetOps;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_io::object_store::ObjectStore;
@@ -186,6 +187,11 @@ impl InvertedIndexBuilder {
         self
     }
 
+    pub fn with_token_set_format(mut self, token_set_format: TokenSetFormat) -> Self {
+        self.token_set_format = token_set_format;
+        self
+    }
+
     pub fn with_progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
         self
@@ -224,6 +230,109 @@ impl InvertedIndexBuilder {
         Ok(())
     }
 
+    pub async fn update_from_segments(
+        &mut self,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+        old_segments: &[Arc<InvertedIndex>],
+        old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+    ) -> Result<()> {
+        let schema = new_data.schema();
+        let doc_col = schema.field(0).name();
+
+        if self.params.lance_tokenizer.is_none() {
+            let field = schema.column_with_name(doc_col).expect_ok()?.1;
+            let doc_type = DocType::try_from(field)?;
+            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
+        }
+
+        self.merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
+            .await?;
+
+        let new_data = document_input(new_data, doc_col)?;
+
+        self.progress
+            .stage_start("tokenize_docs", None, "rows")
+            .await?;
+        self.update_index(new_data, dest_store).await?;
+        self.progress.stage_complete("tokenize_docs").await?;
+
+        self.write(dest_store).await?;
+        Ok(())
+    }
+
+    async fn merge_existing_segments(
+        &mut self,
+        dest_store: &dyn IndexStore,
+        old_segments: &[Arc<InvertedIndex>],
+        old_data_filter: Option<&crate::scalar::OldIndexDataFilter>,
+    ) -> Result<()> {
+        let num_workers = resolve_num_workers(&self.params);
+        let memory_limit_bytes = resolve_worker_memory_limit_bytes(&self.params, num_workers);
+        let mut merged: Option<InnerBuilder> = None;
+        for index in old_segments {
+            if old_data_filter.is_none() {
+                self.deleted_fragments
+                    .extend(index.deleted_fragments().iter());
+            }
+            for partition in &index.partitions {
+                let mut partition_builder = partition.as_ref().clone().into_builder().await?;
+                if let Some(filter) = old_data_filter {
+                    partition_builder.filter_old_data(filter).await?;
+                }
+                if partition_builder.is_empty() {
+                    continue;
+                }
+                match &mut merged {
+                    Some(merged) => {
+                        let would_exceed_memory = merged
+                            .memory_size()
+                            .saturating_add(partition_builder.memory_size())
+                            >= memory_limit_bytes;
+                        let would_exceed_doc_ids = merged
+                            .docs
+                            .len()
+                            .saturating_add(partition_builder.docs.len())
+                            > u32::MAX as usize;
+                        if would_exceed_memory || would_exceed_doc_ids {
+                            let builder = std::mem::replace(merged, partition_builder);
+                            self.write_new_partition(dest_store, builder).await?;
+                        } else {
+                            merged.merge_from(partition_builder)?;
+                        }
+                    }
+                    None => merged = Some(partition_builder),
+                }
+            }
+        }
+
+        if let Some(builder) = merged {
+            self.write_new_partition(dest_store, builder).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_new_partition(
+        &mut self,
+        dest_store: &dyn IndexStore,
+        mut builder: InnerBuilder,
+    ) -> Result<()> {
+        let partition_id = self.next_partition_id() | self.fragment_mask.unwrap_or(0);
+        builder.set_id(partition_id);
+        builder.write(dest_store).await?;
+        self.new_partitions.push(partition_id);
+        Ok(())
+    }
+
+    fn next_partition_id(&self) -> u64 {
+        self.partitions
+            .iter()
+            .chain(self.new_partitions.iter())
+            .map(|id| id + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn update_index(
         &mut self,
@@ -242,7 +351,7 @@ impl InvertedIndexBuilder {
             token_set_format: self.token_set_format,
             worker_memory_limit_bytes,
         };
-        let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
+        let next_id = self.next_partition_id();
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
@@ -609,6 +718,14 @@ impl InnerBuilder {
         self.id
     }
 
+    fn set_id(&mut self, id: u64) {
+        self.id = id;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty()
+    }
+
     /// Set the token set for this builder.
     pub fn set_tokens(&mut self, tokens: TokenSet) {
         self.tokens = tokens;
@@ -648,6 +765,22 @@ impl InnerBuilder {
         self.tokens.remap(&removed_token_ids);
 
         Ok(())
+    }
+
+    async fn filter_old_data(&mut self, filter: &OldIndexDataFilter) -> Result<()> {
+        let mut mapping = HashMap::new();
+        for (row_id, _) in self.docs.iter() {
+            let keep = match filter {
+                OldIndexDataFilter::Fragments { to_keep, .. } => {
+                    to_keep.contains((*row_id >> 32) as u32)
+                }
+                OldIndexDataFilter::RowIds(valid_row_ids) => valid_row_ids.contains(*row_id),
+            };
+            if !keep {
+                mapping.insert(*row_id, None);
+            }
+        }
+        self.remap(&mapping).await
     }
 
     pub fn merge_from(&mut self, other: Self) -> Result<()> {
@@ -732,6 +865,18 @@ impl InnerBuilder {
         }
 
         Ok(())
+    }
+
+    fn memory_size(&self) -> u64 {
+        let posting_lists_overhead =
+            self.posting_lists.capacity() * std::mem::size_of::<PostingListBuilder>();
+        let posting_lists_size: u64 = self
+            .posting_lists
+            .iter()
+            .map(|posting| posting.size())
+            .sum();
+        (self.tokens.memory_size() + self.docs.memory_size() + posting_lists_overhead) as u64
+            + posting_lists_size
     }
 
     pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {

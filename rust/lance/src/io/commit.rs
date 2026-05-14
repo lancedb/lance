@@ -60,6 +60,7 @@ use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
+#[cfg(test)]
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
@@ -130,7 +131,7 @@ pub(crate) async fn write_transaction_file(
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
-    object_store.inner.put(&path, buf.into()).await?;
+    object_store.put(&path, &buf).await?;
 
     Ok(file_name)
 }

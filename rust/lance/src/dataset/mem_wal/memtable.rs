@@ -223,7 +223,14 @@ impl MemTable {
             flushed_batch_positions: HashSet::new(),
             pk_bloom_filter,
             pk_field_ids,
-            indexes: None,
+            // Initialize with an empty IndexStore so the visibility cursor has
+            // a stable Arc shared between the scanner (via `indexes_arc()`)
+            // and the WAL flush handler. Replaced via `set_indexes_arc` if
+            // index configs are supplied. Without this, the no-index path
+            // would hand out fresh empty IndexStores to scanners and the WAL
+            // flush handler, breaking cursor advance — see the regression
+            // test `test_unindexed_memtable_visibility_after_flush`.
+            indexes: Some(Arc::new(IndexStore::new())),
             frozen_at_wal_entry_position: None,
             wal_flush_completion: std::sync::Mutex::new(None),
             memtable_flush_completion: std::sync::Mutex::new(Some(memtable_flush_cell)),
@@ -784,7 +791,7 @@ impl MemTable {
     ///
     /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
     ///
-    /// The scanner captures the current `max_indexed_batch_position` from the
+    /// The scanner captures the current `max_visible_batch_position` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
     /// # Panics
