@@ -31,7 +31,7 @@ use super::take::TakeBuilder;
 use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
-use lance_core::datatypes::{BlobKind, BlobVersion};
+use lance_core::datatypes::{BlobKind, BlobVersion, parse_field_path};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result, utils::address::RowAddress};
 use lance_io::traits::{Reader, WriteExt, Writer};
@@ -1682,8 +1682,10 @@ pub async fn take_blobs_by_addresses(
 
 /// Validate that `column` exists and is a blob column, returning its field id.
 pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Result<u32> {
-    let projection = dataset.schema().project(&[column])?;
-    let blob_field = &projection.fields[0];
+    let schema = dataset.schema();
+    let blob_field = schema
+        .field(column)
+        .ok_or_else(|| Error::field_not_found(column, schema.field_paths()))?;
     if !blob_field.is_blob() {
         return Err(Error::invalid_input_source(
             format!("the column '{}' is not a blob column", column).into(),
@@ -1753,7 +1755,7 @@ async fn collect_blob_entries_for_selection(
         return Ok(Vec::new());
     }
 
-    let descriptions = description_and_addr.column(0).as_struct();
+    let descriptions = leaf_descriptor_struct(&description_and_addr, column)?;
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     match blob_version_from_descriptions(descriptions)? {
@@ -1762,6 +1764,24 @@ async fn collect_blob_entries_for_selection(
             collect_blob_entries_v2(dataset, blob_field_id, descriptions, row_addrs).await
         }
     }
+}
+
+/// Walk into the descriptor `RecordBatch` at `column` and return the leaf
+/// descriptor `StructArray`, descending through nested struct children for
+/// dotted paths.
+fn leaf_descriptor_struct<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StructArray> {
+    let path = parse_field_path(column)?;
+    let mut current = batch
+        .column_by_name(&path[0])
+        .expect("validate_blob_column ensured column exists")
+        .as_struct();
+    for segment in &path[1..] {
+        current = current
+            .column_by_name(segment)
+            .expect("validate_blob_column ensured all path segments exist")
+            .as_struct();
+    }
+    Ok(current)
 }
 
 fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVersion> {

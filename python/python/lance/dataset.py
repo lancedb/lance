@@ -60,7 +60,9 @@ from .lance import (
     PySearchFilter,
     ScanStatistics,
     _Dataset,
+    _format_field_path,
     _MergeInsertBuilder,
+    _parse_field_path,
     _Scanner,
     _write_dataset,
     indices,
@@ -120,8 +122,18 @@ def _is_blob_field(field: pa.Field) -> bool:
     )
 
 
-def _blob_columns_in_schema(schema: pa.Schema) -> set[str]:
-    return {field.name for field in schema if _is_blob_field(field)}
+def _field_blob_paths(field: pa.Field, parent: str = "") -> Iterator[str]:
+    segment = _format_field_path([field.name])
+    field_path = f"{parent}.{segment}" if parent else segment
+    if _is_blob_field(field):
+        yield field_path
+    elif pa.types.is_struct(field.type):
+        for i in range(field.type.num_fields):
+            yield from _field_blob_paths(field.type.field(i), field_path)
+
+
+def _blob_paths_in_schema(schema: pa.Schema) -> list[str]:
+    return [path for field in schema for path in _field_blob_paths(field)]
 
 
 def _normalize_blob_pandas_mode(
@@ -153,23 +165,37 @@ def _blob_column_sources(
     snapshot: Dict[str, Any],
     dataset_schema: pa.Schema,
 ) -> dict[str, str]:
-    blob_columns = {}
-    output_blob_columns = [field.name for field in schema if _is_blob_field(field)]
-    columns_with_transform = snapshot.get("_columns_with_transform")
-    if not columns_with_transform:
-        return {name: name for name in output_blob_columns}
+    output_paths = _blob_paths_in_schema(schema)
+    transforms = dict(snapshot.get("_columns_with_transform") or ())
+    if not transforms:
+        return {path: path for path in output_paths}
 
-    source_is_blob = {field.name for field in dataset_schema if _is_blob_field(field)}
-    for name in output_blob_columns:
-        expr = dict(columns_with_transform).get(name)
-        source = _simple_source_column(expr) if expr is not None else name
-        if source is None or source not in source_is_blob:
+    source_paths = set(_blob_paths_in_schema(dataset_schema))
+    return {p: _resolve_blob_source(p, transforms, source_paths) for p in output_paths}
+
+
+def _resolve_blob_source(
+    path: str,
+    transforms: dict[str, str],
+    source_paths: set[str],
+) -> str:
+    segments = _parse_field_path(path)
+    expr = transforms.get(segments[0])
+    if expr is None:
+        source = path
+    else:
+        src_top = _simple_source_column(expr)
+        if src_top is None:
             raise NotImplementedError(
-                "blob-aware to_pandas only supports direct blob column references "
-                "for transformed projections"
+                "blob-aware to_pandas only supports direct blob column "
+                f"references; got {expr!r} for output column {segments[0]!r}"
             )
-        blob_columns[name] = source
-    return blob_columns
+        source = _format_field_path([src_top, *segments[1:]])
+    if source not in source_paths:
+        raise NotImplementedError(
+            f"blob-aware to_pandas: source path {source!r} is not a blob column"
+        )
+    return source
 
 
 def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
@@ -227,6 +253,96 @@ def _is_null_blob_description(description: Any) -> bool:
             and description["blob_uri"] == ""
         )
     return False
+
+
+def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
+    segments = _parse_field_path(path)
+    values = table.column(segments[0]).to_pylist()
+    for segment in segments[1:]:
+        values = [None if v is None else v.get(segment) for v in values]
+    return values
+
+
+def _dict_with_value_at_path(
+    parent: Optional[dict],
+    sub_path: list[str],
+    value: Any,
+) -> Optional[dict]:
+    if parent is None:
+        return None
+    head = sub_path[0]
+    rest = sub_path[1:]
+    updated = dict(parent)
+    updated[head] = (
+        value if not rest else _dict_with_value_at_path(parent.get(head), rest, value)
+    )
+    return updated
+
+
+def _replace_in_struct_column(
+    dataframe: "pd.DataFrame",
+    path: str,
+    values: list[Optional[BlobFile]],
+) -> None:
+    segments = _parse_field_path(path)
+    parent_name = segments[0]
+    sub_path = segments[1:]
+    parents = dataframe[parent_name].tolist()
+    dataframe[parent_name] = [
+        _dict_with_value_at_path(parent, sub_path, value)
+        for parent, value in zip(parents, values)
+    ]
+
+
+def _materialize_blobs_for_paths(
+    dataset: "LanceDataset",
+    table: pa.Table,
+    blob_paths: list[str],
+    blob_sources: dict[str, str],
+    row_addrs: list[int],
+) -> dict[str, list[Optional[BlobFile]]]:
+    materialized: dict[str, list[Optional[BlobFile]]] = {}
+    for path in blob_paths:
+        descriptions = _descriptors_at_path(table, path)
+
+        present_rows = []
+        addrs_to_fetch = []
+        for row, descriptor in enumerate(descriptions):
+            if not _is_null_blob_description(descriptor):
+                present_rows.append(row)
+                addrs_to_fetch.append(row_addrs[row])
+
+        blobs = (
+            dataset.take_blobs(blob_sources[path], addresses=addrs_to_fetch)
+            if addrs_to_fetch
+            else []
+        )
+
+        path_result: list[Optional[BlobFile]] = [None] * len(descriptions)
+        for row, blob in zip(present_rows, blobs):
+            path_result[row] = blob
+        materialized[path] = path_result
+    return materialized
+
+
+def _place_materialized_blobs(
+    dataframe: "pd.DataFrame",
+    materialized: dict[str, list[Optional[BlobFile]]],
+    schema: pa.Schema,
+) -> None:
+    top_level: dict[str, list[Optional[BlobFile]]] = {}
+    nested: dict[str, list[Optional[BlobFile]]] = {}
+    for path, values in materialized.items():
+        segments = _parse_field_path(path)
+        if len(segments) == 1:
+            top_level[segments[0]] = values
+        else:
+            nested[path] = values
+    for index, field in enumerate(schema):
+        if field.name in top_level:
+            dataframe.insert(index, field.name, top_level[field.name])
+    for path, values in nested.items():
+        _replace_in_struct_column(dataframe, path, values)
 
 
 def _resolve_blob_selection(
@@ -6036,8 +6152,8 @@ class LanceScanner(pa.dataset.Scanner):
         """
         blob_mode = _normalize_blob_pandas_mode(blob_mode)
         schema = self.projected_schema
-        blob_columns = _blob_columns_in_schema(schema)
-        if not blob_columns or blob_mode == _BLOB_PANDAS_MODE_DESCRIPTIONS:
+        blob_paths = _blob_paths_in_schema(schema)
+        if not blob_paths or blob_mode == _BLOB_PANDAS_MODE_DESCRIPTIONS:
             return self.to_table().to_pandas(**kwargs)
 
         if self._snapshot is None:
@@ -6064,7 +6180,15 @@ class LanceScanner(pa.dataset.Scanner):
             raise RuntimeError("blob-aware to_pandas expected _rowaddr in scan results")
 
         row_addrs = table.column(_BLOB_ROW_ADDR_COLUMN).to_pylist()
-        columns_to_drop = [name for name in blob_columns if name in table.schema.names]
+        materialized = _materialize_blobs_for_paths(
+            self._ds, table, blob_paths, blob_sources, row_addrs
+        )
+
+        columns_to_drop = []
+        for path in materialized:
+            segments = _parse_field_path(path)
+            if len(segments) == 1 and segments[0] in table.schema.names:
+                columns_to_drop.append(segments[0])
         if not requested_rowaddr:
             columns_to_drop.append(_BLOB_ROW_ADDR_COLUMN)
         non_blob_table = (
@@ -6075,32 +6199,7 @@ class LanceScanner(pa.dataset.Scanner):
         else:
             dataframe = non_blob_table.to_pandas(**kwargs)
 
-        output_names = [field.name for field in schema]
-        for index, name in enumerate(output_names):
-            if name not in blob_columns:
-                continue
-
-            descriptions = table.column(name).to_pylist()
-            non_null_positions = [
-                pos
-                for pos, description in enumerate(descriptions)
-                if not _is_null_blob_description(description)
-            ]
-            non_null_addrs = [row_addrs[pos] for pos in non_null_positions]
-            blob_files = (
-                self._ds.take_blobs(blob_sources[name], addresses=non_null_addrs)
-                if non_null_addrs
-                else []
-            )
-            blob_iter = iter(blob_files)
-            values = []
-            for description in descriptions:
-                if _is_null_blob_description(description):
-                    values.append(None)
-                    continue
-                values.append(next(blob_iter))
-            dataframe.insert(index, name, values)
-
+        _place_materialized_blobs(dataframe, materialized, schema)
         return dataframe
 
     @property
