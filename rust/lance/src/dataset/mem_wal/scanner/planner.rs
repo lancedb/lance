@@ -1479,4 +1479,124 @@ mod integration_tests {
             "_rowoffset must be NULL for every row"
         );
     }
+
+    #[tokio::test]
+    async fn test_lsm_scan_projection_with_rowid_only_no_rowaddr() {
+        // Test 4: when only `_rowid` (not `_rowaddr`) is requested, the
+        // canonical-projection wrap activates (system column triggers it),
+        // but the per-arm `null_columns(_rowaddr)` wrap stays off
+        // (`keep_row_address` remains false). `_rowid` ends up NULL for
+        // every row because no arm opts into `with_row_id()` in this
+        // planner (a base-only opt-in would mismatch the union schema).
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id", "_rowid", "name"]);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
+        }
+
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        // Canonical wrap activates for the user-requested `_rowid`.
+        assert!(
+            plan_str.contains("ProjectionExec"),
+            "expected canonical projection wrap, got:\n{plan_str}",
+        );
+        // The per-arm `null_columns(_rowaddr)` wrap is gated on
+        // `keep_row_address`, which stays false here. So no
+        // `NULL as _rowaddr` projection should appear.
+        assert!(
+            !plan_str.contains("NULL as _rowaddr"),
+            "no per-arm `_rowaddr` NULL'ing expected when caller didn't ask for `_rowaddr`, got:\n{plan_str}",
+        );
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut total = 0usize;
+        let mut rowid_null = 0usize;
+        for batch in &batches {
+            let rowid = batch.column_by_name("_rowid").unwrap();
+            for i in 0..batch.num_rows() {
+                total += 1;
+                if rowid.is_null(i) {
+                    rowid_null += 1;
+                }
+            }
+        }
+        assert_eq!(total, 7, "expected 7 unique pks after dedup");
+        assert_eq!(
+            rowid_null, total,
+            "_rowid must be NULL for every row (no opt-in)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_empty_plan_with_system_columns() {
+        // Test 5 (planner.rs slice): with no sources, the empty plan must
+        // still expose user-requested system columns at the requested
+        // position in the canonical schema.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let schema: super::SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let scanner =
+            LsmScanner::without_base_table(schema, base_uri, vec![], vec!["id".to_string()])
+                .project(&["id", "_rowaddr", "name", "_rowid"]);
+        let plan = scanner.create_plan().await.unwrap();
+
+        let names: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "id".to_string(),
+                "_rowaddr".to_string(),
+                "name".to_string(),
+                "_rowid".to_string(),
+            ],
+            "empty plan must honor user column order including system columns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_filter_referencing_rowaddr_is_rejected() {
+        // Test 6 (planner.rs slice): documents that `LsmScanner::filter()`
+        // rejects system-column references at parse time. The active-arm
+        // `MemTableScanner` couldn't handle `_rowaddr` in a filter anyway,
+        // and the higher-level builder validates the filter against the
+        // user schema before any per-arm planning happens. Pin this
+        // behavior so it doesn't silently regress to a panic deeper in the
+        // pipeline.
+        let (base_dataset, shard_snapshots, pk_columns, _temp_path) = {
+            let (b, s, _a, p, t) = setup_multi_level_lsm().await;
+            (b, s, p, t)
+        };
+
+        let result =
+            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).filter("_rowaddr > 0");
+        let err = result.expect_err("filter referencing `_rowaddr` must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("_rowaddr"),
+            "rejection message should mention the offending column, got: {msg}",
+        );
+    }
 }

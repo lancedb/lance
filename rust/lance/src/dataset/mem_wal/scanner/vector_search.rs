@@ -25,8 +25,8 @@ use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FilterStaleExec, GenerationBloomFilter, MemtableGenTagExec};
 use super::projection::{
-    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, project_to_canonical,
-    wants_row_address, wants_row_id,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
+    project_to_canonical, wants_row_id,
 };
 
 /// Plans vector search queries over LSM data.
@@ -194,13 +194,21 @@ impl LsmVectorSearchPlanner {
         let mut knn_plans = Vec::new();
         for source in &sources {
             let generation = source.generation();
+            let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let knn = self
                 .build_knn_plan(source, query_vector, k, nprobes, projection)
                 .await?;
             // Normalize each source to the canonical schema.
-            // The base/flushed arms emit an extra `_rowid` (from fast_search) and the
-            // active arm doesn't; user-requested system columns are filled with NULL
-            // here when a source doesn't produce them.
+            // Lance's `fast_search()` always produces `_rowid` whether or
+            // not we asked for it. For non-base arms that value is local to
+            // the per-source dataset and would collide with base IDs, so we
+            // NULL it before merging. (no-op if `_rowid` isn't in the
+            // source schema, e.g. the active arm.)
+            let knn = if is_base {
+                knn
+            } else {
+                null_columns(knn, &[lance_core::ROW_ID])?
+            };
             let normalized = project_to_canonical(knn, &canonical_schema)?;
             let plan: Arc<dyn ExecutionPlan> = if has_bloom {
                 Arc::new(MemtableGenTagExec::new(normalized, generation))
@@ -286,13 +294,12 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
-                // Only the base produces meaningful `_rowid`/`_rowaddr`;
-                // non-base arms get NULL via `project_to_canonical`.
+                // Only the base produces a meaningful `_rowid`. `_rowaddr`
+                // can't be combined with `fast_search()` — the IVF index
+                // doesn't preserve it and `TakeExec` refuses to insert it
+                // post-search — so it stays NULL across all arms.
                 if wants_row_id(projection) {
                     scanner.with_row_id();
-                }
-                if wants_row_address(projection) {
-                    scanner.with_row_address();
                 }
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
@@ -915,6 +922,197 @@ mod tests {
             "expected at least one active-memtable row (id in 1..=4) — none found, so \
              active partitions were silently dropped. Got ids: {:?}",
             all_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_system_columns_real_only_for_base() {
+        // Covers tests 1+2+3 from the PR review:
+        //   1. base-hit `_rowid`/`_rowaddr` carry real values
+        //   2. flushed-memtable arm runs without erroring
+        //   3. `_rowaddr` symmetry with `_rowid` (same code path, both are
+        //      surfaced when requested and NULL'd outside the base arm)
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // Base: id=1 (vector closest to query). Index it so fast_search
+        // returns it.
+        let base_batch = create_test_batch(&schema, &[1]);
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Flushed memtable: id=2 (a separate Lance dataset under
+        // {base_uri}/_mem_wal/{shard}/gen_1) with its own vector index.
+        let shard_id = uuid::Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let gen1_batch = create_test_batch(&schema, &[2]);
+        let mut gen1_dataset = create_dataset(&gen1_uri, vec![gen1_batch]).await;
+        gen1_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+
+        // Active memtable: id=3 with HNSW index.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let active_batch = create_test_batch(&schema, &[3]);
+        batch_store.append(active_batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![shard_snapshot])
+            .with_active_memtable(
+                shard_id,
+                ActiveMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 2,
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        // Project both system columns alongside data columns.
+        let query = create_query_vector();
+        let projection = vec![
+            "id".to_string(),
+            "_rowid".to_string(),
+            "_rowaddr".to_string(),
+            "vector".to_string(),
+        ];
+        let plan = planner
+            .plan_search(&query, 3, 1, Some(&projection))
+            .await
+            .expect("planner should produce a plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // Top-3 over 3 ids, one per source. All should appear.
+        assert_eq!(total, 3, "expected one row per source");
+
+        // Group by id → (rowid_null, rowaddr_null).
+        let mut seen: std::collections::HashMap<i32, (bool, bool)> =
+            std::collections::HashMap::new();
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let rowid = batch.column_by_name("_rowid").unwrap();
+            let rowaddr = batch.column_by_name("_rowaddr").unwrap();
+            for i in 0..batch.num_rows() {
+                seen.insert(ids.value(i), (rowid.is_null(i), rowaddr.is_null(i)));
+            }
+        }
+
+        // id=1 (base): `_rowid` real (the index produces it). `_rowaddr` is
+        // always NULL across vector_search — Lance's `fast_search()` can't
+        // be combined with `with_row_address()`.
+        let (rid_null, raddr_null) = seen.get(&1).expect("base row id=1 missing");
+        assert!(
+            !rid_null,
+            "base row `_rowid` must be real (Lance row id), got NULL"
+        );
+        assert!(
+            raddr_null,
+            "`_rowaddr` is incompatible with vector_search's fast_search; must be NULL"
+        );
+
+        // id=2 (flushed): both NULL — per-source values would collide with base.
+        let (rid_null, raddr_null) = seen.get(&2).expect("flushed row id=2 missing");
+        assert!(rid_null, "flushed row `_rowid` must be NULL");
+        assert!(raddr_null, "flushed row `_rowaddr` must be NULL");
+
+        // id=3 (active): both NULL — BatchStore position is not a Lance row id.
+        let (rid_null, raddr_null) = seen.get(&3).expect("active row id=3 missing");
+        assert!(rid_null, "active row `_rowid` must be NULL");
+        assert!(raddr_null, "active row `_rowaddr` must be NULL");
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_empty_plan_with_system_columns() {
+        // Test 5 (vector_search slice): with no sources, the empty plan
+        // must still expose user-requested system columns at the requested
+        // position, plus `_distance` (always-on for KNN).
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let projection = vec![
+            "_rowid".to_string(),
+            "vector".to_string(),
+            "_rowaddr".to_string(),
+        ];
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 5, 1, Some(&projection))
+            .await
+            .expect("empty plan must accept system columns in projection");
+
+        let names: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "_rowid".to_string(),
+                "vector".to_string(),
+                "_rowaddr".to_string(),
+                "id".to_string(),        // PK auto-appended
+                "_distance".to_string(), // always-on for KNN
+            ],
+            "empty KNN plan must honor user position for system cols and append PK + _distance"
         );
     }
 

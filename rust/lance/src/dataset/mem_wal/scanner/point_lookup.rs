@@ -549,6 +549,8 @@ mod tests {
 
         // Hit row is from base → `_rowaddr` is real. `_rowoffset` stays
         // NULL (no scanner produces it).
+        // (Test 5 — empty-plan with system columns — lives in the next
+        // test below.)
         let rowaddr = batches[0].column_by_name("_rowaddr").unwrap();
         assert!(
             !rowaddr.is_null(0),
@@ -561,6 +563,48 @@ mod tests {
             rowoffset.is_null(0),
             "_rowoffset has no per-source flag, must be NULL across LSM, got: {:?}",
             rowoffset
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_empty_plan_with_system_columns() {
+        // Test 5 (point_lookup slice): with no sources, the empty plan
+        // must still expose user-requested system columns at the
+        // requested position.
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec![
+            "id".to_string(),
+            "_rowaddr".to_string(),
+            "name".to_string(),
+            "_rowid".to_string(),
+        ];
+        let pk_values = vec![ScalarValue::Int32(Some(2))];
+        let plan = planner
+            .plan_lookup(&pk_values, Some(&projection))
+            .await
+            .expect("empty plan must accept system columns in projection");
+
+        let names: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "id".to_string(),
+                "_rowaddr".to_string(),
+                "name".to_string(),
+                "_rowid".to_string(),
+            ],
+            "empty point-lookup plan must honor user column order including system columns"
         );
     }
 }
