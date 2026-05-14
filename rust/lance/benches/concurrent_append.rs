@@ -184,6 +184,7 @@ struct WriterStats {
     latencies: Vec<Duration>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_writer(
     writer_id: usize,
     uri: String,

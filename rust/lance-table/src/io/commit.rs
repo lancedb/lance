@@ -322,8 +322,8 @@ fn version_hint_globally_enabled() -> bool {
 /// Azure, ...) the latest version is already resolved in roughly one request,
 /// so the hint would only add a write per commit for nothing. We write (and
 /// read) it only on stores where listing is not lexicographically ordered —
-/// S3 Express and the local filesystem. Can be force-disabled with
-/// [`VERSION_HINT_ENV`].
+/// S3 Express and the local filesystem. Can be force-disabled with the
+/// `LANCE_USE_VERSION_HINT=0` environment variable.
 pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
     version_hint_globally_enabled() && !object_store.list_is_lexically_ordered
 }
