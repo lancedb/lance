@@ -23,14 +23,6 @@ use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
 };
 
-/// True if the caller put any system column in `projection` — triggers the
-/// canonical-projection wrap in [`LsmScanPlanner::plan_scan`].
-fn user_requests_system_column(projection: Option<&[String]>) -> bool {
-    projection
-        .map(|p| p.iter().any(|c| is_system_column(c)))
-        .unwrap_or(false)
-}
-
 /// Plans scan queries over LSM data.
 pub struct LsmScanPlanner {
     /// Data source collector.
@@ -203,7 +195,10 @@ impl LsmScanPlanner {
         // 5. Surface user-requested system columns at the requested position.
         // Skipped otherwise so the plan shape stays unchanged for callers
         // that don't opt in.
-        if user_requests_system_column(projection) {
+        let user_wants_system = projection
+            .map(|p| p.iter().any(|c| is_system_column(c)))
+            .unwrap_or(false);
+        if user_wants_system {
             plan = project_to_canonical(
                 plan,
                 &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
@@ -341,7 +336,8 @@ impl LsmScanPlanner {
                 let mut scanner = dataset.scan();
 
                 // Project columns + _rowaddr (needed for dedup)
-                let cols = self.build_projection_with_rowaddr(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
                 // No `with_row_id()`: opting in only for base would mismatch
@@ -360,7 +356,8 @@ impl LsmScanPlanner {
                     .await?;
                 let mut scanner = dataset.scan();
 
-                let cols = self.build_projection_with_rowaddr(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
@@ -381,7 +378,8 @@ impl LsmScanPlanner {
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
 
-                let cols = self.build_projection_with_rowaddr(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.with_row_address();
 
@@ -393,14 +391,6 @@ impl LsmScanPlanner {
                 scanner.create_plan().await
             }
         }
-    }
-
-    /// Build the projection list to pass to underlying scanners.
-    ///
-    /// `_rowaddr` is added back per-source via `with_row_address()` rather
-    /// than projection, since `MemTableScanner::project()` rejects it.
-    fn build_projection_with_rowaddr(&self, projection: Option<&[String]>) -> Vec<String> {
-        build_scanner_projection(projection, &self.base_schema, &self.pk_columns)
     }
 
     /// Create an empty execution plan with the canonical scan output schema.

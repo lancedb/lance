@@ -28,21 +28,18 @@ use lance_core::{ROW_ADDR, ROW_ID, Result, is_system_column};
 /// Column name for distance in vector search results.
 pub const DISTANCE_COLUMN: &str = "_distance";
 
-/// Did the caller list `name` in their projection?
-pub fn projection_contains(projection: Option<&[String]>, name: &str) -> bool {
-    projection
-        .map(|p| p.iter().any(|c| c == name))
-        .unwrap_or(false)
-}
-
 /// Did the caller list `_rowid` in their projection?
 pub fn wants_row_id(projection: Option<&[String]>) -> bool {
-    projection_contains(projection, ROW_ID)
+    projection
+        .map(|p| p.iter().any(|c| c == ROW_ID))
+        .unwrap_or(false)
 }
 
 /// Did the caller list `_rowaddr` in their projection?
 pub fn wants_row_address(projection: Option<&[String]>) -> bool {
-    projection_contains(projection, ROW_ADDR)
+    projection
+        .map(|p| p.iter().any(|c| c == ROW_ADDR))
+        .unwrap_or(false)
 }
 
 /// Auto-managed by the planner; must never reach `scanner.project()`.
