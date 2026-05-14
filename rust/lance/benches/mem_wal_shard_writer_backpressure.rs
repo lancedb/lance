@@ -112,8 +112,8 @@ struct Args {
     row_bytes: usize,
     max_memtable_size: usize,
     max_unflushed_memtable_bytes: usize,
-    max_memtable_rows: usize,
-    max_memtable_batches: usize,
+    max_memtable_rows: Option<usize>,
+    max_memtable_batches: Option<usize>,
     max_wal_buffer_size: usize,
     max_wal_flush_interval_ms: u64,
     async_index_buffer_rows: usize,
@@ -140,8 +140,8 @@ impl Default for Args {
             row_bytes: ROW_BYTES_FINEWEB_SHAPE,
             max_memtable_size: 256 * 1024 * 1024,
             max_unflushed_memtable_bytes: 1024 * 1024 * 1024,
-            max_memtable_rows: 1_000_000,
-            max_memtable_batches: 0,
+            max_memtable_rows: None,
+            max_memtable_batches: None,
             max_wal_buffer_size: 10 * 1024 * 1024,
             max_wal_flush_interval_ms: 100,
             async_index_buffer_rows: 10_000,
@@ -174,6 +174,7 @@ fn main() -> Result<()> {
 }
 
 async fn run(args: Args) -> Result<()> {
+    let memtable_limits = effective_memtable_limits(&args);
     let temp_dir = if args.uri.is_none() {
         Some(
             tempfile::tempdir()
@@ -194,7 +195,7 @@ async fn run(args: Args) -> Result<()> {
     };
 
     println!(
-        "bench=mem_wal_shard_writer_backpressure uri={} mode={} seed_rows={} batch_rows={} calls={} vector_dim={} target_rows_per_sec={:?} max_memtable_size={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={}",
+        "bench=mem_wal_shard_writer_backpressure uri={} mode={} seed_rows={} batch_rows={} calls={} vector_dim={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={}",
         uri,
         args.mode.as_str(),
         args.seed_rows,
@@ -203,6 +204,8 @@ async fn run(args: Args) -> Result<()> {
         args.vector_dim,
         args.target_rows_per_sec,
         args.max_memtable_size,
+        memtable_limits.rows,
+        memtable_limits.batches,
         args.max_unflushed_memtable_bytes,
         args.max_wal_buffer_size,
         args.max_wal_flush_interval_ms,
@@ -250,12 +253,8 @@ async fn run(args: Args) -> Result<()> {
         .with_max_unflushed_memtable_bytes(args.max_unflushed_memtable_bytes)
         .with_max_wal_buffer_size(args.max_wal_buffer_size)
         .with_async_index_buffer_rows(args.async_index_buffer_rows)
-        .with_max_memtable_rows(args.max_memtable_rows)
-        .with_max_memtable_batches(if args.max_memtable_batches == 0 {
-            args.calls.saturating_add(1024)
-        } else {
-            args.max_memtable_batches
-        });
+        .with_max_memtable_rows(memtable_limits.rows)
+        .with_max_memtable_batches(memtable_limits.batches);
     if args.max_wal_flush_interval_ms == 0 {
         config.max_wal_flush_interval = None;
     } else {
@@ -393,12 +392,10 @@ async fn run(args: Args) -> Result<()> {
         "tokio_threads": args.tokio_threads,
         "max_memtable_size": args.max_memtable_size,
         "max_unflushed_memtable_bytes": args.max_unflushed_memtable_bytes,
-        "max_memtable_rows": args.max_memtable_rows,
-        "max_memtable_batches": if args.max_memtable_batches == 0 {
-            args.calls.saturating_add(1024)
-        } else {
-            args.max_memtable_batches
-        },
+        "requested_max_memtable_rows": args.max_memtable_rows,
+        "requested_max_memtable_batches": args.max_memtable_batches,
+        "max_memtable_rows": memtable_limits.rows,
+        "max_memtable_batches": memtable_limits.batches,
         "max_wal_buffer_size": args.max_wal_buffer_size,
         "max_wal_flush_interval_ms": args.max_wal_flush_interval_ms,
         "async_index_buffer_rows": args.async_index_buffer_rows,
@@ -592,6 +589,27 @@ fn percentile(values: &[f64], pct: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EffectiveMemTableLimits {
+    rows: usize,
+    batches: usize,
+}
+
+fn effective_memtable_limits(args: &Args) -> EffectiveMemTableLimits {
+    let rows = args.max_memtable_rows.unwrap_or_else(|| {
+        let rows_from_bytes = args.max_memtable_size.div_ceil(args.row_bytes);
+        rows_from_bytes
+            .saturating_mul(2)
+            .saturating_add(args.batch_rows)
+            .max(args.batch_rows)
+            .max(1)
+    });
+    let batches = args
+        .max_memtable_batches
+        .unwrap_or_else(|| rows.div_ceil(args.batch_rows).saturating_add(64).max(16));
+    EffectiveMemTableLimits { rows, batches }
+}
+
 fn parse_args() -> Result<Args> {
     let mut args = Args::default();
     let mut iter = std::env::args().skip(1);
@@ -617,8 +635,12 @@ fn parse_args() -> Result<Args> {
             "--max-unflushed-memtable-bytes" => {
                 args.max_unflushed_memtable_bytes = parse(&flag, &value)?;
             }
-            "--max-memtable-rows" => args.max_memtable_rows = parse(&flag, &value)?,
-            "--max-memtable-batches" => args.max_memtable_batches = parse(&flag, &value)?,
+            "--max-memtable-rows" => {
+                args.max_memtable_rows = parse_optional_nonzero(&flag, &value)?
+            }
+            "--max-memtable-batches" => {
+                args.max_memtable_batches = parse_optional_nonzero(&flag, &value)?
+            }
             "--max-wal-buffer-size" => args.max_wal_buffer_size = parse(&flag, &value)?,
             "--max-wal-flush-interval-ms" => {
                 args.max_wal_flush_interval_ms = parse(&flag, &value)?;
@@ -644,13 +666,21 @@ fn parse_args() -> Result<Args> {
         || args.calls == 0
         || args.vector_dim == 0
         || args.text_bytes == 0
-        || args.max_memtable_rows == 0
+        || args.row_bytes == 0
         || args.max_memtable_size == 0
         || args.max_unflushed_memtable_bytes == 0
     {
         return Err(lance_core::Error::invalid_input(
-            "seed_rows, batch_rows, calls, vector_dim, text_bytes, max_memtable_rows, max_memtable_size, and max_unflushed_memtable_bytes must be greater than 0",
+            "seed_rows, batch_rows, calls, vector_dim, text_bytes, row_bytes, max_memtable_size, and max_unflushed_memtable_bytes must be greater than 0",
         ));
+    }
+    if let Some(max_memtable_rows) = args.max_memtable_rows
+        && max_memtable_rows < args.batch_rows
+    {
+        return Err(lance_core::Error::invalid_input(format!(
+            "max_memtable_rows must be at least batch_rows so one batch fits: max_memtable_rows={}, batch_rows={}",
+            max_memtable_rows, args.batch_rows
+        )));
     }
     if args.mode.indexed() && args.vector_dim % args.num_sub_vectors != 0 {
         return Err(lance_core::Error::invalid_input(format!(
@@ -660,6 +690,11 @@ fn parse_args() -> Result<Args> {
     }
 
     Ok(args)
+}
+
+fn parse_optional_nonzero(flag: &str, value: &str) -> Result<Option<usize>> {
+    let parsed: usize = parse(flag, value)?;
+    Ok((parsed != 0).then_some(parsed))
 }
 
 fn parse<T>(flag: &str, value: &str) -> Result<T>

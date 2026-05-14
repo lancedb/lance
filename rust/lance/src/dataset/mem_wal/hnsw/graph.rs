@@ -175,6 +175,13 @@ struct BeamLimits {
     output_limit: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BuildBeamLimits {
+    ef: usize,
+    visible_len: usize,
+    visited_capacity: usize,
+}
+
 /// Metadata stored under `lance:hnsw` in Lance HNSW batches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LanceHnswMetadata {
@@ -362,7 +369,7 @@ impl HnswGraph {
         let pool_size = rayon::current_num_threads().max(1) * 2;
         let visited_pool = ArrayQueue::new(pool_size);
         for _ in 0..pool_size {
-            let _ = visited_pool.push(VisitedList::new(capacity));
+            let _ = visited_pool.push(VisitedList::new(0));
         }
 
         let packed_level0 = Box::into_raw(Box::new(PackedLevel::empty()));
@@ -448,7 +455,7 @@ impl HnswGraph {
         (parallel_start..ids.end)
             .into_par_iter()
             .try_for_each_init(
-                || VisitedList::new(self.nodes.len()),
+                || VisitedList::new(0),
                 |visited, id| self.insert_inner_with_visited(id, vectors, visited),
             )?;
 
@@ -475,7 +482,7 @@ impl HnswGraph {
         }
         self.validate_source(vectors, ids.end as usize)?;
 
-        let mut visited = VisitedList::new(self.nodes.len());
+        let mut visited = VisitedList::new(0);
         for id in ids.clone() {
             self.insert_inner_with_visited(id, vectors, &mut visited)?;
         }
@@ -536,7 +543,7 @@ impl HnswGraph {
         let mut visited = self
             .visited_pool
             .pop()
-            .unwrap_or_else(|| VisitedList::new(self.nodes.len()));
+            .unwrap_or_else(|| VisitedList::new(0));
         let mut ep = ScoredPoint::new(entry, vectors.distance_to(query, entry));
         for level in (1..visible_max_level).rev() {
             ep = self.greedy_search_query(ep, level, neighbor_visible_len, |id| {
@@ -658,7 +665,7 @@ impl HnswGraph {
         let mut visited = self
             .visited_pool
             .pop()
-            .unwrap_or_else(|| VisitedList::new(self.nodes.len()));
+            .unwrap_or_else(|| VisitedList::new(0));
         let result = self.insert_inner_with_visited(id, vectors, &mut visited);
         let _ = self.visited_pool.push(visited);
         result
@@ -696,8 +703,11 @@ impl HnswGraph {
             let candidates = self.beam_search_build(
                 ep,
                 level,
-                self.params.ef_construction,
-                usize::MAX,
+                BuildBeamLimits {
+                    ef: self.params.ef_construction,
+                    visible_len: usize::MAX,
+                    visited_capacity: vectors.len(),
+                },
                 visited,
                 |candidate| vectors.distance_between(id, candidate),
             )?;
@@ -771,7 +781,12 @@ impl HnswGraph {
     {
         let mut candidates = BinaryHeap::with_capacity(limits.ef);
         let mut results = BinaryHeap::with_capacity(limits.ef);
-        visited.reset(self.nodes.len());
+        let visited_capacity = if visible_len == usize::MAX {
+            self.visible_len.load(Ordering::Acquire)
+        } else {
+            visible_len
+        };
+        visited.reset(visited_capacity);
         let _ = visited.insert(ep.id);
         candidates.push(Reverse(ep));
         results.push(ep);
@@ -846,17 +861,21 @@ impl HnswGraph {
         &self,
         ep: ScoredPoint,
         level: u16,
-        ef: usize,
-        visible_len: usize,
+        limits: BuildBeamLimits,
         visited: &mut VisitedList,
         distance: F,
     ) -> Result<Vec<ScoredPoint>>
     where
         F: Fn(u32) -> f32,
     {
-        let mut candidates = BinaryHeap::with_capacity(ef);
-        let mut results = BinaryHeap::with_capacity(ef);
-        visited.reset(self.nodes.len());
+        let mut candidates = BinaryHeap::with_capacity(limits.ef);
+        let mut results = BinaryHeap::with_capacity(limits.ef);
+        let visited_capacity = if limits.visible_len == usize::MAX {
+            limits.visited_capacity
+        } else {
+            limits.visible_len
+        };
+        visited.reset(visited_capacity);
         let _ = visited.insert(ep.id);
         candidates.push(Reverse(ep));
         results.push(ep);
@@ -866,11 +885,11 @@ impl HnswGraph {
                 .peek()
                 .map(|point| point.distance)
                 .unwrap_or(f32::INFINITY);
-            if current.distance > furthest && results.len() == ef {
+            if current.distance > furthest && results.len() == limits.ef {
                 break;
             }
 
-            self.visit_build_neighbors(current.id, level, visible_len, |neighbor| {
+            self.visit_build_neighbors(current.id, level, limits.visible_len, |neighbor| {
                 if !visited.insert(neighbor) {
                     return;
                 }
@@ -879,8 +898,8 @@ impl HnswGraph {
                     .peek()
                     .map(|point| point.distance)
                     .unwrap_or(f32::INFINITY);
-                if results.len() < ef || candidate.distance < furthest {
-                    if results.len() == ef {
+                if results.len() < limits.ef || candidate.distance < furthest {
+                    if results.len() == limits.ef {
                         results.pop();
                     }
                     results.push(candidate);
