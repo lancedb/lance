@@ -5,6 +5,7 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
+pub mod aggregate_index;
 #[cfg(feature = "substrait")]
 pub mod ann_proto;
 mod filter;

@@ -23,6 +23,7 @@ use lance_arrow::ipc::{
     read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
     write_len_prefixed_bytes,
 };
+use lance_arrow_scalar::ArrowScalar;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
@@ -41,7 +42,9 @@ use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
 };
 use crate::pbold;
-use crate::{Index, IndexType, metrics::MetricsCollector};
+use crate::{
+    Index, IndexType, expression::aggregate::AnyAggregateQuery, metrics::MetricsCollector,
+};
 use crate::{
     frag_reuse::FragReuseIndex,
     progress::IndexBuildProgress,
@@ -751,6 +754,18 @@ impl ScalarIndex for BitmapIndex {
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
         Ok(SearchResult::Exact(selection))
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "this index cannot accelerate the aggregate {query:?}"
+        )))
     }
 
     fn can_remap(&self) -> bool {

@@ -14,6 +14,7 @@ use std::{
     time::Instant,
 };
 
+use crate::expression::aggregate::AnyAggregateQuery;
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
@@ -40,6 +41,7 @@ use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, iter_str_array};
+use lance_arrow_scalar::ArrowScalar;
 use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -1011,6 +1013,18 @@ impl ScalarIndex for InvertedIndex {
                 Ok(SearchResult::at_most(RowAddrTreeMap::from_iter(row_ids)))
             }
         }
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "this index cannot accelerate the aggregate {query:?}"
+        )))
     }
 
     fn can_remap(&self) -> bool {

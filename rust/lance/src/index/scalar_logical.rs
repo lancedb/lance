@@ -10,8 +10,11 @@ use async_trait::async_trait;
 use deepsize::{Context, DeepSizeOf};
 use futures::future::try_join_all;
 use lance_core::{Error, Result};
+use lance_index::expression::aggregate::AnyAggregateQuery;
 use lance_index::metrics::MetricsCollector;
-use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};
+use lance_index::scalar::{
+    AnyQuery, ArrowScalar, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria,
+};
 use lance_index::{Index, IndexType};
 use lance_select::NullableRowAddrSet;
 use lance_table::format::IndexMetadata;
@@ -130,6 +133,19 @@ impl ScalarIndex for LogicalScalarIndex {
         )
         .await?;
         combine_search_results(results)
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "LogicalScalarIndex '{}' cannot accelerate the aggregate {query:?}",
+            self.name
+        )))
     }
 
     fn can_remap(&self) -> bool {

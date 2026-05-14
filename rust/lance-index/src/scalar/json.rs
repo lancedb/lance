@@ -23,6 +23,7 @@ use datafusion_physical_expr::{
 };
 use deepsize::DeepSizeOf;
 use futures::StreamExt;
+use lance_arrow_scalar::ArrowScalar;
 use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
@@ -33,6 +34,7 @@ use lance_core::{Error, ROW_ID, Result, cache::LanceCache, error::LanceOptionExt
 
 use crate::{
     Index, IndexType,
+    expression::aggregate::AnyAggregateQuery,
     frag_reuse::FragReuseIndex,
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
@@ -110,6 +112,18 @@ impl ScalarIndex for JsonIndex {
         self.target_index
             .search(query.target_query.as_ref(), metrics)
             .await
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "this index cannot accelerate the aggregate {query:?}"
+        )))
     }
 
     fn can_remap(&self) -> bool {

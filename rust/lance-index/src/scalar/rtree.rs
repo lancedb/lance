@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::expression::aggregate::AnyAggregateQuery;
 use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
@@ -32,6 +33,7 @@ use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
+use lance_arrow_scalar::ArrowScalar;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
@@ -543,6 +545,18 @@ impl ScalarIndex for RTreeIndex {
                 )))
             }
         }
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "this index cannot accelerate the aggregate {query:?}"
+        )))
     }
 
     fn can_remap(&self) -> bool {
