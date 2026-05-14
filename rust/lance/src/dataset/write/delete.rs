@@ -31,6 +31,21 @@ pub struct DeleteResult {
     pub num_deleted_rows: u64,
 }
 
+/// Result of a staged delete operation.
+///
+/// The returned transaction can be committed later with [`CommitBuilder`].
+/// Pass `affected_rows` to [`CommitBuilder::with_affected_rows`] when present
+/// to preserve row-level conflict resolution for concurrent deletes and updates.
+#[derive(Debug, Clone)]
+pub struct UncommittedDelete {
+    /// The transaction to commit.
+    pub transaction: Transaction,
+    /// The row addresses affected by the delete, if available.
+    pub affected_rows: Option<RowAddrTreeMap>,
+    /// The number of rows that were deleted.
+    pub num_deleted_rows: u64,
+}
+
 /// Apply deletions to fragments based on a RoaringTreemap of row IDs.
 ///
 /// Returns the set of modified fragments and removed fragments, if any.
@@ -171,16 +186,20 @@ impl DeleteBuilder {
     /// # use lance::Result;
     /// # use lance::dataset::Dataset;
     /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
-    /// let transaction = DeleteBuilder::new(dataset.clone(), "age > 65")
+    /// let staged_delete = DeleteBuilder::new(dataset.clone(), "age > 65")
     ///     .execute_uncommitted()
     ///     .await?;
-    /// CommitBuilder::new(dataset)
-    ///     .execute(transaction)
+    /// let mut commit_builder = CommitBuilder::new(dataset);
+    /// if let Some(affected_rows) = staged_delete.affected_rows {
+    ///     commit_builder = commit_builder.with_affected_rows(affected_rows);
+    /// }
+    /// commit_builder
+    ///     .execute(staged_delete.transaction)
     ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn execute_uncommitted(self) -> Result<Transaction> {
+    pub async fn execute_uncommitted(self) -> Result<UncommittedDelete> {
         let job = DeleteJob {
             dataset: self.dataset,
             filter: self.filter,
@@ -189,13 +208,19 @@ impl DeleteBuilder {
         let DeleteData {
             updated_fragments,
             deleted_fragment_ids,
-            ..
+            affected_rows,
+            num_deleted_rows,
         } = data;
-        Ok(job.build_transaction(
+        let transaction = job.build_transaction(
             job.dataset.as_ref(),
             updated_fragments,
             deleted_fragment_ids,
-        ))
+        );
+        Ok(UncommittedDelete {
+            transaction,
+            affected_rows,
+            num_deleted_rows,
+        })
     }
 }
 
@@ -693,7 +718,7 @@ mod tests {
             .unwrap();
         let initial_version = dataset.version().version;
 
-        let transaction = DeleteBuilder::new(Arc::new(dataset.clone()), "i < 10")
+        let staged_delete = DeleteBuilder::new(Arc::new(dataset.clone()), "i < 10")
             .execute_uncommitted()
             .await
             .unwrap();
@@ -702,8 +727,10 @@ mod tests {
         assert_eq!(dataset_before_commit.version().version, initial_version);
         assert_eq!(dataset_before_commit.count_rows(None).await.unwrap(), 100);
 
-        assert_eq!(transaction.read_version, initial_version);
-        match &transaction.operation {
+        assert_eq!(staged_delete.num_deleted_rows, 10);
+        assert!(staged_delete.affected_rows.is_some());
+        assert_eq!(staged_delete.transaction.read_version, initial_version);
+        match &staged_delete.transaction.operation {
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -716,12 +743,21 @@ mod tests {
             other => panic!("expected delete transaction, got {other:?}"),
         }
 
-        let committed = CommitBuilder::new(&tmp_path)
-            .execute(transaction)
+        DeleteBuilder::new(Arc::new(dataset.clone()), "i >= 10 AND i < 20")
+            .execute()
             .await
             .unwrap();
-        assert_eq!(committed.version().version, initial_version + 1);
-        assert_eq!(committed.count_rows(None).await.unwrap(), 90);
+
+        let mut commit_builder = CommitBuilder::new(&tmp_path);
+        if let Some(affected_rows) = staged_delete.affected_rows {
+            commit_builder = commit_builder.with_affected_rows(affected_rows);
+        }
+        let committed = commit_builder
+            .execute(staged_delete.transaction)
+            .await
+            .unwrap();
+        assert_eq!(committed.version().version, initial_version + 2);
+        assert_eq!(committed.count_rows(None).await.unwrap(), 80);
     }
 
     #[tokio::test]
