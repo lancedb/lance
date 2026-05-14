@@ -46,7 +46,7 @@ impl BlockingScanner {
         if collect_stats {
             let stats_for_callback = stats.clone();
             let callback: ExecutionStatsCallback = Arc::new(move |counts| {
-                let mut guard = stats_for_callback.lock().unwrap();
+                let mut guard = stats_for_callback.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(counts.clone());
             });
             scanner.scan_stats_callback(callback);
@@ -59,7 +59,7 @@ impl BlockingScanner {
     }
 
     fn reset_stats(&self) {
-        let mut guard = self.stats.lock().unwrap();
+        let mut guard = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 
