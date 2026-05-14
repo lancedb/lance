@@ -698,7 +698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_execute_uncommitted_stages_without_committing() {
+    async fn test_delete_execute_uncommitted_preserves_affected_rows_for_rebase() {
         fn sequence_data(range: Range<u32>) -> RecordBatch {
             let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
