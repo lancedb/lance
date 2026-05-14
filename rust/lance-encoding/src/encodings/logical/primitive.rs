@@ -3290,6 +3290,16 @@ struct PageInfoAndScheduler {
 pub struct StructuralPrimitiveFieldScheduler {
     page_schedulers: Vec<PageInfoAndScheduler>,
     column_index: u32,
+    // A blob column can be scheduled in two different "projection modes":
+    //   * blob descriptor (the column is projected as a struct of position/size) —
+    //     selects `BlobDescriptionPageScheduler` per page.
+    //   * blob data (the column is projected as the loaded large_binary value) —
+    //     selects `BlobPageScheduler` per page.
+    // The two modes produce incompatible `CachedPageData` shapes, so they must
+    // not share a cache entry (otherwise `BlobPageScheduler::load` will downcast
+    // the wrong type and panic).  Track the mode here so it can be folded into
+    // the field-data cache key.
+    is_blob_descriptor_projection: bool,
 }
 
 impl StructuralPrimitiveFieldScheduler {
@@ -3313,9 +3323,12 @@ impl StructuralPrimitiveFieldScheduler {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let is_blob_descriptor_projection =
+            target_field.is_blob() && matches!(target_field.data_type(), DataType::Struct(_));
         Ok(Self {
             page_schedulers,
             column_index: column_info.index,
+            is_blob_descriptor_projection,
         })
     }
 
@@ -3477,13 +3490,20 @@ impl DeepSizeOf for CachedFieldData {
 #[derive(Debug, Clone)]
 pub struct FieldDataCacheKey {
     pub column_index: u32,
+    // Distinguishes blob-descriptor projection from blob-data projection for the
+    // same column.  See `StructuralPrimitiveFieldScheduler::is_blob_descriptor_projection`.
+    pub is_blob_descriptor_projection: bool,
 }
 
 impl CacheKey for FieldDataCacheKey {
     type ValueType = CachedFieldData;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        self.column_index.to_string().into()
+        if self.is_blob_descriptor_projection {
+            format!("{}/desc", self.column_index).into()
+        } else {
+            self.column_index.to_string().into()
+        }
     }
 
     fn type_name() -> &'static str {
@@ -3499,6 +3519,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     ) -> BoxFuture<'a, Result<()>> {
         let cache_key = FieldDataCacheKey {
             column_index: self.column_index,
+            is_blob_descriptor_projection: self.is_blob_descriptor_projection,
         };
         let cache = context.cache().clone();
 

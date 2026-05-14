@@ -1900,6 +1900,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_append_blob_columns_preserves_blob_encoding() {
+        // Regression test for https://github.com/lance-format/lance/issues/6381.
+        // When a dataset with a blob column has multiple fragments (here,
+        // produced by an append) reading the same column with two different
+        // projections — the descriptor struct (`take_blobs`) and the loaded
+        // `LargeBinary` value (`compact_files`) — used to share a cache entry
+        // keyed only by column index.  The two projections produce
+        // incompatible `CachedPageData` shapes, so the second reader's
+        // `BlobPageScheduler::load` downcast panicked.
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, false)
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+        ]));
+
+        let make_batch = |start: i32, payload: &[&[u8]]| {
+            let ids: ArrayRef = Arc::new(Int32Array::from_iter_values(
+                start..(start + payload.len() as i32),
+            ));
+            let blobs: ArrayRef = Arc::new(LargeBinaryArray::from_iter(
+                payload.iter().map(|v| Some(*v)),
+            ));
+            RecordBatch::try_new(schema.clone(), vec![ids, blobs]).unwrap()
+        };
+
+        let first_payload: Vec<&[u8]> = vec![b"foo", b"bar", b"baz"];
+        let reader =
+            RecordBatchIterator::new(vec![Ok(make_batch(0, &first_payload))], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        drop(dataset);
+
+        let second_payload: Vec<&[u8]> = vec![b"qux", b"quux", b"corge"];
+        let reader =
+            RecordBatchIterator::new(vec![Ok(make_batch(3, &second_payload))], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let dataset_arc = Arc::new(dataset.clone());
+        let row_indices: Vec<u64> =
+            (0..(first_payload.len() + second_payload.len()) as u64).collect();
+        let blobs = dataset_arc
+            .take_blobs_by_indices(&row_indices, "blob")
+            .await
+            .unwrap();
+        let mut expected: Vec<&[u8]> = first_payload.clone();
+        expected.extend(second_payload.iter().copied());
+        assert_eq!(blobs.len(), expected.len());
+        for (blob, want) in blobs.iter().zip(expected.iter()) {
+            let bytes = blob.read().await.unwrap();
+            assert_eq!(bytes.as_ref(), *want);
+        }
+
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_compact_blob_columns() {
         let test_dir = TempStrDir::default();
         let schema = Arc::new(Schema::new(vec![
@@ -1931,6 +2011,24 @@ mod tests {
         dataset.validate().await.unwrap();
         assert!(dataset.get_fragments().len() > 1);
 
+        let row_indices: Vec<u64> = (0..expected_payload.len() as u64).collect();
+
+        // Take blobs while the dataset still has multiple fragments.  This
+        // exercises the descriptor-projection scheduling path; doing it
+        // before `compact_files` previously poisoned the per-column scheduler
+        // cache and caused the subsequent (LargeBinary) scan to panic.
+        let dataset_arc = Arc::new(dataset.clone());
+        let blobs = dataset_arc
+            .take_blobs_by_indices(&row_indices, "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), expected_payload.len());
+        for (blob, expected) in blobs.iter().zip(expected_payload.iter()) {
+            let bytes = blob.read().await.unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_slice());
+        }
+        drop(dataset_arc);
+
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
@@ -1938,7 +2036,6 @@ mod tests {
         assert_eq!(dataset.get_fragments().len(), 1);
 
         let dataset = Arc::new(dataset);
-        let row_indices: Vec<u64> = (0..expected_payload.len() as u64).collect();
         let blobs = dataset
             .take_blobs_by_indices(&row_indices, "blob")
             .await
