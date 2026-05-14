@@ -33,7 +33,8 @@ jobs:
       - name: Checkout lance-namespace
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          repository: lancedb/lance-namespace
+          repository: jackye1995/lance-namespace
+          ref: ns-catalog-split
           path: lance-namespace
       - name: Checkout lance-ray
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -48,8 +49,14 @@ jobs:
       - name: Checkout lance-namespace-impls
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          repository: lance-format/lance-namespace-impls
+          repository: jackye1995/lance-namespace-impls
+          ref: jack/ns-catalog-split
           path: lance-namespace-impls
+      - name: Checkout lance-duckdb
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-duckdb
+          path: lance-duckdb
       - name: Checkout lance-trino
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -67,84 +74,17 @@ jobs:
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
-      - name: Copy lance-namespace docs
+      - name: Assemble full docs website
+        env:
+          LANCE_NAMESPACE_REPO: ${{ github.workspace }}/lance-namespace
+          LANCE_NAMESPACE_IMPLS_REPO: ${{ github.workspace }}/lance-namespace-impls
+          LANCE_SPARK_REPO: ${{ github.workspace }}/lance-spark
+          LANCE_RAY_REPO: ${{ github.workspace }}/lance-ray
+          LANCE_TRINO_REPO: ${{ github.workspace }}/lance-trino
+          LANCE_DUCKDB_REPO: ${{ github.workspace }}/lance-duckdb
+          LANCE_HUGGINGFACE_REPO: ${{ github.workspace }}/lance-huggingface
         run: |
-          cp -r lance-namespace/docs/src docs/src/format/namespace
-          cat >> docs/src/format/.pages << 'EOF'
-            - Namespace Spec: namespace
-          EOF
-          cp docs/src/format/namespace/rest.yaml docs/src/rest.yaml
-      - name: Copy lance-namespace-impls docs
-        run: |
-          # Copy implementation specs to the integrations folder
-          cp lance-namespace-impls/docs/src/*.md docs/src/format/namespace/integrations/
-
-          # Copy .pages from lance-namespace-impls and append template entry
-          cp lance-namespace-impls/docs/src/.pages docs/src/format/namespace/integrations/.pages
-          echo "  - Template for New Integrations: template.md" >> docs/src/format/namespace/integrations/.pages
-      - name: Copy lance-huggingface docs
-        run: |
-          cp -r lance-huggingface/docs/src docs/src/integrations/huggingface
-          cat >> docs/src/integrations/.pages << 'EOF'
-            - Huggingface: huggingface
-          EOF
-      - name: Copy lance-spark docs
-        run: |
-          cp -r lance-spark/docs/src docs/src/integrations/spark
-          cat >> docs/src/integrations/.pages << 'EOF'
-            - Apache Spark: spark
-          EOF
-      - name: Copy lance-ray docs
-        run: |
-          cp -r lance-ray/docs/src docs/src/integrations/ray
-          cat >> docs/src/integrations/.pages << 'EOF'
-            - Ray: ray
-          EOF
-      - name: Copy lance-trino docs
-        run: |
-          cp -r lance-trino/docs/src docs/src/integrations/trino
-          cat >> docs/src/integrations/.pages << 'EOF'
-            - Trino: trino
-          EOF
-      - name: Copy contributing docs
-        run: |
-          mkdir -p docs/src/community/project-specific/lance
-
-          # Lance project files
-          cp CONTRIBUTING.md docs/src/community/project-specific/lance/general.md
-          cp release_process.md docs/src/community/project-specific/lance/release.md
-          cp rust/CONTRIBUTING.md docs/src/community/project-specific/lance/rust.md
-          cp python/CONTRIBUTING.md docs/src/community/project-specific/lance/python.md
-          cp docs/CONTRIBUTING.md docs/src/community/project-specific/lance/docs.md
-
-          # External project files
-          cp lance-ray/CONTRIBUTING.md docs/src/community/project-specific/ray.md
-          cp lance-spark/CONTRIBUTING.md docs/src/community/project-specific/spark.md
-          cp lance-namespace/CONTRIBUTING.md docs/src/community/project-specific/namespace.md
-          cp lance-namespace-impls/CONTRIBUTING.md docs/src/community/project-specific/namespace-impls.md || true
-          cp lance-trino/CONTRIBUTING.md docs/src/community/project-specific/trino.md
-
-          # Create .pages for project-specific
-          cat > docs/src/community/project-specific/.pages << 'EOF'
-          nav:
-            - index.md
-            - Lance: lance
-            - Lance Namespace: namespace.md
-            - Lance Namespace Impls: namespace-impls.md
-            - Lance Ray: ray.md
-            - Lance Spark: spark.md
-            - Lance Trino: trino.md
-          EOF
-
-          # Create .pages for lance subfolder
-          cat > docs/src/community/project-specific/lance/.pages << 'EOF'
-          nav:
-            - General: general.md
-            - Release: release.md
-            - Rust: rust.md
-            - Python: python.md
-            - Docs: docs.md
-          EOF
+          docs/make-full-website.sh
       - name: Deploy
         working-directory: docs
         run: uv run mkdocs gh-deploy --force

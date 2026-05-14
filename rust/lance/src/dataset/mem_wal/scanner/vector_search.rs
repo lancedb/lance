@@ -483,4 +483,54 @@ mod tests {
         assert!(cols.contains(&"vector".to_string()));
         assert!(cols.contains(&"id".to_string()));
     }
+
+    #[tokio::test]
+    async fn test_vector_search_without_base_table() {
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // No base dataset written. Plan construction must still succeed and
+        // exclude any base-table scan node.
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 10, 8, None)
+            .await
+            .expect("planner should produce a plan without a base table");
+
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_str.contains("base/data"),
+            "Plan must not scan base table, got: {}",
+            plan_str
+        );
+
+        // Execute the plan so runtime issues (schema mismatches, missing
+        // sources, etc.) surface here rather than at the call site.
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan
+            .execute(0, ctx.task_ctx())
+            .expect("plan should execute without a base table");
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .expect("collecting batches should succeed");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0, "fresh tier with no sources should yield no rows");
+    }
 }

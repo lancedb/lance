@@ -1,29 +1,27 @@
 # Indices in Lance
 
+Lance treats indices as independent, redundant data structures layered on top of table row identifiers. This keeps the file format free of built-in search structures and lets index formats evolve independently from the table layout.
+
 Lance supports three main categories of indices to accelerate data access: scalar
 indices, vector indices, and system indices.
 
-**Scalar indices** are traditional indices that speed up queries on scalar data types, such as
-integers and strings. Examples include [B-trees](scalar/btree.md) and
-[full-text search indices](scalar/fts.md). Typically, scalar indices receive a
-query predicate, such as equality or range conditions, and output a set of row addresses that
-satisfy the predicate.
+**Scalar indices** accelerate queries on scalar data types such as integers, timestamps,
+and strings. This includes primary skipping structures such as [zone maps](scalar/zonemap.md)
+as well as secondary structures such as [B-trees](scalar/btree.md), [bitmap indices](scalar/bitmap.md),
+and [full-text search indices](scalar/fts.md). They typically accept predicates such as equality,
+range, set-membership, or token matches and return matching row identifiers.
 
 <figure markdown="span">
   ![](./scalar_index.drawio.svg)
 </figure>
 
-**[Vector indices](./vector/index.md)** are specialized for approximate nearest neighbor (ANN) search on high-dimensional
-vector data, such as embeddings from machine learning models. Examples includes IVF (Inverted File)
-indices and HNSW (Hierarchical Navigable Small World) indices. These are separate from scalar indices
-because they use meaningfully different query patterns. Instead of sargable predicates, vector indices
-receive a query vector and return the nearest neighbor row addresses based on some distance metric,
-such as Euclidean distance or cosine similarity. They return row addresses and the corresponding distances.
+**[Vector indices](./vector/index.md)** are specialized for approximate nearest neighbor search on
+high-dimensional embeddings. Examples include IVF-based layouts and HNSW graphs. Instead of scalar
+predicates, vector indices receive a query vector and return row identifiers plus distance scores.
 
-**System indices** are auxiliary indices that help accelerate internal system operations. They are
-different from user-facing scalar and vector indices, as they are not directly used in user queries.
-Examples include the [Fragment Reuse Index](system/frag_reuse.md), which supports efficient row address
-remapping after compaction.
+**System indices** are auxiliary structures that support internal table maintenance and row-identifier
+resolution. They are not queried directly by end users. Examples include the [Fragment Reuse Index](system/frag_reuse.md),
+which supports efficient remapping after compaction.
 
 ## Design
 
@@ -82,7 +80,7 @@ Consider the example dataset in the figure above:
 
 ## Index Storage
 
-The content of each index is stored at the `_indices/{UUID}` directory under the [base path](../layout.md#base-path-system).
+The content of each index is stored at the `_indices/{UUID}` directory under the [base path](../table/layout.md#base-path-system).
 We call this location the **index directory**.
 The actual content stored in the index directory depends on the index type. These can be
 arbitrary files defined by the index implementation. However, often they are made up of
@@ -135,7 +133,7 @@ fragments that would have been covered by that segment.
 
 When loading an index:
 
-1. Get the offset to the index section from the `index_section` field in the [manifest](../index.md#manifest).
+1. Get the offset to the index section from the `index_section` field in the [manifest](../table/index.md#manifest).
 2. Read the index section from the manifest file. This is a protobuf message of type `IndexSection`, which
    contains a list of `IndexMetadata` messages, each describing an index segment.
 3. Read the index files from the `_indices/{UUID}` directory under the dataset directory,

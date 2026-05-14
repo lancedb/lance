@@ -269,10 +269,24 @@ impl Field {
     }
 
     pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
-        // For Map types, we must preserve ALL children (entries struct with key/value)
-        // Map internal structure should not be subject to projection filtering
+        // Map fields encode their physical layout as a single child entries
+        // struct (`Struct<key, value>`) whose presence is required for the
+        // parent to be readable — we never want to filter into that subtree.
+        // But the parent field itself is still subject to selection: if the
+        // caller didn't ask for this Map column, drop it like any other
+        // non-selected leaf. Without this early return the unconditional
+        // children clone would keep `children.is_empty() == false` forever
+        // and every Map column in the schema would survive every projection,
+        // pulling tens-of-bytes-per-row of unrelated data through downstream
+        // operators (notably `SortExec` in scalar-index training, where it
+        // was responsible for >100 GiB external-sort spills on real-world
+        // tables).
+        if self.logical_type.is_map() && !projection.contains_field_id(self.id) {
+            return None;
+        }
+
         let children = if self.logical_type.is_map() {
-            // Map field: keep all children intact (entries struct and its key/value fields)
+            // Map field is selected: keep all children intact.
             self.children.clone()
         } else {
             self.children

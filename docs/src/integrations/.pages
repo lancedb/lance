@@ -1,6 +1,8 @@
 nav:
   - Apache DataFusion: datafusion.md
-  - DuckDB: duckdb.md
   - PostgreSQL: https://github.com/lancedb/pglance
   - PyTorch: pytorch.md
   - Tensorflow: tensorflow.md
+  - Apache Spark: spark
+  - Ray: ray
+  - Trino: trino

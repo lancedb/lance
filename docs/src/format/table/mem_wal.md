@@ -137,7 +137,7 @@ Each WAL entry is stored within the WAL directory of the shard located at `_mem_
 
 WAL files use bit-reversed 64-bit binary naming to distribute files evenly across the directory keyspace.
 This optimizes S3 throughput by spreading sequential writes across S3's internal partitions, minimizing throttling.
-The filename is the bit-reversed binary representation of the entry ID with suffix `.lance`.
+The filename is the bit-reversed binary representation of the entry ID with suffix `.arrow`.
 For example, entry ID 5 (binary `000...101`) becomes `1010000000000000000000000000000000000000000000000000000000000000.arrow`.
 
 ### Flushed MemTable
@@ -225,7 +225,7 @@ For example, version 5 becomes `101000000000000000000000000000000000000000000000
 
 ## MemWAL Index Details
 
-The MemWAL Index uses the [standard index storage](index/index.md#index-storage) at `_indices/{UUID}/`.
+The MemWAL Index uses the [standard index storage](../index/index.md#index-storage) at `_indices/{UUID}/`.
 
 The index stores its data in two parts:
 

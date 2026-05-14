@@ -1195,4 +1195,162 @@ mod integration_tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
     }
+
+    #[tokio::test]
+    async fn test_lsm_scan_without_base_table() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        // Use the same base URI the flushed generations were created under, so
+        // relative `gen_N` folders resolve to real datasets on disk.
+        let base_uri = base_dataset.uri().to_string();
+        let arrow_schema: arrow_schema::Schema = base_dataset.schema().into();
+        let schema = Arc::new(arrow_schema);
+
+        let mut scanner =
+            LsmScanner::without_base_table(schema, base_uri, shard_snapshots, pk_columns);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
+        }
+
+        // Verify the plan does not include a LanceRead for the base table.
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_str.contains("base/data"),
+            "Plan must not include base table scan, got: {}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("gen_1") && plan_str.contains("gen_2"),
+            "Plan must scan flushed generations, got: {}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("MemTableScanExec"),
+            "Plan must scan the active memtable, got: {}",
+            plan_str
+        );
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        // Without the base table, ids that only exist in base (1, 2) are gone.
+        // The fresh tier (gen1, gen2, active) supplies the rest with newest-wins.
+        assert_eq!(results.len(), 5, "Fresh tier should yield 5 unique rows");
+        assert_eq!(results.get(&1), None);
+        assert_eq!(results.get(&2), None);
+        assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"active_5".to_string()));
+        assert_eq!(results.get(&6), Some(&"active_6".to_string()));
+        assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_without_base_table_with_filter() {
+        // Exercises filter() on a scanner built via without_base_table(): the
+        // filter must parse against the supplied schema (no base dataset to
+        // borrow one from) and push down to the fresh-tier sources.
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let base_uri = base_dataset.uri().to_string();
+        let arrow_schema: arrow_schema::Schema = base_dataset.schema().into();
+        let schema = Arc::new(arrow_schema);
+
+        let mut scanner =
+            LsmScanner::without_base_table(schema, base_uri, shard_snapshots, pk_columns)
+                .filter("id > 3")
+                .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_active_memtable(shard_id, memtable);
+        }
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        // id<=3 excluded by filter; id=1,2 also absent because base is excluded.
+        // Fresh tier with newest-wins: gen2_4, active_5, active_6, active_7.
+        assert_eq!(results.len(), 4);
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"active_5".to_string()));
+        assert_eq!(results.get(&6), Some(&"active_6".to_string()));
+        assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_without_base_table_no_flushed_no_active() {
+        // No base, no flushed, no active → empty result, valid plan.
+        let schema = create_pk_schema();
+        let scanner = LsmScanner::without_base_table(
+            schema,
+            "memory:///fresh-tier-empty",
+            vec![],
+            vec!["id".to_string()],
+        );
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+    }
 }

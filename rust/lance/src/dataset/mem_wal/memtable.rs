@@ -317,12 +317,15 @@ impl MemTable {
             .map(|cell| cell.reader())
     }
 
-    /// Signal that the memtable flush is complete.
+    /// Signal that the memtable flush has finished, with the outcome.
     ///
-    /// Called after the memtable has been flushed to Lance storage.
-    pub fn signal_memtable_flush_complete(&self) {
+    /// Must be called whether the flush succeeded or failed — otherwise the
+    /// watch channel is dropped without a value and any awaiting watcher
+    /// (e.g. `ShardWriter::wait_for_flush_drain`) sees the closed channel
+    /// and returns `Err` instead of receiving the actual outcome.
+    pub fn signal_memtable_flush_complete(&self, result: DurabilityResult) {
         if let Some(cell) = self.memtable_flush_completion.lock().unwrap().take() {
-            cell.write(DurabilityResult::ok());
+            cell.write(result);
         }
     }
 

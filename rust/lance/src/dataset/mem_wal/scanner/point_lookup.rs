@@ -455,4 +455,58 @@ mod tests {
             "Expression should contain column name"
         );
     }
+
+    #[tokio::test]
+    async fn test_point_lookup_without_base_table() {
+        use futures::TryStreamExt;
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+
+        // No base dataset is created. We still need a base URI so the collector
+        // can resolve flushed-generation paths.
+        let base_uri = format!("{}/base", base_path);
+
+        // Create a flushed generation under {base_uri}/_mem_wal/{shard}/gen_1
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let gen1_batch = create_test_batch(&schema, &[2, 3], "gen1");
+        create_dataset(&gen1_uri, vec![gen1_batch]).await;
+
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        // id=3 lives in the flushed generation
+        let pk_values = vec![ScalarValue::Int32(Some(3))];
+        let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
+
+        let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            !plan_str.contains("base/data"),
+            "Plan must not scan base table, got: {}",
+            plan_str
+        );
+        assert!(plan_str.contains("gen_1"));
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1);
+
+        // id=99 doesn't exist anywhere → empty
+        let plan = planner
+            .plan_lookup(&[ScalarValue::Int32(Some(99))], None)
+            .await
+            .unwrap();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+    }
 }
