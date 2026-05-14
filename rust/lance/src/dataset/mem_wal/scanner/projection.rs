@@ -1,34 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Projection helpers shared across LSM scanner planners.
+//! Projection helpers shared by the LSM vector search, point lookup, and
+//! scan planners.
 //!
-//! Vector search, point lookup, and the general scan planner all face the
-//! same projection-handling concerns:
+//! `MemTableScanner::project()` only special-cases `_rowid`; passing other
+//! system columns through it errors. And cross-LSM values for system
+//! columns aren't comparable (a `_rowid` of 5 in the base and in a flushed
+//! memtable refer to different rows).
 //!
-//! - The active-arm `MemTableScanner` only special-cases `_rowid` in its
-//!   `project()` method. Other system columns (`_rowaddr`, `_rowoffset`,
-//!   `_row_*_at_version`) are treated as missing data columns and produce
-//!   `Column not found in schema` errors.
-//! - Cross-LSM-source values for system columns are not meaningful: a
-//!   `_rowid` of 5 in the base table and a `_rowid` of 5 in a flushed
-//!   memtable refer to different rows, so concatenating them across the
-//!   union is misleading.
-//!
-//! These helpers give every planner a single source of truth:
-//!
-//! - [`build_scanner_projection`] — what we pass to underlying scanners.
-//!   Strips system columns and `_distance` from the user's projection
-//!   (they are handled separately or auto-generated) and appends PK
-//!   columns for downstream dedup / staleness detection.
-//! - [`canonical_output_schema`] — the final output schema. Honors the
-//!   user's column order, exposes requested system columns at their
-//!   requested position as nullable `UInt64`, and (optionally) ensures
-//!   `_distance` is present for KNN.
-//! - [`project_to_canonical`] — wraps an exec plan in a [`ProjectionExec`]
-//!   that emits `target_schema` exactly. System columns missing from the
-//!   source are filled with NULL literals so the not-comparable semantics
-//!   are explicit at the output rather than producing garbage values.
+//! - [`build_scanner_projection`] — strips system / `_distance` cols, appends PKs.
+//! - [`canonical_output_schema`] — final schema honoring user order; system
+//!   cols become nullable `UInt64`, `_distance` becomes nullable `Float32`.
+//! - [`project_to_canonical`] — wraps a plan to emit `target_schema`,
+//!   NULL-filling system / `_distance` cols missing from the source.
 
 use std::sync::Arc;
 
@@ -38,28 +23,35 @@ use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
-use lance_core::{Result, is_system_column};
+use lance_core::{ROW_ADDR, ROW_ID, Result, is_system_column};
 
 /// Column name for distance in vector search results.
 pub const DISTANCE_COLUMN: &str = "_distance";
 
-/// Whether a column is auto-managed by LSM scanner planners and therefore
-/// must not be forwarded to the underlying scanner's `project()` call.
+/// Did the caller list `name` in their projection?
+pub fn projection_contains(projection: Option<&[String]>, name: &str) -> bool {
+    projection
+        .map(|p| p.iter().any(|c| c == name))
+        .unwrap_or(false)
+}
+
+/// Did the caller list `_rowid` in their projection?
+pub fn wants_row_id(projection: Option<&[String]>) -> bool {
+    projection_contains(projection, ROW_ID)
+}
+
+/// Did the caller list `_rowaddr` in their projection?
+pub fn wants_row_address(projection: Option<&[String]>) -> bool {
+    projection_contains(projection, ROW_ADDR)
+}
+
+/// Auto-managed by the planner; must never reach `scanner.project()`.
 fn is_auto_managed(col: &str) -> bool {
     col == DISTANCE_COLUMN || is_system_column(col)
 }
 
-/// Build the projection list to pass to underlying scanners.
-///
-/// - Strips system columns (`_rowid`, `_rowaddr`, …) and `_distance`.
-///   These are auto-managed (scanner-side `with_row_id`/`with_row_address`
-///   flags, KNN `_distance` synthesis, or NULL fill in the canonical
-///   projection), so passing them through `scanner.project()` would error
-///   in the active-arm `MemTableScanner`.
-/// - Appends every PK column not already present, so downstream dedup /
-///   staleness detection always has a hash key.
-/// - When the user's projection is `None`, defaults to all base-schema
-///   data columns.
+/// Projection to pass to underlying scanners: user cols minus
+/// system/`_distance`, with PKs appended for dedup/staleness.
 pub fn build_scanner_projection(
     user_projection: Option<&[String]>,
     base_schema: &SchemaRef,
@@ -84,21 +76,12 @@ pub fn build_scanner_projection(
     cols
 }
 
-/// Build the canonical output schema, honoring user-specified column order.
+/// Canonical output schema honoring user column order.
 ///
-/// - User-listed columns appear at their original index.
-/// - System columns (`_rowid`, `_rowaddr`, …) are kept as nullable
-///   `UInt64` at the user's requested position; their values are filled
-///   with NULL across LSM sources by [`project_to_canonical`] because
-///   per-source values aren't comparable.
-/// - When `include_distance` is true, `_distance` is exposed as nullable
-///   `Float32` at the user's position, or appended to the end if absent.
-/// - PK columns are appended (after the user projection, before any
-///   auto-appended `_distance`) when not already present, to match the
-///   data flowing through `build_scanner_projection`.
-/// - Any user-projected name that isn't in `base_schema` and isn't a
-///   recognized system / `_distance` column is silently dropped, matching
-///   prior behavior of the per-planner helpers.
+/// System cols → nullable `UInt64` at user position (filled by
+/// `project_to_canonical`). `_distance` (when `include_distance`) →
+/// nullable `Float32` at user position, appended if absent. PKs appended.
+/// Unknown names are silently dropped.
 pub fn canonical_output_schema(
     user_projection: Option<&[String]>,
     base_schema: &SchemaRef,
@@ -145,15 +128,48 @@ pub fn canonical_output_schema(
     Arc::new(Schema::new(fields))
 }
 
-/// Wrap `plan` with a [`ProjectionExec`] that emits exactly `target_schema`.
-///
-/// - Columns present in both source and target are forwarded by name.
-/// - System columns and `_distance` present in the target but missing from
-///   the source are filled with typed NULL literals (UInt64 / Float32),
-///   reflecting the fact that cross-LSM values for these columns are not
-///   meaningful or were not produced by every source.
-/// - Any other missing target column is an internal error (the planner
-///   built a target schema that the source can't satisfy).
+/// Wrap `plan` so the named columns become typed NULL literals; all
+/// other columns are forwarded unchanged. Schema is preserved (same
+/// fields, same dtypes). Useful for stripping the *value* of an
+/// internal column after it has served its purpose (e.g. `_rowaddr`
+/// after the per-arm local sort) without breaking downstream schema
+/// matching.
+pub fn null_columns(
+    plan: Arc<dyn ExecutionPlan>,
+    names: &[&str],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let input_schema = plan.schema();
+    let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(input_schema.fields().len());
+    for (idx, field) in input_schema.fields().iter().enumerate() {
+        let name = field.name();
+        let expr: Arc<dyn PhysicalExpr> = if names.contains(&name.as_str()) {
+            Arc::new(Literal::new(
+                ScalarValue::try_from(field.data_type()).map_err(|e| {
+                    lance_core::Error::internal(format!(
+                        "Cannot build NULL literal for {}: {}",
+                        field.data_type(),
+                        e
+                    ))
+                })?,
+            ))
+        } else {
+            Arc::new(Column::new(name, idx))
+        };
+        project_exprs.push((expr, name.clone()));
+    }
+    let projection_exec = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!(
+            "Failed to build null_columns ProjectionExec: {}",
+            e
+        ))
+    })?;
+    Ok(Arc::new(projection_exec))
+}
+
+/// Wrap `plan` to emit exactly `target_schema`. Source columns are
+/// forwarded by name; system / `_distance` cols missing from the source
+/// are NULL-filled. Other missing columns are an internal error.
 pub fn project_to_canonical(
     plan: Arc<dyn ExecutionPlan>,
     target_schema: &SchemaRef,

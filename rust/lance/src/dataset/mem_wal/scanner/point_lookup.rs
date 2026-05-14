@@ -19,7 +19,10 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
-use super::projection::{build_scanner_projection, canonical_output_schema, project_to_canonical};
+use super::projection::{
+    build_scanner_projection, canonical_output_schema, project_to_canonical, wants_row_address,
+    wants_row_id,
+};
 
 /// Plans point lookup queries over LSM data.
 ///
@@ -201,11 +204,9 @@ impl LsmPointLookupPlanner {
 
     /// Build scan plan for a single data source.
     ///
-    /// Each source's output is projected to the canonical schema so that
-    /// system columns the user requested (`_rowid`, `_rowaddr`, …) appear
-    /// at the user's specified position — filled with NULL when the
-    /// underlying source doesn't produce them, since per-source values
-    /// aren't comparable across LSM levels.
+    /// Output is projected to the canonical schema so user-requested system
+    /// columns appear at the requested position — NULL where the source
+    /// doesn't produce them or where per-source values aren't meaningful.
     async fn build_source_scan(
         &self,
         source: &LsmDataSource,
@@ -215,10 +216,20 @@ impl LsmPointLookupPlanner {
         let cols = build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
         let target =
             canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+        let want_row_id = wants_row_id(projection);
+        let want_row_addr = wants_row_address(projection);
         let scan: Arc<dyn ExecutionPlan> = match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Only the base produces row IDs callers can use against the
+                // dataset (e.g. `take_rows`); non-base arms NULL via canonical.
+                if want_row_id {
+                    scanner.with_row_id();
+                }
+                if want_row_addr {
+                    scanner.with_row_address();
+                }
                 scanner.filter_expr(filter.clone());
                 scanner.create_plan().await?
             }
@@ -485,10 +496,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_point_lookup_projection_with_system_columns() {
-        // Regression: passing system columns (`_rowid`, `_rowaddr`, `_rowoffset`)
-        // in the projection used to either error in the active-arm
-        // MemTableScanner or be silently dropped. They must now be honored at
-        // the user's specified position with NULL values across LSM sources.
+        // Regression: system columns in projection used to error in the
+        // active-arm MemTableScanner or get silently dropped. Verify they're
+        // surfaced at the requested position with the correct NULL/real mix.
         use futures::TryStreamExt;
         use lance_core::is_system_column;
 
@@ -537,17 +547,20 @@ mod tests {
             "system columns must appear at the user's requested position"
         );
 
-        // System columns must be present and NULL across LSM sources (not
-        // comparable across base/flushed/active).
-        for col in ["_rowaddr", "_rowoffset"] {
-            assert!(is_system_column(col));
-            let array = batches[0].column_by_name(col).unwrap();
-            assert!(
-                array.is_null(0),
-                "{} should be NULL in cross-LSM output, got: {:?}",
-                col,
-                array
-            );
-        }
+        // Hit row is from base → `_rowaddr` is real. `_rowoffset` stays
+        // NULL (no scanner produces it).
+        let rowaddr = batches[0].column_by_name("_rowaddr").unwrap();
+        assert!(
+            !rowaddr.is_null(0),
+            "_rowaddr from base should be populated, got: {:?}",
+            rowaddr
+        );
+        let rowoffset = batches[0].column_by_name("_rowoffset").unwrap();
+        assert!(is_system_column("_rowoffset"));
+        assert!(
+            rowoffset.is_null(0),
+            "_rowoffset has no per-source flag, must be NULL across LSM, got: {:?}",
+            rowoffset
+        );
     }
 }

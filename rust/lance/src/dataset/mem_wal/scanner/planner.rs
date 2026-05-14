@@ -19,12 +19,12 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
-use super::projection::{build_scanner_projection, canonical_output_schema, project_to_canonical};
+use super::projection::{
+    build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
+};
 
-/// Did the caller list any system column (`_rowid`, `_rowaddr`, …) in their
-/// projection? When true, [`LsmScanPlanner::plan_scan`] wraps the dedup
-/// output in a canonical projection so the requested system columns appear at
-/// the user's chosen position.
+/// True if the caller put any system column in `projection` — triggers the
+/// canonical-projection wrap in [`LsmScanPlanner::plan_scan`].
 fn user_requests_system_column(projection: Option<&[String]>) -> bool {
     projection
         .map(|p| p.iter().any(|c| is_system_column(c)))
@@ -123,6 +123,7 @@ impl LsmScanPlanner {
 
         let mut sorted_plans = Vec::new();
         for source in sources {
+            let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let scan = self.build_source_scan(&source, projection, filter).await?;
 
             // Sort locally by (pk ASC, _rowaddr DESC)
@@ -134,11 +135,24 @@ impl LsmScanPlanner {
             })?;
             let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, scan));
 
-            // Only tag with generation if user wants _memtable_gen in output
-            let plan: Arc<dyn ExecutionPlan> = if with_memtable_gen {
-                Arc::new(MemtableGenTagExec::new(sorted, source.generation()))
+            // When `_rowaddr` will be surfaced to the caller, NULL it for
+            // non-base arms post-sort: only base values are meaningful (e.g.
+            // for `take_rows`); other arms carry per-source addresses that
+            // collide with base IDs. The schema is preserved so union/dedup
+            // still match (dedup picks rows by upstream order, not value).
+            // Skipped when `_rowaddr` would be stripped by dedup anyway, to
+            // avoid adding a no-op projection to the plan.
+            let after_sort: Arc<dyn ExecutionPlan> = if !is_base && keep_row_address {
+                null_columns(sorted, &[ROW_ADDRESS_COLUMN])?
             } else {
                 sorted
+            };
+
+            // Only tag with generation if user wants _memtable_gen in output
+            let plan: Arc<dyn ExecutionPlan> = if with_memtable_gen {
+                Arc::new(MemtableGenTagExec::new(after_sort, source.generation()))
+            } else {
+                after_sort
             };
 
             sorted_plans.push(plan);
@@ -186,14 +200,9 @@ impl LsmScanPlanner {
         )?;
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(dedup);
 
-        // 5. If the user listed any system column in their projection, wrap the
-        // plan in a canonical projection so each requested system column appears
-        // at the user's specified position. Non-`_rowaddr` system columns get
-        // NULL across LSM sources (per-source values aren't comparable);
-        // `_rowaddr` carries the real value because we forced
-        // `keep_row_address=true` above.
-        // Skipped when no system column is requested so the plan shape stays
-        // identical for callers that don't opt in to this surface area.
+        // 5. Surface user-requested system columns at the requested position.
+        // Skipped otherwise so the plan shape stays unchanged for callers
+        // that don't opt in.
         if user_requests_system_column(projection) {
             plan = project_to_canonical(
                 plan,
@@ -209,11 +218,8 @@ impl LsmScanPlanner {
         Ok(plan)
     }
 
-    /// Build the canonical scan output schema honoring user column order.
-    ///
-    /// Mirrors what the upstream pipeline produces: the user's projection
-    /// (with system columns at their requested positions) plus the planner's
-    /// internal `_rowaddr` / `_memtable_gen` columns when those flags are set.
+    /// Canonical scan output: user projection (system cols at requested
+    /// positions) + `_rowaddr` / `_memtable_gen` when their flags are set.
     fn canonical_scan_schema(
         &self,
         projection: Option<&[String]>,
@@ -338,8 +344,10 @@ impl LsmScanPlanner {
                 let cols = self.build_projection_with_rowaddr(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
+                // No `with_row_id()`: opting in only for base would mismatch
+                // the union schema against flushed/active. `_rowid` stays NULL
+                // for every row via `project_to_canonical`.
 
-                // Apply filter - enables scalar index (BTree) optimization
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
@@ -347,7 +355,6 @@ impl LsmScanPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                // Open as Dataset and scan
                 let dataset = crate::dataset::DatasetBuilder::from_uri(path)
                     .load()
                     .await?;
@@ -357,7 +364,6 @@ impl LsmScanPlanner {
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
-                // Apply filter - enables scalar index (BTree) optimization
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
@@ -370,15 +376,11 @@ impl LsmScanPlanner {
                 schema,
                 ..
             } => {
-                // Use MemTableScanner
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
 
-                // Project the same columns the base/flushed arms see (system
-                // columns and `_distance` already stripped by
-                // `build_projection_with_rowaddr`); `_rowaddr` is added below.
                 let cols = self.build_projection_with_rowaddr(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.with_row_address();
@@ -395,11 +397,8 @@ impl LsmScanPlanner {
 
     /// Build the projection list to pass to underlying scanners.
     ///
-    /// Delegates to [`build_scanner_projection`], which strips system columns
-    /// (`_rowid`, `_rowaddr`, …) and `_distance` from the user's projection.
-    /// `_rowaddr` is added back to the per-source scan via the explicit
-    /// `with_row_address()` flag and surfaced in the canonical output by
-    /// [`canonical_output_schema`] when the caller opted in.
+    /// `_rowaddr` is added back per-source via `with_row_address()` rather
+    /// than projection, since `MemTableScanner::project()` rejects it.
     fn build_projection_with_rowaddr(&self, projection: Option<&[String]>) -> Vec<String> {
         build_scanner_projection(projection, &self.base_schema, &self.pk_columns)
     }
@@ -912,18 +911,24 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan with keep_addr=true (no _memtable_gen, so no MemtableGenTagExec)
+        // Verify plan with keep_addr=true (no _memtable_gen, so no MemtableGenTagExec).
+        // Non-base arms wrap their SortExec in a ProjectionExec that NULLs
+        // `_rowaddr` post-sort: per-source addresses are not meaningful to
+        // the caller. The base arm leaves `_rowaddr` real.
         assert_plan_node_equals(
             plan,
             "DeduplicateExec: pk=[id], with_memtable_gen=false, keep_addr=true, input_sorted=true
   SortPreservingMergeExec: [id@0 ASC NULLS LAST]
     UnionExec
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...gen_2...
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...gen_1...
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+          LanceRead:...gen_2...
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+          LanceRead:...gen_1...
       SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
         LanceRead:...base/data...refine_filter=--",
         )
@@ -973,22 +978,27 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan with both with_memtable_gen=true and keep_addr=true
-        // Full plan with all levels and MemtableGenTagExec at each
+        // Verify plan with both with_memtable_gen=true and keep_addr=true.
+        // Non-base arms wrap their SortExec in a ProjectionExec that NULLs
+        // `_rowaddr`; base leaves it real (so callers can still use it for
+        // `take_rows`). MemtableGenTagExec sits above the NULL projection.
         assert_plan_node_equals(
             plan,
             "DeduplicateExec: pk=[id], with_memtable_gen=true, keep_addr=true, input_sorted=true
   SortPreservingMergeExec: [id@0 ASC NULLS LAST]
     UnionExec
       MemtableGenTagExec: gen=gen3
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+            MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
       MemtableGenTagExec: gen=gen2
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_2...
+        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+            LanceRead:...gen_2...
       MemtableGenTagExec: gen=gen1
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_1...
+        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+            LanceRead:...gen_1...
       MemtableGenTagExec: gen=base
         SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
           LanceRead:...base/data...refine_filter=--",
@@ -1388,11 +1398,9 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_lsm_scan_projection_with_system_columns() {
-        // Regression: passing system columns (`_rowoffset`, `_rowid`) in the
-        // projection used to either error in the active-arm `MemTableScanner`
-        // or be silently dropped. They must now be honored at the user's
-        // specified position with NULL across LSM sources, while `_rowaddr`
-        // (when explicitly requested) carries real values from dedup.
+        // Regression: system columns in projection used to either error in
+        // the active-arm MemTableScanner or get silently dropped. Verify
+        // they're now surfaced at the requested position.
         use lance_core::is_system_column;
 
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
@@ -1433,17 +1441,52 @@ mod integration_tests {
             assert!(is_system_column(sys));
         }
 
-        // `_rowoffset` and `_rowid` aren't comparable across LSM sources and
-        // must be NULL for every row.
+        // setup_multi_level_lsm: base=[1,2,3,4,5], gen1=[3,4], gen2=[4,5,6],
+        // active=[5,6,7]. Dedup picks the newest generation per pk:
+        //   id=1,2 → base (2 rows, real `_rowaddr`)
+        //   id=3   → gen1   (1 row,  NULL  `_rowaddr`)
+        //   id=4   → gen2   (1 row,  NULL  `_rowaddr`)
+        //   id=5,6 → active (2 rows, NULL  `_rowaddr`)
+        //   id=7   → active (1 row,  NULL  `_rowaddr`)
+        // Total 7 rows, 2 real / 5 NULL `_rowaddr`. `_rowid` and
+        // `_rowoffset` are NULL everywhere (no opt-in / no scanner support).
+        let mut rowaddr_real = 0usize;
+        let mut rowaddr_null = 0usize;
+        let mut rowid_null = 0usize;
+        let mut rowoffset_null = 0usize;
+        let mut total = 0usize;
         for batch in &batches {
-            for sys in ["_rowoffset", "_rowid"] {
-                let array = batch.column_by_name(sys).unwrap();
-                assert_eq!(
-                    array.null_count(),
-                    array.len(),
-                    "{sys} must be all NULL across LSM sources, got: {array:?}",
-                );
+            let rowaddr = batch.column_by_name("_rowaddr").unwrap();
+            let rowid = batch.column_by_name("_rowid").unwrap();
+            let rowoffset = batch.column_by_name("_rowoffset").unwrap();
+            for i in 0..batch.num_rows() {
+                total += 1;
+                if rowaddr.is_null(i) {
+                    rowaddr_null += 1;
+                } else {
+                    rowaddr_real += 1;
+                }
+                if rowid.is_null(i) {
+                    rowid_null += 1;
+                }
+                if rowoffset.is_null(i) {
+                    rowoffset_null += 1;
+                }
             }
         }
+        assert_eq!(total, 7, "expected 7 unique pks after dedup");
+        assert_eq!(
+            rowaddr_real, 2,
+            "expected 2 rows (id=1,2) with real `_rowaddr` from base"
+        );
+        assert_eq!(
+            rowaddr_null, 5,
+            "expected 5 rows (id=3-7) with NULL `_rowaddr` from non-base sources"
+        );
+        assert_eq!(rowid_null, total, "_rowid must be NULL for every row");
+        assert_eq!(
+            rowoffset_null, total,
+            "_rowoffset must be NULL for every row"
+        );
     }
 }

@@ -26,6 +26,7 @@ use super::data_source::LsmDataSource;
 use super::exec::{FilterStaleExec, GenerationBloomFilter, MemtableGenTagExec};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, project_to_canonical,
+    wants_row_address, wants_row_id,
 };
 
 /// Plans vector search queries over LSM data.
@@ -285,15 +286,22 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Only the base produces meaningful `_rowid`/`_rowaddr`;
+                // non-base arms get NULL via `project_to_canonical`.
+                if wants_row_id(projection) {
+                    scanner.with_row_id();
+                }
+                if wants_row_address(projection) {
+                    scanner.with_row_address();
+                }
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
-                // fast_search: only search indexed data (memtables cover unindexed).
+                // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
-                // Optional: re-rank base-table candidates with exact distances so
-                // they are directly comparable to MemTable / flushed-MemTable
-                // distances in the cross-source merge.
+                // Re-rank base candidates with exact distances when set, so
+                // they're directly comparable to MemTable distances in the merge.
                 if let Some(factor) = self.base_table_refine_factor {
                     scanner.refine(factor);
                 }
@@ -307,11 +315,11 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
-                // fast_search: only search indexed data
                 scanner.fast_search();
                 scanner.create_plan().await
             }
@@ -326,12 +334,12 @@ impl LsmVectorSearchPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
-                // Use the same projection (PK auto-included) the base/flushed arms use,
-                // otherwise the active arm produces a different schema and the staleness
-                // filter loses the PK column it needs for bloom-filter hashing.
+                // PK auto-included so the staleness filter retains its bloom hash key.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                // No `with_row_id/address`: MemTableScanner returns BatchStore
+                // positions, not Lance row ids.
                 let query_arr: Arc<dyn Array> = Arc::new(query_vector.clone());
                 scanner.nearest(&self.vector_column, query_arr, k);
                 scanner.nprobes(nprobes);
@@ -682,12 +690,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_projection_with_explicit_distance_and_rowid() {
-        // Callers may include `_distance` and/or `_rowid` in their projection
-        // (e.g. to surface them in the output or attempt to control column
-        // order). The planner auto-manages `_distance` (always appended at
-        // the end) and does not expose cross-source `_rowid`, so these names
-        // must be tolerated as projection inputs without breaking the plan,
-        // and `_distance` must not be duplicated in the output.
+        // Regression: `_distance` / `_rowid` in projection must not break
+        // the plan. `_distance` honored at requested position (no
+        // duplication); `_rowid` honored as nullable.
         use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
@@ -778,6 +783,16 @@ mod tests {
         assert!(out_schema.field_with_name("vector").is_ok());
         // PK auto-included for staleness detection.
         assert!(out_schema.field_with_name("id").is_ok());
+        // Top hit comes from the active memtable. Active-arm `_rowid` is
+        // NULL by design (BatchStore position, not a Lance row id). Real
+        // `_rowid` is only produced for base-table rows.
+        assert!(out_schema.field_with_name("_rowid").is_ok());
+        let rowid = batches[0].column_by_name("_rowid").unwrap();
+        assert!(
+            rowid.is_null(0),
+            "active-memtable `_rowid` must be NULL (not a real Lance row id), got: {:?}",
+            rowid
+        );
     }
 
     #[tokio::test]
