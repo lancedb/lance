@@ -243,8 +243,90 @@ impl HnswMemIndex {
 
     /// Insert vectors from multiple batches.
     pub fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
+        let mut combined_range: Option<std::ops::Range<u32>> = None;
+        let mut state: Option<&HnswState> = None;
+
         for stored in batches {
-            self.insert(&stored.data, stored.row_offset)?;
+            let (col_idx, _) = stored
+                .data
+                .schema()
+                .column_with_name(&self.column)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "HNSW index column '{}' is not in the inserted batch schema",
+                        self.column
+                    ))
+                })?;
+            let column = stored.data.column(col_idx);
+            let fsl_ref = column.as_fixed_size_list_opt().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Column '{}' is not a FixedSizeList, got {:?}",
+                    self.column,
+                    column.data_type()
+                ))
+            })?;
+            if fsl_ref.is_empty() {
+                continue;
+            }
+            if fsl_ref.values().as_primitive_opt::<Float32Type>().is_none() {
+                return Err(Error::invalid_input(format!(
+                    "Column '{}' must be FixedSizeList<Float32>, got values type {:?}",
+                    self.column,
+                    fsl_ref.values().data_type()
+                )));
+            }
+            if fsl_ref.null_count() > 0 {
+                return Err(Error::invalid_input(format!(
+                    "HNSW index column '{}' has {} null row(s); null vectors are not supported",
+                    self.column,
+                    fsl_ref.null_count()
+                )));
+            }
+
+            let dim = fsl_ref.value_length() as usize;
+            let current_state = match state {
+                Some(state) => {
+                    if state.storage.dim() != dim {
+                        return Err(Error::invalid_input(format!(
+                            "HNSW index column '{}' dimension changed: expected {}, got {}",
+                            self.column,
+                            state.storage.dim(),
+                            dim
+                        )));
+                    }
+                    state
+                }
+                None => self.ensure_state(dim)?,
+            };
+            state = Some(current_state);
+
+            let vectors = Arc::new(fsl_ref.clone());
+            let id_range = current_state
+                .storage
+                .append_batch(vectors, stored.row_offset)?;
+            if id_range.is_empty() {
+                continue;
+            }
+
+            match &mut combined_range {
+                Some(range) if range.end == id_range.start => {
+                    range.end = id_range.end;
+                }
+                Some(range) => {
+                    return Err(Error::internal(format!(
+                        "non-contiguous HNSW vector id range while inserting batches: existing={:?}, next={:?}",
+                        range, id_range
+                    )));
+                }
+                None => {
+                    combined_range = Some(id_range);
+                }
+            }
+        }
+
+        if let (Some(state), Some(id_range)) = (state, combined_range) {
+            let snapshot = state.storage.snapshot();
+            state.graph.insert_batch(id_range, &snapshot)?;
         }
         Ok(())
     }
@@ -407,6 +489,47 @@ mod tests {
             best_dist
         );
         assert_eq!(best_pos, 5);
+    }
+
+    #[test]
+    fn test_index_insert_batches_combines_hnsw_insert_range() {
+        let dim = 8;
+        let n = 200;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(16).ef_construction(64),
+            n,
+            64,
+        );
+
+        let first = make_batch(0, 75, dim);
+        let second = make_batch(75, 125, dim);
+        let stored = vec![
+            StoredBatch::new(first.clone(), 0, 0),
+            StoredBatch::new(second.clone(), 75, 1),
+        ];
+        index.insert_batches(&stored).unwrap();
+        assert_eq!(index.len(), n);
+
+        let fsl = second
+            .column_by_name("vector")
+            .unwrap()
+            .as_fixed_size_list();
+        let query_inner =
+            Float32Array::from(fsl.value(7).as_primitive::<Float32Type>().values().to_vec());
+        let query = FixedSizeListArray::try_new_from_values(query_inner, dim as i32).unwrap();
+
+        let results = index.search(&query, 5, Some(32), u64::MAX).unwrap();
+        assert!(!results.is_empty());
+        let (best_dist, best_pos) = results[0];
+        assert!(
+            best_dist < 1e-4,
+            "expected near-zero distance, got {}",
+            best_dist
+        );
+        assert_eq!(best_pos, 82);
     }
 
     #[test]

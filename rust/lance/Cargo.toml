@@ -232,5 +232,9 @@ harness = false
 name = "mem_wal_hnsw_bench"
 harness = false
 
+[[bench]]
+name = "mem_wal_shard_writer_backpressure"
+harness = false
+
 [lints]
 workspace = true
