@@ -12,6 +12,7 @@ use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{Column, scalar::ScalarValue};
+pub use lance_arrow_scalar::ArrowScalar;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::pin::Pin;
@@ -27,6 +28,7 @@ use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 
+use crate::expression::aggregate::AnyAggregateQuery;
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
@@ -983,6 +985,19 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
+
+    /// Calculates an aggregate value using the index and an optional `filter`
+    ///
+    /// The returned value should be a partial aggregate.  For example, if calculating
+    /// the average, the returned value should be the sum of all values and the count of values,
+    /// returned as a struct scalar.
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        filter: Option<SearchResult>,
+        total_rows: u64,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar>;
 
     /// Returns true if the remap operation is supported
     fn can_remap(&self) -> bool;

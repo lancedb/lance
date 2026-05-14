@@ -15,7 +15,7 @@ use super::{
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
-use crate::{Index, IndexType};
+use crate::{Index, IndexType, expression::aggregate::AnyAggregateQuery};
 use crate::{
     frag_reuse::FragReuseIndex,
     progress::{IndexBuildProgress, noop_progress},
@@ -44,6 +44,7 @@ use futures::{
     future::BoxFuture,
     stream::{self},
 };
+use lance_arrow_scalar::ArrowScalar;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheKey, LanceCache, WeakLanceCache},
@@ -1616,6 +1617,18 @@ impl ScalarIndex for BTreeIndex {
         let selection = NullableRowAddrSet::union_all(&results);
 
         Ok(SearchResult::Exact(selection))
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "this index cannot accelerate the aggregate {query:?}"
+        )))
     }
 
     fn can_remap(&self) -> bool {

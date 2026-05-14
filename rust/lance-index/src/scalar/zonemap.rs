@@ -13,6 +13,7 @@
 //!
 //!
 use crate::Any;
+use crate::expression::aggregate::AnyAggregateQuery;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -24,6 +25,7 @@ use crate::scalar::{
 };
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_expr::Accumulator;
+use lance_arrow_scalar::ArrowScalar;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -562,6 +564,18 @@ impl ScalarIndex for ZoneMapIndex {
         search_zones(&self.zones, metrics, |zone| {
             self.evaluate_zone_against_query(zone, query)
         })
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "this index cannot accelerate the aggregate {query:?}"
+        )))
     }
 
     fn can_remap(&self) -> bool {

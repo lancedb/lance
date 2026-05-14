@@ -12,6 +12,7 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
+use crate::expression::aggregate::AnyAggregateQuery;
 use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
@@ -32,6 +33,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
+use lance_arrow_scalar::ArrowScalar;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -477,6 +479,18 @@ impl ScalarIndex for NGramIndex {
                 Ok(SearchResult::at_most(RowAddrTreeMap::from(row_ids)))
             }
         }
+    }
+
+    async fn calculate_aggregate(
+        &self,
+        query: &dyn AnyAggregateQuery,
+        _filter: Option<SearchResult>,
+        _total_rows: u64,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<ArrowScalar> {
+        Err(Error::invalid_input(format!(
+            "this index cannot accelerate the aggregate {query:?}"
+        )))
     }
 
     fn can_remap(&self) -> bool {
