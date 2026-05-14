@@ -299,15 +299,33 @@ struct VersionHint {
     version: u64,
 }
 
+/// Set `LANCE_USE_VERSION_HINT=0` (or `false`) to globally disable the version
+/// hint — writers stop emitting the hint file and readers stop consulting it,
+/// falling back to plain listing. Intended as a benchmark/escape-hatch knob;
+/// the hint is on by default.
+const VERSION_HINT_ENV: &str = "LANCE_USE_VERSION_HINT";
+
+fn version_hint_globally_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var(VERSION_HINT_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
 /// Whether this object store benefits from a version hint.
 ///
 /// On stores where listing is lexicographically ordered (S3 Standard, GCS,
 /// Azure, ...) the latest version is already resolved in roughly one request,
 /// so the hint would only add a write per commit for nothing. We write (and
 /// read) it only on stores where listing is not lexicographically ordered —
-/// S3 Express and the local filesystem.
+/// S3 Express and the local filesystem. Can be force-disabled with
+/// [`VERSION_HINT_ENV`].
 pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
-    !object_store.list_is_lexically_ordered
+    version_hint_globally_enabled() && !object_store.list_is_lexically_ordered
 }
 
 /// Path to the JSON version hint file for a dataset.
@@ -865,7 +883,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &'a ObjectStore,
         since_version: u64,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        if object_store.list_is_lexically_ordered {
+        if !uses_version_hint(object_store) {
             return self
                 .list_manifest_locations(base_path, object_store, true)
                 .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))

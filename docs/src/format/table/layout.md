@@ -213,4 +213,5 @@ To avoid this, writers on such stores write `_versions/latest_version_hint.json`
 
 Readers use the hint as a starting point and probe a few higher versions with HEAD requests to find the true latest, falling back to a full listing if the hint is missing (older datasets) or stale.
 The hint is purely an optimization: it never affects correctness, can be safely deleted, and is ignored by readers that don't understand it.
+Set the environment variable `LANCE_USE_VERSION_HINT=0` (or `false`) to globally disable the hint — useful for benchmarks and as an escape hatch.
 
