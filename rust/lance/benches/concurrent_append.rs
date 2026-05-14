@@ -190,6 +190,7 @@ async fn run_writer(
     appends: usize,
     rows_per_append: usize,
     deadline: Option<Instant>,
+    per_attempt_timeout: Option<Duration>,
     session: Arc<Session>,
     store_params: Option<ObjectStoreParams>,
 ) -> WriterStats {
@@ -220,10 +221,34 @@ async fn run_writer(
         let batch = batch(id_base + i * rows_per_append, rows_per_append);
         let params = write_params(session.clone(), store_params.clone());
         let start = Instant::now();
-        let result = InsertBuilder::new(dataset.clone())
-            .with_params(&params)
-            .execute(vec![batch])
-            .await;
+        // Per-attempt cap keeps the slow-tail commits from extending the run
+        // far past the writer-side deadline at high concurrency.
+        let result = match per_attempt_timeout {
+            Some(t) => {
+                let ds = dataset.clone();
+                let params_ref = &params;
+                match tokio::time::timeout(t, async move {
+                    InsertBuilder::new(ds)
+                        .with_params(params_ref)
+                        .execute(vec![batch])
+                        .await
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(lance_core::Error::io_source(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "per-attempt timeout",
+                    )))),
+                }
+            }
+            None => {
+                InsertBuilder::new(dataset.clone())
+                    .with_params(&params)
+                    .execute(vec![batch])
+                    .await
+            }
+        };
         let elapsed = start.elapsed();
         match result {
             Ok(new_ds) => {
@@ -273,6 +298,10 @@ fn bench_concurrent_append(c: &mut Criterion) {
     // hasn't issued `APPENDS_PER_WRITER` commits yet. Lets us bound run time
     // at high concurrency where conflict retries make commits arbitrarily slow.
     let max_wall_secs = env_usize("MAX_WALL_SECS", 0);
+    // Per-attempt timeout. Caps any single commit attempt (including its
+    // internal retries) so the slow-tail of an under-contention commit doesn't
+    // extend the run past the writer deadline. 0 disables it.
+    let per_attempt_timeout_secs = env_usize("PER_ATTEMPT_TIMEOUT_SECS", 0);
 
     let uri = format!(
         "{}/concurrent_append_{}",
@@ -324,6 +353,11 @@ fn bench_concurrent_append(c: &mut Criterion) {
             d.duration_since(wall_start)
         );
     }
+    let per_attempt_timeout = (per_attempt_timeout_secs > 0)
+        .then(|| Duration::from_secs(per_attempt_timeout_secs as u64));
+    if let Some(t) = per_attempt_timeout {
+        println!("Per-attempt timeout: {:?}", t);
+    }
     let all_stats: Vec<WriterStats> = runtime.block_on(async {
         let mut tasks = Vec::with_capacity(num_writers);
         for writer_id in 0..num_writers {
@@ -337,6 +371,7 @@ fn bench_concurrent_append(c: &mut Criterion) {
                     appends_per_writer,
                     rows_per_append,
                     deadline,
+                    per_attempt_timeout,
                     session,
                     store_params,
                 )
