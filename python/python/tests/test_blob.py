@@ -924,3 +924,24 @@ def test_dataset_to_pandas_nested_blob_field_name_with_dot(tmp_path):
 
     assert isinstance(row["blob.payload"], BlobFile)
     assert row["blob.payload"].readall() == b"hello"
+
+
+def test_scanner_to_pandas_nested_blob_projection_lazy(dataset_with_nested_blobs):
+    df = dataset_with_nested_blobs.scanner(columns=["info.image"]).to_pandas()
+
+    assert list(df.columns) == ["info.image"]
+    assert isinstance(df.iloc[0]["info.image"], BlobFile)
+    assert df.iloc[0]["info.image"].readall() == b"hello"
+    assert df.iloc[1]["info.image"] is None
+    assert df.iloc[2]["info.image"].readall() == b"world"
+
+
+def test_scanner_to_pandas_nested_blob_projection_bytes(dataset_with_nested_blobs):
+    df = dataset_with_nested_blobs.scanner(columns=["info.image"]).to_pandas(
+        blob_mode="bytes"
+    )
+
+    assert list(df.columns) == ["info.image"]
+    assert df.iloc[0]["info.image"] == b"hello"
+    assert df.iloc[1]["info.image"] is None
+    assert df.iloc[2]["info.image"] == b"world"

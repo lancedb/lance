@@ -167,10 +167,16 @@ def _blob_column_sources(
 ) -> dict[str, str]:
     output_paths = _blob_paths_in_schema(schema)
     transforms = dict(snapshot.get("_columns_with_transform") or ())
-    if not transforms:
-        return {path: path for path in output_paths}
-
     source_paths = set(_blob_paths_in_schema(dataset_schema))
+    if not transforms:
+        result = {}
+        for path in output_paths:
+            segs = _parse_field_path(path)
+            result[path] = (
+                segs[0] if len(segs) == 1 and segs[0] in source_paths else path
+            )
+        return result
+
     return {p: _resolve_blob_source(p, transforms, source_paths) for p in output_paths}
 
 
