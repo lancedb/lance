@@ -204,14 +204,13 @@ See [Manifest Naming Schemes](transaction.md#manifest-naming-schemes) for detail
 
 ### Version Hint
 
-On object stores where listing is not lexicographically ordered (e.g. S3 Express, the local filesystem), finding the latest version by listing `_versions/` is O(n) in the number of versions.
-To avoid this, writers on such stores write `_versions/latest_version_hint.json` after each successful commit:
+The optional file `_versions/latest_version_hint.json` records the latest committed version as JSON:
 
 ```json
 {"version": 42}
 ```
 
-Readers use the hint as a starting point and probe a few higher versions with HEAD requests to find the true latest, falling back to a full listing if the hint is missing (older datasets) or stale.
-The hint is purely an optimization: it never affects correctness, can be safely deleted, and is ignored by readers that don't understand it.
-Set the environment variable `LANCE_USE_VERSION_HINT=0` (or `false`) to globally disable the hint — useful for benchmarks and as an escape hatch.
+It exists to accelerate latest-version discovery on stores where listing `_versions/` is expensive: a reader can read the hint and probe higher versions with HEAD requests instead of listing the whole directory, falling back to a full listing if the hint is missing or stale.
+
+The hint is purely an optimization. It is always safe to delete, never affects correctness, and can be ignored by readers that don't understand it. Writers may choose not to write it.
 
