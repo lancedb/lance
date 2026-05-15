@@ -514,9 +514,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.3"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
+checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -525,9 +525,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
+checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
 dependencies = [
  "cc",
  "cmake",
@@ -2509,7 +2509,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3616,7 +3616,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrayref",
  "paste",
@@ -3711,7 +3711,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3746,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3778,7 +3778,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3796,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3831,7 +3831,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3862,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -3876,7 +3876,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3943,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3985,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4020,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4036,7 +4036,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4048,7 +4048,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4092,7 +4092,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4129,7 +4129,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.0.0-beta.8"
+version = "7.0.0-beta.9"
 dependencies = [
  "rust-stemmers",
  "serde",
@@ -5156,18 +5156,18 @@ dependencies = [
 
 [[package]]
 name = "pin-project"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbf0d9e68100b3a7989b4901972f265cd542e560a3a8a724e1e20322f4d06ce9"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a990e22f43e84855daf260dded30524ef4a9021cc7541c26540500a50b624389"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7999,9 +7999,9 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee1708bef14716a11bae175f579062d4554d95be2c6829f518df847b7b3fdd0"
+checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
 ]
