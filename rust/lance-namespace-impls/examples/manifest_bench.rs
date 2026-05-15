@@ -20,6 +20,7 @@
 //!   manifest_bench run --root s3://bucket/bench/test1 \
 //!     --operation write-create-namespace --concurrency 50 --operations 200
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -133,18 +134,28 @@ fn create_test_ipc_data() -> Vec<u8> {
 async fn build_namespace(
     root: &str,
     inline_optimization: bool,
+    storage_options: &HashMap<String, String>,
 ) -> Box<dyn LanceNamespace> {
-    let builder = DirectoryNamespaceBuilder::new(root)
-        .dir_listing_enabled(false)
-        .inline_optimization_enabled(inline_optimization);
+    let mut properties = HashMap::new();
+    properties.insert("root".to_string(), root.to_string());
+    properties.insert("dir_listing_enabled".to_string(), "false".to_string());
+    properties.insert(
+        "inline_optimization_enabled".to_string(),
+        inline_optimization.to_string(),
+    );
+    for (k, v) in storage_options {
+        properties.insert(format!("storage.{}", k), v.clone());
+    }
+    let builder = DirectoryNamespaceBuilder::from_properties(properties, None)
+        .expect("Failed to create namespace builder from properties");
     Box::new(builder.build().await.expect("Failed to build namespace"))
 }
 
 // ──────────────────── seed mode ────────────────────
 
-async fn seed(root: &str, count: usize, inline_optimization: bool) {
+async fn seed(root: &str, count: usize, inline_optimization: bool, storage_options: &HashMap<String, String>) {
     eprintln!("Seeding {} entries at {}", count, root);
-    let ns = build_namespace(root, inline_optimization).await;
+    let ns = build_namespace(root, inline_optimization, storage_options).await;
     let ipc_data = Bytes::from(create_test_ipc_data());
 
     let ns_count = count / 3;
@@ -183,8 +194,9 @@ async fn worker(
     worker_id: usize,
     table_count: usize,
     inline_optimization: bool,
+    storage_options: &HashMap<String, String>,
 ) {
-    let ns = build_namespace(root, inline_optimization).await;
+    let ns = build_namespace(root, inline_optimization, storage_options).await;
     let ipc_data = Bytes::from(create_test_ipc_data());
 
     // Warmup (only for warm-read operations)
@@ -278,13 +290,14 @@ async fn cold_read_worker(
     worker_id: usize,
     table_count: usize,
     inline_optimization: bool,
+    storage_options: &HashMap<String, String>,
 ) {
     let ipc_data = Bytes::from(create_test_ipc_data());
 
     for i in 0..operations {
         // Fresh namespace for each operation — simulates cold start
         let start = Instant::now();
-        let ns = build_namespace(root, inline_optimization).await;
+        let ns = build_namespace(root, inline_optimization, storage_options).await;
         let err = run_operation(
             ns.as_ref(),
             operation,
@@ -317,6 +330,7 @@ fn run_workers(
     table_count: usize,
     inline_optimization: bool,
     variant: &str,
+    storage_options: &HashMap<String, String>,
 ) -> BenchResult {
     let ops_per_worker = operations / concurrency.max(1);
     if ops_per_worker == 0 {
@@ -327,8 +341,8 @@ fn run_workers(
 
     let children: Vec<_> = (0..concurrency)
         .map(|worker_id| {
-            Command::new(self_exe)
-                .arg("worker")
+            let mut cmd = Command::new(self_exe);
+            cmd.arg("worker")
                 .arg("--root")
                 .arg(root)
                 .arg("--operation")
@@ -342,8 +356,11 @@ fn run_workers(
                 .arg("--table-count")
                 .arg(table_count.to_string())
                 .arg("--inline-optimization")
-                .arg(inline_optimization.to_string())
-                .stdout(Stdio::piped())
+                .arg(inline_optimization.to_string());
+            for (k, v) in storage_options {
+                cmd.arg("--storage-option").arg(format!("{}={}", k, v));
+            }
+            cmd.stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
                 .expect("Failed to spawn worker")
@@ -411,6 +428,7 @@ async fn main() {
     let mut table_count: usize = 667; // default for 1000 seed: 1000 - 1000/3
     let mut inline_optimization = true;
     let mut variant = String::new();
+    let mut storage_options: HashMap<String, String> = HashMap::new();
 
     let mut i = 2;
     while i < args.len() {
@@ -425,6 +443,13 @@ async fn main() {
             "--table-count" => { table_count = args[i + 1].parse().unwrap(); i += 2; }
             "--inline-optimization" => { inline_optimization = args[i + 1].parse().unwrap(); i += 2; }
             "--variant" => { variant = args[i + 1].clone(); i += 2; }
+            "--storage-option" => {
+                let kv = &args[i + 1];
+                if let Some((k, v)) = kv.split_once('=') {
+                    storage_options.insert(k.to_string(), v.to_string());
+                }
+                i += 2;
+            }
             _ => { eprintln!("Unknown argument: {}", args[i]); std::process::exit(1); }
         }
     }
@@ -435,7 +460,7 @@ async fn main() {
 
     match mode {
         "seed" => {
-            seed(&root, count, inline_optimization).await;
+            seed(&root, count, inline_optimization, &storage_options).await;
         }
         "worker" => {
             if operation.starts_with("cold-read") {
@@ -446,6 +471,7 @@ async fn main() {
                     worker_id,
                     table_count,
                     inline_optimization,
+                    &storage_options,
                 )
                 .await;
             } else {
@@ -457,6 +483,7 @@ async fn main() {
                     worker_id,
                     table_count,
                     inline_optimization,
+                    &storage_options,
                 )
                 .await;
             }
@@ -511,6 +538,7 @@ async fn main() {
                         table_count,
                         inline_optimization,
                         &variant,
+                        &storage_options,
                     );
                     println!("{}", serde_json::to_string(&result).unwrap());
                 }
