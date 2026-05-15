@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Benchmark for directory manifest read/write latency and throughput.
+//! Multi-process manifest benchmark with S3 support.
 //!
-//! Usage:
-//!   cargo run -p lance-namespace-impls --release --example manifest_bench -- \
-//!     --root /tmp/manifest_bench \
-//!     --concurrency 1,2,5,10,20,50,100 \
-//!     --operations 500 \
-//!     --warmup 50
+//! Modes:
+//!   seed      — populate a manifest with N entries
+//!   run       — benchmark read/write operations with multi-process concurrency
+//!   worker    — (internal) single-process worker spawned by `run`
 //!
-//! Output: JSON lines per (operation, concurrency) pair.
+//! Examples:
+//!   # Seed 1000 entries on S3
+//!   manifest_bench seed --root s3://bucket/bench/test1 --count 1000
+//!
+//!   # Cold-read benchmark at concurrency 10
+//!   manifest_bench run --root s3://bucket/bench/test1 \
+//!     --operation cold-read-list-tables --concurrency 10 --operations 100
+//!
+//!   # Multi-process write benchmark
+//!   manifest_bench run --root s3://bucket/bench/test1 \
+//!     --operation write-create-namespace --concurrency 50 --operations 200
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -24,14 +31,13 @@ use lance_namespace::models::{
     ListTablesRequest,
 };
 use lance_namespace_impls::DirectoryNamespaceBuilder;
-use serde::Serialize;
-use tokio::sync::Barrier;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug)]
-struct BenchConfig {
-    operations: usize,
-    warmup: usize,
-    concurrency: usize,
+#[derive(Serialize, Deserialize, Clone)]
+struct LatencyRecord {
+    operation: String,
+    latency_ms: f64,
+    error: bool,
 }
 
 #[derive(Serialize)]
@@ -101,6 +107,7 @@ fn create_test_ipc_data() -> Vec<u8> {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -123,322 +130,253 @@ fn create_test_ipc_data() -> Vec<u8> {
     buffer
 }
 
-async fn setup_namespace(root: &str, inline_optimization: bool) -> Arc<dyn LanceNamespace> {
-    let ns = DirectoryNamespaceBuilder::new(root)
+async fn build_namespace(
+    root: &str,
+    inline_optimization: bool,
+) -> Box<dyn LanceNamespace> {
+    let builder = DirectoryNamespaceBuilder::new(root)
         .dir_listing_enabled(false)
-        .inline_optimization_enabled(inline_optimization)
-        .build()
-        .await
-        .expect("Failed to build namespace");
-    Arc::new(ns)
+        .inline_optimization_enabled(inline_optimization);
+    Box::new(builder.build().await.expect("Failed to build namespace"))
 }
 
-/// Seed the manifest with some initial data for read benchmarks.
-async fn seed_data(ns: &dyn LanceNamespace, num_namespaces: usize, num_tables: usize) {
-    let ipc_data = create_test_ipc_data();
-    for i in 0..num_namespaces {
-        let mut req = CreateNamespaceRequest::new();
-        req.id = Some(vec![format!("ns_{}", i)]);
-        let _ = ns.create_namespace(req).await;
-    }
-    for i in 0..num_tables {
-        let mut req = CreateTableRequest::new();
-        req.id = Some(vec![format!("table_{}", i)]);
-        let _ = ns.create_table(req, Bytes::from(ipc_data.clone())).await;
-    }
-}
+// ──────────────────── seed mode ────────────────────
 
-async fn bench_write_create_namespace(
-    ns: Arc<dyn LanceNamespace>,
-    config: BenchConfig,
-    variant: &str,
-) -> BenchResult {
-    let counter = Arc::new(AtomicU64::new(0));
-    let barrier = Arc::new(Barrier::new(config.concurrency));
-
-    // Warmup
-    for i in 0..config.warmup {
-        let mut req = CreateNamespaceRequest::new();
-        req.id = Some(vec![format!("warmup_ns_{}", i)]);
-        let _ = ns.create_namespace(req).await;
-    }
-
-    let wall_start = Instant::now();
-    let handles: Vec<_> = (0..config.concurrency)
-        .map(|_| {
-            let ns = ns.clone();
-            let counter = counter.clone();
-            let barrier = barrier.clone();
-            let ops_per_worker = config.operations / config.concurrency;
-            tokio::spawn(async move {
-                barrier.wait().await;
-                let mut latencies = Vec::with_capacity(ops_per_worker);
-                let mut errors = 0usize;
-                for _ in 0..ops_per_worker {
-                    let id = counter.fetch_add(1, Ordering::Relaxed);
-                    let mut req = CreateNamespaceRequest::new();
-                    req.id = Some(vec![format!("bench_ns_{}", id)]);
-                    let start = Instant::now();
-                    match ns.create_namespace(req).await {
-                        Ok(_) => latencies.push(start.elapsed().as_secs_f64() * 1000.0),
-                        Err(_) => errors += 1,
-                    }
-                }
-                (latencies, errors)
-            })
-        })
-        .collect();
-
-    let mut all_latencies = Vec::new();
-    let mut total_errors = 0;
-    for h in handles {
-        let (lats, errs) = h.await.unwrap();
-        all_latencies.extend(lats);
-        total_errors += errs;
-    }
-    let wall_duration = wall_start.elapsed();
-    compute_result(
-        variant,
-        "write_create_namespace",
-        config.concurrency,
-        wall_duration,
-        all_latencies,
-        total_errors,
-    )
-}
-
-async fn bench_write_create_table(
-    ns: Arc<dyn LanceNamespace>,
-    config: BenchConfig,
-    variant: &str,
-) -> BenchResult {
-    let counter = Arc::new(AtomicU64::new(0));
-    let barrier = Arc::new(Barrier::new(config.concurrency));
+async fn seed(root: &str, count: usize, inline_optimization: bool) {
+    eprintln!("Seeding {} entries at {}", count, root);
+    let ns = build_namespace(root, inline_optimization).await;
     let ipc_data = Bytes::from(create_test_ipc_data());
 
-    // Warmup
-    for i in 0..config.warmup {
+    let ns_count = count / 3;
+    let table_count = count - ns_count;
+
+    for i in 0..ns_count {
+        let mut req = CreateNamespaceRequest::new();
+        req.id = Some(vec![format!("ns_{}", i)]);
+        if let Err(e) = ns.create_namespace(req).await {
+            eprintln!("seed ns_{}: {}", i, e);
+        }
+        if (i + 1) % 100 == 0 {
+            eprintln!("  seeded {}/{} namespaces", i + 1, ns_count);
+        }
+    }
+    for i in 0..table_count {
         let mut req = CreateTableRequest::new();
-        req.id = Some(vec![format!("warmup_table_{}", i)]);
-        let _ = ns.create_table(req, ipc_data.clone()).await;
+        req.id = Some(vec![format!("table_{}", i)]);
+        if let Err(e) = ns.create_table(req, ipc_data.clone()).await {
+            eprintln!("seed table_{}: {}", i, e);
+        }
+        if (i + 1) % 100 == 0 {
+            eprintln!("  seeded {}/{} tables", i + 1, table_count);
+        }
     }
-
-    let wall_start = Instant::now();
-    let handles: Vec<_> = (0..config.concurrency)
-        .map(|_| {
-            let ns = ns.clone();
-            let counter = counter.clone();
-            let barrier = barrier.clone();
-            let ipc_data = ipc_data.clone();
-            let ops_per_worker = config.operations / config.concurrency;
-            tokio::spawn(async move {
-                barrier.wait().await;
-                let mut latencies = Vec::with_capacity(ops_per_worker);
-                let mut errors = 0usize;
-                for _ in 0..ops_per_worker {
-                    let id = counter.fetch_add(1, Ordering::Relaxed);
-                    let mut req = CreateTableRequest::new();
-                    req.id = Some(vec![format!("bench_table_{}", id)]);
-                    let start = Instant::now();
-                    match ns.create_table(req, ipc_data.clone()).await {
-                        Ok(_) => latencies.push(start.elapsed().as_secs_f64() * 1000.0),
-                        Err(_) => errors += 1,
-                    }
-                }
-                (latencies, errors)
-            })
-        })
-        .collect();
-
-    let mut all_latencies = Vec::new();
-    let mut total_errors = 0;
-    for h in handles {
-        let (lats, errs) = h.await.unwrap();
-        all_latencies.extend(lats);
-        total_errors += errs;
-    }
-    let wall_duration = wall_start.elapsed();
-    compute_result(
-        variant,
-        "write_create_table",
-        config.concurrency,
-        wall_duration,
-        all_latencies,
-        total_errors,
-    )
+    eprintln!("Seed complete: {} namespaces, {} tables", ns_count, table_count);
 }
 
-async fn bench_read_list_namespaces(
-    ns: Arc<dyn LanceNamespace>,
-    config: BenchConfig,
-    variant: &str,
-) -> BenchResult {
-    let barrier = Arc::new(Barrier::new(config.concurrency));
+// ──────────────────── worker mode ────────────────────
 
-    // Warmup
-    for _ in 0..config.warmup {
-        let mut req = ListNamespacesRequest::new();
-        req.id = Some(vec![]);
-        let _ = ns.list_namespaces(req).await;
+async fn worker(
+    root: &str,
+    operation: &str,
+    operations: usize,
+    warmup: usize,
+    worker_id: usize,
+    table_count: usize,
+    inline_optimization: bool,
+) {
+    let ns = build_namespace(root, inline_optimization).await;
+    let ipc_data = Bytes::from(create_test_ipc_data());
+
+    // Warmup (only for warm-read operations)
+    if operation.starts_with("warm-read") {
+        for _ in 0..warmup {
+            let _ = run_operation(
+                ns.as_ref(),
+                operation,
+                worker_id,
+                0,
+                table_count,
+                &ipc_data,
+            )
+            .await;
+        }
     }
 
-    let wall_start = Instant::now();
-    let handles: Vec<_> = (0..config.concurrency)
-        .map(|_| {
-            let ns = ns.clone();
-            let barrier = barrier.clone();
-            let ops_per_worker = config.operations / config.concurrency;
-            tokio::spawn(async move {
-                barrier.wait().await;
-                let mut latencies = Vec::with_capacity(ops_per_worker);
-                let mut errors = 0usize;
-                for _ in 0..ops_per_worker {
-                    let mut req = ListNamespacesRequest::new();
-                    req.id = Some(vec![]);
-                    let start = Instant::now();
-                    match ns.list_namespaces(req).await {
-                        Ok(_) => latencies.push(start.elapsed().as_secs_f64() * 1000.0),
-                        Err(_) => errors += 1,
-                    }
-                }
-                (latencies, errors)
-            })
-        })
-        .collect();
-
-    let mut all_latencies = Vec::new();
-    let mut total_errors = 0;
-    for h in handles {
-        let (lats, errs) = h.await.unwrap();
-        all_latencies.extend(lats);
-        total_errors += errs;
-    }
-    let wall_duration = wall_start.elapsed();
-    compute_result(
-        variant,
-        "read_list_namespaces",
-        config.concurrency,
-        wall_duration,
-        all_latencies,
-        total_errors,
-    )
-}
-
-async fn bench_read_list_tables(
-    ns: Arc<dyn LanceNamespace>,
-    config: BenchConfig,
-    variant: &str,
-) -> BenchResult {
-    let barrier = Arc::new(Barrier::new(config.concurrency));
-
-    // Warmup
-    for _ in 0..config.warmup {
-        let mut req = ListTablesRequest::new();
-        req.id = Some(vec![]);
-        let _ = ns.list_tables(req).await;
-    }
-
-    let wall_start = Instant::now();
-    let handles: Vec<_> = (0..config.concurrency)
-        .map(|_| {
-            let ns = ns.clone();
-            let barrier = barrier.clone();
-            let ops_per_worker = config.operations / config.concurrency;
-            tokio::spawn(async move {
-                barrier.wait().await;
-                let mut latencies = Vec::with_capacity(ops_per_worker);
-                let mut errors = 0usize;
-                for _ in 0..ops_per_worker {
-                    let mut req = ListTablesRequest::new();
-                    req.id = Some(vec![]);
-                    let start = Instant::now();
-                    match ns.list_tables(req).await {
-                        Ok(_) => latencies.push(start.elapsed().as_secs_f64() * 1000.0),
-                        Err(_) => errors += 1,
-                    }
-                }
-                (latencies, errors)
-            })
-        })
-        .collect();
-
-    let mut all_latencies = Vec::new();
-    let mut total_errors = 0;
-    for h in handles {
-        let (lats, errs) = h.await.unwrap();
-        all_latencies.extend(lats);
-        total_errors += errs;
-    }
-    let wall_duration = wall_start.elapsed();
-    compute_result(
-        variant,
-        "read_list_tables",
-        config.concurrency,
-        wall_duration,
-        all_latencies,
-        total_errors,
-    )
-}
-
-async fn bench_read_describe_table(
-    ns: Arc<dyn LanceNamespace>,
-    config: BenchConfig,
-    num_tables: usize,
-    variant: &str,
-) -> BenchResult {
-    let counter = Arc::new(AtomicU64::new(0));
-    let barrier = Arc::new(Barrier::new(config.concurrency));
-
-    // Warmup
-    for i in 0..config.warmup.min(num_tables) {
-        let req = DescribeTableRequest {
-            id: Some(vec![format!("table_{}", i)]),
-            ..Default::default()
+    for i in 0..operations {
+        let start = Instant::now();
+        let err = run_operation(
+            ns.as_ref(),
+            operation,
+            worker_id,
+            i,
+            table_count,
+            &ipc_data,
+        )
+        .await
+        .is_err();
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let record = LatencyRecord {
+            operation: operation.to_string(),
+            latency_ms,
+            error: err,
         };
-        let _ = ns.describe_table(req).await;
+        println!("{}", serde_json::to_string(&record).unwrap());
+    }
+}
+
+async fn run_operation(
+    ns: &dyn LanceNamespace,
+    operation: &str,
+    worker_id: usize,
+    op_idx: usize,
+    table_count: usize,
+    ipc_data: &Bytes,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match operation {
+        "cold-read-list-namespaces" | "warm-read-list-namespaces" => {
+            let mut req = ListNamespacesRequest::new();
+            req.id = Some(vec![]);
+            ns.list_namespaces(req).await?;
+        }
+        "cold-read-list-tables" | "warm-read-list-tables" => {
+            let mut req = ListTablesRequest::new();
+            req.id = Some(vec![]);
+            ns.list_tables(req).await?;
+        }
+        "cold-read-describe-table" | "warm-read-describe-table" => {
+            let table_idx = (worker_id * 1000 + op_idx) % table_count.max(1);
+            let req = DescribeTableRequest {
+                id: Some(vec![format!("table_{}", table_idx)]),
+                ..Default::default()
+            };
+            ns.describe_table(req).await?;
+        }
+        "write-create-namespace" => {
+            let mut req = CreateNamespaceRequest::new();
+            req.id = Some(vec![format!("bench_w{}_{}", worker_id, op_idx)]);
+            ns.create_namespace(req).await?;
+        }
+        "write-create-table" => {
+            let mut req = CreateTableRequest::new();
+            req.id = Some(vec![format!("bench_t{}_{}", worker_id, op_idx)]);
+            ns.create_table(req, ipc_data.clone()).await?;
+        }
+        _ => {
+            return Err(format!("unknown operation: {}", operation).into());
+        }
+    }
+    Ok(())
+}
+
+// ──────────────────── cold-read worker ────────────────────
+// For cold reads, each operation opens a FRESH namespace to avoid caching.
+
+async fn cold_read_worker(
+    root: &str,
+    operation: &str,
+    operations: usize,
+    worker_id: usize,
+    table_count: usize,
+    inline_optimization: bool,
+) {
+    let ipc_data = Bytes::from(create_test_ipc_data());
+
+    for i in 0..operations {
+        // Fresh namespace for each operation — simulates cold start
+        let start = Instant::now();
+        let ns = build_namespace(root, inline_optimization).await;
+        let err = run_operation(
+            ns.as_ref(),
+            operation,
+            worker_id,
+            i,
+            table_count,
+            &ipc_data,
+        )
+        .await
+        .is_err();
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let record = LatencyRecord {
+            operation: operation.to_string(),
+            latency_ms,
+            error: err,
+        };
+        println!("{}", serde_json::to_string(&record).unwrap());
+    }
+}
+
+// ──────────────────── run mode (coordinator) ────────────────────
+
+fn run_workers(
+    self_exe: &str,
+    root: &str,
+    operation: &str,
+    concurrency: usize,
+    operations: usize,
+    warmup: usize,
+    table_count: usize,
+    inline_optimization: bool,
+    variant: &str,
+) -> BenchResult {
+    let ops_per_worker = operations / concurrency.max(1);
+    if ops_per_worker == 0 {
+        return compute_result(variant, operation, concurrency, Duration::ZERO, vec![], 0);
     }
 
     let wall_start = Instant::now();
-    let handles: Vec<_> = (0..config.concurrency)
-        .map(|_| {
-            let ns = ns.clone();
-            let counter = counter.clone();
-            let barrier = barrier.clone();
-            let ops_per_worker = config.operations / config.concurrency;
-            tokio::spawn(async move {
-                barrier.wait().await;
-                let mut latencies = Vec::with_capacity(ops_per_worker);
-                let mut errors = 0usize;
-                for _ in 0..ops_per_worker {
-                    let id = counter.fetch_add(1, Ordering::Relaxed);
-                    let table_idx = id as usize % num_tables;
-                    let req = DescribeTableRequest {
-                        id: Some(vec![format!("table_{}", table_idx)]),
-                        ..Default::default()
-                    };
-                    let start = Instant::now();
-                    match ns.describe_table(req).await {
-                        Ok(_) => latencies.push(start.elapsed().as_secs_f64() * 1000.0),
-                        Err(_) => errors += 1,
-                    }
-                }
-                (latencies, errors)
-            })
+
+    let children: Vec<_> = (0..concurrency)
+        .map(|worker_id| {
+            Command::new(self_exe)
+                .arg("worker")
+                .arg("--root")
+                .arg(root)
+                .arg("--operation")
+                .arg(operation)
+                .arg("--operations")
+                .arg(ops_per_worker.to_string())
+                .arg("--warmup")
+                .arg(warmup.to_string())
+                .arg("--worker-id")
+                .arg(worker_id.to_string())
+                .arg("--table-count")
+                .arg(table_count.to_string())
+                .arg("--inline-optimization")
+                .arg(inline_optimization.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("Failed to spawn worker")
         })
         .collect();
 
     let mut all_latencies = Vec::new();
     let mut total_errors = 0;
-    for h in handles {
-        let (lats, errs) = h.await.unwrap();
-        all_latencies.extend(lats);
-        total_errors += errs;
+
+    for mut child in children {
+        let stdout = child.stdout.take().unwrap();
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = line.expect("failed to read worker output");
+            if let Ok(record) = serde_json::from_str::<LatencyRecord>(&line) {
+                if record.error {
+                    total_errors += 1;
+                } else {
+                    all_latencies.push(record.latency_ms);
+                }
+            }
+        }
+        let status = child.wait().expect("failed to wait for worker");
+        if !status.success() {
+            eprintln!("Worker exited with status: {}", status);
+        }
     }
+
     let wall_duration = wall_start.elapsed();
     compute_result(
         variant,
-        "read_describe_table",
-        config.concurrency,
+        operation,
+        concurrency,
         wall_duration,
         all_latencies,
         total_errors,
@@ -457,134 +395,131 @@ async fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: manifest_bench <seed|run|worker> [options]");
+        std::process::exit(1);
+    }
+
+    let mode = args[1].as_str();
     let mut root = String::new();
+    let mut operation = String::new();
+    let mut operations: usize = 100;
+    let mut warmup: usize = 10;
     let mut concurrency_list = vec![1, 2, 5, 10, 20, 50, 100];
-    let mut operations: usize = 500;
-    let mut warmup: usize = 20;
-    let mut seed_namespaces: usize = 50;
-    let mut seed_tables: usize = 100;
+    let mut count: usize = 1000;
+    let mut worker_id: usize = 0;
+    let mut table_count: usize = 667; // default for 1000 seed: 1000 - 1000/3
     let mut inline_optimization = true;
     let mut variant = String::new();
 
-    let mut i = 1;
+    let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--root" => {
-                root = args[i + 1].clone();
-                i += 2;
-            }
-            "--concurrency" => {
-                concurrency_list = parse_concurrency_list(&args[i + 1]);
-                i += 2;
-            }
-            "--operations" => {
-                operations = args[i + 1].parse().expect("invalid --operations");
-                i += 2;
-            }
-            "--warmup" => {
-                warmup = args[i + 1].parse().expect("invalid --warmup");
-                i += 2;
-            }
-            "--seed-namespaces" => {
-                seed_namespaces = args[i + 1].parse().expect("invalid --seed-namespaces");
-                i += 2;
-            }
-            "--seed-tables" => {
-                seed_tables = args[i + 1].parse().expect("invalid --seed-tables");
-                i += 2;
-            }
-            "--inline-optimization" => {
-                inline_optimization = args[i + 1]
-                    .parse::<bool>()
-                    .expect("invalid --inline-optimization (true/false)");
-                i += 2;
-            }
-            "--variant" => {
-                variant = args[i + 1].clone();
-                i += 2;
-            }
-            _ => {
-                eprintln!("Unknown argument: {}", args[i]);
-                std::process::exit(1);
-            }
+            "--root" => { root = args[i + 1].clone(); i += 2; }
+            "--operation" => { operation = args[i + 1].clone(); i += 2; }
+            "--operations" => { operations = args[i + 1].parse().unwrap(); i += 2; }
+            "--warmup" => { warmup = args[i + 1].parse().unwrap(); i += 2; }
+            "--concurrency" => { concurrency_list = parse_concurrency_list(&args[i + 1]); i += 2; }
+            "--count" => { count = args[i + 1].parse().unwrap(); i += 2; }
+            "--worker-id" => { worker_id = args[i + 1].parse().unwrap(); i += 2; }
+            "--table-count" => { table_count = args[i + 1].parse().unwrap(); i += 2; }
+            "--inline-optimization" => { inline_optimization = args[i + 1].parse().unwrap(); i += 2; }
+            "--variant" => { variant = args[i + 1].clone(); i += 2; }
+            _ => { eprintln!("Unknown argument: {}", args[i]); std::process::exit(1); }
         }
     }
 
-    if root.is_empty() {
-        root = std::env::temp_dir()
-            .join("manifest_bench")
-            .to_string_lossy()
-            .to_string();
-    }
     if variant.is_empty() {
-        variant = if inline_optimization {
-            "default".to_string()
-        } else {
-            "no_inline_opt".to_string()
-        };
+        variant = if inline_optimization { "default".to_string() } else { "no_inline_opt".to_string() };
     }
 
-    eprintln!("=== Manifest Benchmark ===");
-    eprintln!("variant: {}", variant);
-    eprintln!("root: {}", root);
-    eprintln!("inline_optimization: {}", inline_optimization);
-    eprintln!("concurrency: {:?}", concurrency_list);
-    eprintln!("operations per concurrency level: {}", operations);
-    eprintln!("warmup: {}", warmup);
-    eprintln!("seed: {} namespaces, {} tables", seed_namespaces, seed_tables);
+    match mode {
+        "seed" => {
+            seed(&root, count, inline_optimization).await;
+        }
+        "worker" => {
+            if operation.starts_with("cold-read") {
+                cold_read_worker(
+                    &root,
+                    &operation,
+                    operations,
+                    worker_id,
+                    table_count,
+                    inline_optimization,
+                )
+                .await;
+            } else {
+                worker(
+                    &root,
+                    &operation,
+                    operations,
+                    warmup,
+                    worker_id,
+                    table_count,
+                    inline_optimization,
+                )
+                .await;
+            }
+        }
+        "run" => {
+            let self_exe = std::env::current_exe()
+                .expect("failed to get self exe path")
+                .to_string_lossy()
+                .to_string();
 
-    // ---- READ benchmarks: single shared namespace with seeded data ----
-    eprintln!("\n--- Seeding read benchmark data ---");
-    let read_root = format!("{}/read", root);
-    let _ = std::fs::remove_dir_all(&read_root);
-    std::fs::create_dir_all(&read_root).expect("failed to create read root");
-    let read_ns = setup_namespace(&read_root, inline_optimization).await;
-    seed_data(read_ns.as_ref(), seed_namespaces, seed_tables).await;
-    eprintln!("Seeded {} namespaces and {} tables", seed_namespaces, seed_tables);
+            let operations_list = [
+                "cold-read-list-namespaces",
+                "cold-read-list-tables",
+                "cold-read-describe-table",
+                "warm-read-list-namespaces",
+                "warm-read-list-tables",
+                "warm-read-describe-table",
+                "write-create-namespace",
+                "write-create-table",
+            ];
 
-    for &concurrency in &concurrency_list {
-        let actual_ops = (operations / concurrency) * concurrency;
-        let config = BenchConfig {
-            operations: actual_ops,
-            warmup,
-            concurrency,
-        };
+            // If --operation is set, only run that one
+            let ops: Vec<&str> = if operation.is_empty() {
+                operations_list.to_vec()
+            } else {
+                vec![operation.as_str()]
+            };
 
-        let result = bench_read_list_namespaces(read_ns.clone(), config, &variant).await;
-        println!("{}", serde_json::to_string(&result).unwrap());
+            eprintln!("=== Manifest Benchmark ===");
+            eprintln!("variant: {}", variant);
+            eprintln!("root: {}", root);
+            eprintln!("inline_optimization: {}", inline_optimization);
+            eprintln!("concurrency: {:?}", concurrency_list);
+            eprintln!("operations per level: {}", operations);
+            eprintln!("warmup: {}", warmup);
+            eprintln!("table_count: {}", table_count);
 
-        let result = bench_read_list_tables(read_ns.clone(), config, &variant).await;
-        println!("{}", serde_json::to_string(&result).unwrap());
-
-        let result =
-            bench_read_describe_table(read_ns.clone(), config, seed_tables, &variant).await;
-        println!("{}", serde_json::to_string(&result).unwrap());
+            for op in &ops {
+                for &concurrency in &concurrency_list {
+                    let actual_ops = (operations / concurrency) * concurrency;
+                    eprintln!(
+                        "  {} concurrency={} ops={}",
+                        op, concurrency, actual_ops
+                    );
+                    let result = run_workers(
+                        &self_exe,
+                        &root,
+                        op,
+                        concurrency,
+                        actual_ops,
+                        warmup,
+                        table_count,
+                        inline_optimization,
+                        &variant,
+                    );
+                    println!("{}", serde_json::to_string(&result).unwrap());
+                }
+            }
+            eprintln!("=== Benchmark complete ===");
+        }
+        _ => {
+            eprintln!("Unknown mode: {}. Use seed, run, or worker.", mode);
+            std::process::exit(1);
+        }
     }
-
-    // ---- WRITE benchmarks: fresh namespace per concurrency level ----
-    for &concurrency in &concurrency_list {
-        let actual_ops = (operations / concurrency) * concurrency;
-        let config = BenchConfig {
-            operations: actual_ops,
-            warmup: warmup.min(20),
-            concurrency,
-        };
-
-        // Fresh namespace for each write benchmark
-        let write_ns_root = format!("{}/write_ns_c{}", root, concurrency);
-        let _ = std::fs::remove_dir_all(&write_ns_root);
-        std::fs::create_dir_all(&write_ns_root).expect("failed to create write root");
-        let write_ns = setup_namespace(&write_ns_root, inline_optimization).await;
-        let result = bench_write_create_namespace(write_ns, config, &variant).await;
-        println!("{}", serde_json::to_string(&result).unwrap());
-
-        let write_tbl_root = format!("{}/write_tbl_c{}", root, concurrency);
-        let _ = std::fs::remove_dir_all(&write_tbl_root);
-        std::fs::create_dir_all(&write_tbl_root).expect("failed to create write root");
-        let write_ns = setup_namespace(&write_tbl_root, inline_optimization).await;
-        let result = bench_write_create_table(write_ns, config, &variant).await;
-        println!("{}", serde_json::to_string(&result).unwrap());
-    }
-
-    eprintln!("\n=== Benchmark complete ===");
 }
