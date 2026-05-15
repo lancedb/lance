@@ -29,6 +29,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,6 +57,8 @@ const VECTOR_COL: &str = "vec";
 const VECTOR_INDEX_NAME: &str = "vec_idx";
 const TEXT_BYTES: usize = 1_500;
 const ROW_BYTES_FINEWEB_SHAPE: usize = 5_760;
+const FINEWEB_FIXED_BYTES: usize = ROW_BYTES_FINEWEB_SHAPE - TEXT_BYTES - 1024 * size_of::<f32>();
+const VECTOR_ONLY_ID_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -100,10 +103,46 @@ impl Mode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaShape {
+    FineWeb,
+    VectorOnly,
+}
+
+impl SchemaShape {
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "fineweb" => Ok(Self::FineWeb),
+            "vector_only" => Ok(Self::VectorOnly),
+            _ => Err(format!(
+                "unknown schema shape '{value}', expected fineweb|vector_only"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FineWeb => "fineweb",
+            Self::VectorOnly => "vector_only",
+        }
+    }
+
+    fn default_row_bytes(self, vector_dim: usize, text_bytes: usize) -> usize {
+        let vector_bytes = vector_dim.saturating_mul(size_of::<f32>());
+        match self {
+            Self::FineWeb => text_bytes
+                .saturating_add(vector_bytes)
+                .saturating_add(FINEWEB_FIXED_BYTES),
+            Self::VectorOnly => vector_bytes.saturating_add(VECTOR_ONLY_ID_BYTES),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     uri: Option<String>,
     mode: Mode,
+    schema_shape: SchemaShape,
     seed_rows: usize,
     batch_rows: usize,
     calls: usize,
@@ -133,6 +172,7 @@ impl Default for Args {
         Self {
             uri: None,
             mode: Mode::AsyncIndexed,
+            schema_shape: SchemaShape::FineWeb,
             seed_rows: 100_000,
             batch_rows: 1_000,
             calls: 500,
@@ -197,13 +237,16 @@ async fn run(args: Args) -> Result<()> {
     };
 
     println!(
-        "bench=mem_wal_shard_writer_backpressure uri={} mode={} seed_rows={} batch_rows={} calls={} vector_dim={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={} skip_close={}",
+        "bench=mem_wal_shard_writer_backpressure uri={} mode={} schema_shape={} seed_rows={} batch_rows={} calls={} vector_dim={} text_bytes={} row_bytes={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={} skip_close={}",
         uri,
         args.mode.as_str(),
+        args.schema_shape.as_str(),
         args.seed_rows,
         args.batch_rows,
         args.calls,
         args.vector_dim,
+        args.text_bytes,
+        args.row_bytes,
         args.target_rows_per_sec,
         args.max_memtable_size,
         memtable_limits.rows,
@@ -216,11 +259,12 @@ async fn run(args: Args) -> Result<()> {
         args.skip_close,
     );
 
-    let schema = fineweb_schema(args.vector_dim);
+    let schema = schema_for_shape(args.schema_shape, args.vector_dim);
     let text_value = "x".repeat(args.text_bytes);
 
     let setup_start = Instant::now();
     let seed_batch = make_batch(
+        args.schema_shape,
         schema.as_ref(),
         "seed",
         0,
@@ -284,6 +328,7 @@ async fn run(args: Args) -> Result<()> {
     for call in 0..args.calls {
         let batch_start = Instant::now();
         let batch = make_batch(
+            args.schema_shape,
             schema.as_ref(),
             "new",
             args.seed_rows + call * args.batch_rows,
@@ -431,11 +476,13 @@ async fn run(args: Args) -> Result<()> {
     let output = json!({
         "uri": uri,
         "mode": args.mode.as_str(),
+        "schema_shape": args.schema_shape.as_str(),
         "seed_rows": args.seed_rows,
         "batch_rows": args.batch_rows,
         "calls": args.calls,
         "total_rows_written": rows,
         "vector_dim": args.vector_dim,
+        "text_bytes": args.text_bytes,
         "row_bytes": args.row_bytes,
         "target_rows_per_sec": args.target_rows_per_sec,
         "rayon_threads": rayon::current_num_threads(),
@@ -569,14 +616,36 @@ fn memtable_stats_json(memtable: Option<&MemTableStats>) -> serde_json::Value {
     }
 }
 
-fn fineweb_schema(vector_dim: usize) -> Arc<ArrowSchema> {
+fn schema_for_shape(shape: SchemaShape, vector_dim: usize) -> Arc<ArrowSchema> {
+    match shape {
+        SchemaShape::FineWeb => fineweb_schema(vector_dim),
+        SchemaShape::VectorOnly => vector_only_schema(vector_dim),
+    }
+}
+
+fn id_field() -> Field {
     let mut id_metadata = HashMap::new();
     id_metadata.insert(
         "lance-schema:unenforced-primary-key".to_string(),
         "true".to_string(),
     );
+    Field::new("id", DataType::Utf8, false).with_metadata(id_metadata)
+}
+
+fn vector_field(vector_dim: usize) -> Field {
+    Field::new(
+        VECTOR_COL,
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            vector_dim as i32,
+        ),
+        false,
+    )
+}
+
+fn fineweb_schema(vector_dim: usize) -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Utf8, false).with_metadata(id_metadata),
+        id_field(),
         Field::new("text", DataType::Utf8, false),
         Field::new("dump", DataType::Utf8, false),
         Field::new("url", DataType::Utf8, false),
@@ -584,18 +653,16 @@ fn fineweb_schema(vector_dim: usize) -> Arc<ArrowSchema> {
         Field::new("language", DataType::Utf8, false),
         Field::new("language_score", DataType::Float64, false),
         Field::new("token_count", DataType::Int64, false),
-        Field::new(
-            VECTOR_COL,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                vector_dim as i32,
-            ),
-            false,
-        ),
+        vector_field(vector_dim),
     ]))
 }
 
+fn vector_only_schema(vector_dim: usize) -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![id_field(), vector_field(vector_dim)]))
+}
+
 fn make_batch(
+    shape: SchemaShape,
     schema: &ArrowSchema,
     id_prefix: &str,
     start_row: usize,
@@ -606,6 +673,31 @@ fn make_batch(
     let ids = StringArray::from_iter_values(
         (0..num_rows).map(|i| format!("{id_prefix}-{:012}", start_row + i)),
     );
+    let mut vectors = Vec::with_capacity(num_rows * vector_dim);
+    for row in start_row..start_row + num_rows {
+        let cluster = row % 4096;
+        let row_noise = ((row / 4096) % 97) as f32 * 0.0001;
+        for dim in 0..vector_dim {
+            let mixed = cluster
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(dim.wrapping_mul(12_345));
+            vectors.push(((mixed & 0xffff) as f32 / 65_536.0) + row_noise);
+        }
+    }
+    let vector_values = Float32Array::from(vectors);
+    let vector_array = FixedSizeListArray::try_new_from_values(vector_values, vector_dim as i32)?;
+
+    if shape == SchemaShape::VectorOnly {
+        return RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(ids) as ArrayRef,
+                Arc::new(vector_array) as ArrayRef,
+            ],
+        )
+        .map_err(Into::into);
+    }
+
     let text = StringArray::from_iter_values((0..num_rows).map(|_| text_value));
     let dump = StringArray::from_iter_values((0..num_rows).map(|i| match (start_row + i) % 5 {
         0 => "CC-MAIN-2023-50",
@@ -627,20 +719,6 @@ fn make_batch(
     );
     let token_count =
         Int64Array::from_iter_values((0..num_rows).map(|i| 50 + ((start_row + i) % 4046) as i64));
-
-    let mut vectors = Vec::with_capacity(num_rows * vector_dim);
-    for row in start_row..start_row + num_rows {
-        let cluster = row % 4096;
-        let row_noise = ((row / 4096) % 97) as f32 * 0.0001;
-        for dim in 0..vector_dim {
-            let mixed = cluster
-                .wrapping_mul(1_103_515_245)
-                .wrapping_add(dim.wrapping_mul(12_345));
-            vectors.push(((mixed & 0xffff) as f32 / 65_536.0) + row_noise);
-        }
-    }
-    let vector_values = Float32Array::from(vectors);
-    let vector_array = FixedSizeListArray::try_new_from_values(vector_values, vector_dim as i32)?;
 
     RecordBatch::try_new(
         Arc::new(schema.clone()),
@@ -692,6 +770,7 @@ fn effective_memtable_limits(args: &Args) -> EffectiveMemTableLimits {
 
 fn parse_args() -> Result<Args> {
     let mut args = Args::default();
+    let mut row_bytes_explicit = false;
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
         if flag == "--bench" {
@@ -709,12 +788,19 @@ fn parse_args() -> Result<Args> {
             "--mode" => {
                 args.mode = Mode::parse(&value).map_err(lance_core::Error::invalid_input)?;
             }
+            "--schema-shape" => {
+                args.schema_shape =
+                    SchemaShape::parse(&value).map_err(lance_core::Error::invalid_input)?;
+            }
             "--seed-rows" => args.seed_rows = parse(&flag, &value)?,
             "--batch-rows" => args.batch_rows = parse(&flag, &value)?,
             "--calls" => args.calls = parse(&flag, &value)?,
             "--vector-dim" => args.vector_dim = parse(&flag, &value)?,
             "--text-bytes" => args.text_bytes = parse(&flag, &value)?,
-            "--row-bytes" => args.row_bytes = parse(&flag, &value)?,
+            "--row-bytes" => {
+                args.row_bytes = parse(&flag, &value)?;
+                row_bytes_explicit = true;
+            }
             "--max-memtable-size" => args.max_memtable_size = parse(&flag, &value)?,
             "--max-unflushed-memtable-bytes" => {
                 args.max_unflushed_memtable_bytes = parse(&flag, &value)?;
@@ -745,17 +831,27 @@ fn parse_args() -> Result<Args> {
         }
     }
 
+    if !row_bytes_explicit {
+        args.row_bytes = args
+            .schema_shape
+            .default_row_bytes(args.vector_dim, args.text_bytes);
+    }
+
     if args.seed_rows == 0
         || args.batch_rows == 0
         || args.calls == 0
         || args.vector_dim == 0
-        || args.text_bytes == 0
         || args.row_bytes == 0
         || args.max_memtable_size == 0
         || args.max_unflushed_memtable_bytes == 0
     {
         return Err(lance_core::Error::invalid_input(
-            "seed_rows, batch_rows, calls, vector_dim, text_bytes, row_bytes, max_memtable_size, and max_unflushed_memtable_bytes must be greater than 0",
+            "seed_rows, batch_rows, calls, vector_dim, row_bytes, max_memtable_size, and max_unflushed_memtable_bytes must be greater than 0",
+        ));
+    }
+    if args.schema_shape == SchemaShape::FineWeb && args.text_bytes == 0 {
+        return Err(lance_core::Error::invalid_input(
+            "text_bytes must be greater than 0 for schema_shape=fineweb",
         ));
     }
     if let Some(max_memtable_rows) = args.max_memtable_rows
