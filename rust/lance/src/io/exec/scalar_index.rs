@@ -3,7 +3,9 @@
 
 use std::sync::{Arc, LazyLock};
 
-use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::utils::{
+    IndexMetrics, InstrumentedChildInputStream, InstrumentedRecordBatchStreamAdapter,
+};
 use crate::{
     Dataset,
     dataset::rowids::load_row_id_sequences,
@@ -26,7 +28,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
@@ -288,6 +290,55 @@ impl MapIndexExec {
         }
     }
 
+    async fn build_stream(
+        input: datafusion::physical_plan::SendableRecordBatchStream,
+        partition: usize,
+        dataset: Arc<Dataset>,
+        column_name: String,
+        index_name: String,
+        index_metrics: Arc<IndexMetrics>,
+        metrics_set: ExecutionPlanMetricsSet,
+    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
+            .await?
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "IndexedLookupExec: index '{index_name}' on column '{column_name}' disappeared after planning"
+                ))
+            })?;
+        let deletion_mask_fut =
+            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
+        let deletion_mask = if let Some(fut) = deletion_mask_fut {
+            Some(fut.await?)
+        } else {
+            None
+        };
+
+        let helper = InstrumentedChildInputStream::new(
+            input,
+            INDEX_LOOKUP_SCHEMA.clone(),
+            move |batch| {
+                let column_name = column_name.clone();
+                let index_name = index_name.clone();
+                let dataset = dataset.clone();
+                let deletion_mask = deletion_mask.clone();
+                let metrics = index_metrics.clone();
+                Self::map_batch(
+                    column_name,
+                    index_name,
+                    dataset,
+                    deletion_mask,
+                    batch,
+                    metrics,
+                )
+            },
+            1,
+            partition,
+            &metrics_set,
+        );
+        Ok(Box::pin(helper))
+    }
+
     async fn map_batch(
         column_name: String,
         index_name: String,
@@ -327,46 +378,6 @@ impl MapIndexExec {
             INDEX_LOOKUP_SCHEMA.clone(),
             vec![Arc::new(allow_list)],
         )?)
-    }
-
-    async fn do_execute(
-        input: datafusion::physical_plan::SendableRecordBatchStream,
-        dataset: Arc<Dataset>,
-        column_name: String,
-        index_name: String,
-        metrics: Arc<IndexMetrics>,
-    ) -> datafusion::error::Result<
-        impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
-    > {
-        let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
-            .await?
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Internal(format!(
-                    "IndexedLookupExec: index '{index_name}' on column '{column_name}' disappeared after planning"
-                ))
-            })?;
-        let deletion_mask_fut =
-            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
-        let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
-            Some(deletion_mask_fut.await?)
-        } else {
-            None
-        };
-        Ok(input.and_then(move |res| {
-            let column_name = column_name.clone();
-            let index_name = index_name.clone();
-            let dataset = dataset.clone();
-            let deletion_mask = deletion_mask.clone();
-            let metrics = metrics.clone();
-            Self::map_batch(
-                column_name,
-                index_name,
-                dataset,
-                deletion_mask,
-                res,
-                metrics,
-            )
-        }))
     }
 }
 
@@ -410,24 +421,20 @@ impl ExecutionPlan for MapIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let index_vals = self.input.execute(partition, context)?;
-        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
-        let stream_fut = Self::do_execute(
-            index_vals,
+        let input = self.input.execute(partition, context)?;
+        let stream_fut = Self::build_stream(
+            input,
+            partition,
             self.dataset.clone(),
             self.column_name.clone(),
             self.index_name.clone(),
-            metrics,
+            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            self.metrics.clone(),
         );
-        let stream = futures::stream::iter(vec![stream_fut])
-            .then(|stream_fut| stream_fut)
-            .try_flatten()
-            .boxed();
-        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+        let stream = futures::stream::once(stream_fut).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             INDEX_LOOKUP_SCHEMA.clone(),
             stream,
-            partition,
-            &self.metrics,
         )))
     }
 

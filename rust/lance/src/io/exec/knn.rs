@@ -65,7 +65,7 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedChildInputStream, PreFilterSource,
     SelectionVectorToPrefilter,
 };
 
@@ -253,18 +253,42 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
+        let input_schema = input_stream.schema();
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
-        let stream = input_stream
-            .try_filter(|batch| future::ready(batch.num_rows() > 0))
-            .map(move |batch| {
+        let schema = self.schema();
+
+        // Empty batches don't have a vector column to score; filter them out
+        // before reaching the helper so the transform always sees real work.
+        let filtered_input = Box::pin(RecordBatchStreamAdapter::new(
+            input_schema,
+            input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0)),
+        )) as SendableRecordBatchStream;
+
+        // Mirror of the helper's elapsed_compute counter; used to attribute
+        // wall-clock from the spawn_blocking distance kernel back onto the
+        // node's `elapsed_compute` metric.
+        let elapsed_compute = BaselineMetrics::new(&self.metrics, partition)
+            .elapsed_compute()
+            .clone();
+
+        let stream = InstrumentedChildInputStream::new(
+            filtered_input,
+            schema,
+            move |batch| {
                 let key = key.clone();
                 let column = column.clone();
+                let elapsed_compute = elapsed_compute.clone();
                 async move {
-                    let batch = compute_distance(key, dt, &column, batch?)
+                    // Time around the .await to capture the spawn_blocking
+                    // distance work, which otherwise runs while this future is
+                    // Pending and is missed by the helper's own poll timer.
+                    let start = std::time::Instant::now();
+                    let batch = compute_distance(key, dt, &column, batch)
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    elapsed_compute.add_duration(start.elapsed());
 
                     let distances = batch[DIST_COL].as_primitive::<Float32Type>();
                     let mask = BooleanArray::from_iter(
@@ -275,15 +299,12 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                     arrow::compute::filter_record_batch(&batch, &mask)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
-            })
-            .buffer_unordered(get_num_compute_intensive_cpus());
-        let schema = self.schema();
-        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            schema,
-            stream.boxed(),
+            },
+            get_num_compute_intensive_cpus(),
             partition,
             &self.metrics,
-        )) as SendableRecordBatchStream)
+        );
+        Ok(Box::pin(stream) as SendableRecordBatchStream)
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
