@@ -749,7 +749,7 @@ pub struct TagContents {
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
-    #[serde(default = "BranchIdentifier::none")]
+    #[serde(default = "BranchIdentifier::missing_identifier_sentinel")]
     pub identifier: BranchIdentifier,
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
@@ -773,27 +773,25 @@ impl BranchIdentifier {
         Self { version_mapping }
     }
 
-    /// Creates a sentinel branch identifier for branch metadata that is missing lineage.
+    /// Creates a sentinel identifier for legacy branch metadata that lacks an explicit
+    /// identifier.
     ///
-    /// When branch metadata is read from disk, this sentinel is replaced with a deterministic
-    /// synthetic identifier derived from the branch metadata so public branch identifiers remain
-    /// stable across reads.
-    pub fn none() -> Self {
+    /// `BranchContents::from_path` replaces this value with a deterministic synthetic
+    /// identifier. Keeping this sentinel stable lets us distinguish missing identifiers from
+    /// persisted identifiers without changing this field to `Option<BranchIdentifier>`.
+    pub fn missing_identifier_sentinel() -> Self {
         Self {
             version_mapping: vec![(0, Uuid::nil().simple().to_string())],
         }
     }
 
-    fn synthetic(
+    fn synthetic_identifier(
         branch_name: &str,
         parent_branch: Option<&str>,
         parent_version: u64,
         create_at: u64,
     ) -> Self {
         Self {
-            // We synthesize a deterministic UUID for legacy branch files without an explicit
-            // identifier so public branch metadata remains stable across reads. This also makes
-            // lineage and delete-conflict detection for legacy descendants deterministic.
             version_mapping: vec![(
                 0,
                 Uuid::new_v5(
@@ -933,8 +931,11 @@ impl BranchContents {
         branch_name: &str,
     ) -> Result<Self> {
         let mut contents: Self = from_path(path, object_store).await?;
-        if contents.identifier == BranchIdentifier::none() {
-            contents.identifier = BranchIdentifier::synthetic(
+        if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
+            // Legacy branch files do not store an identifier. Derive a deterministic fallback
+            // from stable branch metadata so repeated reads expose the same public
+            // branch_identifier.
+            contents.identifier = BranchIdentifier::synthetic_identifier(
                 branch_name,
                 contents.parent_branch.as_deref(),
                 contents.parent_version,
@@ -1204,7 +1205,7 @@ mod tests {
     async fn test_branch_contents_serialization() {
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
-            identifier: BranchIdentifier::none(),
+            identifier: BranchIdentifier::missing_identifier_sentinel(),
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
@@ -1256,6 +1257,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.identifier, second.identifier);
+        assert_ne!(
+            first.identifier,
+            BranchIdentifier::missing_identifier_sentinel()
+        );
 
         let other = BranchContents::from_path(&second_path, &store, "legacy_branch_other")
             .await
