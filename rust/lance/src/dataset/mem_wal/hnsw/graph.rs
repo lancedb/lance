@@ -524,16 +524,15 @@ impl HnswGraph {
             )));
         }
 
-        let visible_len = self.visible_len.load(Ordering::Acquire);
+        // The vector snapshot and graph publication are captured separately.
+        // Cap search to the common visible prefix so a reader racing with the
+        // writer never follows a newly-published graph edge into an older
+        // vector snapshot.
+        let visible_len = self.visible_len.load(Ordering::Acquire).min(vectors.len());
         if visible_len == 0 {
             return Ok(Vec::new());
         }
-        let indexed_len = self.indexed_len.load(Ordering::Acquire);
-        let neighbor_visible_len = if indexed_len == visible_len {
-            usize::MAX
-        } else {
-            visible_len
-        };
+        let neighbor_visible_len = visible_len;
         let visible_max_level = self.visible_max_level.load(Ordering::Acquire);
         let entry = self.visible_entry_point.load(Ordering::Acquire);
         if entry as usize >= visible_len {
