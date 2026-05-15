@@ -4876,9 +4876,12 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "datafusion-common",
+ "datafusion-physical-plan",
  "futures",
  "hmac",
  "lance",
+ "lance-arrow",
  "lance-core",
  "lance-index",
  "lance-io",
@@ -4891,6 +4894,7 @@ dependencies = [
  "rand 0.9.4",
  "reqwest 0.12.28",
  "ring",
+ "roaring",
  "rstest",
  "rustls-pki-types",
  "serde",
@@ -4901,6 +4905,7 @@ dependencies = [
  "tower",
  "tower-http 0.5.2",
  "url",
+ "uuid",
  "wiremock",
 ]
 

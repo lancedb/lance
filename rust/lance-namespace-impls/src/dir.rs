@@ -307,11 +307,10 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
-    /// Enable or disable inline optimization of the __manifest table.
+    /// Deprecated compatibility option for inline optimization of the __manifest table.
     ///
-    /// When enabled (default), performs compaction and indexing on the __manifest table
-    /// after every write operation to maintain optimal performance.
-    /// When disabled, manual optimization must be performed separately.
+    /// Copy-on-write manifest rewrites always replace data files and maintain
+    /// indexes inline. This setting is retained for callers that still pass it.
     pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
         self.inline_optimization_enabled = enabled;
         self
@@ -349,7 +348,7 @@ impl DirectoryNamespaceBuilder {
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
-    /// - `inline_optimization_enabled`: Enable inline optimization of __manifest table (optional, default: true)
+    /// - `inline_optimization_enabled`: Deprecated compatibility option; ignored by copy-on-write manifest rewrites
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -447,7 +446,7 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
-        // Extract inline_optimization_enabled (default: true)
+        // Extract deprecated inline_optimization_enabled (default: true)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
             .and_then(|v| v.parse::<bool>().ok())
@@ -2935,15 +2934,12 @@ impl LanceNamespace for DirectoryNamespace {
             .to_string();
 
             if let Err(e) = manifest_ns
-                .insert_into_manifest_with_metadata(
-                    vec![manifest::ManifestEntry {
-                        object_id,
-                        object_type: manifest::ObjectType::TableVersion,
-                        location: None,
-                        metadata: Some(metadata_json),
-                    }],
-                    None,
-                )
+                .insert_into_manifest_with_metadata(vec![manifest::ManifestEntry {
+                    object_id,
+                    object_type: manifest::ObjectType::TableVersion,
+                    location: None,
+                    metadata: Some(metadata_json),
+                }])
                 .await
             {
                 log::warn!(
@@ -3039,38 +3035,27 @@ impl LanceNamespace for DirectoryNamespace {
             ranges,
         }];
 
-        let mut total_deleted_count = 0i64;
-
         if self.table_version_storage_enabled
             && let Some(ref manifest_ns) = self.manifest_ns
         {
-            // Phase 1 (atomic commit point): Delete version records from __manifest
-            // for ALL tables in a single atomic operation. This is the authoritative
+            // Phase 1 (atomic commit point): Delete version records from __manifest.
+            // This is the authoritative
             // source of truth — once __manifest entries are removed, the versions
-            // are logically deleted across all tables atomically.
-
-            // Collect all (table_id_str, ranges) for batch deletion
-            let mut all_object_ids: Vec<String> = Vec::new();
-            for te in &table_entries {
-                let table_id_str = manifest::ManifestNamespace::str_object_id(
-                    &te.table_id.clone().unwrap_or_default(),
-                );
-                for (start, end) in &te.ranges {
-                    for version in *start..=*end {
-                        let object_id = manifest::ManifestNamespace::build_version_object_id(
-                            &table_id_str,
-                            version,
-                        );
-                        all_object_ids.push(object_id);
-                    }
-                }
-            }
-
-            if !all_object_ids.is_empty() {
-                total_deleted_count = manifest_ns
-                    .batch_delete_table_versions_by_object_ids(&all_object_ids)
-                    .await?;
-            }
+            // are logically deleted.
+            let table_ranges = table_entries
+                .iter()
+                .map(|te| {
+                    (
+                        manifest::ManifestNamespace::str_object_id(
+                            &te.table_id.clone().unwrap_or_default(),
+                        ),
+                        te.ranges.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let total_deleted_count = manifest_ns
+                .batch_delete_table_versions_by_ranges(&table_ranges)
+                .await?;
 
             // Phase 2: Delete physical manifest files (best-effort).
             // Even if some file deletions fail, the versions are already removed from
@@ -3087,7 +3072,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         // Fallback when table_version_storage is not enabled: delete physical files directly (no __manifest)
-        total_deleted_count = self
+        let total_deleted_count = self
             .delete_physical_version_files(&table_entries, false)
             .await?;
 

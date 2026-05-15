@@ -1344,6 +1344,7 @@ impl Dataset {
             commit_config,
             self.manifest_location.naming_scheme,
             None,
+            None,
         )
         .await?;
 

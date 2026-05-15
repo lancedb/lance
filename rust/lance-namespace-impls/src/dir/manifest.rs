@@ -6,27 +6,40 @@
 //! This module provides a namespace implementation that uses a manifest table
 //! to track tables and nested namespaces.
 
-use arrow::array::builder::{ListBuilder, StringBuilder};
-use arrow::array::{Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow::array::{
+    Array, LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt, TryStreamExt, stream::StreamExt};
-use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::{
-    DeleteBuilder, MergeInsertBuilder, ReadParams, WhenMatched, WhenNotMatched, WriteMode,
-    WriteParams, builder::DatasetBuilder,
+use datafusion_common::DataFusionError;
+use datafusion_physical_plan::{
+    SendableRecordBatchStream,
+    stream::RecordBatchStreamAdapter as DatafusionRecordBatchStreamAdapter,
 };
-use lance::index::DatasetIndexExt;
+use futures::{
+    FutureExt, TryStreamExt,
+    stream::{self, StreamExt},
+};
+use lance::dataset::index::LanceIndexStoreExt;
+use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::{
+    CommitBuilder, InsertBuilder, ReadParams, WhenMatched, WriteMode, WriteParams,
+    builder::DatasetBuilder,
+};
 use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
-use lance_core::Error as LanceError;
+use lance_arrow::json::{JsonArray, decode_json, json_field};
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance_core::{Error as LanceError, ROW_ID};
 use lance_core::{Error, Result};
-use lance_index::IndexType;
-use lance_index::optimize::OptimizeOptions;
-use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+use lance_index::progress::noop_progress;
+use lance_index::registry::IndexPluginRegistry;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams, ScalarIndexParams};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -41,15 +54,18 @@ use lance_namespace::models::{
     TableVersion,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use object_store::{Error as ObjectStoreError, path::Path};
+use lance_table::format::IndexMetadata;
+use object_store::{Error as ObjectStoreError, ObjectStoreExt, path::Path};
+use roaring::RoaringBitmap;
 use std::io::Cursor;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
 };
-use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, mpsc};
+use uuid::Uuid;
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
 const DELIMITER: &str = "$";
@@ -62,11 +78,13 @@ pub(crate) const DECLARED_FILTER_CONCURRENCY: usize = 16;
 const OBJECT_ID_INDEX_NAME: &str = "object_id_btree";
 /// Bitmap index on the object_type column for filtering by type
 const OBJECT_TYPE_INDEX_NAME: &str = "object_type_bitmap";
-/// LabelList index on the base_objects column for view dependencies
-const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
-/// Inline maintenance on the manifest table is expensive relative to a single-row mutation.
-/// Wait until enough fragments accumulate before compacting files or merging indices.
-const MANIFEST_INLINE_OPTIMIZATION_FRAGMENT_THRESHOLD: usize = 8;
+/// JSON FTS index on the metadata column for metadata text search
+const METADATA_INDEX_NAME: &str = "metadata_fts";
+// Each retry reloads and rewrites the full manifest. Match the regular Lance
+// commit retry budget so multi-process namespace writes can make progress.
+const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
+const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
+const MANIFEST_METADATA_INDEX_CHANNEL_SIZE: usize = 2;
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +95,7 @@ pub enum ObjectType {
 }
 
 impl ObjectType {
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Namespace => "namespace",
             Self::Table => "table",
@@ -158,6 +176,445 @@ pub struct ManifestEntry {
     pub location: Option<String>,
     /// Additional metadata serialized as JSON
     pub metadata: Option<String>,
+}
+
+struct CopyOnWriteMutation<T> {
+    result: T,
+    has_changes: bool,
+}
+
+impl<T> CopyOnWriteMutation<T> {
+    fn updated(result: T) -> Self {
+        Self {
+            result,
+            has_changes: true,
+        }
+    }
+
+    fn unchanged(result: T) -> Self {
+        Self {
+            result,
+            has_changes: false,
+        }
+    }
+}
+
+struct ManifestIndexBuildInput {
+    index_name: &'static str,
+    column_name: &'static str,
+    params: ScalarIndexParams,
+    field: Field,
+    stream: SendableRecordBatchStream,
+}
+
+struct ManifestTrainedIndex {
+    index_name: &'static str,
+    column_name: &'static str,
+    uuid: Uuid,
+    created_index: CreatedIndex,
+}
+
+struct ManifestRowValue {
+    object_id: String,
+    object_type: ObjectType,
+    location: Option<String>,
+    metadata: Option<String>,
+}
+
+struct ManifestOutputRow<'a> {
+    object_id: &'a str,
+    object_type: ObjectType,
+    location: Option<&'a str>,
+    metadata: Option<&'a str>,
+}
+
+#[derive(Default)]
+struct ManifestIndexAccumulator {
+    object_ids: BTreeMap<Arc<str>, u64>,
+    object_types: BTreeMap<&'static str, RoaringBitmap>,
+    row_count: u64,
+}
+
+impl ManifestIndexAccumulator {
+    fn next_row_id(&self) -> Result<u64> {
+        if self.row_count > u64::from(u32::MAX) {
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "Manifest rewrite exceeded maximum single-fragment row count: {}",
+                    self.row_count
+                ),
+            }
+            .into());
+        }
+        Ok(self.row_count)
+    }
+
+    fn push(&mut self, row: &ManifestOutputRow<'_>) -> Result<u64> {
+        let row_id = self.next_row_id()?;
+        if self
+            .object_ids
+            .insert(Arc::<str>::from(row.object_id), row_id)
+            .is_some()
+        {
+            return Err(NamespaceError::Internal {
+                message: format!("Manifest contains duplicate object_id '{}'", row.object_id),
+            }
+            .into());
+        }
+        self.object_types
+            .entry(row.object_type.as_str())
+            .or_default()
+            .insert(row_id as u32);
+        self.row_count += 1;
+        Ok(row_id)
+    }
+}
+
+struct ManifestBatchBuilder {
+    object_ids: Vec<String>,
+    object_types: Vec<&'static str>,
+    locations: Vec<Option<String>>,
+    metadatas: Vec<Option<String>>,
+    row_ids: Vec<u64>,
+}
+
+impl ManifestBatchBuilder {
+    fn new() -> Self {
+        Self {
+            object_ids: Vec::new(),
+            object_types: Vec::new(),
+            locations: Vec::new(),
+            metadatas: Vec::new(),
+            row_ids: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.object_ids.is_empty()
+    }
+
+    fn append(
+        &mut self,
+        index_data: &mut ManifestIndexAccumulator,
+        row: ManifestOutputRow<'_>,
+    ) -> Result<()> {
+        let row_id = index_data.push(&row)?;
+        self.object_ids.push(row.object_id.to_string());
+        self.object_types.push(row.object_type.as_str());
+        self.locations.push(row.location.map(ToString::to_string));
+        self.metadatas.push(row.metadata.map(ToString::to_string));
+        self.row_ids.push(row_id);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(RecordBatch, RecordBatch)> {
+        let metadata_array = Arc::new(
+            JsonArray::try_from_iter(self.metadatas.iter().map(|v| v.as_deref()))
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to encode manifest metadata as JSON: {}", e),
+                    })
+                })?
+                .into_inner(),
+        );
+        let manifest_batch = RecordBatch::try_new(
+            ManifestNamespace::manifest_schema(),
+            vec![
+                Arc::new(StringArray::from(self.object_ids)),
+                Arc::new(StringArray::from(self.object_types)),
+                Arc::new(StringArray::from(self.locations)),
+                metadata_array.clone(),
+            ],
+        )
+        .map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to create manifest snapshot batch: {:?}", e),
+            })
+        })?;
+
+        let metadata_index_batch = RecordBatch::try_new(
+            ManifestNamespace::metadata_index_schema(),
+            vec![metadata_array, Arc::new(UInt64Array::from(self.row_ids))],
+        )
+        .map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to create manifest metadata index batch: {:?}", e),
+            })
+        })?;
+
+        Ok((manifest_batch, metadata_index_batch))
+    }
+}
+
+trait ManifestStreamMutation: Send {
+    type Output: Clone + Send + 'static;
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()>;
+
+    fn append_rows(
+        &mut self,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()>;
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output>;
+}
+
+struct ManifestRewriteShared<M: ManifestStreamMutation> {
+    mutation: M,
+    index_data: Option<ManifestIndexAccumulator>,
+    result: Option<CopyOnWriteMutation<M::Output>>,
+    error: Option<LanceError>,
+    metadata_index_sender: Option<mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>>,
+}
+
+impl<M: ManifestStreamMutation> ManifestRewriteShared<M> {
+    fn new(
+        mutation: M,
+        metadata_index_sender: mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>,
+    ) -> Self {
+        Self {
+            mutation,
+            index_data: Some(ManifestIndexAccumulator::default()),
+            result: None,
+            error: None,
+            metadata_index_sender: Some(metadata_index_sender),
+        }
+    }
+}
+
+struct UpsertManifestMutation {
+    entries: Vec<ManifestEntry>,
+    entry_positions: HashMap<String, usize>,
+    matched: Vec<bool>,
+    when_matched: WhenMatched,
+}
+
+impl UpsertManifestMutation {
+    fn new(entries: Vec<ManifestEntry>, when_matched: WhenMatched) -> Self {
+        let entry_positions = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.object_id.clone(), index))
+            .collect();
+        let matched = vec![false; entries.len()];
+        Self {
+            entries,
+            entry_positions,
+            matched,
+            when_matched,
+        }
+    }
+
+    fn entry_row(&self, index: usize) -> ManifestOutputRow<'_> {
+        let entry = &self.entries[index];
+        ManifestOutputRow {
+            object_id: &entry.object_id,
+            object_type: entry.object_type,
+            location: entry.location.as_deref(),
+            metadata: entry.metadata.as_deref(),
+        }
+    }
+}
+
+impl ManifestStreamMutation for UpsertManifestMutation {
+    type Output = ();
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if let Some(index) = self.entry_positions.get(&row.object_id).copied() {
+            match self.when_matched {
+                WhenMatched::Fail => {
+                    return Err(NamespaceError::ConcurrentModification {
+                        message: format!(
+                            "Object '{}' was concurrently created by another operation",
+                            row.object_id
+                        ),
+                    }
+                    .into());
+                }
+                WhenMatched::UpdateAll => {
+                    self.matched[index] = true;
+                    output.append(index_data, self.entry_row(index))?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(NamespaceError::Internal {
+                        message: format!(
+                            "Unsupported manifest rewrite matched action: {:?}",
+                            self.when_matched
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        for index in 0..self.entries.len() {
+            if !self.matched[index] {
+                output.append(index_data, self.entry_row(index))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        CopyOnWriteMutation::updated(())
+    }
+}
+
+struct DeleteObjectMutation {
+    object_id: String,
+    deleted: bool,
+}
+
+impl ManifestStreamMutation for DeleteObjectMutation {
+    type Output = ();
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id == self.object_id {
+            self.deleted = true;
+            return Ok(());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        _output: &mut ManifestBatchBuilder,
+        _index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        if self.deleted {
+            CopyOnWriteMutation::updated(())
+        } else {
+            CopyOnWriteMutation::unchanged(())
+        }
+    }
+}
+
+enum DeleteTableVersionsTarget {
+    ObjectIds(HashSet<String>),
+    Ranges(Vec<DeleteTableVersionRangeTarget>),
+}
+
+#[derive(Clone)]
+struct DeleteTableVersionRangeTarget {
+    object_id_prefix: String,
+    ranges: Vec<(i64, i64)>,
+}
+
+impl DeleteTableVersionRangeTarget {
+    fn matches(&self, object_id: &str) -> bool {
+        let Some(version) = object_id
+            .strip_prefix(&self.object_id_prefix)
+            .and_then(|suffix| suffix.parse::<i64>().ok())
+        else {
+            return false;
+        };
+
+        self.ranges
+            .iter()
+            .any(|(start, end)| *start <= version && version <= *end)
+    }
+}
+
+impl DeleteTableVersionsTarget {
+    fn matches(&self, object_id: &str) -> bool {
+        match self {
+            Self::ObjectIds(object_ids) => object_ids.contains(object_id),
+            Self::Ranges(targets) => targets.iter().any(|target| target.matches(object_id)),
+        }
+    }
+}
+
+struct DeleteTableVersionsMutation {
+    target: DeleteTableVersionsTarget,
+    deleted_count: i64,
+}
+
+impl ManifestStreamMutation for DeleteTableVersionsMutation {
+    type Output = i64;
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_type == ObjectType::TableVersion && self.target.matches(&row.object_id) {
+            self.deleted_count += 1;
+            return Ok(());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        _output: &mut ManifestBatchBuilder,
+        _index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        if self.deleted_count > 0 {
+            CopyOnWriteMutation::updated(self.deleted_count)
+        } else {
+            CopyOnWriteMutation::unchanged(0)
+        }
+    }
 }
 
 /// Information about a namespace stored in the manifest
@@ -306,8 +763,8 @@ pub struct ManifestNamespace {
     /// If true, root namespace tables use {table_name}.lance naming
     /// If false, they use namespace-prefixed names
     dir_listing_enabled: bool,
-    /// Whether to perform inline optimization (compaction and indexing) on the __manifest table
-    /// after every write. Defaults to true.
+    /// Deprecated compatibility option. Copy-on-write manifest rewrites always
+    /// replace data files and maintain indexes inline.
     inline_optimization_enabled: bool,
     /// Number of retries for commit operations on the manifest table.
     /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
@@ -341,11 +798,13 @@ impl std::fmt::Debug for ManifestNamespace {
 /// - Other errors: IO error with the operation description
 fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option<&str>) -> Error {
     match e {
-        // CommitConflict: version collision retries exhausted -> Throttling (safe to retry)
-        LanceError::CommitConflict { .. } => NamespaceError::Throttling {
-            message: format!("Too many concurrent writes, please retry later: {:?}", e),
+        // Safe-to-retry commit conflicts exhausted retries -> Throttling.
+        LanceError::CommitConflict { .. } | LanceError::RetryableCommitConflict { .. } => {
+            NamespaceError::Throttling {
+                message: format!("Too many concurrent writes, please retry later: {:?}", e),
+            }
+            .into()
         }
-        .into(),
         // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification
         // IncompatibleTransaction: incompatible concurrent change -> ConcurrentModification
         LanceError::TooMuchWriteContention { .. } | LanceError::IncompatibleTransaction { .. } => {
@@ -493,6 +952,31 @@ impl ManifestNamespace {
         )
     }
 
+    fn build_version_object_id_prefix(table_object_id: &str) -> String {
+        format!("{}{}", table_object_id, DELIMITER)
+    }
+
+    fn normalize_table_version_ranges(ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
+        let mut ranges = ranges
+            .iter()
+            .copied()
+            .filter(|(start, end)| start <= end)
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            if let Some((_, last_end)) = merged.last_mut()
+                && start <= last_end.saturating_add(1)
+            {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        merged
+    }
+
     /// Parse a version number from the version suffix of a table version object_id.
     ///
     /// The object_id is formatted as `{table_id}${zero_padded_version}`.
@@ -556,167 +1040,6 @@ impl ManifestNamespace {
         Ok(full_url.to_string())
     }
 
-    /// Perform inline optimization on the __manifest table.
-    ///
-    /// This method:
-    /// 1. Creates three indexes on the manifest table:
-    ///    - BTREE index on object_id for fast lookups
-    ///    - Bitmap index on object_type for filtering by type
-    ///    - LabelList index on base_objects for view dependencies
-    /// 2. Runs file compaction to merge small files
-    /// 3. Optimizes existing indices
-    ///
-    /// This is called automatically after writes when inline_optimization_enabled is true.
-    async fn run_inline_optimization(&self) -> Result<()> {
-        if !self.inline_optimization_enabled {
-            return Ok(());
-        }
-
-        // Get a mutable reference to the dataset to perform optimization
-        let mut dataset_guard = self.manifest_dataset.get_mut().await?;
-        let dataset: &mut Dataset = &mut dataset_guard;
-
-        // Step 1: Create indexes if they don't already exist
-        let indices = dataset.load_indices().await?;
-
-        // Check which indexes already exist
-        let has_object_id_index = indices.iter().any(|idx| idx.name == OBJECT_ID_INDEX_NAME);
-        let has_object_type_index = indices.iter().any(|idx| idx.name == OBJECT_TYPE_INDEX_NAME);
-        let has_base_objects_index = indices
-            .iter()
-            .any(|idx| idx.name == BASE_OBJECTS_INDEX_NAME);
-
-        // Create BTREE index on object_id
-        if !has_object_id_index {
-            log::debug!(
-                "Creating BTREE index '{}' on object_id for __manifest table",
-                OBJECT_ID_INDEX_NAME
-            );
-            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
-            if let Err(e) = dataset
-                .create_index(
-                    &["object_id"],
-                    IndexType::BTree,
-                    Some(OBJECT_ID_INDEX_NAME.to_string()),
-                    &params,
-                    true,
-                )
-                .await
-            {
-                log::warn!(
-                    "Failed to create BTREE index on object_id for __manifest table: {:?}. Query performance may be impacted.",
-                    e
-                );
-            } else {
-                log::info!(
-                    "Created BTREE index '{}' on object_id for __manifest table",
-                    OBJECT_ID_INDEX_NAME
-                );
-            }
-        }
-
-        // Create Bitmap index on object_type
-        if !has_object_type_index {
-            log::debug!(
-                "Creating Bitmap index '{}' on object_type for __manifest table",
-                OBJECT_TYPE_INDEX_NAME
-            );
-            let params = ScalarIndexParams::default();
-            if let Err(e) = dataset
-                .create_index(
-                    &["object_type"],
-                    IndexType::Bitmap,
-                    Some(OBJECT_TYPE_INDEX_NAME.to_string()),
-                    &params,
-                    true,
-                )
-                .await
-            {
-                log::warn!(
-                    "Failed to create Bitmap index on object_type for __manifest table: {:?}. Query performance may be impacted.",
-                    e
-                );
-            } else {
-                log::info!(
-                    "Created Bitmap index '{}' on object_type for __manifest table",
-                    OBJECT_TYPE_INDEX_NAME
-                );
-            }
-        }
-
-        // Create LabelList index on base_objects
-        if !has_base_objects_index {
-            log::debug!(
-                "Creating LabelList index '{}' on base_objects for __manifest table",
-                BASE_OBJECTS_INDEX_NAME
-            );
-            let params = ScalarIndexParams::default();
-            if let Err(e) = dataset
-                .create_index(
-                    &["base_objects"],
-                    IndexType::LabelList,
-                    Some(BASE_OBJECTS_INDEX_NAME.to_string()),
-                    &params,
-                    true,
-                )
-                .await
-            {
-                log::warn!(
-                    "Failed to create LabelList index on base_objects for __manifest table: {:?}. Query performance may be impacted.",
-                    e
-                );
-            } else {
-                log::info!(
-                    "Created LabelList index '{}' on base_objects for __manifest table",
-                    BASE_OBJECTS_INDEX_NAME
-                );
-            }
-        }
-
-        let should_compact_and_optimize =
-            dataset.count_fragments() >= MANIFEST_INLINE_OPTIMIZATION_FRAGMENT_THRESHOLD;
-
-        if !should_compact_and_optimize {
-            return Ok(());
-        }
-
-        // Step 2: Run file compaction
-        log::debug!("Running file compaction on __manifest table");
-        match compact_files(dataset, CompactionOptions::default(), None).await {
-            Ok(compaction_metrics) => {
-                if compaction_metrics.fragments_removed > 0 {
-                    log::info!(
-                        "Compacted __manifest table: removed {} fragments, added {} fragments",
-                        compaction_metrics.fragments_removed,
-                        compaction_metrics.fragments_added
-                    );
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to compact files for __manifest table: {:?}. Continuing with optimization.",
-                    e
-                );
-            }
-        }
-
-        // Step 3: Optimize indices
-        log::debug!("Optimizing indices on __manifest table");
-        match dataset.optimize_indices(&OptimizeOptions::default()).await {
-            Ok(_) => {
-                log::info!("Successfully optimized indices on __manifest table");
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to optimize indices on __manifest table: {:?}. Continuing anyway.",
-                    e
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     /// Get the manifest schema
     fn manifest_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
@@ -731,12 +1054,7 @@ impl ManifestNamespace {
             ),
             Field::new("object_type", DataType::Utf8, false),
             Field::new("location", DataType::Utf8, true),
-            Field::new("metadata", DataType::Utf8, true),
-            Field::new(
-                "base_objects",
-                DataType::List(Arc::new(Field::new("object_id", DataType::Utf8, true))),
-                true,
-            ),
+            json_field("metadata", true),
         ]))
     }
 
@@ -781,6 +1099,892 @@ impl ManifestNamespace {
                     message: format!("Column '{}' is not a string array", column_name),
                 })
             })
+    }
+
+    fn required_string_value<'a>(
+        array: &'a StringArray,
+        row: usize,
+        column_name: &str,
+    ) -> Result<&'a str> {
+        if array.is_null(row) {
+            return Err(NamespaceError::Internal {
+                message: format!("Manifest column '{}' has null at row {}", column_name, row),
+            }
+            .into());
+        }
+        Ok(array.value(row))
+    }
+
+    fn optional_string_value(array: &StringArray, row: usize) -> Option<String> {
+        (!array.is_null(row)).then(|| array.value(row).to_string())
+    }
+
+    fn metadata_column_values(
+        batch: &RecordBatch,
+        column_name: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let column = batch.column_by_name(column_name).ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Column '{}' not found", column_name),
+            })
+        })?;
+
+        if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+            return Ok((0..array.len())
+                .map(|row| Self::optional_string_value(array, row))
+                .collect());
+        }
+
+        if let Some(array) = column.as_any().downcast_ref::<LargeStringArray>() {
+            return Ok((0..array.len())
+                .map(|row| (!array.is_null(row)).then(|| array.value(row).to_string()))
+                .collect());
+        }
+
+        if let Some(array) = column.as_any().downcast_ref::<LargeBinaryArray>() {
+            return Ok((0..array.len())
+                .map(|row| (!array.is_null(row)).then(|| decode_json(array.value(row))))
+                .collect());
+        }
+
+        Err(NamespaceError::Internal {
+            message: format!(
+                "Column '{}' is not a supported metadata array: {:?}",
+                column_name,
+                column.data_type()
+            ),
+        }
+        .into())
+    }
+
+    fn projected_schema(dataset: &Dataset) -> Result<SchemaRef> {
+        let projected_columns = ["object_id", "object_type", "location", "metadata"];
+        let lance_schema = dataset.schema();
+        let fields: Vec<_> = projected_columns
+            .iter()
+            .filter_map(|name| {
+                let f = lance_schema.field(name)?;
+                Some(Field::new(*name, f.data_type(), f.nullable))
+            })
+            .collect();
+        Ok(Arc::new(ArrowSchema::new(fields)))
+    }
+
+    async fn manifest_projected_stream(dataset: &Dataset) -> Result<SendableRecordBatchStream> {
+        // Use the dataset's own schema so that old datasets with Utf8 metadata
+        // (instead of JSON/LargeBinary) stream correctly. The downstream
+        // rewrite path (metadata_column_values) handles both column types.
+        let schema = Self::projected_schema(dataset)?;
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["object_id", "object_type", "location", "metadata"])
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to project manifest columns: {:?}", e),
+                })
+            })?;
+        let stream = scanner.try_into_stream().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to create manifest stream: {:?}", e),
+            })
+        })?;
+        let stream = stream.map_err(|err| DataFusionError::External(Box::new(err)));
+        Ok(Box::pin(DatafusionRecordBatchStreamAdapter::new(
+            schema,
+            stream.fuse(),
+        )))
+    }
+
+    fn manifest_rewrite_commit_retries(&self) -> u32 {
+        self.commit_retries
+            .unwrap_or(DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES)
+    }
+
+    fn is_manifest_rewrite_retryable(err: &LanceError) -> bool {
+        matches!(
+            err,
+            LanceError::CommitConflict { .. }
+                | LanceError::RetryableCommitConflict { .. }
+                | LanceError::TooMuchWriteContention { .. }
+        )
+    }
+
+    async fn cleanup_uncommitted_overwrite_files(
+        dataset: &Dataset,
+        transaction: &lance::dataset::transaction::Transaction,
+    ) -> Result<()> {
+        let Operation::Overwrite { fragments, .. } = &transaction.operation else {
+            return Ok(());
+        };
+        let object_store = dataset.object_store(None).await?;
+        let data_dir = dataset.branch_location().path.join("data");
+
+        for fragment in fragments {
+            for data_file in &fragment.files {
+                if data_file.base_id.is_some() {
+                    continue;
+                }
+                let path = data_dir.clone().join(data_file.path.as_str());
+                match object_store.inner.delete(&path).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_uncommitted_index_uuids(
+        dataset: &Dataset,
+        index_uuids: &[Uuid],
+    ) -> Result<()> {
+        let object_store = dataset.object_store(None).await?;
+        for index_uuid in index_uuids {
+            let index_dir = dataset.indices_dir().join(index_uuid.to_string());
+            let mut files = object_store.inner.list(Some(&index_dir));
+            while let Some(file) = files.try_next().await? {
+                match object_store.inner.delete(&file.location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn value_row_id_schema(value_field: Field) -> SchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            value_field,
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]))
+    }
+
+    fn metadata_index_schema() -> SchemaRef {
+        Self::value_row_id_schema(json_field(VALUE_COLUMN_NAME, true))
+    }
+
+    fn metadata_index_stream(
+        receiver: mpsc::Receiver<std::result::Result<RecordBatch, DataFusionError>>,
+    ) -> SendableRecordBatchStream {
+        let schema = Self::metadata_index_schema();
+        let stream = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|batch| (batch, receiver))
+        });
+        Box::pin(DatafusionRecordBatchStreamAdapter::new(
+            schema,
+            stream.fuse(),
+        ))
+    }
+
+    fn metadata_index_params() -> ScalarIndexParams {
+        ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted)
+            .with_params(&InvertedIndexParams::default().lance_tokenizer("json".to_string()))
+    }
+
+    fn string_row_id_batch(
+        schema: SchemaRef,
+        values: Vec<String>,
+        row_ids: Vec<u64>,
+    ) -> Result<RecordBatch> {
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(values)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .map_err(Into::into)
+    }
+
+    fn object_id_index_stream(object_ids: BTreeMap<Arc<str>, u64>) -> SendableRecordBatchStream {
+        let schema =
+            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+        let stream_schema = schema.clone();
+        let stream = stream::unfold(
+            (object_ids.into_iter(), false, schema),
+            |state| async move {
+                let (mut iter, emitted, schema) = state;
+                let mut values = Vec::with_capacity(MANIFEST_INDEX_BATCH_SIZE);
+                let mut row_ids = Vec::with_capacity(MANIFEST_INDEX_BATCH_SIZE);
+                for _ in 0..MANIFEST_INDEX_BATCH_SIZE {
+                    let Some((value, row_id)) = iter.next() else {
+                        break;
+                    };
+                    values.push(value.to_string());
+                    row_ids.push(row_id);
+                }
+                if values.is_empty() {
+                    if emitted {
+                        None
+                    } else {
+                        let batch = Self::string_row_id_batch(schema.clone(), values, row_ids)
+                            .map_err(|err| DataFusionError::External(Box::new(err)));
+                        Some((batch, (iter, true, schema)))
+                    }
+                } else {
+                    let batch = Self::string_row_id_batch(schema.clone(), values, row_ids)
+                        .map_err(|err| DataFusionError::External(Box::new(err)));
+                    Some((batch, (iter, true, schema)))
+                }
+            },
+        );
+        Box::pin(DatafusionRecordBatchStreamAdapter::new(
+            stream_schema,
+            stream.fuse(),
+        ))
+    }
+
+    fn object_type_index_stream(
+        object_types: BTreeMap<&'static str, RoaringBitmap>,
+    ) -> SendableRecordBatchStream {
+        let schema =
+            Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
+        let stream_schema = schema.clone();
+        let entries = object_types
+            .into_iter()
+            .map(|(value, bitmap)| {
+                (
+                    value,
+                    Box::new(bitmap.into_iter()) as Box<dyn Iterator<Item = u32> + Send>,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        let stream = stream::unfold(
+            (entries, None, false, schema),
+            |(mut entries, mut current, emitted, schema)| async move {
+                let mut values = Vec::with_capacity(MANIFEST_INDEX_BATCH_SIZE);
+                let mut row_ids = Vec::with_capacity(MANIFEST_INDEX_BATCH_SIZE);
+                while values.len() < MANIFEST_INDEX_BATCH_SIZE {
+                    if current.is_none() {
+                        current = entries.next();
+                    }
+                    let Some((value, iter)) = current.as_mut() else {
+                        break;
+                    };
+                    if let Some(row_id) = iter.next() {
+                        values.push((*value).to_string());
+                        row_ids.push(u64::from(row_id));
+                    } else {
+                        current = None;
+                    }
+                }
+
+                if values.is_empty() {
+                    if emitted {
+                        None
+                    } else {
+                        let batch = Self::string_row_id_batch(schema.clone(), values, row_ids)
+                            .map_err(|err| DataFusionError::External(Box::new(err)));
+                        Some((batch, (entries, current, true, schema)))
+                    }
+                } else {
+                    let batch = Self::string_row_id_batch(schema.clone(), values, row_ids)
+                        .map_err(|err| DataFusionError::External(Box::new(err)));
+                    Some((batch, (entries, current, true, schema)))
+                }
+            },
+        );
+        Box::pin(DatafusionRecordBatchStreamAdapter::new(
+            stream_schema,
+            stream.fuse(),
+        ))
+    }
+
+    async fn train_manifest_index(
+        dataset: &Dataset,
+        input: ManifestIndexBuildInput,
+        index_uuid: Uuid,
+    ) -> Result<ManifestTrainedIndex> {
+        let index_store = LanceIndexStore::from_dataset_for_new(dataset, &index_uuid.to_string())?;
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name(&input.params.index_type)?;
+        let training_request = plugin
+            .new_training_request(input.params.params.as_deref().unwrap_or("{}"), &input.field)?;
+        let created_index = plugin
+            .train_index(
+                input.stream,
+                &index_store,
+                training_request,
+                None,
+                noop_progress(),
+            )
+            .await?;
+
+        Ok(ManifestTrainedIndex {
+            index_name: input.index_name,
+            column_name: input.column_name,
+            uuid: index_uuid,
+            created_index,
+        })
+    }
+
+    fn manifest_index_metadata(
+        lance_schema: &lance_core::datatypes::Schema,
+        fragment_bitmap: &RoaringBitmap,
+        dataset_version: u64,
+        trained_index: ManifestTrainedIndex,
+    ) -> Result<IndexMetadata> {
+        Ok(IndexMetadata {
+            uuid: trained_index.uuid,
+            fields: vec![lance_schema.field_id(trained_index.column_name)?],
+            name: trained_index.index_name.to_string(),
+            dataset_version,
+            fragment_bitmap: Some(fragment_bitmap.clone()),
+            index_details: Some(Arc::new(trained_index.created_index.index_details)),
+            index_version: trained_index.created_index.index_version as i32,
+            created_at: None,
+            base_id: None,
+            files: trained_index.created_index.files,
+        })
+    }
+
+    async fn build_manifest_index(
+        dataset: &Dataset,
+        lance_schema: &lance_core::datatypes::Schema,
+        input: ManifestIndexBuildInput,
+        fragment_bitmap: &RoaringBitmap,
+        index_uuid: Uuid,
+    ) -> Result<IndexMetadata> {
+        let trained_index = Self::train_manifest_index(dataset, input, index_uuid).await?;
+        Self::manifest_index_metadata(
+            lance_schema,
+            fragment_bitmap,
+            dataset.manifest().version,
+            trained_index,
+        )
+    }
+
+    async fn await_metadata_index_task(
+        task: tokio::task::JoinHandle<Result<ManifestTrainedIndex>>,
+    ) -> Result<ManifestTrainedIndex> {
+        task.await.map_err(|err| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Manifest metadata index build task failed: {}", err),
+            })
+        })?
+    }
+
+    fn spawn_metadata_index_build(
+        dataset: Arc<Dataset>,
+        receiver: mpsc::Receiver<std::result::Result<RecordBatch, DataFusionError>>,
+        index_uuid: Uuid,
+    ) -> tokio::task::JoinHandle<Result<ManifestTrainedIndex>> {
+        tokio::spawn(async move {
+            Self::train_manifest_index(
+                &dataset,
+                ManifestIndexBuildInput {
+                    index_name: METADATA_INDEX_NAME,
+                    column_name: "metadata",
+                    params: Self::metadata_index_params(),
+                    field: json_field(VALUE_COLUMN_NAME, true),
+                    stream: Self::metadata_index_stream(receiver),
+                },
+                index_uuid,
+            )
+            .await
+        })
+    }
+
+    async fn build_manifest_indices(
+        dataset: &Dataset,
+        transaction: &Transaction,
+        index_data: ManifestIndexAccumulator,
+        index_uuids: &mut Vec<Uuid>,
+        metadata_index_task: tokio::task::JoinHandle<Result<ManifestTrainedIndex>>,
+    ) -> Result<Vec<IndexMetadata>> {
+        let Operation::Overwrite {
+            schema, fragments, ..
+        } = &transaction.operation
+        else {
+            return Err(NamespaceError::Internal {
+                message: "Manifest rewrite transaction is not an overwrite".to_string(),
+            }
+            .into());
+        };
+        if fragments.len() > 1 {
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "Manifest rewrite expected a single fragment, found {}",
+                    fragments.len()
+                ),
+            }
+            .into());
+        }
+        let fragment_bitmap = RoaringBitmap::from_iter(0..fragments.len() as u32);
+        let ManifestIndexAccumulator {
+            object_ids,
+            object_types,
+            ..
+        } = index_data;
+        let object_id_uuid = Uuid::new_v4();
+        let object_type_uuid = Uuid::new_v4();
+        index_uuids.extend([object_id_uuid, object_type_uuid]);
+
+        let object_id_index_fut = Self::build_manifest_index(
+            dataset,
+            schema,
+            ManifestIndexBuildInput {
+                index_name: OBJECT_ID_INDEX_NAME,
+                column_name: "object_id",
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                field: Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+                stream: Self::object_id_index_stream(object_ids),
+            },
+            &fragment_bitmap,
+            object_id_uuid,
+        );
+        let object_type_index_fut = Self::build_manifest_index(
+            dataset,
+            schema,
+            ManifestIndexBuildInput {
+                index_name: OBJECT_TYPE_INDEX_NAME,
+                column_name: "object_type",
+                params: ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                field: Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+                stream: Self::object_type_index_stream(object_types),
+            },
+            &fragment_bitmap,
+            object_type_uuid,
+        );
+
+        let metadata_index_fut = async {
+            let trained_index = Self::await_metadata_index_task(metadata_index_task).await?;
+            Self::manifest_index_metadata(
+                schema,
+                &fragment_bitmap,
+                dataset.manifest().version,
+                trained_index,
+            )
+        };
+
+        let (object_id_index, object_type_index, metadata_index) = futures::join!(
+            object_id_index_fut,
+            object_type_index_fut,
+            metadata_index_fut
+        );
+
+        Ok(vec![object_id_index?, object_type_index?, metadata_index?])
+    }
+
+    fn lock_manifest_rewrite_shared<M: ManifestStreamMutation>(
+        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
+    ) -> Result<StdMutexGuard<'_, ManifestRewriteShared<M>>> {
+        shared.lock().map_err(|_| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: "Manifest rewrite state mutex was poisoned".to_string(),
+            })
+        })
+    }
+
+    fn set_manifest_rewrite_error<M: ManifestStreamMutation>(
+        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
+        err: LanceError,
+    ) {
+        match shared.lock() {
+            Ok(mut guard) => {
+                guard.error = Some(err);
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.error = Some(err);
+            }
+        }
+    }
+
+    fn take_manifest_rewrite_error<M: ManifestStreamMutation>(
+        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
+    ) -> Result<Option<LanceError>> {
+        let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
+        Ok(guard.error.take())
+    }
+
+    async fn process_manifest_rewrite_batch<M: ManifestStreamMutation>(
+        batch: RecordBatch,
+        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
+    ) -> Result<Option<RecordBatch>> {
+        let object_ids = Self::get_string_column(&batch, "object_id")?;
+        let object_types = Self::get_string_column(&batch, "object_type")?;
+        let locations = Self::get_string_column(&batch, "location")?;
+        let metadatas = Self::metadata_column_values(&batch, "metadata")?;
+        let (batch, metadata_index_batch, sender) = {
+            let mut output = ManifestBatchBuilder::new();
+            let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
+            let mut index_data = guard.index_data.take().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: "Manifest rewrite index state is unavailable".to_string(),
+                })
+            })?;
+            for (row, metadata) in metadatas.into_iter().enumerate().take(batch.num_rows()) {
+                let row_value = ManifestRowValue {
+                    object_id: Self::required_string_value(object_ids, row, "object_id")?
+                        .to_string(),
+                    object_type: ObjectType::parse(Self::required_string_value(
+                        object_types,
+                        row,
+                        "object_type",
+                    )?)?,
+                    location: Self::optional_string_value(locations, row),
+                    metadata,
+                };
+                guard
+                    .mutation
+                    .process_existing_row(row_value, &mut output, &mut index_data)?;
+            }
+            guard.index_data = Some(index_data);
+            if output.is_empty() {
+                return Ok(None);
+            }
+            let sender = Self::metadata_index_sender(&guard)?;
+            let (batch, metadata_index_batch) = output.finish()?;
+            (batch, metadata_index_batch, sender)
+        };
+        Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
+        Ok(Some(batch))
+    }
+
+    async fn finish_manifest_rewrite_stream<M: ManifestStreamMutation>(
+        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
+    ) -> Result<Option<RecordBatch>> {
+        let maybe_batch = {
+            let mut output = ManifestBatchBuilder::new();
+            let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
+            let mut index_data = guard.index_data.take().ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: "Manifest rewrite index state is unavailable".to_string(),
+                })
+            })?;
+            guard.mutation.append_rows(&mut output, &mut index_data)?;
+            let result = guard.mutation.finish();
+            let force_empty_batch = index_data.row_count == 0;
+            guard.result = Some(result);
+            guard.index_data = Some(index_data);
+            if output.is_empty() && !force_empty_batch {
+                guard.metadata_index_sender.take();
+                None
+            } else {
+                let sender = guard.metadata_index_sender.take().ok_or_else(|| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: "Manifest metadata index stream is already closed".to_string(),
+                    })
+                })?;
+                let (batch, metadata_index_batch) = output.finish()?;
+                Some((batch, metadata_index_batch, sender))
+            }
+        };
+
+        if let Some((batch, metadata_index_batch, sender)) = maybe_batch {
+            Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
+            Ok(Some(batch))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn manifest_rewrite_output_stream<M: ManifestStreamMutation + 'static>(
+        source: SendableRecordBatchStream,
+        shared: Arc<StdMutex<ManifestRewriteShared<M>>>,
+    ) -> SendableRecordBatchStream {
+        enum Phase {
+            Source,
+            Finish,
+            Done,
+        }
+
+        let schema = Self::manifest_schema();
+        let stream = stream::unfold(
+            (source, shared, Phase::Source),
+            |(mut source, shared, mut phase)| async move {
+                loop {
+                    match phase {
+                        Phase::Source => match source.next().await {
+                            Some(Ok(batch)) => {
+                                match Self::process_manifest_rewrite_batch(batch, &shared).await {
+                                    Ok(Some(batch)) => {
+                                        return Some((Ok(batch), (source, shared, phase)));
+                                    }
+                                    Ok(None) => continue,
+                                    Err(err) => {
+                                        let message = err.to_string();
+                                        Self::set_manifest_rewrite_error(&shared, err);
+                                        return Some((
+                                            Err(DataFusionError::External(Box::new(
+                                                std::io::Error::other(message),
+                                            ))),
+                                            (source, shared, Phase::Done),
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(Err(err)) => {
+                                return Some((Err(err), (source, shared, Phase::Done)));
+                            }
+                            None => phase = Phase::Finish,
+                        },
+                        Phase::Finish => {
+                            phase = Phase::Done;
+                            match Self::finish_manifest_rewrite_stream(&shared).await {
+                                Ok(Some(batch)) => {
+                                    return Some((Ok(batch), (source, shared, phase)));
+                                }
+                                Ok(None) => continue,
+                                Err(err) => {
+                                    let message = err.to_string();
+                                    Self::set_manifest_rewrite_error(&shared, err);
+                                    return Some((
+                                        Err(DataFusionError::External(Box::new(
+                                            std::io::Error::other(message),
+                                        ))),
+                                        (source, shared, Phase::Done),
+                                    ));
+                                }
+                            }
+                        }
+                        Phase::Done => return None,
+                    }
+                }
+            },
+        );
+        Box::pin(DatafusionRecordBatchStreamAdapter::new(
+            schema,
+            stream.fuse(),
+        ))
+    }
+
+    fn take_manifest_rewrite_result<M: ManifestStreamMutation>(
+        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
+    ) -> Result<(CopyOnWriteMutation<M::Output>, ManifestIndexAccumulator)> {
+        let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
+        let result = guard.result.take().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: "Manifest rewrite stream did not finish".to_string(),
+            })
+        })?;
+        let index_data = guard.index_data.take().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: "Manifest rewrite index state is unavailable".to_string(),
+            })
+        })?;
+        Ok((result, index_data))
+    }
+
+    fn metadata_index_sender<M: ManifestStreamMutation>(
+        guard: &ManifestRewriteShared<M>,
+    ) -> Result<mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>> {
+        let sender = guard.metadata_index_sender.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: "Manifest metadata index stream is already closed".to_string(),
+            })
+        })?;
+        Ok(sender.clone())
+    }
+
+    async fn send_metadata_index_batch(
+        sender: mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        sender
+            .send(Ok(batch))
+            .await
+            .map_err(|_| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: "Manifest metadata index build stopped before rewrite finished"
+                        .to_string(),
+                })
+            })
+            .map(|_| ())
+    }
+
+    fn close_metadata_index_stream<M: ManifestStreamMutation>(
+        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
+    ) {
+        match shared.lock() {
+            Ok(mut guard) => {
+                guard.metadata_index_sender.take();
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.metadata_index_sender.take();
+            }
+        }
+    }
+
+    async fn rewrite_manifest<M, F>(
+        &self,
+        operation: &str,
+        mut make_mutation: F,
+    ) -> Result<M::Output>
+    where
+        M: ManifestStreamMutation + 'static,
+        F: FnMut() -> M,
+    {
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
+        let max_retries = self.manifest_rewrite_commit_retries();
+        let mut retries = 0;
+
+        loop {
+            let dataset_guard = self.manifest_dataset.get().await?;
+            let dataset = Arc::new(dataset_guard.clone());
+            drop(dataset_guard);
+
+            let source = Self::manifest_projected_stream(&dataset).await?;
+            let metadata_index_uuid = Uuid::new_v4();
+            let mut index_uuids = vec![metadata_index_uuid];
+            let (metadata_index_sender, metadata_index_receiver) =
+                mpsc::channel(MANIFEST_METADATA_INDEX_CHANNEL_SIZE);
+            let metadata_index_task = Self::spawn_metadata_index_build(
+                dataset.clone(),
+                metadata_index_receiver,
+                metadata_index_uuid,
+            );
+            let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(
+                make_mutation(),
+                metadata_index_sender,
+            )));
+            let output_stream = Self::manifest_rewrite_output_stream(source, shared.clone());
+            let write_params = WriteParams {
+                mode: WriteMode::Overwrite,
+                session: self.session.clone(),
+                max_rows_per_file: u32::MAX as usize,
+                skip_auto_cleanup: true,
+                ..WriteParams::default()
+            };
+
+            let transaction = match InsertBuilder::new(dataset.clone())
+                .with_params(&write_params)
+                .execute_uncommitted_stream(output_stream)
+                .await
+            {
+                Ok(transaction) => transaction,
+                Err(err) => {
+                    Self::close_metadata_index_stream(&shared);
+                    let _ = Self::await_metadata_index_task(metadata_index_task).await;
+                    if let Err(cleanup_err) =
+                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
+                    {
+                        log::warn!(
+                            "Failed to clean up uncommitted manifest metadata index files after rewrite stream error: {:?}",
+                            cleanup_err
+                        );
+                    }
+                    if let Some(stream_err) = Self::take_manifest_rewrite_error(&shared)? {
+                        return Err(stream_err);
+                    }
+                    return Err(convert_lance_commit_error(&err, operation, None));
+                }
+            };
+
+            let (mutation, index_data) = Self::take_manifest_rewrite_result(&shared)?;
+            if !mutation.has_changes {
+                let _ = Self::await_metadata_index_task(metadata_index_task).await;
+                if let Err(cleanup_err) =
+                    Self::cleanup_uncommitted_overwrite_files(&dataset, &transaction).await
+                {
+                    log::warn!(
+                        "Failed to clean up uncommitted no-op manifest overwrite files: {:?}",
+                        cleanup_err
+                    );
+                }
+                if let Err(cleanup_err) =
+                    Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
+                {
+                    log::warn!(
+                        "Failed to clean up uncommitted no-op manifest index files: {:?}",
+                        cleanup_err
+                    );
+                }
+                return Ok(mutation.result);
+            }
+
+            let replacement_indices = match Self::build_manifest_indices(
+                &dataset,
+                &transaction,
+                index_data,
+                &mut index_uuids,
+                metadata_index_task,
+            )
+            .await
+            {
+                Ok(indices) => indices,
+                Err(err) => {
+                    if let Err(cleanup_err) =
+                        Self::cleanup_uncommitted_overwrite_files(&dataset, &transaction).await
+                    {
+                        log::warn!(
+                            "Failed to clean up uncommitted manifest data files after index build error: {:?}",
+                            cleanup_err
+                        );
+                    }
+                    if let Err(cleanup_err) =
+                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
+                    {
+                        log::warn!(
+                            "Failed to clean up uncommitted manifest index files after index build error: {:?}",
+                            cleanup_err
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+
+            let cleanup_transaction = transaction.clone();
+            let result = CommitBuilder::new(dataset.clone())
+                .with_max_retries(0)
+                .with_skip_auto_cleanup(true)
+                .with_replacement_indices(replacement_indices)
+                .execute(transaction)
+                .await;
+
+            match result {
+                Ok(new_dataset) => {
+                    self.manifest_dataset.set_latest(new_dataset).await;
+                    return Ok(mutation.result);
+                }
+                Err(err) if Self::is_manifest_rewrite_retryable(&err) && retries < max_retries => {
+                    if let Err(cleanup_err) =
+                        Self::cleanup_uncommitted_overwrite_files(&dataset, &cleanup_transaction)
+                            .await
+                    {
+                        log::warn!(
+                            "Failed to clean up uncommitted manifest overwrite files after retryable commit error: {:?}",
+                            cleanup_err
+                        );
+                    }
+                    if let Err(cleanup_err) =
+                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
+                    {
+                        log::warn!(
+                            "Failed to clean up uncommitted manifest index files after retryable commit error: {:?}",
+                            cleanup_err
+                        );
+                    }
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(retries)))
+                        .await;
+                }
+                Err(err) => {
+                    if let Err(cleanup_err) =
+                        Self::cleanup_uncommitted_overwrite_files(&dataset, &cleanup_transaction)
+                            .await
+                    {
+                        log::warn!(
+                            "Failed to clean up uncommitted manifest overwrite files after commit error: {:?}",
+                            cleanup_err
+                        );
+                    }
+                    if let Err(cleanup_err) =
+                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
+                    {
+                        log::warn!(
+                            "Failed to clean up uncommitted manifest index files after commit error: {:?}",
+                            cleanup_err
+                        );
+                    }
+                    return Err(convert_lance_commit_error(&err, operation, None));
+                }
+            }
+        }
     }
 
     /// Check if the manifest contains an object with the given ID
@@ -855,10 +2059,9 @@ impl ManifestNamespace {
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
             let location_array = Self::get_string_column(&batch, "location")?;
-            let metadata_array = Self::get_string_column(&batch, "metadata")?;
+            let metadata_values = Self::metadata_column_values(&batch, "metadata")?;
             let location = location_array.value(0).to_string();
-            let metadata = if !metadata_array.is_null(0) {
-                let metadata_str = metadata_array.value(0);
+            let metadata = if let Some(metadata_str) = &metadata_values[0] {
                 match serde_json::from_str::<HashMap<String, String>>(metadata_str) {
                     Ok(map) => Some(map),
                     Err(e) => {
@@ -984,203 +2187,55 @@ impl ManifestNamespace {
         object_type: ObjectType,
         location: Option<String>,
     ) -> Result<()> {
-        self.insert_into_manifest_with_metadata(
-            vec![ManifestEntry {
-                object_id,
-                object_type,
-                location,
-                metadata: None,
-            }],
-            None,
-        )
+        self.insert_into_manifest_with_metadata(vec![ManifestEntry {
+            object_id,
+            object_type,
+            location,
+            metadata: None,
+        }])
         .await
     }
 
-    /// Insert one or more entries into the manifest table with metadata and base_objects.
+    /// Insert one or more entries into the manifest table with metadata.
     ///
     /// This is the unified entry point for both single and batch inserts.
-    /// Uses a single MergeInsert operation to insert all entries at once.
     /// If any entry already exists (matching object_id), the entire batch fails.
     pub async fn insert_into_manifest_with_metadata(
         &self,
         entries: Vec<ManifestEntry>,
-        base_objects: Option<Vec<String>>,
     ) -> Result<()> {
-        self.merge_into_manifest_with_metadata(entries, base_objects, WhenMatched::Fail)
+        self.merge_into_manifest_with_metadata(entries, WhenMatched::Fail)
             .await
     }
 
-    async fn upsert_into_manifest_with_metadata(
-        &self,
-        entries: Vec<ManifestEntry>,
-        base_objects: Option<Vec<String>>,
-    ) -> Result<()> {
-        self.merge_into_manifest_with_metadata(entries, base_objects, WhenMatched::UpdateAll)
+    async fn upsert_into_manifest_with_metadata(&self, entries: Vec<ManifestEntry>) -> Result<()> {
+        self.merge_into_manifest_with_metadata(entries, WhenMatched::UpdateAll)
             .await
     }
 
     async fn merge_into_manifest_with_metadata(
         &self,
         entries: Vec<ManifestEntry>,
-        base_objects: Option<Vec<String>>,
         when_matched: WhenMatched,
     ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
-        let schema = Self::manifest_schema();
-
-        let mut object_ids = Vec::with_capacity(entries.len());
-        let mut object_types = Vec::with_capacity(entries.len());
-        let mut locations: Vec<Option<String>> = Vec::with_capacity(entries.len());
-        let mut metadatas: Vec<Option<String>> = Vec::with_capacity(entries.len());
-
-        let string_builder = StringBuilder::new();
-        let mut list_builder = ListBuilder::new(string_builder).with_field(Arc::new(Field::new(
-            "object_id",
-            DataType::Utf8,
-            true,
-        )));
-
-        for (i, entry) in entries.iter().enumerate() {
-            object_ids.push(entry.object_id.as_str());
-            object_types.push(entry.object_type.as_str());
-            locations.push(entry.location.clone());
-            metadatas.push(entry.metadata.clone());
-
-            // Only the first entry gets the base_objects (for single-entry inserts
-            // with base_objects like view creation); batch entries use null.
-            if i == 0 {
-                match &base_objects {
-                    Some(objects) => {
-                        for obj in objects {
-                            list_builder.values().append_value(obj);
-                        }
-                        list_builder.append(true);
-                    }
-                    None => {
-                        list_builder.append_null();
-                    }
-                }
-            } else {
-                list_builder.append_null();
-            }
-        }
-
-        let base_objects_array = list_builder.finish();
-
-        let location_array: Arc<dyn Array> = Arc::new(StringArray::from(
-            locations.iter().map(|l| l.as_deref()).collect::<Vec<_>>(),
-        ));
-
-        let metadata_array: Arc<dyn Array> = Arc::new(StringArray::from(
-            metadatas.iter().map(|m| m.as_deref()).collect::<Vec<_>>(),
-        ));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(object_ids)),
-                Arc::new(StringArray::from(object_types.to_vec())),
-                location_array,
-                metadata_array,
-                Arc::new(base_objects_array),
-            ],
-        )
-        .map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to create manifest entries: {:?}", e),
-            })
-        })?;
-
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-
-        // Use MergeInsert so callers can choose fail-on-existing inserts or metadata upserts.
-        let _mutation_guard = self.manifest_mutation_lock.lock().await;
-        let dataset_guard = self.manifest_dataset.get().await?;
-        let dataset_arc = Arc::new(dataset_guard.clone());
-        drop(dataset_guard); // Drop read guard before merge insert
-
-        let mut merge_builder =
-            MergeInsertBuilder::try_new(dataset_arc, vec!["object_id".to_string()]).map_err(
-                |e| {
-                    lance_core::Error::from(NamespaceError::Internal {
-                        message: format!("Failed to create merge builder: {:?}", e),
-                    })
-                },
-            )?;
-        merge_builder.when_matched(when_matched);
-        merge_builder.when_not_matched(WhenNotMatched::InsertAll);
-        // Use conflict_retries to handle cross-process races on manifest mutations.
-        merge_builder.conflict_retries(5);
-        // TODO: after BTREE index creation on object_id, has_scalar_index=true causes
-        // MergeInsert to use V1 path which lacks bloom filters for conflict detection. This
-        // results in (Some, None) filter mismatch when rebasing against V2 operations.
-        // Setting use_index=false ensures all operations consistently use V2 path.
-        merge_builder.use_index(false);
-        if let Some(retries) = self.commit_retries {
-            merge_builder.commit_retries(retries);
-        }
-
-        let (new_dataset_arc, _merge_stats) = merge_builder
-            .try_build()
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to build merge: {:?}", e),
-                })
-            })?
-            .execute_reader(Box::new(reader))
-            .await
-            .map_err(|e| {
-                convert_lance_commit_error(&e, "Failed to execute merge insert into manifest", None)
-            })?;
-
-        let new_dataset = Arc::try_unwrap(new_dataset_arc).unwrap_or_else(|arc| (*arc).clone());
-        self.manifest_dataset.set_latest(new_dataset).await;
-
-        // Run inline optimization after write
-        if let Err(e) = self.run_inline_optimization().await {
-            log::warn!(
-                "Unexpected failure when running inline optimization: {:?}",
-                e
-            );
-        }
-
-        Ok(())
+        self.rewrite_manifest("Failed to overwrite manifest", || {
+            UpsertManifestMutation::new(entries.clone(), when_matched.clone())
+        })
+        .await
     }
 
     /// Delete an entry from the manifest table
     pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
-        let predicate = format!("object_id = '{}'", object_id);
-
-        // Get dataset and use DeleteBuilder with configured retries
-        let _mutation_guard = self.manifest_mutation_lock.lock().await;
-        let dataset_guard = self.manifest_dataset.get().await?;
-        let dataset = Arc::new(dataset_guard.clone());
-        drop(dataset_guard); // Drop read guard before delete
-
-        let new_dataset = DeleteBuilder::new(dataset, &predicate)
-            .execute()
-            .await
-            .map_err(|e| convert_lance_commit_error(&e, "Failed to delete", None))?;
-
-        // Update the wrapper with the new dataset
-        self.manifest_dataset
-            .set_latest(
-                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
-            )
-            .await;
-
-        // Run inline optimization after delete
-        if let Err(e) = self.run_inline_optimization().await {
-            log::warn!(
-                "Unexpected failure when running inline optimization: {:?}",
-                e
-            );
-        }
-
-        Ok(())
+        let object_id = object_id.to_string();
+        self.rewrite_manifest("Failed to delete from manifest", || DeleteObjectMutation {
+            object_id: object_id.clone(),
+            deleted: false,
+        })
+        .await
     }
 
     /// Query the manifest for all versions of a table, sorted by version.
@@ -1223,13 +2278,12 @@ impl ManifestNamespace {
                 continue;
             }
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
-            let metadata_array = Self::get_string_column(&batch, "metadata")?;
-            for i in 0..batch.num_rows() {
+            let metadata_values = Self::metadata_column_values(&batch, "metadata")?;
+            for (i, metadata) in metadata_values.iter().enumerate().take(batch.num_rows()) {
                 let oid = object_id_array.value(i);
                 // Parse version from object_id
                 if let Some(version) = Self::parse_version_from_object_id(oid) {
-                    let metadata_str = metadata_array.value(i).to_string();
-                    versions.push((version, metadata_str));
+                    versions.push((version, metadata.clone().unwrap_or_default()));
                 }
             }
         }
@@ -1289,11 +2343,22 @@ impl ManifestNamespace {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let metadata_array = Self::get_string_column(&batch, "metadata")?;
-            return Ok(Some(metadata_array.value(0).to_string()));
+            let metadata_values = Self::metadata_column_values(&batch, "metadata")?;
+            return Ok(metadata_values[0].clone());
         }
 
         Ok(None)
+    }
+
+    async fn delete_table_version_rows_by_object_ids(&self, object_ids: &[String]) -> Result<i64> {
+        let object_ids = object_ids.iter().cloned().collect::<HashSet<_>>();
+        self.rewrite_manifest("Failed to delete table versions from manifest", || {
+            DeleteTableVersionsMutation {
+                target: DeleteTableVersionsTarget::ObjectIds(object_ids.clone()),
+                deleted_count: 0,
+            }
+        })
+        .await
     }
 
     /// Delete table version entries from the manifest for a given table and version ranges.
@@ -1302,90 +2367,55 @@ impl ManifestNamespace {
     /// `object_type = 'table_version'` entries whose object_id matches
     /// `{object_id}${zero_padded_version}`.
     ///
-    /// Builds a single filter expression covering all version ranges and executes
-    /// one bulk delete operation instead of deleting versions one at a time.
+    /// Applies the ranges while streaming the manifest rewrite, without expanding
+    /// sparse ranges into every possible version object id.
     pub async fn delete_table_versions(
         &self,
         object_id: &str,
         ranges: &[(i64, i64)],
     ) -> Result<i64> {
-        if ranges.is_empty() {
-            return Ok(0);
-        }
-
-        // Collect all object_ids to delete (both new zero-padded and legacy formats)
-        let mut object_id_conditions: Vec<String> = Vec::new();
-        for (start, end) in ranges {
-            for version in *start..=*end {
-                let oid = Self::build_version_object_id(object_id, version);
-                let escaped = oid.replace('\'', "''");
-                object_id_conditions.push(format!("'{}'", escaped));
-            }
-        }
-
-        if object_id_conditions.is_empty() {
-            return Ok(0);
-        }
-
-        // First, count how many entries exist so we can report the deleted count
-        let in_list = object_id_conditions.join(", ");
-        let filter = format!(
-            "object_type = 'table_version' AND object_id IN ({})",
-            in_list
-        );
-
-        let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {:?}", e),
-            })
-        })?;
-        scanner.project(&["object_id", "location"]).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {:?}", e),
-            })
-        })?;
-        let batches = Self::execute_scanner(scanner).await?;
-        let deleted_count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-
-        if deleted_count == 0 {
-            return Ok(0);
-        }
-
-        // Execute a single bulk delete with the combined filter
-        let _mutation_guard = self.manifest_mutation_lock.lock().await;
-        let dataset_guard = self.manifest_dataset.get().await?;
-        let dataset = Arc::new(dataset_guard.clone());
-        drop(dataset_guard);
-
-        let new_dataset = DeleteBuilder::new(dataset, &filter)
-            .execute()
+        self.batch_delete_table_versions_by_ranges(&[(object_id.to_string(), ranges.to_vec())])
             .await
-            .map_err(|e| {
-                convert_lance_commit_error(&e, "Failed to batch delete table versions", None)
-            })?;
+    }
 
-        self.manifest_dataset
-            .set_latest(
-                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
-            )
-            .await;
-
-        if let Err(e) = self.run_inline_optimization().await {
-            log::warn!(
-                "Unexpected failure when running inline optimization: {:?}",
-                e
-            );
+    /// Atomically delete table version entries from the manifest for multiple
+    /// tables and version ranges.
+    pub async fn batch_delete_table_versions_by_ranges(
+        &self,
+        table_ranges: &[(String, Vec<(i64, i64)>)],
+    ) -> Result<i64> {
+        let targets = table_ranges
+            .iter()
+            .filter_map(|(object_id, ranges)| {
+                let ranges = Self::normalize_table_version_ranges(ranges);
+                if ranges.is_empty() {
+                    None
+                } else {
+                    Some(DeleteTableVersionRangeTarget {
+                        object_id_prefix: Self::build_version_object_id_prefix(object_id),
+                        ranges,
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok(0);
         }
 
-        Ok(deleted_count)
+        self.rewrite_manifest("Failed to delete table versions from manifest", || {
+            DeleteTableVersionsMutation {
+                target: DeleteTableVersionsTarget::Ranges(targets.clone()),
+                deleted_count: 0,
+            }
+        })
+        .await
     }
 
     /// Atomically delete table version entries from the manifest by their object_ids.
     ///
     /// This method supports multi-table transactional deletion: all specified
     /// object_ids (which may span multiple tables) are deleted in a single atomic
-    /// `DeleteBuilder` operation. Either all entries are removed or none are.
+    /// copy-on-write manifest rewrite. Either all entries are removed or none are.
     ///
     /// Object IDs are formatted as `{table_id}${version}`.
     pub async fn batch_delete_table_versions_by_object_ids(
@@ -1396,70 +2426,8 @@ impl ManifestNamespace {
             return Ok(0);
         }
 
-        let in_list: String = object_ids
-            .iter()
-            .map(|oid| {
-                let escaped = oid.replace('\'', "''");
-                format!("'{}'", escaped)
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let filter = format!(
-            "object_type = 'table_version' AND object_id IN ({})",
-            in_list
-        );
-
-        // Count how many entries exist so we can report the deleted count
-        let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {:?}", e),
-            })
-        })?;
-        scanner.project(&["object_id", "location"]).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {:?}", e),
-            })
-        })?;
-        let batches = Self::execute_scanner(scanner).await?;
-        let deleted_count: i64 = batches.iter().map(|b| b.num_rows() as i64).sum();
-
-        if deleted_count == 0 {
-            return Ok(0);
-        }
-
-        // Execute a single atomic bulk delete covering all tables
-        let _mutation_guard = self.manifest_mutation_lock.lock().await;
-        let dataset_guard = self.manifest_dataset.get().await?;
-        let dataset = Arc::new(dataset_guard.clone());
-        drop(dataset_guard);
-
-        let new_dataset = DeleteBuilder::new(dataset, &filter)
-            .execute()
+        self.delete_table_version_rows_by_object_ids(object_ids)
             .await
-            .map_err(|e| {
-                convert_lance_commit_error(
-                    &e,
-                    "Failed to batch delete table versions across multiple tables",
-                    None,
-                )
-            })?;
-
-        self.manifest_dataset
-            .set_latest(
-                Arc::try_unwrap(new_dataset.new_dataset).unwrap_or_else(|arc| (*arc).clone()),
-            )
-            .await;
-
-        if let Err(e) = self.run_inline_optimization().await {
-            log::warn!(
-                "Unexpected failure when running inline optimization: {:?}",
-                e
-            );
-        }
-
-        Ok(deleted_count)
     }
 
     /// Set a property flag in the __manifest table's metadata key-value map.
@@ -1652,11 +2620,10 @@ impl ManifestNamespace {
             }
 
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
-            let metadata_array = Self::get_string_column(&batch, "metadata")?;
+            let metadata_values = Self::metadata_column_values(&batch, "metadata")?;
 
             let object_id_str = object_id_array.value(0);
-            let metadata = if !metadata_array.is_null(0) {
-                let metadata_str = metadata_array.value(0);
+            let metadata = if let Some(metadata_str) = &metadata_values[0] {
                 match serde_json::from_str::<HashMap<String, String>>(metadata_str) {
                     Ok(map) => Some(map),
                     Err(e) => {
@@ -2293,15 +3260,12 @@ impl LanceNamespace for ManifestNamespace {
         if overwriting_existing_table {
             let metadata =
                 Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
-            self.upsert_into_manifest_with_metadata(
-                vec![ManifestEntry {
-                    object_id,
-                    object_type: ObjectType::Table,
-                    location: Some(dir_name),
-                    metadata,
-                }],
-                None,
-            )
+            self.upsert_into_manifest_with_metadata(vec![ManifestEntry {
+                object_id,
+                object_type: ObjectType::Table,
+                location: Some(dir_name),
+                metadata,
+            }])
             .await?;
 
             Ok(CreateTableResponse {
@@ -2324,15 +3288,12 @@ impl LanceNamespace for ManifestNamespace {
                     let metadata =
                         Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
                     // Register in manifest (store dir_name, not full URI)
-                    self.insert_into_manifest_with_metadata(
-                        vec![ManifestEntry {
-                            object_id,
-                            object_type: ObjectType::Table,
-                            location: Some(dir_name.clone()),
-                            metadata,
-                        }],
-                        None,
-                    )
+                    self.insert_into_manifest_with_metadata(vec![ManifestEntry {
+                        object_id,
+                        object_type: ObjectType::Table,
+                        location: Some(dir_name.clone()),
+                        metadata,
+                    }])
                     .await?;
 
                     Ok(CreateTableResponse {
@@ -2531,15 +3492,12 @@ impl LanceNamespace for ManifestNamespace {
         let metadata =
             Self::serialize_metadata(request.properties.as_ref(), "namespace", &object_id)?;
 
-        self.insert_into_manifest_with_metadata(
-            vec![ManifestEntry {
-                object_id,
-                object_type: ObjectType::Namespace,
-                location: None,
-                metadata,
-            }],
-            None,
-        )
+        self.insert_into_manifest_with_metadata(vec![ManifestEntry {
+            object_id,
+            object_type: ObjectType::Namespace,
+            location: None,
+            metadata,
+        }])
         .await?;
 
         Ok(CreateNamespaceResponse {
@@ -2711,15 +3669,12 @@ impl LanceNamespace for ManifestNamespace {
         let metadata = Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
 
         // Add entry to manifest marking this as a declared table (store dir_name, not full path)
-        self.insert_into_manifest_with_metadata(
-            vec![ManifestEntry {
-                object_id,
-                object_type: ObjectType::Table,
-                location: Some(dir_name),
-                metadata,
-            }],
-            None,
-        )
+        self.insert_into_manifest_with_metadata(vec![ManifestEntry {
+            object_id,
+            object_type: ObjectType::Table,
+            location: Some(dir_name),
+            metadata,
+        }])
         .await?;
 
         log::info!(
@@ -2866,15 +3821,23 @@ impl LanceNamespace for ManifestNamespace {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        MANIFEST_TABLE_NAME, METADATA_INDEX_NAME, OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME,
+        ObjectType, convert_lance_commit_error,
+    };
     use crate::{DirectoryNamespaceBuilder, ManifestNamespace};
+    use arrow::datatypes::DataType;
     use bytes::Bytes;
+    use lance::dataset::builder::DatasetBuilder;
+    use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
-        ListTablesRequest, TableExistsRequest,
+        ListNamespacesRequest, ListTablesRequest, TableExistsRequest,
     };
     use rstest::rstest;
+    use std::collections::HashMap;
 
     fn create_test_ipc_data() -> Vec<u8> {
         use arrow::array::{Int32Array, StringArray};
@@ -2904,6 +3867,52 @@ mod tests {
             writer.finish().unwrap();
         }
         buffer
+    }
+
+    fn namespace_request(name: &str) -> CreateNamespaceRequest {
+        let mut request = CreateNamespaceRequest::new();
+        request.id = Some(vec![name.to_string()]);
+        request
+    }
+
+    async fn load_manifest_dataset(root: &str) -> lance::Dataset {
+        DatasetBuilder::from_uri(format!("{}/{}", root, MANIFEST_TABLE_NAME))
+            .load()
+            .await
+            .unwrap()
+    }
+
+    async fn manifest_object_ids(root: &str) -> Vec<String> {
+        let dataset = load_manifest_dataset(root).await;
+        let mut scanner = dataset.scan();
+        scanner.project(&["object_id"]).unwrap();
+        let batches = ManifestNamespace::execute_scanner(scanner).await.unwrap();
+        let mut ids = Vec::new();
+        for batch in batches {
+            let object_ids = ManifestNamespace::get_string_column(&batch, "object_id").unwrap();
+            for row in 0..batch.num_rows() {
+                ids.push(object_ids.value(row).to_string());
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn test_retryable_commit_conflict_maps_to_throttling() {
+        let conflict = lance_core::Error::retryable_commit_conflict_source(
+            1,
+            Box::new(std::io::Error::other("conflict")),
+        );
+        let converted = convert_lance_commit_error(&conflict, "test operation", None);
+
+        let lance_core::Error::Namespace { source, .. } = converted else {
+            panic!("expected namespace error");
+        };
+        let namespace_error = source.downcast_ref::<lance_namespace::NamespaceError>();
+        assert!(matches!(
+            namespace_error,
+            Some(lance_namespace::NamespaceError::Throttling { .. })
+        ));
     }
 
     #[rstest]
@@ -2943,6 +3952,298 @@ mod tests {
         let response = dir_namespace.list_tables(request).await.unwrap();
         assert_eq!(response.tables.len(), 1);
         assert_eq!(response.tables[0], "test_table");
+    }
+
+    #[tokio::test]
+    async fn test_manifest_rewrite_from_properties() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_path.to_string());
+        properties.insert(
+            "inline_optimization_enabled".to_string(),
+            "true".to_string(),
+        );
+
+        let namespace = DirectoryNamespaceBuilder::from_properties(properties, None)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        namespace
+            .create_namespace(namespace_request("workspace"))
+            .await
+            .unwrap();
+
+        let mut request = ListNamespacesRequest::new();
+        request.id = Some(vec![]);
+        let response = namespace.list_namespaces(request).await.unwrap();
+        assert_eq!(response.namespaces, vec!["workspace".to_string()]);
+
+        let dataset = load_manifest_dataset(temp_path).await;
+        let metadata_field = dataset.schema().field("metadata").unwrap();
+        assert_eq!(metadata_field.logical_type.to_string(), "json");
+        assert!(
+            dataset.schema().field("base_objects").is_none(),
+            "manifest rewrites should drop the old base_objects column"
+        );
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.name == OBJECT_ID_INDEX_NAME),
+            "manifest rewrites should create the object_id btree index synchronously"
+        );
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.name == OBJECT_TYPE_INDEX_NAME),
+            "manifest rewrites should create the object_type bitmap index synchronously"
+        );
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.name == METADATA_INDEX_NAME),
+            "manifest rewrites should create the metadata JSON FTS index synchronously"
+        );
+        assert!(
+            indices.iter().all(|index| index.fields.len() == 1),
+            "manifest rewrite indexes should be single-column indexes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_rewrite_overwrites_compact_ordered_snapshot() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        for name in ["zeta", "alpha", "middle"] {
+            namespace
+                .create_namespace(namespace_request(name))
+                .await
+                .unwrap();
+        }
+
+        let dataset = load_manifest_dataset(temp_path).await;
+        assert_eq!(
+            dataset.manifest().fragments.len(),
+            1,
+            "copy-on-write manifest should keep the current snapshot compact"
+        );
+
+        let object_ids = manifest_object_ids(temp_path).await;
+        assert_eq!(
+            object_ids,
+            vec![
+                "zeta".to_string(),
+                "alpha".to_string(),
+                "middle".to_string()
+            ]
+        );
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.name == OBJECT_ID_INDEX_NAME),
+            "manifest rewrites should maintain the object_id btree index"
+        );
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.name == OBJECT_TYPE_INDEX_NAME),
+            "manifest rewrites should maintain the object_type bitmap index"
+        );
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.name == METADATA_INDEX_NAME),
+            "manifest rewrites should maintain the metadata JSON FTS index"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_rewrite_table_lifecycle() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap();
+
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        let response = namespace.list_tables(list_request).await.unwrap();
+        assert_eq!(response.tables, vec!["test_table".to_string()]);
+
+        let mut drop_request = DropTableRequest::new();
+        drop_request.id = Some(vec!["test_table".to_string()]);
+        namespace.drop_table(drop_request).await.unwrap();
+
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        let response = namespace.list_tables(list_request).await.unwrap();
+        assert!(response.tables.is_empty());
+
+        let object_ids = manifest_object_ids(temp_path).await;
+        assert!(object_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_rewrite_table_version_query_preserves_null_metadata_row() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+        let table_object_id = "table";
+        let manifest_ns = namespace.manifest_ns.as_ref().unwrap();
+        manifest_ns
+            .insert_into_manifest_with_metadata(vec![super::ManifestEntry {
+                object_id: ManifestNamespace::build_version_object_id(table_object_id, 1),
+                object_type: super::ObjectType::TableVersion,
+                location: None,
+                metadata: None,
+            }])
+            .await
+            .unwrap();
+
+        let versions = manifest_ns
+            .query_table_versions(table_object_id, false, None)
+            .await
+            .unwrap();
+        assert_eq!(versions, vec![(1, String::new())]);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_delete_table_versions_streams_large_ranges() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+        let manifest_ns = namespace.manifest_ns.as_ref().unwrap();
+        manifest_ns
+            .insert_into_manifest_with_metadata(vec![
+                super::ManifestEntry {
+                    object_id: ManifestNamespace::build_version_object_id("table", 1),
+                    object_type: super::ObjectType::TableVersion,
+                    location: None,
+                    metadata: Some("{}".to_string()),
+                },
+                super::ManifestEntry {
+                    object_id: ManifestNamespace::build_version_object_id("table", 10),
+                    object_type: super::ObjectType::TableVersion,
+                    location: None,
+                    metadata: Some("{}".to_string()),
+                },
+                super::ManifestEntry {
+                    object_id: ManifestNamespace::build_version_object_id("other", 2),
+                    object_type: super::ObjectType::TableVersion,
+                    location: None,
+                    metadata: Some("{}".to_string()),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let deleted = manifest_ns
+            .delete_table_versions("table", &[(1, 1_000_000_000)])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        let object_ids = manifest_object_ids(temp_path).await;
+        assert_eq!(
+            object_ids,
+            vec![ManifestNamespace::build_version_object_id("other", 2)]
+        );
+
+        let deleted = manifest_ns
+            .batch_delete_table_versions_by_ranges(&[("other".to_string(), vec![(2, 2)])])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(manifest_object_ids(temp_path).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_manifest_rewrite_concurrent_compatible_creates_succeed() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let first = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+        let second = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let (alpha, beta) = tokio::join!(
+            first.create_namespace(namespace_request("alpha")),
+            second.create_namespace(namespace_request("beta"))
+        );
+
+        alpha.unwrap();
+        beta.unwrap();
+
+        let mut request = ListNamespacesRequest::new();
+        request.id = Some(vec![]);
+        let mut response = first.list_namespaces(request).await.unwrap();
+        response.namespaces.sort();
+        assert_eq!(
+            response.namespaces,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_rewrite_concurrent_duplicate_create_fails() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let first = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+        let second = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            first.create_namespace(namespace_request("duplicate")),
+            second.create_namespace(namespace_request("duplicate"))
+        );
+
+        let results = [first_result, second_result];
+        let ok_count = results.iter().filter(|result| result.is_ok()).count();
+        let err_count = results.iter().filter(|result| result.is_err()).count();
+        assert_eq!(ok_count, 1);
+        assert_eq!(err_count, 1);
     }
 
     #[rstest]
@@ -4068,5 +5369,169 @@ mod tests {
         let next = ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), Some(2));
         assert_eq!(n, names(&["c", "d"]));
         assert_eq!(next, Some("d".to_string()));
+    }
+
+    /// Seed a __manifest dataset using the legacy schema (Utf8 metadata +
+    /// base_objects List column) so that backward-compat tests start from a
+    /// real pre-migration state.
+    async fn seed_old_schema_manifest(
+        root: &str,
+        rows: &[(&str, &str, Option<&str>, Option<&str>)],
+    ) {
+        use arrow::array::builder::{ListBuilder, StringBuilder};
+        use arrow::array::{RecordBatchIterator, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use lance::dataset::WriteParams;
+        use std::sync::Arc;
+
+        let old_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("object_id", DataType::Utf8, false),
+            Field::new("object_type", DataType::Utf8, false),
+            Field::new("location", DataType::Utf8, true),
+            Field::new("metadata", DataType::Utf8, true),
+            Field::new(
+                "base_objects",
+                DataType::List(Arc::new(Field::new("object_id", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+
+        let mut object_ids = Vec::new();
+        let mut object_types = Vec::new();
+        let mut locations: Vec<Option<String>> = Vec::new();
+        let mut metadatas: Vec<Option<String>> = Vec::new();
+        let mut base_objects_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Field::new("object_id", DataType::Utf8, true));
+
+        for &(oid, otype, loc, meta) in rows {
+            object_ids.push(oid.to_string());
+            object_types.push(otype.to_string());
+            locations.push(loc.map(ToString::to_string));
+            metadatas.push(meta.map(ToString::to_string));
+            base_objects_builder.append(true);
+        }
+
+        let batch = arrow::array::RecordBatch::try_new(
+            old_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(object_ids)),
+                Arc::new(StringArray::from(object_types)),
+                Arc::new(StringArray::from(locations)),
+                Arc::new(StringArray::from(metadatas)),
+                Arc::new(base_objects_builder.finish()),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], old_schema);
+        let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
+        let write_params = WriteParams::default();
+        lance::Dataset::write(Box::new(reader), &manifest_path, Some(write_params))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_backward_compat_read_old_schema_manifest() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let meta_json = r#"{"key":"value"}"#;
+        seed_old_schema_manifest(
+            temp_path,
+            &[
+                ("ns1", ObjectType::Namespace.as_str(), None, None),
+                (
+                    "my_table",
+                    ObjectType::Table.as_str(),
+                    Some("some/location"),
+                    Some(meta_json),
+                ),
+            ],
+        )
+        .await;
+
+        // Verify old dataset has Utf8 metadata and base_objects columns
+        let old_dataset = load_manifest_dataset(temp_path).await;
+        assert!(old_dataset.schema().field("base_objects").is_some());
+        assert_eq!(
+            old_dataset.schema().field("metadata").unwrap().data_type(),
+            DataType::Utf8,
+        );
+
+        // Open via the namespace builder — read path should work.
+        // Disable dir listing so list_tables goes through the manifest path.
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut list_ns_req = ListNamespacesRequest::new();
+        list_ns_req.id = Some(vec![]);
+        let ns_response = namespace.list_namespaces(list_ns_req).await.unwrap();
+        assert_eq!(ns_response.namespaces, vec!["ns1".to_string()]);
+
+        let mut list_tables_req = ListTablesRequest::new();
+        list_tables_req.id = Some(vec![]);
+        let table_response = namespace.list_tables(list_tables_req).await.unwrap();
+        assert_eq!(table_response.tables, vec!["my_table".to_string()]);
+
+        let describe_req = DescribeTableRequest {
+            id: Some(vec!["my_table".to_string()]),
+            ..Default::default()
+        };
+        let describe_resp = namespace.describe_table(describe_req).await.unwrap();
+        let properties = describe_resp.properties.unwrap();
+        assert_eq!(properties.get("key").unwrap(), "value");
+    }
+
+    #[tokio::test]
+    async fn test_backward_compat_write_migrates_old_schema() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        seed_old_schema_manifest(
+            temp_path,
+            &[("existing_ns", ObjectType::Namespace.as_str(), None, None)],
+        )
+        .await;
+
+        // Open namespace and perform a write (which triggers copy-on-write rewrite)
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        namespace
+            .create_namespace(namespace_request("new_ns"))
+            .await
+            .unwrap();
+
+        // After the write, the manifest should have been rewritten with new schema
+        let dataset = load_manifest_dataset(temp_path).await;
+        assert!(
+            dataset.schema().field("base_objects").is_none(),
+            "copy-on-write rewrite should drop the old base_objects column"
+        );
+        let metadata_field = dataset.schema().field("metadata").unwrap();
+        assert_eq!(
+            metadata_field.logical_type.to_string(),
+            "json",
+            "copy-on-write rewrite should migrate metadata to JSON"
+        );
+
+        // Verify both old and new rows are present
+        let mut list_ns_req = ListNamespacesRequest::new();
+        list_ns_req.id = Some(vec![]);
+        let response = namespace.list_namespaces(list_ns_req).await.unwrap();
+        assert!(response.namespaces.contains(&"existing_ns".to_string()));
+        assert!(response.namespaces.contains(&"new_ns".to_string()));
+
+        // Verify indices are built
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(indices.iter().any(|i| i.name == OBJECT_ID_INDEX_NAME));
+        assert!(indices.iter().any(|i| i.name == OBJECT_TYPE_INDEX_NAME));
+        assert!(indices.iter().any(|i| i.name == METADATA_INDEX_NAME));
     }
 }
