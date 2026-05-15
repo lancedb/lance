@@ -1841,11 +1841,11 @@ fn maybe_range(
         }
         // x <= a && x > b
         (Operator::LtEq, Operator::Gt) => {
-            (Bound::Included(right_value), Bound::Excluded(left_value))
+            (Bound::Excluded(right_value), Bound::Included(left_value))
         }
         // x < a && x >= b
         (Operator::Lt, Operator::GtEq) => {
-            (Bound::Excluded(right_value), Bound::Included(left_value))
+            (Bound::Included(right_value), Bound::Excluded(left_value))
         }
         // x < a && x > b
         (Operator::Lt, Operator::Gt) => (Bound::Excluded(right_value), Bound::Excluded(left_value)),
@@ -2393,6 +2393,24 @@ mod tests {
             SargableQuery::Range(
                 Bound::Included(ScalarValue::UInt32(Some(5))),
                 Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+        check_range(
+            &index_info,
+            "aisle <= 10 AND aisle > 5",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Excluded(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+        check_range(
+            &index_info,
+            "aisle < 10 AND aisle >= 5",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Excluded(ScalarValue::UInt32(Some(10))),
             ),
         );
         check_simple(

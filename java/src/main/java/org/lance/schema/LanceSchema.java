@@ -17,6 +17,7 @@ import com.google.common.base.MoreObjects;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -32,6 +33,30 @@ public class LanceSchema {
 
   public List<LanceField> fields() {
     return fields;
+  }
+
+  /**
+   * Get the unenforced primary key fields, ordered by position.
+   *
+   * @return primary key fields sorted by their position value
+   */
+  public List<LanceField> getUnenforcedPrimaryKey() {
+    return fields.stream()
+        .filter(LanceField::isUnenforcedPrimaryKey)
+        .sorted(Comparator.comparingInt(f -> f.getUnenforcedPrimaryKeyPosition().orElse(0)))
+        .collect(Collectors.toList());
+  }
+
+  /**
+   * Get the unenforced clustering key fields, ordered by position.
+   *
+   * @return clustering key fields sorted by their position value
+   */
+  public List<LanceField> getUnenforcedClusteringKey() {
+    return fields.stream()
+        .filter(LanceField::isUnenforcedClusteringKey)
+        .sorted(Comparator.comparingInt(f -> f.getUnenforcedClusteringKeyPosition().orElse(0)))
+        .collect(Collectors.toList());
   }
 
   public Map<String, String> metadata() {

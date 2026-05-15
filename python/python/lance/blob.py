@@ -47,10 +47,12 @@ class Blob:
         return Blob(data=bytes(data))
 
     @staticmethod
-    def from_uri(uri: str, position: int = None, size: int = None) -> "Blob":
+    def from_uri(
+        uri: str, position: Optional[int] = None, size: Optional[int] = None
+    ) -> "Blob":
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
-        if position < 0 or size < 0:
+        if (position is not None and position < 0) or (size is not None and size < 0):
             raise ValueError("External blob position and size must be non-negative")
         return Blob(uri=uri, position=position, size=size)
 

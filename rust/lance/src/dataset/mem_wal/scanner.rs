@@ -37,10 +37,12 @@ mod data_source;
 pub mod exec;
 mod planner;
 mod point_lookup;
+mod projection;
 mod vector_search;
 
 pub use builder::LsmScanner;
 pub use collector::{ActiveMemTableRef, LsmDataSourceCollector};
 pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
 pub use point_lookup::LsmPointLookupPlanner;
-pub use vector_search::{DISTANCE_COLUMN, LsmVectorSearchPlanner};
+pub use projection::DISTANCE_COLUMN;
+pub use vector_search::LsmVectorSearchPlanner;

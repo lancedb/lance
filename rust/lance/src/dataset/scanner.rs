@@ -1981,6 +1981,14 @@ impl Scanner {
         execute_plan(plan, options)
     }
 
+    pub(crate) fn execution_options(&self) -> LanceExecutionOptions {
+        LanceExecutionOptions {
+            batch_size: self.batch_size,
+            execution_stats_callback: self.scan_stats_callback.clone(),
+            ..Default::default()
+        }
+    }
+
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
         let stream = self.try_into_stream().await?;
         let schema = stream.schema();
@@ -2356,6 +2364,14 @@ impl Scanner {
         } else if self.ordering.is_some() {
             // If there is ordering, we can't pushdown limit / offset
             // because we need to sort all data first before applying the limit
+            Ok(None)
+        } else if self.dataset.manifest.uses_stable_row_ids() {
+            // Stable-row-id datasets can contain deleted / rewritten rows that still occupy
+            // physical positions in older fragments while the live replacement rows are appended
+            // to new fragments. `scan_range_before_filter` is a logical offset over visible rows,
+            // but filtered-read planning trims fragments before the stable-row-id/deletion-aware
+            // remapping is finished. Pushing limit / offset down here can spend the range on
+            // tombstoned positions and skip still-live rows in later fragments.
             Ok(None)
         } else {
             match (self.limit, self.offset) {

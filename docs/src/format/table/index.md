@@ -2,9 +2,23 @@
 
 ## Overview
 
-The Lance table format organizes datasets as versioned collections of fragments and indices.
-Each version is described by an immutable manifest file that references data files, deletion files, transaction file and indices.
-The format supports ACID transactions, schema evolution, and efficient incremental updates through Multi-Version Concurrency Control (MVCC).
+The Lance table format organizes datasets as versioned collections of fragments, data files, deletion files, and indices. Each version is described by an immutable manifest that references the physical data for that snapshot.
+
+The format is designed for machine learning and highly selective workloads where column additions, index maintenance, and partial rewrites must be cheap. It supports ACID transactions, schema evolution, time travel, and efficient incremental updates through Multi-Version Concurrency Control (MVCC).
+
+## Design Goals
+
+### Two-Dimensional Storage
+
+Rows are partitioned into fragments, and each fragment can contain multiple data files that each provide one or more columns. This lets writers add or backfill columns by attaching new data files to existing fragments instead of rewriting the full table.
+
+### First-Class Indices
+
+Indices are part of the table format lifecycle. The table metadata describes index discovery and transactional coordination, while the detailed search structures remain separate index formats. This gives engines a uniform way to create, drop, update, and query indices without coupling the table format to any single indexing algorithm.
+
+### External Manifest Store
+
+Lance can commit directly to object storage, but deployments may also coordinate commits through an external manifest store. In that model, the external system helps serialize commits and apply governance checks, while the canonical table state is still persisted in the Lance table format.
 
 ## Manifest
 
@@ -178,7 +192,7 @@ See [Row ID & Lineage Specification](row_id_lineage.md)
 
 Vector indices, scalar indices, full-text search, and index management.
 
-See [Index Specification](index/index.md)
+See [Index Formats](../index/index.md)
 
 ### Versioning
 

@@ -1615,6 +1615,7 @@ mod tests {
                 10, // batch_readahead
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();

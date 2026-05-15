@@ -285,6 +285,7 @@ fn create_fragment<'a>(
         &data_storage_version,
         None,
         &storage_options_obj,
+        &JObject::null(), // base store params are not used when creating fragments
         &JObject::null(), // not used when creating fragments
         &JObject::null(), // not used when creating fragments
         &allow_external_blob_outside_bases,

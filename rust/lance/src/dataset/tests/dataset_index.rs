@@ -768,7 +768,7 @@ async fn test_fts_fuzzy_query() {
             "food".to_owned(), // 1 insertion       # spellchecker:disable-line
         ]
         .into_iter()
-        .collect()
+        .collect::<HashSet<_>>()
     );
 }
 

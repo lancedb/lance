@@ -1184,7 +1184,7 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
-        dataset::{ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1329,6 +1329,24 @@ mod tests {
 
         async fn create_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Create).await
+        }
+
+        // Auto-cleanup is disabled by default; this helper creates a dataset
+        // with auto-cleanup enabled using the default interval/older_than.
+        async fn create_some_data_with_auto_cleanup(&self) -> Result<()> {
+            Dataset::write(
+                some_batch(),
+                &self.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(self.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    auto_cleanup: Some(AutoCleanupParams::default()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+            Ok(())
         }
 
         async fn overwrite_some_data(&self) -> Result<()> {
@@ -1907,7 +1925,7 @@ mod tests {
         // commit.
         let fixture = MockDatasetFixture::try_new().unwrap();
 
-        fixture.create_some_data().await.unwrap();
+        fixture.create_some_data_with_auto_cleanup().await.unwrap();
 
         let dataset_config = &fixture.open().await.unwrap().manifest.config;
         let cleanup_interval: usize = dataset_config
@@ -2876,7 +2894,7 @@ mod tests {
             // Optimize indices after write and delete
             use lance_index::optimize::OptimizeOptions;
             self.dataset
-                .optimize_indices(&OptimizeOptions::append())
+                .optimize_indices(&OptimizeOptions::merge(1))
                 .await?;
             Ok(())
         }
@@ -3083,7 +3101,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 2);
-        assert_eq!(setup.branch1.counts.num_index_files, 23);
+        assert_eq!(setup.branch1.counts.num_index_files, 14);
         setup.assert_all_unchanged().await;
 
         setup.branch1.compact().await.unwrap();
@@ -3098,7 +3116,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 23);
+        assert_eq!(setup.branch1.counts.num_index_files, 14);
         setup.assert_all_unchanged().await;
 
         // Now we clean the referenced files of branch1 by branch2 and branch3
@@ -3112,14 +3130,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts for the latest version of compaction
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 16);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup.branch1.run_cleanup().await.unwrap();
 
         // Only the latest manifest is retained.
@@ -3128,7 +3146,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
     }
 
@@ -3145,7 +3163,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -3161,7 +3179,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch3.compact().await.unwrap();
         setup.branch3.run_cleanup().await.unwrap();
@@ -3171,7 +3189,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch2", "branch4", "main"])
             .await;
@@ -3184,7 +3202,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
     }
 
     #[tokio::test]
@@ -3201,7 +3219,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 2);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 2);
-        assert_eq!(setup.branch4.counts.num_index_files, 16);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -3221,7 +3239,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 17);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch4.compact().await.unwrap();
         setup.branch4.run_cleanup().await.unwrap();
@@ -3231,7 +3249,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 16);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
         setup.assert_all_unchanged().await;
 
         setup.main.run_cleanup().await.unwrap();
@@ -3245,7 +3263,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 17);
+        assert_eq!(setup.main.counts.num_index_files, 14);
     }
 
     #[tokio::test]
@@ -3270,7 +3288,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 30);
+        assert_eq!(setup.main.counts.num_index_files, 21);
         setup.assert_all_unchanged().await;
 
         setup.main.compact().await.unwrap();
@@ -3281,7 +3299,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 30);
+        assert_eq!(setup.main.counts.num_index_files, 21);
         setup.assert_all_unchanged().await;
 
         setup.branch1.write_data().await.unwrap();
@@ -3302,14 +3320,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 29);
+        assert_eq!(setup.branch2.counts.num_index_files, 14);
         setup.branch1.run_cleanup().await.unwrap();
         // Cleanup 4 index files referenced from branch2
         assert_eq!(setup.branch1.counts.num_manifest_files, 2);
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch3 holds references from main:
@@ -3325,7 +3343,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 23);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -3335,7 +3353,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Cleanup doesn't take effects if we don't clean branch2 and branch1 first
@@ -3343,7 +3361,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 23);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         // Cleanup doesn't take effect if we don't clean branch2 first
         setup.branch1.run_cleanup().await.unwrap();
@@ -3351,7 +3369,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.branch2.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3360,7 +3378,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch1.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3369,7 +3387,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Branch4 holds references from main:
@@ -3381,7 +3399,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 23);
+        assert_eq!(setup.main.counts.num_index_files, 14);
 
         setup.branch4.write_data().await.unwrap();
         setup.branch4.compact().await.unwrap();
@@ -3392,7 +3410,7 @@ mod tests {
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 16);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.main.run_cleanup().await.unwrap();
         // Only the latest manifest is retained.
@@ -3401,7 +3419,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
     }
 
     #[tokio::test]
@@ -3425,7 +3443,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // After auto-clean: branch3
         // 2 appends produced 2 data files
         // 2 deletes produced 2 deletion files
@@ -3433,7 +3451,7 @@ mod tests {
         assert_eq!(setup.branch3.counts.num_data_files, 2);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 2);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3455,14 +3473,14 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Only the latest manifest is retained.
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup
             .assert_unchanged(&["branch1", "branch4", "main"])
             .await;
@@ -3492,7 +3510,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 3);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
 
         setup.main.compact().await.unwrap();
         setup
@@ -3512,7 +3530,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
 
         setup.branch4.compact().await.unwrap();
         setup
@@ -3529,13 +3547,13 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // (1, 1, 1, 0, 4) is the counts of one version
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.branch1.write_data().await.unwrap();
         setup.branch1.compact().await.unwrap();
@@ -3553,7 +3571,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // Branch3 and branch2 still hold references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3562,7 +3580,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
 
         setup.branch2.write_data().await.unwrap();
         setup.branch2.compact().await.unwrap();
@@ -3580,7 +3598,7 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 3);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 1);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         // Branch3 still holds references from branch1:
         // - 1 manifest file
         // - 1 data files
@@ -3589,7 +3607,7 @@ mod tests {
         assert_eq!(setup.branch1.counts.num_data_files, 2);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 1);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         // Branch3 still holds references from branch2:
         // - 1 manifest file
         // - 1 data files
@@ -3598,7 +3616,7 @@ mod tests {
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
 
         setup.branch3.write_data().await.unwrap();
         setup.branch3.compact().await.unwrap();
@@ -3616,22 +3634,22 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 13);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 13);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 16);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 19);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         setup.assert_unchanged(&["branch4"]).await;
     }
 
@@ -3675,24 +3693,24 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 20);
+        assert_eq!(setup.main.counts.num_index_files, 14);
         // Branch3 tag holds branch1 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         // Branch3 tag holds branch2 with 1 tx file, 1 data files, 1 deletion files and 4 index files
         assert_eq!(setup.branch2.counts.num_manifest_files, 2);
         assert_eq!(setup.branch2.counts.num_data_files, 2);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 1);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup
             .branch3
@@ -3715,27 +3733,27 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 4);
         assert_eq!(setup.main.counts.num_tx_files, 2);
         assert_eq!(setup.main.counts.num_delete_files, 2);
-        assert_eq!(setup.main.counts.num_index_files, 20);
+        assert_eq!(setup.main.counts.num_index_files, 14);
         assert_eq!(setup.branch1.counts.num_manifest_files, 1);
         assert_eq!(setup.branch1.counts.num_data_files, 1);
         assert_eq!(setup.branch1.counts.num_tx_files, 1);
         assert_eq!(setup.branch1.counts.num_delete_files, 0);
-        assert_eq!(setup.branch1.counts.num_index_files, 10);
+        assert_eq!(setup.branch1.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 16);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
 
         setup.main.dataset.tags().delete("main-tag").await.unwrap();
         setup
@@ -3751,22 +3769,22 @@ mod tests {
         assert_eq!(setup.main.counts.num_data_files, 1);
         assert_eq!(setup.main.counts.num_tx_files, 1);
         assert_eq!(setup.main.counts.num_delete_files, 0);
-        assert_eq!(setup.main.counts.num_index_files, 10);
+        assert_eq!(setup.main.counts.num_index_files, 7);
         assert_eq!(setup.branch2.counts.num_manifest_files, 1);
         assert_eq!(setup.branch2.counts.num_data_files, 1);
         assert_eq!(setup.branch2.counts.num_tx_files, 1);
         assert_eq!(setup.branch2.counts.num_delete_files, 0);
-        assert_eq!(setup.branch2.counts.num_index_files, 13);
+        assert_eq!(setup.branch2.counts.num_index_files, 7);
         assert_eq!(setup.branch3.counts.num_manifest_files, 1);
         assert_eq!(setup.branch3.counts.num_data_files, 1);
         assert_eq!(setup.branch3.counts.num_tx_files, 1);
         assert_eq!(setup.branch3.counts.num_delete_files, 0);
-        assert_eq!(setup.branch3.counts.num_index_files, 16);
+        assert_eq!(setup.branch3.counts.num_index_files, 7);
         assert_eq!(setup.branch4.counts.num_manifest_files, 1);
         assert_eq!(setup.branch4.counts.num_data_files, 1);
         assert_eq!(setup.branch4.counts.num_tx_files, 1);
         assert_eq!(setup.branch4.counts.num_delete_files, 0);
-        assert_eq!(setup.branch4.counts.num_index_files, 13);
+        assert_eq!(setup.branch4.counts.num_index_files, 7);
     }
 
     #[test]

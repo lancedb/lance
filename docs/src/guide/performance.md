@@ -228,7 +228,7 @@ dataset.optimize.compact_files(defer_index_remap=True)
 ```
 
 For details on the index format and usage patterns, see the
-[Fragment Reuse Index specification](../format/table/index/system/frag_reuse.md).
+[Fragment Reuse Index specification](../format/index/system/frag_reuse.md).
 
 ## Indexes
 

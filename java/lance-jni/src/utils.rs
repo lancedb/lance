@@ -38,6 +38,44 @@ pub fn extract_storage_options(
     Ok(storage_options)
 }
 
+pub fn extract_base_store_params(
+    env: &mut JNIEnv,
+    base_store_params_obj: &JObject,
+) -> Result<HashMap<String, ObjectStoreParams>> {
+    if base_store_params_obj.is_null() {
+        return Ok(HashMap::new());
+    }
+
+    env.with_local_frame(16, |env| {
+        let jmap = JMap::from_env(env, base_store_params_obj)?;
+        let mut base_store_params = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+
+        while let Some((key, value)) = iter.next(env)? {
+            if value.is_null() {
+                return Err(Error::input_error(
+                    "baseStoreParams values must be non-null maps".to_string(),
+                ));
+            }
+
+            let key_jstring = JString::from(key);
+            let base_path: String = env.get_string(&key_jstring)?.into();
+            let storage_options = extract_storage_options(env, &value)?;
+            base_store_params.insert(
+                base_path,
+                ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        lance::io::StorageOptionsAccessor::with_static_options(storage_options),
+                    )),
+                    ..Default::default()
+                },
+            );
+        }
+
+        Ok::<_, Error>(base_store_params)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn extract_write_params(
     env: &mut JNIEnv,
@@ -49,6 +87,7 @@ pub fn extract_write_params(
     data_storage_version: &JObject,
     enable_v2_manifest_paths: Option<&JObject>,
     storage_options_obj: &JObject,
+    base_store_params_obj: &JObject,
     initial_bases: &JObject,                     // Optional<BasePath>
     target_bases: &JObject,                      // Optional<String>
     allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
@@ -88,6 +127,7 @@ pub fn extract_write_params(
 
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
+    let base_store_params = extract_base_store_params(env, base_store_params_obj)?;
 
     if let Some(initial_bases) =
         env.get_list_opt(initial_bases, |env, elem| elem.extract_object(env))?
@@ -119,6 +159,9 @@ pub fn extract_write_params(
         storage_options_accessor: accessor,
         ..Default::default()
     });
+    for (base_path, store_params) in base_store_params {
+        write_params = write_params.with_base_store_params(base_path, store_params);
+    }
     Ok(write_params)
 }
 

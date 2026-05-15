@@ -893,7 +893,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                             u32::MAX,
                             1,
                             FilterExpression::no_filter(),
-                        )?
+                        )
+                        .await?
                         .try_collect::<Vec<_>>()
                         .await?;
                     concat_batches(&schema, batches.iter())?

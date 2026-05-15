@@ -547,12 +547,16 @@ message ShardManifest {
   // A writer must increment this when claiming the shard.
   uint64 writer_epoch = 2;
 
-  // The most recent WAL entry position (0-based) that has been flushed to a MemTable.
+  // The most recent WAL entry position that has been flushed to a MemTable.
   // During recovery, replay starts from replay_after_wal_entry_position + 1.
+  // WAL positions are 1-based, so the default value 0 unambiguously means
+  // "no flush has ever stamped this shard" and recovery replays from 1.
   uint64 replay_after_wal_entry_position = 3;
 
-  // The most recent WAL entry position (0-based) at the time manifest was updated.
-  // This is a hint, not authoritative - recovery must list files to find actual state.
+  // The most recent WAL entry position observed at the time the manifest was
+  // updated. WAL positions are 1-based; default 0 means no entry has been
+  // written yet. This is a hint, not authoritative - recovery must list
+  // files to find actual state.
   uint64 wal_entry_position_last_seen = 4;
 
   // Next generation ID to create (incremented after each MemTable flush).

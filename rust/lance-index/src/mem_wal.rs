@@ -159,10 +159,15 @@ pub struct ShardManifest {
     /// ShardField from the ShardSpec determines how to interpret each value.
     pub shard_field_values: HashMap<String, Vec<u8>>,
     pub writer_epoch: u64,
-    /// The most recent WAL entry position (0-based) flushed to a MemTable.
-    /// Recovery replays from `replay_after_wal_entry_position + 1`.
+    /// The most recent WAL entry position flushed to a MemTable.
+    /// Recovery replays from `replay_after_wal_entry_position + 1`. The
+    /// default value 0 means "no flush has ever stamped this shard" — WAL
+    /// positions themselves are 1-based, so 0 is never a valid covered
+    /// position.
     pub replay_after_wal_entry_position: u64,
-    /// The most recent WAL entry position (0-based) when manifest was updated.
+    /// The most recent WAL entry position observed at manifest write time.
+    /// Default 0 means "no entry has been written yet"; WAL positions are
+    /// 1-based.
     pub wal_entry_position_last_seen: u64,
     pub current_generation: u64,
     pub flushed_generations: Vec<FlushedGeneration>,

@@ -2,4 +2,6 @@ nav:
   - Overview: index.md
   - File Format: file
   - Table Format: table
-
+  - Index Formats: index
+  - Catalog Specs: catalog
+  - Namespace Client Spec: namespace

@@ -71,14 +71,17 @@ impl<T: Clone + std::fmt::Debug> WatchableOnceCellReader<T> {
 
     /// Wait for a value to be written.
     ///
-    /// Returns immediately if a value is already present.
-    pub async fn await_value(&mut self) -> T {
-        self.rx
-            .wait_for(|v| v.is_some())
-            .await
-            .expect("watch channel closed")
-            .clone()
-            .expect("no value found")
+    /// Returns immediately if a value is already present. Returns
+    /// `None` if the underlying watch channel was closed before a
+    /// value was published — typically because the producing task
+    /// died (panicked or returned `Err`). Earlier this case used to
+    /// panic with `expect("watch channel closed")`, which turned a
+    /// dead-flusher consequence into a worker panic and made the
+    /// merge_insert call fail with a `RustPanic` instead of a
+    /// recoverable error.
+    pub async fn await_value(&mut self) -> Option<T> {
+        self.rx.wait_for(|v| v.is_some()).await.ok()?;
+        self.rx.borrow().clone()
     }
 }
 
@@ -326,7 +329,7 @@ mod tests {
         cell.write(123);
 
         let result = handle.await.unwrap();
-        assert_eq!(result, 123);
+        assert_eq!(result, Some(123));
     }
 
     #[tokio::test]
@@ -342,7 +345,21 @@ mod tests {
 
         cell.write(456);
 
-        assert_eq!(h1.await.unwrap(), 456);
-        assert_eq!(h2.await.unwrap(), 456);
+        assert_eq!(h1.await.unwrap(), Some(456));
+        assert_eq!(h2.await.unwrap(), Some(456));
+    }
+
+    #[tokio::test]
+    async fn test_watchable_once_cell_returns_none_on_close() {
+        let cell: WatchableOnceCell<i32> = WatchableOnceCell::new();
+        let mut reader = cell.reader();
+
+        // Drop the cell (and thereby the sender) without ever writing.
+        // Earlier this caused `await_value` to panic with
+        // "watch channel closed"; now it returns None so callers can
+        // surface the dead-producer condition as a recoverable error.
+        let handle = tokio::spawn(async move { reader.await_value().await });
+        drop(cell);
+        assert_eq!(handle.await.unwrap(), None);
     }
 }
