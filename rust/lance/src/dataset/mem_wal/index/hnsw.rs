@@ -507,7 +507,7 @@ mod tests {
         let first = make_batch(0, 75, dim);
         let second = make_batch(75, 125, dim);
         let stored = vec![
-            StoredBatch::new(first.clone(), 0, 0),
+            StoredBatch::new(first, 0, 0),
             StoredBatch::new(second.clone(), 75, 1),
         ];
         index.insert_batches(&stored).unwrap();
