@@ -376,14 +376,16 @@ struct ManifestRewriteShared<M: ManifestStreamMutation> {
 impl<M: ManifestStreamMutation> ManifestRewriteShared<M> {
     fn new(
         mutation: M,
-        metadata_index_sender: mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>,
+        metadata_index_sender: Option<
+            mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>,
+        >,
     ) -> Self {
         Self {
             mutation,
             index_data: Some(ManifestIndexAccumulator::default()),
             result: None,
             error: None,
-            metadata_index_sender: Some(metadata_index_sender),
+            metadata_index_sender,
         }
     }
 }
@@ -763,8 +765,9 @@ pub struct ManifestNamespace {
     /// If true, root namespace tables use {table_name}.lance naming
     /// If false, they use namespace-prefixed names
     dir_listing_enabled: bool,
-    /// Deprecated compatibility option. Copy-on-write manifest rewrites always
-    /// replace data files and maintain indexes inline.
+    /// When true, copy-on-write manifest rewrites build replacement indices
+    /// (BTree, Bitmap, FTS) inline during the overwrite. When false, only the
+    /// data file is rewritten and indices are expected to be created offline.
     inline_optimization_enabled: bool,
     /// Number of retries for commit operations on the manifest table.
     /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
@@ -1636,11 +1639,13 @@ impl ManifestNamespace {
             if output.is_empty() {
                 return Ok(None);
             }
-            let sender = Self::metadata_index_sender(&guard)?;
+            let sender = guard.metadata_index_sender.as_ref().cloned();
             let (batch, metadata_index_batch) = output.finish()?;
             (batch, metadata_index_batch, sender)
         };
-        Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
+        if let Some(sender) = sender {
+            Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
+        }
         Ok(Some(batch))
     }
 
@@ -1664,18 +1669,16 @@ impl ManifestNamespace {
                 guard.metadata_index_sender.take();
                 None
             } else {
-                let sender = guard.metadata_index_sender.take().ok_or_else(|| {
-                    lance_core::Error::from(NamespaceError::Internal {
-                        message: "Manifest metadata index stream is already closed".to_string(),
-                    })
-                })?;
+                let sender = guard.metadata_index_sender.take();
                 let (batch, metadata_index_batch) = output.finish()?;
                 Some((batch, metadata_index_batch, sender))
             }
         };
 
         if let Some((batch, metadata_index_batch, sender)) = maybe_batch {
-            Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
+            if let Some(sender) = sender {
+                Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
+            }
             Ok(Some(batch))
         } else {
             Ok(None)
@@ -1769,17 +1772,6 @@ impl ManifestNamespace {
         Ok((result, index_data))
     }
 
-    fn metadata_index_sender<M: ManifestStreamMutation>(
-        guard: &ManifestRewriteShared<M>,
-    ) -> Result<mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>> {
-        let sender = guard.metadata_index_sender.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: "Manifest metadata index stream is already closed".to_string(),
-            })
-        })?;
-        Ok(sender.clone())
-    }
-
     async fn send_metadata_index_batch(
         sender: mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>,
         batch: RecordBatch,
@@ -1823,6 +1815,8 @@ impl ManifestNamespace {
         let max_retries = self.manifest_rewrite_commit_retries();
         let mut retries = 0;
 
+        let build_indices = self.inline_optimization_enabled;
+
         loop {
             let dataset_guard = self.manifest_dataset.get().await?;
             let dataset = Arc::new(dataset_guard.clone());
@@ -1830,17 +1824,31 @@ impl ManifestNamespace {
 
             let source = Self::manifest_projected_stream(&dataset).await?;
             let metadata_index_uuid = Uuid::new_v4();
-            let mut index_uuids = vec![metadata_index_uuid];
+            let mut index_uuids = if build_indices {
+                vec![metadata_index_uuid]
+            } else {
+                vec![]
+            };
             let (metadata_index_sender, metadata_index_receiver) =
                 mpsc::channel(MANIFEST_METADATA_INDEX_CHANNEL_SIZE);
-            let metadata_index_task = Self::spawn_metadata_index_build(
-                dataset.clone(),
-                metadata_index_receiver,
-                metadata_index_uuid,
-            );
+            let metadata_index_task = if build_indices {
+                Some(Self::spawn_metadata_index_build(
+                    dataset.clone(),
+                    metadata_index_receiver,
+                    metadata_index_uuid,
+                ))
+            } else {
+                drop(metadata_index_receiver);
+                None
+            };
             let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(
                 make_mutation(),
-                metadata_index_sender,
+                if build_indices {
+                    Some(metadata_index_sender)
+                } else {
+                    drop(metadata_index_sender);
+                    None
+                },
             )));
             let output_stream = Self::manifest_rewrite_output_stream(source, shared.clone());
             let write_params = WriteParams {
@@ -1859,7 +1867,9 @@ impl ManifestNamespace {
                 Ok(transaction) => transaction,
                 Err(err) => {
                     Self::close_metadata_index_stream(&shared);
-                    let _ = Self::await_metadata_index_task(metadata_index_task).await;
+                    if let Some(task) = metadata_index_task {
+                        let _ = Self::await_metadata_index_task(task).await;
+                    }
                     if let Err(cleanup_err) =
                         Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
                     {
@@ -1877,7 +1887,9 @@ impl ManifestNamespace {
 
             let (mutation, index_data) = Self::take_manifest_rewrite_result(&shared)?;
             if !mutation.has_changes {
-                let _ = Self::await_metadata_index_task(metadata_index_task).await;
+                if let Some(task) = metadata_index_task {
+                    let _ = Self::await_metadata_index_task(task).await;
+                }
                 if let Err(cleanup_err) =
                     Self::cleanup_uncommitted_overwrite_files(&dataset, &transaction).await
                 {
@@ -1897,44 +1909,50 @@ impl ManifestNamespace {
                 return Ok(mutation.result);
             }
 
-            let replacement_indices = match Self::build_manifest_indices(
-                &dataset,
-                &transaction,
-                index_data,
-                &mut index_uuids,
-                metadata_index_task,
-            )
-            .await
-            {
-                Ok(indices) => indices,
-                Err(err) => {
-                    if let Err(cleanup_err) =
-                        Self::cleanup_uncommitted_overwrite_files(&dataset, &transaction).await
-                    {
-                        log::warn!(
-                            "Failed to clean up uncommitted manifest data files after index build error: {:?}",
-                            cleanup_err
-                        );
+            let replacement_indices = if build_indices {
+                match Self::build_manifest_indices(
+                    &dataset,
+                    &transaction,
+                    index_data,
+                    &mut index_uuids,
+                    metadata_index_task
+                        .expect("metadata index task should exist when building indices"),
+                )
+                .await
+                {
+                    Ok(indices) => indices,
+                    Err(err) => {
+                        if let Err(cleanup_err) =
+                            Self::cleanup_uncommitted_overwrite_files(&dataset, &transaction).await
+                        {
+                            log::warn!(
+                                "Failed to clean up uncommitted manifest data files after index build error: {:?}",
+                                cleanup_err
+                            );
+                        }
+                        if let Err(cleanup_err) =
+                            Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
+                        {
+                            log::warn!(
+                                "Failed to clean up uncommitted manifest index files after index build error: {:?}",
+                                cleanup_err
+                            );
+                        }
+                        return Err(err);
                     }
-                    if let Err(cleanup_err) =
-                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
-                    {
-                        log::warn!(
-                            "Failed to clean up uncommitted manifest index files after index build error: {:?}",
-                            cleanup_err
-                        );
-                    }
-                    return Err(err);
                 }
+            } else {
+                vec![]
             };
 
             let cleanup_transaction = transaction.clone();
-            let result = CommitBuilder::new(dataset.clone())
+            let mut commit = CommitBuilder::new(dataset.clone())
                 .with_max_retries(0)
-                .with_skip_auto_cleanup(true)
-                .with_replacement_indices(replacement_indices)
-                .execute(transaction)
-                .await;
+                .with_skip_auto_cleanup(true);
+            if !replacement_indices.is_empty() {
+                commit = commit.with_replacement_indices(replacement_indices);
+            }
+            let result = commit.execute(transaction).await;
 
             match result {
                 Ok(new_dataset) => {
