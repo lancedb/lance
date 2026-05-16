@@ -593,12 +593,18 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
 
     let dataset = Dataset::open(uri).await?;
     let shard_id = Uuid::new_v4();
-    // Auto-flush disabled so the MemTable holds the full read_rows, and
-    // sync_indexed_write forced on so the FTS index is fully populated
-    // when the put loop returns — the read panel measures FTS read
-    // latency and consistency, which are properties of the populated
-    // index and do not depend on whether ingestion was sync or async.
-    let config = shard_writer_config(args, shard_id, true).with_sync_indexed_write(true);
+    // Auto-flush disabled so the MemTable holds the full read_rows.
+    // sync_indexed_write + durable_write are both forced on: the read
+    // panel measures FTS read latency and consistency, which are
+    // properties of the *fully visible* MemTable. The MemTableScanner
+    // respects the visibility watermark, and that watermark only advances
+    // as the WAL becomes durable — so without durable_write the scanner
+    // would query a partially-visible MemTable and report garbage. Both
+    // are properties of ingestion, not of the read path, so forcing them
+    // does not bias the latency/consistency measurement.
+    let config = shard_writer_config(args, shard_id, true)
+        .with_sync_indexed_write(true)
+        .with_durable_write(true);
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
     let ingest_pool = &corpus[read_seed..];
