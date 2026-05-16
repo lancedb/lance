@@ -159,6 +159,9 @@ struct Args {
     max_memtable_size: usize,
     max_unflushed_memtable_bytes: usize,
     max_wal_flush_interval_ms: u64,
+    /// Paced ingest target for the write phase. `None` = unpaced (puts
+    /// issued as fast as possible). Used for the backpressure sweep.
+    target_rows_per_sec: Option<f64>,
     cache_dir: PathBuf,
     num_token_queries: usize,
     num_phrase_queries: usize,
@@ -182,6 +185,7 @@ impl Default for Args {
             max_memtable_size: 16 * 1024 * 1024 * 1024,
             max_unflushed_memtable_bytes: 8 * 1024 * 1024 * 1024,
             max_wal_flush_interval_ms: 100,
+            target_rows_per_sec: None,
             cache_dir: std::env::temp_dir().join("mem_wal_fineweb_fts_cache"),
             num_token_queries: 100,
             num_phrase_queries: 50,
@@ -544,14 +548,35 @@ async fn run_write(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_js
             let rate = ((call + 1) * args.batch_rows) as f64 / puts_start.elapsed().as_secs_f64();
             println!("  put {}/{} ({rate:.0} rows/s)", call + 1, args.calls);
         }
+        // Pace the ingest to `target_rows_per_sec` for the backpressure
+        // sweep: sleep so the (call+1)-th put completes no earlier than
+        // its scheduled time. The MemWAL writer's own backpressure can
+        // still delay a put past schedule — that delay is what the sweep
+        // is looking for.
+        if let Some(target) = args.target_rows_per_sec
+            && target > 0.0
+        {
+            let scheduled = ((call + 1) * args.batch_rows) as f64 / target;
+            let actual = puts_start.elapsed().as_secs_f64();
+            if scheduled > actual {
+                tokio::time::sleep(Duration::from_secs_f64(scheduled - actual)).await;
+            }
+        }
     }
     let elapsed_puts_s = puts_start.elapsed().as_secs_f64();
+
+    // Backlog still buffered when the put loop ends: if the writer kept
+    // up with the ingest rate this is small; a large backlog means the
+    // flush/index pipeline fell behind (accumulating backpressure).
+    let backlog = writer.memtable_stats().await.ok();
 
     let close_start = Instant::now();
     writer.close().await?;
     let elapsed_close_s = close_start.elapsed().as_secs_f64();
     let elapsed_total_s = puts_start.elapsed().as_secs_f64();
 
+    let slow_puts_1s = latencies_ms.iter().filter(|ms| **ms >= 1_000.0).count();
+    let slow_puts_10s = latencies_ms.iter().filter(|ms| **ms >= 10_000.0).count();
     let rows = args.calls * args.batch_rows;
     Ok(json!({
         "phase": "write",
@@ -562,10 +587,17 @@ async fn run_write(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_js
         "calls": args.calls,
         "ingested_rows": rows,
         "max_memtable_rows": args.max_memtable_rows,
+        "target_rows_per_sec": args.target_rows_per_sec,
         "setup_seconds": setup_s,
         "elapsed_puts_seconds": elapsed_puts_s,
         "elapsed_close_seconds": elapsed_close_s,
         "elapsed_total_seconds": elapsed_total_s,
+        "slow_puts_ge_1s": slow_puts_1s,
+        "slow_puts_ge_10s": slow_puts_10s,
+        "backlog_memtable_rows": backlog.as_ref().map(|s| s.row_count),
+        "backlog_pending_wal_rows": backlog.as_ref().map(|s| s.pending_wal_row_count),
+        "backlog_pending_wal_mb":
+            backlog.as_ref().map(|s| s.pending_wal_estimated_bytes as f64 / 1.0e6),
         // Throughput including the final close()/flush — comparable across
         // configs with different flush cadences.
         "throughput_rows_per_sec": rows as f64 / elapsed_total_s,
@@ -840,6 +872,10 @@ fn parse_args() -> Result<Args> {
                 args.max_unflushed_memtable_bytes = parse(&flag, &value)?
             }
             "--max-wal-flush-interval-ms" => args.max_wal_flush_interval_ms = parse(&flag, &value)?,
+            "--target-rows-per-sec" => {
+                let v: f64 = parse(&flag, &value)?;
+                args.target_rows_per_sec = (v > 0.0).then_some(v);
+            }
             "--cache-dir" => args.cache_dir = PathBuf::from(value),
             "--num-token-queries" => args.num_token_queries = parse(&flag, &value)?,
             "--num-phrase-queries" => args.num_phrase_queries = parse(&flag, &value)?,
