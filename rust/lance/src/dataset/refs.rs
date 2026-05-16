@@ -533,7 +533,7 @@ impl Branches<'_> {
         }
 
         let mut branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store()).await?;
+            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
         branch_contents.metadata = metadata;
 
         self.object_store()
