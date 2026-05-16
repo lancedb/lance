@@ -412,7 +412,13 @@ fn shard_writer_config(args: &Args, shard_id: Uuid, disable_auto_flush: bool) ->
     let max_rows = if disable_auto_flush {
         args.read_rows.saturating_mul(4).max(4_000_000)
     } else {
-        args.max_memtable_rows.unwrap_or(usize::MAX / 2)
+        // When no explicit row cap is given, derive a generous but
+        // BOUNDED cap from the byte budget. `usize::MAX/2` here would make
+        // `max_memtable_batches` (computed below) astronomically large and
+        // the writer would try to preallocate a petabyte-scale Vec.
+        args.max_memtable_rows.unwrap_or_else(|| {
+            (args.max_memtable_size / 2048).clamp(args.batch_rows.max(1), 16_000_000)
+        })
     };
     let mut config = ShardWriterConfig::new(shard_id)
         .with_durable_write(args.mode.durable_write())
