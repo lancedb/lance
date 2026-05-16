@@ -33,7 +33,6 @@ use crate::encodings::logical::primitive::miniblock::{
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::{ProtobufUtils21, pb21};
 use crate::statistics::{GetStat, Stat};
-use bytemuck::{AnyBitPattern, cast_slice};
 
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
 const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
@@ -164,12 +163,22 @@ impl InlineBitpacking {
         assert!(data.bits_per_value.is_multiple_of(8));
         assert_eq!(data.bits_per_value, self.uncompressed_bit_width);
         let bits_per_value = data.bits_per_value;
+        // The 128-bit arm is what makes Decimal128 columns benefit from inline bit-packing:
+        // common decimal precisions (e.g. Decimal128(7,2)) pack to ~24 bits, well below the
+        // full 128-bit storage, so end-to-end I/O wins typically dominate the slightly
+        // higher decode CPU of the scalar u128 kernel (see `BitPacking for u128` in
+        // `lance-bitpacking` for why no transposed kernel is generated for u128).
         let compressed = match bits_per_value {
             8 => Self::bitpack_chunked::<u8>(data),
             16 => Self::bitpack_chunked::<u16>(data),
             32 => Self::bitpack_chunked::<u32>(data),
             64 => Self::bitpack_chunked::<u64>(data),
-            _ => unreachable!(),
+            128 => Self::bitpack_chunked::<u128>(data),
+            _ => unreachable!(
+                "InlineBitpacking::chunk_data: unsupported bits_per_value={}; \
+                 supported widths are 8, 16, 32, 64, or 128",
+                bits_per_value
+            ),
         };
         (
             compressed,
@@ -181,27 +190,79 @@ impl InlineBitpacking {
         )
     }
 
-    fn unchunk<T: ArrowNativeType + BitPacking + AnyBitPattern>(
+    fn unchunk<T: ArrowNativeType + BitPacking + bytemuck::Pod>(
         data: LanceBuffer,
         num_values: u64,
     ) -> Result<DataBlock> {
-        // Ensure at least the header is present
-        assert!(data.len() >= std::mem::size_of::<T>());
-        assert!(num_values <= ELEMS_PER_CHUNK);
+        // Header / capacity preconditions. Promoted from `assert!` to typed errors:
+        // these inputs come from on-disk framing and a corrupt or truncated chunk
+        // would otherwise panic instead of failing the read.
+        if data.len() < std::mem::size_of::<T>() {
+            return Err(Error::invalid_input(format!(
+                "bitpacking buffer too short for header: got {} bytes, need at least {}",
+                data.len(),
+                std::mem::size_of::<T>()
+            )));
+        }
+        if num_values > ELEMS_PER_CHUNK {
+            return Err(Error::invalid_input(format!(
+                "bitpacking num_values {num_values} exceeds chunk capacity {ELEMS_PER_CHUNK}"
+            )));
+        }
 
-        // This macro decompresses a chunk(1024 values) of bitpacked values.
+        // Decompress one chunk (1024 values) of bitpacked values.
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
         let mut decompressed = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
 
-        // Copy for memory alignment
-        let chunk_in_u8: Vec<u8> = data.to_vec();
-        let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<T>()];
-        let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<T>());
-        let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
-        // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
-        assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
+        // Read the bit-width header. For T <= u64 it fits in u64 trivially; for u128 the
+        // on-disk header is a u128 but the runtime bit-width is bounded by `Self::T = 128`,
+        // so narrowing to u64 is safe *given a valid file*. We hard-check that bound here
+        // (rather than `debug_assert`) because a corrupt or truncated header from disk
+        // would otherwise wrap silently and feed an out-of-range `width` into
+        // `unchecked_unpack`, whose contract is `width <= Self::T`.
+        let header_bytes = &data[..std::mem::size_of::<T>()];
+        let bit_width_value = if std::mem::size_of::<T>() <= 8 {
+            LittleEndian::read_uint(header_bytes, std::mem::size_of::<T>())
+        } else {
+            let raw = LittleEndian::read_u128(header_bytes);
+            if raw > uncompressed_bit_width as u128 {
+                return Err(Error::invalid_input(format!(
+                    "bitpacking header out of range: {raw} > {uncompressed_bit_width}"
+                )));
+            }
+            raw as u64
+        };
+
+        // Validate body length *before* `pod_collect_to_vec`. The framed body must be
+        // exactly `bit_width_value * ELEMS_PER_CHUNK / 8` bytes, which is always a
+        // multiple of `size_of::<T>()`: `ELEMS_PER_CHUNK / 8 = 128` is divisible by
+        // every supported `size_of::<T>()` ∈ {1, 2, 4, 8, 16}. This upstream check is
+        // load-bearing because:
+        // (a) `pod_collect_to_vec` does NOT panic on a body whose length is not a
+        //     multiple of `size_of::<T>()` — it silently rounds the destination count
+        //     up and zero-pads the tail, which would feed garbage to `unchecked_unpack`
+        //     instead of surfacing the corruption, and
+        // (b) `unchecked_unpack`'s safety contract requires the input slice length to
+        //     match `bit_width * ELEMS_PER_CHUNK / (size_of::<T>() * 8)`; a wrong
+        //     length is undefined behavior, not a recoverable panic.
+        let body = &data[std::mem::size_of::<T>()..];
+        let expected_bytes = (bit_width_value * ELEMS_PER_CHUNK) as usize / 8;
+        if body.len() != expected_bytes {
+            return Err(Error::invalid_input(format!(
+                "bitpacking chunk body length mismatch: got {} bytes, \
+                 expected {expected_bytes} bytes for bit_width={bit_width_value}",
+                body.len()
+            )));
+        }
+
+        // Copy + reinterpret with the correct alignment for T. The underlying
+        // `LanceBuffer` is `Vec<u8>` (1-byte aligned), and `bytemuck::cast_slice::<T>`
+        // panics if alignment is insufficient. `pod_collect_to_vec` allocates a fresh
+        // `Vec<T>` with the right alignment and copies the bytes in. Length is already
+        // validated to be a multiple of `size_of::<T>()` above.
+        let chunk: Vec<T> = bytemuck::pod_collect_to_vec(body);
         unsafe {
-            BitPacking::unchecked_unpack(bit_width_value as usize, chunk, &mut decompressed);
+            BitPacking::unchecked_unpack(bit_width_value as usize, &chunk, &mut decompressed);
         }
 
         decompressed.truncate(num_values as usize);
@@ -246,7 +307,10 @@ impl MiniBlockDecompressor for InlineBitpacking {
             16 => Self::unchunk::<u16>(data, num_values),
             32 => Self::unchunk::<u32>(data, num_values),
             64 => Self::unchunk::<u64>(data, num_values),
-            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
+            128 => Self::unchunk::<u128>(data, num_values),
+            w => Err(Error::invalid_input(format!(
+                "Bitpacking word size must be 8, 16, 32, 64, or 128, got {w}"
+            ))),
         }
     }
 }
@@ -258,7 +322,10 @@ impl BlockDecompressor for InlineBitpacking {
             16 => Self::unchunk::<u16>(data, num_values),
             32 => Self::unchunk::<u32>(data, num_values),
             64 => Self::unchunk::<u64>(data, num_values),
-            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
+            128 => Self::unchunk::<u128>(data, num_values),
+            w => Err(Error::invalid_input(format!(
+                "Bitpacking word size must be 8, 16, 32, 64, or 128, got {w}"
+            ))),
         }
     }
 }
@@ -471,7 +538,12 @@ impl BlockCompressor for OutOfLineBitpacking {
             16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width as usize),
             32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width as usize),
             64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width as usize),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            128 => bitpack_out_of_line::<u128>(fixed_width, self.compressed_bit_width as usize),
+            w => {
+                return Err(Error::invalid_input(format!(
+                    "Bitpacking word size must be 8, 16, 32, 64, or 128, got {w}"
+                )));
+            }
         };
         Ok(compressed)
     }
@@ -484,7 +556,12 @@ impl BlockDecompressor for OutOfLineBitpacking {
             16 => std::mem::size_of::<u16>(),
             32 => std::mem::size_of::<u32>(),
             64 => std::mem::size_of::<u64>(),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            128 => std::mem::size_of::<u128>(),
+            w => {
+                return Err(Error::invalid_input(format!(
+                    "Bitpacking word size must be 8, 16, 32, 64, or 128, got {w}"
+                )));
+            }
         };
         debug_assert_eq!(data.len() % word_size, 0);
         let total_words = (data.len() / word_size) as u64;
@@ -516,7 +593,18 @@ impl BlockDecompressor for OutOfLineBitpacking {
                 num_values as usize,
                 self.compressed_bit_width as usize,
             ),
-            _ => unreachable!(),
+            128 => unpack_out_of_line::<u128>(
+                block,
+                num_values as usize,
+                self.compressed_bit_width as usize,
+            ),
+            // Unreachable: the first match above already returned `Err` for any
+            // unsupported width before we reach this dispatch.
+            _ => unreachable!(
+                "OutOfLineBitpacking::decompress: unsupported uncompressed_bit_width={}; \
+                 supported widths are 8, 16, 32, 64, or 128",
+                self.uncompressed_bit_width
+            ),
         };
         Ok(DataBlock::FixedWidth(unpacked))
     }
@@ -532,10 +620,16 @@ mod test {
     use super::{ELEMS_PER_CHUNK, bitpack_out_of_line, unpack_out_of_line};
     use crate::{
         buffer::LanceBuffer,
-        data::{BlockInfo, FixedWidthDataBlock},
+        compression::{BlockDecompressor, MiniBlockDecompressor},
+        data::{BlockInfo, DataBlock, FixedWidthDataBlock},
+        encodings::logical::primitive::miniblock::MiniBlockCompressor,
+        encodings::physical::bitpacking::InlineBitpacking,
+        statistics::ComputeStat,
         testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
+    use lance_bitpacking::BitPacking;
+    use lance_core::Error;
 
     #[test_log::test(tokio::test)]
     async fn test_miniblock_bitpack() {
@@ -651,5 +745,190 @@ mod test {
         let decoded = unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
         let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
         assert_eq!(decoded_values.as_ref(), values.as_slice());
+    }
+
+    #[test]
+    fn test_out_of_line_bitpack_u128_raw_tail_roundtrip() {
+        // u128 mirror of `test_out_of_line_bitpack_raw_tail_roundtrip`. Reachable
+        // from `try_bitpack_for_block` when `num_values > 1024 && bits_per_value
+        // == 128`, so the OutOfLine path must round-trip for u128 just like the
+        // Inline path covered by `test_inline_bitpack_u128_framed_roundtrip`.
+        // 1025 values trips the runt-tail branch (one packed chunk + raw tail).
+        let bit_width = 24usize;
+        let word_bits = std::mem::size_of::<u128>() as u64 * 8;
+        let values: Vec<u128> = (0..1025).map(|i| (i as u128) & 0xFFFFFF).collect();
+        let input = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            bits_per_value: word_bits,
+            num_values: values.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+
+        let compressed = bitpack_out_of_line::<u128>(input, bit_width);
+        let compressed_words = compressed.borrow_to_typed_slice::<u128>().to_vec();
+        let words_per_chunk = (ELEMS_PER_CHUNK as usize * bit_width).div_ceil(word_bits as usize);
+        assert_eq!(
+            compressed_words.len(),
+            words_per_chunk + (values.len() - ELEMS_PER_CHUNK as usize),
+        );
+
+        let compressed_block = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(compressed_words.clone()),
+            bits_per_value: word_bits,
+            num_values: compressed_words.len() as u64,
+            block_info: BlockInfo::new(),
+        };
+
+        let decoded = unpack_out_of_line::<u128>(compressed_block, values.len(), bit_width);
+        let decoded_values = decoded.data.borrow_to_typed_slice::<u128>();
+        assert_eq!(decoded_values.as_ref(), values.as_slice());
+    }
+
+    /// Build a `LanceBuffer` for `InlineBitpacking::unchunk::<u128>` whose 16-byte
+    /// header advertises `header_bit_width` and whose body has `body_words` u128
+    /// elements. The body is zero-filled — sufficient to exercise validation
+    /// without needing a valid bit-packed stream.
+    fn make_u128_inline_buffer(header_bit_width: u128, body_words: usize) -> LanceBuffer {
+        let mut bytes = Vec::with_capacity(16 + body_words * 16);
+        bytes.extend_from_slice(&header_bit_width.to_le_bytes());
+        bytes.extend(std::iter::repeat_n(0u8, body_words * 16));
+        LanceBuffer::from(bytes)
+    }
+
+    #[test]
+    fn test_inline_bitpack_u128_corrupt_header_returns_err() {
+        // Header advertises bit_width = 200, which exceeds the 128-bit ceiling.
+        // This must surface as `InvalidInput` rather than wrapping silently and
+        // feeding an out-of-range width into `unchecked_unpack` (UB).
+        let body_words = (200 * ELEMS_PER_CHUNK) as usize / (8 * 16);
+        let buf = make_u128_inline_buffer(200, body_words);
+
+        let decoder = InlineBitpacking::new(128);
+        let err = MiniBlockDecompressor::decompress(&decoder, vec![buf], ELEMS_PER_CHUNK)
+            .expect_err("corrupt u128 header must yield Err");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_inline_bitpack_u128_body_length_mismatch_returns_err() {
+        // Header is valid (24 bits) but the body has only 1 u128 word — far
+        // less than (24 * 1024 / 8) = 3072 bytes = 192 u128 words.
+        let buf = make_u128_inline_buffer(24, 1);
+
+        let decoder = InlineBitpacking::new(128);
+        let err = MiniBlockDecompressor::decompress(&decoder, vec![buf], ELEMS_PER_CHUNK)
+            .expect_err("body-length mismatch must yield Err");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_inline_bitpack_unsupported_width_returns_err() {
+        // 7 is not in {8,16,32,64,128} — the dispatch arm must return Err
+        // (previously panicked via `unimplemented!`).
+        let decoder = InlineBitpacking::new(7);
+        let buf = LanceBuffer::from(vec![0u8; 16]);
+        let err = MiniBlockDecompressor::decompress(&decoder, vec![buf], 0)
+            .expect_err("unsupported width must yield Err");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+
+        // Same for `BlockDecompressor` dispatch.
+        let buf = LanceBuffer::from(vec![0u8; 16]);
+        let err = BlockDecompressor::decompress(&decoder, buf, 0)
+            .expect_err("unsupported width must yield Err");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_inline_bitpack_u128_framed_roundtrip() {
+        // Happy-path round-trip through the framed [16-byte header | body] format
+        // that `bitpack_chunked` writes and `unchunk` reads. The previous u128
+        // tests exercise only error paths; this guards the framing itself
+        // (header endianness, body layout, dispatch wiring). Picks bit_width=24
+        // to mirror a Decimal128(7,2)-shaped workload — the motivating use case
+        // for the u128 inline path.
+        let bit_width: usize = 24;
+        let values: Vec<u128> = (0..ELEMS_PER_CHUNK as u128).map(|i| i & 0xFFFFFF).collect();
+        let words_per_chunk = ELEMS_PER_CHUNK as usize * bit_width / 128;
+        let mut packed: Vec<u128> = vec![0u128; words_per_chunk];
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &values, &mut packed);
+        }
+
+        let mut bytes = Vec::with_capacity(16 + words_per_chunk * 16);
+        bytes.extend_from_slice(&(bit_width as u128).to_le_bytes());
+        for word in &packed {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let buf = LanceBuffer::from(bytes);
+
+        let decoder = InlineBitpacking::new(128);
+        let block = MiniBlockDecompressor::decompress(&decoder, vec![buf], ELEMS_PER_CHUNK)
+            .expect("framed u128 chunk must decode");
+        let DataBlock::FixedWidth(fw) = block else {
+            panic!("expected FixedWidth DataBlock");
+        };
+        assert_eq!(fw.bits_per_value, 128);
+        assert_eq!(fw.num_values, ELEMS_PER_CHUNK);
+        let decoded = fw.data.borrow_to_typed_slice::<u128>().to_vec();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_inline_bitpack_u128_compress_decompress_roundtrip() {
+        // End-to-end coverage of the u128 inline path through the public
+        // `MiniBlockCompressor` / `MiniBlockDecompressor` surface — i.e. the
+        // path that real decimal128 columns travel. Spans 2 full chunks plus
+        // a short trailing chunk to also exercise the last-chunk handling.
+        let total: u64 = ELEMS_PER_CHUNK * 2 + 137;
+        let values: Vec<u128> = (0..total as u128).map(|i| i & 0xFFFFFF).collect();
+        let input = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(values.clone()),
+            bits_per_value: 128,
+            num_values: total,
+            block_info: BlockInfo::new(),
+        };
+
+        let codec = InlineBitpacking::new(128);
+        let mut block = DataBlock::FixedWidth(input);
+        block.compute_stat();
+        let (compressed, _enc) =
+            MiniBlockCompressor::compress(&codec, block).expect("u128 compress must succeed");
+        assert_eq!(compressed.num_values, total);
+        assert_eq!(compressed.chunks.len(), 3);
+        assert_eq!(compressed.data.len(), 1);
+
+        let buf = compressed.data.into_iter().next().unwrap();
+        let mut offset = 0usize;
+        let mut decoded: Vec<u128> = Vec::with_capacity(total as usize);
+        let mut consumed = 0u64;
+        for chunk in &compressed.chunks {
+            let chunk_len = chunk.buffer_sizes[0] as usize;
+            let chunk_buf = buf.slice_with_length(offset, chunk_len);
+            offset += chunk_len;
+            let nv = chunk.num_values(consumed, total);
+            consumed += nv;
+            let block = MiniBlockDecompressor::decompress(&codec, vec![chunk_buf], nv)
+                .expect("u128 chunk decompress must succeed");
+            let DataBlock::FixedWidth(fw) = block else {
+                panic!("expected FixedWidth DataBlock");
+            };
+            assert_eq!(fw.bits_per_value, 128);
+            assert_eq!(fw.num_values, nv);
+            decoded.extend_from_slice(fw.data.borrow_to_typed_slice::<u128>().as_ref());
+        }
+        assert_eq!(decoded.len(), total as usize);
+        assert_eq!(decoded, values);
     }
 }

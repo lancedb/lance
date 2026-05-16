@@ -401,6 +401,14 @@ impl FixedWidthDataBlock {
                     self.bits_per_value,
                 )))
             }
+            128 => {
+                let u128_slice = self.data.borrow_to_typed_slice::<u128>();
+                let u128_slice = u128_slice.as_ref();
+                Arc::new(UInt64Array::from(calculate_max_bit_width(
+                    u128_slice,
+                    self.bits_per_value,
+                )))
+            }
             _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
         }
     }

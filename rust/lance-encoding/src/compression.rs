@@ -263,7 +263,7 @@ fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
     use arrow_array::cast::AsArray;
 
     let bits = data.bits_per_value;
-    if !matches!(bits, 8 | 16 | 32 | 64) {
+    if !matches!(bits, 8 | 16 | 32 | 64 | 128) {
         return None;
     }
     if data.num_values == 0 {
@@ -296,7 +296,7 @@ fn try_bitpack_for_block(
     data: &FixedWidthDataBlock,
 ) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
     let bits = data.bits_per_value;
-    if !matches!(bits, 8 | 16 | 32 | 64) {
+    if !matches!(bits, 8 | 16 | 32 | 64 | 128) {
         return None;
     }
 
