@@ -240,5 +240,9 @@ harness = false
 name = "mem_wal_fineweb_fts"
 harness = false
 
+[[bench]]
+name = "mem_wal_fts_bench"
+harness = false
+
 [lints]
 workspace = true
