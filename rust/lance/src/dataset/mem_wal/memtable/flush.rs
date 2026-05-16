@@ -13,6 +13,7 @@ use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
+use lance_table::io::commit::write_manifest_file_to_path;
 use log::info;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -238,22 +239,28 @@ impl MemTableFlusher {
 
         let total_rows = self.write_data_file(&gen_path, memtable).await?;
 
-        let created_indexes = self
-            .create_indexes(&gen_path, index_configs, memtable.indexes(), total_rows)
+        // Open the dataset once for all index building. Dataset::write already
+        // created a v1 manifest with the fragment data.
+        let uri = self.path_to_uri(&gen_path);
+        let mut dataset = Dataset::open(&uri).await?;
+
+        // Collect all index metadata without committing individually.
+        // We write a single manifest containing both data and all indexes.
+        let mut all_indexes: Vec<IndexMetadata> = Vec::new();
+
+        let btree_indexes = self
+            .create_indexes(&mut dataset, index_configs, memtable.indexes(), total_rows)
             .await?;
-        if !created_indexes.is_empty() {
+        if !btree_indexes.is_empty() {
             info!(
                 "Created {} BTree indexes on flushed generation {}",
-                created_indexes.len(),
+                btree_indexes.len(),
                 generation
             );
         }
+        all_indexes.extend(btree_indexes);
 
-        // Create HNSW vector indexes and commit them to the dataset
         if let Some(registry) = memtable.indexes() {
-            let uri = self.path_to_uri(&gen_path);
-            let mut dataset = Dataset::open(&uri).await?;
-
             for config in index_configs {
                 if let MemIndexConfig::Hnsw(hnsw_config) = config
                     && let Some(mem_index) = registry.get_hnsw(&hnsw_config.name)
@@ -277,19 +284,7 @@ impl MemTableFlusher {
                     let fragment_ids: roaring::RoaringBitmap =
                         dataset.fragment_bitmap.as_ref().clone();
                     index_meta.fragment_bitmap = Some(fragment_ids);
-
-                    use crate::dataset::transaction::{Operation, Transaction};
-                    let transaction = Transaction::new(
-                        index_meta.dataset_version,
-                        Operation::CreateIndex {
-                            new_indices: vec![index_meta],
-                            removed_indices: vec![],
-                        },
-                        None,
-                    );
-                    dataset
-                        .apply_commit(transaction, &Default::default(), &Default::default())
-                        .await?;
+                    all_indexes.push(index_meta);
 
                     info!(
                         "Created HNSW index '{}' on flushed generation {}",
@@ -298,9 +293,37 @@ impl MemTableFlusher {
                 }
             }
 
-            // Create FTS indexes from in-memory data (direct flush)
-            self.create_fts_indexes(&gen_path, index_configs, memtable.indexes(), total_rows)
+            let fts_indexes = self
+                .create_fts_indexes(
+                    &dataset,
+                    &gen_path,
+                    index_configs,
+                    memtable.indexes(),
+                    total_rows,
+                )
                 .await?;
+            all_indexes.extend(fts_indexes);
+        }
+
+        // Write a single manifest that includes both fragments and all indexes,
+        // overwriting the data-only v1 manifest created by Dataset::write.
+        if !all_indexes.is_empty() {
+            let mut manifest = dataset.manifest().clone();
+            let manifest_path = dataset.manifest_location().path.clone();
+            // Clear stale section offsets from the original v1 manifest since
+            // the new file has a different layout with the added index section.
+            manifest.index_section = None;
+            manifest.transaction_section = None;
+            manifest.transaction_file = None;
+            write_manifest_file_to_path(
+                &self.object_store,
+                &mut manifest,
+                Some(all_indexes),
+                &manifest_path,
+                None,
+            )
+            .await
+            .map_err(|e| Error::io(format!("Failed to write manifest with indexes: {}", e)))?;
         }
 
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
@@ -331,16 +354,13 @@ impl MemTableFlusher {
         })
     }
 
-    /// Create BTree indexes on the flushed dataset.
+    /// Create BTree indexes on the flushed dataset (uncommitted).
     ///
-    /// # Arguments
-    /// * `gen_path` - Path to the flushed generation folder
-    /// * `index_configs` - Index configurations
-    /// * `mem_indexes` - In-memory index registry (for preprocessed training data)
-    /// * `total_rows` - Total number of rows in the flushed data (for row position reversal)
+    /// Returns index metadata without committing to the dataset manifest.
+    /// The caller is responsible for writing a single manifest with all indexes.
     async fn create_indexes(
         &self,
-        gen_path: &Path,
+        dataset: &mut Dataset,
         index_configs: &[MemIndexConfig],
         mem_indexes: Option<&super::super::index::IndexStore>,
         total_rows: usize,
@@ -348,8 +368,6 @@ impl MemTableFlusher {
         use arrow_array::RecordBatchIterator;
 
         use crate::index::CreateIndexBuilder;
-
-        let uri = self.path_to_uri(gen_path);
 
         let btree_configs: Vec<_> = index_configs
             .iter()
@@ -364,13 +382,12 @@ impl MemTableFlusher {
             return Ok(vec![]);
         }
 
-        let mut dataset = Dataset::open(&uri).await?;
         let mut created_indexes = Vec::new();
 
         for btree_cfg in btree_configs {
             let params = ScalarIndexParams::default();
             let mut builder = CreateIndexBuilder::new(
-                &mut dataset,
+                dataset,
                 &[btree_cfg.column.as_str()],
                 IndexType::BTree,
                 &params,
@@ -393,42 +410,24 @@ impl MemTableFlusher {
             }
 
             let index_meta = builder.execute_uncommitted().await?;
-            created_indexes.push(index_meta.clone());
-
-            use crate::dataset::transaction::{Operation, Transaction};
-            let transaction = Transaction::new(
-                index_meta.dataset_version,
-                Operation::CreateIndex {
-                    new_indices: vec![index_meta],
-                    removed_indices: vec![],
-                },
-                None,
-            );
-            dataset
-                .apply_commit(transaction, &Default::default(), &Default::default())
-                .await?;
+            created_indexes.push(index_meta);
         }
 
         Ok(created_indexes)
     }
 
-    /// Create FTS (Full-Text Search) indexes from in-memory data.
+    /// Create FTS (Full-Text Search) indexes from in-memory data (uncommitted).
     ///
-    /// Directly writes the FTS index files using the pre-computed posting lists
-    /// and token data from the in-memory FTS index, avoiding re-tokenization.
-    ///
-    /// # Arguments
-    /// * `gen_path` - Path to the flushed generation folder
-    /// * `index_configs` - Index configurations
-    /// * `mem_indexes` - In-memory index registry (for preprocessed data)
-    /// * `total_rows` - Total number of rows in the flushed data (for row position reversal)
+    /// Writes the FTS index files and returns index metadata without committing.
+    /// The caller is responsible for writing a single manifest with all indexes.
     async fn create_fts_indexes(
         &self,
+        dataset: &Dataset,
         gen_path: &Path,
         index_configs: &[MemIndexConfig],
         mem_indexes: Option<&super::super::index::IndexStore>,
         total_rows: usize,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexMetadata>> {
         use lance_index::pbold;
         use lance_index::scalar::inverted::current_fts_format_version;
         use lance_index::scalar::lance_format::LanceIndexStore;
@@ -442,17 +441,14 @@ impl MemTableFlusher {
             .collect();
 
         if fts_configs.is_empty() {
-            return Ok(());
+            return Ok(vec![]);
         }
 
         let Some(registry) = mem_indexes else {
-            // No in-memory indexes, skip FTS creation
-            return Ok(());
+            return Ok(vec![]);
         };
 
-        // Open the dataset for index commits
-        let uri = self.path_to_uri(gen_path);
-        let mut dataset = Dataset::open(&uri).await?;
+        let mut created_indexes = Vec::new();
 
         for fts_cfg in fts_configs {
             let Some(fts_index) = registry.get_fts(&fts_cfg.name) else {
@@ -463,14 +459,11 @@ impl MemTableFlusher {
                 continue;
             }
 
-            // Create a unique partition ID for this index
             let partition_id = uuid::Uuid::new_v4().as_u64_pair().0;
 
-            // Build the index data with reversed row positions
             let mut inner_builder =
                 fts_index.to_index_builder_reversed(partition_id, total_rows)?;
 
-            // Create the index store for writing
             let index_uuid = uuid::Uuid::new_v4();
             let index_dir = gen_path
                 .clone()
@@ -482,14 +475,11 @@ impl MemTableFlusher {
                 Arc::new(LanceCache::no_cache()),
             );
 
-            // Write the index files
             inner_builder.write(&index_store).await?;
 
-            // Write metadata file with partition info and params
             self.write_fts_metadata(&index_store, partition_id, fts_cfg)
                 .await?;
 
-            // Create index metadata for commit
             let details = pbold::InvertedIndexDetails::try_from(&fts_cfg.params)?;
             let index_details = prost_types::Any::from_msg(&details)
                 .map_err(|e| Error::io(format!("Failed to serialize index details: {}", e)))?;
@@ -516,20 +506,7 @@ impl MemTableFlusher {
                 base_id: None,
                 files: None,
             };
-
-            // Commit the index to the dataset
-            use crate::dataset::transaction::{Operation, Transaction};
-            let transaction = Transaction::new(
-                index_meta.dataset_version,
-                Operation::CreateIndex {
-                    new_indices: vec![index_meta],
-                    removed_indices: vec![],
-                },
-                None,
-            );
-            dataset
-                .apply_commit(transaction, &Default::default(), &Default::default())
-                .await?;
+            created_indexes.push(index_meta);
 
             info!(
                 "Created FTS index '{}' on column '{}' (direct flush)",
@@ -537,7 +514,7 @@ impl MemTableFlusher {
             );
         }
 
-        Ok(())
+        Ok(created_indexes)
     }
 
     /// Write FTS index metadata file.
@@ -1041,13 +1018,17 @@ mod tests {
         assert_eq!(result.generation.generation, 1);
         assert_eq!(result.rows_flushed, 10);
 
-        // Verify the flushed dataset has the BTree index
-        // result.generation.path is just the folder name, construct full URI
+        // Verify the flushed dataset is a single-version dataset with the BTree index
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
             base_uri, shard_id, result.generation.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            1,
+            "flushed dataset must be a single-version dataset"
+        );
         let indices = dataset.load_indices().await.unwrap();
 
         assert_eq!(indices.len(), 1);
@@ -1174,12 +1155,17 @@ mod tests {
         assert_eq!(result.generation.generation, 1);
         assert_eq!(result.rows_flushed, num_vectors);
 
-        // Verify the flushed dataset has the HNSW index
+        // Verify the flushed dataset is a single-version dataset with the HNSW index
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
             base_uri, shard_id, result.generation.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            1,
+            "flushed dataset must be a single-version dataset"
+        );
         let indices = dataset.load_indices().await.unwrap();
 
         assert_eq!(indices.len(), 1);
@@ -1225,6 +1211,24 @@ mod tests {
             dist_col.value(0) < 1e-3,
             "expected near-zero distance for self-match, got {}",
             dist_col.value(0)
+        );
+
+        // Verify the query plan uses the HNSW vector index
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &query, 5).unwrap();
+        scan.fast_search();
+        let plan = scan.create_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_str.contains("ANNSubIndex: name=vector_hnsw, k=5"),
+            "query plan must use HNSW index, got: {plan_str}"
+        );
+        assert!(
+            plan_str.contains("ANNIvfPartition:"),
+            "query plan must use IVF partition, got: {plan_str}"
         );
     }
 
@@ -1301,12 +1305,17 @@ mod tests {
         assert_eq!(result.generation.generation, 1);
         assert_eq!(result.rows_flushed, 3);
 
-        // Verify the flushed dataset has the FTS index
+        // Verify the flushed dataset is a single-version dataset with the FTS index
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
             base_uri, shard_id, result.generation.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            1,
+            "flushed dataset must be a single-version dataset"
+        );
         let indices = dataset.load_indices().await.unwrap();
 
         assert_eq!(indices.len(), 1);
