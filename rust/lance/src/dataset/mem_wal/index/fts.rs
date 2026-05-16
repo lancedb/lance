@@ -1647,6 +1647,169 @@ impl FtsIndexConfig {
 }
 
 // ============================================================================
+// Partition-structured index (redesign — see
+// ~/ai/analysis/lance/jack-MemTableFTSBetter/fts-segment-redesign/DESIGN.md)
+//
+// An immutable `Partition` holds a frozen slice of the MemTable's inserts as
+// on-disk-shaped posting lists, queried with the shared block-max WAND
+// (`wand_search`). The current per-batch-chunk layout makes queries
+// O(corpus); partitions make them ≈ O(matches) and flush 1:1 to a Lance FTS
+// on-disk partition. Wired into `FtsMemIndex` in a later stage; standalone
+// and dead-code-allowed until then.
+// ============================================================================
+
+use arrow_array::builder::{Int32Builder, ListBuilder};
+use arrow_buffer::ScalarBuffer;
+use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
+use lance_index::scalar::inverted::{
+    DocCandidate, DocSet, MemBM25Scorer, PlainPostingList, PostingList, TokenSet, WandTerm,
+    wand_search,
+};
+
+/// An immutable, frozen FTS partition.
+#[allow(dead_code)]
+struct Partition {
+    /// token text -> local token id (dense, 0-based).
+    tokens: TokenSet,
+    /// posting list per local token id.
+    postings: Vec<PostingList>,
+    /// local doc id -> (row position, token count).
+    docs: DocSet,
+}
+
+#[allow(dead_code)]
+impl Partition {
+    fn doc_count(&self) -> usize {
+        self.docs.len()
+    }
+
+    fn total_tokens(&self) -> u64 {
+        self.docs.total_tokens_num()
+    }
+
+    /// Number of docs in this partition containing `token`.
+    fn token_df(&self, token: &str) -> usize {
+        self.tokens
+            .get(token)
+            .map(|id| self.postings[id as usize].len())
+            .unwrap_or(0)
+    }
+
+    /// WAND-search this partition. `query` is `(token, query-position)` pairs,
+    /// already tokenized. Returns this partition's local candidates (row
+    /// positions); the caller merges across partitions and the tail.
+    fn search(
+        &self,
+        query: &[(String, u32)],
+        operator: Operator,
+        scorer: MemBM25Scorer,
+        params: &FtsSearchParams,
+    ) -> Result<Vec<DocCandidate>> {
+        let mut terms: Vec<WandTerm> = Vec::with_capacity(query.len());
+        for (token, position) in query {
+            match self.tokens.get(token) {
+                Some(token_id) => terms.push((
+                    token.clone(),
+                    token_id,
+                    *position,
+                    1.0,
+                    self.postings[token_id as usize].clone(),
+                )),
+                // Term absent here: an AND query can't match in this
+                // partition; an OR query just drops the term.
+                None if operator == Operator::And => return Ok(Vec::new()),
+                None => {}
+            }
+        }
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        // WAND reports the partition-local doc id in `DocCandidate.row_id`;
+        // remap it to the MemTable row position via the partition's DocSet.
+        let mut hits = wand_search(operator, terms, &self.docs, scorer, params)?;
+        for c in &mut hits {
+            c.row_id = self.docs.row_id(c.row_id as u32);
+        }
+        Ok(hits)
+    }
+}
+
+/// Accumulates documents and freezes them into an immutable `Partition`.
+#[allow(dead_code)]
+struct PartitionBuilder {
+    tokens: TokenSet,
+    /// per local token id: `(doc_local_id, freq, positions)` postings.
+    postings: Vec<Vec<(u32, u32, Vec<u32>)>>,
+    docs: DocSet,
+}
+
+#[allow(dead_code)]
+impl PartitionBuilder {
+    fn new() -> Self {
+        Self {
+            tokens: TokenSet::default(),
+            postings: Vec::new(),
+            docs: DocSet::default(),
+        }
+    }
+
+    fn doc_count(&self) -> usize {
+        self.docs.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.docs.len() == 0
+    }
+
+    /// Add one document: `terms` is `(token, freq, positions)` per distinct
+    /// token, `num_tokens` is the document length.
+    fn add_doc(&mut self, row_position: u64, num_tokens: u32, terms: Vec<(String, u32, Vec<u32>)>) {
+        let doc_id = self.docs.append(row_position, num_tokens);
+        for (token, freq, positions) in terms {
+            let token_id = self.tokens.add(token) as usize;
+            if token_id >= self.postings.len() {
+                self.postings.resize_with(token_id + 1, Vec::new);
+            }
+            self.postings[token_id].push((doc_id, freq, positions));
+        }
+    }
+
+    /// Freeze into an immutable `Partition`. Each token's postings are sorted
+    /// by doc id and converted to a `PlainPostingList`; `max_score` is left
+    /// `None` so WAND derives the per-term upper bound from `df` at query
+    /// time (global BM25 stats are not known to a single partition).
+    fn build(self) -> Partition {
+        let postings: Vec<PostingList> = self
+            .postings
+            .into_iter()
+            .map(|mut docs| {
+                docs.sort_by_key(|(doc_id, _, _)| *doc_id);
+                let row_ids: Vec<u64> = docs.iter().map(|(d, _, _)| *d as u64).collect();
+                let freqs: Vec<f32> = docs.iter().map(|(_, f, _)| *f as f32).collect();
+                let mut positions = ListBuilder::new(Int32Builder::new());
+                for (_, _, doc_positions) in &docs {
+                    for p in doc_positions {
+                        positions.values().append_value(*p as i32);
+                    }
+                    positions.append(true);
+                }
+                PostingList::Plain(PlainPostingList::new(
+                    ScalarBuffer::from(row_ids),
+                    ScalarBuffer::from(freqs),
+                    None,
+                    Some(positions.finish()),
+                ))
+            })
+            .collect();
+        Partition {
+            tokens: self.tokens,
+            postings,
+            docs: self.docs,
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2656,5 +2819,84 @@ mod tests {
 
         let err = index.insert(&batch, 0).unwrap_err();
         assert!(err.to_string().contains("only supports"), "{err}");
+    }
+
+    // ===== Partition redesign (Stage 2) =====
+
+    fn build_test_partition() -> Partition {
+        // 4 docs at row positions 100..104.
+        let mut b = PartitionBuilder::new();
+        b.add_doc(
+            100,
+            2,
+            vec![
+                ("apple".to_string(), 1, vec![0]),
+                ("banana".to_string(), 1, vec![1]),
+            ],
+        );
+        b.add_doc(
+            101,
+            2,
+            vec![
+                ("apple".to_string(), 1, vec![0]),
+                ("cherry".to_string(), 1, vec![1]),
+            ],
+        );
+        b.add_doc(102, 1, vec![("banana".to_string(), 1, vec![0])]);
+        b.add_doc(
+            103,
+            3,
+            vec![
+                ("apple".to_string(), 2, vec![0, 1]),
+                ("date".to_string(), 1, vec![2]),
+            ],
+        );
+        b.build()
+    }
+
+    fn search_partition(p: &Partition, token: &str) -> Vec<u64> {
+        let mut token_docs = std::collections::HashMap::new();
+        token_docs.insert(token.to_string(), p.token_df(token));
+        let scorer = MemBM25Scorer::new(p.total_tokens(), p.doc_count(), token_docs);
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let hits = p
+            .search(&[(token.to_string(), 0)], Operator::Or, scorer, &params)
+            .unwrap();
+        let mut ids: Vec<u64> = hits.iter().map(|c| c.row_id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn test_partition_build_and_search() {
+        let p = build_test_partition();
+        assert_eq!(p.doc_count(), 4);
+        assert_eq!(p.total_tokens(), 8); // 2 + 2 + 1 + 3
+        assert_eq!(p.token_df("apple"), 3);
+        assert_eq!(p.token_df("banana"), 2);
+        assert_eq!(p.token_df("missing"), 0);
+
+        // WAND search must return the row positions containing each term.
+        assert_eq!(search_partition(&p, "apple"), vec![100, 101, 103]);
+        assert_eq!(search_partition(&p, "banana"), vec![100, 102]);
+        assert_eq!(search_partition(&p, "date"), vec![103]);
+        assert!(search_partition(&p, "missing").is_empty());
+    }
+
+    #[test]
+    fn test_partition_and_query_short_circuits_missing_term() {
+        let p = build_test_partition();
+        // "apple" present, "missing" absent -> AND yields nothing.
+        let scorer = MemBM25Scorer::new(p.total_tokens(), p.doc_count(), Default::default());
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let hits = p
+            .search(
+                &[("apple".to_string(), 0), ("missing".to_string(), 1)],
+                Operator::And,
+                scorer,
+                &params,
+            )
+            .unwrap();
+        assert!(hits.is_empty());
     }
 }
