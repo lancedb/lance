@@ -78,14 +78,16 @@ public class FileReaderWriterTest {
    */
   private static void assertSchemaWithColumnStats(Schema expected, Schema actual) {
     assertEquals(expected.getFields(), actual.getFields());
+    Map<String, String> actualMetadata = actual.getCustomMetadata();
+    Map<String, String> expectedMetadata = expected.getCustomMetadata();
     assertNotNull(
-        actual.getMetadata(), "Schema metadata should be present when column stats are written");
+        actualMetadata, "Schema metadata should be present when column stats are written");
     assertEquals(
-        expected.getMetadata().get(COLUMN_STATS_BUFFER_INDEX_KEY),
-        actual.getMetadata().get(COLUMN_STATS_BUFFER_INDEX_KEY));
+        expectedMetadata.get(COLUMN_STATS_BUFFER_INDEX_KEY),
+        actualMetadata.get(COLUMN_STATS_BUFFER_INDEX_KEY));
     assertEquals(
-        expected.getMetadata().get(COLUMN_STATS_VERSION_KEY),
-        actual.getMetadata().get(COLUMN_STATS_VERSION_KEY));
+        expectedMetadata.get(COLUMN_STATS_VERSION_KEY),
+        actualMetadata.get(COLUMN_STATS_VERSION_KEY));
   }
 
   private VectorSchemaRoot createBatch(BufferAllocator allocator) throws IOException {
