@@ -201,13 +201,92 @@ fn bench_runs_vs_rows(c: &mut Criterion) {
     group.finish();
 }
 
+/// New producer API: `insert_run` stores the run as-is without inflating to
+/// bits. Compare against `insert_range_single_run` to see the savings on
+/// the producer side.
+fn bench_insert_run(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert_run_single_run");
+    for &n in ROW_COUNTS {
+        let end = (n - 1) as u32;
+        group.throughput(Throughput::Elements(n));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                let mut map = RowAddrTreeMap::new();
+                map.insert_run(0, 0..=end);
+                std::hint::black_box(map);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// New consumer API: `iter_runs` walks runs directly. For maps built via
+/// `insert_run` it is O(num_runs); for maps built via `insert_range` it
+/// falls back to roaring's `Iter::next_range` which is O(num_run_containers).
+/// Compare against `into_addr_iter_single_run` for the speedup callers see.
+fn bench_iter_runs_consumer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("iter_runs_single_run");
+    for &n in ROW_COUNTS {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_run(0, 0..=(n - 1) as u32);
+        group.throughput(Throughput::Elements(n));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                let mut runs: u64 = 0;
+                for _ in unsafe { map.iter_runs() } {
+                    runs += 1;
+                }
+                std::hint::black_box(runs);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Producer scaling under realistic many-small-runs input. Compare against
+/// the `insert_runs_constant_cardinality` group: `insert_run` should scale
+/// with run count alone, while `insert_range` pays per-bit cost.
+fn bench_insert_run_many(c: &mut Criterion) {
+    let total_rows: u64 = 1_000_000;
+    let mut group = c.benchmark_group("insert_run_constant_cardinality");
+
+    group.throughput(Throughput::Elements(total_rows));
+    group.bench_function("single_run_1M", |b| {
+        b.iter(|| {
+            let mut map = RowAddrTreeMap::new();
+            map.insert_run(0, 0..=(total_rows as u32 - 1));
+            std::hint::black_box(map);
+        });
+    });
+
+    for k in [10u64, 100, 1_000, 10_000] {
+        let run_size = total_rows / k;
+        let stride = run_size * 2;
+        group.bench_function(format!("{k}_runs_1M_total"), |b| {
+            b.iter(|| {
+                let mut map = RowAddrTreeMap::new();
+                for i in 0..k {
+                    let start = (i * stride) as u32;
+                    let end = start + run_size as u32 - 1;
+                    map.insert_run(0, start..=end);
+                }
+                std::hint::black_box(map);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_range,
+    bench_insert_run,
     bench_iter_addrs,
     bench_iter_runs,
+    bench_iter_runs_consumer,
     bench_intersect_ranges,
     bench_range_to_ranges_round_trip,
     bench_runs_vs_rows,
+    bench_insert_run_many,
 );
 criterion_main!(benches);

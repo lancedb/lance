@@ -296,8 +296,27 @@ pub struct RowAddrTreeMap {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowAddrSelection {
+    /// The entire fragment is selected. The fragment size is unknown at this
+    /// layer; callers that need to enumerate concrete row addresses must
+    /// supply it externally.
     Full,
+    /// An explicit per-row roaring bitmap of selected row offsets.
     Partial(RoaringBitmap),
+    /// A sorted, non-overlapping, non-adjacent list of row-offset ranges
+    /// (inclusive on both ends).
+    ///
+    /// This is a range-shaped alternative to `Partial` that lets producers
+    /// emit and consumers walk runs in O(num_runs) rather than O(num_rows).
+    /// It is semantically equivalent to a `Partial` containing the union of
+    /// the ranges, and existing operations that don't natively understand
+    /// `Runs` transparently inflate it to a roaring bitmap.
+    ///
+    /// Invariants (must be upheld by constructors):
+    /// * Vec is non-empty (empty selection should not be stored).
+    /// * Each `RangeInclusive` has `start <= end`.
+    /// * Ranges are sorted by `start`, non-overlapping, and non-adjacent
+    ///   (so that two ranges `a..=b` and `c..=d` always satisfy `c > b + 1`).
+    Runs(Vec<RangeInclusive<u32>>),
 }
 
 impl DeepSizeOf for RowAddrSelection {
@@ -305,6 +324,7 @@ impl DeepSizeOf for RowAddrSelection {
         match self {
             Self::Full => 0,
             Self::Partial(bitmap) => bitmap.serialized_size(),
+            Self::Runs(runs) => runs.capacity() * std::mem::size_of::<RangeInclusive<u32>>(),
         }
     }
 }
@@ -312,22 +332,118 @@ impl DeepSizeOf for RowAddrSelection {
 impl RowAddrSelection {
     fn union_all(selections: &[&Self]) -> Self {
         let mut is_full = false;
-
-        let res = Self::Partial(
-            selections
-                .iter()
-                .filter_map(|selection| match selection {
-                    Self::Full => {
-                        is_full = true;
-                        None
-                    }
-                    Self::Partial(bitmap) => Some(bitmap),
-                })
-                .union(),
-        );
-
-        if is_full { Self::Full } else { res }
+        // Inflate any Runs entries into a temporary roaring bitmap so the
+        // existing per-row union machinery can operate on a uniform input.
+        let inflated: Vec<RoaringBitmap> = selections
+            .iter()
+            .filter_map(|selection| match selection {
+                Self::Full => {
+                    is_full = true;
+                    None
+                }
+                Self::Partial(bitmap) => Some(bitmap.clone()),
+                Self::Runs(runs) => Some(runs_to_bitmap(runs)),
+            })
+            .collect();
+        if is_full {
+            return Self::Full;
+        }
+        Self::Partial(inflated.iter().union())
     }
+
+    /// Materialize `self` as a `RoaringBitmap` of selected row offsets.
+    ///
+    /// `Partial` returns a clone of its bitmap; `Runs` inflates into a bitmap.
+    /// `Full` panics — the size is unknown at this layer (mirrors the
+    /// `into_addr_iter` invariant).
+    #[track_caller]
+    fn to_partial_bitmap(&self) -> RoaringBitmap {
+        match self {
+            Self::Full => panic!("Cannot materialize Full as a bitmap; size unknown"),
+            Self::Partial(bitmap) => bitmap.clone(),
+            Self::Runs(runs) => runs_to_bitmap(runs),
+        }
+    }
+
+    /// Consume `self` and return a `RoaringBitmap` of selected row offsets.
+    ///
+    /// `Partial` returns its bitmap without cloning. See [`to_partial_bitmap`]
+    /// for the by-reference variant.
+    #[track_caller]
+    fn into_partial_bitmap(self) -> RoaringBitmap {
+        match self {
+            Self::Full => panic!("Cannot materialize Full as a bitmap; size unknown"),
+            Self::Partial(bitmap) => bitmap,
+            Self::Runs(runs) => runs_to_bitmap(&runs),
+        }
+    }
+}
+
+fn runs_to_bitmap(runs: &[RangeInclusive<u32>]) -> RoaringBitmap {
+    let mut bitmap = RoaringBitmap::new();
+    for run in runs {
+        bitmap.insert_range(*run.start()..=*run.end());
+    }
+    bitmap
+}
+
+/// Merge a new range into a sorted, non-overlapping, non-adjacent vector
+/// of inclusive ranges, preserving the invariants of `RowAddrSelection::Runs`.
+fn insert_run_into_vec(runs: &mut Vec<RangeInclusive<u32>>, new: RangeInclusive<u32>) {
+    let new_start = *new.start();
+    let new_end = *new.end();
+    debug_assert!(new_start <= new_end);
+
+    // Fast path: append when the new run starts strictly after the last run.
+    // This is the common producer pattern (e.g. zonemap iterating zones in
+    // order). Adjacent runs merge into one.
+    if let Some(last) = runs.last_mut() {
+        if new_start > *last.end() {
+            if new_start == last.end().saturating_add(1) && *last.end() != u32::MAX {
+                *last = *last.start()..=new_end.max(*last.end());
+            } else {
+                runs.push(new);
+            }
+            return;
+        }
+    } else {
+        runs.push(new);
+        return;
+    }
+
+    // General case: find the first run whose end is >= new_start - 1, then
+    // merge the overlapping/adjacent suffix into a single span.
+    let mut merged_start = new_start;
+    let mut merged_end = new_end;
+    // Index of the first run that overlaps or is adjacent to `new`.
+    let lo = runs
+        .iter()
+        .position(|r| {
+            let r_end_plus_one = if *r.end() == u32::MAX {
+                u32::MAX
+            } else {
+                *r.end() + 1
+            };
+            r_end_plus_one >= new_start
+        })
+        .unwrap_or(runs.len());
+    // Index one past the last run that overlaps `new`.
+    let mut hi = lo;
+    while hi < runs.len() {
+        let r = &runs[hi];
+        let new_end_plus_one = if new_end == u32::MAX {
+            u32::MAX
+        } else {
+            new_end + 1
+        };
+        if *r.start() > new_end_plus_one {
+            break;
+        }
+        merged_start = merged_start.min(*r.start());
+        merged_end = merged_end.max(*r.end());
+        hi += 1;
+    }
+    runs.splice(lo..hi, std::iter::once(merged_start..=merged_end));
 }
 
 impl RowSetOps for RowAddrTreeMap {
@@ -343,6 +459,11 @@ impl RowSetOps for RowAddrTreeMap {
             .map(|row_addr_selection| match row_addr_selection {
                 RowAddrSelection::Full => None,
                 RowAddrSelection::Partial(indices) => Some(indices.len()),
+                RowAddrSelection::Runs(runs) => Some(
+                    runs.iter()
+                        .map(|r| u64::from(*r.end() - *r.start()) + 1)
+                        .sum(),
+                ),
             })
             .try_fold(0_u64, |acc, next| next.map(|next| next + acc))
     }
@@ -350,7 +471,8 @@ impl RowSetOps for RowAddrTreeMap {
     fn remove(&mut self, row: Self::Row) -> bool {
         let upper = (row >> 32) as u32;
         let lower = row as u32;
-        match self.inner.get_mut(&upper) {
+        let entry = self.inner.get_mut(&upper);
+        match entry {
             None => false,
             Some(RowAddrSelection::Full) => {
                 let mut set = RoaringBitmap::full();
@@ -365,6 +487,18 @@ impl RowSetOps for RowAddrTreeMap {
                 }
                 removed
             }
+            Some(sel @ RowAddrSelection::Runs(_)) => {
+                // Conservative: inflate to Partial so the same code path runs.
+                let mut bitmap = std::mem::replace(sel, RowAddrSelection::Full)
+                    .into_partial_bitmap();
+                let removed = bitmap.remove(lower);
+                if bitmap.is_empty() {
+                    self.inner.remove(&upper);
+                } else {
+                    self.inner.insert(upper, RowAddrSelection::Partial(bitmap));
+                }
+                removed
+            }
         }
     }
 
@@ -375,6 +509,17 @@ impl RowSetOps for RowAddrTreeMap {
             None => false,
             Some(RowAddrSelection::Full) => true,
             Some(RowAddrSelection::Partial(fragment_set)) => fragment_set.contains(lower),
+            Some(RowAddrSelection::Runs(runs)) => runs
+                .binary_search_by(|r| {
+                    if *r.end() < lower {
+                        std::cmp::Ordering::Less
+                    } else if *r.start() > lower {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok(),
         }
     }
 
@@ -435,18 +580,28 @@ impl RowAddrTreeMap {
     /// If there are any "full fragment" items then this can't be calculated and None
     /// is returned
     pub fn row_addrs(&self) -> Option<impl Iterator<Item = RowAddress> + '_> {
-        let inner_iters = self
+        use itertools::Either;
+        let inner_iters: Vec<_> = self
             .inner
             .iter()
-            .filter_map(|(frag_id, row_addr_selection)| match row_addr_selection {
-                RowAddrSelection::Full => None,
-                RowAddrSelection::Partial(bitmap) => Some(
-                    bitmap
-                        .iter()
-                        .map(|row_offset| RowAddress::new_from_parts(*frag_id, row_offset)),
-                ),
+            .filter_map(|(frag_id, row_addr_selection)| {
+                match row_addr_selection {
+                    RowAddrSelection::Full => None,
+                    RowAddrSelection::Partial(bitmap) => Some(Either::Left(
+                        bitmap
+                            .iter()
+                            .map(|row_offset| RowAddress::new_from_parts(*frag_id, row_offset)),
+                    )),
+                    RowAddrSelection::Runs(runs) => {
+                        let frag_id = *frag_id;
+                        Some(Either::Right(runs.iter().flat_map(move |run| {
+                            (*run.start()..=*run.end())
+                                .map(move |row_offset| RowAddress::new_from_parts(frag_id, row_offset))
+                        })))
+                    }
+                }
             })
-            .collect::<Vec<_>>();
+            .collect();
         if inner_iters.len() != self.inner.len() {
             None
         } else {
@@ -478,6 +633,16 @@ impl RowAddrTreeMap {
             }
             Some(RowAddrSelection::Full) => false,
             Some(RowAddrSelection::Partial(set)) => set.insert(row_addr),
+            Some(sel @ RowAddrSelection::Runs(_)) => {
+                // Single-row inserts always inflate Runs back to Partial; the
+                // representation is for range-shaped producers, not scalar
+                // inserts.
+                let mut bitmap = std::mem::replace(sel, RowAddrSelection::Full)
+                    .into_partial_bitmap();
+                let inserted = bitmap.insert(row_addr);
+                *sel = RowAddrSelection::Partial(bitmap);
+                inserted
+            }
         }
     }
 
@@ -522,12 +687,54 @@ impl RowAddrTreeMap {
                 Some(RowAddrSelection::Partial(set)) => {
                     count += set.insert_range(start..=end);
                 }
+                Some(sel @ RowAddrSelection::Runs(_)) => {
+                    // Inflate to Partial so the count-tracking logic matches
+                    // the existing semantics. Callers wanting to stay on Runs
+                    // should use insert_run.
+                    let mut bitmap = std::mem::replace(sel, RowAddrSelection::Full)
+                        .into_partial_bitmap();
+                    count += bitmap.insert_range(start..=end);
+                    *sel = RowAddrSelection::Partial(bitmap);
+                }
             }
             start_high += 1;
             start_low = 0;
         }
 
         count
+    }
+
+    /// Insert a contiguous run of row offsets for one fragment in O(1) amortized.
+    ///
+    /// This is the producer-side counterpart to [`Self::iter_runs`]: it lets
+    /// callers whose results are naturally range-shaped (scalar-index zone
+    /// searches, deletion ranges, fragment chunks) preserve that shape
+    /// downstream instead of materializing every bit.
+    ///
+    /// Semantics:
+    /// * If the fragment is `Full`, the call is a no-op.
+    /// * If the fragment is `Partial`, the range is inserted into the
+    ///   existing bitmap (no representation change).
+    /// * If the fragment is empty or already `Runs`, the run is merged into
+    ///   `Runs`, preserving the sorted / non-overlapping / non-adjacent
+    ///   invariants.
+    ///
+    /// `run` must satisfy `start <= end`.
+    pub fn insert_run(&mut self, fragment_id: u32, run: RangeInclusive<u32>) {
+        debug_assert!(run.start() <= run.end());
+        match self.inner.get_mut(&fragment_id) {
+            None => {
+                self.inner
+                    .insert(fragment_id, RowAddrSelection::Runs(vec![run]));
+            }
+            Some(RowAddrSelection::Full) => {}
+            Some(RowAddrSelection::Partial(bitmap)) => {
+                bitmap.insert_range(*run.start()..=*run.end());
+            }
+            Some(RowAddrSelection::Runs(runs)) => {
+                insert_run_into_vec(runs, run);
+            }
+        }
     }
 
     /// Add a bitmap for a single fragment
@@ -546,6 +753,23 @@ impl RowAddrTreeMap {
             None => None,
             Some(RowAddrSelection::Full) => None,
             Some(RowAddrSelection::Partial(set)) => Some(set),
+            // Runs has no native bitmap to reference; callers wanting one
+            // should canonicalize first via `to_partial_in_place`.
+            Some(RowAddrSelection::Runs(_)) => None,
+        }
+    }
+
+    /// Force the entry for `fragment_id` (if any) into its `Partial` form.
+    ///
+    /// Useful for callers that need direct bitmap access via
+    /// [`Self::get_fragment_bitmap`] but might have a `Runs` entry produced
+    /// by [`Self::insert_run`]. No-op for `None`, `Full`, and already-Partial.
+    pub fn canonicalize_to_partial(&mut self, fragment_id: u32) {
+        if let Some(sel) = self.inner.get_mut(&fragment_id)
+            && matches!(sel, RowAddrSelection::Runs(_))
+        {
+            let bitmap = std::mem::replace(sel, RowAddrSelection::Full).into_partial_bitmap();
+            *sel = RowAddrSelection::Partial(bitmap);
         }
     }
 
@@ -566,14 +790,20 @@ impl RowAddrTreeMap {
     }
 
     /// Compute the serialized size of the set.
+    ///
+    /// `Runs` entries are accounted for as if they were the equivalent
+    /// `Partial` bitmap so this value matches what `serialize_into` will
+    /// actually write.
     pub fn serialized_size(&self) -> usize {
         // Starts at 4 because of the u32 num_entries
         let mut size = 4;
         for set in self.inner.values() {
             // Each entry is 8 bytes for the fragment id and the bitmap size
             size += 8;
-            if let RowAddrSelection::Partial(set) = set {
-                size += set.serialized_size();
+            match set {
+                RowAddrSelection::Full => {}
+                RowAddrSelection::Partial(bitmap) => size += bitmap.serialized_size(),
+                RowAddrSelection::Runs(runs) => size += runs_to_bitmap(runs).serialized_size(),
             }
         }
         size
@@ -592,15 +822,27 @@ impl RowAddrTreeMap {
     ///   * \[u8\]: bitmap
     ///
     /// If bitmap size is zero then the entire fragment is selected.
+    ///
+    /// `Runs` entries are inflated into their equivalent `Partial` bitmap
+    /// before serialization so the on-disk format remains identical and
+    /// older readers can still load the data.
     pub fn serialize_into<W: Write>(&self, mut writer: W) -> Result<()> {
         writer.write_u32::<byteorder::LittleEndian>(self.inner.len() as u32)?;
         for (fragment, set) in &self.inner {
             writer.write_u32::<byteorder::LittleEndian>(*fragment)?;
-            if let RowAddrSelection::Partial(set) = set {
-                writer.write_u32::<byteorder::LittleEndian>(set.serialized_size() as u32)?;
-                set.serialize_into(&mut writer)?;
-            } else {
-                writer.write_u32::<byteorder::LittleEndian>(0)?;
+            match set {
+                RowAddrSelection::Full => {
+                    writer.write_u32::<byteorder::LittleEndian>(0)?;
+                }
+                RowAddrSelection::Partial(set) => {
+                    writer.write_u32::<byteorder::LittleEndian>(set.serialized_size() as u32)?;
+                    set.serialize_into(&mut writer)?;
+                }
+                RowAddrSelection::Runs(runs) => {
+                    let bitmap = runs_to_bitmap(runs);
+                    writer.write_u32::<byteorder::LittleEndian>(bitmap.serialized_size() as u32)?;
+                    bitmap.serialize_into(&mut writer)?;
+                }
             }
         }
         Ok(())
@@ -645,18 +887,77 @@ impl RowAddrTreeMap {
     /// # Safety
     ///
     /// This is unsafe because if any of the inner RowAddrSelection elements
-    /// is not a Partial then the iterator will panic because we don't know
-    /// the size of the bitmap.
+    /// is `Full` then the iterator will panic because we don't know the size
+    /// of the bitmap. `Runs` entries are flattened to individual addresses;
+    /// callers that want per-run iteration should use [`Self::iter_runs`].
     pub unsafe fn into_addr_iter(self) -> impl Iterator<Item = u64> {
+        // Static-dispatch wrapper so adding the Runs variant doesn't impose
+        // dyn-dispatch cost on the existing Partial path. itertools::Either is
+        // already a workspace dependency.
+        use itertools::Either;
         self.inner
             .into_iter()
-            .flat_map(|(fragment, selection)| match selection {
-                RowAddrSelection::Full => panic!("Size of full fragment is unknown"),
-                RowAddrSelection::Partial(bitmap) => bitmap.into_iter().map(move |val| {
-                    let fragment = fragment as u64;
-                    let row_offset = val as u64;
-                    (fragment << 32) | row_offset
-                }),
+            .flat_map(|(fragment, selection)| {
+                let frag = fragment as u64;
+                match selection {
+                    RowAddrSelection::Full => panic!("Size of full fragment is unknown"),
+                    RowAddrSelection::Partial(bitmap) => Either::Left(
+                        bitmap.into_iter().map(move |val| (frag << 32) | val as u64),
+                    ),
+                    RowAddrSelection::Runs(runs) => Either::Right(runs.into_iter().flat_map(
+                        move |run| {
+                            (u64::from(*run.start())..=u64::from(*run.end()))
+                                .map(move |val| (frag << 32) | val)
+                        },
+                    )),
+                }
+            })
+    }
+
+    /// Iterate the selected row addresses as `(fragment_id, run)` pairs.
+    ///
+    /// This is the run-shaped counterpart to [`Self::into_addr_iter`]: a
+    /// contiguous run of N selected rows yields one item, not N. Use it when
+    /// downstream consumers operate naturally on ranges (e.g. converting a
+    /// mask to offset ranges within a row-id sequence) — the work and
+    /// allocations scale with the number of runs, not the number of rows.
+    ///
+    /// Behavior per variant:
+    /// * `Runs` — yields the stored ranges directly (zero conversion cost).
+    /// * `Partial` — yields runs derived from the underlying roaring
+    ///   bitmap's container structure via `Iter::next_range`. For dense
+    ///   bitmaps this is essentially constant per container.
+    /// * `Full` — panics, matching [`Self::into_addr_iter`]'s contract.
+    ///   Callers that build the map themselves know whether `Full` is in play.
+    ///
+    /// # Safety
+    /// Like `into_addr_iter`, this is unsafe because of the `Full` panic.
+    /// Marking it unsafe forces callers to acknowledge the invariant they
+    /// must uphold (no `Full` entries) at construction time.
+    pub unsafe fn iter_runs(
+        &self,
+    ) -> impl Iterator<Item = (u32, RangeInclusive<u32>)> + '_ {
+        use itertools::Either;
+        self.inner
+            .iter()
+            .flat_map(|(fragment, selection)| {
+                let frag = *fragment;
+                match selection {
+                    RowAddrSelection::Full => {
+                        panic!("Size of full fragment is unknown")
+                    }
+                    RowAddrSelection::Partial(bitmap) => {
+                        // Use roaring's run iterator so dense regions cost
+                        // O(num_runs) instead of O(num_bits).
+                        let mut iter = bitmap.iter();
+                        Either::Left(std::iter::from_fn(move || {
+                            iter.next_range().map(|r| (frag, r))
+                        }))
+                    }
+                    RowAddrSelection::Runs(runs) => {
+                        Either::Right(runs.iter().map(move |r| (frag, r.clone())))
+                    }
+                }
             })
     }
 }
@@ -688,21 +989,19 @@ impl std::ops::BitOrAssign<Self> for RowAddrTreeMap {
 impl std::ops::BitOrAssign<&Self> for RowAddrTreeMap {
     fn bitor_assign(&mut self, rhs: &Self) {
         for (fragment, rhs_set) in &rhs.inner {
-            let lhs_set = self.inner.get_mut(fragment);
-            if let Some(lhs_set) = lhs_set {
-                match lhs_set {
-                    RowAddrSelection::Full => {
-                        // If the fragment is already selected then there is nothing to do
-                    }
-                    RowAddrSelection::Partial(lhs_bitmap) => match rhs_set {
-                        RowAddrSelection::Full => {
-                            *lhs_set = RowAddrSelection::Full;
-                        }
-                        RowAddrSelection::Partial(rhs_set) => {
-                            *lhs_bitmap |= rhs_set;
-                        }
-                    },
+            if let Some(lhs_set) = self.inner.get_mut(fragment) {
+                if matches!(lhs_set, RowAddrSelection::Full)
+                    || matches!(rhs_set, RowAddrSelection::Full)
+                {
+                    *lhs_set = RowAddrSelection::Full;
+                    continue;
                 }
+                // Inflate any Runs on either side; the existing roaring
+                // OR machinery handles the merged bitmap path.
+                let mut lhs_bitmap = std::mem::replace(lhs_set, RowAddrSelection::Full)
+                    .into_partial_bitmap();
+                lhs_bitmap |= &rhs_set.to_partial_bitmap();
+                *lhs_set = RowAddrSelection::Partial(lhs_bitmap);
             } else {
                 self.inner.insert(*fragment, rhs_set.clone());
             }
@@ -741,23 +1040,31 @@ impl std::ops::BitAndAssign<&Self> for RowAddrTreeMap {
             .retain(|fragment, _| rhs.inner.contains_key(fragment));
 
         // For fragments that are on the RHS, intersect the bitmaps
-        for (fragment, mut lhs_set) in &mut self.inner {
-            match (&mut lhs_set, rhs.inner.get(fragment)) {
-                (_, None) => {} // Already handled by retain
-                (_, Some(RowAddrSelection::Full)) => {
-                    // Everything selected on RHS, so can leave LHS untouched.
-                }
-                (RowAddrSelection::Partial(lhs_set), Some(RowAddrSelection::Partial(rhs_set))) => {
-                    *lhs_set &= rhs_set;
-                }
-                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs_set))) => {
-                    *lhs_set = RowAddrSelection::Partial(rhs_set.clone());
-                }
+        for (fragment, lhs_set) in &mut self.inner {
+            let rhs_set = match rhs.inner.get(fragment) {
+                Some(set) => set,
+                None => continue, // Already handled by retain
+            };
+            if matches!(rhs_set, RowAddrSelection::Full) {
+                // Everything selected on RHS — LHS unchanged.
+                continue;
             }
+            // RHS is Partial or Runs; both sides need a concrete bitmap.
+            // For LHS=Full, the result is whatever RHS selects (cloned).
+            if matches!(lhs_set, RowAddrSelection::Full) {
+                *lhs_set = RowAddrSelection::Partial(rhs_set.to_partial_bitmap());
+                continue;
+            }
+            // LHS Partial or Runs: inflate, AND in-place.
+            let mut lhs_bitmap = std::mem::replace(lhs_set, RowAddrSelection::Full)
+                .into_partial_bitmap();
+            lhs_bitmap &= &rhs_set.to_partial_bitmap();
+            *lhs_set = RowAddrSelection::Partial(lhs_bitmap);
         }
         // Some bitmaps might now be empty. If they are, we should remove them.
         self.inner.retain(|_, set| match set {
             RowAddrSelection::Partial(set) => !set.is_empty(),
+            RowAddrSelection::Runs(runs) => !runs.is_empty(),
             RowAddrSelection::Full => true,
         });
     }
@@ -784,33 +1091,29 @@ impl std::ops::Sub<&Self> for RowAddrTreeMap {
 impl std::ops::SubAssign<&Self> for RowAddrTreeMap {
     fn sub_assign(&mut self, rhs: &Self) {
         for (fragment, rhs_set) in &rhs.inner {
-            match self.inner.get_mut(fragment) {
-                None => {}
-                Some(RowAddrSelection::Full) => {
-                    // If the fragment is already selected then there is nothing to do
-                    match rhs_set {
-                        RowAddrSelection::Full => {
-                            self.inner.remove(fragment);
-                        }
-                        RowAddrSelection::Partial(rhs_set) => {
-                            // This generally won't be hit.
-                            let mut set = RoaringBitmap::full();
-                            set -= rhs_set;
-                            self.inner.insert(*fragment, RowAddrSelection::Partial(set));
-                        }
-                    }
-                }
-                Some(RowAddrSelection::Partial(lhs_set)) => match rhs_set {
-                    RowAddrSelection::Full => {
-                        self.inner.remove(fragment);
-                    }
-                    RowAddrSelection::Partial(rhs_set) => {
-                        *lhs_set -= rhs_set;
-                        if lhs_set.is_empty() {
-                            self.inner.remove(fragment);
-                        }
-                    }
-                },
+            let Some(lhs_set) = self.inner.get_mut(fragment) else {
+                continue;
+            };
+            if matches!(rhs_set, RowAddrSelection::Full) {
+                self.inner.remove(fragment);
+                continue;
+            }
+            if matches!(lhs_set, RowAddrSelection::Full) {
+                // LHS=Full, RHS=Partial|Runs: result is Full \ rhs.
+                let rhs_bitmap = rhs_set.to_partial_bitmap();
+                let mut set = RoaringBitmap::full();
+                set -= &rhs_bitmap;
+                self.inner.insert(*fragment, RowAddrSelection::Partial(set));
+                continue;
+            }
+            // LHS Partial or Runs, RHS Partial or Runs: inflate both and subtract.
+            let mut lhs_bitmap = std::mem::replace(lhs_set, RowAddrSelection::Full)
+                .into_partial_bitmap();
+            lhs_bitmap -= &rhs_set.to_partial_bitmap();
+            if lhs_bitmap.is_empty() {
+                self.inner.remove(fragment);
+            } else {
+                self.inner.insert(*fragment, RowAddrSelection::Partial(lhs_bitmap));
             }
         }
     }
@@ -818,7 +1121,7 @@ impl std::ops::SubAssign<&Self> for RowAddrTreeMap {
 
 impl FromIterator<u64> for RowAddrTreeMap {
     fn from_iter<T: IntoIterator<Item = u64>>(iter: T) -> Self {
-        let mut inner = BTreeMap::new();
+        let mut inner: BTreeMap<u32, RowAddrSelection> = BTreeMap::new();
         for row_addr in iter {
             let upper = (row_addr >> 32) as u32;
             let lower = row_addr as u32;
@@ -833,6 +1136,14 @@ impl FromIterator<u64> for RowAddrTreeMap {
                 }
                 Some(RowAddrSelection::Partial(set)) => {
                     set.insert(lower);
+                }
+                Some(sel @ RowAddrSelection::Runs(_)) => {
+                    // Scalar inserts: degrade to Partial to keep the per-bit
+                    // semantics this iterator-based constructor implies.
+                    let mut bitmap = std::mem::replace(sel, RowAddrSelection::Full)
+                        .into_partial_bitmap();
+                    bitmap.insert(lower);
+                    *sel = RowAddrSelection::Partial(bitmap);
                 }
             }
         }
@@ -889,6 +1200,12 @@ impl Extend<u64> for RowAddrTreeMap {
                 Some(RowAddrSelection::Partial(set)) => {
                     set.insert(lower);
                 }
+                Some(sel @ RowAddrSelection::Runs(_)) => {
+                    let mut bitmap = std::mem::replace(sel, RowAddrSelection::Full)
+                        .into_partial_bitmap();
+                    bitmap.insert(lower);
+                    *sel = RowAddrSelection::Partial(bitmap);
+                }
             }
         }
     }
@@ -905,21 +1222,19 @@ impl Extend<Self> for RowAddrTreeMap {
     fn extend<T: IntoIterator<Item = Self>>(&mut self, iter: T) {
         for other in iter {
             for (fragment, set) in other.inner {
-                match self.inner.get_mut(&fragment) {
-                    None => {
-                        self.inner.insert(fragment, set);
+                if let Some(lhs_set) = self.inner.get_mut(&fragment) {
+                    if matches!(lhs_set, RowAddrSelection::Full)
+                        || matches!(set, RowAddrSelection::Full)
+                    {
+                        *lhs_set = RowAddrSelection::Full;
+                        continue;
                     }
-                    Some(RowAddrSelection::Full) => {
-                        // If the fragment is already selected then there is nothing to do
-                    }
-                    Some(RowAddrSelection::Partial(lhs_set)) => match set {
-                        RowAddrSelection::Full => {
-                            self.inner.insert(fragment, RowAddrSelection::Full);
-                        }
-                        RowAddrSelection::Partial(rhs_set) => {
-                            *lhs_set |= rhs_set;
-                        }
-                    },
+                    let mut lhs_bitmap = std::mem::replace(lhs_set, RowAddrSelection::Full)
+                        .into_partial_bitmap();
+                    lhs_bitmap |= set.into_partial_bitmap();
+                    *lhs_set = RowAddrSelection::Partial(lhs_bitmap);
+                } else {
+                    self.inner.insert(fragment, set);
                 }
             }
         }
@@ -2395,6 +2710,176 @@ mod tests {
         }
         assert!(mask.selected(u64::MAX));
         assert!(mask.selected(0));
+    }
+
+    fn frag0(offset: u32) -> u64 {
+        offset as u64
+    }
+
+    #[test]
+    fn test_insert_run_creates_runs_variant() {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_run(0, 100..=199);
+        match map.get(&0) {
+            Some(RowAddrSelection::Runs(runs)) => assert_eq!(runs, &[100..=199]),
+            other => panic!("expected Runs, got {other:?}"),
+        }
+        assert!(map.contains(frag0(150)));
+        assert!(!map.contains(frag0(99)));
+        assert!(!map.contains(frag0(200)));
+        assert_eq!(map.len(), Some(100));
+    }
+
+    #[test]
+    fn test_insert_run_merges_adjacent_and_overlapping() {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_run(0, 10..=19);
+        map.insert_run(0, 20..=29); // adjacent — should merge
+        map.insert_run(0, 5..=12); // overlapping with 10..=29
+        let Some(RowAddrSelection::Runs(runs)) = map.get(&0) else {
+            panic!("expected Runs");
+        };
+        assert_eq!(runs, &[5..=29]);
+        assert_eq!(map.len(), Some(25));
+    }
+
+    #[test]
+    fn test_insert_run_preserves_invariants_on_unsorted_input() {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_run(0, 200..=299);
+        map.insert_run(0, 0..=99); // out of order
+        map.insert_run(0, 150..=160);
+        let Some(RowAddrSelection::Runs(runs)) = map.get(&0) else {
+            panic!("expected Runs");
+        };
+        assert_eq!(runs, &[0..=99, 150..=160, 200..=299]);
+        // The merged set must be in strictly sorted, non-overlapping,
+        // non-adjacent order — verify by walking pairwise.
+        for w in runs.windows(2) {
+            assert!(*w[0].end() + 1 < *w[1].start(),
+                "ranges should be non-adjacent: {:?}", w);
+        }
+    }
+
+    #[test]
+    fn test_insert_run_on_partial_fragment_degrades_to_partial() {
+        let mut map = RowAddrTreeMap::new();
+        // Force a Partial entry via a single insert.
+        map.insert(frag0(50));
+        map.insert_run(0, 100..=199);
+        match map.get(&0) {
+            Some(RowAddrSelection::Partial(bitmap)) => {
+                assert!(bitmap.contains(50));
+                assert!(bitmap.contains(100));
+                assert!(bitmap.contains(199));
+                assert_eq!(bitmap.len(), 101);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_insert_run_on_full_fragment_is_noop() {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_fragment(0);
+        map.insert_run(0, 100..=199);
+        assert!(matches!(map.get(&0), Some(RowAddrSelection::Full)));
+    }
+
+    #[test]
+    fn test_iter_runs_returns_stored_runs_for_runs_variant() {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_run(0, 10..=19);
+        map.insert_run(0, 100..=199);
+        map.insert_run(1, 0..=4);
+        let collected: Vec<_> = unsafe { map.iter_runs() }.collect();
+        assert_eq!(collected, vec![(0, 10..=19), (0, 100..=199), (1, 0..=4)]);
+    }
+
+    #[test]
+    fn test_iter_runs_derives_runs_from_partial_bitmap() {
+        // Build a Partial entry the conventional way; iter_runs should still
+        // recover the underlying run structure via Iter::next_range.
+        let mut map = RowAddrTreeMap::new();
+        map.insert_range(0..100);
+        map.insert_range(200..250);
+        let collected: Vec<_> = unsafe { map.iter_runs() }.collect();
+        assert_eq!(collected, vec![(0, 0..=99), (0, 200..=249)]);
+    }
+
+    #[test]
+    fn test_iter_runs_mixed_variants() {
+        let mut map = RowAddrTreeMap::new();
+        // Fragment 0: Runs
+        map.insert_run(0, 5..=9);
+        // Fragment 1: Partial
+        map.insert_range((1u64 << 32) + 0..(1u64 << 32) + 3);
+        let collected: Vec<_> = unsafe { map.iter_runs() }.collect();
+        assert_eq!(collected, vec![(0, 5..=9), (1, 0..=2)]);
+    }
+
+    #[test]
+    fn test_canonicalize_to_partial_drops_runs_form() {
+        let mut map = RowAddrTreeMap::new();
+        map.insert_run(0, 10..=19);
+        assert!(map.get_fragment_bitmap(0).is_none());
+        map.canonicalize_to_partial(0);
+        let bitmap = map.get_fragment_bitmap(0).expect("should be Partial now");
+        assert_eq!(bitmap.len(), 10);
+        assert!(bitmap.contains(10) && bitmap.contains(19));
+    }
+
+    #[test]
+    fn test_runs_serialization_round_trip_matches_partial() {
+        // Two maps that are semantically equal but stored differently must
+        // produce the same on-disk bytes. This guarantees readers built
+        // against the old format can load data written by the new code.
+        let mut via_runs = RowAddrTreeMap::new();
+        via_runs.insert_run(0, 100..=199);
+        let mut via_partial = RowAddrTreeMap::new();
+        via_partial.insert_range(100..200);
+
+        let mut buf_runs = Vec::new();
+        via_runs.serialize_into(&mut buf_runs).unwrap();
+        let mut buf_partial = Vec::new();
+        via_partial.serialize_into(&mut buf_partial).unwrap();
+        assert_eq!(buf_runs, buf_partial);
+
+        // Reading back always yields Partial — the wire format does not
+        // carry the Runs discriminator.
+        let restored = RowAddrTreeMap::deserialize_from(&buf_runs[..]).unwrap();
+        assert!(matches!(
+            restored.get(&0),
+            Some(RowAddrSelection::Partial(_))
+        ));
+        assert_eq!(restored.len(), Some(100));
+    }
+
+    #[test]
+    fn test_runs_set_ops_match_partial_semantics() {
+        // Same selection encoded two ways must behave identically under
+        // existing set operations.
+        let mut runs_a = RowAddrTreeMap::new();
+        runs_a.insert_run(0, 0..=99);
+        runs_a.insert_run(0, 200..=299);
+        let mut partial_a = RowAddrTreeMap::new();
+        partial_a.insert_range(0..100);
+        partial_a.insert_range(200..300);
+
+        let mut b = RowAddrTreeMap::new();
+        b.insert_range(50..250);
+
+        let inter_runs = runs_a.clone() & &b;
+        let inter_partial = partial_a.clone() & &b;
+        assert_eq!(inter_runs.len(), inter_partial.len());
+
+        let union_runs = runs_a.clone() | &b;
+        let union_partial = partial_a.clone() | &b;
+        assert_eq!(union_runs.len(), union_partial.len());
+
+        let diff_runs = runs_a - &b;
+        let diff_partial = partial_a - &b;
+        assert_eq!(diff_runs.len(), diff_partial.len());
     }
 
     proptest::proptest! {

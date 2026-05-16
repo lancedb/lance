@@ -1604,6 +1604,10 @@ impl FilteredReadExec {
         for (fragment_id, selection) in plan.rows.iter() {
             let ranges = match selection {
                 RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
+                RowAddrSelection::Runs(runs) => runs
+                    .iter()
+                    .map(|r| u64::from(*r.start())..u64::from(*r.end()) + 1)
+                    .collect(),
                 RowAddrSelection::Full => {
                     let fragment = self
                         .dataset
