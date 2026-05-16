@@ -45,8 +45,7 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, MemTableScanner, MemWalConfig, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_core::Result;
@@ -470,8 +469,15 @@ fn build_query_set(sample: &[&str], args: &Args) -> QuerySet {
     }
     let mut by_freq: Vec<(String, u64)> = freq.into_iter().collect();
     by_freq.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Skip the most-frequent tokens: terms like "all"/"one"/"time" appear
+    // in a huge fraction of docs, so thousands of documents tie on BM25
+    // and the top-10 is an unstable near-tie that does not meaningfully
+    // exercise FTS correctness. Mid-frequency terms have a well-determined
+    // top-10. The skip is capped so a small vocabulary still yields queries.
+    let skip = (by_freq.len() / 4).min(300);
     let tokens: Vec<String> = by_freq
         .into_iter()
+        .skip(skip)
         .map(|(t, _)| t)
         .take(args.num_token_queries)
         .collect();
@@ -615,99 +621,97 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
     let ingest_s = ingest_start.elapsed().as_secs_f64();
     println!("  read phase: ingested {n} rows in {ingest_s:.1}s");
 
-    // Build the query set from the ingested slice.
+    // Build the query set from the ingested slice. Each query is a
+    // (is_phrase, query_string) pair so the same set drives both the
+    // MemTableScanner and the reference Dataset scanner.
     let sample: Vec<&str> = ingest_pool[..n].iter().map(|s| s.as_str()).collect();
     let queries = build_query_set(&sample, args);
-    let all_queries: Vec<FtsQueryExpr> = queries
+    let num_token_queries = queries.tokens.len();
+    let num_phrase_queries = queries.phrases.len();
+    let all_queries: Vec<(bool, String)> = queries
         .tokens
         .iter()
-        .map(|t| FtsQueryExpr::match_query(t.clone()))
-        .chain(
-            queries
-                .phrases
-                .iter()
-                .map(|p| FtsQueryExpr::phrase(p.clone())),
-        )
+        .map(|t| (false, t.clone()))
+        .chain(queries.phrases.iter().map(|p| (true, p.clone())))
         .collect();
-    println!(
-        "  query set: {} tokens + {} phrases",
-        queries.tokens.len(),
-        queries.phrases.len()
-    );
+    println!("  query set: {num_token_queries} tokens + {num_phrase_queries} phrases");
 
-    // ---- MemTable read phase ----
+    // ---- MemTable read phase: query through the production MemTableScanner ----
+    // The scanner returns RecordBatches projected to `id`, so there is no
+    // need to map FtsMemIndex row positions back to ids by hand.
     let active = writer.active_memtable_ref().await?;
-    let fts = active
-        .index_store
-        .get_fts(FTS_INDEX_NAME)
-        .ok_or_else(|| lance_core::Error::invalid_input("FTS mem index missing"))?;
-
-    // row_position -> id, recovered from the MemTable batches.
-    let mut row_to_id: HashMap<u64, i64> = HashMap::new();
-    for stored in active.batch_store.iter() {
-        let id_arr = stored
-            .data
-            .column_by_name("id")
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .ok_or_else(|| lance_core::Error::invalid_input("id column missing"))?;
-        for r in 0..id_arr.len() {
-            row_to_id.insert(stored.row_offset + r as u64, id_arr.value(r));
-        }
-    }
+    let mt_batch_store = active.batch_store.clone();
+    let mt_index_store = active.index_store.clone();
+    let mt_schema = active.schema.clone();
+    drop(active);
 
     let mut latencies_us = Vec::with_capacity(all_queries.len());
     let mut mt_top: Vec<HashSet<i64>> = Vec::with_capacity(all_queries.len());
-    for q in &all_queries {
-        let opts = SearchOptions::new().with_limit(args.top_k);
+    for (qi, (is_phrase, q)) in all_queries.iter().enumerate() {
+        let mut scanner = MemTableScanner::new(
+            mt_batch_store.clone(),
+            mt_index_store.clone(),
+            mt_schema.clone(),
+        );
+        if *is_phrase {
+            scanner.full_text_phrase(TEXT_COL, q, 0);
+        } else {
+            scanner.full_text_search(TEXT_COL, q);
+        }
+        scanner.project(&["id"]);
+        scanner.limit(args.top_k, None);
         let t0 = Instant::now();
-        let hits = fts.search_with_options(q, opts);
+        let stream = scanner.try_into_stream().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
         latencies_us.push(t0.elapsed().as_micros() as f64);
-        let ids: HashSet<i64> = hits
-            .iter()
-            .take(args.top_k)
-            .filter_map(|e| row_to_id.get(&e.row_position).copied())
-            .collect();
+        let ids = collect_ids(&batches)?;
+        if qi < 5 {
+            println!(
+                "  [debug mt q{qi}] phrase={is_phrase} '{q}' -> {} ids {:?}",
+                ids.len(),
+                ids.iter().take(5).collect::<Vec<_>>()
+            );
+        }
         mt_top.push(ids);
     }
-    drop(active);
-
     let lat_ms: Vec<f64> = latencies_us.iter().map(|us| us / 1000.0).collect();
     let mt_avg_ms = lat_ms.iter().sum::<f64>() / lat_ms.len().max(1) as f64;
 
-    // ---- Force flush, on-disk replay ----
-    let flush_start = Instant::now();
-    writer.close().await?;
-    let flush_s = flush_start.elapsed().as_secs_f64();
-    let flushed = Dataset::open(uri).await?;
+    // ---- Reference: a plain on-disk dataset over the identical ingested
+    // rows + a normal FTS index. The MemTable FTS results are validated
+    // against this. No MemWAL flush is involved: the flushed data lives in
+    // the MemWAL LSM structure which a plain `Dataset::scan` does not see,
+    // so a separate reference dataset is the apples-to-apples comparison.
+    drop(writer);
+    let ref_uri = format!("{uri}_ref");
+    let ref_build_s =
+        build_reference_dataset(&ref_uri, schema.clone(), &sample, id_base, args.batch_rows)
+            .await?;
+    let ref_ds = Dataset::open(&ref_uri).await?;
 
     let mut consistencies = Vec::with_capacity(all_queries.len());
-    for (q, mt_ids) in all_queries.iter().zip(mt_top.iter()) {
-        let query_str = match q {
-            FtsQueryExpr::Match { query, .. } => query.clone(),
-            FtsQueryExpr::Phrase { query, .. } => format!("\"{query}\""),
-            _ => unreachable!("only match/phrase queries are generated"),
+    for (qi, ((is_phrase, q), mt_ids)) in all_queries.iter().zip(mt_top.iter()).enumerate() {
+        let query_str = if *is_phrase {
+            format!("\"{q}\"")
+        } else {
+            q.clone()
         };
-        let mut scanner = flushed.scan();
-        scanner.full_text_search(FullTextSearchQuery::new(query_str))?;
-        // Restrict to the ingested rows so the on-disk comparison covers
-        // exactly the population the MemTable FTS index held.
-        scanner.filter(&format!("id >= {read_seed}"))?;
+        let mut scanner = ref_ds.scan();
+        scanner.full_text_search(FullTextSearchQuery::new(query_str.clone()))?;
         scanner.limit(Some(args.top_k as i64), None)?;
         scanner.project(&["id"])?;
         let stream = scanner.try_into_stream().await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        let mut disk_ids: HashSet<i64> = HashSet::new();
-        for b in &batches {
-            let id_arr = b
-                .column_by_name("id")
-                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                .ok_or_else(|| lance_core::Error::invalid_input("disk id column missing"))?;
-            for i in 0..id_arr.len() {
-                disk_ids.insert(id_arr.value(i));
-            }
-        }
+        let disk_ids = collect_ids(&batches)?;
         let inter: usize = mt_ids.intersection(&disk_ids).count();
         let denom = mt_ids.len().max(disk_ids.len()).max(1);
+        if qi < 5 {
+            println!(
+                "  [debug ref q{qi}] '{query_str}' -> ref={} mt={} inter={inter}",
+                disk_ids.len(),
+                mt_ids.len()
+            );
+        }
         consistencies.push(inter as f64 / denom as f64);
     }
     let cons_mean = consistencies.iter().sum::<f64>() / consistencies.len().max(1) as f64;
@@ -717,15 +721,14 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
         "phase": "read",
         "mode": args.mode.as_str(),
         "uri": uri,
-        "seed_rows": args.seed_rows,
         "read_rows": n,
         "max_memtable_rows": args.max_memtable_rows,
         "setup_seconds": setup_s,
         "ingest_seconds": ingest_s,
-        "flush_seconds": flush_s,
+        "ref_build_seconds": ref_build_s,
         "num_queries": all_queries.len(),
-        "num_token_queries": queries.tokens.len(),
-        "num_phrase_queries": queries.phrases.len(),
+        "num_token_queries": num_token_queries,
+        "num_phrase_queries": num_phrase_queries,
         "mt_latency_avg_ms": mt_avg_ms,
         "mt_latency_p50_ms": percentile(&lat_ms, 50.0),
         "mt_latency_p95_ms": percentile(&lat_ms, 95.0),
@@ -733,6 +736,57 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
         "consistency_mean": cons_mean,
         "consistency_min": cons_min,
     }))
+}
+
+/// Extract the `id` column values from a list of result batches.
+fn collect_ids(batches: &[RecordBatch]) -> Result<HashSet<i64>> {
+    let mut ids = HashSet::new();
+    for b in batches {
+        let id_arr = b
+            .column_by_name("id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| lance_core::Error::invalid_input("id column missing in result"))?;
+        for i in 0..id_arr.len() {
+            ids.insert(id_arr.value(i));
+        }
+    }
+    Ok(ids)
+}
+
+/// Build a plain Lance dataset (no MemWAL) over `texts` with ids starting
+/// at `id_base`, plus a normal FTS index. Used as the read-phase
+/// comparison reference.
+async fn build_reference_dataset(
+    ref_uri: &str,
+    schema: Arc<ArrowSchema>,
+    texts: &[&str],
+    id_base: i64,
+    batch_rows: usize,
+) -> Result<f64> {
+    let start = Instant::now();
+    let mut batches = Vec::with_capacity(texts.len().div_ceil(batch_rows));
+    let mut lo = 0usize;
+    while lo < texts.len() {
+        let hi = (lo + batch_rows).min(texts.len());
+        batches.push(Ok(make_batch(
+            schema.clone(),
+            id_base + lo as i64,
+            &texts[lo..hi],
+        )));
+        lo = hi;
+    }
+    let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
+    let mut dataset = Dataset::write(reader, ref_uri, Some(WriteParams::default())).await?;
+    dataset
+        .create_index(
+            &[TEXT_COL],
+            IndexType::Inverted,
+            Some(FTS_INDEX_NAME.to_string()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await?;
+    Ok(start.elapsed().as_secs_f64())
 }
 
 // ----------------------------------------------------------------------
