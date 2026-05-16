@@ -579,8 +579,12 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
 
     let dataset = Dataset::open(uri).await?;
     let shard_id = Uuid::new_v4();
-    // Auto-flush disabled so the MemTable holds the full read_rows.
-    let config = shard_writer_config(args, shard_id, true);
+    // Auto-flush disabled so the MemTable holds the full read_rows, and
+    // sync_indexed_write forced on so the FTS index is fully populated
+    // when the put loop returns — the read panel measures FTS read
+    // latency and consistency, which are properties of the populated
+    // index and do not depend on whether ingestion was sync or async.
+    let config = shard_writer_config(args, shard_id, true).with_sync_indexed_write(true);
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
     let ingest_pool = &corpus[args.seed_rows.min(corpus.len())..];
@@ -602,34 +606,6 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
     }
     let ingest_s = ingest_start.elapsed().as_secs_f64();
     println!("  read phase: ingested {n} rows in {ingest_s:.1}s");
-
-    // Wait for the FTS index to catch up before querying the MemTable. In
-    // async-index modes the index is updated in the background WAL-flush
-    // handler, so right after the put loop the FtsMemIndex is still empty.
-    // Auto-flush is disabled in the read phase, so the active memtable and
-    // its batch positions are stable and `max_indexed_batch_position` is a
-    // monotonic, meaningful target here (unlike the write phase).
-    let catchup_start = Instant::now();
-    let catchup_deadline = Duration::from_secs(900);
-    loop {
-        let active = writer.active_memtable_ref().await?;
-        let target = active.batch_store.max_buffered_batch_position();
-        let visible = active.index_store.max_visible_batch_position();
-        drop(active);
-        match target {
-            None => break,
-            Some(t) if visible >= t => break,
-            Some(_) => {}
-        }
-        if catchup_start.elapsed() > catchup_deadline {
-            return Err(lance_core::Error::io(
-                "FTS index did not catch up within 900s".to_string(),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let index_catchup_s = catchup_start.elapsed().as_secs_f64();
-    println!("  read phase: index caught up in {index_catchup_s:.1}s");
 
     // Build the query set from the ingested slice.
     let sample: Vec<&str> = ingest_pool[..n].iter().map(|s| s.as_str()).collect();
@@ -735,7 +711,6 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
         "max_memtable_rows": args.max_memtable_rows,
         "setup_seconds": setup_s,
         "ingest_seconds": ingest_s,
-        "index_catchup_seconds": index_catchup_s,
         "flush_seconds": flush_s,
         "num_queries": all_queries.len(),
         "num_token_queries": queries.tokens.len(),
