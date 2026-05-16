@@ -60,6 +60,12 @@ use uuid::Uuid;
 
 const TEXT_COL: &str = "text";
 const FTS_INDEX_NAME: &str = "text_fts";
+/// Seed-row count for the read phase. Kept tiny so the on-disk corpus is
+/// effectively just the ingested rows: the MemTable FTS index covers only
+/// the ingested rows, so the on-disk `full_text_search` it is compared
+/// against must too. The on-disk query is additionally prefiltered to
+/// `id >= READ_SEED_ROWS` to drop these few seed rows entirely.
+const READ_SEED_ROWS: usize = 1000;
 const HF_API_LISTING: &str =
     "https://huggingface.co/api/datasets/HuggingFaceFW/fineweb/tree/main/sample/10BT";
 const HF_FILE_BASE: &str = "https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/";
@@ -573,8 +579,10 @@ async fn run_write(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_js
 async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_json::Value> {
     let schema = make_schema();
 
-    // Seed dataset with an FTS base index (read phase is FTS-only).
-    let seed = &corpus[..args.seed_rows.min(corpus.len())];
+    // Tiny seed dataset with an FTS base index (read phase is FTS-only).
+    // See READ_SEED_ROWS for why the seed is kept small.
+    let read_seed = READ_SEED_ROWS.min(corpus.len());
+    let seed = &corpus[..read_seed];
     let setup_s = build_seed_dataset(uri, schema.clone(), seed, args.batch_rows, true).await?;
 
     let dataset = Dataset::open(uri).await?;
@@ -587,9 +595,9 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
     let config = shard_writer_config(args, shard_id, true).with_sync_indexed_write(true);
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
-    let ingest_pool = &corpus[args.seed_rows.min(corpus.len())..];
+    let ingest_pool = &corpus[read_seed..];
     let n = args.read_rows.min(ingest_pool.len());
-    let id_base = args.seed_rows as i64;
+    let id_base = read_seed as i64;
     let total_batches = n.div_ceil(args.batch_rows);
     let ingest_start = Instant::now();
     for b in 0..total_batches {
@@ -681,6 +689,9 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
         };
         let mut scanner = flushed.scan();
         scanner.full_text_search(FullTextSearchQuery::new(query_str))?;
+        // Restrict to the ingested rows so the on-disk comparison covers
+        // exactly the population the MemTable FTS index held.
+        scanner.filter(&format!("id >= {read_seed}"))?;
         scanner.limit(Some(args.top_k as i64), None)?;
         scanner.project(&["id"])?;
         let stream = scanner.try_into_stream().await?;
@@ -819,13 +830,13 @@ async fn run(args: Args) -> Result<()> {
         args.max_memtable_rows,
     );
 
-    let ingest_needed = match args.phase {
-        Phase::Write => args.calls * args.batch_rows,
-        Phase::Read => args.read_rows,
+    // Corpus size differs by phase: the write phase seeds with
+    // `seed_rows` and cycles the ingest pool; the read phase uses only a
+    // tiny `READ_SEED_ROWS` seed plus `read_rows` ingested rows.
+    let corpus_rows = match args.phase {
+        Phase::Write => (args.seed_rows + args.calls * args.batch_rows).min(2_000_000),
+        Phase::Read => (READ_SEED_ROWS + args.read_rows).min(2_000_000),
     };
-    // Cap downloaded corpus; the write phase cycles the ingest pool if it
-    // needs more rows than were loaded.
-    let corpus_rows = (args.seed_rows + ingest_needed).min(2_000_000);
     let corpus = load_corpus(corpus_rows, &args.cache_dir).await?;
 
     let result = match args.phase {
