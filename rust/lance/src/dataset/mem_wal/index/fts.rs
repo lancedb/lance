@@ -58,10 +58,10 @@ use arrow_schema::DataType;
 use crossbeam_skiplist::SkipMap;
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::query::{FtsSearchParams, Operator};
+use lance_index::scalar::inverted::query::Operator;
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::{
-    DocSet, MemBM25Scorer, PlainPostingList, PostingList, Scorer, TokenSet, WandTerm, wand_search,
+    DocSet, MemBM25Scorer, PlainPostingList, PostingList, Scorer, TokenSet,
 };
 use lance_tokenizer::TokenStream;
 
@@ -1048,10 +1048,7 @@ impl FtsMemIndex {
         }
         let mut results = Vec::new();
         for p in st.partitions.iter() {
-            match p.search_match(tokens, Operator::Or, &scorer) {
-                Ok(hits) => results.extend(hits),
-                Err(e) => log::warn!("FTS partition match search failed: {e}"),
-            }
+            results.extend(p.search_match(tokens, Operator::Or, &scorer));
         }
         if tail_snap.visible_count > 0 {
             results.extend(score_terms(&tail_snap, &st.tail.terms, tokens, &scorer));
@@ -1074,10 +1071,7 @@ impl FtsMemIndex {
         }
         let mut results = Vec::new();
         for p in st.partitions.iter() {
-            match p.search_phrase(tokens, slop, &scorer) {
-                Ok(hits) => results.extend(hits),
-                Err(e) => log::warn!("FTS partition phrase search failed: {e}"),
-            }
+            results.extend(p.search_phrase(tokens, slop, &scorer));
         }
         if tail_snap.visible_count > 0 {
             results.extend(phrase_search_tail(
@@ -2026,105 +2020,91 @@ impl Partition {
         }
     }
 
-    /// WAND OR/AND-search; candidates scored with `scorer` and reported as
-    /// MemTable row positions.
-    /// WAND runs unbounded (no `limit`): block-max top-k pruning needs
-    /// per-term `max_score` upper bounds, which in-memory posting lists do
-    /// not carry, so a bounded WAND would drop valid top-k docs. The scan is
-    /// still O(matches); the caller truncates to the real limit after merge.
+    /// BM25 OR/AND-search by a direct posting-list scan. A partition holds one
+    /// merged posting list per term, so cost is O(matches) — not O(corpus) as
+    /// the old per-batch-chunk layout was. Block-max WAND pruning is not used:
+    /// it needs per-term `max_score` upper bounds that frozen in-memory
+    /// posting lists do not carry, and an unbounded WAND mis-prunes without
+    /// them. Each token occurrence in `tokens` contributes independently, so
+    /// scores match the tail's `score_terms`.
     fn search_match(
         &self,
         tokens: &[String],
         operator: Operator,
         scorer: &MemBM25Scorer,
-    ) -> Result<Vec<FtsEntry>> {
-        let mut wand_terms: Vec<WandTerm> = Vec::new();
-        let mut tok_order: Vec<String> = Vec::new();
-        for (qpos, t) in tokens.iter().enumerate() {
-            match self.token_ids.get(t.as_str()) {
+    ) -> Vec<FtsEntry> {
+        // doc -> (accumulated score, number of token-occurrence hits).
+        let mut doc_scores: HashMap<u32, (f32, u32)> = HashMap::new();
+        let mut any_present = false;
+        let mut all_present = true;
+        for token in tokens {
+            match self.token_ids.get(token.as_str()) {
                 Some(&id) => {
-                    wand_terms.push((
-                        t.clone(),
-                        id,
-                        qpos as u32,
-                        1.0,
-                        self.postings[id as usize].clone(),
-                    ));
-                    tok_order.push(t.clone());
+                    any_present = true;
+                    let plain = posting_as_plain(&self.postings[id as usize]);
+                    let qw = scorer.query_weight(token);
+                    for i in 0..plain.len() {
+                        let doc = plain.row_ids[i] as u32;
+                        let dl = self.docs.num_tokens(doc);
+                        let s = qw * scorer.doc_weight(plain.frequencies[i] as u32, dl);
+                        let e = doc_scores.entry(doc).or_insert((0.0, 0));
+                        e.0 += s;
+                        e.1 += 1;
+                    }
                 }
-                // Term absent: an AND query cannot match here; OR drops it.
-                None if operator == Operator::And => return Ok(Vec::new()),
-                None => {}
+                None => all_present = false,
             }
         }
-        if wand_terms.is_empty() {
-            return Ok(Vec::new());
+        if !any_present || (operator == Operator::And && !all_present) {
+            return Vec::new();
         }
-        let params = FtsSearchParams::new();
-        let cands = wand_search(operator, wand_terms, &self.docs, scorer.clone(), &params)?;
-        Ok(cands
+        let need = tokens.len() as u32;
+        doc_scores
             .into_iter()
-            .map(|c| {
-                let score: f32 = c
-                    .freqs
-                    .iter()
-                    .map(|(ti, f)| {
-                        scorer.query_weight(&tok_order[*ti as usize])
-                            * scorer.doc_weight(*f, c.doc_length)
-                    })
-                    .sum();
-                FtsEntry {
-                    row_position: self.docs.row_id(c.row_id as u32),
-                    score,
+            .filter_map(|(doc, (score, hits))| {
+                // AND requires the doc to be hit once per query-token slot.
+                if operator == Operator::And && hits < need {
+                    return None;
                 }
+                Some(FtsEntry {
+                    row_position: self.docs.row_id(doc),
+                    score,
+                })
             })
-            .collect())
+            .collect()
     }
 
-    /// Phrase-search: WAND-And finds docs containing every token, then token
-    /// positions are verified. `tokens.len() >= 2`.
-    fn search_phrase(
-        &self,
-        tokens: &[String],
-        slop: u32,
-        scorer: &MemBM25Scorer,
-    ) -> Result<Vec<FtsEntry>> {
-        let mut wand_terms: Vec<WandTerm> = Vec::new();
-        let mut token_id_order: Vec<u32> = Vec::new();
-        for (qpos, t) in tokens.iter().enumerate() {
-            match self.token_ids.get(t.as_str()) {
-                Some(&id) => {
-                    wand_terms.push((
-                        t.clone(),
-                        id,
-                        qpos as u32,
-                        1.0,
-                        self.postings[id as usize].clone(),
-                    ));
-                    token_id_order.push(id);
-                }
+    /// Phrase-search by intersecting posting lists: drive from the rarest
+    /// token, require every other token to contain the doc, and verify the
+    /// token positions satisfy the phrase. `tokens.len() >= 2`.
+    fn search_phrase(&self, tokens: &[String], slop: u32, scorer: &MemBM25Scorer) -> Vec<FtsEntry> {
+        let mut plains: Vec<&PlainPostingList> = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            match self.token_ids.get(token.as_str()) {
+                Some(&id) => plains.push(posting_as_plain(&self.postings[id as usize])),
                 // A phrase needs every token present in this partition.
-                None => return Ok(Vec::new()),
+                None => return Vec::new(),
             }
         }
-        let params = FtsSearchParams::new();
-        let cands = wand_search(
-            Operator::And,
-            wand_terms,
-            &self.docs,
-            scorer.clone(),
-            &params,
-        )?;
+        let rarest = (0..plains.len()).min_by_key(|&i| plains[i].len()).unwrap();
         let mut results = Vec::new();
-        for c in cands {
-            let local_doc = c.row_id; // partition-local doc id
+        for i in 0..plains[rarest].len() {
+            let doc = plains[rarest].row_ids[i];
             let mut all_positions: Vec<Vec<u32>> = Vec::with_capacity(tokens.len());
+            let mut freqs: Vec<u32> = Vec::with_capacity(tokens.len());
             let mut present = true;
-            for &tid in &token_id_order {
-                let plain = posting_as_plain(&self.postings[tid as usize]);
-                match plain.row_ids.binary_search(&local_doc) {
-                    Ok(idx) => all_positions.push(read_positions(plain, idx)),
-                    Err(_) => {
+            for (ti, plain) in plains.iter().enumerate() {
+                let idx = if ti == rarest {
+                    Some(i)
+                } else {
+                    plain.row_ids.binary_search(&doc).ok()
+                };
+                match idx {
+                    Some(idx) => {
+                        freqs.push(plain.frequencies[idx] as u32);
+                        all_positions.push(read_positions(plain, idx));
+                    }
+                    None => {
                         present = false;
                         break;
                     }
@@ -2133,19 +2113,18 @@ impl Partition {
             if !present || !phrase_matches(&all_positions, slop) {
                 continue;
             }
-            let score: f32 = c
-                .freqs
+            let dl = self.docs.num_tokens(doc as u32);
+            let score: f32 = tokens
                 .iter()
-                .map(|(ti, f)| {
-                    scorer.query_weight(&tokens[*ti as usize]) * scorer.doc_weight(*f, c.doc_length)
-                })
+                .zip(&freqs)
+                .map(|(t, &f)| scorer.query_weight(t) * scorer.doc_weight(f, dl))
                 .sum();
             results.push(FtsEntry {
-                row_position: self.docs.row_id(local_doc as u32),
+                row_position: self.docs.row_id(doc as u32),
                 score,
             });
         }
-        Ok(results)
+        results
     }
 }
 
@@ -3266,16 +3245,12 @@ mod tests {
         let apple = index.tokenize_for_search("apple").pop().unwrap();
         // "apple" is present -> an OR search over it matches.
         let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple));
-        let or_hits = p
-            .search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer)
-            .unwrap();
+        let or_hits = p.search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer);
         assert_eq!(or_hits.len(), 3);
         // Adding an absent term to an AND query short-circuits to nothing.
         let and_tokens = vec![apple, "definitely_missing".to_string()];
         let and_scorer = build_scorer(&st, &tail_snap, &and_tokens);
-        let and_hits = p
-            .search_match(&and_tokens, Operator::And, &and_scorer)
-            .unwrap();
+        let and_hits = p.search_match(&and_tokens, Operator::And, &and_scorer);
         assert!(and_hits.is_empty());
     }
 
