@@ -1083,19 +1083,19 @@ wheels = [
 
 [[package]]
 name = "lance-namespace"
-version = "0.7.4"
+version = "0.7.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lance-namespace-urllib3-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/de/5c/0d26122b2c8e6f16d4e008347bcc7b25bca9c45aa838395af37b7d2604f0/lance_namespace-0.7.4.tar.gz", hash = "sha256:f47014b4f00a18716333a0734295936904e0431098a52d3a6757028617d6795c", size = 10685, upload-time = "2026-05-05T00:11:07.437Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2b/da/134670003173881bed44af656badffd91e0b2e0232c083eeacc5923d7335/lance_namespace-0.7.6.tar.gz", hash = "sha256:4e12094005d105ef1b44346c9d7feda4a0f733b127dab90c1a5ffbf7cd433770", size = 10686, upload-time = "2026-05-05T18:26:38.885Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a4/90/8b0bddd186652b2b4916f1041652ff752f9fd564887fe863090b499bbe34/lance_namespace-0.7.4-py3-none-any.whl", hash = "sha256:332d495cb821bd3d89ad70368a9ca5e39e3cc7633ba0e7ce0320981f6472471c", size = 12519, upload-time = "2026-05-05T00:11:03.648Z" },
+    { url = "https://files.pythonhosted.org/packages/83/88/44463a5f41f7077b2ea641f2afded72eaceb6a6a1b4a55c11b22318fed74/lance_namespace-0.7.6-py3-none-any.whl", hash = "sha256:c94a1b8a6aab127e55a20cbf44d927ae3a9b7d435656d2130dccf84ccf7c9999", size = 12519, upload-time = "2026-05-05T18:26:36.425Z" },
 ]
 
 [[package]]
 name = "lance-namespace-urllib3-client"
-version = "0.7.4"
+version = "0.7.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
@@ -1104,9 +1104,9 @@ dependencies = [
     { name = "urllib3", version = "1.26.20", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "urllib3", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/84/62b46e237e6419e60dd614a95496938e696f0c6b98f720b71791ea066070/lance_namespace_urllib3_client-0.7.4.tar.gz", hash = "sha256:061dd30b3a7a2df2cf7c07fdd900d84d12c6779db3d54e5e3d99f0d82d867102", size = 194604, upload-time = "2026-05-05T00:11:04.975Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/44/024aae184c08b3800482cd9b832d534249e25de145af732d4e4c8dff38a8/lance_namespace_urllib3_client-0.7.6.tar.gz", hash = "sha256:15ae7f0d8d56fa34d837f7f6ec5c80a327a905e89ccfed05f7b409d6fe704cdf", size = 195551, upload-time = "2026-05-05T18:26:37.808Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bf/76/f0770e585e440a70844a4e4328e249c1335981d470599b697c02afa18950/lance_namespace_urllib3_client-0.7.4-py3-none-any.whl", hash = "sha256:7784a00a2a78140f2ce70b2a3dac4ee071f7d87d9bb2f76ebb25b482be37a5a1", size = 323540, upload-time = "2026-05-05T00:11:06.45Z" },
+    { url = "https://files.pythonhosted.org/packages/00/50/60c983cc8180772c82370dfad2104b7e788aaacc3bf9a84e8b42bb1ae6a7/lance_namespace_urllib3_client-0.7.6-py3-none-any.whl", hash = "sha256:fb884d8afff8af3aae04a3270624694a189d7ea79225dd349e6c555a1a1d6b52", size = 324603, upload-time = "2026-05-05T18:26:39.718Z" },
 ]
 
 [[package]]
@@ -2620,6 +2620,29 @@ torch = [
     { name = "torch" },
 ]
 
+[package.dev-dependencies]
+benchmarks = [
+    { name = "pytest-benchmark" },
+]
+dev = [
+    { name = "pyright" },
+    { name = "ruff" },
+]
+tests = [
+    { name = "boto3" },
+    { name = "datafusion", marker = "python_full_version >= '3.10'" },
+    { name = "datasets", version = "4.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "duckdb" },
+    { name = "ml-dtypes" },
+    { name = "pandas" },
+    { name = "pillow" },
+    { name = "polars", extra = ["pandas", "pyarrow"] },
+    { name = "psutil" },
+    { name = "pytest" },
+    { name = "tensorflow", version = "2.20.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10' and sys_platform == 'linux'" },
+    { name = "tqdm" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "boto3", marker = "extra == 'tests'" },
@@ -2628,7 +2651,7 @@ requires-dist = [
     { name = "duckdb", marker = "extra == 'tests'" },
     { name = "geoarrow-rust-core", marker = "extra == 'geo'" },
     { name = "geoarrow-rust-io", marker = "extra == 'geo'" },
-    { name = "lance-namespace", specifier = ">=0.7.4,<0.8" },
+    { name = "lance-namespace", specifier = ">=0.7.5,<0.8" },
     { name = "ml-dtypes", marker = "extra == 'tests'" },
     { name = "numpy", specifier = ">=1.22" },
     { name = "pandas", marker = "extra == 'tests'" },
@@ -2645,6 +2668,27 @@ requires-dist = [
     { name = "tqdm", marker = "extra == 'tests'" },
 ]
 provides-extras = ["benchmarks", "dev", "geo", "tests", "torch"]
+
+[package.metadata.requires-dev]
+benchmarks = [{ name = "pytest-benchmark", specifier = "==5.1.0" }]
+dev = [
+    { name = "pyright", specifier = "==1.1.406" },
+    { name = "ruff", specifier = "==0.11.2" },
+]
+tests = [
+    { name = "boto3", specifier = "==1.40.43" },
+    { name = "datafusion", marker = "python_full_version >= '3.10'", specifier = "==53.0.0" },
+    { name = "datasets", marker = "python_full_version >= '3.10'", specifier = "==4.1.1" },
+    { name = "duckdb", specifier = "==1.4.0" },
+    { name = "ml-dtypes", specifier = "==0.5.3" },
+    { name = "pandas", specifier = "==2.3.3" },
+    { name = "pillow", specifier = "==11.3.0" },
+    { name = "polars", extras = ["pyarrow", "pandas"], specifier = "==1.34.0" },
+    { name = "psutil", specifier = "==7.1.0" },
+    { name = "pytest", specifier = "==8.4.2" },
+    { name = "tensorflow", marker = "python_full_version >= '3.10' and sys_platform == 'linux'", specifier = "==2.20.0" },
+    { name = "tqdm", specifier = "==4.67.1" },
+]
 
 [[package]]
 name = "pyproj"
