@@ -13,24 +13,12 @@
  */
 package org.lance;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
-
 import org.lance.file.BlobReadMode;
 import org.lance.file.FileReadOptions;
 import org.lance.file.LanceFileReader;
 import org.lance.file.LanceFileWriter;
 import org.lance.util.Range;
 
-import java.io.IOException;
-import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -47,9 +35,19 @@ import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.lance.file.LanceFileReader;
-import org.lance.file.LanceFileWriter;
-import org.lance.util.Range;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 public class FileReaderWriterTest {
   /**
@@ -67,8 +65,10 @@ public class FileReaderWriterTest {
     Map<String, String> metadata = new HashMap<>();
     metadata.put(COLUMN_STATS_BUFFER_INDEX_KEY, "1");
     metadata.put(COLUMN_STATS_VERSION_KEY, "1");
-    return new Schema(Arrays.asList(Field.nullable("x", new ArrowType.Int(64, true)),
-                          Field.nullable("y", new ArrowType.Utf8())),
+    return new Schema(
+        Arrays.asList(
+            Field.nullable("x", new ArrowType.Int(64, true)),
+            Field.nullable("y", new ArrowType.Utf8())),
         metadata);
   }
 
@@ -80,16 +80,21 @@ public class FileReaderWriterTest {
     assertEquals(expected.getFields(), actual.getFields());
     assertNotNull(
         actual.getMetadata(), "Schema metadata should be present when column stats are written");
-    assertEquals(expected.getMetadata().get(COLUMN_STATS_BUFFER_INDEX_KEY),
+    assertEquals(
+        expected.getMetadata().get(COLUMN_STATS_BUFFER_INDEX_KEY),
         actual.getMetadata().get(COLUMN_STATS_BUFFER_INDEX_KEY));
-    assertEquals(expected.getMetadata().get(COLUMN_STATS_VERSION_KEY),
+    assertEquals(
+        expected.getMetadata().get(COLUMN_STATS_VERSION_KEY),
         actual.getMetadata().get(COLUMN_STATS_VERSION_KEY));
   }
 
   private VectorSchemaRoot createBatch(BufferAllocator allocator) throws IOException {
-    Schema schema = new Schema(Arrays.asList(Field.nullable("x", new ArrowType.Int(64, true)),
-                                   Field.nullable("y", new ArrowType.Utf8())),
-        null);
+    Schema schema =
+        new Schema(
+            Arrays.asList(
+                Field.nullable("x", new ArrowType.Int(64, true)),
+                Field.nullable("y", new ArrowType.Utf8())),
+            null);
     VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
     root.allocateNew();
     BigIntVector iVector = (BigIntVector) root.getVector("x");
@@ -189,8 +194,9 @@ public class FileReaderWriterTest {
       assertFalse(batches.loadNextBatch());
     }
 
-    try (ArrowReader batches = reader.readAll(
-             null, Arrays.asList(Range.of(1, 11), Range.of(14, 19), Range.of(20, 21)), 100)) {
+    try (ArrowReader batches =
+        reader.readAll(
+            null, Arrays.asList(Range.of(1, 11), Range.of(14, 19), Range.of(20, 21)), 100)) {
       assertTrue(batches.loadNextBatch());
       VectorSchemaRoot batch = batches.getVectorSchemaRoot();
       assertEquals(16, batch.getRowCount());
@@ -198,9 +204,11 @@ public class FileReaderWriterTest {
       assertFalse(batches.loadNextBatch());
     }
 
-    try (ArrowReader batches = reader.readAll(Collections.singletonList("x"),
-             Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
-             100)) {
+    try (ArrowReader batches =
+        reader.readAll(
+            Collections.singletonList("x"),
+            Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
+            100)) {
       assertTrue(batches.loadNextBatch());
       VectorSchemaRoot batch = batches.getVectorSchemaRoot();
       assertEquals(4, batch.getRowCount());
@@ -208,9 +216,11 @@ public class FileReaderWriterTest {
       assertFalse(batches.loadNextBatch());
     }
 
-    try (ArrowReader batches = reader.readAll(Collections.singletonList("y"),
-             Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
-             100)) {
+    try (ArrowReader batches =
+        reader.readAll(
+            Collections.singletonList("y"),
+            Arrays.asList(Range.of(23, 25), Range.of(27, 29)),
+            100)) {
       assertTrue(batches.loadNextBatch());
       VectorSchemaRoot batch = batches.getVectorSchemaRoot();
       assertEquals(4, batch.getRowCount());
@@ -250,8 +260,11 @@ public class FileReaderWriterTest {
     try {
       LanceFileWriter.open(filePath, allocator, null, storageOptions);
     } catch (IllegalArgumentException e) {
-      assertTrue(e.getMessage().contains("Unable to find object store prefix: no Azure account "
-          + "name in URI, and no storage account configured."));
+      assertTrue(
+          e.getMessage()
+              .contains(
+                  "Unable to find object store prefix: no Azure account "
+                      + "name in URI, and no storage account configured."));
     }
 
     storageOptions.put("account_name", "some_account");
@@ -317,9 +330,11 @@ public class FileReaderWriterTest {
     try (LanceFileWriter writer = LanceFileWriter.open(filePath, allocator, null)) {
       try (VectorSchemaRoot batch = createBatch(allocator)) {
         writer.write(batch);
-        Assertions.assertThrows(Exception.class,
+        Assertions.assertThrows(
+            Exception.class,
             () -> writer.addSchemaMetadata(Collections.singletonMap("someKey", null)));
-        Assertions.assertThrows(Exception.class,
+        Assertions.assertThrows(
+            Exception.class,
             () -> writer.addSchemaMetadata(Collections.singletonMap(null, "someValue")));
       }
     }
