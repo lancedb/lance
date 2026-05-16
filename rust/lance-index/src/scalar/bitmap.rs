@@ -2556,11 +2556,23 @@ mod tests {
         assert_eq!(index.index_map.len(), 2); // 2 non-null values (1 and 2)
         assert!(!index.null_map.is_empty()); // Should have null values
 
+        // Remap into a separate store so Windows does not need to replace the
+        // source lookup file while the loaded index still owns a reader.
+        let remapped_tmpdir = TempObjDir::default();
+        let remapped_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            remapped_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
         // Perform remap
-        index.remap(&remap, test_store.as_ref()).await.unwrap();
+        index
+            .remap(&remap, remapped_store.as_ref())
+            .await
+            .unwrap();
 
         // Reload and check
-        let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())
+        let reloaded_idx = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
             .await
             .expect("Failed to load remapped bitmap index");
 
