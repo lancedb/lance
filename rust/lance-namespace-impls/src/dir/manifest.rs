@@ -24,10 +24,10 @@ use futures::{
     stream::{self, StreamExt},
 };
 use lance::dataset::index::LanceIndexStoreExt;
-use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::transaction::Operation;
 use lance::dataset::{
-    CommitBuilder, InsertBuilder, ReadParams, WhenMatched, WriteMode, WriteParams,
-    builder::DatasetBuilder,
+    InsertBuilder, ManifestWriteConfig, ReadParams, WhenMatched, WriteMode, WriteParams,
+    builder::DatasetBuilder, write_manifest_file,
 };
 use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
@@ -54,8 +54,9 @@ use lance_namespace::models::{
     TableVersion,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_table::format::IndexMetadata;
-use object_store::{Error as ObjectStoreError, ObjectStoreExt, path::Path};
+use lance_table::format::{IndexMetadata, Manifest};
+use lance_table::io::commit::CommitError;
+use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
 use std::{
@@ -64,7 +65,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
 };
-use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, mpsc};
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
@@ -84,7 +85,6 @@ const METADATA_INDEX_NAME: &str = "metadata_fts";
 // commit retry budget so multi-process namespace writes can make progress.
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
 const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
-const MANIFEST_METADATA_INDEX_CHANNEL_SIZE: usize = 2;
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +232,8 @@ struct ManifestOutputRow<'a> {
 struct ManifestIndexAccumulator {
     object_ids: BTreeMap<Arc<str>, u64>,
     object_types: BTreeMap<&'static str, RoaringBitmap>,
+    metadata_values: Vec<Option<String>>,
+    metadata_row_ids: Vec<u64>,
     row_count: u64,
 }
 
@@ -265,6 +267,9 @@ impl ManifestIndexAccumulator {
             .entry(row.object_type.as_str())
             .or_default()
             .insert(row_id as u32);
+        self.metadata_values
+            .push(row.metadata.map(ToString::to_string));
+        self.metadata_row_ids.push(row_id);
         self.row_count += 1;
         Ok(row_id)
     }
@@ -307,7 +312,7 @@ impl ManifestBatchBuilder {
         Ok(())
     }
 
-    fn finish(self) -> Result<(RecordBatch, RecordBatch)> {
+    fn finish(self) -> Result<RecordBatch> {
         let metadata_array = Arc::new(
             JsonArray::try_from_iter(self.metadatas.iter().map(|v| v.as_deref()))
                 .map_err(|e| {
@@ -317,32 +322,20 @@ impl ManifestBatchBuilder {
                 })?
                 .into_inner(),
         );
-        let manifest_batch = RecordBatch::try_new(
+        RecordBatch::try_new(
             ManifestNamespace::manifest_schema(),
             vec![
                 Arc::new(StringArray::from(self.object_ids)),
                 Arc::new(StringArray::from(self.object_types)),
                 Arc::new(StringArray::from(self.locations)),
-                metadata_array.clone(),
+                metadata_array,
             ],
         )
         .map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to create manifest snapshot batch: {:?}", e),
             })
-        })?;
-
-        let metadata_index_batch = RecordBatch::try_new(
-            ManifestNamespace::metadata_index_schema(),
-            vec![metadata_array, Arc::new(UInt64Array::from(self.row_ids))],
-        )
-        .map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to create manifest metadata index batch: {:?}", e),
-            })
-        })?;
-
-        Ok((manifest_batch, metadata_index_batch))
+        })
     }
 }
 
@@ -370,22 +363,15 @@ struct ManifestRewriteShared<M: ManifestStreamMutation> {
     index_data: Option<ManifestIndexAccumulator>,
     result: Option<CopyOnWriteMutation<M::Output>>,
     error: Option<LanceError>,
-    metadata_index_sender: Option<mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>>,
 }
 
 impl<M: ManifestStreamMutation> ManifestRewriteShared<M> {
-    fn new(
-        mutation: M,
-        metadata_index_sender: Option<
-            mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>,
-        >,
-    ) -> Self {
+    fn new(mutation: M) -> Self {
         Self {
             mutation,
             index_data: Some(ManifestIndexAccumulator::default()),
             result: None,
             error: None,
-            metadata_index_sender,
         }
     }
 }
@@ -1203,59 +1189,6 @@ impl ManifestNamespace {
             .unwrap_or(DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES)
     }
 
-    fn is_manifest_rewrite_retryable(err: &LanceError) -> bool {
-        matches!(
-            err,
-            LanceError::CommitConflict { .. }
-                | LanceError::RetryableCommitConflict { .. }
-                | LanceError::TooMuchWriteContention { .. }
-        )
-    }
-
-    async fn cleanup_uncommitted_overwrite_files(
-        dataset: &Dataset,
-        transaction: &lance::dataset::transaction::Transaction,
-    ) -> Result<()> {
-        let Operation::Overwrite { fragments, .. } = &transaction.operation else {
-            return Ok(());
-        };
-        let object_store = dataset.object_store(None).await?;
-        let data_dir = dataset.branch_location().path.join("data");
-
-        for fragment in fragments {
-            for data_file in &fragment.files {
-                if data_file.base_id.is_some() {
-                    continue;
-                }
-                let path = data_dir.clone().join(data_file.path.as_str());
-                match object_store.inner.delete(&path).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                    Err(err) => return Err(err.into()),
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn cleanup_uncommitted_index_uuids(
-        dataset: &Dataset,
-        index_uuids: &[Uuid],
-    ) -> Result<()> {
-        let object_store = dataset.object_store(None).await?;
-        for index_uuid in index_uuids {
-            let index_dir = dataset.indices_dir().join(index_uuid.to_string());
-            let mut files = object_store.inner.list(Some(&index_dir));
-            while let Some(file) = files.try_next().await? {
-                match object_store.inner.delete(&file.location).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                    Err(err) => return Err(err.into()),
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn value_row_id_schema(value_field: Field) -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![
             value_field,
@@ -1268,14 +1201,45 @@ impl ManifestNamespace {
     }
 
     fn metadata_index_stream(
-        receiver: mpsc::Receiver<std::result::Result<RecordBatch, DataFusionError>>,
+        metadata_values: Vec<Option<String>>,
+        metadata_row_ids: Vec<u64>,
     ) -> SendableRecordBatchStream {
         let schema = Self::metadata_index_schema();
-        let stream = stream::unfold(receiver, |mut receiver| async move {
-            receiver.recv().await.map(|batch| (batch, receiver))
-        });
+        let stream_schema = schema.clone();
+        let stream = stream::unfold(
+            (
+                metadata_values.into_iter().zip(metadata_row_ids).peekable(),
+                false,
+                schema,
+            ),
+            |state| async move {
+                let (mut iter, emitted, schema) = state;
+                let mut values = Vec::with_capacity(MANIFEST_INDEX_BATCH_SIZE);
+                let mut row_ids = Vec::with_capacity(MANIFEST_INDEX_BATCH_SIZE);
+                for _ in 0..MANIFEST_INDEX_BATCH_SIZE {
+                    let Some((value, row_id)) = iter.next() else {
+                        break;
+                    };
+                    values.push(value);
+                    row_ids.push(row_id);
+                }
+                if values.is_empty() {
+                    if emitted {
+                        None
+                    } else {
+                        let batch = Self::json_row_id_batch(schema.clone(), values, row_ids)
+                            .map_err(|err| DataFusionError::External(Box::new(err)));
+                        Some((batch, (iter, true, schema)))
+                    }
+                } else {
+                    let batch = Self::json_row_id_batch(schema.clone(), values, row_ids)
+                        .map_err(|err| DataFusionError::External(Box::new(err)));
+                    Some((batch, (iter, true, schema)))
+                }
+            },
+        );
         Box::pin(DatafusionRecordBatchStreamAdapter::new(
-            schema,
+            stream_schema,
             stream.fuse(),
         ))
     }
@@ -1296,6 +1260,27 @@ impl ManifestNamespace {
                 Arc::new(StringArray::from(values)),
                 Arc::new(UInt64Array::from(row_ids)),
             ],
+        )
+        .map_err(Into::into)
+    }
+
+    fn json_row_id_batch(
+        schema: SchemaRef,
+        values: Vec<Option<String>>,
+        row_ids: Vec<u64>,
+    ) -> Result<RecordBatch> {
+        let json_array = Arc::new(
+            JsonArray::try_from_iter(values.iter().map(|v| v.as_deref()))
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to encode metadata index JSON: {}", e),
+                    })
+                })?
+                .into_inner(),
+        );
+        RecordBatch::try_new(
+            schema,
+            vec![json_array, Arc::new(UInt64Array::from(row_ids))],
         )
         .map_err(Into::into)
     }
@@ -1448,83 +1433,40 @@ impl ManifestNamespace {
         lance_schema: &lance_core::datatypes::Schema,
         input: ManifestIndexBuildInput,
         fragment_bitmap: &RoaringBitmap,
+        dataset_version: u64,
         index_uuid: Uuid,
     ) -> Result<IndexMetadata> {
         let trained_index = Self::train_manifest_index(dataset, input, index_uuid).await?;
         Self::manifest_index_metadata(
             lance_schema,
             fragment_bitmap,
-            dataset.manifest().version,
+            dataset_version,
             trained_index,
         )
     }
 
-    async fn await_metadata_index_task(
-        task: tokio::task::JoinHandle<Result<ManifestTrainedIndex>>,
-    ) -> Result<ManifestTrainedIndex> {
-        task.await.map_err(|err| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Manifest metadata index build task failed: {}", err),
-            })
-        })?
-    }
-
-    fn spawn_metadata_index_build(
-        dataset: Arc<Dataset>,
-        receiver: mpsc::Receiver<std::result::Result<RecordBatch, DataFusionError>>,
-        index_uuid: Uuid,
-    ) -> tokio::task::JoinHandle<Result<ManifestTrainedIndex>> {
-        tokio::spawn(async move {
-            Self::train_manifest_index(
-                &dataset,
-                ManifestIndexBuildInput {
-                    index_name: METADATA_INDEX_NAME,
-                    column_name: "metadata",
-                    params: Self::metadata_index_params(),
-                    field: json_field(VALUE_COLUMN_NAME, true),
-                    stream: Self::metadata_index_stream(receiver),
-                },
-                index_uuid,
-            )
-            .await
-        })
-    }
-
     async fn build_manifest_indices(
         dataset: &Dataset,
-        transaction: &Transaction,
+        manifest: &Manifest,
         index_data: ManifestIndexAccumulator,
         index_uuids: &mut Vec<Uuid>,
-        metadata_index_task: tokio::task::JoinHandle<Result<ManifestTrainedIndex>>,
     ) -> Result<Vec<IndexMetadata>> {
-        let Operation::Overwrite {
-            schema, fragments, ..
-        } = &transaction.operation
-        else {
-            return Err(NamespaceError::Internal {
-                message: "Manifest rewrite transaction is not an overwrite".to_string(),
-            }
-            .into());
-        };
-        if fragments.len() > 1 {
-            return Err(NamespaceError::Internal {
-                message: format!(
-                    "Manifest rewrite expected a single fragment, found {}",
-                    fragments.len()
-                ),
-            }
-            .into());
-        }
-        let fragment_bitmap = RoaringBitmap::from_iter(0..fragments.len() as u32);
+        let num_fragments = manifest.fragments.len();
+        let fragment_bitmap = RoaringBitmap::from_iter(0..num_fragments as u32);
+        let schema = &manifest.schema;
         let ManifestIndexAccumulator {
             object_ids,
             object_types,
+            metadata_values,
+            metadata_row_ids,
             ..
         } = index_data;
         let object_id_uuid = Uuid::new_v4();
         let object_type_uuid = Uuid::new_v4();
-        index_uuids.extend([object_id_uuid, object_type_uuid]);
+        let metadata_uuid = Uuid::new_v4();
+        index_uuids.extend([object_id_uuid, object_type_uuid, metadata_uuid]);
 
+        let dataset_version = manifest.version;
         let object_id_index_fut = Self::build_manifest_index(
             dataset,
             schema,
@@ -1536,6 +1478,7 @@ impl ManifestNamespace {
                 stream: Self::object_id_index_stream(object_ids),
             },
             &fragment_bitmap,
+            dataset_version,
             object_id_uuid,
         );
         let object_type_index_fut = Self::build_manifest_index(
@@ -1549,18 +1492,23 @@ impl ManifestNamespace {
                 stream: Self::object_type_index_stream(object_types),
             },
             &fragment_bitmap,
+            dataset_version,
             object_type_uuid,
         );
-
-        let metadata_index_fut = async {
-            let trained_index = Self::await_metadata_index_task(metadata_index_task).await?;
-            Self::manifest_index_metadata(
-                schema,
-                &fragment_bitmap,
-                dataset.manifest().version,
-                trained_index,
-            )
-        };
+        let metadata_index_fut = Self::build_manifest_index(
+            dataset,
+            schema,
+            ManifestIndexBuildInput {
+                index_name: METADATA_INDEX_NAME,
+                column_name: "metadata",
+                params: Self::metadata_index_params(),
+                field: json_field(VALUE_COLUMN_NAME, true),
+                stream: Self::metadata_index_stream(metadata_values, metadata_row_ids),
+            },
+            &fragment_bitmap,
+            dataset_version,
+            metadata_uuid,
+        );
 
         let (object_id_index, object_type_index, metadata_index) = futures::join!(
             object_id_index_fut,
@@ -1603,7 +1551,7 @@ impl ManifestNamespace {
         Ok(guard.error.take())
     }
 
-    async fn process_manifest_rewrite_batch<M: ManifestStreamMutation>(
+    fn process_manifest_rewrite_batch<M: ManifestStreamMutation>(
         batch: RecordBatch,
         shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
     ) -> Result<Option<RecordBatch>> {
@@ -1611,77 +1559,54 @@ impl ManifestNamespace {
         let object_types = Self::get_string_column(&batch, "object_type")?;
         let locations = Self::get_string_column(&batch, "location")?;
         let metadatas = Self::metadata_column_values(&batch, "metadata")?;
-        let (batch, metadata_index_batch, sender) = {
-            let mut output = ManifestBatchBuilder::new();
-            let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
-            let mut index_data = guard.index_data.take().ok_or_else(|| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: "Manifest rewrite index state is unavailable".to_string(),
-                })
-            })?;
-            for (row, metadata) in metadatas.into_iter().enumerate().take(batch.num_rows()) {
-                let row_value = ManifestRowValue {
-                    object_id: Self::required_string_value(object_ids, row, "object_id")?
-                        .to_string(),
-                    object_type: ObjectType::parse(Self::required_string_value(
-                        object_types,
-                        row,
-                        "object_type",
-                    )?)?,
-                    location: Self::optional_string_value(locations, row),
-                    metadata,
-                };
-                guard
-                    .mutation
-                    .process_existing_row(row_value, &mut output, &mut index_data)?;
-            }
-            guard.index_data = Some(index_data);
-            if output.is_empty() {
-                return Ok(None);
-            }
-            let sender = guard.metadata_index_sender.as_ref().cloned();
-            let (batch, metadata_index_batch) = output.finish()?;
-            (batch, metadata_index_batch, sender)
-        };
-        if let Some(sender) = sender {
-            Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
+        let mut output = ManifestBatchBuilder::new();
+        let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
+        let mut index_data = guard.index_data.take().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: "Manifest rewrite index state is unavailable".to_string(),
+            })
+        })?;
+        for (row, metadata) in metadatas.into_iter().enumerate().take(batch.num_rows()) {
+            let row_value = ManifestRowValue {
+                object_id: Self::required_string_value(object_ids, row, "object_id")?.to_string(),
+                object_type: ObjectType::parse(Self::required_string_value(
+                    object_types,
+                    row,
+                    "object_type",
+                )?)?,
+                location: Self::optional_string_value(locations, row),
+                metadata,
+            };
+            guard
+                .mutation
+                .process_existing_row(row_value, &mut output, &mut index_data)?;
         }
-        Ok(Some(batch))
+        guard.index_data = Some(index_data);
+        if output.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(output.finish()?))
     }
 
-    async fn finish_manifest_rewrite_stream<M: ManifestStreamMutation>(
+    fn finish_manifest_rewrite_stream<M: ManifestStreamMutation>(
         shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
     ) -> Result<Option<RecordBatch>> {
-        let maybe_batch = {
-            let mut output = ManifestBatchBuilder::new();
-            let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
-            let mut index_data = guard.index_data.take().ok_or_else(|| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: "Manifest rewrite index state is unavailable".to_string(),
-                })
-            })?;
-            guard.mutation.append_rows(&mut output, &mut index_data)?;
-            let result = guard.mutation.finish();
-            let force_empty_batch = index_data.row_count == 0;
-            guard.result = Some(result);
-            guard.index_data = Some(index_data);
-            if output.is_empty() && !force_empty_batch {
-                guard.metadata_index_sender.take();
-                None
-            } else {
-                let sender = guard.metadata_index_sender.take();
-                let (batch, metadata_index_batch) = output.finish()?;
-                Some((batch, metadata_index_batch, sender))
-            }
-        };
-
-        if let Some((batch, metadata_index_batch, sender)) = maybe_batch {
-            if let Some(sender) = sender {
-                Self::send_metadata_index_batch(sender, metadata_index_batch).await?;
-            }
-            Ok(Some(batch))
-        } else {
+        let mut output = ManifestBatchBuilder::new();
+        let mut guard = Self::lock_manifest_rewrite_shared(shared)?;
+        let mut index_data = guard.index_data.take().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: "Manifest rewrite index state is unavailable".to_string(),
+            })
+        })?;
+        guard.mutation.append_rows(&mut output, &mut index_data)?;
+        let result = guard.mutation.finish();
+        let force_empty_batch = index_data.row_count == 0;
+        guard.result = Some(result);
+        guard.index_data = Some(index_data);
+        if output.is_empty() && !force_empty_batch {
             Ok(None)
+        } else {
+            Ok(Some(output.finish()?))
         }
     }
 
@@ -1703,7 +1628,7 @@ impl ManifestNamespace {
                     match phase {
                         Phase::Source => match source.next().await {
                             Some(Ok(batch)) => {
-                                match Self::process_manifest_rewrite_batch(batch, &shared).await {
+                                match Self::process_manifest_rewrite_batch(batch, &shared) {
                                     Ok(Some(batch)) => {
                                         return Some((Ok(batch), (source, shared, phase)));
                                     }
@@ -1727,7 +1652,7 @@ impl ManifestNamespace {
                         },
                         Phase::Finish => {
                             phase = Phase::Done;
-                            match Self::finish_manifest_rewrite_stream(&shared).await {
+                            match Self::finish_manifest_rewrite_stream(&shared) {
                                 Ok(Some(batch)) => {
                                     return Some((Ok(batch), (source, shared, phase)));
                                 }
@@ -1772,36 +1697,6 @@ impl ManifestNamespace {
         Ok((result, index_data))
     }
 
-    async fn send_metadata_index_batch(
-        sender: mpsc::Sender<std::result::Result<RecordBatch, DataFusionError>>,
-        batch: RecordBatch,
-    ) -> Result<()> {
-        sender
-            .send(Ok(batch))
-            .await
-            .map_err(|_| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: "Manifest metadata index build stopped before rewrite finished"
-                        .to_string(),
-                })
-            })
-            .map(|_| ())
-    }
-
-    fn close_metadata_index_stream<M: ManifestStreamMutation>(
-        shared: &Arc<StdMutex<ManifestRewriteShared<M>>>,
-    ) {
-        match shared.lock() {
-            Ok(mut guard) => {
-                guard.metadata_index_sender.take();
-            }
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                guard.metadata_index_sender.take();
-            }
-        }
-    }
-
     async fn rewrite_manifest<M, F>(
         &self,
         operation: &str,
@@ -1823,33 +1718,7 @@ impl ManifestNamespace {
             drop(dataset_guard);
 
             let source = Self::manifest_projected_stream(&dataset).await?;
-            let metadata_index_uuid = Uuid::new_v4();
-            let mut index_uuids = if build_indices {
-                vec![metadata_index_uuid]
-            } else {
-                vec![]
-            };
-            let (metadata_index_sender, metadata_index_receiver) =
-                mpsc::channel(MANIFEST_METADATA_INDEX_CHANNEL_SIZE);
-            let metadata_index_task = if build_indices {
-                Some(Self::spawn_metadata_index_build(
-                    dataset.clone(),
-                    metadata_index_receiver,
-                    metadata_index_uuid,
-                ))
-            } else {
-                drop(metadata_index_receiver);
-                None
-            };
-            let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(
-                make_mutation(),
-                if build_indices {
-                    Some(metadata_index_sender)
-                } else {
-                    drop(metadata_index_sender);
-                    None
-                },
-            )));
+            let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(make_mutation())));
             let output_stream = Self::manifest_rewrite_output_stream(source, shared.clone());
             let write_params = WriteParams {
                 mode: WriteMode::Overwrite,
@@ -1866,18 +1735,6 @@ impl ManifestNamespace {
             {
                 Ok(transaction) => transaction,
                 Err(err) => {
-                    Self::close_metadata_index_stream(&shared);
-                    if let Some(task) = metadata_index_task {
-                        let _ = Self::await_metadata_index_task(task).await;
-                    }
-                    if let Err(cleanup_err) =
-                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
-                    {
-                        log::warn!(
-                            "Failed to clean up uncommitted manifest metadata index files after rewrite stream error: {:?}",
-                            cleanup_err
-                        );
-                    }
                     if let Some(stream_err) = Self::take_manifest_rewrite_error(&shared)? {
                         return Err(stream_err);
                     }
@@ -1887,119 +1744,74 @@ impl ManifestNamespace {
 
             let (mutation, index_data) = Self::take_manifest_rewrite_result(&shared)?;
             if !mutation.has_changes {
-                if let Some(task) = metadata_index_task {
-                    let _ = Self::await_metadata_index_task(task).await;
-                }
-                if let Err(cleanup_err) =
-                    Self::cleanup_uncommitted_overwrite_files(&dataset, &transaction).await
-                {
-                    log::warn!(
-                        "Failed to clean up uncommitted no-op manifest overwrite files: {:?}",
-                        cleanup_err
-                    );
-                }
-                if let Err(cleanup_err) =
-                    Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
-                {
-                    log::warn!(
-                        "Failed to clean up uncommitted no-op manifest index files: {:?}",
-                        cleanup_err
-                    );
-                }
                 return Ok(mutation.result);
             }
 
-            let replacement_indices = if build_indices {
-                match Self::build_manifest_indices(
-                    &dataset,
-                    &transaction,
-                    index_data,
-                    &mut index_uuids,
-                    metadata_index_task
-                        .expect("metadata index task should exist when building indices"),
-                )
-                .await
-                {
-                    Ok(indices) => indices,
-                    Err(err) => {
-                        if let Err(cleanup_err) =
-                            Self::cleanup_uncommitted_overwrite_files(&dataset, &transaction).await
-                        {
-                            log::warn!(
-                                "Failed to clean up uncommitted manifest data files after index build error: {:?}",
-                                cleanup_err
-                            );
-                        }
-                        if let Err(cleanup_err) =
-                            Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
-                        {
-                            log::warn!(
-                                "Failed to clean up uncommitted manifest index files after index build error: {:?}",
-                                cleanup_err
-                            );
-                        }
-                        return Err(err);
-                    }
+            // Extract fragments and schema from the overwrite transaction
+            let Operation::Overwrite {
+                fragments, schema, ..
+            } = transaction.operation
+            else {
+                return Err(NamespaceError::Internal {
+                    message: "Manifest rewrite transaction is not an overwrite".to_string(),
                 }
+                .into());
+            };
+            let mut manifest =
+                Manifest::new_from_previous(dataset.manifest(), schema, Arc::new(fragments));
+
+            let indices = if build_indices {
+                let mut index_uuids = vec![];
+                Some(
+                    Self::build_manifest_indices(&dataset, &manifest, index_data, &mut index_uuids)
+                        .await?,
+                )
             } else {
-                vec![]
+                None
             };
 
-            let cleanup_transaction = transaction.clone();
-            let mut commit = CommitBuilder::new(dataset.clone())
-                .with_max_retries(0)
-                .with_skip_auto_cleanup(true);
-            if !replacement_indices.is_empty() {
-                commit = commit.with_replacement_indices(replacement_indices);
-            }
-            let result = commit.execute(transaction).await;
+            let object_store = dataset.object_store(None).await?;
+            let base_path = dataset.branch_location().path;
+            let naming_scheme = dataset.manifest_location().naming_scheme;
+            let config = ManifestWriteConfig::default();
+
+            let result = write_manifest_file(
+                &object_store,
+                dataset.commit_handler(),
+                &base_path,
+                &mut manifest,
+                indices,
+                &config,
+                naming_scheme,
+                None,
+            )
+            .await;
 
             match result {
-                Ok(new_dataset) => {
+                Ok(_) => {
+                    let new_dataset =
+                        dataset
+                            .checkout_version(manifest.version)
+                            .await
+                            .map_err(|e| {
+                                lance_core::Error::from(NamespaceError::Internal {
+                                    message: format!(
+                                        "Failed to checkout committed manifest version {}: {:?}",
+                                        manifest.version, e
+                                    ),
+                                })
+                            })?;
                     self.manifest_dataset.set_latest(new_dataset).await;
                     return Ok(mutation.result);
                 }
-                Err(err) if Self::is_manifest_rewrite_retryable(&err) && retries < max_retries => {
-                    if let Err(cleanup_err) =
-                        Self::cleanup_uncommitted_overwrite_files(&dataset, &cleanup_transaction)
-                            .await
-                    {
-                        log::warn!(
-                            "Failed to clean up uncommitted manifest overwrite files after retryable commit error: {:?}",
-                            cleanup_err
-                        );
-                    }
-                    if let Err(cleanup_err) =
-                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
-                    {
-                        log::warn!(
-                            "Failed to clean up uncommitted manifest index files after retryable commit error: {:?}",
-                            cleanup_err
-                        );
-                    }
+                Err(CommitError::CommitConflict) if retries < max_retries => {
                     retries += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(retries)))
                         .await;
                 }
                 Err(err) => {
-                    if let Err(cleanup_err) =
-                        Self::cleanup_uncommitted_overwrite_files(&dataset, &cleanup_transaction)
-                            .await
-                    {
-                        log::warn!(
-                            "Failed to clean up uncommitted manifest overwrite files after commit error: {:?}",
-                            cleanup_err
-                        );
-                    }
-                    if let Err(cleanup_err) =
-                        Self::cleanup_uncommitted_index_uuids(&dataset, &index_uuids).await
-                    {
-                        log::warn!(
-                            "Failed to clean up uncommitted manifest index files after commit error: {:?}",
-                            cleanup_err
-                        );
-                    }
-                    return Err(convert_lance_commit_error(&err, operation, None));
+                    let lance_err: LanceError = err.into();
+                    return Err(convert_lance_commit_error(&lance_err, operation, None));
                 }
             }
         }
@@ -5551,5 +5363,203 @@ mod tests {
         assert!(indices.iter().any(|i| i.name == OBJECT_ID_INDEX_NAME));
         assert!(indices.iter().any(|i| i.name == OBJECT_TYPE_INDEX_NAME));
         assert!(indices.iter().any(|i| i.name == METADATA_INDEX_NAME));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_indices_are_complete_and_versioned() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Create enough objects to exercise all index types
+        namespace
+            .create_namespace(namespace_request("ns1"))
+            .await
+            .unwrap();
+        namespace
+            .create_namespace(namespace_request("ns2"))
+            .await
+            .unwrap();
+        let buffer = create_test_ipc_data();
+        let mut props1 = HashMap::new();
+        props1.insert("env".to_string(), "prod".to_string());
+        props1.insert("owner".to_string(), "alice".to_string());
+        let mut req = CreateTableRequest::new();
+        req.id = Some(vec!["tbl1".to_string()]);
+        req.properties = Some(props1);
+        namespace
+            .create_table(req, Bytes::from(buffer.clone()))
+            .await
+            .unwrap();
+        let mut props2 = HashMap::new();
+        props2.insert("env".to_string(), "staging".to_string());
+        props2.insert("owner".to_string(), "bob".to_string());
+        let mut req = CreateTableRequest::new();
+        req.id = Some(vec!["tbl2".to_string()]);
+        req.properties = Some(props2);
+        namespace
+            .create_table(req, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        let dataset = load_manifest_dataset(temp_path).await;
+        let indices = dataset.load_indices().await.unwrap();
+
+        // All 3 indices must exist
+        assert_eq!(
+            indices.len(),
+            3,
+            "Expected exactly 3 indices, got: {:?}",
+            indices.iter().map(|i| &i.name).collect::<Vec<_>>()
+        );
+
+        let btree = indices
+            .iter()
+            .find(|i| i.name == OBJECT_ID_INDEX_NAME)
+            .expect("object_id btree index missing");
+        let bitmap = indices
+            .iter()
+            .find(|i| i.name == OBJECT_TYPE_INDEX_NAME)
+            .expect("object_type bitmap index missing");
+        let fts = indices
+            .iter()
+            .find(|i| i.name == METADATA_INDEX_NAME)
+            .expect("metadata FTS index missing");
+
+        // Each index covers exactly one column
+        assert_eq!(btree.fields.len(), 1);
+        assert_eq!(bitmap.fields.len(), 1);
+        assert_eq!(fts.fields.len(), 1);
+
+        // All indices are stamped with the current dataset version
+        let version = dataset.manifest().version;
+        assert_eq!(
+            btree.dataset_version, version,
+            "btree index dataset_version mismatch"
+        );
+        assert_eq!(
+            bitmap.dataset_version, version,
+            "bitmap index dataset_version mismatch"
+        );
+        assert_eq!(
+            fts.dataset_version, version,
+            "fts index dataset_version mismatch"
+        );
+
+        // All indices must have fragment bitmaps covering the single manifest fragment
+        for idx in [btree, bitmap, fts] {
+            let bitmap = idx
+                .fragment_bitmap
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} should have a fragment bitmap", idx.name));
+            assert_eq!(
+                bitmap.len(),
+                dataset.manifest().fragments.len() as u64,
+                "{} fragment bitmap length mismatch",
+                idx.name
+            );
+        }
+
+        // All indices reference distinct UUIDs
+        let mut uuids: Vec<_> = indices.iter().map(|i| i.uuid).collect();
+        uuids.sort();
+        uuids.dedup();
+        assert_eq!(uuids.len(), 3, "index UUIDs should be unique");
+    }
+
+    #[tokio::test]
+    async fn test_manifest_reads_use_indexed_scans() {
+        use lance_index::scalar::FullTextSearchQuery;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // Populate manifest with a namespace and tables with metadata
+        namespace
+            .create_namespace(namespace_request("ns"))
+            .await
+            .unwrap();
+        let buffer = create_test_ipc_data();
+        let mut props = HashMap::new();
+        props.insert(
+            "description".to_string(),
+            "important production data".to_string(),
+        );
+        let mut req = CreateTableRequest::new();
+        req.id = Some(vec!["my_table".to_string()]);
+        req.properties = Some(props);
+        namespace
+            .create_table(req, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        let dataset = load_manifest_dataset(temp_path).await;
+
+        // 1. object_id equality filter should use BTree (ScalarIndexQuery)
+        {
+            let mut scanner = dataset.scan();
+            scanner.filter("object_id = 'ns'").unwrap();
+            scanner.prefilter(true);
+            let plan = scanner.explain_plan(true).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "object_id filter should use ScalarIndexQuery (btree), plan:\n{}",
+                plan
+            );
+        }
+
+        // 2. object_type equality filter should use Bitmap (ScalarIndexQuery)
+        {
+            let mut scanner = dataset.scan();
+            scanner.filter("object_type = 'table'").unwrap();
+            scanner.prefilter(true);
+            let plan = scanner.explain_plan(true).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "object_type filter should use ScalarIndexQuery (bitmap), plan:\n{}",
+                plan
+            );
+        }
+
+        // 3. Combined object_id + object_type filter should use ScalarIndexQuery
+        {
+            let mut scanner = dataset.scan();
+            scanner
+                .filter("object_id = 'my_table' AND object_type = 'table'")
+                .unwrap();
+            scanner.prefilter(true);
+            let plan = scanner.explain_plan(true).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "combined filter should use ScalarIndexQuery, plan:\n{}",
+                plan
+            );
+        }
+
+        // 4. FTS query on metadata should use the inverted index (MatchQuery)
+        {
+            let mut scanner = dataset.scan();
+            let query = FullTextSearchQuery::new("production".to_owned())
+                .with_column("metadata".to_string())
+                .unwrap();
+            scanner.full_text_search(query).unwrap();
+            let plan = scanner.explain_plan(true).await.unwrap();
+            assert!(
+                plan.contains("MatchQuery"),
+                "metadata FTS query should use MatchQuery (inverted index), plan:\n{}",
+                plan
+            );
+        }
     }
 }

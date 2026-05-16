@@ -153,7 +153,12 @@ async fn build_namespace(
 
 // ──────────────────── seed mode ────────────────────
 
-async fn seed(root: &str, count: usize, inline_optimization: bool, storage_options: &HashMap<String, String>) {
+async fn seed(
+    root: &str,
+    count: usize,
+    inline_optimization: bool,
+    storage_options: &HashMap<String, String>,
+) {
     eprintln!("Seeding {} entries at {}", count, root);
     let ns = build_namespace(root, inline_optimization, storage_options).await;
     let ipc_data = Bytes::from(create_test_ipc_data());
@@ -181,7 +186,10 @@ async fn seed(root: &str, count: usize, inline_optimization: bool, storage_optio
             eprintln!("  seeded {}/{} tables", i + 1, table_count);
         }
     }
-    eprintln!("Seed complete: {} namespaces, {} tables", ns_count, table_count);
+    eprintln!(
+        "Seed complete: {} namespaces, {} tables",
+        ns_count, table_count
+    );
 }
 
 // ──────────────────── worker mode ────────────────────
@@ -202,30 +210,16 @@ async fn worker(
     // Warmup (only for warm-read operations)
     if operation.starts_with("warm-read") {
         for _ in 0..warmup {
-            let _ = run_operation(
-                ns.as_ref(),
-                operation,
-                worker_id,
-                0,
-                table_count,
-                &ipc_data,
-            )
-            .await;
+            let _ =
+                run_operation(ns.as_ref(), operation, worker_id, 0, table_count, &ipc_data).await;
         }
     }
 
     for i in 0..operations {
         let start = Instant::now();
-        let err = run_operation(
-            ns.as_ref(),
-            operation,
-            worker_id,
-            i,
-            table_count,
-            &ipc_data,
-        )
-        .await
-        .is_err();
+        let err = run_operation(ns.as_ref(), operation, worker_id, i, table_count, &ipc_data)
+            .await
+            .is_err();
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         let record = LatencyRecord {
             operation: operation.to_string(),
@@ -298,16 +292,9 @@ async fn cold_read_worker(
         // Fresh namespace for each operation — simulates cold start
         let start = Instant::now();
         let ns = build_namespace(root, inline_optimization, storage_options).await;
-        let err = run_operation(
-            ns.as_ref(),
-            operation,
-            worker_id,
-            i,
-            table_count,
-            &ipc_data,
-        )
-        .await
-        .is_err();
+        let err = run_operation(ns.as_ref(), operation, worker_id, i, table_count, &ipc_data)
+            .await
+            .is_err();
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         let record = LatencyRecord {
             operation: operation.to_string(),
@@ -433,16 +420,46 @@ async fn main() {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--root" => { root = args[i + 1].clone(); i += 2; }
-            "--operation" => { operation = args[i + 1].clone(); i += 2; }
-            "--operations" => { operations = args[i + 1].parse().unwrap(); i += 2; }
-            "--warmup" => { warmup = args[i + 1].parse().unwrap(); i += 2; }
-            "--concurrency" => { concurrency_list = parse_concurrency_list(&args[i + 1]); i += 2; }
-            "--count" => { count = args[i + 1].parse().unwrap(); i += 2; }
-            "--worker-id" => { worker_id = args[i + 1].parse().unwrap(); i += 2; }
-            "--table-count" => { table_count = args[i + 1].parse().unwrap(); i += 2; }
-            "--inline-optimization" => { inline_optimization = args[i + 1].parse().unwrap(); i += 2; }
-            "--variant" => { variant = args[i + 1].clone(); i += 2; }
+            "--root" => {
+                root = args[i + 1].clone();
+                i += 2;
+            }
+            "--operation" => {
+                operation = args[i + 1].clone();
+                i += 2;
+            }
+            "--operations" => {
+                operations = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--warmup" => {
+                warmup = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--concurrency" => {
+                concurrency_list = parse_concurrency_list(&args[i + 1]);
+                i += 2;
+            }
+            "--count" => {
+                count = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--worker-id" => {
+                worker_id = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--table-count" => {
+                table_count = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--inline-optimization" => {
+                inline_optimization = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--variant" => {
+                variant = args[i + 1].clone();
+                i += 2;
+            }
             "--storage-option" => {
                 let kv = &args[i + 1];
                 if let Some((k, v)) = kv.split_once('=') {
@@ -450,12 +467,19 @@ async fn main() {
                 }
                 i += 2;
             }
-            _ => { eprintln!("Unknown argument: {}", args[i]); std::process::exit(1); }
+            _ => {
+                eprintln!("Unknown argument: {}", args[i]);
+                std::process::exit(1);
+            }
         }
     }
 
     if variant.is_empty() {
-        variant = if inline_optimization { "default".to_string() } else { "no_inline_opt".to_string() };
+        variant = if inline_optimization {
+            "default".to_string()
+        } else {
+            "no_inline_opt".to_string()
+        };
     }
 
     match mode {
@@ -524,10 +548,7 @@ async fn main() {
             for op in &ops {
                 for &concurrency in &concurrency_list {
                     let actual_ops = (operations / concurrency) * concurrency;
-                    eprintln!(
-                        "  {} concurrency={} ops={}",
-                        op, concurrency, actual_ops
-                    );
+                    eprintln!("  {} concurrency={} ops={}", op, concurrency, actual_ops);
                     let result = run_workers(
                         &self_exe,
                         &root,

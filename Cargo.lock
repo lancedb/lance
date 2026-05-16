@@ -4878,6 +4878,7 @@ dependencies = [
  "chrono",
  "datafusion-common",
  "datafusion-physical-plan",
+ "env_logger",
  "futures",
  "hmac",
  "lance",
