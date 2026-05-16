@@ -1681,10 +1681,17 @@ async fn rewrite_files(
         }
     }
 
-    let mut params = WriteParams::for_dataset(&dataset);
-    params.max_rows_per_file = options.target_rows_per_fragment;
-    params.max_rows_per_group = options.max_rows_per_group;
-    params.mode = WriteMode::Append;
+    let mut params = WriteParams {
+        max_rows_per_file: options.target_rows_per_fragment,
+        max_rows_per_group: options.max_rows_per_group,
+        mode: WriteMode::Append,
+        ..Default::default()
+    };
+    if let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY)
+        && let Ok(policy_disabled) = policy_str.parse::<bool>()
+    {
+        params.disable_column_stats = policy_disabled;
+    }
     // External blobs may reference URIs outside the dataset's base_paths
     // (e.g. absolute file:// URIs with base_id == 0). Without this flag
     // the writer would reject such blobs.
@@ -2182,32 +2189,31 @@ pub async fn commit_compaction(
     }
 
     // Consolidate column statistics if enabled (after the commit)
-    if options.consolidate_column_stats {
-        if let Some(stats_path) =
+    if options.consolidate_column_stats
+        && let Some(stats_path) =
             crate::dataset::column_stats_consolidator::consolidate_column_stats(dataset).await?
-        {
-            // Update manifest with column stats using protobuf struct
-            let column_stats = pb::ColumnStats {
-                path: stats_path,
-                version: COLUMN_STATS_VERSION,
-            };
+    {
+        // Update manifest with column stats using protobuf struct
+        let column_stats = pb::ColumnStats {
+            path: stats_path,
+            version: COLUMN_STATS_VERSION,
+        };
 
-            let config_update_txn = Transaction::new(
-                dataset.manifest.version,
-                Operation::UpdateConfig {
-                    config_updates: None,
-                    table_metadata_updates: None,
-                    schema_metadata_updates: None,
-                    field_metadata_updates: HashMap::new(),
-                    column_stats: Some(column_stats),
-                },
-                None,
-            );
+        let config_update_txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+                column_stats: Some(column_stats),
+            },
+            None,
+        );
 
-            dataset
-                .apply_commit(config_update_txn, &Default::default(), &Default::default())
-                .await?;
-        }
+        dataset
+            .apply_commit(config_update_txn, &Default::default(), &Default::default())
+            .await?;
     }
 
     Ok(metrics)
@@ -8033,7 +8039,7 @@ mod tests {
 
         // Read and verify the stats file content
         let stats_path = &column_stats.unwrap().path;
-        let full_path = dataset.base.child(stats_path.as_str());
+        let full_path = dataset.base.clone().join(stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
             lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -8176,7 +8182,7 @@ mod tests {
 
         // Verify the first stats file content after first compaction
         let first_stats_path = first_column_stats.unwrap().path.clone();
-        let full_path = dataset.base.child(first_stats_path.as_str());
+        let full_path = dataset.base.clone().join(first_stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
             lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -8287,7 +8293,7 @@ mod tests {
 
         // Read and verify the final stats file content
         let stats_path = &second_stats_path;
-        let full_path = dataset.base.child(stats_path.as_str());
+        let full_path = dataset.base.clone().join(stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
             lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -8430,7 +8436,7 @@ mod tests {
 
         // Read and verify the stats file content
         let stats_path = &column_stats.unwrap().path;
-        let full_path = dataset.base.child(stats_path.as_str());
+        let full_path = dataset.base.clone().join(stats_path.as_str());
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
             lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),

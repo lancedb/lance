@@ -43,7 +43,6 @@ use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
-use snafu::location;
 
 use crate::dataset::fragment::FileFragment;
 use crate::{Dataset, Error};
@@ -169,7 +168,7 @@ pub async fn consolidate_column_stats(dataset: &Dataset) -> Result<Option<String
         for data_file in &fragment.metadata().files {
             let file_path = dataset
                 .data_file_dir(data_file)?
-                .child(data_file.path.as_str());
+                .join(data_file.path.as_str());
             let file_stats = read_fragment_column_stats(dataset, &file_path).await?;
 
             if let Some(file_stats) = file_stats {
@@ -211,7 +210,7 @@ pub async fn consolidate_column_stats(dataset: &Dataset) -> Result<Option<String
     let stats_path = String::from("_stats/column_stats.lance");
     write_stats_file(
         dataset.object_store.as_ref(),
-        &dataset.base.child(stats_path.as_str()),
+        &dataset.base.clone().join(stats_path.as_str()),
         consolidated_batch,
     )
     .await?;
@@ -240,7 +239,7 @@ async fn fragment_has_stats(dataset: &Dataset, fragment: &FileFragment) -> Resul
     for data_file in &fragment.metadata().files {
         let file_path = dataset
             .data_file_dir(data_file)?
-            .child(data_file.path.as_str());
+            .join(data_file.path.as_str());
         // Legacy (0.2) format does not have column stats; skip to avoid opening with v2 reader
         if determine_file_version(dataset.object_store.as_ref(), &file_path, None).await?
             == LanceFileVersion::Legacy
@@ -348,133 +347,129 @@ async fn read_fragment_column_stats(
         let struct_array = column_array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected StructArray for column '{}' in column stats",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         // Extract min/max arrays (typed as the column's type in fragment stats)
-        let min_array = struct_array
-            .column_by_name("min")
-            .ok_or_else(|| Error::Internal {
-                message: format!("Missing 'min' field in column stats for '{}'", col_name),
-                location: location!(),
-            })?;
+        let min_array = struct_array.column_by_name("min").ok_or_else(|| {
+            Error::internal(format!(
+                "Missing 'min' field in column stats for '{}'",
+                col_name
+            ))
+        })?;
 
-        let max_array = struct_array
-            .column_by_name("max")
-            .ok_or_else(|| Error::Internal {
-                message: format!("Missing 'max' field in column stats for '{}'", col_name),
-                location: location!(),
-            })?;
+        let max_array = struct_array.column_by_name("max").ok_or_else(|| {
+            Error::internal(format!(
+                "Missing 'max' field in column stats for '{}'",
+                col_name
+            ))
+        })?;
 
         let null_count_array = struct_array
             .column_by_name("null_count")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'null_count' field in column stats for '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt32Array for 'null_count' field in column '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let nan_count_array = struct_array
             .column_by_name("nan_count")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'nan_count' field in column stats for '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt32Array for 'nan_count' field in column '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         // Extract the bound struct
         let bound_struct = struct_array
             .column_by_name("bound")
-            .ok_or_else(|| Error::Internal {
-                message: format!("Missing 'bound' field in column stats for '{}'", col_name),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Missing 'bound' field in column stats for '{}'",
+                    col_name
+                ))
             })?
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected StructArray for 'bound' field in column '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let fragment_id_array = bound_struct
             .column_by_name("fragment_id")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'fragment_id' in bound struct for column '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt64Array for 'fragment_id' in bound struct for column '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let start_array = bound_struct
             .column_by_name("start")
-            .ok_or_else(|| Error::Internal {
-                message: format!("Missing 'start' in bound struct for column '{}'", col_name),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Missing 'start' in bound struct for column '{}'",
+                    col_name
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt64Array for 'start' in bound struct for column '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let length_array = bound_struct
             .column_by_name("length")
-            .ok_or_else(|| Error::Internal {
-                message: format!("Missing 'length' in bound struct for column '{}'", col_name),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Missing 'length' in bound struct for column '{}'",
+                    col_name
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt64Array for 'length' in bound struct for column '{}'",
                     col_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         // Process each zone (row) for this column
@@ -483,23 +478,17 @@ async fn read_fragment_column_stats(
         for zone_idx in 0..num_zones {
             let min_scalar =
                 ScalarValue::try_from_array(min_array.as_ref(), zone_idx).map_err(|e| {
-                    Error::Internal {
-                        message: format!(
-                            "Failed to get min ScalarValue for column '{}': {}",
-                            col_name, e
-                        ),
-                        location: location!(),
-                    }
+                    Error::internal(format!(
+                        "Failed to get min ScalarValue for column '{}': {}",
+                        col_name, e
+                    ))
                 })?;
             let max_scalar =
                 ScalarValue::try_from_array(max_array.as_ref(), zone_idx).map_err(|e| {
-                    Error::Internal {
-                        message: format!(
-                            "Failed to get max ScalarValue for column '{}': {}",
-                            col_name, e
-                        ),
-                        location: location!(),
-                    }
+                    Error::internal(format!(
+                        "Failed to get max ScalarValue for column '{}': {}",
+                        col_name, e
+                    ))
                 })?;
             let zone_stat = ZoneStats {
                 bound: ZoneBound {
@@ -590,14 +579,18 @@ fn build_consolidated_batch(
             }
 
             let min_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.min.clone()))
-                .map_err(|e| Error::Internal {
-                    message: format!("Failed to build min array for column '{}': {}", col_name, e),
-                    location: location!(),
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "Failed to build min array for column '{}': {}",
+                        col_name, e
+                    ))
                 })?;
             let max_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.max.clone()))
-                .map_err(|e| Error::Internal {
-                    message: format!("Failed to build max array for column '{}': {}", col_name, e),
-                    location: location!(),
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "Failed to build max array for column '{}': {}",
+                        col_name, e
+                    ))
                 })?;
 
             let column_type = field.data_type();
@@ -649,46 +642,40 @@ fn build_consolidated_batch(
                 Arc::new(zone_struct_array) as ArrayRef,
                 None,
             )
-            .map_err(|e| Error::Internal {
-                message: format!(
+            .map_err(|e| {
+                Error::internal(format!(
                     "Failed to create ListArray for column '{}': {}",
                     col_name, e
-                ),
-                location: location!(),
+                ))
             })?;
 
             // Use the field definition from the full schema to ensure consistency
-            let schema_field = full_schema_fields
-                .get(col_name)
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "Column '{}' not found in consolidated stats schema",
-                        col_name
-                    ),
-                    location: location!(),
-                })?;
+            let schema_field = full_schema_fields.get(col_name).ok_or_else(|| {
+                Error::internal(format!(
+                    "Column '{}' not found in consolidated stats schema",
+                    col_name
+                ))
+            })?;
             schema_fields.push((**schema_field).clone());
             column_arrays.push(Arc::new(list_array) as ArrayRef);
         }
     }
 
     if column_arrays.is_empty() {
-        return Err(Error::Internal {
-            message: "[ColumnStats] No column statistics to consolidate".to_string(),
-            location: location!(),
-        });
+        return Err(Error::internal(
+            "[ColumnStats] No column statistics to consolidate",
+        ));
     }
 
     // Create schema: one column per dataset column, each of type List<struct>
     let schema = Arc::new(ArrowSchema::new(schema_fields));
 
     // Create RecordBatch: one row total
-    RecordBatch::try_new(schema, column_arrays).map_err(|e| Error::Internal {
-        message: format!(
+    RecordBatch::try_new(schema, column_arrays).map_err(|e| {
+        Error::internal(format!(
             "[ColumnStats] Failed to create consolidated stats batch: {}",
             e
-        ),
-        location: location!(),
+        ))
     })
 }
 
@@ -700,13 +687,8 @@ async fn write_stats_file(
 ) -> Result<()> {
     use lance_file::writer::{FileWriter, FileWriterOptions};
 
-    let lance_schema =
-        lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).map_err(|e| {
-            Error::Internal {
-                message: format!("Failed to convert schema: {}", e),
-                location: location!(),
-            }
-        })?;
+    let lance_schema = lance_core::datatypes::Schema::try_from(batch.schema().as_ref())
+        .map_err(|e| Error::internal(format!("Failed to convert schema: {}", e)))?;
 
     let mut writer = FileWriter::try_new(
         object_store.create(path).await?,
@@ -769,7 +751,7 @@ mod tests {
 
     /// Helper function to read consolidated stats file using FileReader
     async fn read_stats_file(dataset: &Dataset, stats_path: &str) -> Vec<RecordBatch> {
-        let full_path = dataset.base.child(stats_path);
+        let full_path = dataset.base.clone().join(stats_path);
         let scheduler = lance_io::scheduler::ScanScheduler::new(
             dataset.object_store.clone(),
             lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),

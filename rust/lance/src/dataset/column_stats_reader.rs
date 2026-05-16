@@ -14,7 +14,6 @@ use arrow_array::{Array, ListArray, RecordBatch, StructArray, UInt32Array, UInt6
 use datafusion::scalar::ScalarValue;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
-use snafu::location;
 
 use crate::Error;
 
@@ -99,9 +98,8 @@ impl ColumnStatsReader {
         let list_array = column_array
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!("Expected ListArray for column '{}'", column_name),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal(format!("Expected ListArray for column '{}'", column_name))
             })?;
 
         // Check if batch is empty (0 rows)
@@ -118,128 +116,112 @@ impl ColumnStatsReader {
         let struct_array = struct_array_ref
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::Internal {
-                message: format!("Expected StructArray in list for column '{}'", column_name),
-                location: location!(),
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Expected StructArray in list for column '{}'",
+                    column_name
+                ))
             })?;
 
         // Extract fields from the struct
         let fragment_id_array = struct_array
             .column_by_name("fragment_id")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'fragment_id' field in struct for column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt64Array for 'fragment_id' in column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let zone_start_array = struct_array
             .column_by_name("zone_start")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'zone_start' field in struct for column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt64Array for 'zone_start' in column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let zone_length_array = struct_array
             .column_by_name("zone_length")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'zone_length' field in struct for column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt64Array for 'zone_length' in column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let null_count_array = struct_array
             .column_by_name("null_count")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'null_count' field in struct for column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt32Array for 'null_count' in column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?;
 
         let nan_count_array = struct_array
             .column_by_name("nan_count")
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Missing 'nan_count' field in struct for column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?
             .as_any()
             .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "Expected UInt32Array for 'nan_count' in column '{}'",
                     column_name
-                ),
-                location: location!(),
+                ))
             })?;
 
-        let min_value_array =
-            struct_array
-                .column_by_name("min_value")
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "Missing 'min_value' field in struct for column '{}'",
-                        column_name
-                    ),
-                    location: location!(),
-                })?;
+        let min_value_array = struct_array.column_by_name("min_value").ok_or_else(|| {
+            Error::internal(format!(
+                "Missing 'min_value' field in struct for column '{}'",
+                column_name
+            ))
+        })?;
 
-        let max_value_array =
-            struct_array
-                .column_by_name("max_value")
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "Missing 'max_value' field in struct for column '{}'",
-                        column_name
-                    ),
-                    location: location!(),
-                })?;
+        let max_value_array = struct_array.column_by_name("max_value").ok_or_else(|| {
+            Error::internal(format!(
+                "Missing 'max_value' field in struct for column '{}'",
+                column_name
+            ))
+        })?;
 
         // Min/max are stored in the column's Arrow type; convert to ScalarValue per zone
         let num_zones = fragment_id_array.len();
@@ -249,23 +231,17 @@ impl ColumnStatsReader {
         for i in 0..num_zones {
             let min_val =
                 ScalarValue::try_from_array(min_value_array.as_ref(), i).map_err(|e| {
-                    Error::Internal {
-                        message: format!(
-                            "Failed to get min ScalarValue for column '{}' zone {}: {}",
-                            column_name, i, e
-                        ),
-                        location: location!(),
-                    }
+                    Error::internal(format!(
+                        "Failed to get min ScalarValue for column '{}' zone {}: {}",
+                        column_name, i, e
+                    ))
                 })?;
             let max_val =
                 ScalarValue::try_from_array(max_value_array.as_ref(), i).map_err(|e| {
-                    Error::Internal {
-                        message: format!(
-                            "Failed to get max ScalarValue for column '{}' zone {}: {}",
-                            column_name, i, e
-                        ),
-                        location: location!(),
-                    }
+                    Error::internal(format!(
+                        "Failed to get max ScalarValue for column '{}' zone {}: {}",
+                        column_name, i, e
+                    ))
                 })?;
             min_values.push(min_val);
             max_values.push(max_val);
@@ -503,6 +479,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
     fn test_empty_stats_batch() {
         let schema = create_test_schema();
 

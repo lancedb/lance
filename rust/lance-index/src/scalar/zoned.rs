@@ -159,17 +159,17 @@ where
             }
         }
 
-        if current_zone_len > 0 {
-            if let Some(fragment_id) = current_fragment_id {
-                Self::flush_zone(
-                    &mut self.processor,
-                    &mut zones,
-                    fragment_id,
-                    &mut current_zone_len,
-                    &mut zone_start_offset,
-                    &mut zone_end_offset,
-                )?;
-            }
+        if current_zone_len > 0
+            && let Some(fragment_id) = current_fragment_id
+        {
+            Self::flush_zone(
+                &mut self.processor,
+                &mut zones,
+                fragment_id,
+                &mut current_zone_len,
+                &mut zone_start_offset,
+                &mut zone_end_offset,
+            )?;
         }
 
         Ok((zones, null_rows))

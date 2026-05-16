@@ -471,23 +471,23 @@ impl WriteParams {
     /// Returns an error if the manifest contains an invalid policy value or if
     /// `disable_column_stats` doesn't match the dataset's policy.
     pub fn validate_column_stats_policy(&mut self, dataset: Option<&Dataset>) -> Result<()> {
-        if let Some(dataset) = dataset {
-            if let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY) {
-                let dataset_policy_disable: bool = policy_str.parse().map_err(|_| {
-                    Error::invalid_input(format!(
-                        "[ColumnStats] Invalid value for {} in dataset config: {}",
-                        COLUMN_STATS_DISABLED_KEY, policy_str
-                    ))
-                })?;
+        if let Some(dataset) = dataset
+            && let Some(policy_str) = dataset.manifest.config.get(COLUMN_STATS_DISABLED_KEY)
+        {
+            let dataset_policy_disable: bool = policy_str.parse().map_err(|_| {
+                Error::invalid_input(format!(
+                    "[ColumnStats] Invalid value for {} in dataset config: {}",
+                    COLUMN_STATS_DISABLED_KEY, policy_str
+                ))
+            })?;
 
-                if self.disable_column_stats != dataset_policy_disable {
-                    return Err(Error::invalid_input(format!(
-                        "[ColumnStats] Policy mismatch: dataset requires disable_column_stats={}, \
-                             but WriteParams has disable_column_stats={}. \
-                             All fragments in a dataset must have consistent column statistics.",
-                        dataset_policy_disable, self.disable_column_stats
-                    )));
-                }
+            if self.disable_column_stats != dataset_policy_disable {
+                return Err(Error::invalid_input(format!(
+                    "[ColumnStats] Policy mismatch: dataset requires disable_column_stats={}, \
+                         but WriteParams has disable_column_stats={}. \
+                         All fragments in a dataset must have consistent column statistics.",
+                    dataset_policy_disable, self.disable_column_stats
+                )));
             }
             // If no policy in manifest, use the value from WriteParams
         }
