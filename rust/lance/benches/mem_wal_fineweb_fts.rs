@@ -1,33 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! End-to-end benchmark for the SWMR FTS mem index using HuggingFace fineweb.
+//! MemWAL FTS benchmark on real FineWeb text.
 //!
-//! For a single configuration, this binary:
-//!  1. Downloads (and caches) one fineweb sample shard.
-//!  2. Slices `BENCH_BASE_ROWS + BENCH_INGEST_ROWS` rows from it.
-//!  3. (Once per `BENCH_RUN_ID`) writes the base 1M-row Lance dataset to
-//!     `${DATASET_PREFIX}/${BENCH_RUN_ID}/base/`.
-//!  4. Ingests `BENCH_INGEST_ROWS` rows through `ShardWriter` with the
-//!     configured `max_memtable_rows`, `DURABLE_WRITE`, and `FTS_ENABLED`.
-//!     Records write throughput.
-//!  5. If FTS is enabled and `--with-read-test` is set: ingests
-//!     `max_memtable_rows` rows into a fresh dataset with auto-flush
-//!     disabled, queries the MemTable for 150 prebuilt queries (latency),
-//!     forces a flush, queries the on-disk FTS for the same queries, and
-//!     reports the top-10 set overlap (the user-approved "consistency"
-//!     proxy for recall).
+//! FTS-specialized sibling of `mem_wal_shard_writer_backpressure`: same
+//! CLI-arg shape, same `Mode` matrix (async/sync × index/no-index), same
+//! `ShardWriter` wiring and JSON output, but the payload is real
+//! HuggingFace FineWeb `text` and the maintained index is the in-memory
+//! FTS index instead of IVF/PQ.
 //!
-//! Writes a structured `result.json` to `${RESULT_FILE}`. All paths,
-//! credentials, and tunables are env-var driven so the same binary drives
-//! all 12 configs from a shell loop.
+//! Two phases, selected with `--phase`; each invocation does exactly one
+//! phase so a process never holds two `ShardWriter` lifecycles (that is
+//! what deadlocked the first iteration of this bench):
 //!
-//! See `~/ai/analysis/lance/jack-MemTableFTSBetter/fineweb-fts-bench/DESIGN.md`.
+//!   --phase write   throughput panel: ingest `calls × batch-rows` rows
+//!                   through `ShardWriter`, report rows/s + latency
+//!                   percentiles.
+//!   --phase read    MemTable FTS read panel: ingest `read-rows` rows into
+//!                   an auto-flush-disabled MemTable, time the FTS queries
+//!                   against the live MemTable, force a flush, replay the
+//!                   queries against the on-disk FTS index, and report the
+//!                   per-query top-K overlap ("consistency").
+//!
+//! Example:
+//!
+//! ```bash
+//! AWS_DEFAULT_REGION=us-east-1 \
+//! cargo bench -p lance --bench mem_wal_fineweb_fts -- \
+//!   --phase write --mode async_idx \
+//!   --uri s3://jack-devland-build/bench/mem-fts-fineweb/run1/w_async_idx_mt100k \
+//!   --seed-rows 1000000 --batch-rows 1000 --calls 1000 \
+//!   --max-memtable-rows 100000 \
+//!   --cache-dir /mnt/data/fineweb --output result.json
+//! ```
 
 #![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,15 +46,16 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator,
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
-use lance::dataset::mem_wal::write::ShardWriterConfig;
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
+use lance_core::Result;
 use lance_index::IndexType;
-use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+use lance_tokenizer::TokenStream;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
-use serde::Serialize;
+use serde_json::json;
 use uuid::Uuid;
 
 const TEXT_COL: &str = "text";
@@ -53,133 +65,130 @@ const HF_API_LISTING: &str =
 const HF_FILE_BASE: &str = "https://huggingface.co/datasets/HuggingFaceFW/fineweb/resolve/main/";
 
 // ----------------------------------------------------------------------
-// Configuration (env-driven)
+// Mode / Phase
 // ----------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct Config {
-    dataset_prefix: String,
-    run_id: String,
-    config_name: String,
-    max_memtable_rows: usize,
-    durable_write: bool,
-    fts_enabled: bool,
-    base_rows: usize,
-    ingest_rows: usize,
-    batch_size: usize,
-    cache_dir: std::path::PathBuf,
-    result_file: std::path::PathBuf,
-    /// When true, run the read-perf + consistency sub-test in addition to
-    /// the throughput test. Auto-disabled when `fts_enabled = false`.
-    with_read_test: bool,
-    /// How many high-frequency single-token queries to include.
-    num_token_queries: usize,
-    /// How many random 2-token phrase queries to include.
-    num_phrase_queries: usize,
-    /// Top-K used for read latency and consistency.
-    top_k: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    AsyncNoIndex,
+    AsyncIndexed,
+    SyncNoIndex,
+    SyncIndexed,
 }
 
-impl Config {
-    fn from_env() -> Self {
-        let dataset_prefix = std::env::var("DATASET_PREFIX")
-            .unwrap_or_else(|_| "/tmp/bench/mem_fts_fineweb".to_string());
-        let run_id = std::env::var("BENCH_RUN_ID").unwrap_or_else(|_| "dev".to_string());
-        let max_memtable_rows = env_usize("BENCH_MAX_MEMTABLE_ROWS", 100_000);
-        let durable_write = env_bool("DURABLE_WRITE", false);
-        let fts_enabled = env_bool("FTS_ENABLED", false);
-        let base_rows = env_usize("BENCH_BASE_ROWS", 1_000_000);
-        let ingest_rows = env_usize("BENCH_INGEST_ROWS", 1_000_000);
-        let batch_size = env_usize("BENCH_BATCH_SIZE", 1000);
-        let cache_dir = std::env::var("BENCH_CACHE_DIR")
-            .unwrap_or_else(|_| {
-                std::env::temp_dir()
-                    .join("mem_wal_fineweb_fts_cache")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .into();
-        let result_file = std::env::var("RESULT_FILE")
-            .unwrap_or_else(|_| "result.json".to_string())
-            .into();
-        let with_read_test = env_bool("BENCH_WITH_READ_TEST", true) && fts_enabled;
-        let num_token_queries = env_usize("BENCH_NUM_TOKEN_QUERIES", 100);
-        let num_phrase_queries = env_usize("BENCH_NUM_PHRASE_QUERIES", 50);
-        let top_k = env_usize("BENCH_TOP_K", 10);
-
-        let config_name = format!(
-            "mt{}_durable{}_fts{}",
-            human_size(max_memtable_rows),
-            if durable_write { "1" } else { "0" },
-            if fts_enabled { "1" } else { "0" },
-        );
-
-        Self {
-            dataset_prefix,
-            run_id,
-            config_name,
-            max_memtable_rows,
-            durable_write,
-            fts_enabled,
-            base_rows,
-            ingest_rows,
-            batch_size,
-            cache_dir,
-            result_file,
-            with_read_test,
-            num_token_queries,
-            num_phrase_queries,
-            top_k,
+impl Mode {
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "async_noidx" => Ok(Self::AsyncNoIndex),
+            "async_idx" => Ok(Self::AsyncIndexed),
+            "sync_noidx" => Ok(Self::SyncNoIndex),
+            "sync_idx" => Ok(Self::SyncIndexed),
+            _ => Err(format!(
+                "unknown mode '{value}', expected async_noidx|async_idx|sync_noidx|sync_idx"
+            )),
         }
     }
 
-    #[allow(dead_code)]
-    fn base_uri(&self) -> String {
-        format!("{}/{}/base", self.dataset_prefix, self.run_id)
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AsyncNoIndex => "async_noidx",
+            Self::AsyncIndexed => "async_idx",
+            Self::SyncNoIndex => "sync_noidx",
+            Self::SyncIndexed => "sync_idx",
+        }
     }
 
-    fn ingest_uri(&self) -> String {
-        format!(
-            "{}/{}/ingest_{}",
-            self.dataset_prefix, self.run_id, self.config_name
-        )
+    /// FTS index maintained in the MemTable.
+    fn indexed(self) -> bool {
+        matches!(self, Self::AsyncIndexed | Self::SyncIndexed)
     }
 
-    fn read_test_uri(&self) -> String {
-        format!(
-            "{}/{}/readtest_{}",
-            self.dataset_prefix, self.run_id, self.config_name
-        )
+    /// Each `put` waits for WAL durability before returning.
+    fn durable_write(self) -> bool {
+        matches!(self, Self::SyncNoIndex | Self::SyncIndexed)
     }
-}
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_bool(key: &str, default: bool) -> bool {
-    match std::env::var(key).ok().as_deref() {
-        Some("1") | Some("yes") | Some("true") | Some("YES") | Some("TRUE") => true,
-        Some("0") | Some("no") | Some("false") | Some("NO") | Some("FALSE") => false,
-        _ => default,
+    /// Index update happens inline in `put` (only meaningful when indexed).
+    fn sync_indexed_write(self) -> bool {
+        matches!(self, Self::SyncIndexed)
     }
 }
 
-fn human_size(n: usize) -> String {
-    if n % 1_000_000 == 0 {
-        format!("{}M", n / 1_000_000)
-    } else if n % 1_000 == 0 {
-        format!("{}k", n / 1_000)
-    } else {
-        n.to_string()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Write,
+    Read,
+}
+
+impl Phase {
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "write" => Ok(Self::Write),
+            "read" => Ok(Self::Read),
+            _ => Err(format!("unknown phase '{value}', expected write|read")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+        }
     }
 }
 
 // ----------------------------------------------------------------------
-// HF fineweb shard loading
+// Args
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct Args {
+    phase: Phase,
+    mode: Mode,
+    uri: Option<String>,
+    seed_rows: usize,
+    batch_rows: usize,
+    calls: usize,
+    read_rows: usize,
+    max_memtable_rows: Option<usize>,
+    max_memtable_size: usize,
+    max_unflushed_memtable_bytes: usize,
+    max_wal_flush_interval_ms: u64,
+    cache_dir: PathBuf,
+    num_token_queries: usize,
+    num_phrase_queries: usize,
+    top_k: usize,
+    tokio_threads: usize,
+    output: Option<PathBuf>,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        Self {
+            phase: Phase::Write,
+            mode: Mode::AsyncIndexed,
+            uri: None,
+            seed_rows: 1_000_000,
+            batch_rows: 1_000,
+            calls: 1_000,
+            read_rows: 100_000,
+            max_memtable_rows: None,
+            max_memtable_size: 16 * 1024 * 1024 * 1024,
+            max_unflushed_memtable_bytes: 8 * 1024 * 1024 * 1024,
+            max_wal_flush_interval_ms: 100,
+            cache_dir: std::env::temp_dir().join("mem_wal_fineweb_fts_cache"),
+            num_token_queries: 100,
+            num_phrase_queries: 50,
+            top_k: 10,
+            tokio_threads: threads,
+            output: None,
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// HuggingFace FineWeb loading
 // ----------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -189,13 +198,13 @@ struct HfTreeEntry {
     path: String,
 }
 
-async fn list_shard_paths() -> lance_core::Result<Vec<String>> {
+async fn list_shard_paths() -> Result<Vec<String>> {
     let entries: Vec<HfTreeEntry> = reqwest::get(HF_API_LISTING)
         .await
-        .map_err(|e| lance_core::Error::io(format!("listing HTTP: {}", e)))?
+        .map_err(|e| lance_core::Error::io(format!("listing HTTP: {e}")))?
         .json()
         .await
-        .map_err(|e| lance_core::Error::io(format!("listing JSON: {}", e)))?;
+        .map_err(|e| lance_core::Error::io(format!("listing JSON: {e}")))?;
     let mut shards: Vec<String> = entries
         .into_iter()
         .filter(|e| e.kind == "file" && e.path.ends_with(".parquet"))
@@ -205,37 +214,35 @@ async fn list_shard_paths() -> lance_core::Result<Vec<String>> {
     Ok(shards)
 }
 
-async fn download_shard(rel_path: &str, dest: &std::path::Path) -> lance_core::Result<()> {
+async fn download_shard(rel_path: &str, dest: &std::path::Path) -> Result<()> {
     if dest.exists() {
         return Ok(());
     }
-    let url = format!("{}{}", HF_FILE_BASE, rel_path);
-    let max_attempts = 5;
-    for attempt in 1..=max_attempts {
-        println!(
-            "downloading {} (attempt {}/{}) ...",
-            rel_path, attempt, max_attempts
-        );
-        let result: lance_core::Result<bytes::Bytes> = async {
+    let url = format!("{HF_FILE_BASE}{rel_path}");
+    let tmp = dest.with_extension("part");
+    for attempt in 1..=5u32 {
+        println!("downloading {rel_path} (attempt {attempt}/5) ...");
+        let result: Result<bytes::Bytes> = async {
             let resp = reqwest::get(&url)
                 .await
-                .map_err(|e| lance_core::Error::io(format!("download HTTP: {}", e)))?;
+                .map_err(|e| lance_core::Error::io(format!("download HTTP: {e}")))?;
             if !resp.status().is_success() {
                 return Err(lance_core::Error::io(format!(
-                    "download {} → status {}",
-                    url,
+                    "download {url} -> status {}",
                     resp.status()
                 )));
             }
             resp.bytes()
                 .await
-                .map_err(|e| lance_core::Error::io(format!("read body: {}", e)))
+                .map_err(|e| lance_core::Error::io(format!("read body: {e}")))
         }
         .await;
         match result {
             Ok(bytes) => {
-                std::fs::write(dest, &bytes)
-                    .map_err(|e| lance_core::Error::io(format!("write: {}", e)))?;
+                std::fs::write(&tmp, &bytes)
+                    .map_err(|e| lance_core::Error::io(format!("write: {e}")))?;
+                std::fs::rename(&tmp, dest)
+                    .map_err(|e| lance_core::Error::io(format!("rename: {e}")))?;
                 println!(
                     "  wrote {:.1} MB to {}",
                     bytes.len() as f64 / 1024.0 / 1024.0,
@@ -243,13 +250,9 @@ async fn download_shard(rel_path: &str, dest: &std::path::Path) -> lance_core::R
                 );
                 return Ok(());
             }
-            Err(e) if attempt < max_attempts => {
-                let backoff = Duration::from_secs(2u64.pow(attempt as u32));
-                eprintln!(
-                    "  attempt {} failed: {}; retrying in {:?}",
-                    attempt, e, backoff
-                );
-                tokio::time::sleep(backoff).await;
+            Err(e) if attempt < 5 => {
+                eprintln!("  attempt {attempt} failed: {e}; retrying");
+                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
             }
             Err(e) => return Err(e),
         }
@@ -261,23 +264,22 @@ async fn read_shard_text(
     path: &std::path::Path,
     out: &mut Vec<String>,
     max_rows: usize,
-) -> lance_core::Result<usize> {
+) -> Result<usize> {
     let file = tokio::fs::File::open(path)
         .await
-        .map_err(|e| lance_core::Error::io(format!("open parquet: {}", e)))?;
+        .map_err(|e| lance_core::Error::io(format!("open parquet: {e}")))?;
     let builder = ParquetRecordBatchStreamBuilder::new(file)
         .await
-        .map_err(|e| lance_core::Error::io(format!("parquet builder: {}", e)))?;
+        .map_err(|e| lance_core::Error::io(format!("parquet builder: {e}")))?;
     let mut stream = builder
         .build()
-        .map_err(|e| lance_core::Error::io(format!("parquet stream: {}", e)))?;
-
+        .map_err(|e| lance_core::Error::io(format!("parquet stream: {e}")))?;
     let mut taken = 0usize;
     while taken < max_rows {
         let Some(rb) = stream
             .try_next()
             .await
-            .map_err(|e| lance_core::Error::io(format!("parquet read: {}", e)))?
+            .map_err(|e| lance_core::Error::io(format!("parquet read: {e}")))?
         else {
             break;
         };
@@ -287,7 +289,7 @@ async fn read_shard_text(
         let strs = col
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| lance_core::Error::io("text column not StringArray".to_string()))?;
+            .ok_or_else(|| lance_core::Error::io("text not StringArray".to_string()))?;
         for i in 0..strs.len() {
             if taken >= max_rows {
                 break;
@@ -302,44 +304,36 @@ async fn read_shard_text(
     Ok(taken)
 }
 
-async fn load_corpus(
-    needed_rows: usize,
-    cache_dir: &std::path::Path,
-) -> lance_core::Result<Vec<String>> {
+/// Load `needed_rows` text rows from cached FineWeb shards, downloading
+/// shards on demand.
+async fn load_corpus(needed_rows: usize, cache_dir: &std::path::Path) -> Result<Vec<String>> {
     std::fs::create_dir_all(cache_dir)
-        .map_err(|e| lance_core::Error::io(format!("mkdir cache: {}", e)))?;
+        .map_err(|e| lance_core::Error::io(format!("mkdir cache: {e}")))?;
     let shards = list_shard_paths().await?;
-    println!("fineweb sample/10BT has {} parquet shards", shards.len());
-
+    println!("fineweb sample/10BT: {} shards", shards.len());
     let mut buf: Vec<String> = Vec::with_capacity(needed_rows);
-    for rel_path in &shards {
+    for rel in &shards {
         if buf.len() >= needed_rows {
             break;
         }
-        let local_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-        let local = cache_dir.join(local_name);
-        download_shard(rel_path, &local).await?;
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let local = cache_dir.join(name);
+        download_shard(rel, &local).await?;
         let want = needed_rows - buf.len();
         let got = read_shard_text(&local, &mut buf, want).await?;
-        println!(
-            "  shard {} → {} text rows (cumulative {})",
-            local_name,
-            got,
-            buf.len()
-        );
+        println!("  shard {name} -> {got} rows (cumulative {})", buf.len());
     }
     if buf.len() < needed_rows {
-        eprintln!(
-            "  warning: dataset exhausted at {} rows (asked {})",
-            buf.len(),
-            needed_rows
-        );
+        return Err(lance_core::Error::io(format!(
+            "fineweb yielded only {} rows, need {needed_rows}",
+            buf.len()
+        )));
     }
     Ok(buf)
 }
 
 // ----------------------------------------------------------------------
-// Schema + batch helpers
+// Schema / batches
 // ----------------------------------------------------------------------
 
 fn make_schema() -> Arc<ArrowSchema> {
@@ -348,251 +342,121 @@ fn make_schema() -> Arc<ArrowSchema> {
         "lance-schema:unenforced-primary-key".to_string(),
         "true".to_string(),
     );
-    let id = Field::new("id", DataType::Int64, false).with_metadata(id_meta);
     Arc::new(ArrowSchema::new(vec![
-        id,
+        Field::new("id", DataType::Int64, false).with_metadata(id_meta),
         Field::new(TEXT_COL, DataType::Utf8, true),
     ]))
 }
 
-fn make_batch(start_id: i64, texts: &[String], schema: Arc<ArrowSchema>) -> RecordBatch {
-    let n = texts.len();
-    let ids: Vec<i64> = (start_id..start_id + n as i64).collect();
+fn make_batch(schema: Arc<ArrowSchema>, start_id: i64, texts: &[&str]) -> RecordBatch {
+    let ids: Vec<i64> = (start_id..start_id + texts.len() as i64).collect();
     let id_arr: ArrayRef = Arc::new(Int64Array::from(ids));
-    let text_arr: ArrayRef = Arc::new(StringArray::from(texts.to_vec()));
+    let text_arr: ArrayRef = Arc::new(StringArray::from_iter_values(texts.iter().copied()));
     RecordBatch::try_new(schema, vec![id_arr, text_arr]).unwrap()
 }
 
-// ----------------------------------------------------------------------
-// Base dataset
-// ----------------------------------------------------------------------
-
-async fn build_base_if_absent(
-    base_uri: &str,
+/// Write a seed dataset of `seed_texts.len()` rows, optionally create the
+/// base FTS index, and initialize MemWAL.
+async fn build_seed_dataset(
+    uri: &str,
     schema: Arc<ArrowSchema>,
-    base_texts: &[String],
-    batch_size: usize,
-    fts_enabled: bool,
-) -> lance_core::Result<()> {
-    if Dataset::open(base_uri).await.is_ok() {
-        println!("base dataset already exists at {}, skipping build", base_uri);
-        return Ok(());
-    }
-    println!(
-        "building base dataset at {} ({} rows, batch_size {})",
-        base_uri,
-        base_texts.len(),
-        batch_size
-    );
-    let total = base_texts.len();
-    let mut batches = Vec::with_capacity(total.div_ceil(batch_size));
-    let mut start = 0usize;
-    while start < total {
-        let end = (start + batch_size).min(total);
-        batches.push(Ok(make_batch(
-            start as i64,
-            &base_texts[start..end],
-            schema.clone(),
-        )));
-        start = end;
+    seed_texts: &[String],
+    batch_rows: usize,
+    indexed: bool,
+) -> Result<f64> {
+    let start = Instant::now();
+    let mut batches = Vec::with_capacity(seed_texts.len().div_ceil(batch_rows));
+    let mut lo = 0usize;
+    while lo < seed_texts.len() {
+        let hi = (lo + batch_rows).min(seed_texts.len());
+        let slice: Vec<&str> = seed_texts[lo..hi].iter().map(|s| s.as_str()).collect();
+        batches.push(Ok(make_batch(schema.clone(), lo as i64, &slice)));
+        lo = hi;
     }
     let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
-    let mut dataset = Dataset::write(reader, base_uri, Some(WriteParams::default())).await?;
-    if fts_enabled {
-        let fts_params = InvertedIndexParams::default();
+    let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+    if indexed {
         dataset
             .create_index(
                 &[TEXT_COL],
                 IndexType::Inverted,
                 Some(FTS_INDEX_NAME.to_string()),
-                &fts_params,
-                true,
-            )
-            .await?;
-    } else {
-        // Even when MemWAL is configured without FTS, we still need a
-        // BTree index on `id` so MemWAL has at least one maintained
-        // index to reference.
-        let pk_params = ScalarIndexParams::default();
-        dataset
-            .create_index(
-                &["id"],
-                IndexType::BTree,
-                Some("id_btree".to_string()),
-                &pk_params,
+                &InvertedIndexParams::default(),
                 true,
             )
             .await?;
     }
-    let maintained = if fts_enabled {
-        vec![FTS_INDEX_NAME.to_string()]
-    } else {
-        vec!["id_btree".to_string()]
-    };
     dataset
         .initialize_mem_wal(MemWalConfig {
             shard_spec: None,
-            maintained_indexes: maintained,
+            maintained_indexes: if indexed {
+                vec![FTS_INDEX_NAME.to_string()]
+            } else {
+                vec![]
+            },
         })
         .await?;
-    Ok(())
+    Ok(start.elapsed().as_secs_f64())
 }
 
-// ----------------------------------------------------------------------
-// Ingest
-// ----------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-struct IngestStats {
-    rows: usize,
-    wall_seconds: f64,
-    rows_per_sec: f64,
-    /// p95 per-`put` latency in milliseconds.
-    put_p95_ms: f64,
-    put_p50_ms: f64,
-    put_max_ms: f64,
-    num_puts: usize,
-}
-
-async fn ingest_via_shard_writer(
-    target_uri: &str,
-    schema: Arc<ArrowSchema>,
-    base_texts: &[String],
-    ingest_texts: &[String],
-    cfg: &Config,
-    disable_auto_flush: bool,
-) -> lance_core::Result<IngestStats> {
-    // Build a fresh ingest dataset by cloning the base.
-    println!("preparing ingest dataset at {}", target_uri);
-    build_base_if_absent(
-        target_uri,
-        schema.clone(),
-        base_texts,
-        cfg.batch_size,
-        cfg.fts_enabled,
-    )
-    .await?;
-    let dataset = Arc::new(Dataset::open(target_uri).await?);
-
-    let shard_id = Uuid::new_v4();
-    let max_memtable_rows = if disable_auto_flush {
-        cfg.ingest_rows.saturating_mul(2).max(2_000_000)
+fn shard_writer_config(args: &Args, shard_id: Uuid, disable_auto_flush: bool) -> ShardWriterConfig {
+    let max_rows = if disable_auto_flush {
+        args.read_rows.saturating_mul(4).max(4_000_000)
     } else {
-        cfg.max_memtable_rows
+        args.max_memtable_rows.unwrap_or(usize::MAX / 2)
     };
-    let max_memtable_size = if disable_auto_flush {
-        16 * 1024 * 1024 * 1024 // 16 GiB
+    let mut config = ShardWriterConfig::new(shard_id)
+        .with_durable_write(args.mode.durable_write())
+        .with_sync_indexed_write(args.mode.sync_indexed_write())
+        .with_max_memtable_size(args.max_memtable_size)
+        .with_max_unflushed_memtable_bytes(args.max_unflushed_memtable_bytes)
+        .with_max_memtable_rows(max_rows)
+        .with_max_memtable_batches(max_rows.div_ceil(args.batch_rows).saturating_add(64));
+    if args.max_wal_flush_interval_ms == 0 {
+        config.max_wal_flush_interval = None;
     } else {
-        16 * 1024 * 1024 * 1024
-    };
-    let writer_config = ShardWriterConfig {
-        shard_id,
-        shard_spec_id: 0,
-        durable_write: cfg.durable_write,
-        sync_indexed_write: true,
-        max_memtable_size,
-        max_memtable_rows,
-        max_memtable_batches: 4_000_000,
-        max_wal_flush_interval: Some(Duration::from_millis(200)),
-        max_unflushed_memtable_bytes: usize::MAX / 2,
-        ..ShardWriterConfig::default()
-    };
-    let writer = dataset
-        .as_ref()
-        .mem_wal_writer(shard_id, writer_config)
-        .await?;
-
-    // Ingest IDs start above the base table's last id to keep PK unique.
-    let id_offset: i64 = cfg.base_rows as i64;
-    let n = ingest_texts.len();
-    let bs = cfg.batch_size;
-    let total_batches = n.div_ceil(bs);
-
-    let mut put_latencies: Vec<u128> = Vec::with_capacity(total_batches);
-    let start = Instant::now();
-    for i in 0..total_batches {
-        let lo = i * bs;
-        let hi = (lo + bs).min(n);
-        let batch = make_batch(
-            id_offset + lo as i64,
-            &ingest_texts[lo..hi],
-            schema.clone(),
-        );
-        let put_t = Instant::now();
-        writer.put(vec![batch]).await?;
-        put_latencies.push(put_t.elapsed().as_micros());
-        if (i + 1) % 100 == 0 {
-            let so_far = start.elapsed().as_secs_f64();
-            let rate = (i + 1) as f64 * bs as f64 / so_far.max(1e-9);
-            println!(
-                "  ingest progress: {}/{} batches ({:.0} rows/s)",
-                i + 1,
-                total_batches,
-                rate
-            );
-        }
+        config = config
+            .with_max_wal_flush_interval(Duration::from_millis(args.max_wal_flush_interval_ms));
     }
-    // Close the writer to drain the final WAL/memtable flush. With
-    // sync_indexed_write = true the inline index update is already
-    // complete, but auto-flush leaves background memtable->disk work
-    // outstanding that close() awaits. We deliberately include close()
-    // in the elapsed measurement so the reported throughput reflects
-    // "rows fully ingested + their pending flush", not just "puts
-    // returned". This is the apples-to-apples figure across configs
-    // with different `max_memtable_rows` (which drive the flush
-    // cadence). The previous post-ingest spin on
-    // `max_indexed_batch_position` was incorrect under auto-flush
-    // because the counter resets on each new active memtable.
-    writer.close().await?;
-    let elapsed = start.elapsed();
+    config
+}
 
-    put_latencies.sort_unstable();
-    let p50 = put_latencies[put_latencies.len() / 2] as f64 / 1000.0;
-    let p95 = put_latencies[put_latencies.len() * 95 / 100] as f64 / 1000.0;
-    let max = *put_latencies.iter().max().unwrap_or(&0) as f64 / 1000.0;
-    Ok(IngestStats {
-        rows: n,
-        wall_seconds: elapsed.as_secs_f64(),
-        rows_per_sec: n as f64 / elapsed.as_secs_f64().max(1e-9),
-        put_p50_ms: p50,
-        put_p95_ms: p95,
-        put_max_ms: max,
-        num_puts: total_batches,
-    })
+fn percentile(values: &[f64], pct: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((pct / 100.0) * (sorted.len().saturating_sub(1)) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 // ----------------------------------------------------------------------
 // Query set
 // ----------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
 struct QuerySet {
     tokens: Vec<String>,
     phrases: Vec<String>,
 }
 
-fn build_query_set(sample_texts: &[&str], cfg: &Config) -> QuerySet {
-    use lance_tokenizer::TokenStream;
-    // ASCII stop-word-ish list used by the default English analyzer; we only
-    // need a coarse filter for query selection here.
-    const STOPWORDS: &[&str] = &[
-        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "as", "by", "is",
-        "was", "are", "were", "be", "been", "being", "this", "that", "these", "those", "it", "its",
-        "but", "not", "no", "if", "then", "than", "so", "do", "does", "did", "have", "has", "had",
-        "will", "would", "should", "could", "can", "may", "might", "must", "i", "you", "he", "she",
-        "we", "they", "them", "his", "her", "their", "our", "us", "me", "my", "your", "him",
-    ];
+const STOPWORDS: &[&str] = &[
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "as", "by", "is", "was",
+    "are", "were", "be", "been", "being", "this", "that", "these", "those", "it", "its", "but",
+    "not", "no", "if", "then", "than", "so", "do", "does", "did", "have", "has", "had", "will",
+    "would", "should", "could", "can", "may", "might", "must", "i", "you", "he", "she", "we",
+    "they", "them", "his", "her", "their", "our", "us", "me", "my", "your", "him", "at", "from",
+];
+
+fn build_query_set(sample: &[&str], args: &Args) -> QuerySet {
     let mut tokenizer = InvertedIndexParams::default()
         .build()
         .expect("default tokenizer builds");
     let mut freq: HashMap<String, u64> = HashMap::new();
-    for t in sample_texts.iter().take(50_000) {
+    for t in sample.iter().take(50_000) {
         let mut stream = tokenizer.token_stream_for_doc(t);
         while let Some(tok) = stream.next() {
-            if tok.text.len() < 3 || tok.text.len() > 24 {
-                continue;
-            }
-            if STOPWORDS.contains(&tok.text.as_str()) {
+            if tok.text.len() < 3 || tok.text.len() > 24 || STOPWORDS.contains(&tok.text.as_str()) {
                 continue;
             }
             *freq.entry(tok.text.clone()).or_default() += 1;
@@ -603,23 +467,17 @@ fn build_query_set(sample_texts: &[&str], cfg: &Config) -> QuerySet {
     let tokens: Vec<String> = by_freq
         .into_iter()
         .map(|(t, _)| t)
-        .take(cfg.num_token_queries)
+        .take(args.num_token_queries)
         .collect();
 
-    // Phrase queries: walk a deterministic stride of rows, take the first
-    // two consecutive non-stopword non-short tokens.
-    let mut phrases = Vec::with_capacity(cfg.num_phrase_queries);
-    let stride = sample_texts.len().max(1) / cfg.num_phrase_queries.max(1);
+    let mut phrases = Vec::with_capacity(args.num_phrase_queries);
+    let stride = (sample.len().max(1) / args.num_phrase_queries.max(1)).max(1);
     let mut idx = 0usize;
-    while phrases.len() < cfg.num_phrase_queries && idx < sample_texts.len() {
-        let t = sample_texts[idx];
-        let mut stream = tokenizer.token_stream_for_doc(t);
+    while phrases.len() < args.num_phrase_queries && idx < sample.len() {
+        let mut stream = tokenizer.token_stream_for_doc(sample[idx]);
         let mut acc: Vec<String> = Vec::new();
         while let Some(tok) = stream.next() {
-            if tok.text.len() < 3 || tok.text.len() > 24 {
-                continue;
-            }
-            if STOPWORDS.contains(&tok.text.as_str()) {
+            if tok.text.len() < 3 || tok.text.len() > 24 || STOPWORDS.contains(&tok.text.as_str()) {
                 continue;
             }
             acc.push(tok.text.clone());
@@ -628,326 +486,371 @@ fn build_query_set(sample_texts: &[&str], cfg: &Config) -> QuerySet {
                 break;
             }
         }
-        idx = idx.saturating_add(stride.max(1));
+        idx += stride;
     }
-
     QuerySet { tokens, phrases }
 }
 
 // ----------------------------------------------------------------------
-// Read test (FTS only): MemTable query latency + post-flush consistency
+// Write phase
 // ----------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
-struct ReadStats {
-    rows: usize,
-    /// Average across all queries (token + phrase).
-    mt_latency_avg_ms: f64,
-    mt_latency_p50_ms: f64,
-    mt_latency_p95_ms: f64,
-    consistency_mean: f64,
-    consistency_min: f64,
-    num_queries: usize,
+async fn run_write(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_json::Value> {
+    let schema = make_schema();
+    let indexed = args.mode.indexed();
+
+    let seed = &corpus[..args.seed_rows.min(corpus.len())];
+    let setup_s = build_seed_dataset(uri, schema.clone(), seed, args.batch_rows, indexed).await?;
+
+    let dataset = Dataset::open(uri).await?;
+    let shard_id = Uuid::new_v4();
+    let config = shard_writer_config(args, shard_id, false);
+    let writer = dataset.mem_wal_writer(shard_id, config).await?;
+
+    // Ingest rows come from the corpus after the seed, cycled if needed.
+    let ingest_pool = &corpus[args.seed_rows.min(corpus.len())..];
+    let pool_len = ingest_pool.len().max(1);
+    let mut latencies_ms = Vec::with_capacity(args.calls);
+    let id_base = args.seed_rows as i64;
+
+    let puts_start = Instant::now();
+    for call in 0..args.calls {
+        let lo = (call * args.batch_rows) % pool_len;
+        let mut slice: Vec<&str> = Vec::with_capacity(args.batch_rows);
+        for j in 0..args.batch_rows {
+            slice.push(ingest_pool[(lo + j) % pool_len].as_str());
+        }
+        let batch = make_batch(
+            schema.clone(),
+            id_base + (call * args.batch_rows) as i64,
+            &slice,
+        );
+        let put_start = Instant::now();
+        writer.put(vec![batch]).await?;
+        latencies_ms.push(put_start.elapsed().as_secs_f64() * 1000.0);
+        if (call + 1) % 100 == 0 {
+            let rate = ((call + 1) * args.batch_rows) as f64 / puts_start.elapsed().as_secs_f64();
+            println!("  put {}/{} ({rate:.0} rows/s)", call + 1, args.calls);
+        }
+    }
+    let elapsed_puts_s = puts_start.elapsed().as_secs_f64();
+
+    let close_start = Instant::now();
+    writer.close().await?;
+    let elapsed_close_s = close_start.elapsed().as_secs_f64();
+    let elapsed_total_s = puts_start.elapsed().as_secs_f64();
+
+    let rows = args.calls * args.batch_rows;
+    Ok(json!({
+        "phase": "write",
+        "mode": args.mode.as_str(),
+        "uri": uri,
+        "seed_rows": args.seed_rows,
+        "batch_rows": args.batch_rows,
+        "calls": args.calls,
+        "ingested_rows": rows,
+        "max_memtable_rows": args.max_memtable_rows,
+        "setup_seconds": setup_s,
+        "elapsed_puts_seconds": elapsed_puts_s,
+        "elapsed_close_seconds": elapsed_close_s,
+        "elapsed_total_seconds": elapsed_total_s,
+        // Throughput including the final close()/flush — comparable across
+        // configs with different flush cadences.
+        "throughput_rows_per_sec": rows as f64 / elapsed_total_s,
+        // Loop-only throughput (puts returned, flush may be outstanding).
+        "throughput_puts_rows_per_sec": rows as f64 / elapsed_puts_s,
+        "put_p50_ms": percentile(&latencies_ms, 50.0),
+        "put_p90_ms": percentile(&latencies_ms, 90.0),
+        "put_p99_ms": percentile(&latencies_ms, 99.0),
+        "put_max_ms": latencies_ms.iter().copied().fold(0.0_f64, f64::max),
+    }))
 }
 
-async fn run_read_test(
-    target_uri: &str,
-    schema: Arc<ArrowSchema>,
-    base_texts: &[String],
-    ingest_texts: &[String],
-    queries: &QuerySet,
-    cfg: &Config,
-) -> lance_core::Result<ReadStats> {
-    println!(
-        "  read test: ingesting {} rows with auto-flush disabled",
-        ingest_texts.len()
-    );
-    build_base_if_absent(
-        target_uri,
-        schema.clone(),
-        base_texts,
-        cfg.batch_size,
-        true, // FTS index on the base, since this path is FTS-only.
-    )
-    .await?;
-    let dataset = Arc::new(Dataset::open(target_uri).await?);
+// ----------------------------------------------------------------------
+// Read phase
+// ----------------------------------------------------------------------
+
+async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_json::Value> {
+    let schema = make_schema();
+
+    // Seed dataset with an FTS base index (read phase is FTS-only).
+    let seed = &corpus[..args.seed_rows.min(corpus.len())];
+    let setup_s = build_seed_dataset(uri, schema.clone(), seed, args.batch_rows, true).await?;
+
+    let dataset = Dataset::open(uri).await?;
     let shard_id = Uuid::new_v4();
-    let writer_config = ShardWriterConfig {
-        shard_id,
-        shard_spec_id: 0,
-        durable_write: cfg.durable_write,
-        sync_indexed_write: true,
-        // Effectively disable auto-flush triggers so the MemTable holds
-        // the full ingest_texts.len() rows for the query phase.
-        max_memtable_size: 64 * 1024 * 1024 * 1024,
-        max_memtable_rows: ingest_texts.len().saturating_mul(2),
-        max_memtable_batches: 4_000_000,
-        max_wal_flush_interval: Some(Duration::from_millis(200)),
-        max_unflushed_memtable_bytes: usize::MAX / 2,
-        ..ShardWriterConfig::default()
-    };
-    let writer = dataset
-        .as_ref()
-        .mem_wal_writer(shard_id, writer_config)
-        .await?;
+    // Auto-flush disabled so the MemTable holds the full read_rows.
+    let config = shard_writer_config(args, shard_id, true);
+    let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
-    let id_offset: i64 = cfg.base_rows as i64;
-    let bs = cfg.batch_size;
-    let n = ingest_texts.len();
-    let total_batches = n.div_ceil(bs);
-    for i in 0..total_batches {
-        let lo = i * bs;
-        let hi = (lo + bs).min(n);
-        let batch = make_batch(
-            id_offset + lo as i64,
-            &ingest_texts[lo..hi],
-            schema.clone(),
-        );
-        writer.put(vec![batch]).await?;
+    let ingest_pool = &corpus[args.seed_rows.min(corpus.len())..];
+    let n = args.read_rows.min(ingest_pool.len());
+    let id_base = args.seed_rows as i64;
+    let total_batches = n.div_ceil(args.batch_rows);
+    let ingest_start = Instant::now();
+    for b in 0..total_batches {
+        let lo = b * args.batch_rows;
+        let hi = (lo + args.batch_rows).min(n);
+        let slice: Vec<&str> = ingest_pool[lo..hi].iter().map(|s| s.as_str()).collect();
+        writer
+            .put(vec![make_batch(
+                schema.clone(),
+                id_base + lo as i64,
+                &slice,
+            )])
+            .await?;
     }
-    let target_batch_pos = total_batches.saturating_sub(1);
-    loop {
-        let active = writer.active_memtable_ref().await?;
-        if active.index_store.max_indexed_batch_position() >= target_batch_pos {
-            break;
-        }
-        drop(active);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let ingest_s = ingest_start.elapsed().as_secs_f64();
+    println!("  read phase: ingested {n} rows in {ingest_s:.1}s");
 
-    // ----- MemTable phase -----
-    let active = writer.active_memtable_ref().await?;
-    let fts = active
-        .index_store
-        .get_fts(FTS_INDEX_NAME)
-        .ok_or_else(|| lance_core::Error::invalid_input("FTS mem index not found"))?;
-
-    let mut latencies_us: Vec<u128> = Vec::new();
-    let mut mt_top10: Vec<HashSet<i64>> = Vec::new();
-
-    let all_queries: Vec<(FtsQueryExpr, String)> = queries
+    // Build the query set from the ingested slice.
+    let sample: Vec<&str> = ingest_pool[..n].iter().map(|s| s.as_str()).collect();
+    let queries = build_query_set(&sample, args);
+    let all_queries: Vec<FtsQueryExpr> = queries
         .tokens
         .iter()
-        .map(|t| (FtsQueryExpr::match_query(t.clone()), t.clone()))
+        .map(|t| FtsQueryExpr::match_query(t.clone()))
         .chain(
             queries
                 .phrases
                 .iter()
-                .map(|p| (FtsQueryExpr::phrase(p.clone()), format!("\"{p}\""))),
+                .map(|p| FtsQueryExpr::phrase(p.clone())),
         )
         .collect();
+    println!(
+        "  query set: {} tokens + {} phrases",
+        queries.tokens.len(),
+        queries.phrases.len()
+    );
 
-    // Build a row_position -> id map by scanning the active batches.
-    // This is needed because the MemTable returns row_positions; the
-    // post-flush on-disk FTS returns row_ids that match the `id` column.
+    // ---- MemTable read phase ----
+    let active = writer.active_memtable_ref().await?;
+    let fts = active
+        .index_store
+        .get_fts(FTS_INDEX_NAME)
+        .ok_or_else(|| lance_core::Error::invalid_input("FTS mem index missing"))?;
+
+    // row_position -> id, recovered from the MemTable batches.
     let mut row_to_id: HashMap<u64, i64> = HashMap::new();
     for stored in active.batch_store.iter() {
         let id_arr = stored
             .data
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .ok_or_else(|| lance_core::Error::invalid_input("id col missing"))?;
+            .ok_or_else(|| lance_core::Error::invalid_input("id column missing"))?;
         for r in 0..id_arr.len() {
             row_to_id.insert(stored.row_offset + r as u64, id_arr.value(r));
         }
     }
 
-    for (q, label) in &all_queries {
-        let opts = SearchOptions::new().with_limit(cfg.top_k);
+    let mut latencies_us = Vec::with_capacity(all_queries.len());
+    let mut mt_top: Vec<HashSet<i64>> = Vec::with_capacity(all_queries.len());
+    for q in &all_queries {
+        let opts = SearchOptions::new().with_limit(args.top_k);
         let t0 = Instant::now();
-        let entries = fts.search_with_options(q, opts);
-        latencies_us.push(t0.elapsed().as_micros());
-        let mut ids = HashSet::with_capacity(cfg.top_k);
-        for e in entries.iter().take(cfg.top_k) {
-            if let Some(id) = row_to_id.get(&e.row_position) {
-                ids.insert(*id);
-            }
-        }
-        if mt_top10.len() < 3 {
-            println!(
-                "    [mt] {label}: {} hits, ids={:?}",
-                entries.len(),
-                ids.iter().take(3).collect::<Vec<_>>()
-            );
-        }
-        mt_top10.push(ids);
+        let hits = fts.search_with_options(q, opts);
+        latencies_us.push(t0.elapsed().as_micros() as f64);
+        let ids: HashSet<i64> = hits
+            .iter()
+            .take(args.top_k)
+            .filter_map(|e| row_to_id.get(&e.row_position).copied())
+            .collect();
+        mt_top.push(ids);
     }
     drop(active);
 
-    latencies_us.sort_unstable();
-    let avg_us =
-        latencies_us.iter().sum::<u128>() as f64 / latencies_us.len().max(1) as f64;
-    let p50 = latencies_us[latencies_us.len() / 2] as f64 / 1000.0;
-    let p95 = latencies_us[latencies_us.len() * 95 / 100] as f64 / 1000.0;
+    let lat_ms: Vec<f64> = latencies_us.iter().map(|us| us / 1000.0).collect();
+    let mt_avg_ms = lat_ms.iter().sum::<f64>() / lat_ms.len().max(1) as f64;
 
-    // ----- Force flush, then on-disk phase -----
-    println!("  read test: closing writer to force flush");
+    // ---- Force flush, on-disk replay ----
+    let flush_start = Instant::now();
     writer.close().await?;
-    let flushed_dataset = Dataset::open(target_uri).await?;
+    let flush_s = flush_start.elapsed().as_secs_f64();
+    let flushed = Dataset::open(uri).await?;
 
-    let mut consistencies: Vec<f64> = Vec::with_capacity(all_queries.len());
-    for ((q, label), mt_ids) in all_queries.iter().zip(mt_top10.iter()) {
-        let fts_query = match q {
-            FtsQueryExpr::Match { query, .. } => FullTextSearchQuery::new(query.clone()),
-            FtsQueryExpr::Phrase { query, .. } => {
-                FullTextSearchQuery::new(format!("\"{}\"", query))
-            }
-            _ => unreachable!("only match/phrase queries in this set"),
+    let mut consistencies = Vec::with_capacity(all_queries.len());
+    for (q, mt_ids) in all_queries.iter().zip(mt_top.iter()) {
+        let query_str = match q {
+            FtsQueryExpr::Match { query, .. } => query.clone(),
+            FtsQueryExpr::Phrase { query, .. } => format!("\"{query}\""),
+            _ => unreachable!("only match/phrase queries are generated"),
         };
-        let mut scanner = flushed_dataset.scan();
-        scanner.full_text_search(fts_query)?;
-        scanner.limit(Some(cfg.top_k as i64), None)?;
+        let mut scanner = flushed.scan();
+        scanner.full_text_search(FullTextSearchQuery::new(query_str))?;
+        scanner.limit(Some(args.top_k as i64), None)?;
         scanner.project(&["id"])?;
         let stream = scanner.try_into_stream().await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        let mut disk_ids = HashSet::new();
+        let mut disk_ids: HashSet<i64> = HashSet::new();
         for b in &batches {
             let id_arr = b
                 .column_by_name("id")
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                .ok_or_else(|| lance_core::Error::invalid_input("disk id col missing"))?;
+                .ok_or_else(|| lance_core::Error::invalid_input("disk id column missing"))?;
             for i in 0..id_arr.len() {
                 disk_ids.insert(id_arr.value(i));
             }
         }
         let inter: usize = mt_ids.intersection(&disk_ids).count();
         let denom = mt_ids.len().max(disk_ids.len()).max(1);
-        let cons = inter as f64 / denom as f64;
-        if consistencies.len() < 3 {
-            println!(
-                "    [disk] {label}: {} hits; mt={} disk={} ∩={} cons={:.3}",
-                disk_ids.len(),
-                mt_ids.len(),
-                disk_ids.len(),
-                inter,
-                cons
-            );
-        }
-        consistencies.push(cons);
+        consistencies.push(inter as f64 / denom as f64);
     }
-
     let cons_mean = consistencies.iter().sum::<f64>() / consistencies.len().max(1) as f64;
-    let cons_min = consistencies
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let cons_min = consistencies.iter().copied().fold(1.0_f64, f64::min);
 
-    Ok(ReadStats {
-        rows: n,
-        mt_latency_avg_ms: avg_us / 1000.0,
-        mt_latency_p50_ms: p50,
-        mt_latency_p95_ms: p95,
-        consistency_mean: cons_mean,
-        consistency_min: if cons_min.is_finite() { cons_min } else { 0.0 },
-        num_queries: all_queries.len(),
-    })
+    Ok(json!({
+        "phase": "read",
+        "mode": args.mode.as_str(),
+        "uri": uri,
+        "seed_rows": args.seed_rows,
+        "read_rows": n,
+        "max_memtable_rows": args.max_memtable_rows,
+        "setup_seconds": setup_s,
+        "ingest_seconds": ingest_s,
+        "flush_seconds": flush_s,
+        "num_queries": all_queries.len(),
+        "num_token_queries": queries.tokens.len(),
+        "num_phrase_queries": queries.phrases.len(),
+        "mt_latency_avg_ms": mt_avg_ms,
+        "mt_latency_p50_ms": percentile(&lat_ms, 50.0),
+        "mt_latency_p95_ms": percentile(&lat_ms, 95.0),
+        "mt_latency_p99_ms": percentile(&lat_ms, 99.0),
+        "consistency_mean": cons_mean,
+        "consistency_min": cons_min,
+    }))
 }
 
 // ----------------------------------------------------------------------
-// Top-level orchestration
+// CLI
 // ----------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
-struct RunResult {
-    config_name: String,
-    max_memtable_rows: usize,
-    durable_write: bool,
-    fts_enabled: bool,
-    base_rows: usize,
-    ingest_rows: usize,
-    batch_size: usize,
-    ingest: IngestStats,
-    read: Option<ReadStats>,
-    timestamp_utc: String,
+fn parse<T>(flag: &str, value: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|e| lance_core::Error::invalid_input(format!("invalid {flag}: {value} ({e})")))
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> lance_core::Result<()> {
-    let cfg = Config::from_env();
-    println!("=== mem_wal_fineweb_fts === config = {:?}", cfg);
-
-    let total_rows = cfg.base_rows + cfg.ingest_rows;
-    let texts = load_corpus(total_rows, &cfg.cache_dir).await?;
-    if texts.len() < total_rows {
-        return Err(lance_core::Error::io(format!(
-            "fineweb shards yielded only {} rows, need {}",
-            texts.len(),
-            total_rows
-        )));
+fn parse_args() -> Result<Args> {
+    let mut args = Args::default();
+    let mut iter = std::env::args().skip(1);
+    while let Some(flag) = iter.next() {
+        if flag == "--bench" {
+            continue;
+        }
+        let value = iter
+            .next()
+            .ok_or_else(|| lance_core::Error::invalid_input(format!("missing value for {flag}")))?;
+        match flag.as_str() {
+            "--phase" => {
+                args.phase = Phase::parse(&value).map_err(lance_core::Error::invalid_input)?
+            }
+            "--mode" => {
+                args.mode = Mode::parse(&value).map_err(lance_core::Error::invalid_input)?
+            }
+            "--uri" => args.uri = Some(value),
+            "--seed-rows" => args.seed_rows = parse(&flag, &value)?,
+            "--batch-rows" => args.batch_rows = parse(&flag, &value)?,
+            "--calls" => args.calls = parse(&flag, &value)?,
+            "--read-rows" => args.read_rows = parse(&flag, &value)?,
+            "--max-memtable-rows" => {
+                let v: usize = parse(&flag, &value)?;
+                args.max_memtable_rows = (v != 0).then_some(v);
+            }
+            "--max-memtable-size" => args.max_memtable_size = parse(&flag, &value)?,
+            "--max-unflushed-memtable-bytes" => {
+                args.max_unflushed_memtable_bytes = parse(&flag, &value)?
+            }
+            "--max-wal-flush-interval-ms" => args.max_wal_flush_interval_ms = parse(&flag, &value)?,
+            "--cache-dir" => args.cache_dir = PathBuf::from(value),
+            "--num-token-queries" => args.num_token_queries = parse(&flag, &value)?,
+            "--num-phrase-queries" => args.num_phrase_queries = parse(&flag, &value)?,
+            "--top-k" => args.top_k = parse(&flag, &value)?,
+            "--tokio-threads" => args.tokio_threads = parse(&flag, &value)?,
+            "--output" => args.output = Some(PathBuf::from(value)),
+            _ => {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "unknown argument: {flag}"
+                )));
+            }
+        }
     }
-    let base_texts = &texts[..cfg.base_rows];
-    let ingest_texts = &texts[cfg.base_rows..cfg.base_rows + cfg.ingest_rows];
+    if args.batch_rows == 0 || args.calls == 0 || args.seed_rows == 0 {
+        return Err(lance_core::Error::invalid_input(
+            "seed-rows, batch-rows, calls must be > 0",
+        ));
+    }
+    Ok(args)
+}
 
-    let schema = make_schema();
-
-    // Build query set once from the ingest slice (deterministic).
-    let sample_refs: Vec<&str> = ingest_texts.iter().take(50_000).map(|s| s.as_str()).collect();
-    let queries = build_query_set(&sample_refs, &cfg);
-    println!(
-        "query set: {} tokens + {} phrases",
-        queries.tokens.len(),
-        queries.phrases.len()
-    );
-
-    // Throughput sub-test: ingest 1M with the configured params.
-    println!("\n--- throughput sub-test ---");
-    let ingest_stats = ingest_via_shard_writer(
-        &cfg.ingest_uri(),
-        schema.clone(),
-        base_texts,
-        ingest_texts,
-        &cfg,
-        false, // auto-flush enabled (per max_memtable_rows)
-    )
-    .await?;
-    println!("throughput: {:.1} rows/s", ingest_stats.rows_per_sec);
-
-    // Read sub-test: only when FTS enabled and read test requested.
-    let read_stats = if cfg.with_read_test {
-        println!("\n--- read sub-test ---");
-        let n_for_read = cfg.max_memtable_rows.min(ingest_texts.len());
-        let read_ingest = &ingest_texts[..n_for_read];
-        Some(
-            run_read_test(
-                &cfg.read_test_uri(),
-                schema.clone(),
-                base_texts,
-                read_ingest,
-                &queries,
-                &cfg,
-            )
-            .await?,
-        )
+async fn run(args: Args) -> Result<()> {
+    let temp = if args.uri.is_none() {
+        Some(tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {e}")))?)
     } else {
         None
     };
-
-    let timestamp_utc = chrono::Utc::now().to_rfc3339();
-    let result = RunResult {
-        config_name: cfg.config_name.clone(),
-        max_memtable_rows: cfg.max_memtable_rows,
-        durable_write: cfg.durable_write,
-        fts_enabled: cfg.fts_enabled,
-        base_rows: cfg.base_rows,
-        ingest_rows: cfg.ingest_rows,
-        batch_size: cfg.batch_size,
-        ingest: ingest_stats,
-        read: read_stats,
-        timestamp_utc,
+    let uri = match &args.uri {
+        Some(u) => u.clone(),
+        None => temp
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("fineweb_fts.lance")
+            .display()
+            .to_string(),
     };
-    let json = serde_json::to_string_pretty(&result)
-        .map_err(|e| lance_core::Error::io(format!("serialize result: {}", e)))?;
-    if let Some(parent) = cfg.result_file.parent() {
-        if !parent.as_os_str().is_empty() {
+
+    println!(
+        "bench=mem_wal_fineweb_fts phase={} mode={} uri={} seed_rows={} batch_rows={} calls={} read_rows={} max_memtable_rows={:?}",
+        args.phase.as_str(),
+        args.mode.as_str(),
+        uri,
+        args.seed_rows,
+        args.batch_rows,
+        args.calls,
+        args.read_rows,
+        args.max_memtable_rows,
+    );
+
+    let ingest_needed = match args.phase {
+        Phase::Write => args.calls * args.batch_rows,
+        Phase::Read => args.read_rows,
+    };
+    // Cap downloaded corpus; the write phase cycles the ingest pool if it
+    // needs more rows than were loaded.
+    let corpus_rows = (args.seed_rows + ingest_needed).min(2_000_000);
+    let corpus = load_corpus(corpus_rows, &args.cache_dir).await?;
+
+    let result = match args.phase {
+        Phase::Write => run_write(&args, &uri, &corpus).await?,
+        Phase::Read => run_read(&args, &uri, &corpus).await?,
+    };
+
+    let text = serde_json::to_string_pretty(&result)
+        .map_err(|e| lance_core::Error::io(format!("serialize: {e}")))?;
+    println!("{text}");
+    if let Some(path) = &args.output {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
             std::fs::create_dir_all(parent).ok();
         }
+        std::fs::write(path, text.as_bytes())
+            .map_err(|e| lance_core::Error::io(format!("write {}: {e}", path.display())))?;
     }
-    std::fs::write(&cfg.result_file, json.as_bytes())
-        .map_err(|e| lance_core::Error::io(format!("write result: {}", e)))?;
-    println!("\nwrote result to {}", cfg.result_file.display());
     println!("=== DONE ===");
-    let _ = result; // silence unused with no read test
-    let _ = sample_refs;
-    let _ = BTreeMap::<String, String>::new();
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = parse_args()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.tokio_threads.max(1))
+        .enable_all()
+        .build()
+        .map_err(|e| lance_core::Error::io(format!("build runtime: {e}")))?;
+    runtime.block_on(run(args))
 }
