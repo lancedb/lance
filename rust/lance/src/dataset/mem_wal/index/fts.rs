@@ -995,7 +995,7 @@ impl FtsMemIndex {
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(term);
-        self.search_match(&st, &tokens, None)
+        self.search_match(&st, &tokens)
     }
 
     /// Search for documents containing an exact phrase, optionally allowing
@@ -1035,12 +1035,7 @@ impl FtsMemIndex {
     /// scan the tail, all scored with one corpus-wide [`MemBM25Scorer`], and
     /// the results merged. Each doc lives in exactly one partition or the
     /// tail, so the merge is a plain concatenation.
-    fn search_match(
-        &self,
-        st: &IndexState,
-        tokens: &[String],
-        limit: Option<usize>,
-    ) -> Vec<FtsEntry> {
+    fn search_match(&self, st: &IndexState, tokens: &[String]) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
         }
@@ -1053,7 +1048,7 @@ impl FtsMemIndex {
         }
         let mut results = Vec::new();
         for p in st.partitions.iter() {
-            match p.search_match(tokens, Operator::Or, &scorer, limit) {
+            match p.search_match(tokens, Operator::Or, &scorer) {
                 Ok(hits) => results.extend(hits),
                 Err(e) => log::warn!("FTS partition match search failed: {e}"),
             }
@@ -1070,7 +1065,7 @@ impl FtsMemIndex {
         }
         if tokens.len() == 1 {
             // A single-token phrase reduces to a regular term search.
-            return self.search_match(st, tokens, None);
+            return self.search_match(st, tokens);
         }
         let tail_snap = st.tail.snapshot();
         let scorer = build_scorer(st, &tail_snap, tokens);
@@ -1119,7 +1114,7 @@ impl FtsMemIndex {
         if expanded.is_empty() {
             return Vec::new();
         }
-        self.search_match(st, &expanded, None)
+        self.search_match(st, &expanded)
     }
 
     /// Expand `term` against the term dictionaries of every partition and the
@@ -1179,19 +1174,14 @@ impl FtsMemIndex {
     /// per-batch monotonic visibility contract for compound queries.
     pub fn search_query(&self, query: &FtsQueryExpr) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        self.search_query_with_state(query, &st, None)
+        self.search_query_with_state(query, &st)
     }
 
-    fn search_query_with_state(
-        &self,
-        query: &FtsQueryExpr,
-        st: &IndexState,
-        limit: Option<usize>,
-    ) -> Vec<FtsEntry> {
+    fn search_query_with_state(&self, query: &FtsQueryExpr, st: &IndexState) -> Vec<FtsEntry> {
         match query {
             FtsQueryExpr::Match { query, boost } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_match(st, &tokens, limit);
+                let mut results = self.search_match(st, &tokens);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1233,7 +1223,7 @@ impl FtsMemIndex {
         options: SearchOptions,
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let mut results = self.search_query_with_state(query, &st, options.limit);
+        let mut results = self.search_query_with_state(query, &st);
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1264,11 +1254,11 @@ impl FtsMemIndex {
         negative_boost: f32,
         st: &IndexState,
     ) -> Vec<FtsEntry> {
-        let mut results = self.search_query_with_state(positive, st, None);
+        let mut results = self.search_query_with_state(positive, st);
         let Some(neg) = negative else {
             return results;
         };
-        let negative_results = self.search_query_with_state(neg, st, None);
+        let negative_results = self.search_query_with_state(neg, st);
         let negative_set: HashSet<RowPosition> = negative_results
             .into_iter()
             .map(|e| e.row_position)
@@ -1290,26 +1280,26 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         let excluded: HashSet<RowPosition> = must_not
             .iter()
-            .flat_map(|q| self.search_query_with_state(q, st, None))
+            .flat_map(|q| self.search_query_with_state(q, st))
             .map(|e| e.row_position)
             .collect();
 
         let mut result_map: HashMap<RowPosition, f32> = if must.is_empty() {
             let mut map: HashMap<RowPosition, f32> = HashMap::new();
             for q in should {
-                for entry in self.search_query_with_state(q, st, None) {
+                for entry in self.search_query_with_state(q, st) {
                     *map.entry(entry.row_position).or_default() += entry.score;
                 }
             }
             map
         } else {
-            let first_results = self.search_query_with_state(&must[0], st, None);
+            let first_results = self.search_query_with_state(&must[0], st);
             let mut map: HashMap<RowPosition, f32> = first_results
                 .into_iter()
                 .map(|e| (e.row_position, e.score))
                 .collect();
             for q in must.iter().skip(1) {
-                let results = self.search_query_with_state(q, st, None);
+                let results = self.search_query_with_state(q, st);
                 let result_set: HashMap<RowPosition, f32> = results
                     .into_iter()
                     .map(|e| (e.row_position, e.score))
@@ -1320,7 +1310,7 @@ impl FtsMemIndex {
                     .collect();
             }
             for q in should {
-                for entry in self.search_query_with_state(q, st, None) {
+                for entry in self.search_query_with_state(q, st) {
                     if let Some(score) = map.get_mut(&entry.row_position) {
                         *score += entry.score;
                     }
@@ -2038,12 +2028,15 @@ impl Partition {
 
     /// WAND OR/AND-search; candidates scored with `scorer` and reported as
     /// MemTable row positions.
+    /// WAND runs unbounded (no `limit`): block-max top-k pruning needs
+    /// per-term `max_score` upper bounds, which in-memory posting lists do
+    /// not carry, so a bounded WAND would drop valid top-k docs. The scan is
+    /// still O(matches); the caller truncates to the real limit after merge.
     fn search_match(
         &self,
         tokens: &[String],
         operator: Operator,
         scorer: &MemBM25Scorer,
-        limit: Option<usize>,
     ) -> Result<Vec<FtsEntry>> {
         let mut wand_terms: Vec<WandTerm> = Vec::new();
         let mut tok_order: Vec<String> = Vec::new();
@@ -2067,7 +2060,7 @@ impl Partition {
         if wand_terms.is_empty() {
             return Ok(Vec::new());
         }
-        let params = FtsSearchParams::new().with_limit(limit);
+        let params = FtsSearchParams::new();
         let cands = wand_search(operator, wand_terms, &self.docs, scorer.clone(), &params)?;
         Ok(cands
             .into_iter()
@@ -3274,14 +3267,14 @@ mod tests {
         // "apple" is present -> an OR search over it matches.
         let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple));
         let or_hits = p
-            .search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer, None)
+            .search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer)
             .unwrap();
         assert_eq!(or_hits.len(), 3);
         // Adding an absent term to an AND query short-circuits to nothing.
         let and_tokens = vec![apple, "definitely_missing".to_string()];
         let and_scorer = build_scorer(&st, &tail_snap, &and_tokens);
         let and_hits = p
-            .search_match(&and_tokens, Operator::And, &and_scorer, None)
+            .search_match(&and_tokens, Operator::And, &and_scorer)
             .unwrap();
         assert!(and_hits.is_empty());
     }
@@ -3441,5 +3434,49 @@ mod tests {
         }
         assert_eq!(index.doc_count(), 180);
         assert_eq!(index.search("world").len(), 120);
+    }
+
+    #[test]
+    fn test_limited_search_returns_exact_top_k_across_partitions() {
+        // Regression: a limited `search_with_options` over many partitions
+        // must still return the *exact* global top-k. Per-partition WAND must
+        // not prune by a limit it cannot bound (in-memory posting lists carry
+        // no `max_score`), or valid top-k docs are silently dropped.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(2);
+        // 8 docs (4 batches of 2) -> 4 partitions. "lion" appears with tf
+        // 1..=6, so the 6 matching docs have strictly distinct BM25 scores.
+        let texts = [
+            ["lion", "lion lion"],
+            ["lion lion lion", "lion lion lion lion"],
+            ["cat", "lion lion lion lion lion"],
+            ["lion lion lion lion lion lion", "dog"],
+        ];
+        for (b, pair) in texts.iter().enumerate() {
+            let batch = RecordBatch::try_new(
+                create_test_schema(),
+                vec![
+                    Arc::new(Int32Array::from(vec![0, 1])),
+                    Arc::new(StringArray::from(pair.to_vec())),
+                ],
+            )
+            .unwrap();
+            index.insert(&batch, (b * 100) as u64).unwrap();
+        }
+        assert_eq!(index.state.load_full().partitions.len(), 4);
+
+        // Exact full ranking via the unbounded search path.
+        let mut full = index.search("lion");
+        full.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        assert_eq!(full.len(), 6);
+
+        // The limited top-3 must equal the first 3 of the full ranking.
+        let limited = index.search_with_options(
+            &FtsQueryExpr::match_query("lion"),
+            SearchOptions::new().with_limit(3),
+        );
+        assert_eq!(limited.len(), 3);
+        let got: Vec<u64> = limited.iter().map(|e| e.row_position).collect();
+        let expected: Vec<u64> = full.iter().take(3).map(|e| e.row_position).collect();
+        assert_eq!(got, expected, "limited search must return the exact top-3");
     }
 }
