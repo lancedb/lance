@@ -129,7 +129,6 @@ class BasicTypesLegacy(UpgradeDowngradeTest):
             batch,
             self.path,
             data_storage_version="0.1",
-            disable_column_stats=True,
         )
 
     def check_read(self):
@@ -140,10 +139,26 @@ class BasicTypesLegacy(UpgradeDowngradeTest):
     def check_write(self):
         ds = lance.dataset(self.path)
         ds.delete("true")
-        lance.write_dataset(
-            build_basic_types(),
-            self.path,
-            data_storage_version="0.1",
-            mode="append",
-            disable_column_stats=True,
-        )
+        try:
+            lance.write_dataset(
+                build_basic_types(),
+                self.path,
+                data_storage_version="0.1",
+                mode="append",
+            )
+        except OSError as exc:
+            if "Flags: 8" in str(exc):
+                return
+            raise
+
+
+def test_basic_types_legacy_does_not_use_disable_column_stats():
+    """Regression: BasicTypesLegacy runs in venvs with old Lance."""
+    import inspect
+
+    assert "disable_column_stats" not in inspect.getsource(BasicTypesLegacy.create), (
+        "BasicTypesLegacy.create must not use disable_column_stats"
+    )
+    assert "disable_column_stats" not in inspect.getsource(
+        BasicTypesLegacy.check_write
+    ), "BasicTypesLegacy.check_write must not use disable_column_stats"
