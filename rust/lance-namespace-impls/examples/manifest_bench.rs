@@ -4,28 +4,35 @@
 //! Multi-process manifest benchmark with S3 support.
 //!
 //! Modes:
-//!   seed      — populate a manifest with N entries
-//!   run       — benchmark read/write operations with multi-process concurrency
-//!   worker    — (internal) single-process worker spawned by `run`
+//!   seed       — populate a manifest with N entries via namespace API
+//!   seed-large — write a __manifest Lance table directly with N rows
+//!   run        — benchmark read/write operations with multi-process concurrency
+//!   worker     — (internal) single-process worker spawned by `run`
 //!
 //! Examples:
-//!   # Seed 1000 entries on S3
+//!   # Seed 1000 entries via namespace API
 //!   manifest_bench seed --root s3://bucket/bench/test1 --count 1000
 //!
-//!   # Cold-read benchmark at concurrency 10
-//!   manifest_bench run --root s3://bucket/bench/test1 \
-//!     --operation cold-read-list-tables --concurrency 10 --operations 100
+//!   # Seed 500K rows directly into __manifest table
+//!   manifest_bench seed-large --root s3://bucket/bench/scale \
+//!     --count 500000 --inline-optimization true
 //!
-//!   # Multi-process write benchmark
-//!   manifest_bench run --root s3://bucket/bench/test1 \
-//!     --operation write-create-namespace --concurrency 50 --operations 200
+//!   # Run scale benchmark at 500K initial entries
+//!   manifest_bench run --root s3://bucket/bench/scale \
+//!     --concurrency 1,10,100 --operations 200
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::{RecordBatch, RecordBatchIterator, StringArray};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+use lance_arrow::json::JsonArray;
+use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
     CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, ListNamespacesRequest,
@@ -46,6 +53,7 @@ struct BenchResult {
     variant: String,
     operation: String,
     concurrency: usize,
+    initial_entries: usize,
     total_operations: usize,
     total_duration_ms: f64,
     throughput_ops_per_sec: f64,
@@ -70,6 +78,7 @@ fn compute_result(
     variant: &str,
     operation: &str,
     concurrency: usize,
+    initial_entries: usize,
     wall_duration: Duration,
     mut latencies: Vec<f64>,
     errors: usize,
@@ -86,6 +95,7 @@ fn compute_result(
         variant: variant.to_string(),
         operation: operation.to_string(),
         concurrency,
+        initial_entries,
         total_operations: total,
         total_duration_ms: total_ms,
         throughput_ops_per_sec: throughput,
@@ -104,13 +114,10 @@ fn compute_result(
 }
 
 fn create_test_ipc_data() -> Vec<u8> {
-    use arrow::array::{Int32Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::Int32Array;
     use arrow::ipc::writer::StreamWriter;
-    use arrow::record_batch::RecordBatch;
-    use std::sync::Arc;
 
-    let schema = Arc::new(Schema::new(vec![
+    let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, false),
     ]));
@@ -129,6 +136,22 @@ fn create_test_ipc_data() -> Vec<u8> {
         writer.finish().unwrap();
     }
     buffer
+}
+
+fn manifest_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("object_id", DataType::Utf8, false).with_metadata(
+            [(
+                LANCE_UNENFORCED_PRIMARY_KEY_POSITION.to_string(),
+                "0".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        Field::new("object_type", DataType::Utf8, false),
+        Field::new("location", DataType::Utf8, true),
+        lance_arrow::json::json_field("metadata", true),
+    ]))
 }
 
 async fn build_namespace(
@@ -189,6 +212,131 @@ async fn seed(
     eprintln!(
         "Seed complete: {} namespaces, {} tables",
         ns_count, table_count
+    );
+}
+
+// ──────────────────── seed-large mode ────────────────────
+// Writes a __manifest Lance table directly with N rows, bypassing the namespace API.
+
+const SEED_LARGE_BATCH_SIZE: usize = 10_000;
+
+fn generate_manifest_batch(
+    schema: &Arc<ArrowSchema>,
+    start_idx: usize,
+    batch_size: usize,
+    total_count: usize,
+) -> RecordBatch {
+    let ns_count = total_count / 3;
+    let actual_size = batch_size.min(total_count - start_idx);
+
+    let mut object_ids = Vec::with_capacity(actual_size);
+    let mut object_types = Vec::with_capacity(actual_size);
+    let mut locations: Vec<Option<String>> = Vec::with_capacity(actual_size);
+    let mut metadatas: Vec<Option<&str>> = Vec::with_capacity(actual_size);
+
+    for i in start_idx..start_idx + actual_size {
+        if i < ns_count {
+            object_ids.push(format!("ns_{}", i));
+            object_types.push("namespace".to_string());
+            locations.push(None);
+            metadatas.push(None);
+        } else {
+            let table_idx = i - ns_count;
+            object_ids.push(format!("table_{}", table_idx));
+            object_types.push("table".to_string());
+            locations.push(Some(format!("table_{}", table_idx)));
+            metadatas.push(Some(r#"{"bench":"true"}"#));
+        }
+    }
+
+    let metadata_array = Arc::new(
+        JsonArray::try_from_iter(metadatas.into_iter())
+            .expect("Failed to encode metadata as JSON")
+            .into_inner(),
+    );
+
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(object_ids)),
+            Arc::new(StringArray::from(object_types)),
+            Arc::new(StringArray::from(locations)),
+            metadata_array,
+        ],
+    )
+    .expect("Failed to create manifest batch")
+}
+
+async fn seed_large(
+    root: &str,
+    count: usize,
+    inline_optimization: bool,
+    storage_options: &HashMap<String, String>,
+) {
+    let manifest_uri = format!("{}/{}", root, "__manifest");
+    eprintln!(
+        "Seed-large: writing {} rows directly to {}",
+        count, manifest_uri
+    );
+
+    let schema = manifest_schema();
+
+    // Generate batches
+    let mut batches = Vec::new();
+    let mut offset = 0;
+    while offset < count {
+        let batch_size = SEED_LARGE_BATCH_SIZE.min(count - offset);
+        batches.push(generate_manifest_batch(&schema, offset, batch_size, count));
+        offset += batch_size;
+    }
+    eprintln!("  generated {} batches", batches.len());
+
+    let mut write_params = WriteParams {
+        mode: WriteMode::Create,
+        ..WriteParams::default()
+    };
+    if !storage_options.is_empty() {
+        let accessor = Arc::new(
+            lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                storage_options.clone(),
+            ),
+        );
+        write_params.store_params = Some(lance_io::object_store::ObjectStoreParams {
+            storage_options_accessor: Some(accessor),
+            ..Default::default()
+        });
+    }
+
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    InsertBuilder::new(manifest_uri.as_str())
+        .with_params(&write_params)
+        .execute_stream(reader)
+        .await
+        .expect("Failed to write manifest dataset");
+
+    eprintln!("  wrote Lance dataset");
+
+    // Now open via namespace API to trigger the first CoW rewrite with indices
+    if inline_optimization {
+        eprintln!("  triggering initial CoW rewrite to build indices...");
+        let start = Instant::now();
+        let ns = build_namespace(root, true, storage_options).await;
+        let mut req = CreateNamespaceRequest::new();
+        req.id = Some(vec!["__seed_trigger__".to_string()]);
+        ns.create_namespace(req)
+            .await
+            .expect("Failed to trigger CoW rewrite");
+        eprintln!(
+            "  CoW rewrite with index build took {:.1}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    let ns_count = count / 3;
+    let table_count = count - ns_count;
+    eprintln!(
+        "Seed-large complete: {} total rows ({} namespaces, {} tables)",
+        count, ns_count, table_count
     );
 }
 
@@ -315,13 +463,22 @@ fn run_workers(
     operations: usize,
     warmup: usize,
     table_count: usize,
+    initial_entries: usize,
     inline_optimization: bool,
     variant: &str,
     storage_options: &HashMap<String, String>,
 ) -> BenchResult {
     let ops_per_worker = operations / concurrency.max(1);
     if ops_per_worker == 0 {
-        return compute_result(variant, operation, concurrency, Duration::ZERO, vec![], 0);
+        return compute_result(
+            variant,
+            operation,
+            concurrency,
+            initial_entries,
+            Duration::ZERO,
+            vec![],
+            0,
+        );
     }
 
     let wall_start = Instant::now();
@@ -381,6 +538,7 @@ fn run_workers(
         variant,
         operation,
         concurrency,
+        initial_entries,
         wall_duration,
         all_latencies,
         total_errors,
@@ -400,7 +558,7 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: manifest_bench <seed|run|worker> [options]");
+        eprintln!("Usage: manifest_bench <seed|seed-large|run|worker> [options]");
         std::process::exit(1);
     }
 
@@ -413,6 +571,7 @@ async fn main() {
     let mut count: usize = 1000;
     let mut worker_id: usize = 0;
     let mut table_count: usize = 667; // default for 1000 seed: 1000 - 1000/3
+    let mut initial_entries: usize = 0;
     let mut inline_optimization = true;
     let mut variant = String::new();
     let mut storage_options: HashMap<String, String> = HashMap::new();
@@ -452,6 +611,10 @@ async fn main() {
                 table_count = args[i + 1].parse().unwrap();
                 i += 2;
             }
+            "--initial-entries" => {
+                initial_entries = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             "--inline-optimization" => {
                 inline_optimization = args[i + 1].parse().unwrap();
                 i += 2;
@@ -485,6 +648,9 @@ async fn main() {
     match mode {
         "seed" => {
             seed(&root, count, inline_optimization, &storage_options).await;
+        }
+        "seed-large" => {
+            seed_large(&root, count, inline_optimization, &storage_options).await;
         }
         "worker" => {
             if operation.starts_with("cold-read") {
@@ -540,6 +706,7 @@ async fn main() {
             eprintln!("variant: {}", variant);
             eprintln!("root: {}", root);
             eprintln!("inline_optimization: {}", inline_optimization);
+            eprintln!("initial_entries: {}", initial_entries);
             eprintln!("concurrency: {:?}", concurrency_list);
             eprintln!("operations per level: {}", operations);
             eprintln!("warmup: {}", warmup);
@@ -557,6 +724,7 @@ async fn main() {
                         actual_ops,
                         warmup,
                         table_count,
+                        initial_entries,
                         inline_optimization,
                         &variant,
                         &storage_options,
@@ -567,7 +735,10 @@ async fn main() {
             eprintln!("=== Benchmark complete ===");
         }
         _ => {
-            eprintln!("Unknown mode: {}. Use seed, run, or worker.", mode);
+            eprintln!(
+                "Unknown mode: {}. Use seed, seed-large, run, or worker.",
+                mode
+            );
             std::process::exit(1);
         }
     }
