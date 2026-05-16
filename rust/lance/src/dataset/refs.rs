@@ -791,21 +791,40 @@ impl BranchIdentifier {
         parent_version: u64,
         create_at: u64,
     ) -> Self {
+        let identifier_input = format!(
+            "branch_name={branch_name}\nparent_branch={}\nparent_version={parent_version}\ncreate_at={create_at}",
+            parent_branch.unwrap_or("")
+        );
         Self {
             version_mapping: vec![(
                 0,
-                Uuid::new_v5(
-                    &Uuid::NAMESPACE_URL,
-                    format!(
-                        "branch_name={branch_name}\nparent_branch={}\nparent_version={parent_version}\ncreate_at={create_at}",
-                        parent_branch.unwrap_or("")
-                    )
-                    .as_bytes(),
-                )
+                Uuid::from_bytes(Self::synthetic_identifier_bytes(
+                    identifier_input.as_bytes(),
+                ))
                 .simple()
                 .to_string(),
             )],
         }
+    }
+
+    fn synthetic_identifier_bytes(input: &[u8]) -> [u8; 16] {
+        // Use fixed, local hashing so legacy fallback identifiers stay deterministic without
+        // enabling extra UUID generation features.
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        fn hash_with_seed(input: &[u8], seed: u64) -> u64 {
+            input.iter().fold(seed, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+            })
+        }
+
+        let first = hash_with_seed(input, FNV_OFFSET);
+        let second = hash_with_seed(input, FNV_OFFSET ^ 0x9e3779b97f4a7c15);
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&first.to_be_bytes());
+        bytes[8..].copy_from_slice(&second.to_be_bytes());
+        bytes
     }
 
     pub fn main() -> Self {
@@ -1260,6 +1279,13 @@ mod tests {
         assert_ne!(
             first.identifier,
             BranchIdentifier::missing_identifier_sentinel()
+        );
+        assert_eq!(first.identifier.version_mapping[0].1.len(), 32);
+        assert!(
+            first.identifier.version_mapping[0]
+                .1
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
         );
 
         let other = BranchContents::from_path(&second_path, &store, "legacy_branch_other")

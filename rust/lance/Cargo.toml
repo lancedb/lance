@@ -63,7 +63,7 @@ tokio.workspace = true
 url.workspace = true
 rand.workspace = true
 futures.workspace = true
-uuid = { workspace = true, features = ["v5"] }
+uuid.workspace = true
 arrow.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true
