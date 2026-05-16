@@ -21,6 +21,7 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
         max_rows_per_file: 2_500,
         max_rows_per_group: 1_000,
         data_storage_version: Some(version),
+        disable_column_stats: true,
         ..Default::default()
     };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params.clone()))
@@ -165,6 +166,7 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
         Some(WriteParams {
             max_rows_per_file: 1_000,
             data_storage_version: Some(version),
+            disable_column_stats: true,
             ..Default::default()
         }),
     )
@@ -207,6 +209,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
             enable_stable_row_ids: true,
             data_storage_version: Some(version),
             max_rows_per_file: 500,
+            disable_column_stats: true,
             ..Default::default()
         }),
     )
@@ -339,6 +342,7 @@ async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
             enable_stable_row_ids: false,
             data_storage_version: Some(version),
             max_rows_per_file: 500,
+            disable_column_stats: true,
             ..Default::default()
         }),
     )
@@ -432,6 +436,7 @@ async fn test_binary_copy_preserves_zonemap_queries() {
         Some(WriteParams {
             max_rows_per_file: 500,
             data_storage_version: Some(LanceFileVersion::V2_1),
+            disable_column_stats: true,
             ..Default::default()
         }),
     )
@@ -491,6 +496,7 @@ async fn test_binary_copy_preserves_bloom_filter_queries() {
         Some(WriteParams {
             max_rows_per_file: 500,
             data_storage_version: Some(LanceFileVersion::V2_1),
+            disable_column_stats: true,
             ..Default::default()
         }),
     )
@@ -553,6 +559,7 @@ async fn test_binary_copy_fallback_to_common_compaction() {
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
     let write_params = WriteParams {
         max_rows_per_file: 500,
+        disable_column_stats: true,
         ..Default::default()
     };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -590,6 +597,7 @@ async fn test_can_use_binary_copy_schema_consistency_ok() {
     let reader2 = RecordBatchIterator::new(vec![Ok(data.slice(5_000, 5_000))], data.schema());
     let write_params = WriteParams {
         max_rows_per_file: 1_000,
+        disable_column_stats: true,
         ..Default::default()
     };
     let mut dataset = Dataset::write(reader1, test_uri, Some(write_params.clone()))
@@ -617,6 +625,7 @@ async fn test_can_use_binary_copy_schema_mismatch() {
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
     let write_params = WriteParams {
         max_rows_per_file: 1_000,
+        disable_column_stats: true,
         ..Default::default()
     };
     let dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -660,6 +669,7 @@ async fn test_can_use_binary_copy_version_mismatch() {
     let write_params = WriteParams {
         max_rows_per_file: 500,
         data_storage_version: Some(LanceFileVersion::V2_0),
+        disable_column_stats: true,
         ..Default::default()
     };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -668,7 +678,16 @@ async fn test_can_use_binary_copy_version_mismatch() {
 
     // Append additional data and then mark its files as a newer format version (v2.1).
     let reader_append = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
-    dataset.append(reader_append, None).await.unwrap();
+    dataset
+        .append(
+            reader_append,
+            Some(WriteParams {
+                disable_column_stats: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
     let options = CompactionOptions {
         compaction_mode: Some(CompactionMode::TryBinaryCopy),
@@ -702,6 +721,7 @@ async fn test_can_use_binary_copy_reject_deletions() {
     let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
     let write_params = WriteParams {
         max_rows_per_file: 1_000,
+        disable_column_stats: true,
         ..Default::default()
     };
     let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -804,6 +824,7 @@ async fn do_test_binary_copy_compaction_with_complex_schema(version: LanceFileVe
             enable_stable_row_ids: true,
             data_storage_version: Some(version),
             max_rows_per_file: (row_num / 100) as usize,
+            disable_column_stats: true,
             ..Default::default()
         }),
     )

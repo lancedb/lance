@@ -2968,6 +2968,7 @@ mod tests {
             max_rows_per_file: 1000,
             data_storage_version: Some(data_storage_version),
             enable_stable_row_ids: use_stable_row_id,
+            disable_column_stats: true,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -3018,11 +3019,7 @@ mod tests {
         } else {
             0
         };
-        if use_stable_row_id {
-            assert_eq!(dataset.manifest.version, 3 + version_inc_first);
-        } else {
-            assert_eq!(dataset.manifest.version, 5 + version_inc_first);
-        }
+        assert_eq!(dataset.manifest.version, 3 + version_inc_first);
 
         // Can commit the remaining tasks
         commit_compaction(
@@ -3038,17 +3035,10 @@ mod tests {
         } else {
             0
         };
-        if use_stable_row_id {
-            assert_eq!(
-                dataset.manifest.version,
-                5 + version_inc_first + version_inc_second
-            );
-        } else {
-            assert_eq!(
-                dataset.manifest.version,
-                6 + version_inc_first + version_inc_second
-            );
-        }
+        assert_eq!(
+            dataset.manifest.version,
+            5 + version_inc_first + version_inc_second
+        );
 
         assert_eq!(dataset.manifest.uses_stable_row_ids(), use_stable_row_id,);
     }

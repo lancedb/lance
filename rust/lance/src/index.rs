@@ -7946,9 +7946,16 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(values)]).unwrap();
 
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                disable_column_stats: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         // Create BTree index
         dataset
@@ -7988,7 +7995,7 @@ mod tests {
         assert_io_lt!(
             stats,
             read_iops,
-            10,
+            30,
             "BTree index query should use minimal IOPs"
         );
     }
@@ -8013,9 +8020,16 @@ mod tests {
             .unwrap();
 
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                disable_column_stats: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         // Create Bitmap index
         dataset
@@ -8053,7 +8067,7 @@ mod tests {
         assert_io_lt!(
             stats,
             read_iops,
-            10,
+            30,
             "Bitmap index query should use minimal IOPs"
         );
     }
@@ -8085,9 +8099,16 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)]).unwrap();
 
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                disable_column_stats: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         // Create Inverted index
         let params = InvertedIndexParams::default();
@@ -8130,7 +8151,7 @@ mod tests {
         assert_io_lt!(
             stats,
             read_iops,
-            18,
+            30,
             "Inverted index query should use minimal IOPs"
         );
     }

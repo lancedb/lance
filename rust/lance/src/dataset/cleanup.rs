@@ -1697,6 +1697,7 @@ mod tests {
                     commit_handler: Some(Arc::new(RenameCommitHandler)),
                     mode: WriteMode::Create,
                     auto_cleanup: Some(AutoCleanupParams::default()),
+                    disable_column_stats: true,
                     ..Default::default()
                 }),
             )
