@@ -29,6 +29,7 @@ public class ReadOptions {
   private final long metadataCacheSizeBytes;
   private final Optional<ByteBuffer> serializedManifest;
   private final Map<String, String> storageOptions;
+  private final Map<String, Map<String, String>> baseStoreParams;
   private final Optional<Session> session;
 
   private ReadOptions(Builder builder) {
@@ -37,6 +38,7 @@ public class ReadOptions {
     this.indexCacheSizeBytes = builder.indexCacheSizeBytes;
     this.metadataCacheSizeBytes = builder.metadataCacheSizeBytes;
     this.storageOptions = builder.storageOptions;
+    this.baseStoreParams = builder.baseStoreParams;
     this.serializedManifest = builder.serializedManifest;
     this.session = builder.session;
   }
@@ -59,6 +61,10 @@ public class ReadOptions {
 
   public Map<String, String> getStorageOptions() {
     return storageOptions;
+  }
+
+  public Map<String, Map<String, String>> getBaseStoreParams() {
+    return baseStoreParams;
   }
 
   public Optional<ByteBuffer> getSerializedManifest() {
@@ -95,6 +101,7 @@ public class ReadOptions {
     private long indexCacheSizeBytes = 6L * 1024 * 1024 * 1024; // Default to 6 GiB like Rust
     private long metadataCacheSizeBytes = 1024L * 1024 * 1024; // Default to 1 GiB like Rust
     private Map<String, String> storageOptions = new HashMap<>();
+    private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
     private Optional<ByteBuffer> serializedManifest = Optional.empty();
     private Optional<Session> session = Optional.empty();
 
@@ -187,6 +194,22 @@ public class ReadOptions {
      */
     public Builder setStorageOptions(Map<String, String> storageOptions) {
       this.storageOptions = storageOptions;
+      return this;
+    }
+
+    /**
+     * Set runtime-only object store parameters for registered base paths.
+     *
+     * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+     * Each value is the storage options map used as-is for that base. These params are not
+     * persisted in the manifest. If a base has no explicit entry, {@link #setStorageOptions(Map)}
+     * remains the fallback.
+     *
+     * @param baseStoreParams object store parameters keyed by base path URI
+     * @return this builder
+     */
+    public Builder setBaseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+      this.baseStoreParams = baseStoreParams;
       return this;
     }
 

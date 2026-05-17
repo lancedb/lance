@@ -13,12 +13,15 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::Expr;
-use lance_core::Result;
+use lance_core::{Result, is_system_column};
 use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
+use super::projection::{
+    build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
+};
 
 /// Plans scan queries over LSM data.
 pub struct LsmScanPlanner {
@@ -86,6 +89,15 @@ impl LsmScanPlanner {
         with_memtable_gen: bool,
         keep_row_address: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // If the caller explicitly listed `_rowaddr` in the projection, force
+        // dedup to retain it so the canonical projection can surface real
+        // values (instead of NULL-filling). Other system columns aren't
+        // produced by dedup and remain NULL across LSM sources.
+        let user_wants_rowaddr = projection
+            .map(|p| p.iter().any(|c| c == ROW_ADDRESS_COLUMN))
+            .unwrap_or(false);
+        let keep_row_address = keep_row_address || user_wants_rowaddr;
+
         // 1. Collect all data sources
         let sources = self.collector.collect()?;
 
@@ -103,6 +115,7 @@ impl LsmScanPlanner {
 
         let mut sorted_plans = Vec::new();
         for source in sources {
+            let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let scan = self.build_source_scan(&source, projection, filter).await?;
 
             // Sort locally by (pk ASC, _rowaddr DESC)
@@ -114,11 +127,24 @@ impl LsmScanPlanner {
             })?;
             let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, scan));
 
-            // Only tag with generation if user wants _memtable_gen in output
-            let plan: Arc<dyn ExecutionPlan> = if with_memtable_gen {
-                Arc::new(MemtableGenTagExec::new(sorted, source.generation()))
+            // When `_rowaddr` will be surfaced to the caller, NULL it for
+            // non-base arms post-sort: only base values are meaningful (e.g.
+            // for `take_rows`); other arms carry per-source addresses that
+            // collide with base IDs. The schema is preserved so union/dedup
+            // still match (dedup picks rows by upstream order, not value).
+            // Skipped when `_rowaddr` would be stripped by dedup anyway, to
+            // avoid adding a no-op projection to the plan.
+            let after_sort: Arc<dyn ExecutionPlan> = if !is_base && keep_row_address {
+                null_columns(sorted, &[ROW_ADDRESS_COLUMN])?
             } else {
                 sorted
+            };
+
+            // Only tag with generation if user wants _memtable_gen in output
+            let plan: Arc<dyn ExecutionPlan> = if with_memtable_gen {
+                Arc::new(MemtableGenTagExec::new(after_sort, source.generation()))
+            } else {
+                after_sort
             };
 
             sorted_plans.push(plan);
@@ -166,12 +192,57 @@ impl LsmScanPlanner {
         )?;
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(dedup);
 
-        // 5. Add limit if specified
+        // 5. Surface user-requested system columns at the requested position.
+        // Skipped otherwise so the plan shape stays unchanged for callers
+        // that don't opt in.
+        let user_wants_system = projection
+            .map(|p| p.iter().any(|c| is_system_column(c)))
+            .unwrap_or(false);
+        if user_wants_system {
+            plan = project_to_canonical(
+                plan,
+                &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
+            )?;
+        }
+
+        // 6. Add limit if specified
         if let Some(limit) = limit {
             plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), Some(limit)));
         }
 
         Ok(plan)
+    }
+
+    /// Canonical scan output: user projection (system cols at requested
+    /// positions) + `_rowaddr` / `_memtable_gen` when their flags are set.
+    fn canonical_scan_schema(
+        &self,
+        projection: Option<&[String]>,
+        with_memtable_gen: bool,
+        keep_row_address: bool,
+    ) -> SchemaRef {
+        let canonical = canonical_output_schema(
+            projection,
+            &self.base_schema,
+            &self.pk_columns,
+            false, // no _distance
+        );
+        let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
+        if keep_row_address && !fields.iter().any(|f| f.name() == ROW_ADDRESS_COLUMN) {
+            fields.push(Arc::new(Field::new(
+                ROW_ADDRESS_COLUMN,
+                DataType::UInt64,
+                true,
+            )));
+        }
+        if with_memtable_gen && !fields.iter().any(|f| f.name() == MEMTABLE_GEN_COLUMN) {
+            fields.push(Arc::new(Field::new(
+                MEMTABLE_GEN_COLUMN,
+                DataType::UInt64,
+                false,
+            )));
+        }
+        Arc::new(Schema::new(fields))
     }
 
     /// Build sort expressions for local sorting within a single source.
@@ -265,11 +336,14 @@ impl LsmScanPlanner {
                 let mut scanner = dataset.scan();
 
                 // Project columns + _rowaddr (needed for dedup)
-                let cols = self.build_projection_with_rowaddr(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
+                // No `with_row_id()`: opting in only for base would mismatch
+                // the union schema against flushed/active. `_rowid` stays NULL
+                // for every row via `project_to_canonical`.
 
-                // Apply filter - enables scalar index (BTree) optimization
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
@@ -277,17 +351,16 @@ impl LsmScanPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                // Open as Dataset and scan
                 let dataset = crate::dataset::DatasetBuilder::from_uri(path)
                     .load()
                     .await?;
                 let mut scanner = dataset.scan();
 
-                let cols = self.build_projection_with_rowaddr(projection);
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
-                // Apply filter - enables scalar index (BTree) optimization
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
@@ -300,16 +373,14 @@ impl LsmScanPlanner {
                 schema,
                 ..
             } => {
-                // Use MemTableScanner
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
 
-                // Project columns and add _rowaddr for dedup
-                if let Some(cols) = projection {
-                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-                }
+                let cols =
+                    build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.with_row_address();
 
                 // Apply filter - enables BTree index optimization for MemTable
@@ -322,29 +393,7 @@ impl LsmScanPlanner {
         }
     }
 
-    /// Build projection list ensuring all needed columns are included.
-    fn build_projection_with_rowaddr(&self, projection: Option<&[String]>) -> Vec<String> {
-        let mut cols: Vec<String> = if let Some(p) = projection {
-            p.to_vec()
-        } else {
-            self.base_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect()
-        };
-
-        // Ensure PK columns are included
-        for pk in &self.pk_columns {
-            if !cols.contains(pk) {
-                cols.push(pk.clone());
-            }
-        }
-
-        cols
-    }
-
-    /// Create an empty execution plan.
+    /// Create an empty execution plan with the canonical scan output schema.
     fn empty_plan(
         &self,
         projection: Option<&[String]>,
@@ -353,35 +402,7 @@ impl LsmScanPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
-        let mut fields: Vec<Arc<Field>> = if let Some(cols) = projection {
-            cols.iter()
-                .filter_map(|name| {
-                    self.base_schema
-                        .field_with_name(name)
-                        .ok()
-                        .map(|f| Arc::new(f.clone()))
-                })
-                .collect()
-        } else {
-            self.base_schema.fields().iter().cloned().collect()
-        };
-
-        if with_memtable_gen {
-            fields.push(Arc::new(Field::new(
-                MEMTABLE_GEN_COLUMN,
-                DataType::UInt64,
-                false,
-            )));
-        }
-        if keep_row_address {
-            fields.push(Arc::new(Field::new(
-                ROW_ADDRESS_COLUMN,
-                DataType::UInt64,
-                false,
-            )));
-        }
-
-        let schema = Arc::new(Schema::new(fields));
+        let schema = self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address);
         Ok(Arc::new(EmptyExec::new(schema)))
     }
 }
@@ -453,7 +474,7 @@ mod integration_tests {
     use uuid::Uuid;
 
     use crate::dataset::mem_wal::scanner::LsmScanner;
-    use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+    use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
@@ -516,7 +537,7 @@ mod integration_tests {
     async fn setup_multi_level_lsm() -> (
         Arc<Dataset>,
         Vec<ShardSnapshot>,
-        Option<(Uuid, ActiveMemTableRef)>,
+        Option<(Uuid, InMemoryMemTables)>,
         Vec<String>,
         String, // temp_dir path for cleanup
     ) {
@@ -552,11 +573,14 @@ mod integration_tests {
         let active_batch = create_test_batch(&schema, &[5, 6, 7], "active");
         let _ = batch_store.append(active_batch);
 
-        let active_memtable = ActiveMemTableRef {
-            batch_store,
-            index_store,
-            schema: schema.clone(),
-            generation: 3,
+        let active_memtable = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store,
+                index_store,
+                schema: schema.clone(),
+                generation: 3,
+            },
+            frozen: vec![],
         };
 
         let pk_columns = vec!["id".to_string()];
@@ -581,7 +605,7 @@ mod integration_tests {
         // Create scanner without requesting _memtable_gen
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -618,7 +642,7 @@ mod integration_tests {
         let mut scanner =
             LsmScanner::new(base_dataset, shard_snapshots, pk_columns).with_memtable_gen();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -662,7 +686,7 @@ mod integration_tests {
         // Create scanner
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -714,6 +738,109 @@ mod integration_tests {
         assert_eq!(results.get(&7), Some(&"active_7".to_string()));
     }
 
+    /// Regression for the concurrent-read-vs-flush hole: a sealed
+    /// (frozen-awaiting-flush) memtable is not yet recorded as a flushed
+    /// generation, but its rows must still be in the scan's read union and
+    /// dedup correctly by generation across the active/frozen seam.
+    ///
+    /// Layout: base(0) ids 1-5, flushed gen1 ids 3,4, flushed gen2 ids
+    /// 4,5,6, frozen memtable gen3 ids 6,7, active memtable gen4 ids 7,8.
+    #[tokio::test]
+    async fn test_lsm_scan_frozen_memtable_in_read_union() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+
+        let base_uri = format!("{}/base", base_path);
+        let base_dataset = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&schema, &[1, 2, 3, 4, 5], "base")],
+            )
+            .await,
+        );
+
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![create_test_batch(&schema, &[3, 4], "gen1")]).await;
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
+        create_dataset(
+            &gen2_uri,
+            vec![create_test_batch(&schema, &[4, 5, 6], "gen2")],
+        )
+        .await;
+
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(4)
+            .with_flushed_generation(1, "gen_1".to_string())
+            .with_flushed_generation(2, "gen_2".to_string());
+
+        // Frozen gen3 (sealed, NOT in the manifest) and active gen4.
+        let frozen_store = Arc::new(BatchStore::with_capacity(100));
+        let _ = frozen_store.append(create_test_batch(&schema, &[6, 7], "frozen"));
+        let frozen = InMemoryMemTableRef {
+            batch_store: frozen_store,
+            index_store: Arc::new(IndexStore::new()),
+            schema: schema.clone(),
+            generation: 3,
+        };
+
+        let active_store = Arc::new(BatchStore::with_capacity(100));
+        let _ = active_store.append(create_test_batch(&schema, &[7, 8], "active"));
+        let in_memory = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store: active_store,
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation: 4,
+            },
+            frozen: vec![frozen],
+        };
+
+        let scanner = LsmScanner::new(base_dataset, vec![shard_snapshot], vec!["id".to_string()])
+            .with_in_memory_memtables(shard_id, in_memory);
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        assert_eq!(results.len(), 8, "ids 1-8 should all be present");
+        assert_eq!(results.get(&1), Some(&"base_1".to_string()));
+        assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"gen2_5".to_string()));
+        // id=6: in flushed gen2 AND frozen gen3 -> frozen wins. This is the
+        // bug: pre-fix the frozen memtable fell out of the read union and
+        // id=6 resolved to "gen2_6".
+        assert_eq!(results.get(&6), Some(&"frozen_6".to_string()));
+        // id=7: in frozen gen3 AND active gen4 -> active wins across the seam.
+        assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+        assert_eq!(results.get(&8), Some(&"active_8".to_string()));
+    }
+
     #[tokio::test]
     async fn test_lsm_scan_with_projection() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
@@ -723,7 +850,7 @@ mod integration_tests {
         let mut scanner =
             LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&["id"]);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -753,7 +880,7 @@ mod integration_tests {
         // Create scanner with limit
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).limit(3, None);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -875,23 +1002,29 @@ mod integration_tests {
         let mut scanner =
             LsmScanner::new(base_dataset, shard_snapshots, pk_columns).with_row_address();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan with keep_addr=true (no _memtable_gen, so no MemtableGenTagExec)
+        // Verify plan with keep_addr=true (no _memtable_gen, so no MemtableGenTagExec).
+        // Non-base arms wrap their SortExec in a ProjectionExec that NULLs
+        // `_rowaddr` post-sort: per-source addresses are not meaningful to
+        // the caller. The base arm leaves `_rowaddr` real.
         assert_plan_node_equals(
             plan,
             "DeduplicateExec: pk=[id], with_memtable_gen=false, keep_addr=true, input_sorted=true
   SortPreservingMergeExec: [id@0 ASC NULLS LAST]
     UnionExec
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...gen_2...
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...gen_1...
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+          LanceRead:...gen_2...
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+          LanceRead:...gen_1...
       SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
         LanceRead:...base/data...refine_filter=--",
         )
@@ -936,27 +1069,32 @@ mod integration_tests {
             .with_memtable_gen()
             .with_row_address();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan with both with_memtable_gen=true and keep_addr=true
-        // Full plan with all levels and MemtableGenTagExec at each
+        // Verify plan with both with_memtable_gen=true and keep_addr=true.
+        // Non-base arms wrap their SortExec in a ProjectionExec that NULLs
+        // `_rowaddr`; base leaves it real (so callers can still use it for
+        // `take_rows`). MemtableGenTagExec sits above the NULL projection.
         assert_plan_node_equals(
             plan,
             "DeduplicateExec: pk=[id], with_memtable_gen=true, keep_addr=true, input_sorted=true
   SortPreservingMergeExec: [id@0 ASC NULLS LAST]
     UnionExec
       MemtableGenTagExec: gen=gen3
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+            MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
       MemtableGenTagExec: gen=gen2
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_2...
+        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+            LanceRead:...gen_2...
       MemtableGenTagExec: gen=gen1
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_1...
+        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
+            LanceRead:...gen_1...
       MemtableGenTagExec: gen=base
         SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
           LanceRead:...base/data...refine_filter=--",
@@ -973,7 +1111,7 @@ mod integration_tests {
     async fn setup_multi_level_lsm_with_btree_index() -> (
         Arc<Dataset>,
         Vec<ShardSnapshot>,
-        Option<(Uuid, ActiveMemTableRef)>,
+        Option<(Uuid, InMemoryMemTables)>,
         Vec<String>,
         String,
     ) {
@@ -1038,11 +1176,14 @@ mod integration_tests {
 
         let index_store = Arc::new(index_store);
 
-        let active_memtable = ActiveMemTableRef {
-            batch_store,
-            index_store,
-            schema: schema.clone(),
-            generation: 3,
+        let active_memtable = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store,
+                index_store,
+                schema: schema.clone(),
+                generation: 3,
+            },
+            frozen: vec![],
         };
 
         let pk_columns = vec!["id".to_string()];
@@ -1067,7 +1208,7 @@ mod integration_tests {
             .filter("id = 5")
             .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -1159,7 +1300,7 @@ mod integration_tests {
             .filter("id = 3")
             .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and verify result
@@ -1194,5 +1335,377 @@ mod integration_tests {
         // id=3 should return gen1 version (base had 3, gen1 updated it)
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_without_base_table() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        // Use the same base URI the flushed generations were created under, so
+        // relative `gen_N` folders resolve to real datasets on disk.
+        let base_uri = base_dataset.uri().to_string();
+        let arrow_schema: arrow_schema::Schema = base_dataset.schema().into();
+        let schema = Arc::new(arrow_schema);
+
+        let mut scanner =
+            LsmScanner::without_base_table(schema, base_uri, shard_snapshots, pk_columns);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        // Verify the plan does not include a LanceRead for the base table.
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_str.contains("base/data"),
+            "Plan must not include base table scan, got: {}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("gen_1") && plan_str.contains("gen_2"),
+            "Plan must scan flushed generations, got: {}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("MemTableScanExec"),
+            "Plan must scan the active memtable, got: {}",
+            plan_str
+        );
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        // Without the base table, ids that only exist in base (1, 2) are gone.
+        // The fresh tier (gen1, gen2, active) supplies the rest with newest-wins.
+        assert_eq!(results.len(), 5, "Fresh tier should yield 5 unique rows");
+        assert_eq!(results.get(&1), None);
+        assert_eq!(results.get(&2), None);
+        assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"active_5".to_string()));
+        assert_eq!(results.get(&6), Some(&"active_6".to_string()));
+        assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_without_base_table_with_filter() {
+        // Exercises filter() on a scanner built via without_base_table(): the
+        // filter must parse against the supplied schema (no base dataset to
+        // borrow one from) and push down to the fresh-tier sources.
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let base_uri = base_dataset.uri().to_string();
+        let arrow_schema: arrow_schema::Schema = base_dataset.schema().into();
+        let schema = Arc::new(arrow_schema);
+
+        let mut scanner =
+            LsmScanner::without_base_table(schema, base_uri, shard_snapshots, pk_columns)
+                .filter("id > 3")
+                .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        // id<=3 excluded by filter; id=1,2 also absent because base is excluded.
+        // Fresh tier with newest-wins: gen2_4, active_5, active_6, active_7.
+        assert_eq!(results.len(), 4);
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"active_5".to_string()));
+        assert_eq!(results.get(&6), Some(&"active_6".to_string()));
+        assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_without_base_table_no_flushed_no_active() {
+        // No base, no flushed, no active → empty result, valid plan.
+        let schema = create_pk_schema();
+        let scanner = LsmScanner::without_base_table(
+            schema,
+            "memory:///fresh-tier-empty",
+            vec![],
+            vec!["id".to_string()],
+        );
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_projection_with_system_columns() {
+        // Regression: system columns in projection used to either error in
+        // the active-arm MemTableScanner or get silently dropped. Verify
+        // they're now surfaced at the requested position.
+        use lance_core::is_system_column;
+
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&[
+            "id",
+            "_rowoffset",
+            "name",
+            "_rowaddr",
+            "_rowid",
+        ]);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .expect("plan must execute when system columns are in projection")
+            .try_collect()
+            .await
+            .expect("collecting batches must not fail");
+
+        assert!(!batches.is_empty(), "expected at least one batch");
+        let out_schema = batches[0].schema();
+        let names: Vec<&str> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id", "_rowoffset", "name", "_rowaddr", "_rowid"],
+            "system columns must appear at the user's requested position"
+        );
+        for sys in ["_rowoffset", "_rowaddr", "_rowid"] {
+            assert!(is_system_column(sys));
+        }
+
+        // setup_multi_level_lsm: base=[1,2,3,4,5], gen1=[3,4], gen2=[4,5,6],
+        // active=[5,6,7]. Dedup picks the newest generation per pk:
+        //   id=1,2 → base (2 rows, real `_rowaddr`)
+        //   id=3   → gen1   (1 row,  NULL  `_rowaddr`)
+        //   id=4   → gen2   (1 row,  NULL  `_rowaddr`)
+        //   id=5,6 → active (2 rows, NULL  `_rowaddr`)
+        //   id=7   → active (1 row,  NULL  `_rowaddr`)
+        // Total 7 rows, 2 real / 5 NULL `_rowaddr`. `_rowid` and
+        // `_rowoffset` are NULL everywhere (no opt-in / no scanner support).
+        let mut rowaddr_real = 0usize;
+        let mut rowaddr_null = 0usize;
+        let mut rowid_null = 0usize;
+        let mut rowoffset_null = 0usize;
+        let mut total = 0usize;
+        for batch in &batches {
+            let rowaddr = batch.column_by_name("_rowaddr").unwrap();
+            let rowid = batch.column_by_name("_rowid").unwrap();
+            let rowoffset = batch.column_by_name("_rowoffset").unwrap();
+            for i in 0..batch.num_rows() {
+                total += 1;
+                if rowaddr.is_null(i) {
+                    rowaddr_null += 1;
+                } else {
+                    rowaddr_real += 1;
+                }
+                if rowid.is_null(i) {
+                    rowid_null += 1;
+                }
+                if rowoffset.is_null(i) {
+                    rowoffset_null += 1;
+                }
+            }
+        }
+        assert_eq!(total, 7, "expected 7 unique pks after dedup");
+        assert_eq!(
+            rowaddr_real, 2,
+            "expected 2 rows (id=1,2) with real `_rowaddr` from base"
+        );
+        assert_eq!(
+            rowaddr_null, 5,
+            "expected 5 rows (id=3-7) with NULL `_rowaddr` from non-base sources"
+        );
+        assert_eq!(rowid_null, total, "_rowid must be NULL for every row");
+        assert_eq!(
+            rowoffset_null, total,
+            "_rowoffset must be NULL for every row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_projection_with_rowid_only_no_rowaddr() {
+        // Test 4: when only `_rowid` (not `_rowaddr`) is requested, the
+        // canonical-projection wrap activates (system column triggers it),
+        // but the per-arm `null_columns(_rowaddr)` wrap stays off
+        // (`keep_row_address` remains false). `_rowid` ends up NULL for
+        // every row because no arm opts into `with_row_id()` in this
+        // planner (a base-only opt-in would mismatch the union schema).
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id", "_rowid", "name"]);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        // Canonical wrap activates for the user-requested `_rowid`.
+        assert!(
+            plan_str.contains("ProjectionExec"),
+            "expected canonical projection wrap, got:\n{plan_str}",
+        );
+        // The per-arm `null_columns(_rowaddr)` wrap is gated on
+        // `keep_row_address`, which stays false here. So no
+        // `NULL as _rowaddr` projection should appear.
+        assert!(
+            !plan_str.contains("NULL as _rowaddr"),
+            "no per-arm `_rowaddr` NULL'ing expected when caller didn't ask for `_rowaddr`, got:\n{plan_str}",
+        );
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut total = 0usize;
+        let mut rowid_null = 0usize;
+        for batch in &batches {
+            let rowid = batch.column_by_name("_rowid").unwrap();
+            for i in 0..batch.num_rows() {
+                total += 1;
+                if rowid.is_null(i) {
+                    rowid_null += 1;
+                }
+            }
+        }
+        assert_eq!(total, 7, "expected 7 unique pks after dedup");
+        assert_eq!(
+            rowid_null, total,
+            "_rowid must be NULL for every row (no opt-in)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_empty_plan_with_system_columns() {
+        // Test 5 (planner.rs slice): with no sources, the empty plan must
+        // still expose user-requested system columns at the requested
+        // position in the canonical schema.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let schema: super::SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let scanner =
+            LsmScanner::without_base_table(schema, base_uri, vec![], vec!["id".to_string()])
+                .project(&["id", "_rowaddr", "name", "_rowid"]);
+        let plan = scanner.create_plan().await.unwrap();
+
+        let names: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "id".to_string(),
+                "_rowaddr".to_string(),
+                "name".to_string(),
+                "_rowid".to_string(),
+            ],
+            "empty plan must honor user column order including system columns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_filter_referencing_rowaddr_is_rejected() {
+        // Test 6 (planner.rs slice): documents that `LsmScanner::filter()`
+        // rejects system-column references at parse time. The active-arm
+        // `MemTableScanner` couldn't handle `_rowaddr` in a filter anyway,
+        // and the higher-level builder validates the filter against the
+        // user schema before any per-arm planning happens. Pin this
+        // behavior so it doesn't silently regress to a panic deeper in the
+        // pipeline.
+        let (base_dataset, shard_snapshots, pk_columns, _temp_path) = {
+            let (b, s, _a, p, t) = setup_multi_level_lsm().await;
+            (b, s, p, t)
+        };
+
+        let result =
+            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).filter("_rowaddr > 0");
+        let err = result.expect_err("filter referencing `_rowaddr` must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("_rowaddr"),
+            "rejection message should mention the offending column, got: {msg}",
+        );
     }
 }

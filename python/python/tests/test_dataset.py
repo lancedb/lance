@@ -2269,7 +2269,6 @@ def test_merge_insert_subcols(tmp_path: Path):
     dataset = lance.write_dataset(
         initial_data, tmp_path / "dataset", max_rows_per_file=5
     )
-    original_fragments = dataset.get_fragments()
 
     new_values = pa.table(
         {
@@ -2279,6 +2278,12 @@ def test_merge_insert_subcols(tmp_path: Path):
     )
     (dataset.merge_insert("a").when_matched_update_all().execute(new_values))
 
+    # Partial-schema upserts run through the v2 `FullSchemaMergeInsertExec`
+    # path (see Rust issue #6442). We only assert the semantic outcome here
+    # — the exact fragment / file layout is an implementation detail of the
+    # v1 RewriteColumns optimization that no longer applies. Column `c`
+    # (not in the source) must retain its original values for the updated
+    # rows.
     expected = pa.table(
         {
             "a": range(10),
@@ -2287,20 +2292,6 @@ def test_merge_insert_subcols(tmp_path: Path):
         }
     )
     assert dataset.to_table().sort_by("a") == expected
-
-    # First fragment has new file
-    fragments = dataset.get_fragments()
-    assert fragments[0].fragment_id == original_fragments[0].fragment_id
-    assert fragments[1].fragment_id == original_fragments[1].fragment_id
-
-    assert len(fragments[0].data_files()) == 2
-    assert (
-        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
-    )
-    assert len(fragments[1].data_files()) == 1
-    assert str(fragments[1].data_files()[0]) == str(
-        original_fragments[1].data_files()[0]
-    )
 
     new_values = pa.table(
         {
@@ -2316,6 +2307,8 @@ def test_merge_insert_subcols(tmp_path: Path):
     )
 
     assert dataset.count_rows() == 12
+    # Newly inserted rows (keys 10, 11) get NULL for column `c` because
+    # the source did not provide a value for it and `c` is nullable.
     expected = pa.table(
         {
             "a": range(0, 12),
@@ -3086,6 +3079,37 @@ def test_update_dataset(tmp_path: Path):
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
     check_update_stats(update_dict, (100,))
+
+
+def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "name_1": pa.array(["1", "4", "7"]),
+                "name_2": pa.array(["2", "5", "8"]),
+                "name_3": pa.array(["3", "6", "9"]),
+            }
+        ),
+        tmp_path / "dataset",
+        enable_stable_row_ids=True,
+    )
+
+    update_dict = dataset.update(updates=dict(name_3="'xxxx'"), where="name_1 = '7'")
+    check_update_stats(update_dict, (1,))
+
+    expected = pa.table(
+        {
+            "name_1": pa.array(["1", "4", "7"]),
+            "name_2": pa.array(["2", "5", "8"]),
+            "name_3": pa.array(["3", "6", "xxxx"]),
+        }
+    )
+    actual = dataset.to_table().sort_by("name_1")
+    assert actual == expected
+
+    scanner_table = dataset.scanner(limit=10).to_table().sort_by("name_1")
+    assert scanner_table == expected
+    assert scanner_table == actual
 
 
 def test_update_dataset_all_types(tmp_path: Path):

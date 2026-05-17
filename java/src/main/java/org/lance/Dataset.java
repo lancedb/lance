@@ -150,6 +150,7 @@ public class Dataset implements Closeable {
               params.getDataStorageVersion(),
               params.getEnableV2ManifestPaths(),
               params.getStorageOptions(),
+              params.getBaseStoreParams(),
               params.getInitialBases(),
               params.getTargetBases(),
               params.getAllowExternalBlobOutsideBases(),
@@ -198,6 +199,7 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
@@ -216,6 +218,7 @@ public class Dataset implements Closeable {
    * @param dataStorageVersion data storage version
    * @param enableV2ManifestPaths whether to enable v2 manifest paths
    * @param storageOptions storage options
+   * @param baseStoreParams runtime-only object store parameters keyed by base path URI
    * @param initialBases initial bases
    * @param targetBases target bases
    * @param namespaceClient optional namespace client for managed versioning and credential refresh
@@ -234,6 +237,7 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
@@ -285,6 +289,7 @@ public class Dataset implements Closeable {
             params.getDataStorageVersion(),
             params.getEnableV2ManifestPaths(),
             params.getStorageOptions(),
+            params.getBaseStoreParams(),
             params.getInitialBases(),
             params.getTargetBases(),
             params.getAllowExternalBlobOutsideBases(),
@@ -306,7 +311,12 @@ public class Dataset implements Closeable {
   @Deprecated
   public static Dataset open(String path) {
     return open(
-        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
+        new RootAllocator(Long.MAX_VALUE),
+        true,
+        path,
+        new ReadOptions.Builder().build(),
+        new HashMap<>(),
+        null);
   }
 
   /**
@@ -320,7 +330,8 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path, ReadOptions options) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
+    return open(
+        new RootAllocator(Long.MAX_VALUE), true, path, options, options.getBaseStoreParams(), null);
   }
 
   /**
@@ -349,7 +360,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
-    return open(allocator, false, path, options, null);
+    return open(allocator, false, path, options, options.getBaseStoreParams(), null);
   }
 
   /**
@@ -365,7 +376,27 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session) {
-    return open(allocator, selfManagedAllocator, path, options, session, null, null, false);
+    return open(
+        allocator, selfManagedAllocator, path, options, options.getBaseStoreParams(), session);
+  }
+
+  static Dataset open(
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Map<String, Map<String, String>> baseStoreParams,
+      Session session) {
+    return open(
+        allocator,
+        selfManagedAllocator,
+        path,
+        options,
+        baseStoreParams,
+        session,
+        null,
+        null,
+        false);
   }
 
   /**
@@ -388,6 +419,7 @@ public class Dataset implements Closeable {
       boolean selfManagedAllocator,
       String path,
       ReadOptions options,
+      Map<String, Map<String, String>> baseStoreParams,
       Session session,
       LanceNamespace namespaceClient,
       List<String> tableId,
@@ -410,6 +442,7 @@ public class Dataset implements Closeable {
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
+            baseStoreParams,
             options.getSerializedManifest(),
             sessionHandle,
             namespaceClient,
@@ -433,6 +466,7 @@ public class Dataset implements Closeable {
       long indexCacheSize,
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
       Optional<ByteBuffer> serializedManifest,
       long sessionHandle,
       LanceNamespace namespaceClient,
@@ -755,6 +789,35 @@ public class Dataset implements Closeable {
   }
 
   private native byte[] nativeTake(List<Long> indices, List<String> columns);
+
+  /**
+   * Select rows of data by their physical row IDs.
+   *
+   * @param rowIds the physical row IDs to retrieve (from the _rowid column)
+   * @param columns the columns to include in the result
+   * @return an ArrowReader containing the requested rows in input order
+   * @throws IOException if a row ID does not exist or an I/O error occurs
+   */
+  public ArrowReader takeRows(List<Long> rowIds, List<String> columns) throws IOException {
+    Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    Preconditions.checkArgument(
+        rowIds != null && !rowIds.isEmpty(), "rowIds cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      byte[] arrowData = nativeTakeRows(rowIds, columns);
+      ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
+      ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
+      return new ArrowStreamReader(readChannel, allocator) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          readChannel.close();
+          byteArrayInputStream.close();
+        }
+      };
+    }
+  }
+
+  private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
 
   /**
    * Randomly sample n rows from the dataset.

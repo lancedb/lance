@@ -3160,7 +3160,7 @@ impl Dataset {
         region_spec: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
-        use lance_index::mem_wal::{ShardField as RegionField, ShardSpec as RegionSpec};
+        use lance_index::mem_wal::{ShardingField as RegionField, ShardingSpec as RegionSpec};
         use std::collections::HashMap;
 
         let region_spec_rust = if let Some(spec) = region_spec {
@@ -3187,7 +3187,7 @@ impl Dataset {
         };
 
         let config = lance::dataset::mem_wal::MemWalConfig {
-            shard_spec: region_spec_rust,
+            sharding_spec: region_spec_rust,
             maintained_indexes: maintained_indexes.unwrap_or_default(),
         };
         let mut ds = Arc::clone(&self.ds);

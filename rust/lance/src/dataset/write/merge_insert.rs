@@ -1390,6 +1390,15 @@ impl MergeInsertJob {
             .collect::<Vec<_>>();
         let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
         let source_df = session_ctx.read_one_shot(source)?;
+        // Capture the source field names *before* aliasing / joining so we
+        // can tell which dataset columns are missing from the source and
+        // need to be filled from the target side of the join below.
+        let source_field_names: std::collections::HashSet<String> = source_df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
         // Inject a sentinel literal column so we can reliably determine, after the join,
         // whether the source side contributed a row.  This is NULL-safe: even when every
         // ON column is NULL the sentinel lets us distinguish a source-only row from a
@@ -1401,7 +1410,7 @@ impl MergeInsertJob {
         let scan_aliased = scan.alias("target")?;
         let join_type = self.create_plan_join_type();
         let dataset_schema: Schema = self.dataset.schema().into();
-        let df = scan_aliased
+        let mut df = scan_aliased
             .join(
                 source_df_aliased,
                 join_type,
@@ -1413,6 +1422,26 @@ impl MergeInsertJob {
                 MERGE_ACTION_COLUMN,
                 merge_insert_action(&self.params, Some(&dataset_schema))?,
             )?;
+
+        // Partial-schema upsert: for every dataset column missing from the
+        // source, add a synthetic unqualified column that copies the target
+        // side's value for that column. For matched rows this carries the
+        // existing target value (preserving non-source columns on update);
+        // for unmatched source rows (inserts) the outer join leaves the
+        // target side NULL, so inserts get NULL for missing columns. The
+        // unqualified name matches the dataset field and becomes a normal
+        // data column from the write exec's perspective.
+        //
+        // We iterate the dataset schema in order so that the resulting
+        // physical plan is deterministic and easy to inspect in tests.
+        for field in dataset_schema.fields() {
+            if !source_field_names.contains(field.name()) {
+                df = df.with_column(
+                    field.name(),
+                    logical_expr::col(format!("target.\"{}\"", field.name())),
+                )?;
+            }
+        }
 
         let (session_state, logical_plan) = df.into_parts();
 
@@ -1515,11 +1544,18 @@ impl MergeInsertJob {
 
     /// Check if the merge insert operation can use the fast path (create_plan).
     ///
-    /// The fast path is only available for specific conditions:
-    /// - when_matched is UpdateAll or UpdateIf or Fail
-    /// - The execution will not use the legacy scalar-index join path
-    /// - Source schema matches dataset schema exactly
-    /// - when_not_matched_by_source is Keep, Delete, or DeleteIf
+    /// The fast path is available when:
+    /// - `when_matched` is `UpdateAll`, `UpdateIf`, `Fail`, `Delete`, or `DoNothing`
+    /// - Either `use_index` is false OR there's no scalar index on the join key
+    /// - The source schema is either (a) the full dataset schema, or (b) a
+    ///   subset of it (partial-schema upsert), or (c) just the key columns for
+    ///   delete-only operations
+    /// - `when_not_matched_by_source` is `Keep`, `Delete`, or `DeleteIf`
+    ///
+    /// For partial-schema upserts with `insert_not_matched=true`, every missing
+    /// target column must be nullable — otherwise this method returns an
+    /// `InvalidInput` error, because inserted rows would otherwise attempt to
+    /// write a non-nullable NULL downstream.
     async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
@@ -1535,6 +1571,38 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
+
+        // Partial-schema upsert: every source field must exist in the target
+        // and have a compatible data type. Missing target columns will be
+        // filled from the target side of the join in `create_plan`.
+        let is_subset_schema = !is_full_schema
+            && lance_schema.fields.iter().all(|sf| {
+                full_schema
+                    .field(&sf.name)
+                    .map(|tf| tf.data_type() == sf.data_type())
+                    .unwrap_or(false)
+            });
+
+        // If the user is inserting unmatched rows with a partial source, any
+        // target column missing from the source would receive NULL for those
+        // inserts. Non-nullable targets cannot accept that, so reject early
+        // with a descriptive error instead of failing later in the writer.
+        if is_subset_schema && self.params.insert_not_matched {
+            let non_nullable_missing: Vec<&str> = full_schema
+                .fields
+                .iter()
+                .filter(|tf| lance_schema.field(&tf.name).is_none() && !tf.nullable)
+                .map(|tf| tf.name.as_str())
+                .collect();
+            if !non_nullable_missing.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "Cannot insert rows with a partial-schema source: target column(s) \
+                     {:?} are non-nullable and not provided by the source. Either add \
+                     them to the source or set when_not_matched to DoNothing.",
+                    non_nullable_missing
+                )));
+            }
+        }
 
         let would_use_scalar_index = if self.params.use_index
             && matches!(
@@ -1560,7 +1628,7 @@ impl MergeInsertJob {
                 .iter()
                 .any(|f| f.name() == key.as_str())
         });
-        let schema_ok = is_full_schema || (no_upsert && source_has_key_columns);
+        let schema_ok = is_full_schema || is_subset_schema || (no_upsert && source_has_key_columns);
 
         Ok(matches!(
             self.params.when_matched,
@@ -1568,6 +1636,7 @@ impl MergeInsertJob {
                 | WhenMatched::UpdateIf(_)
                 | WhenMatched::Fail
                 | WhenMatched::Delete
+                | WhenMatched::DoNothing
         ) && !would_use_scalar_index
             && schema_ok
             && matches!(
@@ -3539,15 +3608,22 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_delete_not_supported() {
+        async fn test_delete_not_matched_by_source_on_v2_subcols() {
+            // Historical note: this combination used to be rejected outright
+            // on the v1 subcols path because v1 could not delete by source
+            // while rewriting only a subset of columns. The v2 path handles
+            // it uniformly through the action column, so the previously-
+            // rejected configuration now succeeds. This test asserts the
+            // successful path to keep the negative-test history explicit.
             let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
+
+            let rows_before = ds.count_rows(None).await.unwrap() as u64;
 
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
                 new_data.schema(),
             ));
 
-            // Should reject when_not_matched_by_source_delete as not yet supported
             let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
                 .unwrap()
                 .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
@@ -3555,15 +3631,24 @@ mod tests {
                 .when_not_matched(WhenNotMatched::DoNothing)
                 .try_build()
                 .unwrap();
-            let res = assert_send(job.execute_reader(reader)).await;
-            assert!(
-                matches!(
-                    &res,
-                    &Err(Error::NotSupported { ref source, .. })
-                        if source.to_string().contains("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data"),
-                ),
-                "Expected NotSupported error, got: {:?}",
-                res
+            // assert_send also pins us to the "returned future is Send"
+            // contract that the previous (negative) version of this test
+            // used to guard.
+            let (updated_ds, stats) = assert_send(job.execute_reader(reader))
+                .await
+                .expect("partial-schema + delete-by-source should succeed on v2");
+
+            // 272 rows in source — 2 of them are inserts (ignored because
+            // when_not_matched is DoNothing), the other 270 match existing
+            // rows and update them. The remaining 754 target rows that are
+            // not matched by the source get deleted.
+            assert_eq!(stats.num_updated_rows, 270);
+            assert_eq!(stats.num_inserted_rows, 0);
+            assert_eq!(stats.num_deleted_rows, rows_before - 270);
+            assert_eq!(
+                updated_ds.count_rows(None).await.unwrap() as u64,
+                270,
+                "only the 270 updated rows should remain after the delete-by-source"
             );
         }
 
@@ -3629,48 +3714,97 @@ mod tests {
 
             let (ds, stats) = job.execute_reader(reader).await.unwrap();
 
-            // Should not rewrite the affected data files
             let fragments_after = ds
                 .get_fragments()
                 .iter()
                 .map(|f| f.metadata().clone())
                 .collect::<Vec<_>>();
-            assert_eq!(
-                fragments_before.iter().map(|f| f.id).collect::<Vec<_>>(),
-                fragments_after
-                    .iter()
-                    .take(fragments_before.len())
-                    .map(|f| f.id)
-                    .collect::<Vec<_>>()
-            );
-            // Only the second and third fragment should be different.
-            assert_eq!(fragments_before[0], fragments_after[0]);
-            assert_ne!(fragments_before[1], fragments_after[1]);
-            assert_ne!(fragments_before[2], fragments_after[2]);
-            assert_eq!(fragments_before[3], fragments_after[3]);
 
-            let has_added_files = |frag: &Fragment| {
-                assert_eq!(frag.files.len(), 2);
-                let data_files = &frag.files;
-                // Updated columns should be only columns in new data files
-                // -2 field ids are tombstoned.
-                assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
-                assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
-            };
-            has_added_files(&fragments_after[1]);
-            has_added_files(&fragments_after[2]);
-
+            // Stats are path-independent: 272 source rows = 2 inserts
+            // (if insert) + 270 updates, nothing deleted.
+            assert_eq!(stats.num_updated_rows, (new_data.num_rows() - 2) as u64);
+            assert_eq!(stats.num_deleted_rows, 0);
             if insert {
-                assert_eq!(fragments_after.len(), 5);
                 assert_eq!(stats.num_inserted_rows, 2);
             } else {
-                assert_eq!(fragments_after.len(), 4);
                 assert_eq!(stats.num_inserted_rows, 0);
             }
 
-            assert_eq!(stats.num_updated_rows, (new_data.num_rows() - 2) as u64);
-            assert_eq!(stats.num_deleted_rows, 0);
+            if scalar_index {
+                // v1 path: partial-schema upserts with a scalar index on the
+                // join key fall back to the in-place Merger that rewrites
+                // only the changed columns. Verify the legacy file-layout
+                // optimization (tombstoned field ids + new partial data
+                // files) is still produced on this path, including
+                // unchanged fragment ids.
+                assert_eq!(
+                    fragments_before.iter().map(|f| f.id).collect::<Vec<_>>(),
+                    fragments_after
+                        .iter()
+                        .take(fragments_before.len())
+                        .map(|f| f.id)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(fragments_before[0], fragments_after[0]);
+                assert_ne!(fragments_before[1], fragments_after[1]);
+                assert_ne!(fragments_before[2], fragments_after[2]);
+                assert_eq!(fragments_before[3], fragments_after[3]);
 
+                let has_added_files = |frag: &Fragment| {
+                    assert_eq!(frag.files.len(), 2);
+                    let data_files = &frag.files;
+                    // Updated columns should be only columns in new data files
+                    // -2 field ids are tombstoned.
+                    assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
+                    assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
+                };
+                has_added_files(&fragments_after[1]);
+                has_added_files(&fragments_after[2]);
+
+                if insert {
+                    assert_eq!(fragments_after.len(), 5);
+                } else {
+                    assert_eq!(fragments_after.len(), 4);
+                }
+            } else {
+                // v2 path: partial-schema upserts run through the same
+                // FullSchemaMergeInsertExec as full-schema upserts and
+                // write brand-new fragments. Fragment 1 is entirely
+                // matched (all 256 rows) so it is removed; fragment 2 is
+                // partially matched so it keeps its id with a deletion
+                // vector; a new fragment holds the 270 updated rows
+                // (and the 2 inserted rows when `insert` is set).
+                let ids_after: Vec<u64> = fragments_after.iter().map(|f| f.id).collect();
+                assert_eq!(
+                    fragments_after.len(),
+                    4,
+                    "expected [frag 0, frag 2, frag 3, new frag], got {:?}",
+                    ids_after
+                );
+                assert_eq!(
+                    fragments_before[0], fragments_after[0],
+                    "frag 0 (untouched) should be identical"
+                );
+                assert!(
+                    !ids_after.contains(&1),
+                    "frag 1 was fully matched by source and should have been removed"
+                );
+                assert!(
+                    ids_after.contains(&2),
+                    "frag 2 was only partially matched and should still be present"
+                );
+                assert!(
+                    ids_after.contains(&3),
+                    "frag 3 (untouched) should still be present"
+                );
+            }
+
+            // Semantic data check (shared across both code paths): look
+            // rows up by key so we don't depend on the scan-order mechanics
+            // of v1 vs v2. For updated rows, `value` must be the new
+            // source value and `other` must be the original (preserved
+            // from the target). For untouched rows, both columns must be
+            // unchanged.
             let data = ds
                 .scan()
                 .scan_in_order(true)
@@ -3680,17 +3814,433 @@ mod tests {
             assert_eq!(data.num_rows(), if insert { 1024 + 2 } else { 1024 });
             assert_eq!(data.num_columns(), 3);
 
-            let values = data
+            use std::collections::HashMap;
+            let other_col = data
+                .column_by_name("other")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let value_col = data
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let key_col = data
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let mut row_by_key: HashMap<String, (u32, String)> = HashMap::new();
+            for i in 0..data.num_rows() {
+                row_by_key.insert(
+                    key_col.value(i).to_string(),
+                    (value_col.value(i), other_col.value(i).to_string()),
+                );
+            }
+
+            // Pull original column data for reference lookups.
+            let orig_batch_schema = new_data.schema();
+            assert_eq!(orig_batch_schema.field(0).name(), "key");
+            assert_eq!(orig_batch_schema.field(1).name(), "value");
+            let new_keys = new_data
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            let new_values = new_data
                 .column(1)
                 .as_any()
                 .downcast_ref::<UInt32Array>()
                 .unwrap();
-            assert_eq!(values.value(0), 0);
-            assert_eq!(values.value(256), 1024);
-            assert_eq!(values.value(512), 512);
-            assert_eq!(values.value(715), 1024 + new_data.num_rows() as u32 - 3);
-            if insert {
-                assert_eq!(values.value(1024), 1024 + new_data.num_rows() as u32 - 2);
+            // Every updated source row (270 of them) should be present
+            // with its new value and a preserved `other` string.
+            for i in 0..(new_data.num_rows() - 2) {
+                let key = new_keys.value(i).to_string();
+                let (value, other) = row_by_key
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("updated key {} missing from result", key));
+                assert_eq!(*value, new_values.value(i));
+                assert!(
+                    !other.is_empty(),
+                    "updated row for key {} should retain its original `other` value",
+                    key
+                );
+            }
+            // The 2 batch3 rows at the end of new_data are inserts.
+            for i in (new_data.num_rows() - 2)..new_data.num_rows() {
+                let key = new_keys.value(i).to_string();
+                let found = row_by_key.get(&key);
+                if insert {
+                    let (value, _) =
+                        found.unwrap_or_else(|| panic!("inserted key {} missing from result", key));
+                    assert_eq!(*value, new_values.value(i));
+                } else {
+                    assert!(
+                        found.is_none(),
+                        "unmatched source row for key {} must not be present when insert=false",
+                        key
+                    );
+                }
+            }
+        }
+
+        /// Verifies that `explain_plan` succeeds for a partial-schema upsert
+        /// and emits a plan that uses the v2 `FullSchemaMergeInsertExec`
+        /// path. This is the explicit acceptance criterion for #6442: the
+        /// partial-schema path must go through the same physical plan as
+        /// full-schema upserts instead of falling back to v1.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_v2_explain_plan() {
+            let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
+
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+            let source_schema: Schema = new_data.schema().as_ref().clone();
+            let plan = job
+                .explain_plan(Some(&source_schema), false)
+                .await
+                .expect("explain_plan must succeed for partial-schema upsert on v2");
+
+            // The `MergeInsert: on=[...]` header is rendered by the v2
+            // extension node's `fmt_for_explain` — it only appears when
+            // `create_plan` was used (legacy v1 does not go through this
+            // path at all). Combined with the presence of `HashJoinExec`
+            // this uniquely identifies the v2 physical plan.
+            assert!(
+                plan.contains("MergeInsert: on=[key]"),
+                "expected MergeInsert extension node in plan (v2 marker), got: {}",
+                plan
+            );
+            assert!(
+                plan.contains("HashJoinExec"),
+                "expected HashJoinExec in plan, got: {}",
+                plan
+            );
+            // Evidence that the partial-schema fix is active: the target
+            // side of the join reads the `other` column (which is missing
+            // from the source) and an explicit projection carries it
+            // through to the write exec alongside source columns.
+            assert!(
+                plan.contains("LanceRead") && plan.contains("projection=[other"),
+                "target-side scan should include the filled `other` column: {}",
+                plan
+            );
+            assert!(
+                plan.contains("other@0 as other"),
+                "expected post-join projection to carry `other` from the target side: {}",
+                plan
+            );
+        }
+
+        /// Partial-schema upserts with `insert_not_matched=InsertAll` must
+        /// reject non-nullable missing columns at the API boundary instead
+        /// of producing a confusing downstream writer error. The user-
+        /// facing error message must name the offending column(s).
+        #[tokio::test]
+        async fn test_merge_insert_subcols_v2_rejects_non_nullable_insert() {
+            // Build a dataset whose `other` column is explicitly non-nullable
+            // so that a partial source missing it cannot safely insert new rows.
+            let full_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::UInt32, true),
+                Field::new("other", DataType::Utf8, false),
+            ]));
+            let full_batch = RecordBatch::try_new(
+                full_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["k0", "k1", "k2"])),
+                    Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                Box::new(RecordBatchIterator::new([Ok(full_batch)], full_schema)),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap();
+            let ds = Arc::new(ds);
+
+            // Source source lacks `other` and tries to insert a new key.
+            let partial_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::UInt32, true),
+            ]));
+            let partial_batch = RecordBatch::try_new(
+                partial_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["k1", "k_new"])),
+                    Arc::new(UInt32Array::from(vec![11, 99])),
+                ],
+            )
+            .unwrap();
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(partial_batch)],
+                partial_schema,
+            ));
+
+            let res = MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(reader)
+                .await;
+
+            match res {
+                Err(Error::InvalidInput { source, .. }) => {
+                    let msg = source.to_string();
+                    assert!(
+                        msg.contains("partial-schema")
+                            && msg.contains("non-nullable")
+                            && msg.contains("\"other\""),
+                        "expected descriptive partial-schema / non-nullable error naming \
+                         the `other` column, got: {}",
+                        msg
+                    );
+                }
+                other => panic!(
+                    "expected InvalidInput error for non-nullable missing column on insert path, got: {:?}",
+                    other
+                ),
+            }
+        }
+
+        /// Partial-schema v2 upsert must correctly handle `camelCase` column
+        /// names both in the join key and in a column that is *omitted* from
+        /// the source. DataFusion's `col()` lowercases unquoted identifiers,
+        /// so the partial-schema fill-in wraps the target reference in double
+        /// quotes (`target."<name>"`) and `on_cols` are likewise quoted. This
+        /// test pins that behavior down — prior to this, the v2 partial-schema
+        /// path had no coverage for case-sensitive column names.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_v2_camel_case_column() {
+            // Target dataset: camelCase join key AND a camelCase nullable
+            // column that will be omitted from the source schema.
+            let full_schema = Arc::new(Schema::new(vec![
+                Field::new("userId", DataType::Utf8, false),
+                Field::new("score", DataType::UInt32, true),
+                Field::new("extraData", DataType::Utf8, true),
+            ]));
+            let full_batch = RecordBatch::try_new(
+                full_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["u1", "u2", "u3"])),
+                    Arc::new(UInt32Array::from(vec![10, 20, 30])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                Box::new(RecordBatchIterator::new([Ok(full_batch)], full_schema)),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap();
+            let ds = Arc::new(ds);
+
+            // Partial-schema source: no `extraData`. Updates `u2` and inserts `u_new`.
+            let partial_schema = Arc::new(Schema::new(vec![
+                Field::new("userId", DataType::Utf8, false),
+                Field::new("score", DataType::UInt32, true),
+            ]));
+            let partial_batch = RecordBatch::try_new(
+                partial_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["u2", "u_new"])),
+                    Arc::new(UInt32Array::from(vec![22, 99])),
+                ],
+            )
+            .unwrap();
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(partial_batch)],
+                partial_schema,
+            ));
+
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["userId".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap();
+            let (updated_ds, stats) = job
+                .execute_reader(reader)
+                .await
+                .expect("camelCase partial-schema upsert must succeed on v2");
+
+            assert_eq!(stats.num_updated_rows, 1);
+            assert_eq!(stats.num_inserted_rows, 1);
+            assert_eq!(stats.num_deleted_rows, 0);
+
+            // Read the whole dataset back and index by userId so assertions
+            // are independent of physical row order.
+            let data = updated_ds
+                .scan()
+                .scan_in_order(true)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(data.num_rows(), 4);
+            assert_eq!(data.num_columns(), 3);
+
+            let user_ids = data
+                .column_by_name("userId")
+                .expect("camelCase join key column must be present in result")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let scores = data
+                .column_by_name("score")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let extra = data
+                .column_by_name("extraData")
+                .expect("camelCase omitted column must be present in result")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            let mut by_user: std::collections::HashMap<String, (u32, Option<String>)> =
+                std::collections::HashMap::new();
+            for i in 0..data.num_rows() {
+                let extra_val = if extra.is_null(i) {
+                    None
+                } else {
+                    Some(extra.value(i).to_string())
+                };
+                by_user.insert(user_ids.value(i).to_string(), (scores.value(i), extra_val));
+            }
+
+            // Untouched rows: unchanged.
+            assert_eq!(by_user["u1"], (10, Some("a".to_string())));
+            assert_eq!(by_user["u3"], (30, Some("c".to_string())));
+            // Updated row: score bumped, camelCase `extraData` preserved from target.
+            assert_eq!(
+                by_user["u2"],
+                (22, Some("b".to_string())),
+                "partial-schema update must preserve camelCase `extraData` from the target side of the join"
+            );
+            // Inserted row: camelCase column must be NULL (outer-join target side is NULL).
+            assert_eq!(
+                by_user["u_new"],
+                (99, None),
+                "partial-schema insert must produce NULL for omitted camelCase column"
+            );
+        }
+
+        /// End-to-end bloom-filter conflict-detection check for a
+        /// partial-schema upsert. With the v2 path enabled for partial
+        /// schema, the returned transaction must carry a populated
+        /// `inserted_rows_filter` whenever the join key is an unenforced
+        /// primary key. Previously (v1 path) this filter was always
+        /// `None` for partial schema.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_v2_bloom_filter() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt32, false).with_metadata(
+                    vec![(
+                        "lance-schema:unenforced-primary-key".to_string(),
+                        "true".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                Field::new("value", DataType::UInt32, true),
+                Field::new("tag", DataType::Utf8, true),
+            ]));
+            let initial = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                    Arc::new(UInt32Array::from(vec![0, 0, 0])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+            .unwrap();
+            let dataset = InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap();
+            let dataset = Arc::new(dataset);
+
+            // Partial source — only `id` and `value`, missing nullable `tag`.
+            let partial_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt32, false).with_metadata(
+                    vec![(
+                        "lance-schema:unenforced-primary-key".to_string(),
+                        "true".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                Field::new("value", DataType::UInt32, true),
+            ]));
+            let partial = RecordBatch::try_new(
+                partial_schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![1, 5])), // one update (1), one insert (5)
+                    Arc::new(UInt32Array::from(vec![42, 99])),
+                ],
+            )
+            .unwrap();
+            let stream = RecordBatchStreamAdapter::new(
+                partial_schema,
+                futures::stream::iter(vec![Ok(partial)]),
+            );
+
+            let UncommittedMergeInsert { transaction, .. } =
+                MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+                    .await
+                    .unwrap();
+
+            // The committed transaction must carry the populated bloom
+            // filter — this is the core conflict-detection acceptance
+            // criterion for #6442.
+            let committed = CommitBuilder::new(dataset.clone())
+                .execute(transaction)
+                .await
+                .unwrap();
+            let tx_path = committed
+                .manifest()
+                .transaction_file
+                .clone()
+                .expect("transaction file must be written");
+            let tx_read =
+                read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
+                    .await
+                    .unwrap();
+            match &tx_read.operation {
+                Operation::Update {
+                    inserted_rows_filter,
+                    ..
+                } => {
+                    let filter = inserted_rows_filter
+                        .as_ref()
+                        .expect("partial-schema upsert on a PK must emit a bloom filter");
+                    // Exactly one key field (id).
+                    assert_eq!(filter.field_ids.len(), 1);
+                }
+                other => panic!("expected Operation::Update, got: {:?}", other),
             }
         }
     }
@@ -4393,6 +4943,62 @@ mod tests {
         ).await.unwrap();
     }
 
+    /// Verifies that a default find-or-create merge insert
+    /// (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`) is routed
+    /// through the v2 `FullSchemaMergeInsertExec` path. Prior to this
+    /// change, `can_use_create_plan` rejected `DoNothing` outright and the
+    /// operation fell back to the legacy v1 `Merger`; the assertion below
+    /// would fail on `main`. See lance-format/lance#6441.
+    #[tokio::test]
+    async fn test_fast_path_find_or_create() {
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
+
+        // Create dataset with initial data
+        let ds = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // Default MergeInsertBuilder config is find-or-create:
+        //   when_matched = DoNothing, when_not_matched = InsertAll.
+        let merge_insert_job =
+            crate::dataset::MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+                .unwrap()
+                .try_build()
+                .unwrap();
+
+        // Source data with a mix of already-present and new keys.
+        let new_data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(2))
+            .col("value", array::step::<UInt32Type>())
+            .col("key", array::rand_pseudo_uuid_hex());
+        let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
+        let new_data_stream = reader_to_stream(Box::new(new_data));
+
+        // Should reach the v2 fast path (`create_plan` + FullSchemaMergeInsertExec).
+        // Dropping to v1 here would return an error from create_plan instead.
+        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+
+        // The join is Right because we keep unmatched source rows (InsertAll)
+        // but discard unmatched target rows (DoNothing on when_matched,
+        // Keep on when_not_matched_by_source). The CASE expression simplifies
+        // to `_rowaddr IS NULL → Insert, else Nothing`.
+        assert_plan_node_equals(
+            plan,
+            "MergeInsert: on=[key], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[_rowid@0 as _rowid, _rowaddr@1 as _rowaddr, value@2 as value, key@3 as key, __merge_source_sentinel@4 as __merge_source_sentinel, CASE WHEN _rowaddr@1 IS NULL THEN 2 ELSE 0 END as __action]
+      HashJoinExec: mode=CollectLeft, join_type=Right, on=[(key@0, key@1)], projection=[_rowid@1, _rowaddr@2, value@3, key@4, __merge_source_sentinel@5]
+        LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
+        RepartitionExec...
+          ProjectionExec: expr=[value@0 as value, key@1 as key, true as __merge_source_sentinel]
+            StreamingTableExec: partition_sizes=1, projection=[value, key]"
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn test_skip_auto_cleanup() {
         let tmpdir = TempStrDir::default();
@@ -4772,6 +5378,102 @@ mod tests {
         assert!(
             matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
             "Expected TooMuchWriteContention (retryable conflict exhausted), got: {:?}",
+            result2
+        );
+    }
+
+    /// Concurrency regression for lance-format/lance#6441: two concurrent
+    /// find-or-create jobs (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`)
+    /// both try to insert the same fresh key. The second must fail with
+    /// `TooMuchWriteContention` because the bloom-filter-backed
+    /// `inserted_rows_filter` detects the overlap during rebase. Before
+    /// routing find-or-create through v2 this did not work at all: the v1
+    /// path returned `inserted_rows_filter=None`, so there was nothing to
+    /// intersect against during conflict resolution.
+    #[tokio::test]
+    async fn test_concurrent_find_or_create_same_new_key() {
+        // Schema with an unenforced primary key on "id" — that is what
+        // activates bloom-filter conflict detection.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_string(),
+                    "true".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        // Initial dataset with ids 0..=3 — id=100 is not present.
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Both jobs try to find-or-create the same new id=100.
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+
+        // b2 is built against version 1 with zero retries, so when it needs
+        // to rebase against b1's commit the bloom-filter intersection decides
+        // the outcome directly.
+        let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .conflict_retries(0)
+            .try_build()
+            .unwrap();
+
+        // First job commits successfully, producing version 2 with id=100.
+        let s1 = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch1.clone())]),
+        );
+        let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let result1 = b1.execute(Box::pin(s1) as SendableRecordBatchStream).await;
+        assert!(result1.is_ok(), "First find-or-create should succeed");
+
+        // Second job fails because its inserted_rows_filter overlaps b1's.
+        let s2 = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(batch2.clone())]),
+        );
+        let result2 = b2.execute(Box::pin(s2) as SendableRecordBatchStream).await;
+
+        assert!(
+            matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
+            "Expected TooMuchWriteContention (bloom-filter conflict) for find-or-create, got: {:?}",
             result2
         );
     }
@@ -5427,6 +6129,37 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         assert!(verbose_plan.contains("MergeInsert"));
         // Verbose should also match the expected pattern
         assert_string_matches(&verbose_plan, expected_pattern).unwrap();
+    }
+
+    /// Asserts that `explain_plan()` is supported for a default find-or-create
+    /// configuration (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`).
+    /// Before lance-format/lance#6441 this returned `Error::NotSupported`
+    /// because the job fell back to the legacy v1 path.
+    #[tokio::test]
+    async fn test_explain_plan_find_or_create() {
+        let dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col("name", array::cycle_utf8_literals(&["a", "b", "c"]))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
+            .await
+            .unwrap();
+
+        // Default builder config == find-or-create.
+        let merge_insert_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .try_build()
+                .unwrap();
+
+        let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
+
+        let expected_pattern = "\
+MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
+  CoalescePartitionsExec...
+    HashJoinExec...join_type=Right...
+      LanceRead...
+      StreamingTableExec: partition_sizes=1, projection=[id, name]";
+        assert_string_matches(&plan, expected_pattern).unwrap();
     }
 
     #[tokio::test]
@@ -6469,19 +7202,32 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 .unwrap();
 
         let fragments = updated_dataset.get_fragments();
-        // in-place updates only, no new fragment should be added
-        assert_eq!(fragments.len(), 2);
+        // v2 path: partial-schema upsert goes through FullSchemaMergeInsertExec
+        // which writes a new fragment containing the updated rows. Fragments
+        // 0 and 1 keep 2 rows each (with deletion vectors covering the
+        // matched keys), fragment 2 is the new one holding the 2 updated
+        // rows. The v1 RewriteColumns optimization (2 fragments, in-place
+        // rewrite) is tracked separately as issue #4193.
+        assert_eq!(fragments.len(), 3);
 
         let updated_indices = updated_dataset.load_indices().await.unwrap();
-        // all the fragments have been updated, so the index of the vector field has been deleted
-        assert_eq!(updated_indices.len(), 1);
+        // Both indices remain after the v2 upsert. The vector index still
+        // covers the old fragments' non-deleted rows (the deleted rows are
+        // filtered by deletion vectors), and queries that need the new
+        // row values fall back to scanning the unindexed new fragment.
+        // This is a behavior difference from v1, which eagerly invalidated
+        // the vec index when any row in a fragment was updated.
+        assert_eq!(updated_indices.len(), 2);
         let updated_value_index = updated_indices
             .iter()
             .find(|idx| idx.name == "value_idx")
             .unwrap();
 
+        // The scalar index on `value` must still cover fragments 0 and 1 —
+        // even though those fragments now carry deletion vectors, the
+        // `value` column itself was not modified, so the existing index
+        // entries remain valid for the rows that were not deleted.
         let value_bitmap = updated_value_index.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(value_bitmap.len(), 2);
         assert!(value_bitmap.contains(0));
         assert!(value_bitmap.contains(1));
     }

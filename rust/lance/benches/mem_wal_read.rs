@@ -232,7 +232,7 @@ async fn setup_benchmark(
     // Initialize MemWAL
     lsm_dataset
         .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
+            sharding_spec: None,
             maintained_indexes: vec![],
         })
         .await
@@ -841,7 +841,7 @@ async fn setup_vector_benchmark(
     // Initialize MemWAL
     lsm_dataset
         .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
+            sharding_spec: None,
             maintained_indexes: vec![],
         })
         .await

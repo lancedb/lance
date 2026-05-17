@@ -50,24 +50,6 @@ impl JsonbType {
 mod common {
     use super::*;
 
-    /// Key type for JSON field access - optimizes field/index parsing
-    #[derive(Debug, Clone)]
-    pub enum KeyType {
-        Field(String),
-        Index(usize),
-    }
-
-    impl KeyType {
-        /// Parse a key string into either a field name or array index (once per operation)
-        pub fn parse(key: &str) -> Self {
-            if let Ok(index) = key.parse::<usize>() {
-                Self::Index(index)
-            } else {
-                Self::Field(key.to_string())
-            }
-        }
-    }
-
     /// Convert ColumnarValue arguments to ArrayRef vector
     ///
     /// Note: This implementation currently broadcasts scalars to arrays.
@@ -132,18 +114,24 @@ mod common {
         }
     }
 
-    /// Get JSON field/element using pre-parsed key type (avoids repeated parsing)
+    /// Get a JSON field or array element by key.
     pub fn get_json_value_by_key(
         raw_jsonb: &jsonb::RawJsonb,
-        key_type: &KeyType,
+        key: &str,
     ) -> Result<Option<jsonb::OwnedJsonb>> {
-        match key_type {
-            KeyType::Field(field) => raw_jsonb
-                .get_by_name(field, false)
-                .map_err(|e| execution_error(format!("Failed to get field '{}': {}", field, e))),
-            KeyType::Index(index) => raw_jsonb.get_by_index(*index).map_err(|e| {
-                execution_error(format!("Failed to get array element [{}]: {}", index, e))
-            }),
+        if raw_jsonb.is_object().unwrap_or(false) {
+            raw_jsonb
+                .get_by_name(key, false)
+                .map_err(|e| execution_error(format!("Failed to get field '{}': {}", key, e)))
+        } else if raw_jsonb.is_array().unwrap_or(false) {
+            match key.parse::<usize>() {
+                Ok(index) => raw_jsonb.get_by_index(index).map_err(|e| {
+                    execution_error(format!("Failed to get array element [{}]: {}", index, e))
+                }),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
         }
     }
 
@@ -537,10 +525,9 @@ fn json_get_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             builder.append_null();
         } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+            match common::get_json_value_by_key(&raw_jsonb, key)? {
                 Some(value) => builder.append_value(value.as_raw().as_ref()),
                 None => builder.append_null(),
             }
@@ -591,10 +578,9 @@ fn json_get_string_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             builder.append_null();
         } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+            match common::get_json_value_by_key(&raw_jsonb, key)? {
                 Some(value) => match json_value_to_string(value)? {
                     Some(string_val) => builder.append_value(&string_val),
                     None => builder.append_null(),
@@ -648,10 +634,9 @@ fn json_get_int_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             builder.append_null();
         } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+            match common::get_json_value_by_key(&raw_jsonb, key)? {
                 Some(value) => match json_value_to_int(value)? {
                     Some(int_val) => builder.append_value(int_val),
                     None => builder.append_null(),
@@ -705,10 +690,9 @@ fn json_get_float_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             builder.append_null();
         } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+            match common::get_json_value_by_key(&raw_jsonb, key)? {
                 Some(value) => match json_value_to_float(value)? {
                     Some(float_val) => builder.append_value(float_val),
                     None => builder.append_null(),
@@ -762,10 +746,9 @@ fn json_get_bool_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
             builder.append_null();
         } else if let Some(key) = common::get_string_value_at(key_array, i) {
             let jsonb_bytes = jsonb_array.value(i);
-            let key_type = common::KeyType::parse(key);
             let raw_jsonb = jsonb::RawJsonb::new(jsonb_bytes);
 
-            match common::get_json_value_by_key(&raw_jsonb, &key_type)? {
+            match common::get_json_value_by_key(&raw_jsonb, key)? {
                 Some(value) => match json_value_to_bool(value)? {
                     Some(bool_val) => builder.append_value(bool_val),
                     None => builder.append_null(),
@@ -1094,28 +1077,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_get_int_udf() -> Result<()> {
-        let json = r#"{"int": 42, "str_num": "99", "bool": true}"#;
+        let json = r#"{"int": 42, "str_num": "99", "bool": true, "0": 7}"#;
         let jsonb_bytes = create_test_jsonb(json);
 
         let mut binary_builder = LargeBinaryBuilder::new();
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
-        binary_builder.append_value(&jsonb_bytes);
+        for _ in 0..4 {
+            binary_builder.append_value(&jsonb_bytes);
+        }
 
         let jsonb_array = Arc::new(binary_builder.finish());
         let key_array = Arc::new(StringArray::from(vec![
             Some("int"),
             Some("str_num"),
             Some("bool"),
+            Some("0"),
         ]));
 
         let result = json_get_int_impl(&[jsonb_array, key_array])?;
         let int_array = result.as_any().downcast_ref::<Int64Array>().unwrap();
 
-        assert_eq!(int_array.len(), 3);
+        assert_eq!(int_array.len(), 4);
         assert_eq!(int_array.value(0), 42);
         assert_eq!(int_array.value(1), 99);
         assert_eq!(int_array.value(2), 1); // jsonb converts true to 1
+        assert_eq!(int_array.value(3), 7);
 
         Ok(())
     }
@@ -1372,6 +1357,34 @@ mod tests {
         assert_eq!(string_array.len(), 3);
         assert_eq!(string_array.value(0), "first");
         assert_eq!(string_array.value(1), "second");
+        assert!(string_array.is_null(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_json_get_numeric_object_key() -> Result<()> {
+        let obj_bytes = create_test_jsonb(r#"{"0": "from_object", "1": 42}"#);
+        let arr_bytes = create_test_jsonb(r#"["zero", "one", "two"]"#);
+
+        let mut binary_builder = LargeBinaryBuilder::new();
+        binary_builder.append_value(&obj_bytes);
+        binary_builder.append_value(&arr_bytes);
+        binary_builder.append_value(&arr_bytes);
+
+        let jsonb_array = Arc::new(binary_builder.finish());
+        let key_array = Arc::new(StringArray::from(vec![
+            Some("0"),   // Numeric key on object: looks up the "0" field.
+            Some("0"),   // Numeric key on array: looks up index 0.
+            Some("foo"), // Non-numeric key on array: no match.
+        ]));
+
+        let result = json_get_string_impl(&[jsonb_array, key_array])?;
+        let string_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "from_object");
+        assert_eq!(string_array.value(1), "zero");
         assert!(string_array.is_null(2));
 
         Ok(())

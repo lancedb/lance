@@ -76,6 +76,47 @@ impl RowIdIndex {
         let address = address_segment.get(pos)?;
         Some(RowAddress::from(address))
     }
+
+    /// Get addresses for many row ids in one pass over the index.
+    ///
+    /// Returns one entry per input id, in input order (`None` for missing).
+    /// Sorts a working copy of the input internally so the chunk iterator
+    /// is advanced at most once per chunk, amortizing the per-id tree walk
+    /// from O(N · log F) to O(F + N).
+    pub fn get_many(&self, row_ids: &[u64]) -> Vec<Option<RowAddress>> {
+        let n = row_ids.len();
+        let mut out = vec![None; n];
+        if n == 0 {
+            return out;
+        }
+
+        let mut sorted: Vec<(u64, usize)> = row_ids.iter().copied().zip(0..n).collect();
+        sorted.sort_unstable_by_key(|&(id, _)| id);
+
+        let mut chunks = self.0.iter().peekable();
+        for (id, orig_idx) in sorted {
+            // Advance past chunks that end before this id.
+            while let Some((range, _)) = chunks.peek() {
+                if *range.end() < id {
+                    chunks.next();
+                } else {
+                    break;
+                }
+            }
+            let Some((range, (row_id_seg, addr_seg))) = chunks.peek() else {
+                break;
+            };
+            if id < *range.start() {
+                continue; // falls in a gap between chunks
+            }
+            if let Some(pos) = row_id_seg.position(id)
+                && let Some(addr) = addr_seg.get(pos)
+            {
+                out[orig_idx] = Some(RowAddress::from(addr));
+            }
+        }
+        out
+    }
 }
 
 impl DeepSizeOf for RowIdIndex {

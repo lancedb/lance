@@ -805,6 +805,28 @@ fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<P
     dict.set_item("batch_count", stats.batch_count)?;
     dict.set_item("estimated_size_bytes", stats.estimated_size)?;
     dict.set_item("generation", stats.generation)?;
+    dict.set_item(
+        "max_buffered_batch_position",
+        stats.max_buffered_batch_position,
+    )?;
+    dict.set_item(
+        "max_flushed_batch_position",
+        stats.max_flushed_batch_position,
+    )?;
+    dict.set_item(
+        "pending_wal_start_batch_position",
+        stats.pending_wal_start_batch_position,
+    )?;
+    dict.set_item(
+        "pending_wal_end_batch_position",
+        stats.pending_wal_end_batch_position,
+    )?;
+    dict.set_item("pending_wal_batch_count", stats.pending_wal_batch_count)?;
+    dict.set_item("pending_wal_row_count", stats.pending_wal_row_count)?;
+    dict.set_item(
+        "pending_wal_estimated_bytes",
+        stats.pending_wal_estimated_bytes,
+    )?;
     Ok(dict.into_any().unbind())
 }
 
@@ -882,5 +904,12 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
         batch_count: 0,
         estimated_size: 0,
         generation: stats_before_close.generation.saturating_add(1),
+        max_buffered_batch_position: None,
+        max_flushed_batch_position: None,
+        pending_wal_start_batch_position: None,
+        pending_wal_end_batch_position: None,
+        pending_wal_batch_count: 0,
+        pending_wal_row_count: 0,
+        pending_wal_estimated_bytes: 0,
     }
 }

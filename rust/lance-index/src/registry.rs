@@ -21,8 +21,12 @@ pub struct IndexPluginRegistry {
 }
 
 impl IndexPluginRegistry {
+    fn normalize_plugin_name(name: &str) -> String {
+        name.to_lowercase()
+    }
+
     fn get_plugin_name_from_details_name(&self, details_name: &str) -> String {
-        let details_name = details_name.to_lowercase();
+        let details_name = Self::normalize_plugin_name(details_name);
         if details_name.ends_with("indexdetails") {
             details_name.replace("indexdetails", "")
         } else {
@@ -75,11 +79,12 @@ impl IndexPluginRegistry {
 
     /// Get an index plugin suitable for training an index with the given parameters
     pub fn get_plugin_by_name(&self, name: &str) -> Result<&dyn ScalarIndexPlugin> {
+        let plugin_name = Self::normalize_plugin_name(name);
         self.plugins
-            .get(name)
+            .get(&plugin_name)
             .map(|plugin| plugin.as_ref())
             .ok_or_else(|| {
-                let hint = if name == "rtree" {
+                let hint = if plugin_name == "rtree" {
                     ". The 'rtree' index requires the `geo` feature. \
                      Rebuild with `--features geo` to enable geospatial support"
                 } else {
@@ -98,5 +103,28 @@ impl IndexPluginRegistry {
         let details_name = details.type_url.split('.').next_back().unwrap();
         let plugin_name = self.get_plugin_name_from_details_name(details_name);
         self.get_plugin_by_name(&plugin_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_plugin_by_name_accepts_case_insensitive_builtin_names() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+
+        for (requested_name, expected_name) in [
+            ("BTREE", "BTree"),
+            ("Bitmap", "Bitmap"),
+            ("INVERTED", "Inverted"),
+            ("NGRAM", "NGram"),
+            ("ZONEMAP", "ZoneMap"),
+            ("BLOOMFILTER", "BloomFilter"),
+            ("JSON", "Json"),
+        ] {
+            let plugin = registry.get_plugin_by_name(requested_name).unwrap();
+            assert_eq!(plugin.name(), expected_name);
+        }
     }
 }

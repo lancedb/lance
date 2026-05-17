@@ -323,12 +323,17 @@ impl U64Segment {
                 }
             }
             Self::RangeWithHoles { range, holes } => {
-                if range.contains(&val) && holes.binary_search(val).is_err() {
-                    let offset = (val - range.start) as usize;
-                    let holes = holes.iter().take_while(|&hole| hole < val).count();
-                    Some(offset - holes)
-                } else {
-                    None
+                if !range.contains(&val) {
+                    return None;
+                }
+                // binary_search returns Err(idx) where idx is the count of holes
+                // strictly less than val (holes are unique and sorted).
+                match holes.binary_search(val) {
+                    Ok(_) => None,
+                    Err(num_holes_before) => {
+                        let offset = (val - range.start) as usize;
+                        Some(offset - num_holes_before)
+                    }
                 }
             }
             Self::RangeWithBitmap { range, bitmap } => {
@@ -351,17 +356,47 @@ impl U64Segment {
                 Some(val) if val < range.end => Some(val),
                 _ => None,
             },
-            Self::RangeWithHoles { range, .. } => {
-                if i >= (range.end - range.start) as usize {
+            Self::RangeWithHoles { range, holes } => {
+                let len = (range.end - range.start) as usize - holes.len();
+                if i >= len {
                     return None;
                 }
-                self.iter().nth(i)
+                // The i-th surviving value v satisfies v = range.start + i + k,
+                // where k = |{h ∈ holes : h < v}|. holes[k] - k is monotone
+                // non-decreasing in k (holes are sorted and unique), so binary
+                // search for the smallest k such that holes[k] - k > range.start + i.
+                let target = range.start + i as u64;
+                let mut lo = 0usize;
+                let mut hi = holes.len();
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let h = holes.get(mid).unwrap();
+                    if h.saturating_sub(mid as u64) > target {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                Some(range.start + i as u64 + lo as u64)
             }
-            Self::RangeWithBitmap { range, .. } => {
-                if i >= (range.end - range.start) as usize {
-                    return None;
+            Self::RangeWithBitmap { range, bitmap } => {
+                // Find the i-th set bit (a "select1") via byte-wise popcount.
+                // Bytes past `bitmap.len()` are zero-padded by construction
+                // (Bitmap::new_full), so popcount counts only valid positions.
+                let mut remaining = i;
+                for (byte_idx, &byte) in bitmap.data.iter().enumerate() {
+                    let ones = byte.count_ones() as usize;
+                    if remaining < ones {
+                        let mut b = byte;
+                        for _ in 0..remaining {
+                            b &= b - 1; // clear lowest set bit
+                        }
+                        let bit = b.trailing_zeros() as usize;
+                        return Some(range.start + (byte_idx * 8 + bit) as u64);
+                    }
+                    remaining -= ones;
                 }
-                self.iter().nth(i)
+                None
             }
             Self::SortedArray(array) => array.get(i),
             Self::Array(array) => array.get(i),

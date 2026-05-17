@@ -1,5 +1,21 @@
 # Lance File Format
 
+The Lance file format is a columnar container optimized for cloud object stores, random access, and Arrow-native processing. It deliberately focuses on page layout and encoding mechanics, while leaving table semantics and search structures to higher layers.
+
+## Design Goals
+
+### No Row Groups
+
+Lance does not use Parquet-style row groups. Each column may have its own number of pages, which keeps column data in large storage-friendly chunks regardless of schema width and avoids coupling scanner partitioning to physical file layout.
+
+### Random-Access-Friendly Encoding
+
+Pages are designed so readers can fetch contiguous row ranges with a small and predictable number of I/O operations. This is important for selective filters, point lookups, vector-search follow-up reads, and ML training workloads that sample rows non-sequentially.
+
+### Functional Decomposition
+
+The file layer does not bundle table-level statistics or query-side indices into the base file structure. Those capabilities are defined as separate index formats so they can evolve independently of the core file container.
+
 ## File Structure
 
 A Lance file is a container for tabular data. The data is stored in "disk pages". Each disk page contains some rows

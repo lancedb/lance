@@ -1253,6 +1253,19 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
+            // Scalar indices have no rebalance concept, so skip them entirely
+            // when every fragment is already covered and the caller hasn't
+            // asked for retrain or an explicit delta merge. Vector indices
+            // fall through and use a rebalance-aware no-op check inside
+            // merge_indices_with_unindexed_frags.
+            if !options.retrain
+                && options.num_indices_to_merge.is_none_or(|n| n == 0)
+                && index_group_is_scalar(self, deltas)
+                && index_group_has_no_unindexed(self, deltas)
+            {
+                continue;
+            }
+
             let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
             else {
                 continue;
@@ -1333,6 +1346,32 @@ impl DatasetIndexExt for Dataset {
             .read_partition(partition_id, with_vector)
             .await
     }
+}
+
+fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+    let Some(field_id) = deltas.first().and_then(|d| d.fields.first()) else {
+        return false;
+    };
+    match dataset.schema().field_by_id(*field_id) {
+        Some(field) => !is_vector_field(field.data_type()),
+        None => false,
+    }
+}
+
+fn index_group_has_no_unindexed(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+    let mut indexed = RoaringBitmap::new();
+    for idx in deltas {
+        if let Some(bitmap) = idx.fragment_bitmap.as_ref() {
+            indexed |= bitmap;
+        } else {
+            // Pre-0.8 indices have no fragment bitmap; treat as needing optimize.
+            return false;
+        }
+    }
+    dataset
+        .fragments()
+        .iter()
+        .all(|frag| indexed.contains(frag.id as u32))
 }
 
 fn sum_indexed_rows_per_delta(indexed_fragments_per_delta: &[Vec<Fragment>]) -> Result<Vec<usize>> {
@@ -3603,6 +3642,133 @@ mod tests {
             }
             assert_indexed_rows(&dataset, num_rows).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_optimize_fts_respects_num_indices_to_merge() {
+        use lance_index::scalar::inverted::query::PhraseQuery;
+
+        async fn append_texts(dataset: &mut Dataset, schema: Arc<Schema>, rows: &[(i32, &str)]) {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(rows.iter().map(|(id, _)| *id))),
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|(_, text)| *text),
+                    )),
+                ],
+            )
+            .unwrap();
+            let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema);
+            dataset.append(batch_iter, None).await.unwrap();
+        }
+
+        async fn num_fts_segments(dataset: &Dataset) -> usize {
+            let stats = dataset.index_statistics("text_idx").await.unwrap();
+            let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+            stats["num_indices"].as_u64().unwrap() as usize
+        }
+
+        async fn assert_fts_ids(
+            dataset: &Dataset,
+            query: FullTextSearchQuery,
+            expected_ids: &[i32],
+        ) {
+            let result = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .full_text_search(query)
+                .unwrap()
+                .limit(Some(20), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(ids, expected_ids);
+        }
+
+        let dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values([0, 1])),
+                Arc::new(StringArray::from_iter_values([
+                    "alpha base phrase",
+                    "beta base phrase",
+                ])),
+            ],
+        )
+        .unwrap();
+        let batch_iterator = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(batch_iterator, &dir, None).await.unwrap();
+        let params = InvertedIndexParams::default().with_position(true);
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        assert_eq!(num_fts_segments(&dataset).await, 1);
+
+        append_texts(&mut dataset, schema.clone(), &[(2, "gamma delta phrase")]).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(num_fts_segments(&dataset).await, 2);
+
+        append_texts(&mut dataset, schema.clone(), &[(3, "epsilon zeta phrase")]).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+        assert_eq!(num_fts_segments(&dataset).await, 2);
+        assert_fts_ids(
+            &dataset,
+            FullTextSearchQuery::new("epsilon".to_owned()),
+            &[3],
+        )
+        .await;
+
+        append_texts(&mut dataset, schema.clone(), &[(4, "eta theta phrase")]).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(num_fts_segments(&dataset).await, 3);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+        assert_eq!(num_fts_segments(&dataset).await, 2);
+        assert_fts_ids(
+            &dataset,
+            FullTextSearchQuery::new_query(PhraseQuery::new("eta theta".to_owned()).into()),
+            &[4],
+        )
+        .await;
+
+        append_texts(&mut dataset, schema, &[(5, "iota kappa phrase")]).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(num_fts_segments(&dataset).await, 3);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(10))
+            .await
+            .unwrap();
+        assert_eq!(num_fts_segments(&dataset).await, 1);
+        assert_fts_ids(&dataset, FullTextSearchQuery::new("alpha".to_owned()), &[0]).await;
+        assert_fts_ids(&dataset, FullTextSearchQuery::new("iota".to_owned()), &[5]).await;
     }
 
     #[tokio::test]

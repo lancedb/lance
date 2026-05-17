@@ -407,7 +407,7 @@ async fn create_dataset(
     // Initialize MemWAL with specified maintained indexes
     dataset
         .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
+            sharding_spec: None,
             maintained_indexes: maintained_indexes.to_vec(),
         })
         .await

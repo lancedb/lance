@@ -744,7 +744,7 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" => {
+        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "shared-memory" => {
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
         #[cfg(not(feature = "dynamodb"))]
@@ -1353,5 +1353,21 @@ mod tests {
         let mut expected_versions = detached_versions.clone();
         expected_versions.sort();
         assert_eq!(found_versions, expected_versions);
+    }
+
+    #[tokio::test]
+    async fn test_commit_handler_from_url_memory_schemes() {
+        // Both `memory://` and `shared-memory://` must route to
+        // ConditionalPutCommitHandler — otherwise concurrent writers fall
+        // through to UnsafeCommitHandler and silently clobber each other's
+        // manifests.
+        for url in ["memory://bucket-a/ds", "shared-memory://bucket-a/ds"] {
+            let handler = commit_handler_from_url(url, &None).await.unwrap();
+            assert_eq!(
+                format!("{:?}", handler),
+                "ConditionalPutCommitHandler",
+                "{url} should route to ConditionalPutCommitHandler",
+            );
+        }
     }
 }

@@ -383,11 +383,16 @@ mod tests {
         let k = ((2 * x.len()) - 1) as f64;
         let k_epsilon = k * T::epsilon().as_();
 
-        if k_epsilon < 1.0 {
-            (k_epsilon * dot) as f32
+        let error = if k_epsilon < 1.0 {
+            k_epsilon * dot
         } else {
-            (2.0 * T::epsilon().as_() * dot) as f32
-        }
+            2.0 * T::epsilon().as_() * dot
+        };
+
+        // Near the subnormal range the analytical error can underflow to zero,
+        // but f32 accumulation can still differ by a few subnormal ULPs.
+        let subnormal_rounding_floor = x.len() as f64 * f64::from(f32::from_bits(1));
+        error.max(subnormal_rounding_floor) as f32
     }
 
     fn do_dot_test<T: Dot + AsPrimitive<f64> + Float>(
