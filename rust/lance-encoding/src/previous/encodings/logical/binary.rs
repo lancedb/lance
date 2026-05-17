@@ -174,7 +174,7 @@ impl BinaryArrayDecoder {
     /// Falls back to LargeUtf8 / LargeBinary if the data exceeds the i32 offset limit.
     fn from_large_list_to_small<T: ByteArrayType<Offset = i32>>(
         array: &GenericListArray<i64>,
-    ) -> ArrayRef {
+    ) -> Result<ArrayRef> {
         let values = array
             .values()
             .as_primitive::<UInt8Type>()
@@ -189,20 +189,24 @@ impl BinaryArrayDecoder {
             // Safe to downcast to i32 offsets
             let small: Vec<i32> = large_offsets.iter().map(|&o| o as i32).collect();
             let offsets = arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(small));
-            Arc::new(GenericByteArray::<T>::new(
+            Ok(Arc::new(GenericByteArray::<T>::new(
                 offsets,
                 values,
                 array.nulls().cloned(),
-            ))
+            )))
         } else {
             // Data exceeds 2GB -- cannot fit in i32 offsets.
             // This should not happen in practice because the batch-size feedback
             // loop limits batch sizes, but if it does we return a clear error.
-            panic!(
-                "A single batch of variable-length data exceeded 2 GiB ({} bytes). \
-                 Use LargeUtf8 / LargeBinary in your schema, or reduce the batch size.",
-                last_offset
-            );
+            Err(lance_core::Error::InvalidInput {
+                source: format!(
+                    "A single batch of variable-length data exceeded 2 GiB ({} bytes). \
+                     Use LargeUtf8 / LargeBinary in your schema, or reduce the batch size.",
+                    last_offset
+                )
+                .into(),
+                location: lance_core::location!(),
+            })
         }
     }
 }
@@ -215,7 +219,7 @@ impl DecodeArrayTask for BinaryArrayDecoder {
             DataType::Binary => {
                 // Internal representation is always LargeList (i64 offsets) now
                 if arr.data_type() == &DataType::LargeList(Arc::new(arrow_schema::Field::new("item", DataType::UInt8, false))) {
-                    Self::from_large_list_to_small::<BinaryType>(arr.as_list::<i64>())
+                    Self::from_large_list_to_small::<BinaryType>(arr.as_list::<i64>())?
                 } else {
                     Self::from_list_array::<BinaryType>(arr.as_list::<i32>())
                 }
@@ -223,13 +227,16 @@ impl DecodeArrayTask for BinaryArrayDecoder {
             DataType::LargeBinary => Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>()),
             DataType::Utf8 => {
                 if arr.data_type() == &DataType::LargeList(Arc::new(arrow_schema::Field::new("item", DataType::UInt8, false))) {
-                    Self::from_large_list_to_small::<Utf8Type>(arr.as_list::<i64>())
+                    Self::from_large_list_to_small::<Utf8Type>(arr.as_list::<i64>())?
                 } else {
                     Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())
                 }
             }
             DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
-            _ => panic!("Binary decoder does not support this data type"),
+            _ => return Err(lance_core::Error::Internal {
+                message: "Binary decoder does not support this data type".to_string(),
+                location: lance_core::location!(),
+            }),
         };
         // data_size is only tracked in the v2.1 structural decode path; the legacy
         // v2.0 path does not need it so we return 0.
