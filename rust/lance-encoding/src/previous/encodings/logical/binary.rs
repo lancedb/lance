@@ -229,9 +229,11 @@ impl DecodeArrayTask for BinaryArrayDecoder {
                 }
             }
             DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
-            _ => return Err(lance_core::Error::internal(
-                "Binary decoder does not support this data type",
-            )),
+            _ => {
+                return Err(lance_core::Error::internal(
+                    "Binary decoder does not support this data type",
+                ))
+            }
         };
         // data_size is only tracked in the v2.1 structural decode path; the legacy
         // v2.0 path does not need it so we return 0.
