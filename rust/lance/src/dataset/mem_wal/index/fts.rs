@@ -1923,6 +1923,65 @@ fn block_len(doc_count: u32, b: u32) -> usize {
     (doc_count as usize - b as usize * POSTING_BLOCK).min(POSTING_BLOCK)
 }
 
+/// Bit width needed to represent `v` (0 for `v == 0`).
+fn bit_width(v: u32) -> u8 {
+    (32 - v.leading_zeros()) as u8
+}
+
+/// Pack `values` (each `< 2^width`) into `buf` as little-endian `width`-bit
+/// fields. `width == 0` writes nothing.
+fn bitpack_put(buf: &mut Vec<u8>, values: &[u32], width: u8) {
+    if width == 0 {
+        return;
+    }
+    let mut acc: u64 = 0;
+    let mut bits: u32 = 0;
+    for &v in values {
+        acc |= (v as u64) << bits;
+        bits += width as u32;
+        while bits >= 8 {
+            buf.push(acc as u8);
+            acc >>= 8;
+            bits -= 8;
+        }
+    }
+    if bits > 0 {
+        buf.push(acc as u8);
+    }
+}
+
+/// Unpack `n` little-endian `width`-bit values starting at `buf[start]`,
+/// appending them to `out`.
+fn bitpack_get(buf: &[u8], start: usize, n: usize, width: u8, out: &mut Vec<u32>) {
+    if width == 0 {
+        out.resize(out.len() + n, 0);
+        return;
+    }
+    let mask: u64 = if width >= 32 {
+        u32::MAX as u64
+    } else {
+        (1u64 << width) - 1
+    };
+    let mut acc: u64 = 0;
+    let mut bits: u32 = 0;
+    let mut byte = start;
+    for _ in 0..n {
+        while bits < width as u32 {
+            acc |= (buf[byte] as u64) << bits;
+            byte += 1;
+            bits += 8;
+        }
+        out.push((acc & mask) as u32);
+        acc >>= width;
+        bits -= width as u32;
+    }
+}
+
+/// Number of bytes a `bitpack_put` of `n` values of `width` bits occupies.
+fn bitpack_len(n: usize, width: u8) -> usize {
+    (n * width as usize).div_ceil(8)
+}
+
 /// Per-128-doc-block metadata — enough to skip and score-bound a block
 /// without decoding its payload.
 #[derive(Clone, Copy)]
@@ -1934,6 +1993,9 @@ struct BlockMeta {
     df_offset: u32,
     /// start offset of the block's position payload in `pos_data`.
     pos_offset: u32,
+    /// bit width of the packed doc-id deltas (from `first_doc`) and freqs.
+    doc_width: u8,
+    freq_width: u8,
 }
 
 /// Per-term locator into a partition's shared posting buffers.
@@ -1990,19 +2052,18 @@ fn build_partition(
         for chunk in docs_for_term.chunks(POSTING_BLOCK) {
             let df_offset = doc_freq_data.len() as u32;
             let pos_offset = pos_data.len() as u32;
-            // doc-id gaps for docs[1..] (docs[0] is `first_doc`).
-            let mut prev = chunk[0].0;
-            for &(d, _, _) in &chunk[1..] {
-                vbyte_put(&mut doc_freq_data, d - prev);
-                prev = d;
-            }
-            // frequencies.
-            let mut blk_max_freq = 0u32;
-            for &(_, f, _) in chunk {
-                vbyte_put(&mut doc_freq_data, f);
-                blk_max_freq = blk_max_freq.max(f);
-            }
-            // positions: count + delta-encoded positions per doc.
+            let first_doc = chunk[0].0;
+            let last_doc = chunk[chunk.len() - 1].0;
+            // doc ids: bit-pack `doc - first_doc` at a fixed block width.
+            let doc_width = bit_width(last_doc - first_doc);
+            let doc_deltas: Vec<u32> = chunk.iter().map(|&(d, _, _)| d - first_doc).collect();
+            bitpack_put(&mut doc_freq_data, &doc_deltas, doc_width);
+            // frequencies: bit-pack at a fixed block width.
+            let blk_max_freq = chunk.iter().map(|&(_, f, _)| f).max().unwrap_or(0);
+            let freq_width = bit_width(blk_max_freq);
+            let freqs: Vec<u32> = chunk.iter().map(|&(_, f, _)| f).collect();
+            bitpack_put(&mut doc_freq_data, &freqs, freq_width);
+            // positions: VByte count + delta-encoded positions per doc.
             for &(d, _, ref positions) in chunk {
                 vbyte_put(&mut pos_data, positions.len() as u32);
                 let mut prev_p = 0u32;
@@ -2013,10 +2074,12 @@ fn build_partition(
                 term_min_dl = term_min_dl.min(docs.num_tokens(d));
             }
             block_meta.push(BlockMeta {
-                first_doc: chunk[0].0,
-                last_doc: chunk[chunk.len() - 1].0,
+                first_doc,
+                last_doc,
                 df_offset,
                 pos_offset,
+                doc_width,
+                freq_width,
             });
             term_max_freq = term_max_freq.max(blk_max_freq);
         }
@@ -2439,17 +2502,27 @@ impl<'a> PostingCursor<'a> {
         let n = block_len(self.pref.doc_count, block);
         self.docs.clear();
         self.freqs.clear();
-        let mut pos = bm.df_offset as usize;
-        let mut d = bm.first_doc;
-        self.docs.push(d);
-        for _ in 1..n {
-            d += vbyte_get(&self.part.doc_freq_data, &mut pos);
-            self.docs.push(d);
+        // doc ids: bit-packed `doc - first_doc`.
+        let df_start = bm.df_offset as usize;
+        bitpack_get(
+            &self.part.doc_freq_data,
+            df_start,
+            n,
+            bm.doc_width,
+            &mut self.docs,
+        );
+        for d in &mut self.docs {
+            *d += bm.first_doc;
         }
-        for _ in 0..n {
-            self.freqs
-                .push(vbyte_get(&self.part.doc_freq_data, &mut pos));
-        }
+        // frequencies follow the doc-id block.
+        let freq_start = df_start + bitpack_len(n, bm.doc_width);
+        bitpack_get(
+            &self.part.doc_freq_data,
+            freq_start,
+            n,
+            bm.freq_width,
+            &mut self.freqs,
+        );
         self.decoded = block;
     }
 
@@ -3879,6 +3952,31 @@ mod tests {
             assert_eq!(vbyte_get(&buf, &mut pos), v);
         }
         assert_eq!(pos, buf.len(), "every byte consumed");
+    }
+
+    #[test]
+    fn test_bitpack_roundtrip() {
+        // Cover width 0 (all-zero), sub-byte, byte-crossing, and full widths.
+        let cases: [(Vec<u32>, u8); 6] = [
+            (vec![0u32; 5], 0),
+            (vec![0, 1, 0, 1, 1, 0, 1], 1),
+            (vec![3, 0, 7, 5, 2, 6, 1, 4], 3),
+            (vec![200, 17, 255, 0, 130], 8),
+            (vec![1000, 5, 65535, 42], 16),
+            (vec![1, u32::MAX, 0, 123_456_789], 32),
+        ];
+        for (values, width) in &cases {
+            let mut buf = Vec::new();
+            bitpack_put(&mut buf, values, *width);
+            assert_eq!(
+                buf.len(),
+                bitpack_len(values.len(), *width),
+                "width={width}"
+            );
+            let mut out = Vec::new();
+            bitpack_get(&buf, 0, values.len(), *width, &mut out);
+            assert_eq!(&out, values, "width={width}");
+        }
     }
 
     #[test]
