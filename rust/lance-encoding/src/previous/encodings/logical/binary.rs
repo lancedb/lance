@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, GenericByteArray, GenericListArray,
+    Array, ArrayRef, GenericByteArray, GenericListArray, OffsetSizeTrait,
     cast::AsArray,
     types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, UInt8Type, Utf8Type},
 };
@@ -152,7 +152,10 @@ pub struct BinaryArrayDecoder {
 }
 
 impl BinaryArrayDecoder {
-    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> ArrayRef {
+    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> ArrayRef
+    where
+        T::Offset: OffsetSizeTrait,
+    {
         let values = array
             .values()
             .as_primitive::<UInt8Type>()
@@ -166,6 +169,42 @@ impl BinaryArrayDecoder {
             array.nulls().cloned(),
         ))
     }
+
+    /// Convert a LargeList (i64 offsets) array to a small-offset byte array (Utf8 / Binary).
+    /// Falls back to LargeUtf8 / LargeBinary if the data exceeds the i32 offset limit.
+    fn from_large_list_to_small<T: ByteArrayType<Offset = i32>>(
+        array: &GenericListArray<i64>,
+    ) -> ArrayRef {
+        let values = array
+            .values()
+            .as_primitive::<UInt8Type>()
+            .values()
+            .inner()
+            .clone();
+        let large_offsets = array.offsets();
+
+        // Check if the offsets fit in i32
+        let last_offset = large_offsets[large_offsets.len() - 1];
+        if last_offset <= i32::MAX as i64 {
+            // Safe to downcast to i32 offsets
+            let small: Vec<i32> = large_offsets.iter().map(|&o| o as i32).collect();
+            let offsets = arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(small));
+            Arc::new(GenericByteArray::<T>::new(
+                offsets,
+                values,
+                array.nulls().cloned(),
+            ))
+        } else {
+            // Data exceeds 2GB -- cannot fit in i32 offsets.
+            // This should not happen in practice because the batch-size feedback
+            // loop limits batch sizes, but if it does we return a clear error.
+            panic!(
+                "A single batch of variable-length data exceeded 2 GiB ({} bytes). \
+                 Use LargeUtf8 / LargeBinary in your schema, or reduce the batch size.",
+                last_offset
+            );
+        }
+    }
 }
 
 impl DecodeArrayTask for BinaryArrayDecoder {
@@ -173,9 +212,22 @@ impl DecodeArrayTask for BinaryArrayDecoder {
         let data_type = self.data_type;
         let (arr, _) = self.inner.decode()?;
         let result = match data_type {
-            DataType::Binary => Self::from_list_array::<BinaryType>(arr.as_list::<i32>()),
+            DataType::Binary => {
+                // Internal representation is always LargeList (i64 offsets) now
+                if arr.data_type() == &DataType::LargeList(Arc::new(arrow_schema::Field::new("item", DataType::UInt8, false))) {
+                    Self::from_large_list_to_small::<BinaryType>(arr.as_list::<i64>())
+                } else {
+                    Self::from_list_array::<BinaryType>(arr.as_list::<i32>())
+                }
+            }
             DataType::LargeBinary => Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>()),
-            DataType::Utf8 => Self::from_list_array::<Utf8Type>(arr.as_list::<i32>()),
+            DataType::Utf8 => {
+                if arr.data_type() == &DataType::LargeList(Arc::new(arrow_schema::Field::new("item", DataType::UInt8, false))) {
+                    Self::from_large_list_to_small::<Utf8Type>(arr.as_list::<i64>())
+                } else {
+                    Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())
+                }
+            }
             DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
             _ => panic!("Binary decoder does not support this data type"),
         };
