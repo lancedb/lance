@@ -203,11 +203,9 @@ impl LogicalPageDecoder for BlobFieldDecoder {
                 .zip(sizes.iter())
                 .map(|(p, s)| *p != 1 || *s != 0)
                 .collect::<BooleanBuffer>();
-            // Issue the I/O before committing any decoder state.  If the
-            // request fails (e.g. cloud storage returns HTTP 503), this is the
-            // single, meaningful point of failure: the error propagates and
-            // the decoder is left untouched -- never half-advanced into a
-            // state where a later drain would read rows that never loaded.
+            // Run the I/O before mutating decoder state, so a failed load
+            // leaves the decoder untouched and `wait_for_loaded` is the single,
+            // clean point of failure.
             let bytes = self
                 .io
                 .submit_request(ranges, self.base_priority + start as u64)
@@ -234,9 +232,9 @@ impl LogicalPageDecoder for BlobFieldDecoder {
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         if num_rows as usize > self.loaded.len() {
-            // This should not happen, but if the blob data failed to load we
-            // would rather surface a clean error than panic on an
-            // out-of-bounds drain.
+            // `loaded` is populated by `wait_for_loaded`; guard the
+            // load-before-drain contract so a violation surfaces as an error
+            // rather than an out-of-bounds drain panic.
             return Err(Error::internal(format!(
                 "BlobFieldDecoder was asked to drain {num_rows} rows but only \
                  {} are loaded",
@@ -405,17 +403,22 @@ impl FieldEncoder for BlobFieldEncoder {
 mod tests {
     use std::{
         collections::{HashMap, VecDeque},
+        ops::Range,
         sync::{Arc, LazyLock},
     };
 
-    use arrow_array::LargeBinaryArray;
+    use arrow_array::{LargeBinaryArray, PrimitiveArray, types::UInt64Type};
     use arrow_schema::{DataType, Field};
+    use bytes::Bytes;
+    use futures::{FutureExt, future::BoxFuture};
     use lance_arrow::BLOB_META_KEY;
     use lance_core::{Error, Result};
 
     use super::BlobFieldDecoder;
     use crate::{
+        EncodingsIo,
         format::pb::column_encoding,
+        previous::decoder::LogicalPageDecoder,
         testing::{TestCases, check_round_trip_encoding_of_data, check_specific_random},
         version::LanceFileVersion,
     };
@@ -477,47 +480,40 @@ mod tests {
         check_round_trip_encoding_of_data(vec![array], &test_cases, Default::default()).await;
     }
 
-    /// An `EncodingsIo` that simulates cloud storage rejecting every request
-    /// with a retryable error (e.g. an exhausted HTTP 503 retry budget).
+    /// An `EncodingsIo` that rejects every request, simulating cloud storage
+    /// returning a retryable error (e.g. an exhausted HTTP 503 retry budget).
     #[derive(Debug)]
     struct FailingScheduler;
 
-    impl crate::EncodingsIo for FailingScheduler {
+    impl EncodingsIo for FailingScheduler {
         fn submit_request(
             &self,
-            _ranges: Vec<std::ops::Range<u64>>,
+            _ranges: Vec<Range<u64>>,
             _priority: u64,
-        ) -> futures::future::BoxFuture<'static, Result<Vec<bytes::Bytes>>> {
-            use futures::FutureExt;
+        ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
             std::future::ready(Err(Error::io("simulated HTTP 503 from cloud storage"))).boxed()
         }
     }
 
-    /// When the blob data download fails (e.g. sustained HTTP 503), the
-    /// decoder's `loaded` buffer is left empty.  A subsequent `drain` must
-    /// surface a clean error rather than panic on an out-of-bounds VecDeque
-    /// drain ("range end index N out of range for slice of length 0").
+    /// A failed blob load must surface through `wait_for_loaded` and leave the
+    /// decoder untouched -- never half-advanced into a state where a later
+    /// `drain` reads rows that never loaded (which panicked with "range end
+    /// index N out of range for slice of length 0").
     #[test_log::test(tokio::test)]
-    async fn test_drain_after_io_failure_does_not_panic() {
-        use arrow_array::{PrimitiveArray, types::UInt64Type};
-
-        use crate::previous::decoder::LogicalPageDecoder;
-
-        let num_rows = 16_384u64;
-        // Every row points at a non-empty blob so `wait_for_loaded` issues an
-        // I/O request, which the failing scheduler rejects.
-        let positions =
-            PrimitiveArray::<UInt64Type>::from_iter_values((0..num_rows).map(|i| 1_000 + i * 10));
-        let sizes = PrimitiveArray::<UInt64Type>::from_iter_values(std::iter::repeat_n(
-            10u64,
+    async fn test_io_failure_leaves_blob_decoder_consistent() {
+        let num_rows = 8u64;
+        // `positions`/`sizes` only need `num_rows` entries; the failing
+        // scheduler rejects the request regardless of the ranges it is given.
+        let descs = PrimitiveArray::<UInt64Type>::from_iter_values(std::iter::repeat_n(
+            0u64,
             num_rows as usize,
         ));
 
         let mut decoder = BlobFieldDecoder {
-            io: Arc::new(FailingScheduler) as Arc<dyn crate::EncodingsIo>,
+            io: Arc::new(FailingScheduler),
             unloaded_descriptions: None,
-            positions,
-            sizes,
+            positions: descs.clone(),
+            sizes: descs,
             num_rows,
             loaded: VecDeque::new(),
             validity: VecDeque::new(),
@@ -526,35 +522,15 @@ mod tests {
             base_priority: 0,
         };
 
-        // The failed download must propagate as an error: `wait_for_loaded`
-        // is the single, meaningful point of failure.
-        let load_result = decoder.wait_for_loaded(num_rows - 1).await;
-        assert!(
-            load_result.is_err(),
-            "wait_for_loaded should propagate the I/O failure"
-        );
+        // `wait_for_loaded` propagates the I/O failure...
+        assert!(decoder.wait_for_loaded(num_rows - 1).await.is_err());
 
-        // A failed load must leave the decoder state untouched -- not
-        // half-advanced -- so no later step can read rows that never loaded.
-        assert_eq!(
-            decoder.rows_loaded, 0,
-            "rows_loaded must not advance when the load fails"
-        );
-        assert!(
-            decoder.loaded.is_empty(),
-            "no blob bytes should be buffered after a failed load"
-        );
-        assert!(
-            decoder.validity.is_empty(),
-            "no validity should be buffered after a failed load"
-        );
+        // ...and leaves no half-loaded state behind.
+        assert_eq!(decoder.rows_loaded, 0);
+        assert!(decoder.loaded.is_empty());
+        assert!(decoder.validity.is_empty());
 
-        // Belt-and-suspenders: even if a drain is somehow reached in this
-        // state it must error, not panic on an out-of-bounds VecDeque drain.
-        let drain_result = decoder.drain(num_rows);
-        assert!(
-            drain_result.is_err(),
-            "drain after a failed load should error, not panic"
-        );
+        // A drain in this state errors instead of panicking on the empty buffer.
+        assert!(decoder.drain(num_rows).is_err());
     }
 }
