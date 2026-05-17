@@ -624,31 +624,6 @@ mod tests {
             );
         }
 
-        // Non-matching values must not be treated as a PK marker, so the
-        // field never becomes part of the primary key.
-        {
-            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
-            let mut dataset = fresh_dataset(tmp_dir.as_str()).await;
-            for falsy in ["no", "false", "0", "anything-else"] {
-                dataset
-                    .update_field_metadata()
-                    .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, falsy)])
-                    .unwrap()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    dataset
-                        .schema()
-                        .field("name")
-                        .unwrap()
-                        .unenforced_primary_key_position,
-                    None,
-                    "value {:?} should not be treated as a PK marker",
-                    falsy
-                );
-            }
-        }
-
         // A non-numeric position value must fall back to the boolean-flag
         // path, not panic on parse.
         {
@@ -680,8 +655,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_unenforced_primary_key_is_immutable() {
-        // The unenforced primary key cannot be changed once set: a commit
-        // that would alter the set of primary key columns is rejected.
+        // Once set, the unenforced primary key cannot be changed, re-set, or
+        // removed: any commit that writes its reserved metadata keys, or that
+        // alters the set of primary key columns, is rejected.
         use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 
         let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
@@ -714,15 +690,15 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.schema().unenforced_primary_key().len(), 1);
 
-        // Re-applying the identical primary key is a no-op and allowed; this
-        // keeps conflict retries, which re-apply the same transaction, safe.
-        dataset
+        // Re-applying the primary key, even to the identical column, is
+        // rejected: the reserved key cannot be written once a key is set.
+        let err = dataset
             .update_field_metadata()
             .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
             .unwrap()
             .await
-            .unwrap();
-        assert_eq!(dataset.schema().unenforced_primary_key().len(), 1);
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
 
         // Adding a second primary key column is rejected.
         let err = dataset
@@ -746,6 +722,49 @@ mod tests {
         let pk = dataset.schema().unenforced_primary_key();
         assert_eq!(pk.len(), 1);
         assert_eq!(pk[0].name, "id");
+    }
+
+    #[tokio::test]
+    async fn test_unenforced_primary_key_rejects_invalid_marker() {
+        // Writing a reserved primary key metadata key with a value that is not
+        // a valid marker (e.g. a non-truthy flag) is rejected rather than
+        // silently ignored.
+        use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            tmp_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        for invalid in ["no", "false", "0", "anything-else"] {
+            let err = dataset
+                .update_field_metadata()
+                .replace("id", [(LANCE_UNENFORCED_PRIMARY_KEY, invalid)])
+                .unwrap()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "value {:?}: got {:?}",
+                invalid,
+                err
+            );
+            assert!(dataset.schema().unenforced_primary_key().is_empty());
+        }
     }
 
     #[tokio::test]
