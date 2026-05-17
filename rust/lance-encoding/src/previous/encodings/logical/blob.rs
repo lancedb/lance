@@ -228,6 +228,16 @@ impl LogicalPageDecoder for BlobFieldDecoder {
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        if num_rows as usize > self.loaded.len() {
+            // This should not happen, but if the blob data failed to load we
+            // would rather surface a clean error than panic on an
+            // out-of-bounds drain.
+            return Err(Error::internal(format!(
+                "BlobFieldDecoder was asked to drain {num_rows} rows but only \
+                 {} are loaded",
+                self.loaded.len(),
+            )));
+        }
         let bytes = self.loaded.drain(0..num_rows as usize).collect::<Vec<_>>();
         let validity = self.drain_validity(num_rows as usize)?;
         self.rows_drained += num_rows;

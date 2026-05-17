@@ -440,7 +440,17 @@ impl BlobPageDecoder {
 
 impl StructuralPageDecoder for BlobPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
-        let blobs = self.blobs.drain(0..num_rows as usize).collect::<Vec<_>>();
+        let num_rows = num_rows as usize;
+        if num_rows > self.blobs.len() {
+            // This should not happen, but if a page failed to load we would
+            // rather surface a clean error than panic on an out-of-bounds drain.
+            return Err(Error::internal(format!(
+                "BlobPageDecoder was asked to drain {num_rows} rows but only \
+                 {} are available",
+                self.blobs.len(),
+            )));
+        }
+        let blobs = self.blobs.drain(0..num_rows).collect::<Vec<_>>();
         Ok(Box::new(BlobDecodePageTask::new(
             blobs,
             self.def_meaning.clone(),
@@ -516,5 +526,21 @@ impl DecodePageTask for BlobDecodePageTask {
             data: data_block,
             repdef: RepDefUnraveler::new(rep, def, self.def_meaning, num_values),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_beyond_available_errors_instead_of_panicking() {
+        // A blob page whose data failed to load has no blobs.  Draining it
+        // must surface a clean error rather than panic on an out-of-bounds
+        // VecDeque drain.
+        let def_meaning: Arc<[DefinitionInterpretation]> =
+            Arc::from(vec![DefinitionInterpretation::AllValidItem]);
+        let mut decoder = BlobPageDecoder::new(Vec::new(), def_meaning);
+        assert!(decoder.drain(16384).is_err());
     }
 }
