@@ -307,6 +307,13 @@ pub struct MemWalIndexDetails {
     pub maintained_indexes: Vec<String>,
     pub merged_generations: Vec<MergedGeneration>,
     pub index_catchup: Vec<IndexCatchupProgress>,
+    /// Default `ShardWriter` configuration values for this MemWAL index.
+    ///
+    /// Persisted so every writer — across processes and restarts — starts
+    /// from the same default writer configuration. These are defaults only;
+    /// an individual writer may still override any value at runtime in its
+    /// own (non-persisted) `ShardWriterConfig`.
+    pub writer_defaults: HashMap<String, String>,
 }
 
 impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
@@ -323,6 +330,7 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
                 .map(|mg| mg.into())
                 .collect(),
             index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
+            writer_defaults: details.writer_defaults.clone(),
         }
     }
 }
@@ -351,6 +359,7 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .into_iter()
                 .map(IndexCatchupProgress::try_from)
                 .collect::<lance_core::Result<_>>()?,
+            writer_defaults: details.writer_defaults,
         })
     }
 }

@@ -313,6 +313,7 @@ async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::
         .await?;
     dataset
         .initialize_mem_wal(MemWalConfig {
+            writer_defaults: Default::default(),
             sharding_spec: None,
             maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
         })

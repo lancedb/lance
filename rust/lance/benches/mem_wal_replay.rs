@@ -157,6 +157,7 @@ async fn setup_dataset(schema: &Arc<ArrowSchema>, name: &str, dataset_prefix: &s
 
     dataset
         .initialize_mem_wal(MemWalConfig {
+            writer_defaults: Default::default(),
             sharding_spec: None,
             maintained_indexes: vec![],
         })

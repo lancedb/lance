@@ -4071,6 +4071,42 @@ mod shard_writer_tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn test_initialize_mem_wal_records_writer_defaults() {
+        let vector_dim = 128;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_writer_defaults_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        let writer_defaults = std::collections::HashMap::from([
+            ("max_wal_buffer_size".to_string(), "8388608".to_string()),
+            ("durable_write".to_string(), "true".to_string()),
+        ]);
+
+        dataset
+            .initialize_mem_wal(MemWalConfig {
+                writer_defaults: writer_defaults.clone(),
+                sharding_spec: None,
+                maintained_indexes: vec![],
+            })
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        // Defaults must survive the manifest round-trip so all writers share them.
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .expect("Failed to read MemWAL index details")
+            .expect("MemWAL index details should exist");
+
+        assert_eq!(details.writer_defaults, writer_defaults);
+    }
+
     /// Quick smoke test for shard writer - runs against memory://
     /// Run with: cargo test -p lance shard_writer_tests::test_shard_writer_smoke -- --nocapture
     #[tokio::test]
@@ -4092,6 +4128,7 @@ mod shard_writer_tests {
         // Initialize MemWAL (no indexes for smoke test)
         dataset
             .initialize_mem_wal(MemWalConfig {
+                writer_defaults: Default::default(),
                 sharding_spec: None,
                 maintained_indexes: vec![],
             })
@@ -4149,6 +4186,7 @@ mod shard_writer_tests {
 
         dataset
             .initialize_mem_wal(MemWalConfig {
+                writer_defaults: Default::default(),
                 sharding_spec: None,
                 maintained_indexes: vec!["vector_idx".to_string()],
             })
@@ -4290,6 +4328,7 @@ mod shard_writer_tests {
         // Initialize MemWAL with all three indexes
         dataset
             .initialize_mem_wal(MemWalConfig {
+                writer_defaults: Default::default(),
                 sharding_spec: None,
                 maintained_indexes: vec![
                     "id_btree".to_string(),
@@ -4372,6 +4411,7 @@ mod shard_writer_tests {
         // Initialize MemWAL with BTree index only (simpler for this test)
         dataset
             .initialize_mem_wal(MemWalConfig {
+                writer_defaults: Default::default(),
                 sharding_spec: None,
                 maintained_indexes: vec!["id_btree".to_string()],
             })

@@ -3187,6 +3187,7 @@ impl Dataset {
         };
 
         let config = lance::dataset::mem_wal::MemWalConfig {
+            writer_defaults: Default::default(),
             sharding_spec: region_spec_rust,
             maintained_indexes: maintained_indexes.unwrap_or_default(),
         };

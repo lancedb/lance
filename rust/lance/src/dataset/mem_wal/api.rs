@@ -6,6 +6,7 @@
 //! This module provides the user-facing API for initializing and using MemWAL
 //! on a Dataset.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::index::DatasetIndexExt;
@@ -37,6 +38,10 @@ pub struct MemWalConfig {
     /// Index names to maintain in MemTables.
     /// These must reference indexes already defined on the base table.
     pub maintained_indexes: Vec<String>,
+    /// Default `ShardWriter` configuration values to record in the MemWAL
+    /// index, so every writer starts from the same defaults. Empty means no
+    /// defaults are recorded.
+    pub writer_defaults: HashMap<String, String>,
 }
 
 /// Shard initialization options for MemWAL.
@@ -287,6 +292,7 @@ async fn initialize_mem_wal_impl(
         inline_snapshots: None,
         sharding_specs: config.sharding_spec.into_iter().collect(),
         maintained_indexes: config.maintained_indexes,
+        writer_defaults: config.writer_defaults,
         ..Default::default()
     };
 

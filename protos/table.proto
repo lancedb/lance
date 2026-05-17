@@ -673,6 +673,15 @@ message MemWalIndexDetails {
   //
   // If an index is not present in this list, it is assumed to be fully caught up.
   repeated IndexCatchupProgress index_catchup = 10;
+
+  // Default ShardWriter configuration values for this MemWAL index.
+  //
+  // A free-form string map persisted so that every writer — across
+  // processes and restarts — starts from the same default writer
+  // configuration. These are defaults only: an individual writer may
+  // still override any value at runtime in its own ShardWriterConfig
+  // (which is not persisted).
+  map<string, string> writer_defaults = 11;
 }
 
 // Sharding spec definition.
