@@ -40,7 +40,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -282,15 +282,13 @@ async fn run(args: Args) -> Result<()> {
     let index_setup_s = index_start.elapsed().as_secs_f64();
 
     dataset
-        .initialize_mem_wal(MemWalConfig {
-            writer_defaults: Default::default(),
-            sharding_spec: None,
-            maintained_indexes: if args.mode.indexed() {
-                vec![VECTOR_INDEX_NAME.to_string()]
-            } else {
-                vec![]
-            },
+        .initialize_mem_wal()
+        .maintained_indexes(if args.mode.indexed() {
+            vec![VECTOR_INDEX_NAME.to_string()]
+        } else {
+            vec![]
         })
+        .execute()
         .await?;
 
     let shard_id = Uuid::new_v4();

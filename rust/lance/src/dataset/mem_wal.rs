@@ -42,7 +42,7 @@ pub mod util;
 mod wal;
 pub mod write;
 
-pub use api::{DatasetMemWalExt, MemWalConfig, MemWalShardConfig};
+pub use api::{DatasetMemWalExt, InitializeMemWalBuilder};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};

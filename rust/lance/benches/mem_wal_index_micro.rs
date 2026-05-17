@@ -39,7 +39,7 @@ use lance::dataset::mem_wal::write::{
     HnswIndexConfig, IndexStore, MemIndexConfig, MemTable, MemTableFlusher, MemTableScanner,
     ShardWriterConfig,
 };
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardManifestStore};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -187,11 +187,9 @@ async fn main() -> lance_core::Result<()> {
 
     let mut dataset = build_base_dataset(&uri, dim).await?;
     dataset
-        .initialize_mem_wal(MemWalConfig {
-            writer_defaults: Default::default(),
-            sharding_spec: None,
-            maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
-        })
+        .initialize_mem_wal()
+        .maintained_indexes([VECTOR_INDEX_NAME])
+        .execute()
         .await?;
     let dataset = Arc::new(dataset);
 

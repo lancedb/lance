@@ -3152,49 +3152,23 @@ impl Dataset {
     /// Must be called once before any `mem_wal_writer()` calls.
     /// Requires the dataset schema to have at least one field with
     /// the `lance-schema:unenforced-primary-key` metadata.
-    #[pyo3(signature=(maintained_indexes=None, region_spec=None))]
+    #[pyo3(signature=(maintained_indexes=None))]
     fn initialize_mem_wal(
         &mut self,
         py: Python<'_>,
         maintained_indexes: Option<Vec<String>>,
-        region_spec: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
-        use lance_index::mem_wal::{ShardingField as RegionField, ShardingSpec as RegionSpec};
-        use std::collections::HashMap;
 
-        let region_spec_rust = if let Some(spec) = region_spec {
-            let spec_id: u32 = spec.getattr("spec_id")?.extract()?;
-            let fields_py: Vec<Bound<'_, PyAny>> = spec.getattr("fields")?.extract()?;
-            let fields = fields_py
-                .iter()
-                .map(|f| -> PyResult<RegionField> {
-                    Ok(RegionField {
-                        field_id: f.getattr("field_id")?.extract()?,
-                        source_ids: f.getattr("source_ids")?.extract()?,
-                        transform: f.getattr("transform")?.extract()?,
-                        expression: f.getattr("expression")?.extract()?,
-                        result_type: f.getattr("result_type")?.extract()?,
-                        parameters: f
-                            .getattr("parameters")?
-                            .extract::<HashMap<String, String>>()?,
-                    })
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            Some(RegionSpec { spec_id, fields })
-        } else {
-            None
-        };
-
-        let config = lance::dataset::mem_wal::MemWalConfig {
-            writer_defaults: Default::default(),
-            sharding_spec: region_spec_rust,
-            maintained_indexes: maintained_indexes.unwrap_or_default(),
-        };
+        let maintained_indexes = maintained_indexes.unwrap_or_default();
         let mut ds = Arc::clone(&self.ds);
         let new_ds = rt()
             .block_on(Some(py), async move {
-                Arc::make_mut(&mut ds).initialize_mem_wal(config).await?;
+                Arc::make_mut(&mut ds)
+                    .initialize_mem_wal()
+                    .maintained_indexes(maintained_indexes)
+                    .execute()
+                    .await?;
                 Ok::<Arc<LanceDataset>, lance_core::Error>(ds)
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
