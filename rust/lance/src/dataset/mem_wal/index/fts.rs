@@ -51,18 +51,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
-use arrow_array::builder::{Int32Builder, ListBuilder};
-use arrow_array::{Array, Int32Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
-use arrow_buffer::ScalarBuffer;
+use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_schema::DataType;
 use crossbeam_skiplist::SkipMap;
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::Operator;
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
-use lance_index::scalar::inverted::{
-    DocSet, MemBM25Scorer, PlainPostingList, PostingList, Scorer, TokenSet,
-};
+use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_tokenizer::TokenStream;
 
 use super::RowPosition;
@@ -1405,19 +1401,18 @@ impl FtsMemIndex {
         let mut term_postings: HashMap<String, Vec<(u32, u32, Option<Vec<u32>>)>> = HashMap::new();
         for p in st.partitions.iter() {
             for (token, posting) in p.tokens_with_postings() {
-                let plain = posting_as_plain(posting);
                 let bucket = term_postings.entry(token.to_string()).or_default();
-                for i in 0..plain.len() {
-                    let row_pos = p.docs.row_id(plain.row_ids[i] as u32);
+                for i in 0..posting.len() {
+                    let row_pos = p.docs.row_id(posting.doc_ids[i]);
                     let Some(&doc_id) = original_to_doc_id.get(&row_pos) else {
                         continue;
                     };
                     let pos = if with_position {
-                        Some(read_positions(plain, i))
+                        Some(posting.positions(i).to_vec())
                     } else {
                         None
                     };
-                    bucket.push((doc_id, plain.frequencies[i] as u32, pos));
+                    bucket.push((doc_id, posting.freqs[i], pos));
                 }
             }
         }
@@ -1773,11 +1768,11 @@ fn phrase_search_tail(
     results
 }
 
-fn phrase_matches(positions: &[Vec<u32>], slop: u32) -> bool {
+fn phrase_matches<T: AsRef<[u32]>>(positions: &[T], slop: u32) -> bool {
     if positions.is_empty() {
         return false;
     }
-    for &first_pos in &positions[0] {
+    for &first_pos in positions[0].as_ref() {
         if phrase_from_position(positions, first_pos, slop) {
             return true;
         }
@@ -1785,12 +1780,13 @@ fn phrase_matches(positions: &[Vec<u32>], slop: u32) -> bool {
     false
 }
 
-fn phrase_from_position(positions: &[Vec<u32>], first_pos: u32, slop: u32) -> bool {
+fn phrase_from_position<T: AsRef<[u32]>>(positions: &[T], first_pos: u32, slop: u32) -> bool {
     let mut expected = first_pos;
     for token_positions in positions.iter().skip(1) {
         let min = expected.saturating_add(1);
         let max = expected.saturating_add(1 + slop);
         match token_positions
+            .as_ref()
             .iter()
             .filter(|&&p| p >= min && p <= max)
             .min()
@@ -1853,16 +1849,44 @@ impl FtsIndexConfig {
 // Immutable partition
 // ============================================================================
 
+/// A frozen per-term posting list inside a [`Partition`]. Exact-sized plain
+/// `Vec`s — no Arrow builder capacity slack — with partition-local `u32` doc
+/// ids. Positions use a CSR layout: posting `i` owns
+/// `pos_data[pos_offsets[i]..pos_offsets[i + 1]]`.
+struct PartitionPosting {
+    /// partition-local doc ids, ascending.
+    doc_ids: Vec<u32>,
+    /// term frequency per posting.
+    freqs: Vec<u32>,
+    /// `doc_ids.len() + 1` offsets into `pos_data`.
+    pos_offsets: Vec<u32>,
+    pos_data: Vec<u32>,
+}
+
+impl PartitionPosting {
+    fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+
+    fn positions(&self, i: usize) -> &[u32] {
+        &self.pos_data[self.pos_offsets[i] as usize..self.pos_offsets[i + 1] as usize]
+    }
+
+    fn heap_size(&self) -> usize {
+        (self.doc_ids.len() + self.freqs.len() + self.pos_offsets.len() + self.pos_data.len())
+            * std::mem::size_of::<u32>()
+    }
+}
+
 /// An immutable, frozen FTS partition: a slice of the MemTable's inserts held
-/// as on-disk-shaped posting lists and queried with block-max WAND in
-/// ≈O(matches). Built by freezing the tail; flushed 1:1 into the Lance FTS
-/// on-disk format. See `DESIGN.md` in the redesign analysis directory.
+/// as compact per-term posting lists, queried by a direct O(matches) scan.
+/// Built by freezing the tail; flushed 1:1 into the Lance FTS on-disk format.
+/// See `DESIGN.md` in the redesign analysis directory.
 struct Partition {
     /// token text -> local token id (dense, 0-based; indexes `postings`).
     token_ids: HashMap<Arc<str>, u32>,
-    /// posting list per local token id. In-memory partitions are always
-    /// `PostingList::Plain` and always carry positions.
-    postings: Vec<PostingList>,
+    /// posting list per local token id.
+    postings: Vec<PartitionPosting>,
     /// local doc id -> (MemTable row position, token count).
     docs: DocSet,
 }
@@ -1877,10 +1901,7 @@ impl Partition {
     }
 
     fn entry_count(&self) -> usize {
-        self.postings
-            .iter()
-            .map(|p| posting_as_plain(p).len())
-            .sum()
+        self.postings.iter().map(|p| p.len()).sum()
     }
 
     fn contains_token(&self, token: &str) -> bool {
@@ -1891,7 +1912,7 @@ impl Partition {
         self.token_ids.keys()
     }
 
-    fn tokens_with_postings(&self) -> impl Iterator<Item = (&Arc<str>, &PostingList)> {
+    fn tokens_with_postings(&self) -> impl Iterator<Item = (&Arc<str>, &PartitionPosting)> {
         self.token_ids
             .iter()
             .map(move |(t, &id)| (t, &self.postings[id as usize]))
@@ -1901,7 +1922,7 @@ impl Partition {
     fn token_df(&self, token: &str) -> usize {
         self.token_ids
             .get(token)
-            .map(|&id| posting_as_plain(&self.postings[id as usize]).len())
+            .map(|&id| self.postings[id as usize].len())
             .unwrap_or(0)
     }
 
@@ -1910,16 +1931,8 @@ impl Partition {
         for t in self.token_ids.keys() {
             total += std::mem::size_of::<Arc<str>>() + t.len() + std::mem::size_of::<u32>() + 16;
         }
-        for p in &self.postings {
-            let pl = posting_as_plain(p);
-            total += pl.row_ids.len() * std::mem::size_of::<u64>()
-                + pl.frequencies.len() * std::mem::size_of::<f32>()
-                + pl.positions
-                    .as_ref()
-                    .map(|a| a.get_array_memory_size())
-                    .unwrap_or(0);
-        }
-        total += self.docs.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
+        total += self.postings.iter().map(|p| p.heap_size()).sum::<usize>();
+        total += self.docs.len() * (std::mem::size_of::<u64>() + 2 * std::mem::size_of::<u32>());
         total
     }
 
@@ -1995,12 +2008,12 @@ impl Partition {
                     raw.push(Vec::new());
                     id
                 });
-                let plain = posting_as_plain(&p.postings[local_id as usize]);
-                for i in 0..plain.len() {
+                let posting = &p.postings[local_id as usize];
+                for i in 0..posting.len() {
                     raw[merged_id as usize].push((
-                        plain.row_ids[i] as u32 + doc_offset,
-                        plain.frequencies[i] as u32,
-                        read_positions(plain, i),
+                        posting.doc_ids[i] + doc_offset,
+                        posting.freqs[i],
+                        posting.positions(i).to_vec(),
                     ));
                 }
             }
@@ -2033,23 +2046,24 @@ impl Partition {
         operator: Operator,
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
-        // doc -> (accumulated score, number of token-occurrence hits).
-        let mut doc_scores: HashMap<u32, (f32, u32)> = HashMap::new();
+        // Partition-local doc ids are dense 0..doc_count, so accumulate into
+        // flat arrays — no per-posting hashing.
+        let n = self.docs.len();
+        let mut scores = vec![0.0f32; n];
+        let mut hits = vec![0u32; n];
         let mut any_present = false;
         let mut all_present = true;
         for token in tokens {
             match self.token_ids.get(token.as_str()) {
                 Some(&id) => {
                     any_present = true;
-                    let plain = posting_as_plain(&self.postings[id as usize]);
+                    let posting = &self.postings[id as usize];
                     let qw = scorer.query_weight(token);
-                    for i in 0..plain.len() {
-                        let doc = plain.row_ids[i] as u32;
-                        let dl = self.docs.num_tokens(doc);
-                        let s = qw * scorer.doc_weight(plain.frequencies[i] as u32, dl);
-                        let e = doc_scores.entry(doc).or_insert((0.0, 0));
-                        e.0 += s;
-                        e.1 += 1;
+                    for i in 0..posting.len() {
+                        let doc = posting.doc_ids[i] as usize;
+                        let dl = self.docs.num_tokens(posting.doc_ids[i]);
+                        scores[doc] += qw * scorer.doc_weight(posting.freqs[i], dl);
+                        hits[doc] += 1;
                     }
                 }
                 None => all_present = false,
@@ -2058,51 +2072,52 @@ impl Partition {
         if !any_present || (operator == Operator::And && !all_present) {
             return Vec::new();
         }
+        // AND requires the doc to be hit once per query-token slot.
         let need = tokens.len() as u32;
-        doc_scores
-            .into_iter()
-            .filter_map(|(doc, (score, hits))| {
-                // AND requires the doc to be hit once per query-token slot.
-                if operator == Operator::And && hits < need {
-                    return None;
-                }
-                Some(FtsEntry {
-                    row_position: self.docs.row_id(doc),
-                    score,
-                })
-            })
-            .collect()
+        let mut results = Vec::new();
+        for doc in 0..n {
+            if hits[doc] == 0 || (operator == Operator::And && hits[doc] < need) {
+                continue;
+            }
+            results.push(FtsEntry {
+                row_position: self.docs.row_id(doc as u32),
+                score: scores[doc],
+            });
+        }
+        results
     }
 
     /// Phrase-search by intersecting posting lists: drive from the rarest
     /// token, require every other token to contain the doc, and verify the
     /// token positions satisfy the phrase. `tokens.len() >= 2`.
     fn search_phrase(&self, tokens: &[String], slop: u32, scorer: &MemBM25Scorer) -> Vec<FtsEntry> {
-        let mut plains: Vec<&PlainPostingList> = Vec::with_capacity(tokens.len());
+        let mut postings: Vec<&PartitionPosting> = Vec::with_capacity(tokens.len());
         for token in tokens {
             match self.token_ids.get(token.as_str()) {
-                Some(&id) => plains.push(posting_as_plain(&self.postings[id as usize])),
+                Some(&id) => postings.push(&self.postings[id as usize]),
                 // A phrase needs every token present in this partition.
                 None => return Vec::new(),
             }
         }
-        let rarest = (0..plains.len()).min_by_key(|&i| plains[i].len()).unwrap();
+        let rarest = (0..postings.len())
+            .min_by_key(|&i| postings[i].len())
+            .unwrap();
         let mut results = Vec::new();
-        for i in 0..plains[rarest].len() {
-            let doc = plains[rarest].row_ids[i];
-            let mut all_positions: Vec<Vec<u32>> = Vec::with_capacity(tokens.len());
+        for i in 0..postings[rarest].len() {
+            let doc = postings[rarest].doc_ids[i];
+            let mut all_positions: Vec<&[u32]> = Vec::with_capacity(tokens.len());
             let mut freqs: Vec<u32> = Vec::with_capacity(tokens.len());
             let mut present = true;
-            for (ti, plain) in plains.iter().enumerate() {
+            for (ti, posting) in postings.iter().enumerate() {
                 let idx = if ti == rarest {
                     Some(i)
                 } else {
-                    plain.row_ids.binary_search(&doc).ok()
+                    posting.doc_ids.binary_search(&doc).ok()
                 };
                 match idx {
                     Some(idx) => {
-                        freqs.push(plain.frequencies[idx] as u32);
-                        all_positions.push(read_positions(plain, idx));
+                        freqs.push(posting.freqs[idx]);
+                        all_positions.push(posting.positions(idx));
                     }
                     None => {
                         present = false;
@@ -2113,14 +2128,14 @@ impl Partition {
             if !present || !phrase_matches(&all_positions, slop) {
                 continue;
             }
-            let dl = self.docs.num_tokens(doc as u32);
+            let dl = self.docs.num_tokens(doc);
             let score: f32 = tokens
                 .iter()
                 .zip(&freqs)
                 .map(|(t, &f)| scorer.query_weight(t) * scorer.doc_weight(f, dl))
                 .sum();
             results.push(FtsEntry {
-                row_position: self.docs.row_id(doc as u32),
+                row_position: self.docs.row_id(doc),
                 score,
             });
         }
@@ -2128,46 +2143,27 @@ impl Partition {
     }
 }
 
-/// Convert per-token `(doc_id, freq, positions)` postings — sorted by doc id —
-/// into an on-disk-shaped `PlainPostingList`. `max_score` is left `None`;
-/// WAND derives per-term bounds from the posting list at query time.
-fn freeze_postings_one(docs: Vec<(u32, u32, Vec<u32>)>) -> PostingList {
-    let row_ids: Vec<u64> = docs.iter().map(|(d, _, _)| *d as u64).collect();
-    let freqs: Vec<f32> = docs.iter().map(|(_, f, _)| *f as f32).collect();
-    let mut positions = ListBuilder::new(Int32Builder::new());
-    for (_, _, doc_positions) in &docs {
-        for p in doc_positions {
-            positions.values().append_value(*p as i32);
-        }
-        positions.append(true);
+/// Convert `(doc_id, freq, positions)` triples — already sorted by doc id —
+/// into a compact, exact-sized [`PartitionPosting`].
+fn freeze_postings_one(docs: Vec<(u32, u32, Vec<u32>)>) -> PartitionPosting {
+    let n = docs.len();
+    let total_pos: usize = docs.iter().map(|(_, _, p)| p.len()).sum();
+    let mut doc_ids = Vec::with_capacity(n);
+    let mut freqs = Vec::with_capacity(n);
+    let mut pos_offsets = Vec::with_capacity(n + 1);
+    let mut pos_data = Vec::with_capacity(total_pos);
+    pos_offsets.push(0);
+    for (d, f, positions) in docs {
+        doc_ids.push(d);
+        freqs.push(f);
+        pos_data.extend_from_slice(&positions);
+        pos_offsets.push(pos_data.len() as u32);
     }
-    PostingList::Plain(PlainPostingList::new(
-        ScalarBuffer::from(row_ids),
-        ScalarBuffer::from(freqs),
-        None,
-        Some(positions.finish()),
-    ))
-}
-
-/// In-memory FTS partitions only ever build `PostingList::Plain`.
-fn posting_as_plain(p: &PostingList) -> &PlainPostingList {
-    match p {
-        PostingList::Plain(pl) => pl,
-        PostingList::Compressed(_) => {
-            unreachable!("in-memory FTS partitions only build plain posting lists")
-        }
-    }
-}
-
-/// Read the position list for the `idx`-th posting as a `Vec<u32>`.
-fn read_positions(plain: &PlainPostingList, idx: usize) -> Vec<u32> {
-    match plain.positions(idx) {
-        Some(arr) => arr
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .map(|a| a.values().iter().map(|&v| v as u32).collect())
-            .unwrap_or_default(),
-        None => Vec::new(),
+    PartitionPosting {
+        doc_ids,
+        freqs,
+        pos_offsets,
+        pos_data,
     }
 }
 
