@@ -300,11 +300,8 @@ mod tests {
         let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array);
 
         assert!(result.is_err());
-        match result {
-            Err(lance_core::Error::InvalidInput { message, .. }) => {
-                assert!(message.contains("exceeded 2 GiB"));
-            }
-            _ => panic!("Expected InvalidInput error"),
-        }
+        let err = result.unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("exceeded 2 GiB"));
     }
 }
