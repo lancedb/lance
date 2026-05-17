@@ -45,7 +45,8 @@
 //! into one builder. The on-disk format is unchanged from Lance's existing
 //! inverted index.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -991,7 +992,7 @@ impl FtsMemIndex {
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(term);
-        self.search_match(&st, &tokens)
+        self.search_match(&st, &tokens, None)
     }
 
     /// Search for documents containing an exact phrase, optionally allowing
@@ -1031,7 +1032,12 @@ impl FtsMemIndex {
     /// scan the tail, all scored with one corpus-wide [`MemBM25Scorer`], and
     /// the results merged. Each doc lives in exactly one partition or the
     /// tail, so the merge is a plain concatenation.
-    fn search_match(&self, st: &IndexState, tokens: &[String]) -> Vec<FtsEntry> {
+    fn search_match(
+        &self,
+        st: &IndexState,
+        tokens: &[String],
+        limit: Option<usize>,
+    ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
         }
@@ -1044,7 +1050,7 @@ impl FtsMemIndex {
         }
         let mut results = Vec::new();
         for p in st.partitions.iter() {
-            results.extend(p.search_match(tokens, Operator::Or, &scorer));
+            results.extend(p.search_match(tokens, Operator::Or, &scorer, limit));
         }
         if tail_snap.visible_count > 0 {
             results.extend(score_terms(&tail_snap, &st.tail.terms, tokens, &scorer));
@@ -1058,7 +1064,7 @@ impl FtsMemIndex {
         }
         if tokens.len() == 1 {
             // A single-token phrase reduces to a regular term search.
-            return self.search_match(st, tokens);
+            return self.search_match(st, tokens, None);
         }
         let tail_snap = st.tail.snapshot();
         let scorer = build_scorer(st, &tail_snap, tokens);
@@ -1104,7 +1110,7 @@ impl FtsMemIndex {
         if expanded.is_empty() {
             return Vec::new();
         }
-        self.search_match(st, &expanded)
+        self.search_match(st, &expanded, None)
     }
 
     /// Expand `term` against the term dictionaries of every partition and the
@@ -1164,14 +1170,22 @@ impl FtsMemIndex {
     /// per-batch monotonic visibility contract for compound queries.
     pub fn search_query(&self, query: &FtsQueryExpr) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        self.search_query_with_state(query, &st)
+        self.search_query_with_state(query, &st, None)
     }
 
-    fn search_query_with_state(&self, query: &FtsQueryExpr, st: &IndexState) -> Vec<FtsEntry> {
+    /// `limit` is the caller's top-k, threaded down so a top-level `Match`
+    /// leaf can prune with WAND. Compound branches (`Boolean`/`Boost`) need
+    /// their children's full result sets, so they pass `None` downward.
+    fn search_query_with_state(
+        &self,
+        query: &FtsQueryExpr,
+        st: &IndexState,
+        limit: Option<usize>,
+    ) -> Vec<FtsEntry> {
         match query {
             FtsQueryExpr::Match { query, boost } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_match(st, &tokens);
+                let mut results = self.search_match(st, &tokens, limit);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1213,7 +1227,7 @@ impl FtsMemIndex {
         options: SearchOptions,
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let mut results = self.search_query_with_state(query, &st);
+        let mut results = self.search_query_with_state(query, &st, options.limit);
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1244,11 +1258,11 @@ impl FtsMemIndex {
         negative_boost: f32,
         st: &IndexState,
     ) -> Vec<FtsEntry> {
-        let mut results = self.search_query_with_state(positive, st);
+        let mut results = self.search_query_with_state(positive, st, None);
         let Some(neg) = negative else {
             return results;
         };
-        let negative_results = self.search_query_with_state(neg, st);
+        let negative_results = self.search_query_with_state(neg, st, None);
         let negative_set: HashSet<RowPosition> = negative_results
             .into_iter()
             .map(|e| e.row_position)
@@ -1270,26 +1284,26 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         let excluded: HashSet<RowPosition> = must_not
             .iter()
-            .flat_map(|q| self.search_query_with_state(q, st))
+            .flat_map(|q| self.search_query_with_state(q, st, None))
             .map(|e| e.row_position)
             .collect();
 
         let mut result_map: HashMap<RowPosition, f32> = if must.is_empty() {
             let mut map: HashMap<RowPosition, f32> = HashMap::new();
             for q in should {
-                for entry in self.search_query_with_state(q, st) {
+                for entry in self.search_query_with_state(q, st, None) {
                     *map.entry(entry.row_position).or_default() += entry.score;
                 }
             }
             map
         } else {
-            let first_results = self.search_query_with_state(&must[0], st);
+            let first_results = self.search_query_with_state(&must[0], st, None);
             let mut map: HashMap<RowPosition, f32> = first_results
                 .into_iter()
                 .map(|e| (e.row_position, e.score))
                 .collect();
             for q in must.iter().skip(1) {
-                let results = self.search_query_with_state(q, st);
+                let results = self.search_query_with_state(q, st, None);
                 let result_set: HashMap<RowPosition, f32> = results
                     .into_iter()
                     .map(|e| (e.row_position, e.score))
@@ -1300,7 +1314,7 @@ impl FtsMemIndex {
                     .collect();
             }
             for q in should {
-                for entry in self.search_query_with_state(q, st) {
+                for entry in self.search_query_with_state(q, st, None) {
                     if let Some(score) = map.get_mut(&entry.row_position) {
                         *score += entry.score;
                     }
@@ -1861,6 +1875,11 @@ struct PartitionPosting {
     /// `doc_ids.len() + 1` offsets into `pos_data`.
     pos_offsets: Vec<u32>,
     pos_data: Vec<u32>,
+    /// Largest `freq` and smallest doc length over this list. `doc_weight` is
+    /// increasing in freq and decreasing in doc length, so `doc_weight(max_freq,
+    /// min_dl)` is a valid per-term score upper bound for WAND pruning.
+    max_freq: u32,
+    min_dl: u32,
 }
 
 impl PartitionPosting {
@@ -1870,6 +1889,11 @@ impl PartitionPosting {
 
     fn positions(&self, i: usize) -> &[u32] {
         &self.pos_data[self.pos_offsets[i] as usize..self.pos_offsets[i + 1] as usize]
+    }
+
+    /// Upper bound on this term's BM25 doc-side weight, given the scorer.
+    fn max_doc_weight(&self, scorer: &MemBM25Scorer) -> f32 {
+        scorer.doc_weight(self.max_freq, self.min_dl)
     }
 
     fn heap_size(&self) -> usize {
@@ -1983,7 +2007,10 @@ impl Partition {
             token_ids.insert(term.clone(), id);
             raw.push(docs_for_term);
         }
-        let postings = raw.into_iter().map(freeze_postings_one).collect();
+        let postings = raw
+            .into_iter()
+            .map(|v| freeze_postings_one(v, &docs))
+            .collect();
         Some(Self {
             token_ids,
             postings,
@@ -2023,7 +2050,7 @@ impl Partition {
             .into_iter()
             .map(|mut v| {
                 v.sort_by_key(|(d, _, _)| *d);
-                freeze_postings_one(v)
+                freeze_postings_one(v, &docs)
             })
             .collect();
         Self {
@@ -2033,49 +2060,61 @@ impl Partition {
         }
     }
 
-    /// BM25 OR/AND-search by a direct posting-list scan. A partition holds one
-    /// merged posting list per term, so cost is O(matches) — not O(corpus) as
-    /// the old per-batch-chunk layout was. Block-max WAND pruning is not used:
-    /// it needs per-term `max_score` upper bounds that frozen in-memory
-    /// posting lists do not carry, and an unbounded WAND mis-prunes without
-    /// them. Each token occurrence in `tokens` contributes independently, so
-    /// scores match the tail's `score_terms`.
+    /// BM25 OR/AND-search of the partition. With an OR operator and a result
+    /// limit, prunes with block-max WAND; otherwise runs a direct O(matches)
+    /// scan. Every result is scored with `scorer`, so scores are identical
+    /// regardless of which path runs (and identical to the tail's
+    /// `score_terms`).
     fn search_match(
         &self,
         tokens: &[String],
         operator: Operator,
         scorer: &MemBM25Scorer,
+        limit: Option<usize>,
     ) -> Vec<FtsEntry> {
-        // Partition-local doc ids are dense 0..doc_count, so accumulate into
-        // flat arrays — no per-posting hashing.
-        let n = self.docs.len();
-        let mut scores = vec![0.0f32; n];
-        let mut hits = vec![0u32; n];
-        let mut any_present = false;
+        // Resolve present query tokens to (local token id, query weight).
+        // Repeated query tokens are kept so scores match `score_terms`.
+        let mut terms: Vec<(usize, f32)> = Vec::with_capacity(tokens.len());
         let mut all_present = true;
         for token in tokens {
             match self.token_ids.get(token.as_str()) {
-                Some(&id) => {
-                    any_present = true;
-                    let posting = &self.postings[id as usize];
-                    let qw = scorer.query_weight(token);
-                    for i in 0..posting.len() {
-                        let doc = posting.doc_ids[i] as usize;
-                        let dl = self.docs.num_tokens(posting.doc_ids[i]);
-                        scores[doc] += qw * scorer.doc_weight(posting.freqs[i], dl);
-                        hits[doc] += 1;
-                    }
-                }
+                Some(&id) => terms.push((id as usize, scorer.query_weight(token))),
                 None => all_present = false,
             }
         }
-        if !any_present || (operator == Operator::And && !all_present) {
+        if terms.is_empty() || (operator == Operator::And && !all_present) {
             return Vec::new();
         }
-        // AND requires the doc to be hit once per query-token slot.
-        let need = tokens.len() as u32;
+        match limit {
+            Some(k) if k > 0 && operator == Operator::Or => self.wand_match(&terms, scorer, k),
+            _ => self.scan_match(&terms, operator, tokens.len() as u32, scorer),
+        }
+    }
+
+    /// Exact direct scan: accumulate every match into flat arrays indexed by
+    /// the dense local doc id. Used for unbounded and AND queries.
+    fn scan_match(
+        &self,
+        terms: &[(usize, f32)],
+        operator: Operator,
+        need: u32,
+        scorer: &MemBM25Scorer,
+    ) -> Vec<FtsEntry> {
+        let n = self.docs.len();
+        let mut scores = vec![0.0f32; n];
+        let mut hits = vec![0u32; n];
+        for &(id, qw) in terms {
+            let posting = &self.postings[id];
+            for i in 0..posting.len() {
+                let doc = posting.doc_ids[i] as usize;
+                let dl = self.docs.num_tokens(posting.doc_ids[i]);
+                scores[doc] += qw * scorer.doc_weight(posting.freqs[i], dl);
+                hits[doc] += 1;
+            }
+        }
         let mut results = Vec::new();
         for doc in 0..n {
+            // AND requires the doc to be hit once per query-token slot.
             if hits[doc] == 0 || (operator == Operator::And && hits[doc] < need) {
                 continue;
             }
@@ -2085,6 +2124,90 @@ impl Partition {
             });
         }
         results
+    }
+
+    /// Block-max WAND top-k over an OR query. Exact: each term's
+    /// `(max_freq, min_dl)` gives a sound score upper bound, so the algorithm
+    /// only skips docs that provably cannot enter the top-`k`.
+    fn wand_match(
+        &self,
+        terms: &[(usize, f32)],
+        scorer: &MemBM25Scorer,
+        k: usize,
+    ) -> Vec<FtsEntry> {
+        let mut cursors: Vec<WandCursor> = terms
+            .iter()
+            .map(|&(id, qw)| {
+                let posting = &self.postings[id];
+                WandCursor {
+                    posting,
+                    idx: 0,
+                    qw,
+                    ub: qw * posting.max_doc_weight(scorer),
+                }
+            })
+            .collect();
+        // Min-heap of the current top-k by score.
+        let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k + 1);
+        // theta = score of the weakest doc still in the top-k (-inf until full).
+        let mut theta = f32::NEG_INFINITY;
+        loop {
+            cursors.retain(|c| c.doc().is_some());
+            if cursors.is_empty() {
+                break;
+            }
+            cursors.sort_by_key(|c| c.doc().unwrap());
+            // Pivot: first cursor whose cumulative upper bound exceeds theta.
+            let mut acc = 0.0f32;
+            let mut pivot = None;
+            for (i, c) in cursors.iter().enumerate() {
+                acc += c.ub;
+                if acc > theta {
+                    pivot = Some(i);
+                    break;
+                }
+            }
+            let Some(pivot) = pivot else {
+                break; // no remaining doc can reach theta
+            };
+            let pivot_doc = cursors[pivot].doc().unwrap();
+            if cursors[0].doc().unwrap() == pivot_doc {
+                // Every cursor positioned at pivot_doc contributes; score it.
+                let dl = self.docs.num_tokens(pivot_doc);
+                let mut score = 0.0f32;
+                for c in cursors.iter_mut() {
+                    if c.doc() == Some(pivot_doc) {
+                        score += c.qw * scorer.doc_weight(c.posting.freqs[c.idx], dl);
+                        c.idx += 1;
+                    }
+                }
+                if heap.len() < k {
+                    heap.push(Reverse(ScoredDoc {
+                        score,
+                        doc: pivot_doc,
+                    }));
+                    if heap.len() == k {
+                        theta = heap.peek().unwrap().0.score;
+                    }
+                } else if score > theta {
+                    heap.pop();
+                    heap.push(Reverse(ScoredDoc {
+                        score,
+                        doc: pivot_doc,
+                    }));
+                    theta = heap.peek().unwrap().0.score;
+                }
+            } else {
+                // A cursor before the pivot trails pivot_doc; skip it forward.
+                cursors[0].skip_to(pivot_doc);
+            }
+        }
+        heap.into_iter()
+            .map(|Reverse(sd)| FtsEntry {
+                row_position: self.docs.row_id(sd.doc),
+                score: sd.score,
+            })
+            .collect()
     }
 
     /// Phrase-search by intersecting posting lists: drive from the rarest
@@ -2143,9 +2266,57 @@ impl Partition {
     }
 }
 
+/// A scored doc id, ordered by score then doc id (`total_cmp`, so a stray
+/// non-finite score cannot panic the heap).
+struct ScoredDoc {
+    score: f32,
+    doc: u32,
+}
+
+impl PartialEq for ScoredDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for ScoredDoc {}
+impl PartialOrd for ScoredDoc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScoredDoc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then(self.doc.cmp(&other.doc))
+    }
+}
+
+/// A cursor over one term's posting list, used by [`Partition::wand_match`].
+struct WandCursor<'a> {
+    posting: &'a PartitionPosting,
+    idx: usize,
+    qw: f32,
+    /// Upper bound on this term's contribution to any doc's score.
+    ub: f32,
+}
+
+impl WandCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        self.posting.doc_ids.get(self.idx).copied()
+    }
+
+    /// Advance to the first posting with `doc_id >= target`.
+    fn skip_to(&mut self, target: u32) {
+        let rest = &self.posting.doc_ids[self.idx..];
+        self.idx += rest.partition_point(|&d| d < target);
+    }
+}
+
 /// Convert `(doc_id, freq, positions)` triples — already sorted by doc id —
-/// into a compact, exact-sized [`PartitionPosting`].
-fn freeze_postings_one(docs: Vec<(u32, u32, Vec<u32>)>) -> PartitionPosting {
+/// into a compact, exact-sized [`PartitionPosting`]. `docset` supplies doc
+/// lengths for the WAND score-bound metadata.
+fn freeze_postings_one(docs: Vec<(u32, u32, Vec<u32>)>, docset: &DocSet) -> PartitionPosting {
     let n = docs.len();
     let total_pos: usize = docs.iter().map(|(_, _, p)| p.len()).sum();
     let mut doc_ids = Vec::with_capacity(n);
@@ -2153,9 +2324,13 @@ fn freeze_postings_one(docs: Vec<(u32, u32, Vec<u32>)>) -> PartitionPosting {
     let mut pos_offsets = Vec::with_capacity(n + 1);
     let mut pos_data = Vec::with_capacity(total_pos);
     pos_offsets.push(0);
+    let mut max_freq = 0u32;
+    let mut min_dl = u32::MAX;
     for (d, f, positions) in docs {
         doc_ids.push(d);
         freqs.push(f);
+        max_freq = max_freq.max(f);
+        min_dl = min_dl.min(docset.num_tokens(d));
         pos_data.extend_from_slice(&positions);
         pos_offsets.push(pos_data.len() as u32);
     }
@@ -2164,6 +2339,8 @@ fn freeze_postings_one(docs: Vec<(u32, u32, Vec<u32>)>) -> PartitionPosting {
         freqs,
         pos_offsets,
         pos_data,
+        max_freq,
+        min_dl: min_dl.max(1),
     }
 }
 
@@ -3241,12 +3418,12 @@ mod tests {
         let apple = index.tokenize_for_search("apple").pop().unwrap();
         // "apple" is present -> an OR search over it matches.
         let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple));
-        let or_hits = p.search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer);
+        let or_hits = p.search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer, None);
         assert_eq!(or_hits.len(), 3);
         // Adding an absent term to an AND query short-circuits to nothing.
         let and_tokens = vec![apple, "definitely_missing".to_string()];
         let and_scorer = build_scorer(&st, &tail_snap, &and_tokens);
-        let and_hits = p.search_match(&and_tokens, Operator::And, &and_scorer);
+        let and_hits = p.search_match(&and_tokens, Operator::And, &and_scorer, None);
         assert!(and_hits.is_empty());
     }
 
@@ -3449,5 +3626,53 @@ mod tests {
         let got: Vec<u64> = limited.iter().map(|e| e.row_position).collect();
         let expected: Vec<u64> = full.iter().take(3).map(|e| e.row_position).collect();
         assert_eq!(got, expected, "limited search must return the exact top-3");
+    }
+
+    #[test]
+    fn test_wand_topk_matches_exact_full_scan() {
+        // WAND must produce the exact same top-k as an unbounded scan, at a
+        // scale where pruning genuinely engages. 40 docs across ~8 partitions;
+        // "alpha" appears with tf 1..=40, giving 40 strictly distinct scores.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(5);
+        for i in 0..40u64 {
+            let text = "alpha ".repeat((i + 1) as usize);
+            let batch = RecordBatch::try_new(
+                create_test_schema(),
+                vec![
+                    Arc::new(Int32Array::from(vec![0])),
+                    Arc::new(StringArray::from(vec![text.as_str()])),
+                ],
+            )
+            .unwrap();
+            index.insert(&batch, i).unwrap();
+        }
+        assert!(index.state.load_full().partitions.len() >= 2);
+
+        // Exact ranking from the unbounded path.
+        let mut full = index.search("alpha");
+        assert_eq!(full.len(), 40);
+        full.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap()
+                .then(a.row_position.cmp(&b.row_position))
+        });
+
+        // For several k, WAND-pruned top-k must equal the exact top-k.
+        for k in [1usize, 3, 10, 25, 40, 50] {
+            let limited = index.search_with_options(
+                &FtsQueryExpr::match_query("alpha"),
+                SearchOptions::new().with_limit(k),
+            );
+            let expect_len = k.min(40);
+            assert_eq!(limited.len(), expect_len, "k={k}");
+            let got: Vec<u64> = limited.iter().map(|e| e.row_position).collect();
+            let expected: Vec<u64> = full
+                .iter()
+                .take(expect_len)
+                .map(|e| e.row_position)
+                .collect();
+            assert_eq!(got, expected, "WAND top-{k} must equal the exact top-{k}");
+        }
     }
 }
