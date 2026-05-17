@@ -35,8 +35,8 @@ use lance_arrow::json::JsonArray;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
-    CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, ListNamespacesRequest,
-    ListTablesRequest,
+    CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
+    ListNamespacesRequest, ListTablesRequest,
 };
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use serde::{Deserialize, Serialize};
@@ -415,6 +415,13 @@ async fn run_operation(
             req.id = Some(vec![format!("bench_t{}_{}", worker_id, op_idx)]);
             ns.create_table(req, ipc_data.clone()).await?;
         }
+        "write-declare-table" => {
+            let req = DeclareTableRequest {
+                id: Some(vec![format!("bench_d{}_{}", worker_id, op_idx)]),
+                ..Default::default()
+            };
+            ns.declare_table(req).await?;
+        }
         _ => {
             return Err(format!("unknown operation: {}", operation).into());
         }
@@ -692,6 +699,7 @@ async fn main() {
                 "warm-read-list-tables",
                 "warm-read-describe-table",
                 "write-create-namespace",
+                "write-declare-table",
                 "write-create-table",
             ];
 
