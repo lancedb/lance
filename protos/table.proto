@@ -540,7 +540,7 @@ message ShardManifest {
   // Computed shard field values as raw Arrow scalar bytes, keyed by shard
   // field id. The byte encoding follows Arrow's little-endian convention:
   // int32 is 4 LE bytes, utf8 is raw UTF-8 bytes, etc. The receiver looks
-  // up the result_type from the ShardSpec to interpret each value.
+  // up the result_type from the ShardingSpec to interpret each value.
   repeated ShardFieldEntry shard_field_entries = 14;
 
   // Writer fencing token - monotonically increasing.
@@ -571,11 +571,11 @@ message ShardManifest {
 
 // A shard field value stored as raw Arrow scalar bytes.
 message ShardFieldEntry {
-  // Shard field id (matches ShardField.field_id in the ShardSpec).
+  // Shard field id (matches ShardingField.field_id in the ShardingSpec).
   string field_id = 1;
 
   // Raw Arrow scalar value bytes in little-endian encoding.
-  // The data type is determined by the result_type of the matching ShardField.
+  // The data type is determined by the result_type of the matching ShardingField.
   bytes value = 2;
 }
 
@@ -611,7 +611,7 @@ message IndexCatchupProgress {
 
 // Index details for MemWAL Index, stored in IndexMetadata.index_details.
 // This is the centralized structure for all MemWAL metadata:
-// - Configuration (shard specs, indexes to maintain)
+// - Configuration (sharding specs, indexes to maintain)
 // - Merge progress (merged generations per shard)
 // - Shard state snapshots
 //
@@ -626,7 +626,7 @@ message IndexCatchupProgress {
 // authoritative in the shard manifest files.
 //   shard_id: utf8
 //   shard_spec_id: uint32
-//   shard_field_{field_id}: typed per the matching ShardField.result_type
+//   shard_field_{field_id}: typed per the matching ShardingField.result_type
 message MemWalIndexDetails {
   // Snapshot timestamp (Unix timestamp in milliseconds).
   int64 snapshot_ts_millis = 1;
@@ -641,9 +641,9 @@ message MemWalIndexDetails {
   // Format: Lance file bytes with the shard snapshot schema.
   optional bytes inline_snapshots = 3;
 
-  // Shard specs defining how to derive shard identifiers.
+  // Sharding specs defining how to derive shard identifiers.
   // This configuration determines how rows are partitioned into shards.
-  repeated ShardSpec shard_specs = 7;
+  repeated ShardingSpec sharding_specs = 7;
 
   // Indexes from the base table to maintain in MemTables.
   // These are index names referencing indexes defined on the base table.
@@ -675,18 +675,18 @@ message MemWalIndexDetails {
   repeated IndexCatchupProgress index_catchup = 10;
 }
 
-// Shard spec definition.
-message ShardSpec {
+// Sharding spec definition.
+message ShardingSpec {
   // Unique identifier for this spec within the index.
   // IDs are never reused.
   uint32 spec_id = 1;
 
-  // Shard field definitions that determine how to compute shard identifiers.
-  repeated ShardField fields = 2;
+  // Sharding field definitions that determine how to compute shard identifiers.
+  repeated ShardingField fields = 2;
 }
 
-// Shard field definition.
-message ShardField {
+// Sharding field definition.
+message ShardingField {
   // Unique string identifier for this shard field.
   string field_id = 1;
 

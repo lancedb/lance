@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::index::DatasetIndexExt;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardSpec};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingSpec};
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
@@ -30,10 +30,10 @@ use super::write::ShardWriter;
 pub struct MemWalConfig {
     /// Optional shard specification for partitioning writes.
     ///
-    /// If None, MemWAL is initialized without any shard spec (manual shard management).
+    /// If None, MemWAL is initialized without any sharding spec (manual shard management).
     ///
-    /// TODO: Add `add_shard_spec()` API to add shard specs after initialization.
-    pub shard_spec: Option<ShardSpec>,
+    /// TODO: Add `add_sharding_spec()` API to add sharding specs after initialization.
+    pub sharding_spec: Option<ShardingSpec>,
     /// Index names to maintain in MemTables.
     /// These must reference indexes already defined on the base table.
     pub maintained_indexes: Vec<String>,
@@ -59,7 +59,7 @@ pub trait DatasetMemWalExt {
     /// ```ignore
     /// let mut dataset = Dataset::open("s3://bucket/dataset").await?;
     /// dataset.initialize_mem_wal(MemWalConfig {
-    ///     shard_spec: None,
+    ///     sharding_spec: None,
     ///     maintained_indexes: vec!["id_btree".to_string()],
     /// }).await?;
     /// ```
@@ -285,7 +285,7 @@ async fn initialize_mem_wal_impl(
     let details = MemWalIndexDetails {
         num_shards: shard_config.num_shards,
         inline_snapshots: None,
-        shard_specs: config.shard_spec.into_iter().collect(),
+        sharding_specs: config.sharding_spec.into_iter().collect(),
         maintained_indexes: config.maintained_indexes,
         ..Default::default()
     };

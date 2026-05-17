@@ -188,7 +188,7 @@ async fn main() -> lance_core::Result<()> {
     let mut dataset = build_base_dataset(&uri, dim).await?;
     dataset
         .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
+            sharding_spec: None,
             maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
         })
         .await?;

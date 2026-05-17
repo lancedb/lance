@@ -4092,7 +4092,7 @@ mod shard_writer_tests {
         // Initialize MemWAL (no indexes for smoke test)
         dataset
             .initialize_mem_wal(MemWalConfig {
-                shard_spec: None,
+                sharding_spec: None,
                 maintained_indexes: vec![],
             })
             .await
@@ -4149,7 +4149,7 @@ mod shard_writer_tests {
 
         dataset
             .initialize_mem_wal(MemWalConfig {
-                shard_spec: None,
+                sharding_spec: None,
                 maintained_indexes: vec!["vector_idx".to_string()],
             })
             .await
@@ -4290,7 +4290,7 @@ mod shard_writer_tests {
         // Initialize MemWAL with all three indexes
         dataset
             .initialize_mem_wal(MemWalConfig {
-                shard_spec: None,
+                sharding_spec: None,
                 maintained_indexes: vec![
                     "id_btree".to_string(),
                     "text_fts".to_string(),
@@ -4372,7 +4372,7 @@ mod shard_writer_tests {
         // Initialize MemWAL with BTree index only (simpler for this test)
         dataset
             .initialize_mem_wal(MemWalConfig {
-                shard_spec: None,
+                sharding_spec: None,
                 maintained_indexes: vec!["id_btree".to_string()],
             })
             .await

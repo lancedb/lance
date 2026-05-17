@@ -283,7 +283,7 @@ async fn run(args: Args) -> Result<()> {
 
     dataset
         .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
+            sharding_spec: None,
             maintained_indexes: if args.mode.indexed() {
                 vec![VECTOR_INDEX_NAME.to_string()]
             } else {
