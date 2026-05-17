@@ -198,15 +198,11 @@ impl BinaryArrayDecoder {
             // Data exceeds 2GB -- cannot fit in i32 offsets.
             // This should not happen in practice because the batch-size feedback
             // loop limits batch sizes, but if it does we return a clear error.
-            Err(lance_core::Error::InvalidInput {
-                source: format!(
-                    "A single batch of variable-length data exceeded 2 GiB ({} bytes). \
-                     Use LargeUtf8 / LargeBinary in your schema, or reduce the batch size.",
-                    last_offset
-                )
-                .into(),
-                location: lance_core::location!(),
-            })
+            Err(lance_core::Error::invalid_input(format!(
+                "A single batch of variable-length data exceeded 2 GiB ({} bytes). \
+                 Use LargeUtf8 / LargeBinary in your schema, or reduce the batch size.",
+                last_offset
+            )))
         }
     }
 }
@@ -235,7 +231,7 @@ impl DecodeArrayTask for BinaryArrayDecoder {
             DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
             _ => return Err(lance_core::Error::Internal {
                 message: "Binary decoder does not support this data type".to_string(),
-                location: lance_core::location!(),
+                location: snafu::location!(),
             }),
         };
         // data_size is only tracked in the v2.1 structural decode path; the legacy
