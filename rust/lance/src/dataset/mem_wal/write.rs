@@ -4083,14 +4083,14 @@ mod shard_writer_tests {
             .await
             .expect("Failed to create dataset");
 
-        let writer_defaults = std::collections::HashMap::from([
-            ("max_wal_buffer_size".to_string(), "8388608".to_string()),
-            ("durable_write".to_string(), "true".to_string()),
-        ]);
+        let writer_config = ShardWriterConfig::default()
+            .with_durable_write(false)
+            .with_max_memtable_size(8 * 1024 * 1024);
 
         dataset
             .initialize_mem_wal()
-            .writer_defaults(writer_defaults.clone())
+            .writer_config_defaults(writer_config)
+            .add_writer_default("custom_knob", "custom_value")
             .execute()
             .await
             .expect("Failed to initialize MemWAL");
@@ -4102,7 +4102,35 @@ mod shard_writer_tests {
             .expect("Failed to read MemWAL index details")
             .expect("MemWAL index details should exist");
 
-        assert_eq!(details.writer_defaults, writer_defaults);
+        let defaults = &details.writer_defaults;
+        // ShardWriterConfig tunables are recorded under their field names.
+        assert_eq!(
+            defaults.get("durable_write").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            defaults.get("max_memtable_size").map(String::as_str),
+            Some("8388608")
+        );
+        // Duration knobs are recorded in milliseconds with a `_ms` suffix.
+        assert_eq!(
+            defaults
+                .get("max_wal_flush_interval_ms")
+                .map(String::as_str),
+            Some("100")
+        );
+        // Every tunable field is present.
+        assert!(defaults.contains_key("sync_indexed_write"));
+        assert!(defaults.contains_key("enable_memtable"));
+        assert!(defaults.contains_key("async_index_interval_ms"));
+        // add_writer_default records arbitrary keys.
+        assert_eq!(
+            defaults.get("custom_knob").map(String::as_str),
+            Some("custom_value")
+        );
+        // Shard identity is not a configuration default.
+        assert!(!defaults.contains_key("shard_id"));
+        assert!(!defaults.contains_key("shard_spec_id"));
     }
 
     #[tokio::test]

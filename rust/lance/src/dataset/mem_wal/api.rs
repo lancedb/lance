@@ -152,26 +152,28 @@ impl<'a> InitializeMemWalBuilder<'a> {
         self
     }
 
-    /// Set the default `ShardWriter` configuration recorded in the MemWAL
-    /// index, replacing any previously set defaults.
+    /// Record `config` as the default `ShardWriter` configuration.
     ///
-    /// These are defaults only; an individual writer may still override any
-    /// value at runtime in its own (non-persisted) `ShardWriterConfig`.
-    pub fn writer_defaults<I, K, V>(mut self, defaults: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.writer_defaults = defaults
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect();
+    /// Every tunable field is persisted into the MemWAL index so that all
+    /// writers — across processes and restarts — start from the same
+    /// defaults. Shard identity (`shard_id`, `shard_spec_id`) is not a
+    /// configuration default and is not recorded. These remain defaults only:
+    /// an individual writer may still override any value at runtime in its own
+    /// (non-persisted) `ShardWriterConfig`.
+    ///
+    /// Merges into any defaults already set; a key set via
+    /// [`add_writer_default`](Self::add_writer_default) afterwards wins.
+    pub fn writer_config_defaults(mut self, config: ShardWriterConfig) -> Self {
+        self.writer_defaults
+            .extend(writer_config_to_defaults(&config));
         self
     }
 
-    /// Record a single default `ShardWriter` configuration entry.
-    pub fn writer_default(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    /// Record a single arbitrary writer-configuration default.
+    ///
+    /// Use this for keys not covered by
+    /// [`writer_config_defaults`](Self::writer_config_defaults).
+    pub fn add_writer_default(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.writer_defaults.insert(key.into(), value.into());
         self
     }
@@ -358,6 +360,75 @@ fn scalar_result_type(data_type: &DataType) -> Option<&'static str> {
         DataType::Boolean => "boolean",
         _ => return None,
     })
+}
+
+/// Extract the tunable defaults from a [`ShardWriterConfig`] into the persisted
+/// string map. Shard identity (`shard_id`, `shard_spec_id`) is not a default.
+/// `Duration` knobs are recorded in milliseconds with a `_ms` key suffix.
+fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, String> {
+    let mut defaults = HashMap::from([
+        (
+            "durable_write".to_string(),
+            config.durable_write.to_string(),
+        ),
+        (
+            "sync_indexed_write".to_string(),
+            config.sync_indexed_write.to_string(),
+        ),
+        (
+            "max_wal_buffer_size".to_string(),
+            config.max_wal_buffer_size.to_string(),
+        ),
+        (
+            "max_memtable_size".to_string(),
+            config.max_memtable_size.to_string(),
+        ),
+        (
+            "max_memtable_rows".to_string(),
+            config.max_memtable_rows.to_string(),
+        ),
+        (
+            "max_memtable_batches".to_string(),
+            config.max_memtable_batches.to_string(),
+        ),
+        (
+            "manifest_scan_batch_size".to_string(),
+            config.manifest_scan_batch_size.to_string(),
+        ),
+        (
+            "max_unflushed_memtable_bytes".to_string(),
+            config.max_unflushed_memtable_bytes.to_string(),
+        ),
+        (
+            "backpressure_log_interval_ms".to_string(),
+            config.backpressure_log_interval.as_millis().to_string(),
+        ),
+        (
+            "async_index_buffer_rows".to_string(),
+            config.async_index_buffer_rows.to_string(),
+        ),
+        (
+            "async_index_interval_ms".to_string(),
+            config.async_index_interval.as_millis().to_string(),
+        ),
+        (
+            "enable_memtable".to_string(),
+            config.enable_memtable.to_string(),
+        ),
+    ]);
+    if let Some(interval) = config.max_wal_flush_interval {
+        defaults.insert(
+            "max_wal_flush_interval_ms".to_string(),
+            interval.as_millis().to_string(),
+        );
+    }
+    if let Some(interval) = config.stats_log_interval {
+        defaults.insert(
+            "stats_log_interval_ms".to_string(),
+            interval.as_millis().to_string(),
+        );
+    }
+    defaults
 }
 
 /// Extension trait for Dataset to support MemWAL operations.
