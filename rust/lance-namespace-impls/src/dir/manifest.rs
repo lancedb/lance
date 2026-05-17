@@ -635,6 +635,25 @@ impl DatasetConsistencyWrapper {
         })
     }
 
+    /// Get the cached dataset without reloading.
+    /// Use when the caller knows the dataset is already at an acceptable version
+    /// (e.g., under a mutation lock where we just committed or are about to detect
+    /// conflicts at commit time).
+    pub async fn get_cached(&self) -> DatasetReadGuard<'_> {
+        DatasetReadGuard {
+            guard: self.0.read().await,
+        }
+    }
+
+    /// Reload the dataset and return a reference.
+    /// Use on retry paths where we know the version is stale.
+    pub async fn get_refreshed(&self) -> Result<DatasetReadGuard<'_>> {
+        self.reload().await?;
+        Ok(DatasetReadGuard {
+            guard: self.0.read().await,
+        })
+    }
+
     /// Get a mutable reference to the dataset.
     /// Always reloads to ensure strong consistency.
     pub async fn get_mut(&self) -> Result<DatasetWriteGuard<'_>> {
@@ -1713,7 +1732,13 @@ impl ManifestNamespace {
         let build_indices = self.inline_optimization_enabled;
 
         loop {
-            let dataset_guard = self.manifest_dataset.get().await?;
+            // First attempt uses cached dataset (no I/O). Retries reload to pick up
+            // the version that won the conflict.
+            let dataset_guard = if retries == 0 {
+                self.manifest_dataset.get_cached().await
+            } else {
+                self.manifest_dataset.get_refreshed().await?
+            };
             let dataset = Arc::new(dataset_guard.clone());
             drop(dataset_guard);
 
@@ -1789,19 +1814,12 @@ impl ManifestNamespace {
 
             match result {
                 Ok(_) => {
-                    let new_dataset =
-                        dataset
-                            .checkout_version(manifest.version)
-                            .await
-                            .map_err(|e| {
-                                lance_core::Error::from(NamespaceError::Internal {
-                                    message: format!(
-                                        "Failed to checkout committed manifest version {}: {:?}",
-                                        manifest.version, e
-                                    ),
-                                })
-                            })?;
-                    self.manifest_dataset.set_latest(new_dataset).await;
+                    // Promote cache to the committed version. checkout_version reads
+                    // the manifest we just wrote, which is typically served from the
+                    // object-store HTTP cache and avoids a full reload cycle.
+                    if let Ok(new_dataset) = dataset.checkout_version(manifest.version).await {
+                        self.manifest_dataset.set_latest(new_dataset).await;
+                    }
                     return Ok(mutation.result);
                 }
                 Err(CommitError::CommitConflict) if retries < max_retries => {
