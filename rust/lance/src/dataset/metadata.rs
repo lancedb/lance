@@ -540,117 +540,90 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_field_metadata_syncs_unenforced_primary_key_position() {
-        // Regression test: installing the unenforced primary key via field
-        // metadata must keep the cached `unenforced_primary_key_position` in
-        // sync with the metadata HashMap, otherwise the next commit drops the
-        // marker because the protobuf is encoded from the cached option.
-        //
-        // The primary key is immutable once set, so each install case uses a
-        // fresh dataset.
-        use lance_core::datatypes::{
-            LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
-        };
+        // Installing the unenforced primary key via field metadata must keep
+        // the cached `unenforced_primary_key_position` in sync with the
+        // metadata HashMap, otherwise the next commit drops the marker because
+        // the protobuf is encoded from the cached option.
+        use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 
-        async fn fresh_dataset(uri: &str) -> Dataset {
-            let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("id", DataType::Int32, false),
-                ArrowField::new("name", DataType::Utf8, true),
-            ]));
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![1, 2, 3])),
-                    Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
-                ],
-            )
-            .unwrap();
-            Dataset::write(
-                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-                uri,
-                None,
-            )
-            .await
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmp_dir.as_str();
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
+        assert!(dataset.schema().unenforced_primary_key().is_empty());
+
+        dataset
+            .update_field_metadata()
+            .update("a", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
             .unwrap()
-        }
+            .await
+            .unwrap();
+        let a_field = dataset.schema().field("a").unwrap();
+        assert_eq!(a_field.unenforced_primary_key_position, Some(1));
 
-        // Install PK on "id" via the position key. The cached option must
-        // reflect it and the marker must round-trip through reopen, since it
-        // is encoded from the cached option rather than the metadata HashMap.
-        {
-            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
-            let uri = tmp_dir.as_str();
-            let mut dataset = fresh_dataset(uri).await;
-            assert!(dataset.schema().unenforced_primary_key().is_empty());
+        // The marker is encoded from the cached option, so it must round-trip
+        // through reopen.
+        let reopened = Dataset::open(uri).await.unwrap();
+        let pk = reopened.schema().unenforced_primary_key();
+        assert_eq!(pk.len(), 1);
+        assert_eq!(pk[0].name, "a");
+    }
 
-            dataset
-                .update_field_metadata()
-                .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
-                .unwrap()
-                .await
-                .unwrap();
+    #[tokio::test]
+    async fn test_update_field_metadata_unenforced_primary_key_legacy_flag() {
+        // The legacy boolean-flag form installs the primary key and syncs the
+        // cached option; all accepted truthy spellings are recognized.
+        use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 
-            let id_field = dataset.schema().field("id").unwrap();
-            assert_eq!(id_field.unenforced_primary_key_position, Some(0));
-            let pk = dataset.schema().unenforced_primary_key();
-            assert_eq!(pk.len(), 1);
-            assert_eq!(pk[0].name, "id");
-
-            let reopened = Dataset::open(uri).await.unwrap();
-            let pk = reopened.schema().unenforced_primary_key();
-            assert_eq!(pk.len(), 1);
-            assert_eq!(pk[0].name, "id");
-        }
-
-        // Legacy boolean-flag form must also sync the cached option. All
-        // accepted truthy spellings install the primary key.
         for truthy in ["true", "1", "yes", "TRUE", "Yes"] {
-            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
-            let mut dataset = fresh_dataset(tmp_dir.as_str()).await;
+            let data = gen_batch()
+                .col("a", array::step::<Int32Type>())
+                .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+            let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
             dataset
                 .update_field_metadata()
-                .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, truthy)])
+                .replace("a", [(LANCE_UNENFORCED_PRIMARY_KEY, truthy)])
                 .unwrap()
                 .await
                 .unwrap();
+            let a_field = dataset.schema().field("a").unwrap();
             assert_eq!(
-                dataset
-                    .schema()
-                    .field("name")
-                    .unwrap()
-                    .unenforced_primary_key_position,
+                a_field.unenforced_primary_key_position,
                 Some(0),
                 "value {:?} should be treated as a PK marker",
                 truthy
             );
         }
+    }
 
-        // A non-numeric position value must fall back to the boolean-flag
-        // path, not panic on parse.
-        {
-            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
-            let mut dataset = fresh_dataset(tmp_dir.as_str()).await;
-            dataset
-                .update_field_metadata()
-                .replace(
-                    "name",
-                    [
-                        (LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "not-a-number"),
-                        (LANCE_UNENFORCED_PRIMARY_KEY, "true"),
-                    ],
-                )
-                .unwrap()
-                .await
-                .unwrap();
-            assert_eq!(
-                dataset
-                    .schema()
-                    .field("name")
-                    .unwrap()
-                    .unenforced_primary_key_position,
-                Some(0),
-                "garbage position must fall through to the boolean fallback",
-            );
-        }
+    #[tokio::test]
+    async fn test_update_field_metadata_unenforced_primary_key_non_numeric_position() {
+        // A non-numeric position value falls back to the boolean-flag path
+        // rather than panicking on parse.
+        use lance_core::datatypes::{
+            LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+        };
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        dataset
+            .update_field_metadata()
+            .replace(
+                "a",
+                [
+                    (LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "not-a-number"),
+                    (LANCE_UNENFORCED_PRIMARY_KEY, "true"),
+                ],
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        let a_field = dataset.schema().field("a").unwrap();
+        assert_eq!(a_field.unenforced_primary_key_position, Some(0));
     }
 
     #[tokio::test]
@@ -660,31 +633,16 @@ mod tests {
         // alters the set of primary key columns, is rejected.
         use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 
-        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("name", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            tmp_dir.as_str(),
-            None,
-        )
-        .await
-        .unwrap();
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
 
         // The first install of the primary key is allowed.
         dataset
             .update_field_metadata()
-            .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
+            .update("a", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
             .unwrap()
             .await
             .unwrap();
@@ -694,7 +652,7 @@ mod tests {
         // rejected: the reserved key cannot be written once a key is set.
         let err = dataset
             .update_field_metadata()
-            .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
+            .update("a", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
             .unwrap()
             .await
             .unwrap_err();
@@ -703,7 +661,7 @@ mod tests {
         // Adding a second primary key column is rejected.
         let err = dataset
             .update_field_metadata()
-            .update("name", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "2")])
+            .update("b", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "2")])
             .unwrap()
             .await
             .unwrap_err();
@@ -712,7 +670,7 @@ mod tests {
         // Removing the primary key is rejected.
         let err = dataset
             .update_field_metadata()
-            .replace("id", [] as [UpdateMapEntry; 0])
+            .replace("a", [] as [UpdateMapEntry; 0])
             .unwrap()
             .await
             .unwrap_err();
@@ -721,7 +679,7 @@ mod tests {
         // The primary key is unchanged after the rejected commits.
         let pk = dataset.schema().unenforced_primary_key();
         assert_eq!(pk.len(), 1);
-        assert_eq!(pk[0].name, "id");
+        assert_eq!(pk[0].name, "a");
     }
 
     #[tokio::test]
@@ -731,29 +689,15 @@ mod tests {
         // silently ignored.
         use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 
-        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            tmp_dir.as_str(),
-            None,
-        )
-        .await
-        .unwrap();
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
 
         for invalid in ["no", "false", "0", "anything-else"] {
             let err = dataset
                 .update_field_metadata()
-                .replace("id", [(LANCE_UNENFORCED_PRIMARY_KEY, invalid)])
+                .replace("a", [(LANCE_UNENFORCED_PRIMARY_KEY, invalid)])
                 .unwrap()
                 .await
                 .unwrap_err();
@@ -785,5 +729,152 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_syncs_unenforced_clustering_key_position() {
+        // Installing the unenforced clustering key via field metadata must keep
+        // the cached `unenforced_clustering_key_position` in sync with the
+        // metadata HashMap, otherwise the next commit drops the marker because
+        // the protobuf is encoded from the cached option.
+        use lance_core::datatypes::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmp_dir.as_str();
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
+        assert!(dataset.schema().unenforced_clustering_key().is_empty());
+
+        dataset
+            .update_field_metadata()
+            .update("a", [(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "1")])
+            .unwrap()
+            .await
+            .unwrap();
+        let a_field = dataset.schema().field("a").unwrap();
+        assert_eq!(a_field.unenforced_clustering_key_position, Some(1));
+
+        // The marker is encoded from the cached option, so it must round-trip
+        // through reopen.
+        let reopened = Dataset::open(uri).await.unwrap();
+        let ck = reopened.schema().unenforced_clustering_key();
+        assert_eq!(ck.len(), 1);
+        assert_eq!(ck[0].name, "a");
+    }
+
+    #[tokio::test]
+    async fn test_update_field_metadata_unenforced_clustering_key_compound() {
+        // A compound clustering key installs all of its columns, ordered by
+        // position, and round-trips through reopen.
+        use lance_core::datatypes::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmp_dir.as_str();
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
+
+        dataset
+            .update_field_metadata()
+            .update("b", [(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "1")])
+            .unwrap()
+            .update("a", [(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "2")])
+            .unwrap()
+            .await
+            .unwrap();
+
+        let reopened = Dataset::open(uri).await.unwrap();
+        let ck = reopened.schema().unenforced_clustering_key();
+        assert_eq!(ck.len(), 2);
+        assert_eq!(ck[0].name, "b");
+        assert_eq!(ck[1].name, "a");
+    }
+
+    #[tokio::test]
+    async fn test_unenforced_clustering_key_is_immutable() {
+        // Once set, the unenforced clustering key cannot be changed, re-set, or
+        // removed: any commit that writes its reserved metadata key, or that
+        // alters the set of clustering key columns, is rejected.
+        use lance_core::datatypes::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        // The first install of the clustering key is allowed.
+        dataset
+            .update_field_metadata()
+            .update("a", [(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "1")])
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(dataset.schema().unenforced_clustering_key().len(), 1);
+
+        // Re-applying the clustering key, even to the identical column, is
+        // rejected: the reserved key cannot be written once a key is set.
+        let err = dataset
+            .update_field_metadata()
+            .update("a", [(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "1")])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // Adding a second clustering key column is rejected.
+        let err = dataset
+            .update_field_metadata()
+            .update("b", [(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "2")])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // Removing the clustering key is rejected.
+        let err = dataset
+            .update_field_metadata()
+            .replace("a", [] as [UpdateMapEntry; 0])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // The clustering key is unchanged after the rejected commits.
+        let ck = dataset.schema().unenforced_clustering_key();
+        assert_eq!(ck.len(), 1);
+        assert_eq!(ck[0].name, "a");
+    }
+
+    #[tokio::test]
+    async fn test_unenforced_clustering_key_rejects_invalid_marker() {
+        // Writing the reserved clustering key metadata key with a value that is
+        // not a valid position is rejected rather than silently ignored.
+        use lance_core::datatypes::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        for invalid in ["not-a-number", "", "1.5"] {
+            let err = dataset
+                .update_field_metadata()
+                .replace("a", [(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, invalid)])
+                .unwrap()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "value {:?}: got {:?}",
+                invalid,
+                err
+            );
+            assert!(dataset.schema().unenforced_clustering_key().is_empty());
+        }
     }
 }
