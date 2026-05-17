@@ -4072,10 +4072,10 @@ mod shard_writer_tests {
     }
 
     #[tokio::test]
-    async fn test_initialize_mem_wal_records_writer_defaults() {
+    async fn test_initialize_mem_wal_records_writer_config_defaults() {
         let vector_dim = 128;
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_writer_defaults_{}", Uuid::new_v4());
+        let uri = format!("memory://test_writer_config_defaults_{}", Uuid::new_v4());
 
         let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
         let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
@@ -4090,7 +4090,7 @@ mod shard_writer_tests {
         dataset
             .initialize_mem_wal()
             .writer_config_defaults(writer_config)
-            .add_writer_default("custom_knob", "custom_value")
+            .add_writer_config_default("custom_knob", "custom_value")
             .execute()
             .await
             .expect("Failed to initialize MemWAL");
@@ -4102,7 +4102,7 @@ mod shard_writer_tests {
             .expect("Failed to read MemWAL index details")
             .expect("MemWAL index details should exist");
 
-        let defaults = &details.writer_defaults;
+        let defaults = &details.writer_config_defaults;
         // ShardWriterConfig tunables are recorded under their field names.
         assert_eq!(
             defaults.get("durable_write").map(String::as_str),
@@ -4123,7 +4123,7 @@ mod shard_writer_tests {
         assert!(defaults.contains_key("sync_indexed_write"));
         assert!(defaults.contains_key("enable_memtable"));
         assert!(defaults.contains_key("async_index_interval_ms"));
-        // add_writer_default records arbitrary keys.
+        // add_writer_config_default records arbitrary keys.
         assert_eq!(
             defaults.get("custom_knob").map(String::as_str),
             Some("custom_value")

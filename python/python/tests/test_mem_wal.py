@@ -342,7 +342,7 @@ def test_initialize_mem_wal_manual(tmp_path):
     assert details["num_shards"] == 0
     assert details["sharding_specs"] == []
     assert details["maintained_indexes"] == []
-    assert details["writer_defaults"] == {}
+    assert details["writer_config_defaults"] == {}
 
 
 def test_initialize_mem_wal_unsharded(tmp_path):
@@ -387,7 +387,7 @@ def test_initialize_mem_wal_maintained_indexes(tmp_path):
     assert ds.mem_wal_index_details()["maintained_indexes"] == ["id_btree"]
 
 
-def test_initialize_mem_wal_writer_defaults(tmp_path):
+def test_initialize_mem_wal_writer_config_defaults(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
     ds.initialize_mem_wal(
         durable_write=False,
@@ -395,7 +395,7 @@ def test_initialize_mem_wal_writer_defaults(tmp_path):
         max_wal_flush_interval_ms=250,
     )
 
-    defaults = ds.mem_wal_index_details()["writer_defaults"]
+    defaults = ds.mem_wal_index_details()["writer_config_defaults"]
     assert defaults["durable_write"] == "false"
     assert defaults["max_memtable_size"] == str(8 * 1024 * 1024)
     # Duration knobs are recorded in milliseconds with a `_ms` suffix.
@@ -405,10 +405,10 @@ def test_initialize_mem_wal_writer_defaults(tmp_path):
     assert "enable_memtable" in defaults
 
 
-def test_initialize_mem_wal_no_writer_defaults_when_unset(tmp_path):
+def test_initialize_mem_wal_no_writer_config_defaults_when_unset(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
     ds.initialize_mem_wal(bucket_column="id", num_buckets=4)
-    assert ds.mem_wal_index_details()["writer_defaults"] == {}
+    assert ds.mem_wal_index_details()["writer_config_defaults"] == {}
 
 
 def test_initialize_mem_wal_rejects_conflicting_sharding(tmp_path):

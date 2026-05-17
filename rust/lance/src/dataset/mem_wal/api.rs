@@ -92,7 +92,7 @@ pub struct InitializeMemWalBuilder<'a> {
     dataset: &'a mut Dataset,
     sharding: Sharding,
     maintained_indexes: Vec<String>,
-    writer_defaults: HashMap<String, String>,
+    writer_config_defaults: HashMap<String, String>,
 }
 
 impl<'a> InitializeMemWalBuilder<'a> {
@@ -101,7 +101,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             dataset,
             sharding: Sharding::Manual,
             maintained_indexes: Vec::new(),
-            writer_defaults: HashMap::new(),
+            writer_config_defaults: HashMap::new(),
         }
     }
 
@@ -162,9 +162,9 @@ impl<'a> InitializeMemWalBuilder<'a> {
     /// (non-persisted) `ShardWriterConfig`.
     ///
     /// Merges into any defaults already set; a key set via
-    /// [`add_writer_default`](Self::add_writer_default) afterwards wins.
+    /// [`add_writer_config_default`](Self::add_writer_config_default) afterwards wins.
     pub fn writer_config_defaults(mut self, config: ShardWriterConfig) -> Self {
-        self.writer_defaults
+        self.writer_config_defaults
             .extend(writer_config_to_defaults(&config));
         self
     }
@@ -173,8 +173,12 @@ impl<'a> InitializeMemWalBuilder<'a> {
     ///
     /// Use this for keys not covered by
     /// [`writer_config_defaults`](Self::writer_config_defaults).
-    pub fn add_writer_default(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.writer_defaults.insert(key.into(), value.into());
+    pub fn add_writer_config_default(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.writer_config_defaults.insert(key.into(), value.into());
         self
     }
 
@@ -187,7 +191,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             dataset,
             sharding,
             maintained_indexes,
-            writer_defaults,
+            writer_config_defaults,
         } = self;
 
         if dataset.schema().unenforced_primary_key().is_empty() {
@@ -219,7 +223,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             num_shards,
             sharding_specs,
             maintained_indexes,
-            writer_defaults,
+            writer_config_defaults,
             ..Default::default()
         };
 

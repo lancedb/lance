@@ -681,7 +681,7 @@ message MemWalIndexDetails {
   // configuration. These are defaults only: an individual writer may
   // still override any value at runtime in its own ShardWriterConfig
   // (which is not persisted).
-  map<string, string> writer_defaults = 11;
+  map<string, string> writer_config_defaults = 11;
 }
 
 // Sharding spec definition.

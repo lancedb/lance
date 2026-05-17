@@ -3348,7 +3348,7 @@ impl Dataset {
     /// has not been initialized.
     ///
     /// The returned dict has `num_shards`, `maintained_indexes`,
-    /// `writer_defaults`, and `sharding_specs`.
+    /// `writer_config_defaults`, and `sharding_specs`.
     fn mem_wal_index_details<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3363,7 +3363,7 @@ impl Dataset {
         let dict = PyDict::new(py);
         dict.set_item("num_shards", details.num_shards)?;
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
-        dict.set_item("writer_defaults", details.writer_defaults)?;
+        dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
 
         let specs = PyList::empty(py);
         for spec in &details.sharding_specs {

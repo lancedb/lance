@@ -313,7 +313,7 @@ pub struct MemWalIndexDetails {
     /// from the same default writer configuration. These are defaults only;
     /// an individual writer may still override any value at runtime in its
     /// own (non-persisted) `ShardWriterConfig`.
-    pub writer_defaults: HashMap<String, String>,
+    pub writer_config_defaults: HashMap<String, String>,
 }
 
 impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
@@ -330,7 +330,7 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
                 .map(|mg| mg.into())
                 .collect(),
             index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
-            writer_defaults: details.writer_defaults.clone(),
+            writer_config_defaults: details.writer_config_defaults.clone(),
         }
     }
 }
@@ -359,7 +359,7 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .into_iter()
                 .map(IndexCatchupProgress::try_from)
                 .collect::<lance_core::Result<_>>()?,
-            writer_defaults: details.writer_defaults,
+            writer_config_defaults: details.writer_config_defaults,
         })
     }
 }

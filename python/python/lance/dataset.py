@@ -4685,7 +4685,7 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         dict or None
             A dict with ``num_shards``, ``maintained_indexes``,
-            ``writer_defaults``, and ``sharding_specs``, or ``None`` when
+            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
             MemWAL has not been initialized on this dataset.
         """
         return self._ds.mem_wal_index_details()
