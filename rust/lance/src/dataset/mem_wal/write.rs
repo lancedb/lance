@@ -4192,6 +4192,62 @@ mod shard_writer_tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_initialize_mem_wal_identity_sharding() {
+        let vector_dim = 128;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_identity_sharding_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        // A column that does not exist is rejected.
+        let result = dataset
+            .initialize_mem_wal()
+            .identity_sharding("nonexistent")
+            .execute()
+            .await;
+        assert!(
+            result.is_err(),
+            "an unknown identity column should be rejected"
+        );
+
+        // A non-scalar column cannot be a shard key.
+        let result = dataset
+            .initialize_mem_wal()
+            .identity_sharding("vector")
+            .execute()
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-scalar identity column should be rejected"
+        );
+
+        dataset
+            .initialize_mem_wal()
+            .identity_sharding("text")
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .expect("Failed to read MemWAL index details")
+            .expect("MemWAL index details should exist");
+
+        // Identity sharding has an open-ended shard count.
+        assert_eq!(details.num_shards, 0);
+        assert_eq!(details.sharding_specs.len(), 1);
+        let field = &details.sharding_specs[0].fields[0];
+        assert_eq!(field.transform.as_deref(), Some("identity"));
+        assert_eq!(field.result_type.as_str(), "utf8");
+        assert_eq!(field.source_ids.len(), 1);
+    }
+
     /// Quick smoke test for shard writer - runs against memory://
     /// Run with: cargo test -p lance shard_writer_tests::test_shard_writer_smoke -- --nocapture
     #[tokio::test]

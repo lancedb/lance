@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
@@ -43,6 +44,10 @@ const BUCKET_TRANSFORM: &str = "bucket";
 /// a single shard.
 const UNSHARDED_TRANSFORM: &str = "unsharded";
 
+/// Transform name for [`InitializeMemWalBuilder::identity_sharding`]: the shard
+/// value is the raw value of the source column.
+const IDENTITY_TRANSFORM: &str = "identity";
+
 /// Parameter key holding the bucket count `N` on the bucket transform.
 const NUM_BUCKETS_PARAM: &str = "num_buckets";
 
@@ -61,6 +66,8 @@ enum Sharding {
     /// Hash-bucket the single-column unenforced primary key into `num_buckets`
     /// shards.
     Bucket { column: String, num_buckets: u32 },
+    /// Shard by the raw value of `column` (identity transform).
+    Identity { column: String },
 }
 
 /// Builder for initializing MemWAL on a [`Dataset`].
@@ -113,6 +120,20 @@ impl<'a> InitializeMemWalBuilder<'a> {
         self.sharding = Sharding::Bucket {
             column: column.into(),
             num_buckets,
+        };
+        self
+    }
+
+    /// Shard by the raw value of `column` (the identity transform).
+    ///
+    /// Each distinct value of `column` becomes its own shard; use this when the
+    /// data is already partitioned by that column. The caller is responsible
+    /// for ensuring every primary key maps consistently to a single value of
+    /// `column`. `column` must be a scalar column that exists on the dataset;
+    /// it is validated by [`execute`](Self::execute).
+    pub fn identity_sharding(mut self, column: impl Into<String>) -> Self {
+        self.sharding = Sharding::Identity {
+            column: column.into(),
         };
         self
     }
@@ -232,6 +253,7 @@ fn resolve_sharding(dataset: &Dataset, sharding: Sharding) -> Result<(Vec<Shardi
             vec![bucket_sharding_spec(dataset, &column, num_buckets)?],
             num_buckets,
         )),
+        Sharding::Identity { column } => Ok((vec![identity_sharding_spec(dataset, &column)?], 0)),
     }
 }
 
@@ -286,6 +308,55 @@ fn bucket_sharding_spec(dataset: &Dataset, column: &str, num_buckets: u32) -> Re
             result_type: SHARDING_RESULT_TYPE.to_string(),
             parameters: HashMap::from([(NUM_BUCKETS_PARAM.to_string(), num_buckets.to_string())]),
         }],
+    })
+}
+
+/// Build the sharding spec for [`InitializeMemWalBuilder::identity_sharding`].
+fn identity_sharding_spec(dataset: &Dataset, column: &str) -> Result<ShardingSpec> {
+    let field = dataset.schema().field(column).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "identity_sharding: column '{}' not found on the dataset",
+            column
+        ))
+    })?;
+
+    let data_type = field.data_type();
+    let result_type = scalar_result_type(&data_type).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "identity_sharding: column '{}' has type {:?}, which cannot be used as a shard key",
+            column, data_type
+        ))
+    })?;
+
+    Ok(ShardingSpec {
+        spec_id: SHARDING_SPEC_ID,
+        fields: vec![ShardingField {
+            field_id: SHARDING_FIELD_ID.to_string(),
+            source_ids: vec![field.id],
+            transform: Some(IDENTITY_TRANSFORM.to_string()),
+            expression: None,
+            result_type: result_type.to_string(),
+            parameters: HashMap::new(),
+        }],
+    })
+}
+
+/// The Arrow type name for a scalar column usable as a shard key, or `None`
+/// for types that cannot be a shard key.
+fn scalar_result_type(data_type: &DataType) -> Option<&'static str> {
+    Some(match data_type {
+        DataType::Int8 => "int8",
+        DataType::Int16 => "int16",
+        DataType::Int32 => "int32",
+        DataType::Int64 => "int64",
+        DataType::UInt8 => "uint8",
+        DataType::UInt16 => "uint16",
+        DataType::UInt32 => "uint32",
+        DataType::UInt64 => "uint64",
+        DataType::Utf8 => "utf8",
+        DataType::LargeUtf8 => "large_utf8",
+        DataType::Boolean => "boolean",
+        _ => return None,
     })
 }
 
