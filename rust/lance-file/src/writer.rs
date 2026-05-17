@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+use lance_arrow_scalar::ArrowScalar;
 use lance_core::utils::zone::FileZoneBuilder;
 
 use arrow_data::ArrayData;
@@ -33,8 +34,6 @@ use prost_types::Any;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
-
-use datafusion_common::ScalarValue;
 
 use crate::datatypes::FieldsWithMeta;
 use crate::format::MAGIC;
@@ -266,6 +265,39 @@ fn initial_column_metadata() -> pbfile::ColumnMetadata {
         buffer_sizes: Vec::new(),
         encoding: None,
     }
+}
+
+fn scalar_options_to_array<'a>(
+    data_type: &DataType,
+    scalars: impl IntoIterator<Item = &'a Option<ArrowScalar>>,
+) -> Result<ArrayRef> {
+    let arrays = scalars
+        .into_iter()
+        .map(|scalar| match scalar {
+            Some(scalar) => {
+                if scalar.data_type() != data_type {
+                    return Err(Error::internal(format!(
+                        "Column statistics scalar type mismatch: expected {:?}, got {:?}",
+                        data_type,
+                        scalar.data_type()
+                    )));
+                }
+                Ok(Arc::clone(scalar.as_array()))
+            }
+            None => Ok(arrow_array::new_null_array(data_type, 1)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if arrays.is_empty() {
+        return Ok(arrow_array::new_empty_array(data_type));
+    }
+
+    let array_refs = arrays
+        .iter()
+        .map(|array| array.as_ref() as &dyn Array)
+        .collect::<Vec<_>>();
+    arrow_select::concat::concat(&array_refs)
+        .map_err(|e| Error::invalid_input(format!("Failed to build statistics array: {}", e)))
 }
 
 static WARNED_ON_UNSTABLE_API: AtomicBool = AtomicBool::new(false);
@@ -509,8 +541,8 @@ impl FileWriter {
             .extend(std::mem::take(&mut schema.metadata));
         self.schema = Some(schema);
 
-        // Initialize column statistics processors if enabled; skip columns for which DataFusion
-        // min/max is not supported (try_new fails), so we stay in sync with DataFusion upgrades.
+        // Initialize column statistics processors if enabled; skip columns whose type
+        // cannot be represented by the current column-zone min/max schema.
         if !self.options.disable_column_stats {
             let mut processors = Vec::new();
             for field in &self.schema.as_ref().unwrap().fields {
@@ -1105,11 +1137,10 @@ impl FileWriter {
             })?;
             let data_type = field.data_type();
 
-            // Build min/max arrays from zone scalars; array type is inferred from ScalarValue
-            let min_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.min.clone()))
-                .map_err(|e| Error::invalid_input(e.to_string()))?;
-            let max_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.max.clone()))
-                .map_err(|e| Error::invalid_input(e.to_string()))?;
+            let min_array =
+                scalar_options_to_array(&data_type, zones.iter().map(|zone| &zone.min))?;
+            let max_array =
+                scalar_options_to_array(&data_type, zones.iter().map(|zone| &zone.max))?;
 
             let mut null_counts = Vec::with_capacity(num_zones);
             let mut nan_counts = Vec::with_capacity(num_zones);

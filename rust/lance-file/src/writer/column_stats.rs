@@ -9,9 +9,8 @@
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
-use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion_common::ScalarValue;
-use datafusion_expr::Accumulator;
+use lance_arrow_scalar::ArrowScalar;
+use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::zone::{ZoneBound, ZoneProcessor};
 use lance_core::{Error, Result};
 
@@ -21,8 +20,8 @@ pub(super) const COLUMN_STATS_ZONE_SIZE: u64 = 1_000_000;
 /// Column statistics for a single zone
 #[derive(Debug, Clone)]
 pub(super) struct ColumnZoneStatistics {
-    pub min: ScalarValue,
-    pub max: ScalarValue,
+    pub min: Option<ArrowScalar>,
+    pub max: Option<ArrowScalar>,
     pub null_count: u32,
     pub nan_count: u32,
     pub bound: ZoneBound,
@@ -30,33 +29,44 @@ pub(super) struct ColumnZoneStatistics {
 
 /// Statistics processor for a single column that implements ZoneProcessor trait
 pub(super) struct ColumnStatisticsProcessor {
-    data_type: DataType,
-    min: MinAccumulator,
-    max: MaxAccumulator,
-    null_count: u32,
-    nan_count: u32,
+    accumulator: StatisticsAccumulator,
 }
 
 /// Returns true for types that support min/max aggregation.
-/// We exclude nested types (Struct, List, etc.) because DataFusion's try_new can succeed
-/// for them but comparison fails at runtime. For other types we delegate to try_new.
 fn supports_min_max(data_type: &DataType) -> bool {
-    // Exclude types that try_new accepts but fail at runtime when comparing.
-    // FixedSizeList is excluded because extension types (e.g. bfloat16) use it as storage;
-    // min/max arrays then lack extension metadata and cause schema mismatch.
-    if matches!(
+    // Skip binary types until column-zone stats can store bounded prefixes instead of full values.
+    matches!(
         data_type,
-        DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Struct(_)
-            | DataType::Map(_, _)
-            | DataType::RunEndEncoded(_, _)
-            | DataType::Dictionary(_, _)
-    ) {
-        return false;
-    }
-    MinAccumulator::try_new(data_type).is_ok() && MaxAccumulator::try_new(data_type).is_ok()
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+    )
+}
+
+fn count_to_u32(value: u64, stat_name: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        Error::invalid_input(format!(
+            "Column statistics {} exceeds UInt32: {}",
+            stat_name, value
+        ))
+    })
 }
 
 impl ColumnStatisticsProcessor {
@@ -67,44 +77,9 @@ impl ColumnStatisticsProcessor {
                 data_type
             )));
         }
-        let min =
-            MinAccumulator::try_new(&data_type).map_err(|e| Error::invalid_input(e.to_string()))?;
-        let max =
-            MaxAccumulator::try_new(&data_type).map_err(|e| Error::invalid_input(e.to_string()))?;
         Ok(Self {
-            data_type,
-            min,
-            max,
-            null_count: 0,
-            nan_count: 0,
+            accumulator: StatisticsAccumulator::new(&data_type),
         })
-    }
-
-    fn count_nans(array: &ArrayRef) -> u32 {
-        match array.data_type() {
-            DataType::Float16 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float16Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float32 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float32Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            DataType::Float64 => {
-                let array = array
-                    .as_any()
-                    .downcast_ref::<arrow_array::Float64Array>()
-                    .unwrap();
-                array.values().iter().filter(|&&x| x.is_nan()).count() as u32
-            }
-            _ => 0,
-        }
     }
 }
 
@@ -112,39 +87,23 @@ impl ZoneProcessor for ColumnStatisticsProcessor {
     type ZoneStatistics = ColumnZoneStatistics;
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
-        self.null_count += array.null_count() as u32;
-        self.nan_count += Self::count_nans(array);
-        self.min
-            .update_batch(std::slice::from_ref(array))
-            .map_err(|e| Error::invalid_input(e.to_string()))?;
-        self.max
-            .update_batch(std::slice::from_ref(array))
+        self.accumulator
+            .update(array)
             .map_err(|e| Error::invalid_input(e.to_string()))?;
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+        let snapshot = self.accumulator.statistics();
         let stats = ColumnZoneStatistics {
-            min: self
-                .min
-                .evaluate()
-                .map_err(|e| Error::invalid_input(e.to_string()))?,
-            max: self
-                .max
-                .evaluate()
-                .map_err(|e| Error::invalid_input(e.to_string()))?,
-            null_count: self.null_count,
-            nan_count: self.nan_count,
+            min: snapshot.min,
+            max: snapshot.max,
+            null_count: count_to_u32(snapshot.null_count, "null_count")?,
+            nan_count: count_to_u32(snapshot.nan_count.unwrap_or(0), "nan_count")?,
             bound,
         };
 
-        // Auto-reset for next zone
-        self.min = MinAccumulator::try_new(&self.data_type)
-            .map_err(|e| Error::invalid_input(e.to_string()))?;
-        self.max = MaxAccumulator::try_new(&self.data_type)
-            .map_err(|e| Error::invalid_input(e.to_string()))?;
-        self.null_count = 0;
-        self.nan_count = 0;
+        self.accumulator.reset();
 
         Ok(stats)
     }

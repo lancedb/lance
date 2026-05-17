@@ -13,6 +13,8 @@ rust-version.workspace = true
 
 [dependencies]
 lance-arrow.workspace = true
+lance-arrow-scalar.workspace = true
+lance-arrow-stats.workspace = true
 lance-core.workspace = true
 lance-encoding.workspace = true
 lance-io.workspace = true
@@ -28,8 +30,6 @@ async-trait.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 datafusion-common.workspace = true
-datafusion-expr.workspace = true
-datafusion.workspace = true
 deepsize.workspace = true
 futures.workspace = true
 log.workspace = true
