@@ -399,14 +399,16 @@ impl FieldEncoder for BlobFieldEncoder {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         sync::{Arc, LazyLock},
     };
 
     use arrow_array::LargeBinaryArray;
     use arrow_schema::{DataType, Field};
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::{Error, Result};
 
+    use super::BlobFieldDecoder;
     use crate::{
         format::pb::column_encoding,
         testing::{TestCases, check_round_trip_encoding_of_data, check_specific_random},
@@ -468,5 +470,69 @@ mod tests {
             }));
         // Don't use blob encoding if not requested
         check_round_trip_encoding_of_data(vec![array], &test_cases, Default::default()).await;
+    }
+
+    /// An `EncodingsIo` that simulates cloud storage rejecting every request
+    /// with a retryable error (e.g. an exhausted HTTP 503 retry budget).
+    #[derive(Debug)]
+    struct FailingScheduler;
+
+    impl crate::EncodingsIo for FailingScheduler {
+        fn submit_request(
+            &self,
+            _ranges: Vec<std::ops::Range<u64>>,
+            _priority: u64,
+        ) -> futures::future::BoxFuture<'static, Result<Vec<bytes::Bytes>>> {
+            use futures::FutureExt;
+            std::future::ready(Err(Error::io("simulated HTTP 503 from cloud storage"))).boxed()
+        }
+    }
+
+    /// When the blob data download fails (e.g. sustained HTTP 503), the
+    /// decoder's `loaded` buffer is left empty.  A subsequent `drain` must
+    /// surface a clean error rather than panic on an out-of-bounds VecDeque
+    /// drain ("range end index N out of range for slice of length 0").
+    #[test_log::test(tokio::test)]
+    async fn test_drain_after_io_failure_does_not_panic() {
+        use arrow_array::{PrimitiveArray, types::UInt64Type};
+
+        use crate::previous::decoder::LogicalPageDecoder;
+
+        let num_rows = 16_384u64;
+        // Every row points at a non-empty blob so `wait_for_loaded` issues an
+        // I/O request, which the failing scheduler rejects.
+        let positions =
+            PrimitiveArray::<UInt64Type>::from_iter_values((0..num_rows).map(|i| 1_000 + i * 10));
+        let sizes = PrimitiveArray::<UInt64Type>::from_iter_values(std::iter::repeat_n(
+            10u64,
+            num_rows as usize,
+        ));
+
+        let mut decoder = BlobFieldDecoder {
+            io: Arc::new(FailingScheduler) as Arc<dyn crate::EncodingsIo>,
+            unloaded_descriptions: None,
+            positions,
+            sizes,
+            num_rows,
+            loaded: VecDeque::new(),
+            validity: VecDeque::new(),
+            rows_loaded: 0,
+            rows_drained: 0,
+            base_priority: 0,
+        };
+
+        // The failed download must propagate as an error.
+        let load_result = decoder.wait_for_loaded(num_rows - 1).await;
+        assert!(
+            load_result.is_err(),
+            "wait_for_loaded should propagate the I/O failure"
+        );
+
+        // Draining the (empty) decoder afterwards must error, not panic.
+        let drain_result = decoder.drain(num_rows);
+        assert!(
+            drain_result.is_err(),
+            "drain after a failed load should error, not panic"
+        );
     }
 }
