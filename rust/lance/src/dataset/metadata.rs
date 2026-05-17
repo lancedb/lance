@@ -540,66 +540,72 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_field_metadata_syncs_unenforced_primary_key_position() {
-        // Regression test: updating field metadata to install (or remove) the
-        // unenforced primary key keys must keep the cached
-        // `unenforced_primary_key_position` in sync, otherwise the next
-        // commit drops the marker because the protobuf is encoded from the
-        // cached option, not from the metadata HashMap.
+        // Regression test: installing the unenforced primary key via field
+        // metadata must keep the cached `unenforced_primary_key_position` in
+        // sync with the metadata HashMap, otherwise the next commit drops the
+        // marker because the protobuf is encoded from the cached option.
+        //
+        // The primary key is immutable once set, so each install case uses a
+        // fresh dataset.
         use lance_core::datatypes::{
             LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
         };
 
-        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
-        let uri = tmp_dir.as_str();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, false),
-            ArrowField::new("name", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-            uri,
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert!(dataset.schema().unenforced_primary_key().is_empty());
-
-        // Install PK on "id" via the position key. Both the cached option
-        // and the result of `unenforced_primary_key()` must reflect it.
-        dataset
-            .update_field_metadata()
-            .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
-            .unwrap()
-            .await
+        async fn fresh_dataset(uri: &str) -> Dataset {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
             .unwrap();
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                uri,
+                None,
+            )
+            .await
+            .unwrap()
+        }
 
-        let id_field = dataset.schema().field("id").unwrap();
-        assert_eq!(id_field.unenforced_primary_key_position, Some(0));
-        let pk = dataset.schema().unenforced_primary_key();
-        assert_eq!(pk.len(), 1);
-        assert_eq!(pk[0].name, "id");
+        // Install PK on "id" via the position key. The cached option must
+        // reflect it and the marker must round-trip through reopen, since it
+        // is encoded from the cached option rather than the metadata HashMap.
+        {
+            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let uri = tmp_dir.as_str();
+            let mut dataset = fresh_dataset(uri).await;
+            assert!(dataset.schema().unenforced_primary_key().is_empty());
 
-        // Round-trip through reopen: the position must be persisted in the
-        // protobuf, not just in the in-memory HashMap.
-        let reopened = Dataset::open(uri).await.unwrap();
-        let pk = reopened.schema().unenforced_primary_key();
-        assert_eq!(pk.len(), 1);
-        assert_eq!(pk[0].name, "id");
+            dataset
+                .update_field_metadata()
+                .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
+                .unwrap()
+                .await
+                .unwrap();
+
+            let id_field = dataset.schema().field("id").unwrap();
+            assert_eq!(id_field.unenforced_primary_key_position, Some(0));
+            let pk = dataset.schema().unenforced_primary_key();
+            assert_eq!(pk.len(), 1);
+            assert_eq!(pk[0].name, "id");
+
+            let reopened = Dataset::open(uri).await.unwrap();
+            let pk = reopened.schema().unenforced_primary_key();
+            assert_eq!(pk.len(), 1);
+            assert_eq!(pk[0].name, "id");
+        }
 
         // Legacy boolean-flag form must also sync the cached option. All
-        // three accepted boolean spellings ("true", "1", "yes") and case
-        // variants must work; non-matching strings must be ignored.
+        // accepted truthy spellings install the primary key.
         for truthy in ["true", "1", "yes", "TRUE", "Yes"] {
+            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let mut dataset = fresh_dataset(tmp_dir.as_str()).await;
             dataset
                 .update_field_metadata()
                 .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, truthy)])
@@ -617,10 +623,46 @@ mod tests {
                 truthy
             );
         }
-        for falsy in ["no", "false", "0", "anything-else"] {
+
+        // Non-matching values must not be treated as a PK marker, so the
+        // field never becomes part of the primary key.
+        {
+            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let mut dataset = fresh_dataset(tmp_dir.as_str()).await;
+            for falsy in ["no", "false", "0", "anything-else"] {
+                dataset
+                    .update_field_metadata()
+                    .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, falsy)])
+                    .unwrap()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    dataset
+                        .schema()
+                        .field("name")
+                        .unwrap()
+                        .unenforced_primary_key_position,
+                    None,
+                    "value {:?} should not be treated as a PK marker",
+                    falsy
+                );
+            }
+        }
+
+        // A non-numeric position value must fall back to the boolean-flag
+        // path, not panic on parse.
+        {
+            let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let mut dataset = fresh_dataset(tmp_dir.as_str()).await;
             dataset
                 .update_field_metadata()
-                .replace("name", [(LANCE_UNENFORCED_PRIMARY_KEY, falsy)])
+                .replace(
+                    "name",
+                    [
+                        (LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "not-a-number"),
+                        (LANCE_UNENFORCED_PRIMARY_KEY, "true"),
+                    ],
+                )
                 .unwrap()
                 .await
                 .unwrap();
@@ -630,53 +672,80 @@ mod tests {
                     .field("name")
                     .unwrap()
                     .unenforced_primary_key_position,
-                None,
-                "value {:?} should not be treated as a PK marker",
-                falsy
+                Some(0),
+                "garbage position must fall through to the boolean fallback",
             );
         }
+    }
 
-        // Position key with a non-numeric value must fall back to the
-        // boolean-flag path, not panic on parse.
+    #[tokio::test]
+    async fn test_unenforced_primary_key_is_immutable() {
+        // The unenforced primary key cannot be changed once set: a commit
+        // that would alter the set of primary key columns is rejected.
+        use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            tmp_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The first install of the primary key is allowed.
         dataset
             .update_field_metadata()
-            .replace(
-                "name",
-                [
-                    (LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "not-a-number"),
-                    (LANCE_UNENFORCED_PRIMARY_KEY, "true"),
-                ],
-            )
+            .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
             .unwrap()
             .await
             .unwrap();
-        assert_eq!(
-            dataset
-                .schema()
-                .field("name")
-                .unwrap()
-                .unenforced_primary_key_position,
-            Some(0),
-            "garbage position must fall through to the boolean fallback",
-        );
+        assert_eq!(dataset.schema().unenforced_primary_key().len(), 1);
 
-        // Removing the keys must clear the cached option, otherwise the
-        // protobuf would still encode a stale PK marker on next commit.
+        // Re-applying the identical primary key is a no-op and allowed; this
+        // keeps conflict retries, which re-apply the same transaction, safe.
         dataset
+            .update_field_metadata()
+            .update("id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")])
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(dataset.schema().unenforced_primary_key().len(), 1);
+
+        // Adding a second primary key column is rejected.
+        let err = dataset
+            .update_field_metadata()
+            .update("name", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "2")])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // Removing the primary key is rejected.
+        let err = dataset
             .update_field_metadata()
             .replace("id", [] as [UpdateMapEntry; 0])
             .unwrap()
             .await
-            .unwrap();
-        let id_field = dataset.schema().field("id").unwrap();
-        assert_eq!(id_field.unenforced_primary_key_position, None);
-        assert!(
-            !dataset
-                .schema()
-                .unenforced_primary_key()
-                .iter()
-                .any(|f| f.name == "id")
-        );
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+
+        // The primary key is unchanged after the rejected commits.
+        let pk = dataset.schema().unenforced_primary_key();
+        assert_eq!(pk.len(), 1);
+        assert_eq!(pk[0].name, "id");
     }
 
     #[tokio::test]

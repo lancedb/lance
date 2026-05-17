@@ -2382,6 +2382,17 @@ impl Transaction {
                     apply_update_map(&mut schema_metadata, schema_metadata_updates);
                     manifest.schema.metadata = schema_metadata;
                 }
+                // The unenforced primary key is immutable once set. Capture it
+                // before applying field metadata updates so any change can be
+                // rejected below. This also covers the concurrent-writer race:
+                // a transaction retried after a conflict is re-applied here
+                // onto a base manifest that may already carry a primary key.
+                let primary_key_before: Vec<i32> = manifest
+                    .schema
+                    .unenforced_primary_key()
+                    .iter()
+                    .map(|field| field.id)
+                    .collect();
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
@@ -2402,6 +2413,19 @@ impl Transaction {
                     } else {
                         return Err(Error::invalid_input_source(
                             format!("Field with id {} does not exist", field_id).into(),
+                        ));
+                    }
+                }
+                if !primary_key_before.is_empty() {
+                    let primary_key_after: Vec<i32> = manifest
+                        .schema
+                        .unenforced_primary_key()
+                        .iter()
+                        .map(|field| field.id)
+                        .collect();
+                    if primary_key_after != primary_key_before {
+                        return Err(Error::invalid_input(
+                            "the unenforced primary key cannot be changed once set",
                         ));
                     }
                 }
