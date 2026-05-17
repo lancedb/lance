@@ -203,13 +203,18 @@ impl LogicalPageDecoder for BlobFieldDecoder {
                 .zip(sizes.iter())
                 .map(|(p, s)| *p != 1 || *s != 0)
                 .collect::<BooleanBuffer>();
-            self.validity.push_back(validity);
-            self.rows_loaded = end as u64;
+            // Issue the I/O before committing any decoder state.  If the
+            // request fails (e.g. cloud storage returns HTTP 503), this is the
+            // single, meaningful point of failure: the error propagates and
+            // the decoder is left untouched -- never half-advanced into a
+            // state where a later drain would read rows that never loaded.
             let bytes = self
                 .io
                 .submit_request(ranges, self.base_priority + start as u64)
                 .await?;
+            self.validity.push_back(validity);
             self.loaded.extend(bytes);
+            self.rows_loaded = end as u64;
             Ok(())
         }
         .boxed()
@@ -521,14 +526,31 @@ mod tests {
             base_priority: 0,
         };
 
-        // The failed download must propagate as an error.
+        // The failed download must propagate as an error: `wait_for_loaded`
+        // is the single, meaningful point of failure.
         let load_result = decoder.wait_for_loaded(num_rows - 1).await;
         assert!(
             load_result.is_err(),
             "wait_for_loaded should propagate the I/O failure"
         );
 
-        // Draining the (empty) decoder afterwards must error, not panic.
+        // A failed load must leave the decoder state untouched -- not
+        // half-advanced -- so no later step can read rows that never loaded.
+        assert_eq!(
+            decoder.rows_loaded, 0,
+            "rows_loaded must not advance when the load fails"
+        );
+        assert!(
+            decoder.loaded.is_empty(),
+            "no blob bytes should be buffered after a failed load"
+        );
+        assert!(
+            decoder.validity.is_empty(),
+            "no validity should be buffered after a failed load"
+        );
+
+        // Belt-and-suspenders: even if a drain is somehow reached in this
+        // state it must error, not panic on an out-of-bounds VecDeque drain.
         let drain_result = decoder.drain(num_rows);
         assert!(
             drain_result.is_err(),
