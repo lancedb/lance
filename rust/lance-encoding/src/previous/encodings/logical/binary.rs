@@ -240,3 +240,71 @@ impl DecodeArrayTask for BinaryArrayDecoder {
         Ok((result, 0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::builder::LargeListBuilder;
+    use arrow_array::builder::PrimitiveBuilder;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt8Type;
+
+    #[test]
+    fn test_from_large_list_to_small() {
+        // Create a small LargeList array (i64 offsets) to test downcasting
+        let values_builder = PrimitiveBuilder::<UInt8Type>::new();
+        let mut builder = LargeListBuilder::new(values_builder);
+
+        // Add "hello"
+        builder.values().append_slice(b"hello");
+        builder.append(true);
+
+        // Add "world"
+        builder.values().append_slice(b"world");
+        builder.append(true);
+
+        let large_list_array = builder.finish();
+
+        // Convert to small StringArray
+        let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array).unwrap();
+
+        assert_eq!(result.data_type(), &DataType::Utf8);
+        let string_array = result.as_string::<i32>();
+        assert_eq!(string_array.len(), 2);
+        assert_eq!(string_array.value(0), "hello");
+        assert_eq!(string_array.value(1), "world");
+    }
+
+    #[test]
+    fn test_from_large_list_to_small_overflow() {
+        // We can manually craft an array with a fake offset that exceeds i32::MAX
+        // to test the 2GB limit check without allocating 2GB of memory.
+        let values = arrow_buffer::ScalarBuffer::from(vec![0u8; 1]);
+
+        // Create offsets that exceed i32::MAX
+        let offsets = arrow_buffer::OffsetBuffer::new(
+            arrow_buffer::ScalarBuffer::from(vec![0_i64, (i32::MAX as i64) + 10])
+        );
+
+        // Field for LargeList
+        let field = Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true));
+
+        // Build the GenericListArray directly
+        let large_list_array = GenericListArray::<i64>::new(
+            field,
+            offsets,
+            Arc::new(arrow_array::UInt8Array::new(values, None)),
+            None,
+        );
+
+        let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array);
+
+        assert!(result.is_err());
+        match result {
+            Err(lance_core::Error::InvalidInput { message, .. }) => {
+                assert!(message.contains("exceeded 2 GiB"));
+            }
+            _ => panic!("Expected InvalidInput error"),
+        }
+    }
+}
