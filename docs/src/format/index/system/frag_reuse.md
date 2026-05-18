@@ -38,7 +38,7 @@ the indices are all caught up and the specific reuse version can be trimmed.
 The presence of the Fragment Reuse Index changes how Lance detects conflicts between concurrent
 operations. Operations that would normally conflict with compaction (such as index building) can
 proceed without conflict when the FRI is in use. For full details on how conflict detection is
-affected, see [conflict resolution](../../transaction.md#conflict-resolution).
+affected, see [conflict resolution](../../table/transaction.md#conflict-resolution).
 
 ### Index Load Cost
 

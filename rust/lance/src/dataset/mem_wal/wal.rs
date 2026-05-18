@@ -94,7 +94,7 @@ impl std::fmt::Debug for BatchDurableWatcher {
 /// A single WAL entry representing a batch of batches.
 #[derive(Debug, Clone)]
 pub struct WalEntry {
-    /// WAL entry position (0-based, sequential).
+    /// WAL entry position (1-based, sequential — see `FIRST_WAL_ENTRY_POSITION`).
     pub position: u64,
     /// Writer epoch at the time of write.
     pub writer_epoch: u64,
@@ -664,7 +664,12 @@ impl WalEntryData {
 // Generic WAL Appender and Tailer
 // ============================================================================
 
-const FIRST_WAL_ENTRY_POSITION: u64 = 0;
+/// First valid WAL entry position. Positions are 1-based so that a
+/// `ShardManifest::replay_after_wal_entry_position` of 0 unambiguously means
+/// "no flush has ever stamped the cursor" — replay then starts at position 1
+/// without needing to consult `flushed_generations`, which an external
+/// compactor may legitimately drain back to empty.
+const FIRST_WAL_ENTRY_POSITION: u64 = 1;
 const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;
 const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 const MAX_CURSOR_PROBE: u64 = 4096;
@@ -1389,8 +1394,9 @@ mod tests {
         let source = batch_store_source(&batch_store);
         let result = buffer.flush(&source, batch_store.len()).await.unwrap();
         let entry = result.entry.unwrap();
-        // First entry from a freshly-discovered position is 0 (atomic-create
-        // path discovers the tip via list and starts at FIRST_WAL_ENTRY_POSITION).
+        // First entry from a freshly-discovered position lands at
+        // FIRST_WAL_ENTRY_POSITION (atomic-create path discovers the tip
+        // via list).
         assert_eq!(entry.position, FIRST_WAL_ENTRY_POSITION);
         assert_eq!(entry.writer_epoch, 1);
         assert_eq!(entry.num_batches, 2);
@@ -1629,6 +1635,7 @@ mod tests {
         assert!(hint >= 1, "cursor hint never updated, last={hint}");
 
         // next_position must still resolve to one past the last appended entry.
-        assert_eq!(tailer.next_position().await.unwrap(), 3);
+        // Three entries from a fresh shard land at 1, 2, 3, so next is 4.
+        assert_eq!(tailer.next_position().await.unwrap(), 4);
     }
 }

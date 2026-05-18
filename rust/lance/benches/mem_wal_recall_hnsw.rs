@@ -27,8 +27,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
+use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::mem_wal::write::{MemTableScanner, ShardWriterConfig};
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -312,10 +312,9 @@ async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::
         )
         .await?;
     dataset
-        .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
-            maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
-        })
+        .initialize_mem_wal()
+        .maintained_indexes([VECTOR_INDEX_NAME])
+        .execute()
         .await?;
     Ok(())
 }

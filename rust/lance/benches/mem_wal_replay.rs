@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig, WalTailer};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig, WalTailer};
 use lance::dataset::{Dataset, WriteParams};
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
@@ -156,10 +156,8 @@ async fn setup_dataset(schema: &Arc<ArrowSchema>, name: &str, dataset_prefix: &s
     .expect("Failed to seed dataset");
 
     dataset
-        .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
-            maintained_indexes: vec![],
-        })
+        .initialize_mem_wal()
+        .execute()
         .await
         .expect("Failed to initialize MemWAL");
 

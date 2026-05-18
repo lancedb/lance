@@ -2063,6 +2063,10 @@ impl ExecutionPlan for FilteredReadExec {
         }
         let limit = limit?;
 
+        if self.dataset.manifest.uses_stable_row_ids() {
+            return None;
+        }
+
         let mut updated_options = self.options.clone();
 
         if self.options.full_filter.is_none() && self.options.refine_filter.is_none() {

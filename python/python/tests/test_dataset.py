@@ -3081,6 +3081,37 @@ def test_update_dataset(tmp_path: Path):
     check_update_stats(update_dict, (100,))
 
 
+def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "name_1": pa.array(["1", "4", "7"]),
+                "name_2": pa.array(["2", "5", "8"]),
+                "name_3": pa.array(["3", "6", "9"]),
+            }
+        ),
+        tmp_path / "dataset",
+        enable_stable_row_ids=True,
+    )
+
+    update_dict = dataset.update(updates=dict(name_3="'xxxx'"), where="name_1 = '7'")
+    check_update_stats(update_dict, (1,))
+
+    expected = pa.table(
+        {
+            "name_1": pa.array(["1", "4", "7"]),
+            "name_2": pa.array(["2", "5", "8"]),
+            "name_3": pa.array(["3", "6", "xxxx"]),
+        }
+    )
+    actual = dataset.to_table().sort_by("name_1")
+    assert actual == expected
+
+    scanner_table = dataset.scanner(limit=10).to_table().sort_by("name_1")
+    assert scanner_table == expected
+    assert scanner_table == actual
+
+
 def test_update_dataset_all_types(tmp_path: Path):
     table = pa.table(
         {

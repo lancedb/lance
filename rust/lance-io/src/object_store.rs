@@ -544,7 +544,10 @@ impl ObjectStore {
     }
 
     pub fn is_cloud(&self) -> bool {
-        !self.is_local() && self.scheme != "memory"
+        if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
+            return false;
+        }
+        true
     }
 
     /// Whether this object store prefers the lite scheduler.

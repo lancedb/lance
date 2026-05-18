@@ -33,6 +33,7 @@
 //! monotonically increasing writer epochs in the shard manifest.
 
 mod api;
+mod hnsw;
 mod index;
 mod manifest;
 pub mod memtable;
@@ -41,7 +42,7 @@ pub mod util;
 mod wal;
 pub mod write;
 
-pub use api::{DatasetMemWalExt, MemWalConfig, MemWalShardConfig};
+pub use api::{DatasetMemWalExt, InitializeMemWalBuilder};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};

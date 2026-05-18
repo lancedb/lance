@@ -3290,6 +3290,12 @@ struct PageInfoAndScheduler {
 pub struct StructuralPrimitiveFieldScheduler {
     page_schedulers: Vec<PageInfoAndScheduler>,
     column_index: u32,
+    // Identifies the requested decode shape (e.g. blob descriptor struct vs
+    // raw bytes). Blob columns can produce multiple page scheduler variants
+    // for the same physical column depending on the target field's data type,
+    // and the cached page state types differ per variant. The view tag is
+    // mixed into the cache key so different variants do not collide.
+    view_tag: String,
 }
 
 impl StructuralPrimitiveFieldScheduler {
@@ -3316,6 +3322,7 @@ impl StructuralPrimitiveFieldScheduler {
         Ok(Self {
             page_schedulers,
             column_index: column_info.index,
+            view_tag: format!("{:?}", target_field.data_type()),
         })
     }
 
@@ -3474,16 +3481,25 @@ impl DeepSizeOf for CachedFieldData {
 }
 
 // Cache key for field data
+//
+// Both `column_index` and `view_tag` are part of the key because a single
+// physical column can be decoded under more than one shape — a blob column,
+// for instance, materializes as a `Struct<position, size>` descriptor in one
+// scheduler variant and as the raw `LargeBinary` bytes in another. Each
+// variant builds different `CachedPageData` types per page, so two readers
+// that hit the same `column_index` with different shapes used to collide and
+// crash with a downcast failure when loading cached state.
 #[derive(Debug, Clone)]
 pub struct FieldDataCacheKey {
     pub column_index: u32,
+    pub view_tag: String,
 }
 
 impl CacheKey for FieldDataCacheKey {
     type ValueType = CachedFieldData;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        self.column_index.to_string().into()
+        format!("{}:{}", self.column_index, self.view_tag).into()
     }
 
     fn type_name() -> &'static str {
@@ -3499,6 +3515,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     ) -> BoxFuture<'a, Result<()>> {
         let cache_key = FieldDataCacheKey {
             column_index: self.column_index,
+            view_tag: self.view_tag.clone(),
         };
         let cache = context.cache().clone();
 

@@ -19,6 +19,7 @@ no-default-features = true
 ignored = ["tracing-chrome"]
 
 [dependencies]
+arc-swap = { workspace = true }
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
@@ -45,6 +46,7 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
@@ -62,6 +64,7 @@ roaring.workspace = true
 tokio.workspace = true
 url.workspace = true
 rand.workspace = true
+rayon.workspace = true
 futures.workspace = true
 uuid.workspace = true
 arrow.workspace = true
@@ -223,6 +226,14 @@ harness = false
 
 [[bench]]
 name = "mem_wal_recall_hnsw"
+harness = false
+
+[[bench]]
+name = "mem_wal_hnsw_bench"
+harness = false
+
+[[bench]]
+name = "mem_wal_shard_writer_backpressure"
 harness = false
 
 [lints]

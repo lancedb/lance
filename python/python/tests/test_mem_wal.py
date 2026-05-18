@@ -7,6 +7,7 @@ import uuid
 
 import lance
 import pyarrow as pa
+import pytest
 from lance.mem_wal import (
     LsmPointLookupPlanner,
     LsmScanner,
@@ -319,3 +320,109 @@ def test_region_writer_e2e_correctness(tmp_path):
     new_ids = result.column("id").to_pylist()
     assert 10000 in new_ids
     assert 10009 in new_ids
+
+
+# === initialize_mem_wal: sharding, maintained indexes, writer defaults ===
+
+
+def _mem_wal_dataset(tmp_path, name: str = "ds"):
+    """A base dataset with an unenforced primary key, ready for MemWAL init."""
+    ds_path = str(tmp_path / name)
+    return lance.write_dataset(
+        _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
+    )
+
+
+def test_initialize_mem_wal_manual(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    ds.initialize_mem_wal()
+
+    details = ds.mem_wal_index_details()
+    assert details is not None
+    assert details["num_shards"] == 0
+    assert details["sharding_specs"] == []
+    assert details["maintained_indexes"] == []
+    assert details["writer_config_defaults"] == {}
+
+
+def test_initialize_mem_wal_unsharded(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    ds.initialize_mem_wal(unsharded=True)
+
+    details = ds.mem_wal_index_details()
+    assert details["num_shards"] == 1
+    specs = details["sharding_specs"]
+    assert len(specs) == 1
+    assert specs[0]["fields"][0]["transform"] == "unsharded"
+
+
+def test_initialize_mem_wal_bucket_sharding(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    ds.initialize_mem_wal(bucket_column="id", num_buckets=8)
+
+    details = ds.mem_wal_index_details()
+    assert details["num_shards"] == 8
+    field = details["sharding_specs"][0]["fields"][0]
+    assert field["transform"] == "bucket"
+    assert field["parameters"]["num_buckets"] == "8"
+
+
+def test_initialize_mem_wal_identity_sharding(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    ds.initialize_mem_wal(identity_column="name")
+
+    details = ds.mem_wal_index_details()
+    # identity sharding has an open-ended shard count
+    assert details["num_shards"] == 0
+    field = details["sharding_specs"][0]["fields"][0]
+    assert field["transform"] == "identity"
+    assert field["result_type"] == "utf8"
+
+
+def test_initialize_mem_wal_maintained_indexes(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    ds.create_scalar_index("id", "BTREE", name="id_btree")
+    ds.initialize_mem_wal(maintained_indexes=["id_btree"])
+
+    assert ds.mem_wal_index_details()["maintained_indexes"] == ["id_btree"]
+
+
+def test_initialize_mem_wal_writer_config_defaults(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    ds.initialize_mem_wal(
+        durable_write=False,
+        max_memtable_size=8 * 1024 * 1024,
+        max_wal_flush_interval_ms=250,
+    )
+
+    defaults = ds.mem_wal_index_details()["writer_config_defaults"]
+    assert defaults["durable_write"] == "false"
+    assert defaults["max_memtable_size"] == str(8 * 1024 * 1024)
+    # Duration knobs are recorded in milliseconds with a `_ms` suffix.
+    assert defaults["max_wal_flush_interval_ms"] == "250"
+    # Every ShardWriterConfig tunable is recorded once any default is set.
+    assert "sync_indexed_write" in defaults
+    assert "enable_memtable" in defaults
+
+
+def test_initialize_mem_wal_no_writer_config_defaults_when_unset(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    ds.initialize_mem_wal(bucket_column="id", num_buckets=4)
+    assert ds.mem_wal_index_details()["writer_config_defaults"] == {}
+
+
+def test_initialize_mem_wal_rejects_conflicting_sharding(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    with pytest.raises(ValueError, match="at most one"):
+        ds.initialize_mem_wal(unsharded=True, bucket_column="id", num_buckets=8)
+
+
+def test_initialize_mem_wal_rejects_partial_bucket(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    with pytest.raises(ValueError, match="num_buckets"):
+        ds.initialize_mem_wal(bucket_column="id")
+
+
+def test_mem_wal_index_details_none_before_init(tmp_path):
+    ds = _mem_wal_dataset(tmp_path)
+    assert ds.mem_wal_index_details() is None

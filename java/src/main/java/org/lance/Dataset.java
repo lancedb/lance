@@ -791,6 +791,35 @@ public class Dataset implements Closeable {
   private native byte[] nativeTake(List<Long> indices, List<String> columns);
 
   /**
+   * Select rows of data by their physical row IDs.
+   *
+   * @param rowIds the physical row IDs to retrieve (from the _rowid column)
+   * @param columns the columns to include in the result
+   * @return an ArrowReader containing the requested rows in input order
+   * @throws IOException if a row ID does not exist or an I/O error occurs
+   */
+  public ArrowReader takeRows(List<Long> rowIds, List<String> columns) throws IOException {
+    Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    Preconditions.checkArgument(
+        rowIds != null && !rowIds.isEmpty(), "rowIds cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      byte[] arrowData = nativeTakeRows(rowIds, columns);
+      ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
+      ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
+      return new ArrowStreamReader(readChannel, allocator) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          readChannel.close();
+          byteArrayInputStream.close();
+        }
+      };
+    }
+  }
+
+  private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
+
+  /**
    * Randomly sample n rows from the dataset.
    *
    * <p>The returned rows are in row-id order (not random order), which allows the underlying take
