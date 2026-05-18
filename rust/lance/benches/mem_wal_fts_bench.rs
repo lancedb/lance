@@ -605,7 +605,13 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     }
     term_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
     phrase_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pct = |v: &[f64], p: f64| if v.is_empty() { f64::NAN } else { percentile(v, p) };
+    let pct = |v: &[f64], p: f64| {
+        if v.is_empty() {
+            f64::NAN
+        } else {
+            percentile(v, p)
+        }
+    };
     println!(
         "result split: term_p50={:.1} term_p95={:.1} ({} q) | phrase_p50={:.1} phrase_p95={:.1} ({} q)",
         pct(&term_lat, 50.0),

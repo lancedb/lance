@@ -59,9 +59,14 @@ echo "Lucene classpath: $LUCENE_CP"
 
 # ---- build the Lance bench ----
 echo "=== Building Lance FTS bench ==="
+# Drop stale binaries so the freshest build is unambiguous, then pick the
+# most-recently-modified one — a lexical sort by build hash can otherwise
+# pick a stale binary after a dependency change rotates the hash.
+rm -f "$REPO_ROOT"/target/release/deps/mem_wal_fts_bench-*
 cargo bench -p lance --bench mem_wal_fts_bench --no-run
 LANCE_BIN="$(find "$REPO_ROOT/target/release/deps" -maxdepth 1 -type f -perm -111 \
-    -name 'mem_wal_fts_bench-*' ! -name '*.d' | sort | tail -1)"
+    -name 'mem_wal_fts_bench-*' ! -name '*.d' -printf '%T@ %p\n' \
+    | sort -nr | head -1 | cut -d' ' -f2-)"
 echo "Lance bench: $LANCE_BIN"
 
 # ---- compile the Lucene bench ----
