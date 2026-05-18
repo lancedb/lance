@@ -232,7 +232,7 @@ impl DecodeArrayTask for BinaryArrayDecoder {
             _ => {
                 return Err(lance_core::Error::internal(
                     "Binary decoder does not support this data type",
-                ))
+                ));
             }
         };
         // data_size is only tracked in the v2.1 structural decode path; the legacy
@@ -266,7 +266,8 @@ mod tests {
         let large_list_array = builder.finish();
 
         // Convert to small StringArray
-        let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array).unwrap();
+        let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array)
+            .unwrap();
 
         assert_eq!(result.data_type(), &DataType::Utf8);
         let string_array = result.as_string::<i32>();
