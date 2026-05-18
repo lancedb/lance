@@ -2009,6 +2009,8 @@ struct BlockMeta {
     /// first / last doc id in the block (block doc ids are ascending).
     first_doc: u32,
     last_doc: u32,
+    /// largest frequency in the block — the block-max WAND score bound.
+    max_freq: u32,
     /// start offset of the block's doc/freq payload in `doc_freq_data`.
     df_offset: u32,
     /// start offset of the block's position payload in `pos_data`.
@@ -2096,6 +2098,7 @@ fn build_partition(
             block_meta.push(BlockMeta {
                 first_doc,
                 last_doc,
+                max_freq: blk_max_freq,
                 df_offset,
                 pos_offset,
                 doc_width,
@@ -2303,12 +2306,18 @@ impl Partition {
         results
     }
 
-    /// WAND top-k over an OR query, contributing into the caller's shared
-    /// [`TopK`]. Exact: each term's `(max_freq, min_dl)` gives a sound score
-    /// upper bound, so docs that provably cannot beat the shared threshold
-    /// are skipped. Because the threshold is shared across all partitions and
-    /// the tail, a partition processed late prunes against an already-warm
-    /// threshold instead of cold-starting.
+    /// Block-max WAND top-k over an OR query, contributing into the caller's
+    /// shared [`TopK`]. Exact. Two sound bounds drive pruning:
+    ///
+    /// - the per-*list* bound `doc_weight(list max_freq, min_dl)` selects the
+    ///   pivot doc (always valid for any future doc);
+    /// - the per-*block* bound `doc_weight(block max_freq, min_dl)`, summed
+    ///   over all lanes for the blocks covering the pivot doc, decides whether
+    ///   the whole `[pivot_doc, min block end]` region can be skipped without
+    ///   decoding or scoring it.
+    ///
+    /// The threshold is shared across all partitions and the tail, so a
+    /// partition processed late prunes against an already-warm threshold.
     fn wand_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
         let mut lanes: Vec<WandLane> = Vec::with_capacity(tokens.len());
         for token in tokens {
@@ -2318,7 +2327,8 @@ impl Partition {
                 lanes.push(WandLane {
                     cursor: PostingCursor::new(self, id),
                     qw,
-                    ub: qw * scorer.doc_weight(pref.max_freq, pref.min_dl),
+                    min_dl: pref.min_dl,
+                    list_ub: qw * scorer.doc_weight(pref.max_freq, pref.min_dl),
                 });
             }
         }
@@ -2332,11 +2342,11 @@ impl Partition {
             }
             lanes.sort_by_key(|l| l.cursor.doc().unwrap());
             let theta = topk.threshold();
-            // Pivot: first lane whose cumulative upper bound exceeds theta.
+            // Pivot: first lane whose cumulative per-list bound exceeds theta.
             let mut acc = 0.0f32;
             let mut pivot = None;
             for (i, l) in lanes.iter().enumerate() {
-                acc += l.ub;
+                acc += l.list_ub;
                 if acc > theta {
                     pivot = Some(i);
                     break;
@@ -2346,21 +2356,38 @@ impl Partition {
                 break; // no remaining doc can reach theta
             };
             let pivot_doc = lanes[pivot].cursor.doc().unwrap();
-            if lanes[0].cursor.doc().unwrap() == pivot_doc {
-                // Every lane positioned at pivot_doc contributes; score it.
-                let dl = self.docs.num_tokens(pivot_doc);
-                let mut score = 0.0f32;
-                for l in lanes.iter_mut() {
-                    if l.cursor.doc() == Some(pivot_doc) {
-                        score += l.qw * scorer.doc_weight(l.cursor.freq(), dl);
-                        l.cursor.advance();
-                    }
-                }
-                topk.offer(score, self.docs.row_id(pivot_doc));
-            } else {
-                // A lane before the pivot trails pivot_doc; skip it forward.
+            if lanes[0].cursor.doc().unwrap() != pivot_doc {
+                // A lane before the pivot trails pivot_doc; align it first.
                 lanes[0].cursor.skip_to(pivot_doc);
+                continue;
             }
+            // Block-max check: an upper bound on every doc in
+            // `[pivot_doc, region_end]` is the sum, over all lanes, of each
+            // lane's max contribution from the block covering pivot_doc.
+            // `region_end` is the smallest such block end, so within the
+            // region every lane stays in the same block and the bound holds.
+            let mut block_ub = 0.0f32;
+            let mut region_end = u32::MAX;
+            for l in &lanes {
+                let bmf = l.cursor.block_max_freq_for(pivot_doc);
+                block_ub += l.qw * scorer.doc_weight(bmf, l.min_dl);
+                region_end = region_end.min(l.cursor.block_end_for(pivot_doc));
+            }
+            if block_ub <= theta {
+                // No doc in the region can beat theta — skip the whole region.
+                lanes[0].cursor.skip_to(region_end.saturating_add(1));
+                continue;
+            }
+            // pivot_doc may win; score it.
+            let dl = self.docs.num_tokens(pivot_doc);
+            let mut score = 0.0f32;
+            for l in lanes.iter_mut() {
+                if l.cursor.doc() == Some(pivot_doc) {
+                    score += l.qw * scorer.doc_weight(l.cursor.freq(), dl);
+                    l.cursor.advance();
+                }
+            }
+            topk.offer(score, self.docs.row_id(pivot_doc));
         }
     }
 
@@ -2495,12 +2522,14 @@ impl TopK {
     }
 }
 
-/// One WAND lane: a posting cursor plus its query weight and score bound.
+/// One WAND lane: a posting cursor plus its query weight and score bounds.
 struct WandLane<'a> {
     cursor: PostingCursor<'a>,
     qw: f32,
-    /// Upper bound on this term's contribution to any doc's score.
-    ub: f32,
+    /// Smallest doc length over the term — input to the per-block bound.
+    min_dl: u32,
+    /// Per-list contribution upper bound, for pivot selection.
+    list_ub: f32,
 }
 
 /// A decoding cursor over one term's compressed posting list. Decodes a
@@ -2653,6 +2682,38 @@ impl<'a> PostingCursor<'a> {
         self.decode_doc_freq(self.block);
         // `last_doc >= target`, so this block holds a doc >= target.
         self.i += self.docs[self.i..].partition_point(|&d| d < target);
+    }
+
+    /// The term's `BlockMeta` slice.
+    fn blocks(&self) -> &[BlockMeta] {
+        let start = self.pref.block_start as usize;
+        &self.part.block_meta[start..start + self.pref.block_count as usize]
+    }
+
+    /// Index (within the term) of the first block that could hold `target` —
+    /// the first block with `last_doc >= target`. Shallow: binary search over
+    /// `BlockMeta`, no payload decode.
+    fn shallow_block(&self, target: u32) -> Option<usize> {
+        let blocks = self.blocks();
+        let idx = blocks.partition_point(|b| b.last_doc < target);
+        (idx < blocks.len()).then_some(idx)
+    }
+
+    /// Largest frequency in the block that would hold `target` (a sound,
+    /// possibly loose, per-block score-bound input). 0 if `target` is past
+    /// the term's last block.
+    fn block_max_freq_for(&self, target: u32) -> u32 {
+        self.shallow_block(target)
+            .map(|b| self.blocks()[b].max_freq)
+            .unwrap_or(0)
+    }
+
+    /// Last doc id of the block that would hold `target` (`u32::MAX` if past
+    /// the last block) — the upper end of a skippable region.
+    fn block_end_for(&self, target: u32) -> u32 {
+        self.shallow_block(target)
+            .map(|b| self.blocks()[b].last_doc)
+            .unwrap_or(u32::MAX)
     }
 }
 
@@ -3985,6 +4046,48 @@ mod tests {
                 .map(|e| e.row_position)
                 .collect();
             assert_eq!(got, expected, "WAND top-{k} must equal the exact top-{k}");
+        }
+    }
+
+    #[test]
+    fn test_block_max_wand_exact_at_scale() {
+        // 600 docs across 2 partitions; "alpha" in every doc with a frequency
+        // that cycles, so per-block maxima vary and the block-max skip path
+        // genuinely engages. The WAND top-k must still equal the exact
+        // full-scan top-k.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(300);
+        for i in 0..600u64 {
+            let tf = (i % 17) + 1;
+            let text = format!("{}filler", "alpha ".repeat(tf as usize));
+            let batch = RecordBatch::try_new(
+                create_test_schema(),
+                vec![
+                    Arc::new(Int32Array::from(vec![0])),
+                    Arc::new(StringArray::from(vec![text.as_str()])),
+                ],
+            )
+            .unwrap();
+            index.insert(&batch, i).unwrap();
+        }
+        assert!(index.state.load_full().partitions.len() >= 2);
+
+        // Exact ranking via the unbounded scan path.
+        let mut full = index.search("alpha");
+        assert_eq!(full.len(), 600);
+        full.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        // For several k, the WAND top-k's score multiset must equal the exact
+        // top-k's (row ties make the row set non-unique, but scores are not).
+        for k in [1usize, 10, 50, 200] {
+            let limited = index.search_with_options(
+                &FtsQueryExpr::match_query("alpha"),
+                SearchOptions::new().with_limit(k),
+            );
+            assert_eq!(limited.len(), k, "k={k}");
+            let mut got: Vec<f32> = limited.iter().map(|e| e.score).collect();
+            got.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let expected: Vec<f32> = full.iter().take(k).map(|e| e.score).collect();
+            assert_eq!(got, expected, "WAND top-{k} scores must match exact");
         }
     }
 
