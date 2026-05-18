@@ -171,7 +171,7 @@ impl BinaryArrayDecoder {
     }
 
     /// Convert a LargeList (i64 offsets) array to a small-offset byte array (Utf8 / Binary).
-    /// Falls back to LargeUtf8 / LargeBinary if the data exceeds the i32 offset limit.
+    /// Returns an error if the data exceeds the i32 offset limit.
     fn from_large_list_to_small<T: ByteArrayType<Offset = i32>>(
         array: &GenericListArray<i64>,
     ) -> Result<ArrayRef> {
@@ -260,6 +260,8 @@ mod tests {
     use arrow_array::builder::PrimitiveBuilder;
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt8Type;
+    use arrow_buffer::Buffer;
+    use arrow_data::ArrayData;
 
     #[test]
     fn test_from_large_list_to_small() {
@@ -292,24 +294,33 @@ mod tests {
     fn test_from_large_list_to_small_overflow() {
         // We can manually craft an array with a fake offset that exceeds i32::MAX
         // to test the 2GB limit check without allocating 2GB of memory.
-        let values = arrow_buffer::ScalarBuffer::from(vec![0u8; 1]);
-
         // Create offsets that exceed i32::MAX
-        let offsets = arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
-            0_i64,
-            (i32::MAX as i64) + 10,
-        ]));
+        let offsets = Buffer::from_slice_ref([0_i64, (i32::MAX as i64) + 10]);
 
         // Field for LargeList
         let field = Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true));
 
-        // Build the GenericListArray directly
-        let large_list_array = GenericListArray::<i64>::new(
-            field,
-            offsets,
-            Arc::new(arrow_array::UInt8Array::new(values, None)),
-            None,
-        );
+        // SAFETY: The deliberately oversized offset is invalid for the one-byte child array.
+        // This lets the test exercise BinaryArrayDecoder's overflow guard without allocating
+        // more than 2 GiB of child values.
+        let values_data = unsafe {
+            ArrayData::builder(DataType::UInt8)
+                .len(1)
+                .add_buffer(Buffer::from_slice_ref([0_u8]))
+                .build_unchecked()
+        };
+
+        // SAFETY: This intentionally constructs an invalid LargeList array with offsets beyond
+        // the child value length so the helper can reject the i64-to-i32 downcast before building
+        // a Binary / Utf8 array.
+        let list_data = unsafe {
+            ArrayData::builder(DataType::LargeList(field))
+                .len(1)
+                .add_buffer(offsets)
+                .add_child_data(values_data)
+                .build_unchecked()
+        };
+        let large_list_array = GenericListArray::<i64>::from(list_data);
 
         let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array);
 
