@@ -9,6 +9,7 @@ import tarfile
 import textwrap
 
 import lance
+import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
@@ -747,6 +748,60 @@ def dataset_for_pandas_blob_tests(tmp_path):
     return lance.write_dataset(table, tmp_path / "blob_pandas_ds")
 
 
+@pytest.fixture
+def dataset_for_pandas_no_blob_tests(tmp_path):
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "name": pa.array(["one", "two", "three"], pa.string()),
+            "bin": pa.array([b"x", b"y", b"z"], pa.large_binary()),
+        }
+    )
+    return lance.write_dataset(table, tmp_path / "no_blob_pandas_ds")
+
+
+@pytest.mark.parametrize("source", ["dataset", "scanner", "fragment"])
+def test_to_pandas_without_blobs_matches_arrow_with_kwargs(
+    dataset_for_pandas_no_blob_tests,
+    source,
+):
+    kwargs = {"types_mapper": pd.ArrowDtype}
+    ds = dataset_for_pandas_no_blob_tests
+
+    if source == "dataset":
+        actual = ds.to_pandas(**kwargs)
+        expected = ds.to_table().to_pandas(**kwargs)
+    elif source == "scanner":
+        scanner = ds.scanner(
+            columns=["id", "name"],
+            filter="id >= 2",
+            limit=2,
+            offset=0,
+            batch_size=1,
+        )
+        actual = scanner.to_pandas(**kwargs)
+        expected = scanner.to_table().to_pandas(**kwargs)
+    else:
+        fragment = ds.get_fragments()[0]
+        actual = fragment.to_pandas(
+            columns=["id", "name"],
+            filter="id >= 2",
+            limit=2,
+            offset=0,
+            batch_size=1,
+            **kwargs,
+        )
+        expected = fragment.to_table(
+            columns=["id", "name"],
+            filter="id >= 2",
+            limit=2,
+            offset=0,
+        ).to_pandas(**kwargs)
+
+    pd.testing.assert_frame_equal(actual, expected)
+    assert actual.dtypes["id"] == pd.ArrowDtype(pa.int64())
+
+
 def test_dataset_to_pandas_blob_lazy(dataset_for_pandas_blob_tests):
     df = dataset_for_pandas_blob_tests.to_pandas()
 
@@ -800,6 +855,29 @@ def test_scanner_to_pandas_blob_filter_limit_order(dataset_for_pandas_blob_tests
     assert df["blob"].tolist() == [None]
 
 
+@pytest.mark.parametrize("source", ["dataset", "scanner", "fragment"])
+def test_to_pandas_blob_scan_parameters(dataset_for_pandas_blob_tests, source):
+    ds = dataset_for_pandas_blob_tests
+    scan_kwargs = {
+        "columns": ["id", "blob"],
+        "filter": "id > 1",
+        "limit": 1,
+        "offset": 1,
+        "batch_size": 1,
+    }
+
+    if source == "dataset":
+        df = ds.to_pandas(**scan_kwargs, blob_mode="bytes")
+    elif source == "scanner":
+        df = ds.scanner(**scan_kwargs).to_pandas(blob_mode="bytes")
+    else:
+        df = ds.get_fragments()[0].to_pandas(**scan_kwargs, blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df["id"].tolist() == [3]
+    assert df["blob"].tolist() == [b"world"]
+
+
 def test_scanner_to_pandas_blob_empty_result(dataset_for_pandas_blob_tests):
     df = dataset_for_pandas_blob_tests.scanner(
         columns=["id", "blob"], filter="id > 10"
@@ -811,7 +889,7 @@ def test_scanner_to_pandas_blob_empty_result(dataset_for_pandas_blob_tests):
 
 def test_fragment_to_pandas_blob(dataset_for_pandas_blob_tests):
     fragment = dataset_for_pandas_blob_tests.get_fragments()[0]
-    df = fragment.to_pandas(columns=["id", "blob"], blob_mode="bytes")
+    df = fragment.to_pandas(columns=["id", "blob"], batch_size=1, blob_mode="bytes")
 
     assert list(df.columns) == ["id", "blob"]
     assert df["blob"].tolist() == [b"hello", None, b"world"]
