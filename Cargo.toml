@@ -100,6 +100,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "std",
 ] }
 lance-bitpacking = { version = "=7.0.0-beta.14", path = "./rust/compression/bitpacking" }
+bitpacking = "0.9"
 bitvec = "1"
 bytes = "1.11.1"
 byteorder = "1.5"

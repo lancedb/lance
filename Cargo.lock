@@ -4343,6 +4343,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "bitpacking",
  "byteorder",
  "bytes",
  "chrono",

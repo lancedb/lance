@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arc_swap::ArcSwap;
 use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_schema::DataType;
+use bitpacking::{BitPacker, BitPacker4x};
 use crossbeam_skiplist::SkipMap;
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
@@ -1997,9 +1998,46 @@ fn bitpack_get(buf: &[u8], start: usize, n: usize, width: u8, out: &mut Vec<u32>
     }
 }
 
-/// Number of bytes a `bitpack_put` of `n` values of `width` bits occupies.
+/// Number of bytes a width-`width` bit-packed block of `n` values occupies.
+/// Identical for the scalar and `BitPacker4x` codecs.
 fn bitpack_len(n: usize, width: u8) -> usize {
     (n * width as usize).div_ceil(8)
+}
+
+/// Bit-pack `values` into `buf`: SIMD `BitPacker4x` for a full 128-element
+/// block (the common-term hot path), scalar `bitpack_put` for a shorter
+/// final block.
+fn pack_block(bp: &BitPacker4x, buf: &mut Vec<u8>, values: &[u32], width: u8) {
+    if values.len() == POSTING_BLOCK && width > 0 {
+        let mut input = [0u32; POSTING_BLOCK];
+        input.copy_from_slice(values);
+        let mut out = [0u8; POSTING_BLOCK * 4];
+        let n = bp.compress(&input, &mut out, width);
+        buf.extend_from_slice(&out[..n]);
+    } else {
+        bitpack_put(buf, values, width);
+    }
+}
+
+/// Unpack `n` values of `width` bits from `buf[start..]` into `out` (cleared
+/// first) — SIMD for a full 128-element block, scalar otherwise.
+fn unpack_block(
+    bp: &BitPacker4x,
+    buf: &[u8],
+    start: usize,
+    n: usize,
+    width: u8,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    if n == POSTING_BLOCK && width > 0 {
+        let mut decoded = [0u32; POSTING_BLOCK];
+        let bytes = bitpack_len(POSTING_BLOCK, width);
+        bp.decompress(&buf[start..start + bytes], &mut decoded, width);
+        out.extend_from_slice(&decoded);
+    } else {
+        bitpack_get(buf, start, n, width, out);
+    }
 }
 
 /// Per-128-doc-block metadata — enough to skip and score-bound a block
@@ -2059,6 +2097,7 @@ fn build_partition(
     docs: DocSet,
 ) -> Partition {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let bp = BitPacker4x::new();
     let mut terms = Vec::with_capacity(entries.len());
     let mut postings = Vec::with_capacity(entries.len());
     let mut block_meta: Vec<BlockMeta> = Vec::new();
@@ -2077,12 +2116,12 @@ fn build_partition(
             // doc ids: bit-pack `doc - first_doc` at a fixed block width.
             let doc_width = bit_width(last_doc - first_doc);
             let doc_deltas: Vec<u32> = chunk.iter().map(|&(d, _, _)| d - first_doc).collect();
-            bitpack_put(&mut doc_freq_data, &doc_deltas, doc_width);
+            pack_block(&bp, &mut doc_freq_data, &doc_deltas, doc_width);
             // frequencies: bit-pack at a fixed block width.
             let blk_max_freq = chunk.iter().map(|&(_, f, _)| f).max().unwrap_or(0);
             let freq_width = bit_width(blk_max_freq);
             let freqs: Vec<u32> = chunk.iter().map(|&(_, f, _)| f).collect();
-            bitpack_put(&mut doc_freq_data, &freqs, freq_width);
+            pack_block(&bp, &mut doc_freq_data, &freqs, freq_width);
             // positions: VByte count + delta-encoded positions per doc.
             for &(d, _, ref positions) in chunk {
                 vbyte_put(&mut pos_data, positions.len() as u32);
@@ -2520,6 +2559,8 @@ struct PostingCursor<'a> {
     positions: Vec<Vec<u32>>,
     /// index within the current block.
     i: usize,
+    /// SIMD bit-(un)packer for full 128-doc blocks.
+    bp: BitPacker4x,
 }
 
 impl<'a> PostingCursor<'a> {
@@ -2535,6 +2576,7 @@ impl<'a> PostingCursor<'a> {
             pos_decoded: u32::MAX,
             positions: Vec::new(),
             i: 0,
+            bp: BitPacker4x::new(),
         };
         if pref.block_count > 0 {
             cursor.decode_doc_freq(0);
@@ -2549,10 +2591,10 @@ impl<'a> PostingCursor<'a> {
         let bm = self.part.block_meta[(self.pref.block_start + block) as usize];
         let n = block_len(self.pref.doc_count, block);
         self.docs.clear();
-        self.freqs.clear();
         // doc ids: bit-packed `doc - first_doc`.
         let df_start = bm.df_offset as usize;
-        bitpack_get(
+        unpack_block(
+            &self.bp,
             &self.part.doc_freq_data,
             df_start,
             n,
@@ -2564,7 +2606,8 @@ impl<'a> PostingCursor<'a> {
         }
         // frequencies follow the doc-id block.
         let freq_start = df_start + bitpack_len(n, bm.doc_width);
-        bitpack_get(
+        unpack_block(
+            &self.bp,
             &self.part.doc_freq_data,
             freq_start,
             n,
