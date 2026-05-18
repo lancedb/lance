@@ -593,6 +593,29 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         f64::NAN
     };
 
+    // Per-query-type latency split — `latencies_us` is parallel to `queries`.
+    let mut term_lat: Vec<f64> = Vec::new();
+    let mut phrase_lat: Vec<f64> = Vec::new();
+    for (q, &lat) in queries.iter().zip(&latencies_us) {
+        if q.kind == "phrase" {
+            phrase_lat.push(lat);
+        } else {
+            term_lat.push(lat);
+        }
+    }
+    term_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    phrase_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |v: &[f64], p: f64| if v.is_empty() { f64::NAN } else { percentile(v, p) };
+    println!(
+        "result split: term_p50={:.1} term_p95={:.1} ({} q) | phrase_p50={:.1} phrase_p95={:.1} ({} q)",
+        pct(&term_lat, 50.0),
+        pct(&term_lat, 95.0),
+        term_lat.len(),
+        pct(&phrase_lat, 50.0),
+        pct(&phrase_lat, 95.0),
+        phrase_lat.len(),
+    );
+
     println!(
         "result impl=lance_fts run={} docs={} queries={} build_s={:.3} build_docs_per_s={:.0} \
          q_p50_us={:.1} q_p95_us={:.1} qps_1t={:.0} qps_{}t={:.0} \
