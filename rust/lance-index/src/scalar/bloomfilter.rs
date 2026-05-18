@@ -20,6 +20,7 @@ use arrow_array::{Array, UInt64Array};
 mod as_bytes;
 pub mod sbbf;
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;
@@ -45,7 +46,6 @@ const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 const MAX_BLOOMFILTER_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024;
-const BLOOMFILTER_READ_BATCH_SIZE: usize = 4 * 1024;
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
 #[derive(Debug, Clone)]
@@ -110,11 +110,16 @@ impl BloomFilterIndex {
             .and_then(|bs| bs.parse().ok())
             .unwrap_or(*DEFAULT_PROBABILITY);
 
+        let read_batch_size =
+            Self::read_batch_size(number_of_items, probability, MAX_BLOOMFILTER_ARRAY_LENGTH)?;
+
         let mut zones = Vec::new();
-        for start in (0..index_file.num_rows()).step_by(BLOOMFILTER_READ_BATCH_SIZE) {
-            let end = (start + BLOOMFILTER_READ_BATCH_SIZE).min(index_file.num_rows());
-            let bloom_data = index_file.read_range(start..end, None).await?;
-            zones.extend(Self::try_from_serialized(bloom_data)?);
+        for start in (0..index_file.num_rows()).step_by(read_batch_size) {
+            let end = (start + read_batch_size).min(index_file.num_rows());
+            let mut bloom_data = index_file.read_range_stream(start..end, None).await?;
+            while let Some(batch) = bloom_data.try_next().await? {
+                zones.extend(Self::try_from_serialized(batch)?);
+            }
         }
 
         Ok(Arc::new(Self {
@@ -122,6 +127,30 @@ impl BloomFilterIndex {
             number_of_items,
             probability,
         }))
+    }
+
+    fn read_batch_size(
+        number_of_items: u64,
+        probability: f64,
+        max_array_length: usize,
+    ) -> Result<usize> {
+        // Bloom filters are stored in an Arrow BinaryArray, whose offsets are i32.
+        // The serialized filter size is fixed by the index parameters, so bound
+        // reads by total serialized bytes instead of row count alone.
+        let params = BloomFilterIndexBuilderParams {
+            number_of_items,
+            probability,
+        };
+        let filter_size = BloomFilterProcessor::build_filter(&params)?
+            .to_bytes()
+            .len();
+        if filter_size > max_array_length {
+            return Err(Error::invalid_input(format!(
+                "Serialized bloom filter size {} exceeds max supported batch bytes {}",
+                filter_size, max_array_length
+            )));
+        }
+        Ok((max_array_length / filter_size).max(1))
     }
 
     fn try_from_serialized(data: RecordBatch) -> Result<Vec<BloomFilterStatistics>> {
@@ -1252,7 +1281,9 @@ mod tests {
 
     use crate::scalar::{
         BloomFilterQuery, ScalarIndex, SearchResult,
-        bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterIndexBuilderParams},
+        bloomfilter::{
+            BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterIndexBuilderParams, sbbf::Sbbf,
+        },
         lance_format::LanceIndexStore,
     };
 
@@ -2214,6 +2245,44 @@ mod tests {
             }
             _ => panic!("Expected AtMost search result from bloomfilter"),
         }
+    }
+
+    #[test]
+    fn test_bloomfilter_read_batch_size_is_byte_bounded() {
+        let number_of_items = 1;
+        let probability = 0.25;
+        let max_test_batch_bytes = 48;
+        let filter_bytes = Sbbf::with_ndv_fpp(number_of_items, probability)
+            .unwrap()
+            .to_bytes();
+
+        assert!(filter_bytes.len() <= max_test_batch_bytes);
+        assert!(filter_bytes.len() * 2 > max_test_batch_bytes);
+
+        assert_eq!(
+            BloomFilterIndex::read_batch_size(number_of_items, probability, max_test_batch_bytes,)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_bloomfilter_read_batch_size_rejects_oversized_filter() {
+        let number_of_items = 1;
+        let probability = 0.25;
+        let filter_bytes = Sbbf::with_ndv_fpp(number_of_items, probability)
+            .unwrap()
+            .to_bytes();
+
+        let error =
+            BloomFilterIndex::read_batch_size(number_of_items, probability, filter_bytes.len() - 1)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds max supported batch bytes"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
