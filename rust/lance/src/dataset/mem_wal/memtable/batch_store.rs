@@ -52,6 +52,8 @@ pub struct StoredBatch {
     pub data: RecordBatch,
     /// Number of rows in this batch (cached for quick access).
     pub num_rows: usize,
+    /// Estimated memory size in bytes.
+    pub estimated_size: usize,
     /// Row offset in the MemTable (cumulative rows before this batch).
     pub row_offset: u64,
     /// Position of this batch in the store (0-indexed).
@@ -62,13 +64,40 @@ impl StoredBatch {
     /// Create a new StoredBatch.
     pub fn new(data: RecordBatch, row_offset: u64, batch_position: usize) -> Self {
         let num_rows = data.num_rows();
+        let estimated_size = Self::estimate_batch_size(&data);
         Self {
             data,
             num_rows,
+            estimated_size,
             row_offset,
             batch_position,
         }
     }
+
+    /// Estimate the memory size of a RecordBatch.
+    fn estimate_batch_size(batch: &RecordBatch) -> usize {
+        batch
+            .columns()
+            .iter()
+            .map(|col| col.get_array_memory_size())
+            .sum::<usize>()
+            + std::mem::size_of::<RecordBatch>()
+    }
+}
+
+/// Snapshot of the active batches that have not yet been flushed to WAL.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PendingWalFlushStats {
+    /// First pending batch position, inclusive.
+    pub start_batch_position: Option<usize>,
+    /// Last pending batch position, exclusive.
+    pub end_batch_position: Option<usize>,
+    /// Number of pending batches.
+    pub batch_count: usize,
+    /// Number of rows in pending batches.
+    pub row_count: usize,
+    /// Estimated bytes in pending batches.
+    pub estimated_bytes: usize,
 }
 
 /// Error returned when the store is full.
@@ -220,13 +249,12 @@ impl BatchStore {
             return Err(StoreFull);
         }
 
-        let num_rows = batch.num_rows();
-        let estimated_size = Self::estimate_batch_size(&batch);
-
         // Row offset is the total rows BEFORE this batch
         let row_offset = self.total_rows.load(Ordering::Relaxed) as u64;
 
         let stored = StoredBatch::new(batch, row_offset, idx);
+        let num_rows = stored.num_rows;
+        let estimated_size = stored.estimated_size;
 
         // SAFETY:
         // 1. idx < capacity, so slot exists
@@ -289,10 +317,9 @@ impl BatchStore {
         // Write all batches to slots (not yet visible to readers)
         for (i, batch) in batches.into_iter().enumerate() {
             let idx = start_idx + i;
-            let num_rows = batch.num_rows();
-            let estimated_size = Self::estimate_batch_size(&batch);
-
             let stored = StoredBatch::new(batch, row_offset, idx);
+            let num_rows = stored.num_rows;
+            let estimated_size = stored.estimated_size;
 
             // SAFETY:
             // 1. idx < capacity (checked above)
@@ -322,16 +349,6 @@ impl BatchStore {
             .store(start_idx + count, Ordering::Release);
 
         Ok(results)
-    }
-
-    /// Estimate the memory size of a RecordBatch.
-    fn estimate_batch_size(batch: &RecordBatch) -> usize {
-        batch
-            .columns()
-            .iter()
-            .map(|col| col.get_array_memory_size())
-            .sum::<usize>()
-            + std::mem::size_of::<RecordBatch>()
     }
 
     // =========================================================================
@@ -439,6 +456,29 @@ impl BatchStore {
         } else {
             None
         }
+    }
+
+    /// Get a point-in-time summary of batches pending WAL flush.
+    pub fn pending_wal_flush_stats(&self) -> PendingWalFlushStats {
+        let Some((start, end)) = self.pending_wal_flush_range() else {
+            return PendingWalFlushStats::default();
+        };
+
+        let mut stats = PendingWalFlushStats {
+            start_batch_position: Some(start),
+            end_batch_position: Some(end),
+            batch_count: 0,
+            row_count: 0,
+            estimated_bytes: 0,
+        };
+        for batch_position in start..end {
+            if let Some(stored) = self.get(batch_position) {
+                stats.batch_count += 1;
+                stats.row_count += stored.num_rows;
+                stats.estimated_bytes += stored.estimated_size;
+            }
+        }
+        stats
     }
 
     /// Get a reference to a batch by index.

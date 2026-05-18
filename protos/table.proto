@@ -540,19 +540,23 @@ message ShardManifest {
   // Computed shard field values as raw Arrow scalar bytes, keyed by shard
   // field id. The byte encoding follows Arrow's little-endian convention:
   // int32 is 4 LE bytes, utf8 is raw UTF-8 bytes, etc. The receiver looks
-  // up the result_type from the ShardSpec to interpret each value.
+  // up the result_type from the ShardingSpec to interpret each value.
   repeated ShardFieldEntry shard_field_entries = 14;
 
   // Writer fencing token - monotonically increasing.
   // A writer must increment this when claiming the shard.
   uint64 writer_epoch = 2;
 
-  // The most recent WAL entry position (0-based) that has been flushed to a MemTable.
+  // The most recent WAL entry position that has been flushed to a MemTable.
   // During recovery, replay starts from replay_after_wal_entry_position + 1.
+  // WAL positions are 1-based, so the default value 0 unambiguously means
+  // "no flush has ever stamped this shard" and recovery replays from 1.
   uint64 replay_after_wal_entry_position = 3;
 
-  // The most recent WAL entry position (0-based) at the time manifest was updated.
-  // This is a hint, not authoritative - recovery must list files to find actual state.
+  // The most recent WAL entry position observed at the time the manifest was
+  // updated. WAL positions are 1-based; default 0 means no entry has been
+  // written yet. This is a hint, not authoritative - recovery must list
+  // files to find actual state.
   uint64 wal_entry_position_last_seen = 4;
 
   // Next generation ID to create (incremented after each MemTable flush).
@@ -567,11 +571,11 @@ message ShardManifest {
 
 // A shard field value stored as raw Arrow scalar bytes.
 message ShardFieldEntry {
-  // Shard field id (matches ShardField.field_id in the ShardSpec).
+  // Shard field id (matches ShardingField.field_id in the ShardingSpec).
   string field_id = 1;
 
   // Raw Arrow scalar value bytes in little-endian encoding.
-  // The data type is determined by the result_type of the matching ShardField.
+  // The data type is determined by the result_type of the matching ShardingField.
   bytes value = 2;
 }
 
@@ -607,7 +611,7 @@ message IndexCatchupProgress {
 
 // Index details for MemWAL Index, stored in IndexMetadata.index_details.
 // This is the centralized structure for all MemWAL metadata:
-// - Configuration (shard specs, indexes to maintain)
+// - Configuration (sharding specs, indexes to maintain)
 // - Merge progress (merged generations per shard)
 // - Shard state snapshots
 //
@@ -622,7 +626,7 @@ message IndexCatchupProgress {
 // authoritative in the shard manifest files.
 //   shard_id: utf8
 //   shard_spec_id: uint32
-//   shard_field_{field_id}: typed per the matching ShardField.result_type
+//   shard_field_{field_id}: typed per the matching ShardingField.result_type
 message MemWalIndexDetails {
   // Snapshot timestamp (Unix timestamp in milliseconds).
   int64 snapshot_ts_millis = 1;
@@ -637,9 +641,9 @@ message MemWalIndexDetails {
   // Format: Lance file bytes with the shard snapshot schema.
   optional bytes inline_snapshots = 3;
 
-  // Shard specs defining how to derive shard identifiers.
+  // Sharding specs defining how to derive shard identifiers.
   // This configuration determines how rows are partitioned into shards.
-  repeated ShardSpec shard_specs = 7;
+  repeated ShardingSpec sharding_specs = 7;
 
   // Indexes from the base table to maintain in MemTables.
   // These are index names referencing indexes defined on the base table.
@@ -669,20 +673,29 @@ message MemWalIndexDetails {
   //
   // If an index is not present in this list, it is assumed to be fully caught up.
   repeated IndexCatchupProgress index_catchup = 10;
+
+  // Default ShardWriter configuration values for this MemWAL index.
+  //
+  // A free-form string map persisted so that every writer — across
+  // processes and restarts — starts from the same default writer
+  // configuration. These are defaults only: an individual writer may
+  // still override any value at runtime in its own ShardWriterConfig
+  // (which is not persisted).
+  map<string, string> writer_config_defaults = 11;
 }
 
-// Shard spec definition.
-message ShardSpec {
+// Sharding spec definition.
+message ShardingSpec {
   // Unique identifier for this spec within the index.
   // IDs are never reused.
   uint32 spec_id = 1;
 
-  // Shard field definitions that determine how to compute shard identifiers.
-  repeated ShardField fields = 2;
+  // Sharding field definitions that determine how to compute shard identifiers.
+  repeated ShardingField fields = 2;
 }
 
-// Shard field definition.
-message ShardField {
+// Sharding field definition.
+message ShardingField {
   // Unique string identifier for this shard field.
   string field_id = 1;
 

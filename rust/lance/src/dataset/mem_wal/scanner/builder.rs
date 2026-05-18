@@ -4,6 +4,7 @@
 //! LSM Scanner builder.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -15,7 +16,7 @@ use futures::TryStreamExt;
 use lance_core::{Error, Result};
 use uuid::Uuid;
 
-use super::collector::{ActiveMemTableRef, LsmDataSourceCollector};
+use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::ShardSnapshot;
 use super::planner::LsmScanPlanner;
 use crate::dataset::Dataset;
@@ -56,7 +57,9 @@ pub struct LsmScanner {
     /// explicitly by [`Self::without_base_table`].
     schema: SchemaRef,
     shard_snapshots: Vec<ShardSnapshot>,
-    active_memtables: HashMap<Uuid, ActiveMemTableRef>,
+    /// In-memory memtables by shard (active + frozen-awaiting-flush), so
+    /// the scanner path carries frozen-undrained generations too.
+    in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
 
     // Query configuration
     projection: Option<Vec<String>>,
@@ -91,7 +94,7 @@ impl LsmScanner {
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),
             shard_snapshots,
-            active_memtables: HashMap::new(),
+            in_memory_memtables: HashMap::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -127,7 +130,7 @@ impl LsmScanner {
             base: BaseSource::PathOnly(base_path.into()),
             schema,
             shard_snapshots,
-            active_memtables: HashMap::new(),
+            in_memory_memtables: HashMap::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -138,13 +141,32 @@ impl LsmScanner {
         }
     }
 
-    /// Add an active MemTable for strong consistency reads.
-    ///
-    /// Active MemTables contain data that may not be persisted yet.
-    /// Including them provides strong consistency at the cost of
-    /// requiring coordination with the writer.
-    pub fn with_active_memtable(mut self, shard_id: Uuid, memtable: ActiveMemTableRef) -> Self {
-        self.active_memtables.insert(shard_id, memtable);
+    /// Set a shard's active memtable. Back-compat / test entry point; the
+    /// read path uses [`Self::with_in_memory_memtables`]. Replaces the
+    /// active memtable, preserving any frozen memtables already registered.
+    pub fn with_active_memtable(mut self, shard_id: Uuid, memtable: InMemoryMemTableRef) -> Self {
+        match self.in_memory_memtables.entry(shard_id) {
+            Entry::Occupied(mut e) => e.get_mut().active = memtable,
+            Entry::Vacant(e) => {
+                e.insert(InMemoryMemTables {
+                    active: memtable,
+                    frozen: Vec::new(),
+                });
+            }
+        }
+        self
+    }
+
+    /// Register a shard's in-memory memtables (active + frozen-awaiting-
+    /// flush) captured atomically by `ShardWriter::in_memory_memtable_refs`.
+    /// The read path's entry point — closes the concurrent-read-vs-flush
+    /// hole by carrying frozen-undrained generations into the scan.
+    pub fn with_in_memory_memtables(
+        mut self,
+        shard_id: Uuid,
+        memtables: InMemoryMemTables,
+    ) -> Self {
+        self.in_memory_memtables.insert(shard_id, memtables);
         self
     }
 
@@ -281,8 +303,8 @@ impl LsmScanner {
             ),
         };
 
-        for (shard_id, memtable) in &self.active_memtables {
-            collector = collector.with_active_memtable(*shard_id, memtable.clone());
+        for (shard_id, mems) in &self.in_memory_memtables {
+            collector = collector.with_in_memory_memtables(*shard_id, mems.clone());
         }
 
         collector
@@ -298,7 +320,14 @@ impl std::fmt::Debug for LsmScanner {
         f.debug_struct("LsmScanner")
             .field(label, &value)
             .field("num_shards", &self.shard_snapshots.len())
-            .field("num_active_memtables", &self.active_memtables.len())
+            .field(
+                "num_in_memory_memtables",
+                &self
+                    .in_memory_memtables
+                    .values()
+                    .map(|m| 1 + m.frozen.len())
+                    .sum::<usize>(),
+            )
             .field("projection", &self.projection)
             .field("limit", &self.limit)
             .field("offset", &self.offset)
@@ -343,14 +372,14 @@ mod tests {
     }
 
     #[test]
-    fn test_active_memtable_ref() {
+    fn test_in_memory_memtable_ref() {
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
         let batch_store = Arc::new(BatchStore::with_capacity(100));
         let index_store = Arc::new(IndexStore::new());
         let schema = Arc::new(arrow_schema::Schema::empty());
 
-        let memtable_ref = ActiveMemTableRef {
+        let memtable_ref = InMemoryMemTableRef {
             batch_store,
             index_store,
             schema,

@@ -635,17 +635,23 @@ impl MemTableScanner {
 
     /// Execute the scan and collect all results into a single RecordBatch.
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
-        let stream = self.try_into_stream().await?;
+        let plan = self.create_plan().await?;
+        let output_schema = plan.schema();
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+        let stream = plan
+            .execute(0, task_ctx)
+            .map_err(|e| Error::io(format!("Failed to execute plan: {}", e)))?;
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
             .map_err(|e| Error::io(format!("Failed to collect batches: {}", e)))?;
 
         if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(self.output_schema()));
+            return Ok(RecordBatch::new_empty(output_schema));
         }
 
-        arrow_select::concat::concat_batches(&self.output_schema(), &batches)
+        arrow_select::concat::concat_batches(&output_schema, &batches)
             .map_err(|e| Error::io(format!("Failed to concatenate batches: {}", e)))
     }
 

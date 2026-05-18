@@ -30,7 +30,6 @@ pub mod local;
 pub mod memory;
 #[cfg(feature = "oss")]
 pub mod oss;
-#[cfg(test)]
 pub mod shared_memory;
 #[cfg(feature = "tencent")]
 pub mod tencent;
@@ -294,7 +293,6 @@ impl Default for ObjectStoreRegistry {
         let mut providers: HashMap<String, Arc<dyn ObjectStoreProvider>> = HashMap::new();
 
         providers.insert("memory".into(), Arc::new(memory::MemoryStoreProvider));
-        #[cfg(test)]
         providers.insert(
             "shared-memory".into(),
             Arc::new(shared_memory::SharedMemoryStoreProvider::default()),

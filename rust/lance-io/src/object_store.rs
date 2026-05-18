@@ -544,11 +544,7 @@ impl ObjectStore {
     }
 
     pub fn is_cloud(&self) -> bool {
-        if self.is_local() || self.scheme == "memory" {
-            return false;
-        }
-        #[cfg(test)]
-        if self.scheme == "shared-memory" {
+        if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
         }
         true

@@ -50,7 +50,7 @@ use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::{
     ActiveMemTableRef, LsmDataSourceCollector, LsmVectorSearchPlanner, ShardSnapshot,
 };
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -247,10 +247,9 @@ async fn setup_benchmark(
     )
     .await;
     lsm_dataset
-        .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
-            maintained_indexes: vec![VECTOR_INDEX_NAME.to_string()],
-        })
+        .initialize_mem_wal()
+        .maintained_indexes([VECTOR_INDEX_NAME])
+        .execute()
         .await
         .unwrap();
     let lsm_dataset = Arc::new(lsm_dataset);

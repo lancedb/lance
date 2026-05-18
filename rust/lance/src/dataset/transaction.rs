@@ -18,7 +18,10 @@ use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
 use deepsize::DeepSizeOf;
-use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
+use lance_core::datatypes::{
+    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
+    LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
@@ -2382,6 +2385,38 @@ impl Transaction {
                     apply_update_map(&mut schema_metadata, schema_metadata_updates);
                     manifest.schema.metadata = schema_metadata;
                 }
+                // The unenforced primary and clustering keys are reserved
+                // schema properties: each is immutable once set, and its
+                // reserved metadata keys cannot be written with an invalid
+                // value. Capture the prior keys, and whether this transaction
+                // writes a reserved key, before applying the updates so
+                // violations can be rejected below. This runs on every apply,
+                // including conflict-rebase, so it also rejects the
+                // concurrent-writer race.
+                let primary_key_before: Vec<i32> = manifest
+                    .schema
+                    .unenforced_primary_key()
+                    .iter()
+                    .map(|field| field.id)
+                    .collect();
+                let writes_primary_key = field_metadata_updates.values().any(|update| {
+                    update.update_entries.iter().any(|entry| {
+                        entry.key == LANCE_UNENFORCED_PRIMARY_KEY
+                            || entry.key == LANCE_UNENFORCED_PRIMARY_KEY_POSITION
+                    })
+                });
+                let clustering_key_before: Vec<i32> = manifest
+                    .schema
+                    .unenforced_clustering_key()
+                    .iter()
+                    .map(|field| field.id)
+                    .collect();
+                let writes_clustering_key = field_metadata_updates.values().any(|update| {
+                    update
+                        .update_entries
+                        .iter()
+                        .any(|entry| entry.key == LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+                });
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
@@ -2399,11 +2434,61 @@ impl Transaction {
                                     })
                                     .map(|_| 0)
                             });
+                        // Also set unenforced clustering key based on updated
+                        // field metadata.
+                        field.unenforced_clustering_key_position = field
+                            .metadata
+                            .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+                            .and_then(|s| s.parse::<u32>().ok());
                     } else {
                         return Err(Error::invalid_input_source(
                             format!("Field with id {} does not exist", field_id).into(),
                         ));
                     }
+                }
+                let primary_key_after: Vec<i32> = manifest
+                    .schema
+                    .unenforced_primary_key()
+                    .iter()
+                    .map(|field| field.id)
+                    .collect();
+                if !primary_key_before.is_empty() {
+                    // The primary key is already set: reject any change to it,
+                    // and any write that touches a reserved primary key.
+                    if writes_primary_key || primary_key_after != primary_key_before {
+                        return Err(Error::invalid_input(
+                            "the unenforced primary key is a reserved key and cannot be changed once set",
+                        ));
+                    }
+                } else if writes_primary_key && primary_key_after.is_empty() {
+                    // A reserved primary key was written but did not install a
+                    // valid primary key (e.g. a non-marker flag value or a
+                    // non-numeric position).
+                    return Err(Error::invalid_input(
+                        "the unenforced primary key is a reserved key and cannot be set to an invalid value",
+                    ));
+                }
+                let clustering_key_after: Vec<i32> = manifest
+                    .schema
+                    .unenforced_clustering_key()
+                    .iter()
+                    .map(|field| field.id)
+                    .collect();
+                if !clustering_key_before.is_empty() {
+                    // The clustering key is already set: reject any change to
+                    // it, and any write that touches the reserved key.
+                    if writes_clustering_key || clustering_key_after != clustering_key_before {
+                        return Err(Error::invalid_input(
+                            "the unenforced clustering key is a reserved key and cannot be changed once set",
+                        ));
+                    }
+                } else if writes_clustering_key && clustering_key_after.is_empty() {
+                    // The reserved clustering key was written but did not
+                    // install a valid clustering key (e.g. a non-numeric
+                    // position value).
+                    return Err(Error::invalid_input(
+                        "the unenforced clustering key is a reserved key and cannot be set to an invalid value",
+                    ));
                 }
             }
             _ => {}

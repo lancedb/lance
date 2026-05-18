@@ -153,6 +153,85 @@ fn stats_log_interval_from_millis(ms: u64) -> Option<std::time::Duration> {
     }
 }
 
+/// Build a `ShardWriterConfig` from optional MemWAL writer keyword arguments.
+///
+/// Returns `None` when no keyword argument is supplied, so callers can tell
+/// "use the defaults" apart from an explicit configuration.
+#[allow(clippy::too_many_arguments)]
+fn writer_config_from_kwargs(
+    durable_write: Option<bool>,
+    sync_indexed_write: Option<bool>,
+    max_wal_buffer_size: Option<usize>,
+    max_wal_flush_interval_ms: Option<u64>,
+    max_memtable_size: Option<usize>,
+    max_memtable_rows: Option<usize>,
+    max_memtable_batches: Option<usize>,
+    max_unflushed_memtable_bytes: Option<usize>,
+    manifest_scan_batch_size: Option<usize>,
+    async_index_buffer_rows: Option<usize>,
+    async_index_interval_ms: Option<u64>,
+    backpressure_log_interval_ms: Option<u64>,
+    stats_log_interval_ms: Option<u64>,
+) -> Option<lance::dataset::mem_wal::ShardWriterConfig> {
+    use std::time::Duration;
+
+    let mut config = lance::dataset::mem_wal::ShardWriterConfig::default();
+    let mut any = false;
+    if let Some(v) = durable_write {
+        config = config.with_durable_write(v);
+        any = true;
+    }
+    if let Some(v) = sync_indexed_write {
+        config = config.with_sync_indexed_write(v);
+        any = true;
+    }
+    if let Some(v) = max_wal_buffer_size {
+        config = config.with_max_wal_buffer_size(v);
+        any = true;
+    }
+    if let Some(v) = max_wal_flush_interval_ms {
+        config = config.with_max_wal_flush_interval(Duration::from_millis(v));
+        any = true;
+    }
+    if let Some(v) = max_memtable_size {
+        config = config.with_max_memtable_size(v);
+        any = true;
+    }
+    if let Some(v) = max_memtable_rows {
+        config = config.with_max_memtable_rows(v);
+        any = true;
+    }
+    if let Some(v) = max_memtable_batches {
+        config = config.with_max_memtable_batches(v);
+        any = true;
+    }
+    if let Some(v) = max_unflushed_memtable_bytes {
+        config = config.with_max_unflushed_memtable_bytes(v);
+        any = true;
+    }
+    if let Some(v) = manifest_scan_batch_size {
+        config = config.with_manifest_scan_batch_size(v);
+        any = true;
+    }
+    if let Some(v) = async_index_buffer_rows {
+        config = config.with_async_index_buffer_rows(v);
+        any = true;
+    }
+    if let Some(v) = async_index_interval_ms {
+        config = config.with_async_index_interval(Duration::from_millis(v));
+        any = true;
+    }
+    if let Some(v) = backpressure_log_interval_ms {
+        config = config.with_backpressure_log_interval(Duration::from_millis(v));
+        any = true;
+    }
+    if let Some(v) = stats_log_interval_ms {
+        config = config.with_stats_log_interval(stats_log_interval_from_millis(v));
+        any = true;
+    }
+    any.then_some(config)
+}
+
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
     if reader.is_instance_of::<Scanner>() {
@@ -3149,56 +3228,162 @@ impl Dataset {
 
     /// Initialize MemWAL on this dataset.
     ///
-    /// Must be called once before any `mem_wal_writer()` calls.
-    /// Requires the dataset schema to have at least one field with
-    /// the `lance-schema:unenforced-primary-key` metadata.
-    #[pyo3(signature=(maintained_indexes=None, region_spec=None))]
+    /// Must be called once before any `mem_wal_writer()` calls. Requires the
+    /// dataset schema to have at least one field with the
+    /// `lance-schema:unenforced-primary-key` metadata.
+    ///
+    /// At most one sharding mode may be selected: bucket sharding
+    /// (`bucket_column` + `num_buckets`), identity sharding (`identity_column`),
+    /// or `unsharded`. With none selected, shards are managed manually.
+    ///
+    /// Any writer-configuration keyword arguments are recorded as the default
+    /// `ShardWriter` configuration for the MemWAL index.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(
+        *,
+        maintained_indexes=None,
+        bucket_column=None,
+        num_buckets=None,
+        identity_column=None,
+        unsharded=false,
+        durable_write=None,
+        sync_indexed_write=None,
+        max_wal_buffer_size=None,
+        max_wal_flush_interval_ms=None,
+        max_memtable_size=None,
+        max_memtable_rows=None,
+        max_memtable_batches=None,
+        max_unflushed_memtable_bytes=None,
+        manifest_scan_batch_size=None,
+        async_index_buffer_rows=None,
+        async_index_interval_ms=None,
+        backpressure_log_interval_ms=None,
+        stats_log_interval_ms=None,
+    ))]
     fn initialize_mem_wal(
         &mut self,
         py: Python<'_>,
         maintained_indexes: Option<Vec<String>>,
-        region_spec: Option<Bound<'_, PyAny>>,
+        bucket_column: Option<String>,
+        num_buckets: Option<u32>,
+        identity_column: Option<String>,
+        unsharded: bool,
+        durable_write: Option<bool>,
+        sync_indexed_write: Option<bool>,
+        max_wal_buffer_size: Option<usize>,
+        max_wal_flush_interval_ms: Option<u64>,
+        max_memtable_size: Option<usize>,
+        max_memtable_rows: Option<usize>,
+        max_memtable_batches: Option<usize>,
+        max_unflushed_memtable_bytes: Option<usize>,
+        manifest_scan_batch_size: Option<usize>,
+        async_index_buffer_rows: Option<usize>,
+        async_index_interval_ms: Option<u64>,
+        backpressure_log_interval_ms: Option<u64>,
+        stats_log_interval_ms: Option<u64>,
     ) -> PyResult<()> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
-        use lance_index::mem_wal::{ShardField as RegionField, ShardSpec as RegionSpec};
-        use std::collections::HashMap;
 
-        let region_spec_rust = if let Some(spec) = region_spec {
-            let spec_id: u32 = spec.getattr("spec_id")?.extract()?;
-            let fields_py: Vec<Bound<'_, PyAny>> = spec.getattr("fields")?.extract()?;
-            let fields = fields_py
-                .iter()
-                .map(|f| -> PyResult<RegionField> {
-                    Ok(RegionField {
-                        field_id: f.getattr("field_id")?.extract()?,
-                        source_ids: f.getattr("source_ids")?.extract()?,
-                        transform: f.getattr("transform")?.extract()?,
-                        expression: f.getattr("expression")?.extract()?,
-                        result_type: f.getattr("result_type")?.extract()?,
-                        parameters: f
-                            .getattr("parameters")?
-                            .extract::<HashMap<String, String>>()?,
-                    })
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            Some(RegionSpec { spec_id, fields })
-        } else {
-            None
+        let bucket = match (bucket_column.as_deref(), num_buckets) {
+            (Some(_), Some(_)) => true,
+            (None, None) => false,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "bucket sharding requires both `bucket_column` and `num_buckets`",
+                ));
+            }
         };
+        let modes = [bucket, identity_column.is_some(), unsharded]
+            .into_iter()
+            .filter(|&m| m)
+            .count();
+        if modes > 1 {
+            return Err(PyValueError::new_err(
+                "at most one of bucket sharding, `identity_column`, or `unsharded` may be set",
+            ));
+        }
 
-        let config = lance::dataset::mem_wal::MemWalConfig {
-            shard_spec: region_spec_rust,
-            maintained_indexes: maintained_indexes.unwrap_or_default(),
-        };
+        let writer_config = writer_config_from_kwargs(
+            durable_write,
+            sync_indexed_write,
+            max_wal_buffer_size,
+            max_wal_flush_interval_ms,
+            max_memtable_size,
+            max_memtable_rows,
+            max_memtable_batches,
+            max_unflushed_memtable_bytes,
+            manifest_scan_batch_size,
+            async_index_buffer_rows,
+            async_index_interval_ms,
+            backpressure_log_interval_ms,
+            stats_log_interval_ms,
+        );
+        let maintained_indexes = maintained_indexes.unwrap_or_default();
+
         let mut ds = Arc::clone(&self.ds);
         let new_ds = rt()
             .block_on(Some(py), async move {
-                Arc::make_mut(&mut ds).initialize_mem_wal(config).await?;
+                let dataset = Arc::make_mut(&mut ds);
+                let mut builder = dataset.initialize_mem_wal();
+                if let (Some(column), Some(n)) = (bucket_column, num_buckets) {
+                    builder = builder.bucket_sharding(column, n);
+                } else if let Some(column) = identity_column {
+                    builder = builder.identity_sharding(column);
+                } else if unsharded {
+                    builder = builder.unsharded();
+                }
+                builder = builder.maintained_indexes(maintained_indexes);
+                if let Some(config) = writer_config {
+                    builder = builder.writer_config_defaults(config);
+                }
+                builder.execute().await?;
                 Ok::<Arc<LanceDataset>, lance_core::Error>(ds)
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         self.ds = new_ds;
         Ok(())
+    }
+
+    /// Return the MemWAL index details for this dataset, or `None` if MemWAL
+    /// has not been initialized.
+    ///
+    /// The returned dict has `num_shards`, `maintained_indexes`,
+    /// `writer_config_defaults`, and `sharding_specs`.
+    fn mem_wal_index_details<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        use lance::dataset::mem_wal::DatasetMemWalExt;
+
+        let ds = self.ds.clone();
+        let details = rt()
+            .block_on(Some(py), async move { ds.mem_wal_index_details().await })?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let Some(details) = details else {
+            return Ok(None);
+        };
+
+        let dict = PyDict::new(py);
+        dict.set_item("num_shards", details.num_shards)?;
+        dict.set_item("maintained_indexes", details.maintained_indexes)?;
+        dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
+
+        let specs = PyList::empty(py);
+        for spec in &details.sharding_specs {
+            let spec_dict = PyDict::new(py);
+            spec_dict.set_item("spec_id", spec.spec_id)?;
+            let fields = PyList::empty(py);
+            for field in &spec.fields {
+                let field_dict = PyDict::new(py);
+                field_dict.set_item("field_id", &field.field_id)?;
+                field_dict.set_item("source_ids", field.source_ids.clone())?;
+                field_dict.set_item("transform", field.transform.clone())?;
+                field_dict.set_item("result_type", &field.result_type)?;
+                field_dict.set_item("parameters", field.parameters.clone())?;
+                fields.append(field_dict)?;
+            }
+            spec_dict.set_item("fields", fields)?;
+            specs.append(spec_dict)?;
+        }
+        dict.set_item("sharding_specs", specs)?;
+        Ok(Some(dict))
     }
 
     /// Get a RegionWriter for the specified region.
@@ -3240,51 +3425,27 @@ impl Dataset {
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
     ) -> PyResult<crate::mem_wal::PyRegionWriter> {
-        use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig as RegionWriterConfig};
+        use lance::dataset::mem_wal::DatasetMemWalExt;
 
         let uuid = uuid::Uuid::parse_str(&region_id)
             .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
 
-        let mut config = RegionWriterConfig::default();
-        if let Some(v) = durable_write {
-            config = config.with_durable_write(v);
-        }
-        if let Some(v) = sync_indexed_write {
-            config = config.with_sync_indexed_write(v);
-        }
-        if let Some(v) = max_wal_buffer_size {
-            config = config.with_max_wal_buffer_size(v);
-        }
-        if let Some(v) = max_wal_flush_interval_ms {
-            config = config.with_max_wal_flush_interval(std::time::Duration::from_millis(v));
-        }
-        if let Some(v) = max_memtable_size {
-            config = config.with_max_memtable_size(v);
-        }
-        if let Some(v) = max_memtable_rows {
-            config = config.with_max_memtable_rows(v);
-        }
-        if let Some(v) = max_memtable_batches {
-            config = config.with_max_memtable_batches(v);
-        }
-        if let Some(v) = max_unflushed_memtable_bytes {
-            config = config.with_max_unflushed_memtable_bytes(v);
-        }
-        if let Some(v) = manifest_scan_batch_size {
-            config = config.with_manifest_scan_batch_size(v);
-        }
-        if let Some(v) = async_index_buffer_rows {
-            config = config.with_async_index_buffer_rows(v);
-        }
-        if let Some(v) = async_index_interval_ms {
-            config = config.with_async_index_interval(std::time::Duration::from_millis(v));
-        }
-        if let Some(v) = backpressure_log_interval_ms {
-            config = config.with_backpressure_log_interval(std::time::Duration::from_millis(v));
-        }
-        if let Some(v) = stats_log_interval_ms {
-            config = config.with_stats_log_interval(stats_log_interval_from_millis(v));
-        }
+        let config = writer_config_from_kwargs(
+            durable_write,
+            sync_indexed_write,
+            max_wal_buffer_size,
+            max_wal_flush_interval_ms,
+            max_memtable_size,
+            max_memtable_rows,
+            max_memtable_batches,
+            max_unflushed_memtable_bytes,
+            manifest_scan_batch_size,
+            async_index_buffer_rows,
+            async_index_interval_ms,
+            backpressure_log_interval_ms,
+            stats_log_interval_ms,
+        )
+        .unwrap_or_default();
 
         let ds = self.ds.clone();
         let writer = rt()

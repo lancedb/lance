@@ -4597,27 +4597,55 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         *,
         maintained_indexes: Optional[List[str]] = None,
-        region_spec: Optional["mem_wal.RegionSpec"] = None,
+        bucket_column: Optional[str] = None,
+        num_buckets: Optional[int] = None,
+        identity_column: Optional[str] = None,
+        unsharded: bool = False,
+        durable_write: Optional[bool] = None,
+        sync_indexed_write: Optional[bool] = None,
+        max_wal_buffer_size: Optional[int] = None,
+        max_wal_flush_interval_ms: Optional[int] = None,
+        max_memtable_size: Optional[int] = None,
+        max_memtable_rows: Optional[int] = None,
+        max_memtable_batches: Optional[int] = None,
+        max_unflushed_memtable_bytes: Optional[int] = None,
+        manifest_scan_batch_size: Optional[int] = None,
+        async_index_buffer_rows: Optional[int] = None,
+        async_index_interval_ms: Optional[int] = None,
+        backpressure_log_interval_ms: Optional[int] = None,
+        stats_log_interval_ms: Optional[int] = None,
     ) -> None:
         """Initialize MemWAL on this dataset.
 
-        Must be called once before any calls to `mem_wal_writer`.
-        The dataset schema must have at least one field annotated with
-        the ``lance-schema:unenforced-primary-key`` Arrow field metadata.
+        Must be called once before any calls to `mem_wal_writer`. The dataset
+        schema must have at least one field annotated with the
+        ``lance-schema:unenforced-primary-key`` Arrow field metadata.
+
+        At most one sharding mode may be selected: bucket sharding
+        (``bucket_column`` + ``num_buckets``), identity sharding
+        (``identity_column``), or ``unsharded``. With none selected, shards are
+        managed manually by passing region IDs to `mem_wal_writer`.
+
+        Any writer-configuration keyword arguments (``durable_write``,
+        ``max_memtable_size``, ``max_wal_flush_interval_ms``, etc. — the same
+        knobs accepted by `mem_wal_writer`) are recorded as the default
+        `~lance.mem_wal.RegionWriter` configuration in the MemWAL index, so
+        every writer starts from the same defaults.
 
         Parameters
         ----------
         maintained_indexes : list of str, optional
-            Names of existing vector indexes to keep updated as data is
-            written through the MemWAL.  Must reference indexes that
-            already exist on the dataset.
-        region_spec : RegionSpec, optional
-            Partitioning specification for automatic region routing.
-            When provided, Lance will derive a region identifier from each
-            written row according to the spec and route writes to the
-            correct `~lance.mem_wal.RegionWriter` automatically.
-            When ``None`` (default), the caller must manage region IDs
-            manually by passing them to `mem_wal_writer`.
+            Names of existing indexes to keep updated as data is written
+            through the MemWAL. Must reference indexes that already exist.
+        bucket_column : str, optional
+            With ``num_buckets``, hash-bucket writes by this column, which must
+            be the single-column unenforced primary key.
+        num_buckets : int, optional
+            Number of hash buckets (shards). Required with ``bucket_column``.
+        identity_column : str, optional
+            Shard by the raw value of this scalar column.
+        unsharded : bool, default False
+            Route every write to a single shard.
 
         Raises
         ------
@@ -4625,38 +4653,42 @@ class LanceDataset(pa.dataset.Dataset):
             - Dataset has no ``lance-schema:unenforced-primary-key`` field.
             - An entry in *maintained_indexes* does not exist on the dataset.
             - MemWAL has already been initialized on this dataset.
-
-        Examples
-        --------
-        Without region spec (manual region management):
-
-        import lance
-        import pyarrow as pa
-        import tempfile
-        schema = pa.schema([
-        ...     pa.field("id", pa.int64(), nullable=False,
-        ...              metadata={"lance-schema:unenforced-primary-key": "true"}),
-        ...     pa.field("val", pa.float32()),
-        ... ])
-        table = pa.table({"id": [1], "val": [0.1]}, schema=schema)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ds = lance.write_dataset(table, tmpdir)
-            ds.initialize_mem_wal()
-
-        With a region spec for automatic routing by ``tenant_id``:
-
-        from lance.mem_wal import RegionField, RegionSpec
-        spec = RegionSpec(
-        ...     spec_id=1,
-        ...     fields=[RegionField(field_id="tenant_id", source_ids=[0],
-        ...                        result_type="int64")],
-        ... )
-        ds.initialize_mem_wal(region_spec=spec)
+        ValueError
+            More than one sharding mode was selected, or bucket sharding was
+            given only one of ``bucket_column`` / ``num_buckets``.
         """
         self._ds.initialize_mem_wal(
             maintained_indexes=maintained_indexes,
-            region_spec=region_spec,
+            bucket_column=bucket_column,
+            num_buckets=num_buckets,
+            identity_column=identity_column,
+            unsharded=unsharded,
+            durable_write=durable_write,
+            sync_indexed_write=sync_indexed_write,
+            max_wal_buffer_size=max_wal_buffer_size,
+            max_wal_flush_interval_ms=max_wal_flush_interval_ms,
+            max_memtable_size=max_memtable_size,
+            max_memtable_rows=max_memtable_rows,
+            max_memtable_batches=max_memtable_batches,
+            max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
+            manifest_scan_batch_size=manifest_scan_batch_size,
+            async_index_buffer_rows=async_index_buffer_rows,
+            async_index_interval_ms=async_index_interval_ms,
+            backpressure_log_interval_ms=backpressure_log_interval_ms,
+            stats_log_interval_ms=stats_log_interval_ms,
         )
+
+    def mem_wal_index_details(self) -> Optional[dict]:
+        """Return the MemWAL index details, or ``None`` if not initialized.
+
+        Returns
+        -------
+        dict or None
+            A dict with ``num_shards``, ``maintained_indexes``,
+            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
+            MemWAL has not been initialized on this dataset.
+        """
+        return self._ds.mem_wal_index_details()
 
     def mem_wal_writer(
         self,
