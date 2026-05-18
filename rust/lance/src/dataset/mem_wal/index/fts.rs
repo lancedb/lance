@@ -1913,31 +1913,6 @@ impl FtsIndexConfig {
 /// per-block score bound; a block's payload is self-delimiting.
 const POSTING_BLOCK: usize = 128;
 
-/// Append `v` to `buf` as unsigned LEB128 (VByte).
-fn vbyte_put(buf: &mut Vec<u8>, mut v: u32) {
-    while v >= 0x80 {
-        buf.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    buf.push(v as u8);
-}
-
-/// Read one unsigned LEB128 value from `buf` at `*pos`, advancing `*pos`.
-fn vbyte_get(buf: &[u8], pos: &mut usize) -> u32 {
-    let mut v = 0u32;
-    let mut shift = 0u32;
-    loop {
-        let b = buf[*pos];
-        *pos += 1;
-        v |= ((b & 0x7f) as u32) << shift;
-        if b & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    v
-}
-
 /// Number of docs in block `b` (0-based within a term) of a `doc_count`-long
 /// posting list.
 fn block_len(doc_count: u32, b: u32) -> usize {
@@ -2040,6 +2015,41 @@ fn unpack_block(
     }
 }
 
+/// Random-access read of `n` width-`width` values at logical index `s` from a
+/// bit-packed stream whose first value starts at byte `base` of `buf`. Used to
+/// decode one document's positions without touching the rest of the block.
+fn bitpack_read_at(buf: &[u8], base: usize, s: usize, n: usize, width: u8, out: &mut Vec<u32>) {
+    if n == 0 {
+        return;
+    }
+    if width == 0 {
+        out.resize(out.len() + n, 0);
+        return;
+    }
+    let w = width as u32;
+    let mask: u64 = if w >= 32 {
+        u32::MAX as u64
+    } else {
+        (1u64 << w) - 1
+    };
+    let start_bit = s * width as usize;
+    let mut byte = base + start_bit / 8;
+    let skip = (start_bit % 8) as u32;
+    let mut acc = (buf[byte] as u64) >> skip;
+    let mut bits = 8 - skip;
+    byte += 1;
+    for _ in 0..n {
+        while bits < w {
+            acc |= (buf[byte] as u64) << bits;
+            byte += 1;
+            bits += 8;
+        }
+        out.push((acc & mask) as u32);
+        acc >>= w;
+        bits -= w;
+    }
+}
+
 /// Per-128-doc-block metadata — enough to skip and score-bound a block
 /// without decoding its payload.
 #[derive(Clone, Copy)]
@@ -2054,6 +2064,8 @@ struct BlockMeta {
     /// bit width of the packed doc-id deltas (from `first_doc`) and freqs.
     doc_width: u8,
     freq_width: u8,
+    /// bit width of the packed position deltas.
+    pos_width: u8,
 }
 
 /// Per-term locator into a partition's shared posting buffers.
@@ -2122,16 +2134,20 @@ fn build_partition(
             let freq_width = bit_width(blk_max_freq);
             let freqs: Vec<u32> = chunk.iter().map(|&(_, f, _)| f).collect();
             pack_block(&bp, &mut doc_freq_data, &freqs, freq_width);
-            // positions: VByte count + delta-encoded positions per doc.
+            // positions: one bit-packed delta stream for the whole block.
+            // A doc's position count equals its frequency, so no count is
+            // stored — doc `i`'s slice is found from the freq prefix sum.
+            let mut pos_deltas: Vec<u32> = Vec::new();
             for &(d, _, ref positions) in chunk {
-                vbyte_put(&mut pos_data, positions.len() as u32);
                 let mut prev_p = 0u32;
                 for &p in positions {
-                    vbyte_put(&mut pos_data, p - prev_p);
+                    pos_deltas.push(p - prev_p);
                     prev_p = p;
                 }
                 term_min_dl = term_min_dl.min(docs.num_tokens(d));
             }
+            let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
+            bitpack_put(&mut pos_data, &pos_deltas, pos_width);
             block_meta.push(BlockMeta {
                 first_doc,
                 last_doc,
@@ -2139,6 +2155,7 @@ fn build_partition(
                 pos_offset,
                 doc_width,
                 freq_width,
+                pos_width,
             });
             term_max_freq = term_max_freq.max(blk_max_freq);
         }
@@ -2554,9 +2571,13 @@ struct PostingCursor<'a> {
     decoded: u32,
     docs: Vec<u32>,
     freqs: Vec<u32>,
-    /// the block decoded into `positions` (`u32::MAX` = none).
-    pos_decoded: u32,
-    positions: Vec<Vec<u32>>,
+    /// freq prefix sum of the decoded block (`len == freqs.len() + 1`); the
+    /// block it was computed for is `prefix_block`. Indexes the position
+    /// stream for random per-doc access.
+    prefix: Vec<u32>,
+    prefix_block: u32,
+    /// scratch for the most recently decoded doc's positions.
+    pos_scratch: Vec<u32>,
     /// index within the current block.
     i: usize,
     /// SIMD bit-(un)packer for full 128-doc blocks.
@@ -2573,8 +2594,9 @@ impl<'a> PostingCursor<'a> {
             decoded: u32::MAX,
             docs: Vec::new(),
             freqs: Vec::new(),
-            pos_decoded: u32::MAX,
-            positions: Vec::new(),
+            prefix: Vec::new(),
+            prefix_block: u32::MAX,
+            pos_scratch: Vec::new(),
             i: 0,
             bp: BitPacker4x::new(),
         };
@@ -2617,25 +2639,19 @@ impl<'a> PostingCursor<'a> {
         self.decoded = block;
     }
 
-    fn decode_positions(&mut self, block: u32) {
-        if self.pos_decoded == block {
+    /// Ensure `prefix` holds the freq prefix sum of the current block.
+    fn ensure_prefix(&mut self) {
+        if self.prefix_block == self.block {
             return;
         }
-        let bm = self.part.block_meta[(self.pref.block_start + block) as usize];
-        let n = block_len(self.pref.doc_count, block);
-        self.positions.clear();
-        let mut pos = bm.pos_offset as usize;
-        for _ in 0..n {
-            let cnt = vbyte_get(&self.part.pos_data, &mut pos);
-            let mut v = Vec::with_capacity(cnt as usize);
-            let mut last = 0u32;
-            for _ in 0..cnt {
-                last += vbyte_get(&self.part.pos_data, &mut pos);
-                v.push(last);
-            }
-            self.positions.push(v);
+        self.prefix.clear();
+        self.prefix.push(0);
+        let mut sum = 0u32;
+        for &f in &self.freqs {
+            sum += f;
+            self.prefix.push(sum);
         }
-        self.pos_decoded = block;
+        self.prefix_block = self.block;
     }
 
     /// Current doc id, or `None` once the list is exhausted.
@@ -2657,11 +2673,29 @@ impl<'a> PostingCursor<'a> {
         self.freqs[self.i]
     }
 
-    /// Positions of the current posting (decoded lazily).
+    /// Positions of the current posting — decoded on demand for this one
+    /// document only (random access into the block's position stream).
     fn positions(&mut self) -> &[u32] {
-        let block = self.block;
-        self.decode_positions(block);
-        &self.positions[self.i]
+        self.ensure_prefix();
+        let bm = self.part.block_meta[(self.pref.block_start + self.block) as usize];
+        let s = self.prefix[self.i] as usize;
+        let n = self.prefix[self.i + 1] as usize - s;
+        self.pos_scratch.clear();
+        bitpack_read_at(
+            &self.part.pos_data,
+            bm.pos_offset as usize,
+            s,
+            n,
+            bm.pos_width,
+            &mut self.pos_scratch,
+        );
+        // un-delta in place.
+        let mut last = 0u32;
+        for d in &mut self.pos_scratch {
+            last += *d;
+            *d = last;
+        }
+        &self.pos_scratch
     }
 
     /// Step to the next posting.
@@ -4032,17 +4066,17 @@ mod tests {
     }
 
     #[test]
-    fn test_vbyte_roundtrip() {
-        let vals = [0u32, 1, 127, 128, 300, 16_383, 16_384, 70_000, u32::MAX];
+    fn test_bitpack_read_at_random_access() {
+        // Pack a stream, then random-access arbitrary [s, s+n) ranges.
+        let vals: Vec<u32> = (0..200u32).map(|i| (i * 7 + 3) % 1000).collect();
+        let width = bit_width(*vals.iter().max().unwrap());
         let mut buf = Vec::new();
-        for &v in &vals {
-            vbyte_put(&mut buf, v);
+        bitpack_put(&mut buf, &vals, width);
+        for &(s, n) in &[(0usize, 5usize), (1, 1), (63, 10), (130, 70), (199, 1)] {
+            let mut out = Vec::new();
+            bitpack_read_at(&buf, 0, s, n, width, &mut out);
+            assert_eq!(out, &vals[s..s + n], "s={s} n={n}");
         }
-        let mut pos = 0;
-        for &v in &vals {
-            assert_eq!(vbyte_get(&buf, &mut pos), v);
-        }
-        assert_eq!(pos, buf.len(), "every byte consumed");
     }
 
     #[test]
