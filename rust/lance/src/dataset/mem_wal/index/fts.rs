@@ -1050,10 +1050,12 @@ impl FtsMemIndex {
         self.search_fuzzy_tokens(&st, &tokens, fuzziness, max_expansions)
     }
 
-    /// BM25 OR-search over the query tokens: WAND each immutable partition,
-    /// scan the tail, all scored with one corpus-wide [`MemBM25Scorer`], and
-    /// the results merged. Each doc lives in exactly one partition or the
-    /// tail, so the merge is a plain concatenation.
+    /// BM25 OR-search over the query tokens, scored with one corpus-wide
+    /// [`MemBM25Scorer`]. With a result limit, all partitions and the tail
+    /// feed a single shared top-k heap: the tail is scanned first to warm the
+    /// pruning threshold, then each partition's WAND prunes against the
+    /// shared rising threshold (instead of every partition cold-starting).
+    /// Without a limit, an exact O(matches) scan across partitions + tail.
     fn search_match(
         &self,
         st: &IndexState,
@@ -1070,14 +1072,32 @@ impl FtsMemIndex {
         if scorer.num_docs() == 0 {
             return Vec::new();
         }
-        let mut results = Vec::new();
-        for p in st.partitions.iter() {
-            results.extend(p.search_match(tokens, Operator::Or, &scorer, limit));
+        match limit {
+            Some(k) if k > 0 => {
+                let mut topk = TopK::new(k);
+                // Scan the tail first so the shared threshold is warm before
+                // the partition WANDs run.
+                if tail_snap.visible_count > 0 {
+                    for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer) {
+                        topk.offer(e.score, e.row_position);
+                    }
+                }
+                for p in st.partitions.iter() {
+                    p.wand_into(tokens, &scorer, &mut topk);
+                }
+                topk.into_entries()
+            }
+            _ => {
+                let mut results = Vec::new();
+                for p in st.partitions.iter() {
+                    results.extend(p.search_match(tokens, Operator::Or, &scorer));
+                }
+                if tail_snap.visible_count > 0 {
+                    results.extend(score_terms(&tail_snap, &st.tail.terms, tokens, &scorer));
+                }
+                results
+            }
         }
-        if tail_snap.visible_count > 0 {
-            results.extend(score_terms(&tail_snap, &st.tail.terms, tokens, &scorer));
-        }
-        results
     }
 
     fn search_phrase_tokens(&self, st: &IndexState, tokens: &[String], slop: u32) -> Vec<FtsEntry> {
@@ -2223,17 +2243,14 @@ impl Partition {
         build_partition(merged.into_iter().collect(), docs)
     }
 
-    /// BM25 OR/AND-search of the partition. With an OR operator and a result
-    /// limit, prunes with block-max WAND; otherwise runs a direct O(matches)
-    /// scan. Every result is scored with `scorer`, so scores are identical
-    /// regardless of which path runs (and identical to the tail's
-    /// `score_terms`).
+    /// Exact O(matches) BM25 OR/AND-search of the partition by direct posting
+    /// scan. The pruned top-k path is `wand_into`; this is the unbounded and
+    /// AND path. Scored with `scorer`, so scores match `score_terms`.
     fn search_match(
         &self,
         tokens: &[String],
         operator: Operator,
         scorer: &MemBM25Scorer,
-        limit: Option<usize>,
     ) -> Vec<FtsEntry> {
         // Resolve present query tokens to (local term id, query weight).
         // Repeated query tokens are kept so scores match `score_terms`.
@@ -2248,10 +2265,7 @@ impl Partition {
         if terms.is_empty() || (operator == Operator::And && !all_present) {
             return Vec::new();
         }
-        match limit {
-            Some(k) if k > 0 && operator == Operator::Or => self.wand_match(&terms, scorer, k),
-            _ => self.scan_match(&terms, operator, tokens.len() as u32, scorer),
-        }
+        self.scan_match(&terms, operator, tokens.len() as u32, scorer)
     }
 
     /// Exact direct scan: accumulate every match into flat arrays indexed by
@@ -2289,31 +2303,35 @@ impl Partition {
         results
     }
 
-    /// Block-max WAND top-k over an OR query. Exact: each term's
-    /// `(max_freq, min_dl)` gives a sound score upper bound, so the algorithm
-    /// only skips docs that provably cannot enter the top-`k`.
-    fn wand_match(&self, terms: &[(u32, f32)], scorer: &MemBM25Scorer, k: usize) -> Vec<FtsEntry> {
-        let mut lanes: Vec<WandLane> = terms
-            .iter()
-            .map(|&(id, qw)| {
+    /// WAND top-k over an OR query, contributing into the caller's shared
+    /// [`TopK`]. Exact: each term's `(max_freq, min_dl)` gives a sound score
+    /// upper bound, so docs that provably cannot beat the shared threshold
+    /// are skipped. Because the threshold is shared across all partitions and
+    /// the tail, a partition processed late prunes against an already-warm
+    /// threshold instead of cold-starting.
+    fn wand_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
+        let mut lanes: Vec<WandLane> = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            if let Some(id) = self.term_id(token) {
                 let pref = &self.postings[id as usize];
-                WandLane {
+                let qw = scorer.query_weight(token);
+                lanes.push(WandLane {
                     cursor: PostingCursor::new(self, id),
                     qw,
                     ub: qw * scorer.doc_weight(pref.max_freq, pref.min_dl),
-                }
-            })
-            .collect();
-        // Min-heap of the current top-k by score.
-        let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k + 1);
-        // theta = score of the weakest doc still in the top-k (-inf until full).
-        let mut theta = f32::NEG_INFINITY;
+                });
+            }
+        }
+        if lanes.is_empty() {
+            return;
+        }
         loop {
             lanes.retain(|l| l.cursor.doc().is_some());
             if lanes.is_empty() {
                 break;
             }
             lanes.sort_by_key(|l| l.cursor.doc().unwrap());
+            let theta = topk.threshold();
             // Pivot: first lane whose cumulative upper bound exceeds theta.
             let mut acc = 0.0f32;
             let mut pivot = None;
@@ -2338,33 +2356,12 @@ impl Partition {
                         l.cursor.advance();
                     }
                 }
-                if heap.len() < k {
-                    heap.push(Reverse(ScoredDoc {
-                        score,
-                        doc: pivot_doc,
-                    }));
-                    if heap.len() == k {
-                        theta = heap.peek().unwrap().0.score;
-                    }
-                } else if score > theta {
-                    heap.pop();
-                    heap.push(Reverse(ScoredDoc {
-                        score,
-                        doc: pivot_doc,
-                    }));
-                    theta = heap.peek().unwrap().0.score;
-                }
+                topk.offer(score, self.docs.row_id(pivot_doc));
             } else {
                 // A lane before the pivot trails pivot_doc; skip it forward.
                 lanes[0].cursor.skip_to(pivot_doc);
             }
         }
-        heap.into_iter()
-            .map(|Reverse(sd)| FtsEntry {
-                row_position: self.docs.row_id(sd.doc),
-                score: sd.score,
-            })
-            .collect()
     }
 
     /// Phrase-search by intersecting posting lists: drive from the rarest
@@ -2421,29 +2418,80 @@ impl Partition {
     }
 }
 
-/// A scored doc id, ordered by score then doc id (`total_cmp`, so a stray
-/// non-finite score cannot panic the heap).
-struct ScoredDoc {
+/// A scored MemTable row, ordered by score then row position (`total_cmp`,
+/// so a stray non-finite score cannot panic the heap).
+struct ScoredEntry {
     score: f32,
-    doc: u32,
+    row_position: u64,
 }
 
-impl PartialEq for ScoredDoc {
+impl PartialEq for ScoredEntry {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
-impl Eq for ScoredDoc {}
-impl PartialOrd for ScoredDoc {
+impl Eq for ScoredEntry {}
+impl PartialOrd for ScoredEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ScoredDoc {
+impl Ord for ScoredEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
             .total_cmp(&other.score)
-            .then(self.doc.cmp(&other.doc))
+            .then(self.row_position.cmp(&other.row_position))
+    }
+}
+
+/// A bounded top-k collector shared across all partitions and the tail of a
+/// single query. `threshold()` is the score of the weakest entry once full —
+/// the WAND pruning bound — and rises monotonically as entries are offered.
+struct TopK {
+    k: usize,
+    heap: BinaryHeap<Reverse<ScoredEntry>>,
+}
+
+impl TopK {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: BinaryHeap::with_capacity(k + 1),
+        }
+    }
+
+    /// Score a doc must beat to enter the top-k (`-inf` until the heap fills).
+    fn threshold(&self) -> f32 {
+        if self.heap.len() >= self.k {
+            self.heap.peek().unwrap().0.score
+        } else {
+            f32::NEG_INFINITY
+        }
+    }
+
+    fn offer(&mut self, score: f32, row_position: u64) {
+        if self.heap.len() < self.k {
+            self.heap.push(Reverse(ScoredEntry {
+                score,
+                row_position,
+            }));
+        } else if score > self.heap.peek().unwrap().0.score {
+            self.heap.pop();
+            self.heap.push(Reverse(ScoredEntry {
+                score,
+                row_position,
+            }));
+        }
+    }
+
+    fn into_entries(self) -> Vec<FtsEntry> {
+        self.heap
+            .into_iter()
+            .map(|Reverse(e)| FtsEntry {
+                row_position: e.row_position,
+                score: e.score,
+            })
+            .collect()
     }
 }
 
@@ -3682,12 +3730,12 @@ mod tests {
         let apple = index.tokenize_for_search("apple").pop().unwrap();
         // "apple" is present -> an OR search over it matches.
         let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple));
-        let or_hits = p.search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer, None);
+        let or_hits = p.search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer);
         assert_eq!(or_hits.len(), 3);
         // Adding an absent term to an AND query short-circuits to nothing.
         let and_tokens = vec![apple, "definitely_missing".to_string()];
         let and_scorer = build_scorer(&st, &tail_snap, &and_tokens);
-        let and_hits = p.search_match(&and_tokens, Operator::And, &and_scorer, None);
+        let and_hits = p.search_match(&and_tokens, Operator::And, &and_scorer);
         assert!(and_hits.is_empty());
     }
 
