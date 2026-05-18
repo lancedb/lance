@@ -214,7 +214,13 @@ impl DecodeArrayTask for BinaryArrayDecoder {
         let result = match data_type {
             DataType::Binary => {
                 // Internal representation is always LargeList (i64 offsets) now
-                if arr.data_type() == &DataType::LargeList(Arc::new(arrow_schema::Field::new("item", DataType::UInt8, false))) {
+                if arr.data_type()
+                    == &DataType::LargeList(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::UInt8,
+                        false,
+                    )))
+                {
                     Self::from_large_list_to_small::<BinaryType>(arr.as_list::<i64>())?
                 } else {
                     Self::from_list_array::<BinaryType>(arr.as_list::<i32>())
@@ -222,7 +228,13 @@ impl DecodeArrayTask for BinaryArrayDecoder {
             }
             DataType::LargeBinary => Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>()),
             DataType::Utf8 => {
-                if arr.data_type() == &DataType::LargeList(Arc::new(arrow_schema::Field::new("item", DataType::UInt8, false))) {
+                if arr.data_type()
+                    == &DataType::LargeList(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::UInt8,
+                        false,
+                    )))
+                {
                     Self::from_large_list_to_small::<Utf8Type>(arr.as_list::<i64>())?
                 } else {
                     Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())
@@ -266,8 +278,8 @@ mod tests {
         let large_list_array = builder.finish();
 
         // Convert to small StringArray
-        let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array)
-            .unwrap();
+        let result =
+            BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array).unwrap();
 
         assert_eq!(result.data_type(), &DataType::Utf8);
         let string_array = result.as_string::<i32>();
@@ -283,9 +295,10 @@ mod tests {
         let values = arrow_buffer::ScalarBuffer::from(vec![0u8; 1]);
 
         // Create offsets that exceed i32::MAX
-        let offsets = arrow_buffer::OffsetBuffer::new(
-            arrow_buffer::ScalarBuffer::from(vec![0_i64, (i32::MAX as i64) + 10])
-        );
+        let offsets = arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+            0_i64,
+            (i32::MAX as i64) + 10,
+        ]));
 
         // Field for LargeList
         let field = Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true));
