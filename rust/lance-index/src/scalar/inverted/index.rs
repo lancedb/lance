@@ -33,6 +33,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
@@ -4062,6 +4063,7 @@ async fn tokenize_and_count(
     tokenizer: Box<dyn LanceTokenizer>,
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
+    elapsed_compute: Option<Time>,
 ) -> DataFusionResult<RecordBatch> {
     let output_schema = Arc::new(Schema::new(vec![
         ROW_ID_FIELD.clone(),
@@ -4086,7 +4088,12 @@ async fn tokenize_and_count(
             let query_tokens = query_tokens.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
+            let elapsed_compute = elapsed_compute.clone();
             spawn_cpu(move || {
+                // Time the per-batch CPU work so callers can attribute it to
+                // `elapsed_compute` on a metric handle (the spawn_cpu worker
+                // thread is invisible to the caller's poll timer otherwise).
+                let start = std::time::Instant::now();
                 let batch = batch?;
                 let mut all_token_counts = UInt64Builder::with_capacity(batch.num_rows());
                 let mut query_token_counts = FixedSizeListBuilder::with_capacity(
@@ -4140,6 +4147,9 @@ async fn tokenize_and_count(
                     tracing::warn!("Flat full text search is accumulating a large number of bytes.  Consider using an FTS index instead.");
                 }
 
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
                 DataFusionResult::Ok(result_batch)
             })
         })
@@ -4269,6 +4279,10 @@ fn flat_bm25_score(
     Ok(batch)
 }
 
+#[deprecated(
+    note = "use `flat_bm25_search_stream_with_metrics` to record CPU compute \
+            time on a metric handle; pass `None` for the old behavior"
+)]
 pub async fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
@@ -4276,6 +4290,32 @@ pub async fn flat_bm25_search_stream(
     tokenizer: Box<dyn LanceTokenizer>,
     base_scorer: Option<MemBM25Scorer>,
     target_batch_size: usize,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    flat_bm25_search_stream_with_metrics(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        base_scorer,
+        target_batch_size,
+        None,
+    )
+    .await
+}
+
+/// Same as [`flat_bm25_search_stream`] but accepts an optional `Time` handle
+/// that, if provided, will receive the CPU time spent in (a) per-batch
+/// tokenization on the `spawn_cpu` worker threads and (b) the synchronous
+/// scoring phase. This lets a calling `ExecutionPlan` report accurate
+/// `elapsed_compute` without double-counting upstream poll time.
+pub async fn flat_bm25_search_stream_with_metrics(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
+    target_batch_size: usize,
+    elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
@@ -4301,12 +4341,23 @@ pub async fn flat_bm25_search_stream(
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
     // and we are tokenizing with a whitespace tokenizer, we need to know that there are 3 tokens
     // and the token book appears once.
-    let counted_input =
-        tokenize_and_count(chunked, tokenizer, query_tokens.clone(), doc_col_idx).await?;
+    let counted_input = tokenize_and_count(
+        chunked,
+        tokenizer,
+        query_tokens.clone(),
+        doc_col_idx,
+        elapsed_compute.clone(),
+    )
+    .await?;
 
-    // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize)
+    // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
+    // Synchronous and single-threaded, so we time it from this thread.
+    let scoring_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(scoring_start.elapsed());
+    }
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -5730,6 +5781,65 @@ mod tests {
         assert!(
             index.deleted_fragments().is_empty(),
             "index without deleted_fragments column should have empty bitmap"
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_search_stream_with_metrics_records_elapsed_compute() {
+        use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
+        use arrow_array::{StringArray, UInt64Array};
+        use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
+
+        // Tiny stream of one batch containing the query term in two rows.
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    "the quick brown fox",
+                    "lazy dog sleeps",
+                    "the brown fox jumps over",
+                    "completely unrelated text",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+
+        let elapsed_compute = Time::default();
+        let result_stream = flat_bm25_search_stream_with_metrics(
+            input,
+            "text".to_string(),
+            "fox".to_string(),
+            tokenizer,
+            None,
+            100,
+            Some(elapsed_compute.clone()),
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        assert!(!batches.is_empty(), "expected at least one scored batch");
+
+        // Both phase 1 (tokenize_and_count's spawn_cpu) and phase 2 (sync
+        // scoring) call `add_duration` on the metric; verify the handle
+        // was actually populated.
+        assert!(
+            elapsed_compute.value() > 0,
+            "elapsed_compute should have been populated; got 0"
         );
     }
 }

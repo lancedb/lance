@@ -34,10 +34,7 @@ use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{
-    IndexMetrics, InstrumentedChildInputStream, InstrumentedRecordBatchStreamAdapter,
-    build_prefilter,
-};
+use super::utils::{IndexMetrics, InstrumentedChildInputStream, build_prefilter};
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
@@ -51,7 +48,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer,
-    flat_bm25_search_stream,
+    flat_bm25_search_stream_with_metrics,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -1003,6 +1000,13 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
 
+        // CPU time accumulator passed into `flat_bm25_search_stream_with_metrics`
+        // so it can attribute the spawn_cpu tokenize work and synchronous
+        // scoring back onto this node's `elapsed_compute`. Sharing the same
+        // `Time` handle that's already inside the FtsIndexMetrics avoids
+        // registering a duplicate metric.
+        let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
+
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
@@ -1010,12 +1014,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let unindexed_input =
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
-        // NOTE: this node still uses InstrumentedRecordBatchStreamAdapter, which
-        // double-counts child input time in elapsed_compute (see #5155). The
-        // helper introduced in this PR doesn't fit cleanly here because
-        // `flat_bm25_search_stream` both consumes the child input and spawn_cpu's
-        // the tokenize/count work internally — fixing it requires a separate
-        // refactor in lance-index. Tracked as follow-up to #5155.
         let stream = stream::once(async move {
             let segments = match preset_segments {
                 Some(segments) => Some(segments),
@@ -1052,30 +1050,33 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 ),
             };
 
-            flat_bm25_search_stream(
+            flat_bm25_search_stream_with_metrics(
                 unindexed_input,
                 column,
                 query.terms,
                 tokenizer,
                 base_scorer,
                 target_batch_size,
+                Some(elapsed_compute),
             )
             .await
         })
         .try_flatten()
         .map(move |batch| {
-            if let Ok(batch) = &batch {
-                metrics_clone
-                    .baseline_metrics
-                    .record_output(batch.num_rows());
+            // record_poll records output_rows, output_bytes, and output_batches
+            // on the shared BaselineMetrics — same pattern DataFusion's own
+            // FilterExec uses inside its hand-written poll_next.
+            let poll = metrics_clone
+                .baseline_metrics
+                .record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
             }
-            batch
         });
-        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
-            partition,
-            &self.metrics,
         )))
     }
 
