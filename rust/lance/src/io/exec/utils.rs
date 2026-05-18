@@ -363,53 +363,52 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        loop {
-            // Fill in-flight transforms up to `concurrency` from the input.
-            // Polling the input does NOT count toward `elapsed_compute`.
-            while !this.input_done && this.in_flight.len() < this.concurrency {
-                match this.input.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok(batch))) => {
-                        this.in_flight.push((this.transform)(batch));
-                    }
-                    Poll::Ready(Some(Err(e))) => {
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    Poll::Ready(None) => {
-                        this.input_done = true;
-                    }
-                    Poll::Pending => break,
+
+        // Fill in-flight transforms up to `concurrency` from the input.
+        // Polling the input does NOT count toward `elapsed_compute`.
+        while !this.input_done && this.in_flight.len() < this.concurrency {
+            match this.input.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(batch))) => {
+                    this.in_flight.push((this.transform)(batch));
                 }
-            }
-
-            // Drive in-flight transforms; their poll time IS counted.
-            if !this.in_flight.is_empty() {
-                let timer = this.baseline_metrics.elapsed_compute().timer();
-                let poll = this.in_flight.poll_next_unpin(cx);
-                timer.done();
-                match poll {
-                    Poll::Ready(Some(result)) => {
-                        if result.is_ok() {
-                            this.batch_count.add(1);
-                        }
-                        return this.baseline_metrics.record_poll(Poll::Ready(Some(result)));
-                    }
-                    // Unreachable: `FuturesUnordered::poll_next` returns
-                    // `Ready(None)` only when empty, and we just checked
-                    // `!is_empty` above. A panic here is preferable to a
-                    // silent infinite loop if the invariant ever breaks.
-                    Poll::Ready(None) => {
-                        unreachable!("FuturesUnordered yielded None while non-empty")
-                    }
-                    Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(e)));
                 }
+                Poll::Ready(None) => {
+                    this.input_done = true;
+                }
+                Poll::Pending => break,
             }
-
-            if this.input_done {
-                return Poll::Ready(None);
-            }
-
-            return Poll::Pending;
         }
+
+        // Drive in-flight transforms; their poll time IS counted.
+        if !this.in_flight.is_empty() {
+            let timer = this.baseline_metrics.elapsed_compute().timer();
+            let poll = this.in_flight.poll_next_unpin(cx);
+            timer.done();
+            match poll {
+                Poll::Ready(Some(result)) => {
+                    if result.is_ok() {
+                        this.batch_count.add(1);
+                    }
+                    return this.baseline_metrics.record_poll(Poll::Ready(Some(result)));
+                }
+                // Unreachable: `FuturesUnordered::poll_next` returns
+                // `Ready(None)` only when empty, and we just checked
+                // `!is_empty` above. A panic here is preferable to a
+                // silent infinite loop if the invariant ever breaks.
+                Poll::Ready(None) => {
+                    unreachable!("FuturesUnordered yielded None while non-empty")
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if this.input_done {
+            return Poll::Ready(None);
+        }
+
+        Poll::Pending
     }
 }
 

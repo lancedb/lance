@@ -299,6 +299,12 @@ impl MapIndexExec {
         index_metrics: Arc<IndexMetrics>,
         metrics_set: ExecutionPlanMetricsSet,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        // Time the one-shot setup (fragment bitmap + deletion mask) so it's
+        // attributed to this node's elapsed_compute. The helper itself only
+        // times per-batch work.
+        let elapsed_compute = datafusion::physical_plan::metrics::MetricBuilder::new(&metrics_set)
+            .elapsed_compute(partition);
+        let setup_start = std::time::Instant::now();
         let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
             .await?
             .ok_or_else(|| {
@@ -313,6 +319,7 @@ impl MapIndexExec {
         } else {
             None
         };
+        elapsed_compute.add_duration(setup_start.elapsed());
 
         let helper = InstrumentedChildInputStream::new(
             input,
