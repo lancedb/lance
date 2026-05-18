@@ -87,6 +87,7 @@ tests = [
     "datafusion==53.0.0; python_version >= '3.10'",
 ]
 dev = [
+    "maturin==1.13.3",
     "pyright==1.1.406",
     "ruff==0.11.2",
 ]

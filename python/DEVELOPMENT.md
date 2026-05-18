@@ -17,7 +17,7 @@ This project is built with [maturin](https://github.com/PyO3/maturin).
 It can be built in development mode with:
 
 ```shell
-uv run maturin develop
+uv run maturin develop --uv
 ```
 
 This builds the Rust native module in place. You will need to re-run this
@@ -105,7 +105,7 @@ Before running benchmarks, you should build pylance in release mode:
 
 ```shell
 uv sync --group benchmarks
-uv run maturin develop --profile release-with-debug --extras benchmarks --features datagen
+uv run maturin develop --uv --profile release-with-debug --extras benchmarks --features datagen
 ```
 
 (You can also use `--release` or `--profile release`, but `--profile release-with-debug`
@@ -173,12 +173,12 @@ the benchmarks again with `--benchmark-compare`.
 CURRENT_BRANCH=$(git branch --show-current)
 git checkout main
 uv sync --group benchmarks
-uv run maturin develop --profile release-with-debug --features datagen
+uv run maturin develop --uv --profile release-with-debug --features datagen
 uv run pytest --benchmark-save=baseline python/benchmarks -m "not slow"
 COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
 git checkout $CURRENT_BRANCH
 uv sync --group benchmarks
-uv run maturin develop --profile release-with-debug --features datagen
+uv run maturin develop --uv --profile release-with-debug --features datagen
 uv run pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
 ```
 

@@ -87,8 +87,8 @@ jobs:
           python -m venv venv
           source venv/bin/activate
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
-          pip install maturin
-          maturin develop --profile ci --locked --extras tests,ray
+          pip install maturin==1.13.3 uv
+          maturin develop --uv --profile ci --locked --extras tests,ray
       - name: Run doctest
         run: |
           source venv/bin/activate

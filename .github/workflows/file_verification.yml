@@ -51,8 +51,8 @@ jobs:
         run: |
           python -m venv venv
           source venv/bin/activate
-          pip install pyarrow maturin
-          maturin develop --release
+          pip install pyarrow maturin==1.13.3 uv
+          maturin develop --uv --release
 
       - name: Test Lance File Write Read Round Trip
         run: |

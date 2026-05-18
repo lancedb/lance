@@ -30,7 +30,7 @@ install: ## Sync dependencies and set up local development tools
 	uv tool run pre-commit install
 
 build: ## Build the local Rust extension with maturin
-	$(UV_RUN) maturin develop
+	$(UV_RUN) maturin develop --uv
 
 test: ## Run Python tests except recurring tests
 	pytest $(PYTEST_ARGS) python/tests
