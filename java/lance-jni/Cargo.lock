@@ -3633,6 +3633,7 @@ dependencies = [
  "async-trait",
  "async_cell",
  "aws-credential-types",
+ "bitpacking",
  "byteorder",
  "bytes",
  "chrono",
