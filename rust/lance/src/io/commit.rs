@@ -35,7 +35,8 @@ use lance_table::format::{
     WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, CommitStrategy, ManifestLocation, ManifestNamingScheme,
+    CommitConfig, CommitError, CommitHandler, CommitStrategy, ManifestLocation,
+    ManifestNamingScheme,
 };
 use rand::{Rng, rng};
 
