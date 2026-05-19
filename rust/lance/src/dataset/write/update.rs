@@ -1446,15 +1446,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_by_rowid() {
-        let (dataset, _test_dir) =
-            make_test_dataset(LanceFileVersion::Stable, true).await;
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Stable, true).await;
 
-        let orig_batch = dataset
-            .scan()
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
         let orig_row_ids = orig_batch
             .column_by_name(ROW_ID)
             .unwrap()
@@ -1516,15 +1510,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_by_rowid_in_list() {
-        let (dataset, _test_dir) =
-            make_test_dataset(LanceFileVersion::Stable, true).await;
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Stable, true).await;
 
-        let orig_batch = dataset
-            .scan()
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
         let orig_row_ids = orig_batch
             .column_by_name(ROW_ID)
             .unwrap()
@@ -1543,10 +1531,8 @@ mod tests {
             .iter()
             .map(|&i| orig_row_ids.value(i))
             .collect();
-        let target_ids: std::collections::HashSet<i64> = target_indices
-            .iter()
-            .map(|&i| orig_ids.value(i))
-            .collect();
+        let target_ids: std::collections::HashSet<i64> =
+            target_indices.iter().map(|&i| orig_ids.value(i)).collect();
         let in_list: String = target_row_ids
             .iter()
             .map(|id| id.to_string())
