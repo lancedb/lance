@@ -442,46 +442,6 @@ pub struct DocCandidate {
     pub doc_length: u32,
 }
 
-/// One query term for [`wand_search`]: the token text, its id, the token's
-/// position in the query (used only by phrase queries), the query-side
-/// weight, and the term's posting list.
-pub type WandTerm = (String, u32, u32, f32, PostingList);
-
-/// In-memory block-max WAND search entry point.
-///
-/// Runs the same WAND algorithm as the on-disk inverted index query path,
-/// but over caller-supplied posting lists. This is the query primitive for
-/// the in-memory FTS MemTable index, whose frozen segments hold their
-/// postings as [`PostingList::Plain`]. Mirrors `Wand`'s on-disk usage; the
-/// row-address mask is a no-op (the in-memory index has no deletions).
-pub fn wand_search<S: Scorer>(
-    operator: Operator,
-    terms: Vec<WandTerm>,
-    docs: &DocSet,
-    scorer: S,
-    params: &FtsSearchParams,
-) -> Result<Vec<DocCandidate>> {
-    let num_doc = docs.len();
-    let postings = terms
-        .into_iter()
-        .map(|(token, token_id, position, query_weight, list)| {
-            PostingIterator::with_query_weight(
-                token,
-                token_id,
-                position,
-                query_weight,
-                list,
-                num_doc,
-            )
-        });
-    let mut wand = Wand::new(operator, postings, docs, scorer);
-    wand.search(
-        params,
-        Arc::new(RowAddrMask::default()),
-        &crate::metrics::NoOpMetricsCollector,
-    )
-}
-
 struct HeadPosting {
     // Iterators that are already positioned on or after the next candidate doc.
     // The heap is ordered by smallest doc id so the top element determines
@@ -1693,62 +1653,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.len(), 0); // Should not panic
-    }
-
-    // Proves the public `wand_search` entry point works over caller-built
-    // in-memory posting lists — the query primitive for the segmented
-    // FTS MemTable index. (BM25 ranking itself is covered by `test_wand`
-    // and the on-disk index tests.)
-    #[test]
-    fn test_wand_search_in_memory() {
-        let mut docs = DocSet::default();
-        for i in 0..10u64 {
-            docs.append(i, 1);
-        }
-        // term "a": docs 0,2,4,6,8 — term "b": docs 1,2,5,8 — union of 7.
-        let term_a = generate_posting_list(vec![0, 2, 4, 6, 8], 1.0, None, false);
-        let term_b = generate_posting_list(vec![1, 2, 5, 8], 1.0, None, false);
-        let union: std::collections::HashSet<u64> = [0, 1, 2, 4, 5, 6, 8].into_iter().collect();
-        let terms: Vec<WandTerm> = vec![
-            ("a".to_string(), 0, 0, 1.0, term_a),
-            ("b".to_string(), 1, 1, 1.0, term_b),
-        ];
-        let params = FtsSearchParams::default().with_limit(Some(3));
-        let scorer = IndexBM25Scorer::new(std::iter::empty());
-        let result = wand_search(Operator::Or, terms, &docs, scorer, &params).unwrap();
-        assert_eq!(result.len(), 3, "limit=3 should return 3 candidates");
-        for c in &result {
-            assert!(union.contains(&c.row_id), "id {} not in union", c.row_id);
-            assert!(!c.freqs.is_empty(), "candidate must record term freqs");
-        }
-
-        // Unlimited search returns exactly the union of the two posting lists.
-        let scorer = IndexBM25Scorer::new(std::iter::empty());
-        let all = wand_search(
-            Operator::Or,
-            vec![
-                (
-                    "a".to_string(),
-                    0,
-                    0,
-                    1.0,
-                    generate_posting_list(vec![0, 2, 4, 6, 8], 1.0, None, false),
-                ),
-                (
-                    "b".to_string(),
-                    1,
-                    1,
-                    1.0,
-                    generate_posting_list(vec![1, 2, 5, 8], 1.0, None, false),
-                ),
-            ],
-            &docs,
-            scorer,
-            &FtsSearchParams::default(),
-        )
-        .unwrap();
-        let got: std::collections::HashSet<u64> = all.iter().map(|c| c.row_id).collect();
-        assert_eq!(got, union, "OR search must return the posting-list union");
     }
 
     #[test]

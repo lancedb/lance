@@ -25,7 +25,6 @@ use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
 pub use scorer::{MemBM25Scorer, Scorer};
 pub use tokenizer::*;
-pub use wand::{DocCandidate, WandTerm, wand_search};
 
 use crate::scalar::inverted::query::{FtsSearchParams, Tokens};
 
