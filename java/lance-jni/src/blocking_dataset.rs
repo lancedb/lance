@@ -3531,16 +3531,11 @@ fn inner_get_zonemap_stats<'local>(
                                 .await
                                 .map_err(Error::from)?,
                         );
-                        let index_file = match index_store
-                            .open_index_file("zonemap.lance")
-                            .await
-                        {
+                        let index_file = match index_store.open_index_file("zonemap.lance").await {
                             Ok(file) => file,
                             Err(e) => {
-                                let is_not_found = matches!(
-                                    &e,
-                                    lance_core::Error::NotFound { .. }
-                                ) || e.to_string().contains("not found");
+                                let is_not_found = matches!(&e, lance_core::Error::NotFound { .. })
+                                    || e.to_string().contains("not found");
                                 if !is_not_found {
                                     return Err(Error::from(e));
                                 }
