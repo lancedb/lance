@@ -212,6 +212,16 @@ JVM engine connectors can be built using the Lance Java SDK. Here are some conne
 * [Flink Lance connector](https://github.com/lancedb/lance-flink)
 * [Trino Lance connector](https://github.com/lancedb/lance-trino)
 
+## Configuration
+
+Environment variables read by the JNI layer at runtime:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LANCE_JNI_DISABLE_DEFAULT_REGISTRY_SHARING` | unset (sharing on) | Set to `1`/`true`/`yes` to give every default `Dataset.open` (no explicit `Session`) a fresh `ObjectStoreRegistry`. Disables the process-wide registry that coalesces concurrent cold builds for the same URI. |
+
+Default-open paths share an `ObjectStoreRegistry` so concurrent opens against the same URI reuse one `ObjectStore` instead of each rebuilding the credential chain and HTTP client. Bare-URI opens (empty storage options, no provider, no namespace commit handler) collapse onto a single cache entry per URI: the first caller's resolved default credentials become the credentials used by every subsequent caller for the lifetime of that `ObjectStore`. Callers that need cross-tenant isolation under bare URIs should either pass an explicit `Session`, supply tenant-distinguishing storage options, or set the variable above to opt out entirely.
+
 ## Contributing
 
 From the codebase dimension, the lance project is a multiple-lang project. All Java-related code is located in the `java` directory.
