@@ -45,9 +45,20 @@ use lance_core::Result;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
+use crate::progress::IndexBuildProgress;
+use futures::StreamExt;
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
+
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
-const ZONEMAP_FILENAME: &str = "zonemap.lance";
+pub const ZONEMAP_FILENAME: &str = "zonemap.lance";
+/// Prefix used for per-worker partial files written during distributed
+/// zone-map index construction. Files have the form
+/// `part_<worker_id>_zonemap.lance` and are merged into the final
+/// `zonemap.lance` by [`merge_index_files`].
+pub const ZONEMAP_PART_FILE_PREFIX: &str = "part_";
+pub const ZONEMAP_PART_FILE_SUFFIX: &str = "_zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
@@ -733,6 +744,17 @@ impl ZoneMapIndexBuilder {
     }
 
     pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
+        self.write_index_to(index_store, ZONEMAP_FILENAME).await
+    }
+
+    /// Write the zone-map record batch to a specific file name. Used by the
+    /// distributed build path where each worker writes a `part_<id>_zonemap.lance`
+    /// file that is later merged by [`merge_index_files`].
+    pub async fn write_index_to(
+        self,
+        index_store: &dyn IndexStore,
+        file_name: &str,
+    ) -> Result<()> {
         let record_batch = self.zonemap_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -742,7 +764,7 @@ impl ZoneMapIndexBuilder {
         );
 
         let mut index_file = index_store
-            .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
+            .new_index_file(file_name, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
         index_file.finish().await?;
@@ -835,19 +857,32 @@ impl ZoneProcessor for ZoneMapProcessor {
 pub struct ZoneMapIndexPlugin;
 
 impl ZoneMapIndexPlugin {
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn train_zonemap_index(
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<ZoneMapIndexBuilderParams>,
     ) -> Result<()> {
-        // train_zonemap_index: calling scan_aligned_chunks
+        Self::train_zonemap_index_to(batches_source, index_store, options, ZONEMAP_FILENAME).await
+    }
+
+    /// Train the zone-map index and write it to the given file name.
+    /// Used by both the standalone path (writing `zonemap.lance`) and the
+    /// distributed build path (writing `part_<id>_zonemap.lance`).
+    async fn train_zonemap_index_to(
+        batches_source: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        options: Option<ZoneMapIndexBuilderParams>,
+        file_name: &str,
+    ) -> Result<()> {
         let value_type = batches_source.schema().field(0).data_type().clone();
 
         let mut builder = ZoneMapIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
 
         builder.train(batches_source).await?;
 
-        builder.write_index(index_store).await?;
+        builder.write_index_to(index_store, file_name).await?;
         Ok(())
     }
 }
@@ -922,7 +957,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        _fragment_ids: Option<Vec<u32>>,
+        fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
@@ -932,7 +967,19 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        let file_name = match fragment_ids.as_deref() {
+            // Distributed build: each worker writes a per-worker file. We use the
+            // smallest fragment id in the worker's assignment to name the file.
+            // ZoneTrainer already partitions zones strictly by fragment_id, so
+            // worker files never share zones across the same fragment_id and the
+            // final merge step is a pure concatenation.
+            Some(ids) if !ids.is_empty() => {
+                let worker_id = ids.iter().copied().min().expect("non-empty fragment_ids");
+                zonemap_part_file_name(worker_id)
+            }
+            _ => ZONEMAP_FILENAME.to_string(),
+        };
+        Self::train_zonemap_index_to(data, index_store, Some(request.params), &file_name).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
@@ -950,6 +997,139 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
+}
+
+fn zonemap_part_file_name(worker_id: u32) -> String {
+    format!("{ZONEMAP_PART_FILE_PREFIX}{worker_id}{ZONEMAP_PART_FILE_SUFFIX}")
+}
+
+/// List per-worker zonemap part files written during distributed builds.
+async fn list_zonemap_part_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+) -> Result<Vec<String>> {
+    let mut part_files = Vec::new();
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                let file_name = meta.location.filename().unwrap_or_default();
+                if file_name.starts_with(ZONEMAP_PART_FILE_PREFIX)
+                    && file_name.ends_with(ZONEMAP_PART_FILE_SUFFIX)
+                {
+                    part_files.push(file_name.to_string());
+                }
+            }
+            Err(err) => {
+                return Err(Error::io(format!(
+                    "Failed to list zonemap part files in {}: {err}",
+                    index_dir
+                )));
+            }
+        }
+    }
+    if part_files.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "No zonemap part files found in index directory: {}; \
+             call build_index for each fragment group before calling merge_index_metadata",
+            index_dir
+        )));
+    }
+    // Stable order (by worker id) so the merged output is deterministic.
+    // Sort numerically by the worker_id embedded in the filename, not
+    // lexicographically, so that part_10_* comes after part_2_*.
+    part_files.sort_by_key(|name| {
+        name.strip_prefix(ZONEMAP_PART_FILE_PREFIX)
+            .and_then(|s| s.strip_suffix(ZONEMAP_PART_FILE_SUFFIX))
+            .and_then(|id| id.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
+    Ok(part_files)
+}
+
+/// Merge per-worker zonemap part files into a single `zonemap.lance`.
+///
+/// Each worker writes a `part_<worker_id>_zonemap.lance` containing zones for
+/// its assigned fragments. Because zones are independent and never span
+/// fragments, the merge is a pure concatenation of record batches with no
+/// sorting, deduplication, or rewrite of zone payloads.
+pub async fn merge_index_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    store: Arc<dyn IndexStore>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<()> {
+    progress
+        .stage_start("scan_zonemap_parts", None, "files")
+        .await?;
+    let part_files = list_zonemap_part_files(object_store, index_dir).await?;
+    progress
+        .stage_progress("scan_zonemap_parts", part_files.len() as u64)
+        .await?;
+    progress.stage_complete("scan_zonemap_parts").await?;
+
+    progress
+        .stage_start(
+            "concat_zonemap_parts",
+            Some(part_files.len() as u64),
+            "files",
+        )
+        .await?;
+
+    // Read the first part to recover the arrow schema (including the
+    // ZONEMAP_SIZE_META_KEY metadata) for the merged output. Subsequent parts
+    // are appended in order.
+    let first_reader = store.open_index_file(&part_files[0]).await?;
+    let first_num_rows = first_reader.num_rows();
+    let first_batch = first_reader.read_range(0..first_num_rows, None).await?;
+    let merged_schema = first_batch.schema();
+    let mut writer = store
+        .new_index_file(ZONEMAP_FILENAME, merged_schema)
+        .await?;
+    if first_num_rows > 0 {
+        writer.write_record_batch(first_batch).await?;
+    }
+    progress
+        .stage_progress("concat_zonemap_parts", 1)
+        .await?;
+
+    for (idx, file_name) in part_files.iter().enumerate().skip(1) {
+        let reader = store.open_index_file(file_name).await?;
+        let num_rows = reader.num_rows();
+        if num_rows > 0 {
+            let batch = reader.read_range(0..num_rows, None).await?;
+            writer.write_record_batch(batch).await?;
+        }
+        progress
+            .stage_progress("concat_zonemap_parts", (idx + 1) as u64)
+            .await?;
+    }
+    writer.finish().await?;
+    progress.stage_complete("concat_zonemap_parts").await?;
+
+    progress
+        .stage_start(
+            "cleanup_zonemap_parts",
+            Some(part_files.len() as u64),
+            "files",
+        )
+        .await?;
+    for (idx, file_name) in part_files.iter().enumerate() {
+        if let Err(error) = store.delete_index_file(file_name).await {
+            tracing::warn!(
+                "Failed to delete zonemap part file '{}': {}. \
+                 This does not affect the merged zonemap index, but the part file \
+                 may need manual cleanup.",
+                file_name,
+                error
+            );
+        }
+        progress
+            .stage_progress("cleanup_zonemap_parts", (idx + 1) as u64)
+            .await?;
+    }
+    progress.stage_complete("cleanup_zonemap_parts").await?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ class SupportedDistributedIndices(str, Enum):
     BTREE = "BTREE"
     BITMAP = "BITMAP"
     INVERTED = "INVERTED"
+    ZONEMAP = "ZONEMAP"
 
     # Precise vector index types supported by distributed merge
     IVF_FLAT = "IVF_FLAT"

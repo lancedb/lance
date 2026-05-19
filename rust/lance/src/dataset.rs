@@ -3072,6 +3072,15 @@ impl Dataset {
                 )
                 .await
             }
+            IndexType::ZoneMap => {
+                lance_index::scalar::zonemap::merge_index_files(
+                    self.object_store.as_ref(),
+                    &index_dir,
+                    Arc::new(store),
+                    progress,
+                )
+                .await
+            }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(
                     "Vector distributed indexing no longer supports merge_index_metadata; \
