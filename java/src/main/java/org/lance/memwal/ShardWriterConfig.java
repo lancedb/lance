@@ -13,6 +13,8 @@
  */
 package org.lance.memwal;
 
+import com.google.common.base.Preconditions;
+
 import java.util.Optional;
 
 /**
@@ -20,7 +22,7 @@ import java.util.Optional;
  *
  * <p>Every value is optional; unset values fall back to the Lance default writer configuration. Use
  * the {@code with*} methods to build a configuration, then pass it to {@link
- * org.lance.Dataset#memWalWriter} or {@link InitializeMemWalParams#withWriterConfig}.
+ * org.lance.Dataset#memWalWriter} or {@link InitializeMemWalParams#withWriterConfigDefaults}.
  */
 public class ShardWriterConfig {
   private Optional<Boolean> durableWrite = Optional.empty();
@@ -51,66 +53,104 @@ public class ShardWriterConfig {
 
   /** Maximum size of the in-memory WAL buffer, in bytes. */
   public ShardWriterConfig withMaxWalBufferSize(long maxWalBufferSize) {
+    Preconditions.checkArgument(
+        maxWalBufferSize >= 0, "maxWalBufferSize must not be negative, got %s", maxWalBufferSize);
     this.maxWalBufferSize = Optional.of(maxWalBufferSize);
     return this;
   }
 
   /** Maximum interval between WAL flushes, in milliseconds. */
   public ShardWriterConfig withMaxWalFlushIntervalMs(long maxWalFlushIntervalMs) {
+    Preconditions.checkArgument(
+        maxWalFlushIntervalMs >= 0,
+        "maxWalFlushIntervalMs must not be negative, got %s",
+        maxWalFlushIntervalMs);
     this.maxWalFlushIntervalMs = Optional.of(maxWalFlushIntervalMs);
     return this;
   }
 
   /** Maximum size of a MemTable before it is flushed, in bytes. */
   public ShardWriterConfig withMaxMemtableSize(long maxMemtableSize) {
+    Preconditions.checkArgument(
+        maxMemtableSize >= 0, "maxMemtableSize must not be negative, got %s", maxMemtableSize);
     this.maxMemtableSize = Optional.of(maxMemtableSize);
     return this;
   }
 
   /** Maximum number of rows in a MemTable before it is flushed. */
   public ShardWriterConfig withMaxMemtableRows(long maxMemtableRows) {
+    Preconditions.checkArgument(
+        maxMemtableRows >= 0, "maxMemtableRows must not be negative, got %s", maxMemtableRows);
     this.maxMemtableRows = Optional.of(maxMemtableRows);
     return this;
   }
 
   /** Maximum number of record batches in a MemTable before it is flushed. */
   public ShardWriterConfig withMaxMemtableBatches(long maxMemtableBatches) {
+    Preconditions.checkArgument(
+        maxMemtableBatches >= 0,
+        "maxMemtableBatches must not be negative, got %s",
+        maxMemtableBatches);
     this.maxMemtableBatches = Optional.of(maxMemtableBatches);
     return this;
   }
 
   /** Maximum unflushed MemTable bytes allowed before applying backpressure. */
   public ShardWriterConfig withMaxUnflushedMemtableBytes(long maxUnflushedMemtableBytes) {
+    Preconditions.checkArgument(
+        maxUnflushedMemtableBytes >= 0,
+        "maxUnflushedMemtableBytes must not be negative, got %s",
+        maxUnflushedMemtableBytes);
     this.maxUnflushedMemtableBytes = Optional.of(maxUnflushedMemtableBytes);
     return this;
   }
 
   /** Batch size used when scanning the WAL manifest. */
   public ShardWriterConfig withManifestScanBatchSize(long manifestScanBatchSize) {
+    Preconditions.checkArgument(
+        manifestScanBatchSize >= 0,
+        "manifestScanBatchSize must not be negative, got %s",
+        manifestScanBatchSize);
     this.manifestScanBatchSize = Optional.of(manifestScanBatchSize);
     return this;
   }
 
   /** Number of rows buffered before an asynchronous index update is triggered. */
   public ShardWriterConfig withAsyncIndexBufferRows(long asyncIndexBufferRows) {
+    Preconditions.checkArgument(
+        asyncIndexBufferRows >= 0,
+        "asyncIndexBufferRows must not be negative, got %s",
+        asyncIndexBufferRows);
     this.asyncIndexBufferRows = Optional.of(asyncIndexBufferRows);
     return this;
   }
 
   /** Interval between asynchronous index updates, in milliseconds. */
   public ShardWriterConfig withAsyncIndexIntervalMs(long asyncIndexIntervalMs) {
+    Preconditions.checkArgument(
+        asyncIndexIntervalMs >= 0,
+        "asyncIndexIntervalMs must not be negative, got %s",
+        asyncIndexIntervalMs);
     this.asyncIndexIntervalMs = Optional.of(asyncIndexIntervalMs);
     return this;
   }
 
   /** Interval between backpressure log messages, in milliseconds. */
   public ShardWriterConfig withBackpressureLogIntervalMs(long backpressureLogIntervalMs) {
+    Preconditions.checkArgument(
+        backpressureLogIntervalMs >= 0,
+        "backpressureLogIntervalMs must not be negative, got %s",
+        backpressureLogIntervalMs);
     this.backpressureLogIntervalMs = Optional.of(backpressureLogIntervalMs);
     return this;
   }
 
   /** Interval between statistics log messages, in milliseconds; {@code 0} disables logging. */
   public ShardWriterConfig withStatsLogIntervalMs(long statsLogIntervalMs) {
+    Preconditions.checkArgument(
+        statsLogIntervalMs >= 0,
+        "statsLogIntervalMs must not be negative, got %s",
+        statsLogIntervalMs);
     this.statsLogIntervalMs = Optional.of(statsLogIntervalMs);
     return this;
   }

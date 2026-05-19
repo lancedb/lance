@@ -33,7 +33,7 @@ public class InitializeMemWalParams {
   private Optional<Integer> numBuckets = Optional.empty();
   private Optional<String> identityColumn = Optional.empty();
   private boolean unsharded = false;
-  private Optional<ShardWriterConfig> writerConfig = Optional.empty();
+  private Optional<ShardWriterConfig> writerConfigDefaults = Optional.empty();
 
   /** Names of the indexes to maintain through the MemWAL. Must already exist on the dataset. */
   public InitializeMemWalParams withMaintainedIndexes(List<String> maintainedIndexes) {
@@ -64,9 +64,9 @@ public class InitializeMemWalParams {
   }
 
   /** Default {@link ShardWriterConfig} recorded in the MemWAL index for all writers. */
-  public InitializeMemWalParams withWriterConfig(ShardWriterConfig writerConfig) {
-    Preconditions.checkNotNull(writerConfig, "writerConfig must not be null");
-    this.writerConfig = Optional.of(writerConfig);
+  public InitializeMemWalParams withWriterConfigDefaults(ShardWriterConfig writerConfigDefaults) {
+    Preconditions.checkNotNull(writerConfigDefaults, "writerConfigDefaults must not be null");
+    this.writerConfigDefaults = Optional.of(writerConfigDefaults);
     return this;
   }
 
@@ -90,7 +90,7 @@ public class InitializeMemWalParams {
     return unsharded;
   }
 
-  public Optional<ShardWriterConfig> writerConfig() {
-    return writerConfig;
+  public Optional<ShardWriterConfig> writerConfigDefaults() {
+    return writerConfigDefaults;
   }
 }

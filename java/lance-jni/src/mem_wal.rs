@@ -337,7 +337,7 @@ where
     let scanner = guard
         .inner
         .take()
-        .ok_or_else(|| Error::runtime_error("LsmScanner has already been consumed".to_string()))?;
+        .ok_or_else(|| Error::runtime_error("LsmScanner is no longer usable because an earlier builder call (e.g. filter) failed; create a new scanner".to_string()))?;
     guard.inner = Some(f(scanner)?);
     Ok(())
 }
@@ -431,7 +431,7 @@ fn inner_scanner_open_stream(env: &mut JNIEnv, this: JObject, stream_addr: jlong
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingLsmScanner>(&this, NATIVE_LSM_SCANNER) }?;
         let scanner = guard.inner.as_ref().ok_or_else(|| {
-            Error::runtime_error("LsmScanner has already been consumed".to_string())
+            Error::runtime_error("LsmScanner is no longer usable because an earlier builder call (e.g. filter) failed; create a new scanner".to_string())
         })?;
         RT.block_on(scanner.try_into_stream())?
     };
@@ -455,7 +455,7 @@ fn inner_scanner_count_rows(env: &mut JNIEnv, this: JObject) -> Result<u64> {
     let scanner = guard
         .inner
         .as_ref()
-        .ok_or_else(|| Error::runtime_error("LsmScanner has already been consumed".to_string()))?;
+        .ok_or_else(|| Error::runtime_error("LsmScanner is no longer usable because an earlier builder call (e.g. filter) failed; create a new scanner".to_string()))?;
     Ok(RT.block_on(scanner.count_rows())?)
 }
 
@@ -885,7 +885,7 @@ fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject
     let identity_column = env.get_optional_string_from_method(&params, "identityColumn")?;
     let unsharded = env.call_method(&params, "unsharded", "()Z", &[])?.z()?;
     let writer_config =
-        env.get_optional_from_method(&params, "writerConfig", |env, config_obj| {
+        env.get_optional_from_method(&params, "writerConfigDefaults", |env, config_obj| {
             build_writer_config(env, &config_obj)
         })?;
 
@@ -1280,15 +1280,21 @@ fn sharding_field_to_java<'a>(env: &mut JNIEnv<'a>, field: &ShardingField) -> Re
         Some(t) => env.new_string(t)?.into(),
         None => JObject::null(),
     };
+    let expression: JObject = match &field.expression {
+        Some(e) => env.new_string(e)?.into(),
+        None => JObject::null(),
+    };
     let result_type: JObject = env.new_string(&field.result_type)?.into();
     let parameters = field.parameters.clone().into_java(env)?;
     Ok(env.new_object(
         "org/lance/memwal/ShardingField",
-        "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;Ljava/util/Map;)V",
+        "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;\
+         Ljava/lang/String;Ljava/util/Map;)V",
         &[
             JValueGen::Object(&field_id),
             JValueGen::Object(&source_ids),
             JValueGen::Object(&transform),
+            JValueGen::Object(&expression),
             JValueGen::Object(&result_type),
             JValueGen::Object(&parameters),
         ],

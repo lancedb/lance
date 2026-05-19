@@ -80,7 +80,15 @@ public class LsmScanner implements Closeable {
 
   private native void nativeProject(List<String> columns);
 
-  /** Set a SQL filter expression, for example {@code "value > 0.5"}. */
+  /**
+   * Set a SQL filter expression, for example {@code "value > 0.5"}.
+   *
+   * <p>If {@code expr} fails to parse, an {@link IllegalArgumentException} is thrown and this
+   * scanner becomes unusable — build a new scanner rather than retrying on this instance.
+   *
+   * @param expr a SQL filter expression
+   * @return this scanner
+   */
   public LsmScanner filter(String expr) {
     Preconditions.checkNotNull(expr, "expr must not be null");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {

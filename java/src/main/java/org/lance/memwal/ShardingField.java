@@ -25,6 +25,7 @@ public class ShardingField {
   private final String fieldId;
   private final List<Integer> sourceIds;
   private final Optional<String> transform;
+  private final Optional<String> expression;
   private final String resultType;
   private final Map<String, String> parameters;
 
@@ -32,6 +33,7 @@ public class ShardingField {
    * @param fieldId identifier for the derived field
    * @param sourceIds source field IDs used as inputs
    * @param transform optional transform name applied to the source fields, may be {@code null}
+   * @param expression optional expression used to derive the field value, may be {@code null}
    * @param resultType output type name for the derived field
    * @param parameters extra transform parameters
    */
@@ -39,11 +41,13 @@ public class ShardingField {
       String fieldId,
       List<Integer> sourceIds,
       String transform,
+      String expression,
       String resultType,
       Map<String, String> parameters) {
     this.fieldId = fieldId;
     this.sourceIds = sourceIds == null ? Collections.emptyList() : sourceIds;
     this.transform = Optional.ofNullable(transform);
+    this.expression = Optional.ofNullable(expression);
     this.resultType = resultType;
     this.parameters = parameters == null ? Collections.emptyMap() : parameters;
   }
@@ -63,6 +67,11 @@ public class ShardingField {
     return transform;
   }
 
+  /** Optional expression used to derive the field value. */
+  public Optional<String> expression() {
+    return expression;
+  }
+
   /** Output type name for the derived field. */
   public String resultType() {
     return resultType;
@@ -79,6 +88,7 @@ public class ShardingField {
         .add("fieldId", fieldId)
         .add("sourceIds", sourceIds)
         .add("transform", transform.orElse(null))
+        .add("expression", expression.orElse(null))
         .add("resultType", resultType)
         .add("parameters", parameters)
         .toString();
