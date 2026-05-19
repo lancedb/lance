@@ -4,18 +4,24 @@
 //! Physical optimizer rule that rewrites `COUNT`-shaped aggregates into
 //! [`AggregateIndexSearchExec`].
 //!
+//! v1 only fires for fully unfiltered counts — the simplest provably-safe
+//! envelope. Filtered counts are deferred to a follow-up that can validate
+//! the index covers every dataset fragment.
+//!
 //! Recognized shape:
 //!
 //! ```text
 //! AggregateExec(Single, aggs=[COUNT(*)], group_by=[])
-//!   └── FilteredReadExec { full_filter ⊆ index_input, no refine_filter, ... }
+//!   └── FilteredReadExec { no full_filter, no refine_filter, no index_input,
+//!                          no scan range, no with_deleted_rows, no fragment
+//!                          subset, not stable-row-ids }
 //! ```
 //!
 //! Rewritten to:
 //!
 //! ```text
 //! AggregateExec(Final, aggs=[COUNT(*)], group_by=[])
-//!   └── AggregateIndexSearchExec { prefilter_input = index_input }
+//!   └── AggregateIndexSearchExec { prefilter_input = None }
 //! ```
 //!
 //! [`AggregateIndexSearchExec`] emits partial-state, so the outer
@@ -104,22 +110,32 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         }
     }
 
-    // The input must be a FilteredReadExec whose filter is either absent or
-    // fully evaluable by a child scalar-index search.
+    // The input must be a FilteredReadExec we can prove is safe to skip.
     let child = &agg.children()[0];
     let Some(filtered_read) = child.as_any().downcast_ref::<FilteredReadExec>() else {
         return Ok(None);
     };
 
-    let options = filtered_read.options();
-    // A refine filter is a residual the index couldn't fully evaluate — we'd
-    // need to scan data to apply it, so bail.
-    if options.refine_filter.is_some() {
+    // Stable-row-id mode: `DatasetPreFilter::create_deletion_mask` produces an
+    // AllowList in stable-id space, but `AggregateIndexSearchExec` builds its
+    // fragments-allow list in row-address space. ANDing across the two yields
+    // a silently wrong count (rows in fragments > 0 are dropped because their
+    // stable ids and row addresses share a fragment-id bucket only by accident).
+    // Until the exec can reconcile the two id spaces, refuse to fire.
+    if filtered_read.dataset().manifest().uses_stable_row_ids() {
         return Ok(None);
     }
-    // A full_filter without an index_input means the filter is evaluated by
-    // re-reading every row; not pushdownable.
-    if options.full_filter.is_some() && filtered_read.index_input().is_none() {
+
+    let options = filtered_read.options();
+    // No filter at all is the only case v1 can prove correct. With a filter we
+    // would also need to verify the scalar index covers every dataset fragment
+    // (otherwise rows in unindexed fragments are silently dropped). That check
+    // is async and not currently expressible in a sync PhysicalOptimizerRule;
+    // until we plumb it through, leave the filtered case on the scan path.
+    if options.full_filter.is_some()
+        || options.refine_filter.is_some()
+        || filtered_read.index_input().is_some()
+    {
         return Ok(None);
     }
     // LIMIT/OFFSET would change the count.
@@ -155,12 +171,8 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         .collect();
     let aggregate_funcs: Vec<Arc<AggregateFunctionExpr>> = agg.aggr_expr().to_vec();
 
-    let exec = AggregateIndexSearchExec::try_new(
-        dataset,
-        aggregates,
-        aggregate_funcs,
-        prefilter_input,
-    )?;
+    let exec =
+        AggregateIndexSearchExec::try_new(dataset, aggregates, aggregate_funcs, prefilter_input)?;
     let exec_schema = exec.schema();
     let exec: Arc<dyn ExecutionPlan> = Arc::new(exec);
 
@@ -269,7 +281,9 @@ mod tests {
     /// Drive the rule via `Scanner::create_plan` (which registers the rule
     /// through `get_physical_optimizer`) and return both the plan and the
     /// final count for inspection.
-    async fn run_count(scanner: &mut crate::dataset::scanner::Scanner) -> (Arc<dyn ExecutionPlan>, i64) {
+    async fn run_count(
+        scanner: &mut crate::dataset::scanner::Scanner,
+    ) -> (Arc<dyn ExecutionPlan>, i64) {
         scanner
             .aggregate(AggregateExpr::builder().count_star().build())
             .unwrap();
@@ -280,7 +294,12 @@ mod tests {
         )
         .unwrap();
         let batches: Vec<_> = stream.try_collect().await.unwrap();
-        assert_eq!(batches.len(), 1, "count plan emitted {} batches", batches.len());
+        assert_eq!(
+            batches.len(),
+            1,
+            "count plan emitted {} batches",
+            batches.len()
+        );
         let count = batches[0]
             .column(0)
             .as_any()
@@ -304,15 +323,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_fires_when_filter_fully_indexed() {
+    async fn rule_skips_when_filter_present_even_if_indexed() {
+        // Deferred until the rule can verify the index covers every dataset
+        // fragment — without that check, an index built before a fragment
+        // append silently drops rows. See `rule_skips_partial_index_coverage`
+        // below for the regression scenario this protects against.
         let fixture = make_fixture().await;
         let mut scanner = fixture.dataset.scan();
         scanner.filter("ordered < 25").unwrap();
         let (plan, count) = run_count(&mut scanner).await;
         assert_eq!(count, 25);
         assert!(
-            plan_contains_pushdown(&plan),
-            "expected AggregateIndexSearchExec in plan: {}",
+            !plan_contains_pushdown(&plan),
+            "rule should not fire with any filter in v1, got plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_skips_partial_index_coverage() {
+        // Regression: when an index doesn't cover every dataset fragment
+        // (here, by appending a fragment after the index was built), the rule
+        // must not fire — otherwise rows in unindexed fragments are silently
+        // dropped. Today this is enforced by the blanket "no filter" gate.
+        use crate::dataset::WriteParams;
+        let tmp = TempStrDir::default();
+        // Build a 4×10 dataset with a BTree index covering all 4 fragments.
+        let mut dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        // Append a fragment after the index was built — it is unindexed.
+        let extra = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(10),
+                lance_datagen::BatchCount::from(1),
+            );
+        let dataset = Dataset::write(
+            extra,
+            tmp.as_str(),
+            Some(WriteParams {
+                mode: crate::dataset::WriteMode::Append,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let mut scanner = dataset.scan();
+        scanner.filter("ordered < 100").unwrap();
+        let (plan, count) = run_count(&mut scanner).await;
+        // 5 fragments × 10 rows, all match `< 100`.
+        assert_eq!(count, 50);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "rule must not fire when the index has partial coverage, got plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_skips_with_stable_row_ids() {
+        // Regression: with stable row IDs the deletion mask is built in
+        // stable-id space while fragments_allow is in row-address space.
+        // ANDing across the two undercounts; refuse to fire.
+        use crate::dataset::WriteParams;
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset_with_params(
+                tmp.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // Touch a deletion so we exercise the masks that would otherwise
+        // collide across id spaces.
+        dataset.delete("ordered = 0").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let mut scanner = dataset.scan();
+        let (plan, count) = run_count(&mut scanner).await;
+        // 2 × 10 rows, minus the one deletion.
+        assert_eq!(count, 19);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "rule must not fire under stable row IDs, got plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
@@ -378,4 +498,3 @@ mod tests {
         );
     }
 }
-

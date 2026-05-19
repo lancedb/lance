@@ -268,7 +268,9 @@ async fn test_count_star_single_fragment() {
         vec![],
     );
 
-    // Verify COUNT(*) has empty projection optimization
+    // COUNT(*) is rewritten by AggregateIndexPushdown into a Final aggregate
+    // over AggregateIndexSearchExec, which answers from manifest metadata + the
+    // deletion mask instead of scanning column data.
     let mut scanner = ds.scan();
     scanner
         .aggregate(AggregateExpr::substrait(agg_bytes.clone()))
@@ -276,8 +278,8 @@ async fn test_count_star_single_fragment() {
     let plan = scanner.create_plan().await.unwrap();
     assert_plan_node_equals(
         plan,
-        "AggregateExec: mode=Single, gby=[], aggr=[count(...)]
-  LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--",
+        "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
+  AggregateIndexSearch: aggs=[count@\"*\"]",
     )
     .await
     .unwrap();
@@ -1204,11 +1206,12 @@ async fn test_scanner_count_rows() {
         .unwrap();
     let plan = scanner.create_plan().await.unwrap();
 
-    // COUNT(*) should have empty projection (optimized to not read any columns)
+    // COUNT(*) is rewritten by AggregateIndexPushdown into a Final aggregate
+    // over AggregateIndexSearchExec.
     assert_plan_node_equals(
         plan.clone(),
-        "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--",
+        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+  AggregateIndexSearch: aggs=[count@\"*\"]",
     )
     .await
     .unwrap();
