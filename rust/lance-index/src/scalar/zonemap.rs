@@ -48,7 +48,7 @@ use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_
 use crate::progress::IndexBuildProgress;
 use futures::StreamExt;
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, path::Path};
 
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
@@ -396,7 +396,17 @@ impl ZoneMapIndex {
     where
         Self: Sized,
     {
-        let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
+        let index_file = match store.open_index_file(ZONEMAP_FILENAME).await {
+            Ok(file) => file,
+            Err(original_err) if is_missing_zonemap_error(&original_err) => {
+                let files = store.list_files_with_sizes().await?;
+                let Some(part_file) = find_single_zonemap_part_file(&files)? else {
+                    return Err(original_err);
+                };
+                store.open_index_file(part_file).await?
+            }
+            Err(other_err) => return Err(other_err),
+        };
         let zone_maps = index_file
             .read_range(0..index_file.num_rows(), None)
             .await?;
@@ -997,6 +1007,35 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 
 fn zonemap_part_file_name(worker_id: u32) -> String {
     format!("{ZONEMAP_PART_FILE_PREFIX}{worker_id}{ZONEMAP_PART_FILE_SUFFIX}")
+}
+
+fn is_missing_zonemap_error(err: &Error) -> bool {
+    matches!(err, Error::NotFound { .. })
+        || matches!(
+            err,
+            Error::IO { source, .. }
+                if source
+                    .downcast_ref::<ObjectStoreError>()
+                    .map(|os_err| matches!(os_err, ObjectStoreError::NotFound { .. }))
+                    .unwrap_or(false)
+        )
+}
+
+fn find_single_zonemap_part_file(files: &[lance_table::format::IndexFile]) -> Result<Option<&str>> {
+    let part_files: Vec<_> = files
+        .iter()
+        .filter_map(|file| {
+            (file.path.starts_with(ZONEMAP_PART_FILE_PREFIX)
+                && file.path.ends_with(ZONEMAP_PART_FILE_SUFFIX))
+            .then_some(file.path.as_str())
+        })
+        .collect();
+
+    if part_files.len() == 1 {
+        Ok(Some(part_files[0]))
+    } else {
+        Ok(None)
+    }
 }
 
 /// List per-worker zonemap part files written during distributed builds.
