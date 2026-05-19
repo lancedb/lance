@@ -78,8 +78,6 @@ pub struct MemTable {
     /// Generation number (incremented on flush).
     generation: u64,
 
-    /// WAL batch mapping: batch_position -> (wal_entry_position, position within WAL entry).
-    wal_batch_mapping: HashMap<usize, (u64, usize)>,
     /// Last WAL entry position that has been flushed.
     last_flushed_wal_entry_position: u64,
     /// Set of batch IDs that have been flushed to WAL.
@@ -218,7 +216,6 @@ impl MemTable {
             cache_config,
             cached_dataset: RwLock::new(None),
             generation,
-            wal_batch_mapping: HashMap::new(),
             last_flushed_wal_entry_position: 0,
             flushed_batch_positions: HashSet::new(),
             pk_bloom_filter,
@@ -561,17 +558,21 @@ impl MemTable {
 
     /// Mark batches as flushed to WAL.
     ///
-    /// Updates the WAL batch mapping for use during MemTable flush.
-    /// Also updates the batch_store's watermark to the highest flushed batch_position.
+    /// Records the per-batch WAL mapping (on the shared `BatchStore`, so the
+    /// memtable-flush path can read it) and advances the batch_store
+    /// watermark to the highest flushed batch_position. Production drives
+    /// the mapping via [`BatchStore::record_wal_mapping`] directly from the
+    /// WAL-flush path; this method is the equivalent entry point used by
+    /// tests that don't go through `WalFlusher`.
     pub fn mark_wal_flushed(
         &mut self,
         batch_positions: &[usize],
         wal_entry_position: u64,
         positions: &[usize],
     ) {
-        for (idx, &batch_position) in batch_positions.iter().enumerate() {
-            self.wal_batch_mapping
-                .insert(batch_position, (wal_entry_position, positions[idx]));
+        self.batch_store
+            .record_wal_mapping(batch_positions, wal_entry_position, positions);
+        for &batch_position in batch_positions {
             self.flushed_batch_positions.insert(batch_position);
         }
         self.last_flushed_wal_entry_position = wal_entry_position;
@@ -724,9 +725,9 @@ impl MemTable {
         self.batch_store.estimated_bytes() + self.pk_bloom_filter.estimated_memory_size()
     }
 
-    /// Get the WAL batch mapping.
-    pub fn wal_batch_mapping(&self) -> &HashMap<usize, (u64, usize)> {
-        &self.wal_batch_mapping
+    /// Snapshot of the WAL batch mapping (owned by the shared `BatchStore`).
+    pub fn wal_batch_mapping(&self) -> HashMap<usize, (u64, usize)> {
+        self.batch_store.wal_batch_mapping()
     }
 
     /// Get the last flushed WAL entry position.

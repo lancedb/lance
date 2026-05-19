@@ -474,6 +474,12 @@ impl WalFlusher {
         let rows_to_index: usize = stored_batches.iter().map(|b| b.num_rows).sum();
         let record_batches: Vec<RecordBatch> =
             stored_batches.iter().map(|s| s.data.clone()).collect();
+        // Batch positions in append order. `WalAppender::append` writes
+        // `record_batches` as one WAL entry, so the i-th element here is at
+        // within-entry index i. Captured before `stored_batches` is moved
+        // into the index task below; used to stamp the composite recency key.
+        let flushed_positions: Vec<usize> =
+            stored_batches.iter().map(|s| s.batch_position).collect();
 
         let appender = self.wal_appender.clone();
         let (append_result, index_result) = if let Some(idx_registry) = indexes {
@@ -509,6 +515,20 @@ impl WalFlusher {
 
         // Update per-memtable watermark (inclusive: last batch ID that was flushed)
         batch_store.set_max_flushed_batch_position(end_batch_position - 1);
+
+        // Stamp the composite WAL recency key. Every batch in this append
+        // shares `entry_position`; the within-entry index is the batch's
+        // FIFO order in `record_batches` (== order in `flushed_positions`),
+        // which is what makes `(_wal_seq, _wal_pos)` write-order-monotonic
+        // and per-write unique. The memtable-flush path reads this back via
+        // `BatchStore::wal_batch_mapping` to write the L0 file's recency
+        // columns; without it the flush would have no authoritative key.
+        let within_entry: Vec<usize> = (0..flushed_positions.len()).collect();
+        batch_store.record_wal_mapping(
+            &flushed_positions,
+            append_result.entry_position,
+            &within_entry,
+        );
 
         // Notify durability waiters (global channel)
         let _ = self.durable_watermark_tx.send(end_batch_position);

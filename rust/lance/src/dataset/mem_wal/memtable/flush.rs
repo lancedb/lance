@@ -185,7 +185,10 @@ impl MemTableFlusher {
             return Ok(0);
         }
         let total_rows = batch_store.total_rows();
-        let wal_mapping = memtable.wal_batch_mapping();
+        // Authoritative per-batch WAL recency key, recorded by the WAL-flush
+        // path (`BatchStore::record_wal_mapping`). Flush is hard-gated on
+        // `all_flushed_to_wal()`, so every batch here has an entry.
+        let wal_mapping = batch_store.wal_batch_mapping();
 
         let base_schema = memtable.schema();
         let mut fields: Vec<Arc<Field>> = base_schema.fields().iter().cloned().collect();

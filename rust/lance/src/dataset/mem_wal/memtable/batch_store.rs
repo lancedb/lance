@@ -40,7 +40,9 @@
 //! ```
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::mem::MaybeUninit;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
@@ -155,6 +157,15 @@ pub struct BatchStore {
     /// Uses usize::MAX as sentinel for "nothing flushed yet".
     /// This is per-memtable tracking, not global.
     max_flushed_batch_position: AtomicUsize,
+
+    /// Per-batch WAL write position: `batch_position -> (wal_entry_position,
+    /// within-WAL-entry index)`. Recorded at WAL-flush time, read at
+    /// memtable-flush time to stamp the composite recency key
+    /// `(_wal_seq, _wal_pos)` into the flushed L0 file. It lives here rather
+    /// than on `MemTable` because the WAL-flush path only ever holds the
+    /// shared `BatchStore`, never `&mut MemTable`; this is the single
+    /// structure reachable from both phases.
+    wal_batch_mapping: Mutex<HashMap<usize, (u64, usize)>>,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -192,6 +203,7 @@ impl BatchStore {
             total_rows: AtomicUsize::new(0),
             estimated_bytes: AtomicUsize::new(0),
             max_flushed_batch_position: AtomicUsize::new(usize::MAX), // Nothing flushed yet
+            wal_batch_mapping: Mutex::new(HashMap::new()),
         }
     }
 
@@ -418,6 +430,35 @@ impl BatchStore {
         );
         self.max_flushed_batch_position
             .store(batch_position, Ordering::Release);
+    }
+
+    /// Record the WAL write position of a set of just-flushed batches.
+    /// `batch_positions[i]` was appended into WAL entry `wal_entry_position`
+    /// at within-entry index `within_entry_positions[i]`. The within-entry
+    /// index MUST be each batch's FIFO order within the entry — that is what
+    /// makes the composite `(_wal_seq, _wal_pos)` key write-order-monotonic
+    /// (the WAL appender coalesces multiple batches into one entry, so the
+    /// entry position alone is not per-write unique).
+    pub fn record_wal_mapping(
+        &self,
+        batch_positions: &[usize],
+        wal_entry_position: u64,
+        within_entry_positions: &[usize],
+    ) {
+        debug_assert_eq!(
+            batch_positions.len(),
+            within_entry_positions.len(),
+            "batch_positions and within_entry_positions must be parallel"
+        );
+        let mut map = self.wal_batch_mapping.lock().unwrap();
+        for (&bp, &wp) in batch_positions.iter().zip(within_entry_positions) {
+            map.insert(bp, (wal_entry_position, wp));
+        }
+    }
+
+    /// Snapshot of the per-batch WAL mapping. Cloned (called once per flush).
+    pub fn wal_batch_mapping(&self) -> HashMap<usize, (u64, usize)> {
+        self.wal_batch_mapping.lock().unwrap().clone()
     }
 
     /// Get the number of batches pending WAL flush.
