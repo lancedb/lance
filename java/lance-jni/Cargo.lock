@@ -3996,6 +3996,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "datafusion",
  "datafusion-common",
  "env_logger",
  "jni 0.21.1",
