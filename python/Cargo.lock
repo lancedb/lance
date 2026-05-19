@@ -3993,6 +3993,7 @@ dependencies = [
  "async_cell",
  "aws-credential-types",
  "aws-sdk-dynamodb",
+ "bitpacking",
  "byteorder",
  "bytes",
  "chrono",
