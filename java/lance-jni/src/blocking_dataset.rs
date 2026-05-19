@@ -3531,10 +3531,40 @@ fn inner_get_zonemap_stats<'local>(
                                 .await
                                 .map_err(Error::from)?,
                         );
-                        let index_file = index_store
+                        let index_file = match index_store
                             .open_index_file("zonemap.lance")
                             .await
-                            .map_err(Error::from)?;
+                        {
+                            Ok(file) => file,
+                            Err(e) => {
+                                let is_not_found = matches!(
+                                    &e,
+                                    lance_core::Error::NotFound { .. }
+                                ) || e.to_string().contains("not found");
+                                if !is_not_found {
+                                    return Err(Error::from(e));
+                                }
+                                let files = index_store
+                                    .list_files_with_sizes()
+                                    .await
+                                    .map_err(Error::from)?;
+                                let part_files: Vec<_> = files
+                                    .iter()
+                                    .filter_map(|f| {
+                                        (f.path.starts_with("part_")
+                                            && f.path.ends_with("_zonemap.lance"))
+                                        .then_some(f.path.as_str())
+                                    })
+                                    .collect();
+                                if part_files.len() != 1 {
+                                    return Err(Error::from(e));
+                                }
+                                index_store
+                                    .open_index_file(part_files[0])
+                                    .await
+                                    .map_err(Error::from)?
+                            }
+                        };
                         if index_file.num_rows() == 0 {
                             continue;
                         }
