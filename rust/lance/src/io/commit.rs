@@ -954,34 +954,15 @@ pub(crate) async fn commit_transaction(
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
 
-    let is_add_only_operation = matches!(
-        &transaction.operation,
-        Operation::Append { .. }
-            | Operation::Overwrite { .. }
-            | Operation::CreateIndex { .. }
-            | Operation::ReserveFragments { .. }
-            | Operation::Project { .. }
-            | Operation::UpdateConfig { .. }
-            | Operation::UpdateMemWalState { .. }
-            | Operation::Clone { .. }
-            | Operation::Restore { .. }
-            | Operation::UpdateBases { .. }
-    );
-
     while backoff.attempt() < num_attempts {
         // Determine whether rebase is needed based on commit strategy:
         // - Pessimistic: always rebase before commit (safest, original behavior)
         // - Optimistic: skip rebase on first attempt, only rebase on conflict
-        // - Hybrid: optimistic for add-only ops, pessimistic for modifying ops
-        let needs_rebase = if strict_overwrite {
-            false
-        } else {
-            match commit_config.commit_strategy {
+        let needs_rebase = !strict_overwrite
+            && match commit_config.commit_strategy {
                 CommitStrategy::Pessimistic => true,
                 CommitStrategy::Optimistic => backoff.attempt() > 0,
-                CommitStrategy::Hybrid => !is_add_only_operation || backoff.attempt() > 0,
-            }
-        };
+            };
 
         if needs_rebase {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;

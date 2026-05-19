@@ -1128,14 +1128,11 @@ pub enum CommitStrategy {
     #[default]
     Pessimistic,
     /// Attempt to commit first without rebase, and only rebase on conflict.
-    /// Faster for add-only operations (Append, CreateIndex) since they skip
-    /// the rebase IO on the fast path, but fragment-modifying operations
-    /// (Delete, Update, Rewrite) will waste a commit attempt on conflict.
+    /// Faster for all operation types under concurrent writes by skipping
+    /// the rebase IO on the fast path. Even for fragment-modifying operations
+    /// (Delete, Update, Rewrite), the cost of a failed commit attempt is
+    /// typically lower than the rebase IO overhead.
     Optimistic,
-    /// Hybrid strategy: add-only operations use optimistic commit, while
-    /// fragment-modifying operations use pessimistic commit. This gives the
-    /// best of both worlds for mixed workloads.
-    Hybrid,
 }
 
 #[derive(Debug, Clone)]

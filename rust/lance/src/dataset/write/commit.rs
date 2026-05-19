@@ -167,9 +167,7 @@ impl<'a> CommitBuilder<'a> {
     /// - [`CommitStrategy::Pessimistic`] (default): Always rebase before commit.
     ///   Safer for high-contention workloads with Delete/Update/Rewrite.
     /// - [`CommitStrategy::Optimistic`]: Attempt to commit first, rebase only on conflict.
-    ///   Faster for add-only workloads (Append, CreateIndex).
-    /// - [`CommitStrategy::Hybrid`]: Optimistic for add-only operations, pessimistic for
-    ///   fragment-modifying operations. Best of both worlds for mixed workloads.
+    ///   Faster for all operation types under concurrent writes.
     pub fn with_commit_strategy(mut self, strategy: CommitStrategy) -> Self {
         self.commit_config.commit_strategy = strategy;
         self
