@@ -13,6 +13,7 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
+use crate::cache::CacheCodecImpl;
 use crate::{Error, Result};
 
 use super::address::RowAddress;
@@ -658,6 +659,16 @@ impl RowAddrTreeMap {
                     (fragment << 32) | row_offset
                 }),
             })
+    }
+}
+
+impl CacheCodecImpl for RowAddrTreeMap {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+        self.serialize_into(writer)
+    }
+
+    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+        Self::deserialize_from(data.as_ref())
     }
 }
 
