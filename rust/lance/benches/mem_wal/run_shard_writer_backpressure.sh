@@ -6,19 +6,25 @@
 # vector and FTS numbers are directly comparable.
 #
 # Usage:
-#   INDEX_TYPE=fts    ./bench/run_shard_writer_backpressure.sh [run_id]
-#   INDEX_TYPE=vector ./bench/run_shard_writer_backpressure.sh [run_id]
+#   INDEX_TYPE=fts    rust/lance/benches/mem_wal/run_shard_writer_backpressure.sh [run_id]
+#   INDEX_TYPE=vector rust/lance/benches/mem_wal/run_shard_writer_backpressure.sh [run_id]
 #
 # Finds the max sustainable async-indexed throughput: the highest paced
 # target where puts never block (slow>=1s == 0) and the WAL flush queue
 # does not accumulate (tail queue delta ~0).
+#
+# Env:
+#   DATASET_PREFIX  scratch dataset location (default <tmpdir>/mem-wal-backpressure)
 
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 
 INDEX_TYPE="${INDEX_TYPE:-fts}"
 RUN_ID="${1:-bp-${INDEX_TYPE}-$(date -u +%Y%m%dT%H%M%SZ)}"
-DATASET_PREFIX="${DATASET_PREFIX:-s3://jack-devland-build/bench/mem-fts-fineweb}"
+DATASET_PREFIX="${DATASET_PREFIX:-${TMPDIR:-/tmp}/mem-wal-backpressure}"
 
 # Shared knobs — identical to the HNSW vector backpressure sweep so the
 # two index types are measured the same way.
@@ -34,7 +40,6 @@ MAX_WAL_BUFFER_SIZE="${MAX_WAL_BUFFER_SIZE:-52428800}"        # 50 MiB
 MAX_WAL_FLUSH_INTERVAL_MS="${MAX_WAL_FLUSH_INTERVAL_MS:-0}"
 SAMPLE_INTERVAL_MS="${SAMPLE_INTERVAL_MS:-1000}"
 CONFIG_TIMEOUT="${CONFIG_TIMEOUT:-2400}"
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
 # Paced async-indexed target sweep (rows/s). FTS indexing is heavier than
 # IVF/PQ so its sustainable ceiling is lower; the vector sweep can push
@@ -47,15 +52,15 @@ esac
 TARGETS="${TARGETS:-$TARGETS_DEFAULT}"
 
 CALLS=$(( ROWS / BATCH_ROWS ))
-LOCAL_DIR="bench/results/${RUN_ID}"
+LOCAL_DIR="$REPO_ROOT/target/mem-wal-backpressure-results/${RUN_ID}"
 mkdir -p "$LOCAL_DIR"
 
 BIN="$(find target/release/deps -maxdepth 1 -type f -perm -111 \
-    -name 'mem_wal_shard_writer_backpressure-*' ! -name '*.d' 2>/dev/null | sort | tail -1)"
+    -name 'mem_wal_shard_writer_backpressure-*' ! -name '*.d' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
 if [ -z "$BIN" ]; then
     cargo bench -p lance --bench mem_wal_shard_writer_backpressure --no-run
     BIN="$(find target/release/deps -maxdepth 1 -type f -perm -111 \
-        -name 'mem_wal_shard_writer_backpressure-*' ! -name '*.d' 2>/dev/null | sort | tail -1)"
+        -name 'mem_wal_shard_writer_backpressure-*' ! -name '*.d' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
 fi
 echo "index_type=$INDEX_TYPE  bin=$BIN  run_id=$RUN_ID  rows=$ROWS"
 

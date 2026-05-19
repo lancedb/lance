@@ -239,10 +239,12 @@ harness = false
 
 [[bench]]
 name = "mem_wal_fineweb_fts"
+path = "benches/mem_wal/fts/mem_wal_fineweb_fts.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_fts_bench"
+path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
 harness = false
 
 [lints]

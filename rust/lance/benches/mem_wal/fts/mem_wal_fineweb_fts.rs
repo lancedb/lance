@@ -25,13 +25,12 @@
 //! Example:
 //!
 //! ```bash
-//! AWS_DEFAULT_REGION=us-east-1 \
 //! cargo bench -p lance --bench mem_wal_fineweb_fts -- \
 //!   --phase write --mode async_idx \
-//!   --uri s3://jack-devland-build/bench/mem-fts-fineweb/run1/w_async_idx_mt100k \
+//!   --uri /tmp/mem-fts-fineweb/run1/w_async_idx_mt100k \
 //!   --seed-rows 1000000 --batch-rows 1000 --calls 1000 \
 //!   --max-memtable-rows 100000 \
-//!   --cache-dir /mnt/data/fineweb --output result.json
+//!   --cache-dir /tmp/fineweb-cache --output result.json
 //! ```
 
 #![recursion_limit = "256"]

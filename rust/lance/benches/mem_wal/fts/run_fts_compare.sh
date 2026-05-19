@@ -6,30 +6,30 @@
 # size, runs each impl in Run A (pre-tokenized) and Run B (native
 # analyzers), and prints build/query/recall side by side.
 #
-# Usage: ./bench/run_fts_compare.sh [run_id]
+# Usage: rust/lance/benches/mem_wal/fts/run_fts_compare.sh [run_id]
 #
 # Env:
 #   SIZES        doc-count sweep (default "100000 500000 1000000")
 #   K            top-k (default 10)
 #   THREADS      query threads for the multi-thread QPS run
-#   LUCENE_DIR   Lucene checkout (default ~/oss/lucene)
 #   LUCENE_CP    pre-built Lucene classpath; if set, the Lucene build is skipped
+#   LUCENE_DIR   Lucene source checkout — built when LUCENE_CP is unset
 #   JAVA_HOME    JDK 25 home; if unset the script searches common locations
-#   CACHE_DIR    FineWeb shard cache (default /mnt/data/fineweb)
+#   CACHE_DIR    FineWeb shard download cache (default <tmpdir>/lance-fineweb-cache)
 
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
-REPO_ROOT="$(pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 
 RUN_ID="${1:-fts-compare-$(date -u +%Y%m%dT%H%M%SZ)}"
 SIZES="${SIZES:-100000 500000 1000000}"
 K="${K:-10}"
 THREADS="${THREADS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
-LUCENE_DIR="${LUCENE_DIR:-$HOME/oss/lucene}"
-CACHE_DIR="${CACHE_DIR:-/mnt/data/fineweb}"
-WORK="${WORK:-/tmp/fts_compare/$RUN_ID}"
-RESULT_DIR="$REPO_ROOT/bench/results/$RUN_ID"
-mkdir -p "$WORK" "$RESULT_DIR"
+CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/lance-fineweb-cache}"
+WORK="${WORK:-${TMPDIR:-/tmp}/fts_compare/$RUN_ID}"
+RESULT_DIR="$REPO_ROOT/target/fts-compare-results/$RUN_ID"
+mkdir -p "$WORK" "$RESULT_DIR" "$CACHE_DIR"
 
 # ---- locate JDK 25 ----
 if [ -z "${JAVA_HOME:-}" ]; then
@@ -47,6 +47,10 @@ echo "JDK: $($JAVA -version 2>&1 | head -1)"
 
 # ---- build Lucene classpath ----
 if [ -z "${LUCENE_CP:-}" ]; then
+    if [ -z "${LUCENE_DIR:-}" ]; then
+        echo "ERROR: set LUCENE_CP (prebuilt jars) or LUCENE_DIR (source checkout)" >&2
+        exit 1
+    fi
     echo "=== Building Lucene jars ($LUCENE_DIR) ==="
     ( cd "$LUCENE_DIR" && JAVA_HOME="$JAVA_HOME" ./gradlew -q \
         :lucene:core:jar :lucene:analysis:common:jar ) || {
@@ -72,7 +76,7 @@ echo "Lance bench: $LANCE_BIN"
 # ---- compile the Lucene bench ----
 echo "=== Compiling Lucene FTS bench ==="
 "$JAVAC" -cp "$LUCENE_CP" -d "$WORK" \
-    "$REPO_ROOT/bench/lucene_fts_bench/LuceneFtsBench.java" \
+    "$SCRIPT_DIR/LuceneFtsBench.java" \
     || { echo "ERROR: javac failed" >&2; exit 1; }
 
 mutual_overlap() {  # $1=topk file A  $2=topk file B  $3=k

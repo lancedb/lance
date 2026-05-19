@@ -8,31 +8,37 @@
 #               times the FTS queries, flushes, and replays on disk.
 #
 # Every config runs as its own process under a `timeout` watchdog, so a
-# hang costs one timeout window, not days. result.json is uploaded to S3.
+# hang costs one timeout window, not days. When DATASET_PREFIX points at
+# object storage, each result.json is also uploaded there.
 #
-# Usage: ./bench/run_fineweb_fts.sh [run_id]
+# Usage: rust/lance/benches/mem_wal/fts/run_fineweb_fts.sh [run_id]
+#
+# Env:
+#   DATASET_PREFIX  scratch dataset location (default <tmpdir>/mem-fts-fineweb)
+#   CACHE_DIR       FineWeb shard download cache (default <tmpdir>/lance-fineweb-cache)
 
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
 
 RUN_ID="${1:-$(date -u +%Y%m%dT%H%M%SZ)}"
-DATASET_PREFIX="${DATASET_PREFIX:-s3://jack-devland-build/bench/mem-fts-fineweb}"
+DATASET_PREFIX="${DATASET_PREFIX:-${TMPDIR:-/tmp}/mem-fts-fineweb}"
 SEED_ROWS="${SEED_ROWS:-1000000}"
 BATCH_ROWS="${BATCH_ROWS:-1000}"
 CALLS="${CALLS:-1000}"
-CACHE_DIR="${CACHE_DIR:-/mnt/data/fineweb}"
+CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/lance-fineweb-cache}"
 CONFIG_TIMEOUT="${CONFIG_TIMEOUT:-3600}"
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 
-LOCAL_DIR="bench/results/${RUN_ID}"
-mkdir -p "$LOCAL_DIR"
+LOCAL_DIR="$REPO_ROOT/target/fineweb-fts-results/${RUN_ID}"
+mkdir -p "$LOCAL_DIR" "$CACHE_DIR"
 
-BIN="$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'mem_wal_fineweb_fts-*' ! -name '*.d' 2>/dev/null | sort | tail -1)"
+BIN="$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'mem_wal_fineweb_fts-*' ! -name '*.d' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
 if [ -z "$BIN" ]; then
     echo "building bench binary..."
     cargo bench -p lance --bench mem_wal_fineweb_fts --no-run
-    BIN="$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'mem_wal_fineweb_fts-*' ! -name '*.d' 2>/dev/null | sort | tail -1)"
+    BIN="$(find target/release/deps -maxdepth 1 -type f -perm -111 -name 'mem_wal_fineweb_fts-*' ! -name '*.d' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
 fi
 echo "bench binary: $BIN"
 echo "run id:       $RUN_ID"

@@ -11,9 +11,8 @@
 //! Example:
 //!
 //! ```bash
-//! AWS_DEFAULT_REGION=us-east-1 \
 //! cargo bench -p lance --bench mem_wal_shard_writer_backpressure -- \
-//!   --uri s3://jack-devland-build/memwal-rust-native \
+//!   --uri /tmp/memwal-rust-native \
 //!   --mode async_idx \
 //!   --seed-rows 100000 \
 //!   --batch-rows 1000 \
