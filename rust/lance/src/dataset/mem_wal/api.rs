@@ -63,8 +63,7 @@ enum Sharding {
     Manual,
     /// A single shard; every row is routed to it.
     Unsharded,
-    /// Hash-bucket the single-column unenforced primary key into `num_buckets`
-    /// shards.
+    /// Hash-bucket a shard key into `num_buckets` shards.
     Bucket { column: String, num_buckets: u32 },
     /// Shard by the raw value of `column` (identity transform).
     Identity { column: String },
@@ -111,11 +110,13 @@ impl<'a> InitializeMemWalBuilder<'a> {
         self
     }
 
-    /// Hash-bucket the unenforced primary key into `num_buckets` shards.
+    /// Hash-bucket `column` into `num_buckets` shards.
     ///
-    /// `column` must name the dataset's single-column unenforced primary key;
-    /// `num_buckets` must be in `[1, 1024]`. Both are validated by
-    /// [`execute`](Self::execute).
+    /// For primary-key tables, `column` must name the dataset's single-column
+    /// unenforced primary key so every update for the same key routes to the
+    /// same shard. Append-only tables without a primary key may use any scalar
+    /// column. `num_buckets` must be in `[1, 1024]`. These constraints are
+    /// validated by [`execute`](Self::execute).
     pub fn bucket_sharding(mut self, column: impl Into<String>, num_buckets: u32) -> Self {
         self.sharding = Sharding::Bucket {
             column: column.into(),
@@ -127,10 +128,10 @@ impl<'a> InitializeMemWalBuilder<'a> {
     /// Shard by the raw value of `column` (the identity transform).
     ///
     /// Each distinct value of `column` becomes its own shard; use this when the
-    /// data is already partitioned by that column. The caller is responsible
-    /// for ensuring every primary key maps consistently to a single value of
-    /// `column`. `column` must be a scalar column that exists on the dataset;
-    /// it is validated by [`execute`](Self::execute).
+    /// data is already partitioned by that column. For primary-key tables, the
+    /// caller is responsible for ensuring every primary key maps consistently
+    /// to a single value of `column`. `column` must be a scalar column that
+    /// exists on the dataset; it is validated by [`execute`](Self::execute).
     pub fn identity_sharding(mut self, column: impl Into<String>) -> Self {
         self.sharding = Sharding::Identity {
             column: column.into(),
@@ -142,7 +143,8 @@ impl<'a> InitializeMemWalBuilder<'a> {
     /// previously set list.
     ///
     /// Each name must reference an index that already exists on the dataset.
-    /// The primary key btree is maintained implicitly and must not be listed.
+    /// The primary key btree, when present, is maintained implicitly and must
+    /// not be listed.
     pub fn maintained_indexes<I, S>(mut self, indexes: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -184,8 +186,8 @@ impl<'a> InitializeMemWalBuilder<'a> {
 
     /// Initialize MemWAL on the dataset, committing the MemWAL system index.
     ///
-    /// Fails if the dataset has no unenforced primary key, if any maintained
-    /// index does not exist, or if MemWAL is already initialized.
+    /// Fails if any maintained index does not exist, if the selected sharding
+    /// configuration is invalid, or if MemWAL is already initialized.
     pub async fn execute(self) -> Result<()> {
         let Self {
             dataset,
@@ -193,13 +195,6 @@ impl<'a> InitializeMemWalBuilder<'a> {
             maintained_indexes,
             writer_config_defaults,
         } = self;
-
-        if dataset.schema().unenforced_primary_key().is_empty() {
-            return Err(Error::invalid_input(
-                "MemWAL requires a primary key on the dataset. \
-                 Define a primary key using the 'lance-schema:unenforced-primary-key' Arrow field metadata.",
-            ));
-        }
 
         // Resolve (and validate) the sharding choice before any I/O.
         let (sharding_specs, num_shards) = resolve_sharding(dataset, sharding)?;
@@ -288,8 +283,23 @@ fn bucket_sharding_spec(dataset: &Dataset, column: &str, num_buckets: u32) -> Re
     }
 
     let pk_fields = dataset.schema().unenforced_primary_key();
-    let pk = match pk_fields.as_slice() {
-        [single] => *single,
+    let source_field = match pk_fields.as_slice() {
+        [single] => {
+            let pk = *single;
+            if pk.name.as_str() != column {
+                return Err(Error::invalid_input(format!(
+                    "bucket_sharding: column '{}' does not match the unenforced primary key column '{}'",
+                    column, pk.name
+                )));
+            }
+            pk
+        }
+        [] => dataset.schema().field(column).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "bucket_sharding: column '{}' not found on the dataset",
+                column
+            ))
+        })?,
         _ => {
             return Err(Error::invalid_input(
                 "bucket_sharding requires a single-column unenforced primary key; \
@@ -297,10 +307,12 @@ fn bucket_sharding_spec(dataset: &Dataset, column: &str, num_buckets: u32) -> Re
             ));
         }
     };
-    if pk.name.as_str() != column {
+
+    let data_type = source_field.data_type();
+    if data_type.is_nested() || data_type.is_null() {
         return Err(Error::invalid_input(format!(
-            "bucket_sharding: column '{}' does not match the unenforced primary key column '{}'",
-            column, pk.name
+            "bucket_sharding: column '{}' has type {:?}, which cannot be used as a shard key",
+            column, data_type
         )));
     }
 
@@ -308,7 +320,7 @@ fn bucket_sharding_spec(dataset: &Dataset, column: &str, num_buckets: u32) -> Re
         spec_id: SHARDING_SPEC_ID,
         fields: vec![ShardingField {
             field_id: SHARDING_FIELD_ID.to_string(),
-            source_ids: vec![pk.id],
+            source_ids: vec![source_field.id],
             transform: Some(BUCKET_TRANSFORM.to_string()),
             expression: None,
             result_type: SHARDING_RESULT_TYPE.to_string(),

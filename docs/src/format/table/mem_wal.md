@@ -8,7 +8,9 @@ scan, point lookup, vector search and full-text search.
 ![MemWAL Overview](../../images/mem_wal_overview.png)
 
 A Lance table is called a **base table** under the context of the MemWAL spec.
-It must have an [unenforced primary key](index.md#unenforced-primary-key) defined in the table schema.
+It may have an [unenforced primary key](index.md#unenforced-primary-key) defined in the table schema.
+Primary keys are required for primary-key lookups and last-write-wins upsert semantics,
+but append-only MemWAL tables may omit them.
 
 On top of the base table, the MemWAL spec defines a set of shards.
 Writers write to shards, and data in each shard is merged into the base table asynchronously.
@@ -22,7 +24,7 @@ Each shard has exactly one active writer at any time.
 Writers claim a shard and then write data to that shard.
 Data in each shard is expected to be merged into the base table asynchronously.
 
-Rows of the same primary key must be written to one and only one shard.
+For tables with a primary key, rows of the same primary key must be written to one and only one shard.
 If two shards contain rows with the same primary key, the following scenario can cause data corruption:
 
 1. Shard A receives a write with primary key `pk=1` at time T1
@@ -34,6 +36,8 @@ If two shards contain rows with the same primary key, the following scenario can
 This violates the expected "last write wins" semantics.
 By ensuring each primary key is assigned to exactly one shard via the sharding spec,
 merge order between shards becomes irrelevant for correctness.
+Append-only tables without a primary key do not rely on last-write-wins conflict resolution
+and may shard by any deterministic append key or partitioning column.
 
 See [MemWAL Shard Architecture](#shard-architecture) for the complete shard architecture.
 
@@ -162,8 +166,9 @@ The content within the generation directory follows the [Lance table storage lay
 Generation numbers determine merge order of flushed MemTable into base table:
 lower numbers represent older data and must be merged to the base table first to preserve correct upsert semantics.
 
-Within a single flushed MemTable, if there are multiple rows of the same primary key,
-the row that is last inserted wins.
+Within a single flushed MemTable for a primary-key table,
+if there are multiple rows of the same primary key, the row that is last inserted wins.
+Append-only tables without a primary key retain all inserted rows.
 
 ### Shard Manifest
 
@@ -479,7 +484,8 @@ The garbage collector removes obsolete data from shard directories. Flushed MemT
 
 ### LSM Tree Merging Read
 
-Readers **MUST** merge results from multiple data sources (base table, flushed MemTables, in-memory MemTables) by primary key to ensure correctness.
+For tables with a primary key, readers **MUST** merge results from multiple data sources
+(base table, flushed MemTables, in-memory MemTables) by primary key to ensure correctness.
 
 When the same primary key exists in multiple sources, the reader must keep only the newest version based on:
 
@@ -495,6 +501,10 @@ This deduplication is essential because:
 - A single write batch may contain multiple updates to the same primary key
 
 Without proper merging, queries would return duplicate or stale rows.
+
+Append-only tables without a primary key do not perform primary-key deduplication.
+Readers should include the relevant base table, flushed MemTables, and in-memory MemTables
+according to the requested consistency level; duplicate values are treated as distinct appended rows.
 
 ### Reader Consistency
 
@@ -526,7 +536,9 @@ Datasets come from:
 
 Each dataset is tagged with a generation number: 0 for the base table, and positive integers for MemTable generations.
 Within a shard, the generation number determines data freshness, with higher numbers representing newer data.
-Rows from different shards do not need deduplication since each primary key maps to exactly one shard.
+For primary-key tables, rows from different shards do not need deduplication
+since each primary key maps to exactly one shard.
+Append-only tables without a primary key do not require cross-shard primary-key deduplication.
 
 The planner also collects bloom filters from each generation for staleness detection during search queries.
 
