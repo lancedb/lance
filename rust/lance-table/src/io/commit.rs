@@ -1119,11 +1119,30 @@ impl Debug for ConditionalPutCommitHandler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitStrategy {
+    /// Always rebase before attempting to commit. Safer for high-contention
+    /// scenarios with Delete/Update/Rewrite operations, but adds IO overhead
+    /// (load_and_sort_new_transactions + TransactionRebase::try_new) on every
+    /// attempt even when there is no conflict.
+    #[default]
+    Pessimistic,
+    /// Attempt to commit first without rebase, and only rebase on conflict.
+    /// Faster for add-only operations (Append, CreateIndex) since they skip
+    /// the rebase IO on the fast path, but fragment-modifying operations
+    /// (Delete, Update, Rewrite) will waste a commit attempt on conflict.
+    Optimistic,
+    /// Hybrid strategy: add-only operations use optimistic commit, while
+    /// fragment-modifying operations use pessimistic commit. This gives the
+    /// best of both worlds for mixed workloads.
+    Hybrid,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
-    // TODO: add isolation_level
+    pub commit_strategy: CommitStrategy,
 }
 
 impl Default for CommitConfig {
@@ -1131,6 +1150,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            commit_strategy: CommitStrategy::default(),
         }
     }
 }

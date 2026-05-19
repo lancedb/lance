@@ -35,7 +35,7 @@ use lance_table::format::{
     WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
+    CommitConfig, CommitError, CommitHandler, CommitStrategy, ManifestLocation, ManifestNamingScheme,
 };
 use rand::{Rng, rng};
 
@@ -954,21 +954,37 @@ pub(crate) async fn commit_transaction(
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
 
-    while backoff.attempt() < num_attempts {
-        // We are pessimistic here and assume there may be other transactions
-        // we need to check for. We could be optimistic here and blindly
-        // attempt to commit, giving faster performance for sequence writes and
-        // slower performance for concurrent writes. But that makes the fast path
-        // faster and the slow path slower, which makes performance less predictable
-        // for users. So we always check for other transactions.
-        // We skip this for strict overwrites, because strict overwrites can't be rebased.
-        if !strict_overwrite {
-            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+    let is_add_only_operation = matches!(
+        &transaction.operation,
+        Operation::Append { .. }
+            | Operation::Overwrite { .. }
+            | Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::Project { .. }
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateMemWalState { .. }
+            | Operation::Clone { .. }
+            | Operation::Restore { .. }
+            | Operation::UpdateBases { .. }
+    );
 
-            // See if we can retry the commit. Try to account for all
-            // transactions that have been committed since the read_version.
-            // Use small amount of backoff to handle transactions that all
-            // started at exact same time better.
+    while backoff.attempt() < num_attempts {
+        // Determine whether rebase is needed based on commit strategy:
+        // - Pessimistic: always rebase before commit (safest, original behavior)
+        // - Optimistic: skip rebase on first attempt, only rebase on conflict
+        // - Hybrid: optimistic for add-only ops, pessimistic for modifying ops
+        let needs_rebase = if strict_overwrite {
+            false
+        } else {
+            match commit_config.commit_strategy {
+                CommitStrategy::Pessimistic => true,
+                CommitStrategy::Optimistic => backoff.attempt() > 0,
+                CommitStrategy::Hybrid => !is_add_only_operation || backoff.attempt() > 0,
+            }
+        };
+
+        if needs_rebase {
+            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
             let mut rebase =
                 TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
