@@ -149,15 +149,27 @@ impl MemTableFlusher {
         })
     }
 
-    /// Write data file with batches in reverse order (newest first).
+    /// Write data file with batches in reverse order (newest first), stamping
+    /// the composite WAL recency key `(_wal_seq, _wal_pos)` per row.
+    ///
+    /// `_wal_seq` is the row's `wal_entry_position` and `_wal_pos` its
+    /// within-WAL-entry position, looked up per batch from the memtable's
+    /// `wal_batch_mapping`. Both are per-batch constants — invariant under the
+    /// in-batch row reversal applied here — and form the authoritative recency
+    /// key L0→base compaction uses to pick the per-PK survivor by true WAL
+    /// write order. They are internal to the L0 file and never read back (see
+    /// [`crate::dataset::mem_wal::WAL_SEQ_COLUMN`]).
     ///
     /// Returns the total number of rows written, which is needed for
     /// reversing row positions in indexes.
     #[instrument(name = "mt_write_data_file", level = "debug", skip_all, fields(path = %path))]
     async fn write_data_file(&self, path: &Path, memtable: &MemTable) -> Result<usize> {
-        use arrow_array::RecordBatchIterator;
+        use arrow::compute::kernels::take::take;
+        use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 
         use crate::dataset::WriteParams;
+        use crate::dataset::mem_wal::{WAL_POS_COLUMN, WAL_SEQ_COLUMN};
 
         if memtable.row_count() == 0 {
             return Ok(0);
@@ -165,15 +177,67 @@ impl MemTableFlusher {
 
         // Scan batches in reverse order (newest first) so that the flushed
         // data is ordered from newest to oldest. This enables more efficient
-        // K-way merge during LSM scan.
-        let (batches, total_rows) = memtable.scan_batches_reversed().await?;
-        if batches.is_empty() {
+        // K-way merge during LSM scan. Use the StoredBatch variant so each
+        // batch's `batch_position` is available for the WAL-mapping lookup.
+        let batch_store = memtable.batch_store();
+        let stored = batch_store.to_stored_vec_reversed();
+        if stored.is_empty() {
             return Ok(0);
+        }
+        let total_rows = batch_store.total_rows();
+        let wal_mapping = memtable.wal_batch_mapping();
+
+        let base_schema = memtable.schema();
+        let mut fields: Vec<Arc<Field>> = base_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(
+            WAL_SEQ_COLUMN,
+            DataType::UInt64,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            WAL_POS_COLUMN,
+            DataType::UInt64,
+            false,
+        )));
+        let out_schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            base_schema.metadata().clone(),
+        ));
+
+        let mut batches = Vec::with_capacity(stored.len());
+        for sb in stored {
+            // Flush is hard-gated on `all_flushed_to_wal()`, so every batch
+            // is guaranteed a mapping entry; a miss is an invariant violation.
+            let (wal_seq, wal_pos) = *wal_mapping.get(&sb.batch_position).ok_or_else(|| {
+                Error::internal(format!(
+                    "Batch {} reached flush without a WAL mapping entry (flush must be \
+                     gated on all_flushed_to_wal())",
+                    sb.batch_position
+                ))
+            })?;
+
+            let num_rows = sb.data.num_rows();
+            // Reverse rows within the batch (newest first), matching the
+            // historical `to_vec_reversed` ordering the LSM merge and index
+            // row-position reversal rely on. `_wal_seq`/`_wal_pos` are batch
+            // constants, so the reversal does not affect them.
+            let mut columns: Vec<ArrayRef> = if num_rows == 0 {
+                sb.data.columns().to_vec()
+            } else {
+                let indices = UInt32Array::from_iter_values((0..num_rows as u32).rev());
+                sb.data
+                    .columns()
+                    .iter()
+                    .map(|col| take(col.as_ref(), &indices, None))
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            columns.push(Arc::new(UInt64Array::from(vec![wal_seq; num_rows])));
+            columns.push(Arc::new(UInt64Array::from(vec![wal_pos as u64; num_rows])));
+            batches.push(RecordBatch::try_new(out_schema.clone(), columns)?);
         }
 
         let uri = self.path_to_uri(path);
-        let reader =
-            RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), out_schema.clone());
 
         // Use very large max_rows_per_file to ensure 1 fragment per flushed memtable
         let write_params = WriteParams {
@@ -1365,8 +1429,14 @@ mod tests {
             "Should find document with 'quick brown fox'"
         );
 
-        // Verify the query plan uses the FTS index
+        // Verify the query plan uses the FTS index. Project only the user
+        // columns: a flushed generation also physically carries the internal
+        // `_wal_seq`/`_wal_pos` recency columns, and production never reads a
+        // generation with a default (all-column) projection — `build_source_scan`
+        // always projects explicitly. Asserting the plan under an explicit
+        // projection keeps this FTS test from coupling to L0 internals.
         let mut scan = dataset.scan();
+        scan.project(&["id", "text"]).unwrap();
         scan.full_text_search(FullTextSearchQuery::new("hello".to_owned()))
             .unwrap();
         let plan = scan.create_plan().await.unwrap();
@@ -1379,5 +1449,192 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // -- Composite WAL recency key (`_wal_seq`, `_wal_pos`) ------------------
+
+    use arrow_array::{Array, UInt64Array};
+
+    use crate::dataset::mem_wal::{WAL_POS_COLUMN, WAL_SEQ_COLUMN};
+
+    fn pk_value_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]))
+    }
+
+    fn row_batch(schema: &Arc<ArrowSchema>, id: i32, value: Option<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![id])),
+                Arc::new(Int32Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Flush `memtable` and return its rows as `(id, value, _wal_seq,
+    /// _wal_pos)`, sorted by the composite recency key.
+    async fn flush_and_scan(
+        memtable: &MemTable,
+        covered_wal_entry_position: u64,
+    ) -> Vec<(i32, Option<i32>, u64, u64)> {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _m) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let flusher =
+            MemTableFlusher::new(store, base_path, base_uri.clone(), shard_id, manifest_store);
+        let result = flusher
+            .flush(memtable, epoch, covered_wal_entry_position)
+            .await
+            .unwrap();
+
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri, shard_id, result.generation.path
+        );
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+
+        let id = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let value = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let seq = batch
+            .column_by_name(WAL_SEQ_COLUMN)
+            .expect("flushed L0 file must carry _wal_seq")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let pos = batch
+            .column_by_name(WAL_POS_COLUMN)
+            .expect("flushed L0 file must carry _wal_pos")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        let mut rows: Vec<(i32, Option<i32>, u64, u64)> = (0..batch.num_rows())
+            .map(|i| {
+                let v = if value.is_null(i) {
+                    None
+                } else {
+                    Some(value.value(i))
+                };
+                (id.value(i), v, seq.value(i), pos.value(i))
+            })
+            .collect();
+        rows.sort_by_key(|r| (r.2, r.3));
+        rows
+    }
+
+    /// Insert-then-update of the same PK flushed as two *separate* WAL
+    /// entries: `_wal_seq` alone discriminates; the NULL update is the
+    /// max-key survivor.
+    #[tokio::test]
+    async fn test_flush_composite_key_separate_wal_entries() {
+        let schema = pk_value_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let b0 = memtable
+            .insert(row_batch(&schema, 182, Some(3156)))
+            .await
+            .unwrap();
+        let b1 = memtable
+            .insert(row_batch(&schema, 182, None))
+            .await
+            .unwrap();
+        memtable.mark_wal_flushed(&[b0], 1, &[0]);
+        memtable.mark_wal_flushed(&[b1], 2, &[0]);
+
+        let rows = flush_and_scan(&memtable, 2).await;
+
+        assert_eq!(
+            rows,
+            vec![(182, Some(3156), 1, 0), (182, None, 2, 0)],
+            "both same-PK rows must survive into L0 with strictly-ordered \
+             composite keys; the NULL update has the max (_wal_seq, _wal_pos)"
+        );
+    }
+
+    /// The precise regression guard. Insert-then-update of the same PK
+    /// coalesced into *one* WAL entry: the two rows share a `_wal_seq` and
+    /// are ordered only by `_wal_pos`. A single-`u64` key (entry position
+    /// alone) ties here and cannot pick the update — that is the bug.
+    #[tokio::test]
+    async fn test_flush_composite_key_same_wal_entry() {
+        let schema = pk_value_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let b0 = memtable
+            .insert(row_batch(&schema, 182, Some(3156)))
+            .await
+            .unwrap();
+        let b1 = memtable
+            .insert(row_batch(&schema, 182, None))
+            .await
+            .unwrap();
+        // One WAL entry (position 1), within-entry positions 0 and 1.
+        memtable.mark_wal_flushed(&[b0, b1], 1, &[0, 1]);
+
+        let rows = flush_and_scan(&memtable, 1).await;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (182, Some(3156), 1, 0));
+        assert_eq!(rows[1], (182, None, 1, 1));
+        assert_eq!(rows[0].2, rows[1].2, "same WAL entry => identical _wal_seq");
+        assert!(
+            rows[1].3 > rows[0].3,
+            "within-entry position must order the duplicate by write order"
+        );
+        assert_eq!(
+            rows.iter().max_by_key(|r| (r.2, r.3)).unwrap().1,
+            None,
+            "max composite key must select the NULL update, not the insert"
+        );
+    }
+
+    /// Replay determinism: re-applying the identical write/WAL sequence
+    /// produces byte-identical `(_wal_seq, _wal_pos)` stamps, so a
+    /// re-flushed generation is stable across restart/replay.
+    #[tokio::test]
+    async fn test_flush_composite_key_replay_deterministic() {
+        let schema = pk_value_schema();
+
+        let build = || async {
+            let mut mt = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+            let b0 = mt.insert(row_batch(&schema, 1, Some(10))).await.unwrap();
+            let b1 = mt.insert(row_batch(&schema, 2, Some(20))).await.unwrap();
+            let b2 = mt.insert(row_batch(&schema, 1, None)).await.unwrap();
+            mt.mark_wal_flushed(&[b0, b1], 7, &[0, 1]);
+            mt.mark_wal_flushed(&[b2], 8, &[0]);
+            mt
+        };
+
+        let rows_a = flush_and_scan(&build().await, 8).await;
+        let rows_b = flush_and_scan(&build().await, 8).await;
+
+        assert_eq!(
+            rows_a, rows_b,
+            "identical replay must stamp identical composite keys"
+        );
+        assert_eq!(
+            rows_a,
+            vec![(1, Some(10), 7, 0), (2, Some(20), 7, 1), (1, None, 8, 0),]
+        );
     }
 }
