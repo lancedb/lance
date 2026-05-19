@@ -1165,4 +1165,321 @@ mod tests {
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0, "fresh tier with no sources should yield no rows");
     }
+
+    /// Build a batch where each row carries an explicit `(id, vector_seed)`.
+    ///
+    /// The vector for `seed` is `[seed*0.1, seed*0.1+0.1, +0.2, +0.3]` — the
+    /// same formula as `create_test_batch`, but with the id decoupled from the
+    /// vector so a primary key can be re-inserted with a different vector
+    /// (i.e. an update).
+    fn create_batch_with_seeds(schema: &ArrowSchema, rows: &[(i32, i32)]) -> RecordBatch {
+        use arrow_array::builder::Float32Builder;
+
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        let mut vector_builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        for (_, seed) in rows {
+            let base = *seed as f32 * 0.1;
+            vector_builder.values().append_value(base);
+            vector_builder.values().append_value(base + 0.1);
+            vector_builder.values().append_value(base + 0.2);
+            vector_builder.values().append_value(base + 0.3);
+            vector_builder.append(true);
+        }
+
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(vector_builder.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Build a PK bloom filter for `i32` ids using the exact hash that
+    /// `FilterStaleExec::compute_pk_hash` computes (is_null=false, then the
+    /// value), so the staleness filter recognizes these keys.
+    fn bloom_with_ids(ids: &[i32]) -> Arc<Sbbf> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut bf = Sbbf::with_ndv_fpp(100, 0.01).unwrap();
+        for id in ids {
+            let mut hasher = DefaultHasher::new();
+            false.hash(&mut hasher); // is_null = false
+            id.hash(&mut hasher);
+            bf.insert_hash(hasher.finish());
+        }
+        Arc::new(bf)
+    }
+
+    /// Collect `(id, _distance)` pairs from KNN result batches.
+    fn collect_id_distance(batches: &[RecordBatch]) -> Vec<(i32, f32)> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .expect("id column missing")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id column should be Int32");
+            let dist = batch
+                .column_by_name(DISTANCE_COLUMN)
+                .expect("_distance column missing")
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .expect("_distance should be Float32");
+            for i in 0..batch.num_rows() {
+                out.push((ids.value(i), dist.value(i)));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_cross_generation_override_excludes_stale() {
+        // The canonical "row update" case across LSM generations:
+        //   * PK id=1 was first written with vector A (== the query vector,
+        //     L2 distance ~0) and lives in the base table (generation 0).
+        //   * PK id=1 was then re-inserted with a far vector B into the
+        //     active memtable (generation 2) — an update.
+        //   * id=5 exists only in the base table and is never overridden.
+        //
+        // A KNN query equal to vector A would rank the stale base row first
+        // (distance ~0). The gen-2 PK bloom filter must mark id=1 stale in
+        // generation 0 so `FilterStaleExec` drops vector A entirely: the only
+        // surviving id=1 row is vector B from the active memtable, while the
+        // un-overridden id=5 still comes through the base arm.
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // Base table (generation 0): id=1 -> vector A (== query), id=5 -> own.
+        let base_batch = create_batch_with_seeds(&schema, &[(1, 1), (5, 5)]);
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Active memtable (generation 2): id=1 re-inserted with a far vector B.
+        let active_batch = create_batch_with_seeds(&schema, &[(1, 99), (2, 2)]);
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        batch_store.append(active_batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let active_ref = ActiveMemTableRef {
+            batch_store,
+            index_store,
+            schema: schema.clone(),
+            generation: 2,
+        };
+
+        let query = create_query_vector();
+        let ctx = SessionContext::new();
+
+        // Negative control: no bloom filter -> staleness NOT applied. The
+        // stale base row (id=1, distance ~0) is visible, proving the test
+        // actually exercises FilterStaleExec rather than just missing data.
+        {
+            let collector = LsmDataSourceCollector::new(base_dataset.clone(), vec![])
+                .with_active_memtable(shard_id, active_ref.clone());
+            let planner = LsmVectorSearchPlanner::new(
+                collector,
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+            );
+            let plan = planner.plan_search(&query, 4, 1, None).await.unwrap();
+            let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            let rows = collect_id_distance(&batches);
+            assert!(
+                rows.iter().any(|&(id, d)| id == 1 && d.abs() < 1e-3),
+                "without a bloom filter the stale base id=1 (distance ~0) must \
+                 be visible — got {:?}",
+                rows
+            );
+        }
+
+        // With gen-2 bloom containing id=1 -> base id=1 is stale and dropped.
+        {
+            let collector = LsmDataSourceCollector::new(base_dataset.clone(), vec![])
+                .with_active_memtable(shard_id, active_ref.clone());
+            let planner = LsmVectorSearchPlanner::new(
+                collector,
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+            )
+            .with_bloom_filter(2, bloom_with_ids(&[1]));
+
+            let plan = planner.plan_search(&query, 4, 1, None).await.unwrap();
+            let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            let rows = collect_id_distance(&batches);
+
+            // The only ~0-distance candidate was the stale base id=1.
+            assert!(
+                rows.iter().all(|&(_, d)| d.abs() >= 1e-3),
+                "stale base id=1 (distance ~0, overridden in gen 2) must be \
+                 filtered out — got {:?}",
+                rows
+            );
+            let id1: Vec<f32> = rows
+                .iter()
+                .filter(|&&(id, _)| id == 1)
+                .map(|&(_, d)| d)
+                .collect();
+            assert_eq!(
+                id1.len(),
+                1,
+                "id=1 must appear exactly once (the gen-2 version), got {:?}",
+                rows
+            );
+            assert!(
+                id1[0] > 1.0,
+                "surviving id=1 must be the far gen-2 vector B, got distance {}",
+                id1[0]
+            );
+            assert!(
+                rows.iter().any(|&(id, _)| id == 5),
+                "un-overridden base id=5 must still be returned, got {:?}",
+                rows
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_same_l0_override_newest_wins() {
+        // FAILING SPEC — intentionally not yet satisfied (see PR description).
+        //
+        // Same-generation / same active-memtable ("L0") override:
+        //   * PK id=1 is inserted with vector A (== the query, distance ~0).
+        //   * PK id=1 is then re-inserted with a far vector B in a *later
+        //     batch of the same active memtable* (same generation).
+        //
+        // Correct newest-wins behavior: a KNN query equal to vector A must
+        // NOT return the stale A; id=1 must appear exactly once, reflecting
+        // vector B (the newer insert).
+        //
+        // Today this FAILS: `FilterStaleExec` only consults bloom filters of
+        // generations strictly greater than a row's generation, so it never
+        // resolves duplicates within the active memtable, and the active arm
+        // carries no `_rowaddr` insert-order tiebreak (unlike the full-scan
+        // path's `DeduplicateExec`). Both A and B are returned. This test
+        // encodes the intended contract for that gap.
+        use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+
+        // Batch 0: id=1 -> vector A (== query), plus id=2 for content.
+        let b0 = create_batch_with_seeds(&schema, &[(1, 1), (2, 2)]);
+        batch_store.append(b0.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b0, 0, Some(0))
+            .unwrap();
+
+        // Batch 1 (newer, same memtable): id=1 re-inserted with far vector B.
+        let b1 = create_batch_with_seeds(&schema, &[(1, 99)]);
+        batch_store.append(b1.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b1, 2, Some(1))
+            .unwrap();
+
+        let index_store = Arc::new(index_store);
+        let shard_id = uuid::Uuid::new_v4();
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_active_memtable(
+                shard_id,
+                ActiveMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema.clone(),
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector(); // == stale vector A for id=1
+        let plan = planner.plan_search(&query, 5, 1, None).await.unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_distance(&batches);
+
+        let id1: Vec<f32> = rows
+            .iter()
+            .filter(|&&(id, _)| id == 1)
+            .map(|&(_, d)| d)
+            .collect();
+        assert_eq!(
+            id1.len(),
+            1,
+            "newest-wins: id=1 must appear exactly once after a same-L0 \
+             override, got {:?}",
+            rows
+        );
+        assert!(
+            id1[0] > 1.0,
+            "newest-wins: surviving id=1 must be the newer far vector B, not \
+             the stale A — got distance {}",
+            id1[0]
+        );
+        assert!(
+            rows.iter().all(|&(_, d)| d.abs() >= 1e-3),
+            "newest-wins: stale vector A (distance ~0) must be excluded, got \
+             {:?}",
+            rows
+        );
+    }
 }

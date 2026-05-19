@@ -534,4 +534,68 @@ mod tests {
     fn test_score_column_name() {
         assert_eq!(SCORE_COLUMN, "_score");
     }
+
+    #[tokio::test]
+    async fn test_fts_same_l0_override_newest_wins() {
+        // FAILING SPEC — intentionally not yet satisfied (see PR description).
+        //
+        // Same active-memtable ("L0") row override for FTS:
+        //   * PK id=1 is inserted with text "apple".
+        //   * PK id=1 is then re-inserted with text "banana" in a later batch
+        //     of the same active memtable.
+        //
+        // Correct newest-wins behavior: searching "apple" must return NO rows
+        // — the current value for id=1 is "banana", so the stale "apple"
+        // document is superseded.
+        //
+        // Today this FAILS: the FTS mem index is append-only with no PK
+        // tombstone/dedup, and there is no LSM FTS staleness path — only MVCC
+        // WAL-flush visibility. The stale "apple" document for id=1 is still
+        // returned. This test encodes the intended contract for that gap.
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+
+        let mut registry = IndexStore::new();
+        registry.add_fts("text_idx".to_string(), 1, "text".to_string());
+
+        // Batch 0: id=1 -> "apple".
+        let b0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["apple"])),
+            ],
+        )
+        .unwrap();
+        registry.insert(&b0, 0).unwrap();
+        batch_store.append(b0).unwrap();
+
+        // Batch 1 (newer, same memtable): id=1 re-inserted -> "banana".
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["banana"])),
+            ],
+        )
+        .unwrap();
+        registry.insert(&b1, 1).unwrap();
+        batch_store.append(b1).unwrap();
+
+        let indexes = Arc::new(registry);
+        let query = FtsQuery::match_query("text", "apple");
+
+        // max_visible_batch_position = 1 -> both batches visible.
+        let exec = FtsIndexExec::new(batch_store, indexes, query, 1, None, schema, false).unwrap();
+        let ctx = Arc::new(TaskContext::default());
+        let stream = exec.execute(0, ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "newest-wins: id=1 was overridden to \"banana\"; searching \
+             \"apple\" must return no rows, but the stale document was returned"
+        );
+    }
 }
