@@ -1526,7 +1526,7 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
 
-        let target_indices = vec![3, 7, 15];
+        let target_indices = [3, 7, 15];
         let target_row_ids: Vec<u64> = target_indices
             .iter()
             .map(|&i| orig_row_ids.value(i))
