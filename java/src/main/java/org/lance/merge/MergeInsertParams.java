@@ -13,10 +13,13 @@
  */
 package org.lance.merge;
 
+import org.lance.memwal.MergedGeneration;
+
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -35,6 +38,7 @@ public class MergeInsertParams {
   private int conflictRetries = 10;
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
+  private List<MergedGeneration> markedGenerations = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -223,8 +227,27 @@ public class MergeInsertParams {
     return this;
   }
 
+  /**
+   * Mark MemWAL generations as merged into the base table.
+   *
+   * <p>Use this when the merge insert incorporates data from MemWAL flushed generations. It updates
+   * the MemWAL generation tracking to prevent the same generations from being merged again.
+   *
+   * @param generations the flushed generations being merged
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams markGenerationsAsMerged(List<MergedGeneration> generations) {
+    Preconditions.checkNotNull(generations, "generations must not be null");
+    this.markedGenerations = generations;
+    return this;
+  }
+
   public List<String> on() {
     return on;
+  }
+
+  public List<MergedGeneration> markedGenerations() {
+    return markedGenerations;
   }
 
   public WhenMatched whenMatched() {

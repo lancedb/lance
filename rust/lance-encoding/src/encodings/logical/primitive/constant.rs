@@ -124,7 +124,7 @@ impl ConstantPageScheduler {
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
         let max_visible_def = def_meaning
             .iter()
-            .filter(|d| !d.is_list())
+            .take_while(|d| !d.is_list())
             .map(|d| d.num_def_levels())
             .sum();
 

@@ -60,7 +60,9 @@ from .lance import (
     PySearchFilter,
     ScanStatistics,
     _Dataset,
+    _format_field_path,
     _MergeInsertBuilder,
+    _parse_field_path,
     _Scanner,
     _write_dataset,
     indices,
@@ -120,8 +122,18 @@ def _is_blob_field(field: pa.Field) -> bool:
     )
 
 
-def _blob_columns_in_schema(schema: pa.Schema) -> set[str]:
-    return {field.name for field in schema if _is_blob_field(field)}
+def _field_blob_paths(field: pa.Field, parent: str = "") -> Iterator[str]:
+    segment = _format_field_path([field.name])
+    field_path = f"{parent}.{segment}" if parent else segment
+    if _is_blob_field(field):
+        yield field_path
+    elif pa.types.is_struct(field.type):
+        for i in range(field.type.num_fields):
+            yield from _field_blob_paths(field.type.field(i), field_path)
+
+
+def _blob_paths_in_schema(schema: pa.Schema) -> list[str]:
+    return [path for field in schema for path in _field_blob_paths(field)]
 
 
 def _normalize_blob_pandas_mode(
@@ -132,20 +144,34 @@ def _normalize_blob_pandas_mode(
     return cast("Literal['lazy', 'bytes', 'descriptions']", blob_mode)
 
 
-def _simple_source_column(expr: str) -> Optional[str]:
-    expr = expr.strip()
-    if expr.startswith("`") and expr.endswith("`") and expr.count("`") == 2:
-        return expr[1:-1]
-    if "." in expr or any(ch.isspace() for ch in expr):
-        return None
-    if not expr:
-        return None
-    allowed = set("_$")
-    if not (expr[0].isalpha() or expr[0] == "_"):
-        return None
-    if any(not (ch.isalnum() or ch in allowed) for ch in expr[1:]):
-        return None
-    return expr
+def _sources_from_transforms(
+    output_paths: list[str],
+    transforms: dict[str, str],
+) -> dict[str, str]:
+    result = {}
+    for path in output_paths:
+        segments = _parse_field_path(path)
+        source_path = transforms[segments[0]]
+        result[path] = (
+            source_path
+            if not segments[1:]
+            else _format_field_path(_parse_field_path(source_path) + segments[1:])
+        )
+    return result
+
+
+def _sources_from_direct_projection(
+    output_paths: list[str],
+    dataset_schema: pa.Schema,
+) -> dict[str, str]:
+    source_paths = set(_blob_paths_in_schema(dataset_schema))
+    result = {}
+    for path in output_paths:
+        segments = _parse_field_path(path)
+        result[path] = (
+            segments[0] if len(segments) == 1 and segments[0] in source_paths else path
+        )
+    return result
 
 
 def _blob_column_sources(
@@ -153,23 +179,11 @@ def _blob_column_sources(
     snapshot: Dict[str, Any],
     dataset_schema: pa.Schema,
 ) -> dict[str, str]:
-    blob_columns = {}
-    output_blob_columns = [field.name for field in schema if _is_blob_field(field)]
-    columns_with_transform = snapshot.get("_columns_with_transform")
-    if not columns_with_transform:
-        return {name: name for name in output_blob_columns}
-
-    source_is_blob = {field.name for field in dataset_schema if _is_blob_field(field)}
-    for name in output_blob_columns:
-        expr = dict(columns_with_transform).get(name)
-        source = _simple_source_column(expr) if expr is not None else name
-        if source is None or source not in source_is_blob:
-            raise NotImplementedError(
-                "blob-aware to_pandas only supports direct blob column references "
-                "for transformed projections"
-            )
-        blob_columns[name] = source
-    return blob_columns
+    output_paths = _blob_paths_in_schema(schema)
+    transforms = dict(snapshot.get("_columns_with_transform") or ())
+    if transforms:
+        return _sources_from_transforms(output_paths, transforms)
+    return _sources_from_direct_projection(output_paths, dataset_schema)
 
 
 def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
@@ -227,6 +241,115 @@ def _is_null_blob_description(description: Any) -> bool:
             and description["blob_uri"] == ""
         )
     return False
+
+
+def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
+    segments = _parse_field_path(path)
+    values = table.column(segments[0]).to_pylist()
+
+    for segment in segments[1:]:
+        values = [value.get(segment) if value is not None else None for value in values]
+
+    return values
+
+
+def _replace_value_at_path(
+    parent: Optional[dict],
+    segments: list[str],
+    value: Any,
+) -> Optional[dict]:
+    if parent is None:
+        return None
+
+    segment = segments[0]
+    updated = dict(parent)
+
+    if len(segments) == 1:
+        updated[segment] = value
+    else:
+        updated[segment] = _replace_value_at_path(
+            parent[segment],
+            segments[1:],
+            value,
+        )
+
+    return updated
+
+
+def _replace_in_struct_column(
+    dataframe: "pd.DataFrame",
+    path: str,
+    values: list[Optional[BlobFile]],
+) -> None:
+    segments = _parse_field_path(path)
+    parent_name = segments[0]
+    nested_segments = segments[1:]
+
+    parents = dataframe[parent_name].tolist()
+
+    dataframe[parent_name] = [
+        _replace_value_at_path(parent, nested_segments, value)
+        for parent, value in zip(parents, values)
+    ]
+
+
+def _fetch_blob_files_for_paths(
+    dataset: "LanceDataset",
+    table: pa.Table,
+    blob_paths: list[str],
+    blob_sources: dict[str, str],
+    row_addrs: list[int],
+) -> dict[str, list[Optional[BlobFile]]]:
+    blob_files: dict[str, list[Optional[BlobFile]]] = {}
+    for path in blob_paths:
+        descriptors = _descriptors_at_path(table, path)
+
+        null_mask = [
+            _is_null_blob_description(descriptor) for descriptor in descriptors
+        ]
+
+        non_null_addresses = [
+            row_addrs[index] for index, is_null in enumerate(null_mask) if not is_null
+        ]
+
+        fetched_blobs = (
+            iter(dataset.take_blobs(blob_sources[path], addresses=non_null_addresses))
+            if non_null_addresses
+            else iter([])
+        )
+
+        blobs_for_path = []
+        for is_null in null_mask:
+            if is_null:
+                blobs_for_path.append(None)
+            else:
+                blobs_for_path.append(next(fetched_blobs))
+
+        blob_files[path] = blobs_for_path
+
+    return blob_files
+
+
+def _place_blob_files(
+    dataframe: "pd.DataFrame",
+    blob_files: dict[str, list[Optional[BlobFile]]],
+    schema: pa.Schema,
+) -> None:
+    top_level: dict[str, list[Optional[BlobFile]]] = {}
+    nested: dict[str, list[Optional[BlobFile]]] = {}
+    for path, values in blob_files.items():
+        segments = _parse_field_path(path)
+        if len(segments) == 1:
+            top_level[segments[0]] = values
+        else:
+            nested[path] = values
+
+    for index, field in enumerate(schema):
+        if field.name in top_level:
+            dataframe.insert(index, field.name, top_level[field.name])
+
+    for path, values in nested.items():
+        _replace_in_struct_column(dataframe, path, values)
 
 
 def _resolve_blob_selection(
@@ -4597,27 +4720,55 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         *,
         maintained_indexes: Optional[List[str]] = None,
-        region_spec: Optional["mem_wal.RegionSpec"] = None,
+        bucket_column: Optional[str] = None,
+        num_buckets: Optional[int] = None,
+        identity_column: Optional[str] = None,
+        unsharded: bool = False,
+        durable_write: Optional[bool] = None,
+        sync_indexed_write: Optional[bool] = None,
+        max_wal_buffer_size: Optional[int] = None,
+        max_wal_flush_interval_ms: Optional[int] = None,
+        max_memtable_size: Optional[int] = None,
+        max_memtable_rows: Optional[int] = None,
+        max_memtable_batches: Optional[int] = None,
+        max_unflushed_memtable_bytes: Optional[int] = None,
+        manifest_scan_batch_size: Optional[int] = None,
+        async_index_buffer_rows: Optional[int] = None,
+        async_index_interval_ms: Optional[int] = None,
+        backpressure_log_interval_ms: Optional[int] = None,
+        stats_log_interval_ms: Optional[int] = None,
     ) -> None:
         """Initialize MemWAL on this dataset.
 
-        Must be called once before any calls to `mem_wal_writer`.
-        The dataset schema must have at least one field annotated with
-        the ``lance-schema:unenforced-primary-key`` Arrow field metadata.
+        Must be called once before any calls to `mem_wal_writer`. The dataset
+        schema must have at least one field annotated with the
+        ``lance-schema:unenforced-primary-key`` Arrow field metadata.
+
+        At most one sharding mode may be selected: bucket sharding
+        (``bucket_column`` + ``num_buckets``), identity sharding
+        (``identity_column``), or ``unsharded``. With none selected, shards are
+        managed manually by passing region IDs to `mem_wal_writer`.
+
+        Any writer-configuration keyword arguments (``durable_write``,
+        ``max_memtable_size``, ``max_wal_flush_interval_ms``, etc. — the same
+        knobs accepted by `mem_wal_writer`) are recorded as the default
+        `~lance.mem_wal.RegionWriter` configuration in the MemWAL index, so
+        every writer starts from the same defaults.
 
         Parameters
         ----------
         maintained_indexes : list of str, optional
-            Names of existing vector indexes to keep updated as data is
-            written through the MemWAL.  Must reference indexes that
-            already exist on the dataset.
-        region_spec : RegionSpec, optional
-            Partitioning specification for automatic region routing.
-            When provided, Lance will derive a region identifier from each
-            written row according to the spec and route writes to the
-            correct `~lance.mem_wal.RegionWriter` automatically.
-            When ``None`` (default), the caller must manage region IDs
-            manually by passing them to `mem_wal_writer`.
+            Names of existing indexes to keep updated as data is written
+            through the MemWAL. Must reference indexes that already exist.
+        bucket_column : str, optional
+            With ``num_buckets``, hash-bucket writes by this column, which must
+            be the single-column unenforced primary key.
+        num_buckets : int, optional
+            Number of hash buckets (shards). Required with ``bucket_column``.
+        identity_column : str, optional
+            Shard by the raw value of this scalar column.
+        unsharded : bool, default False
+            Route every write to a single shard.
 
         Raises
         ------
@@ -4625,38 +4776,42 @@ class LanceDataset(pa.dataset.Dataset):
             - Dataset has no ``lance-schema:unenforced-primary-key`` field.
             - An entry in *maintained_indexes* does not exist on the dataset.
             - MemWAL has already been initialized on this dataset.
-
-        Examples
-        --------
-        Without region spec (manual region management):
-
-        import lance
-        import pyarrow as pa
-        import tempfile
-        schema = pa.schema([
-        ...     pa.field("id", pa.int64(), nullable=False,
-        ...              metadata={"lance-schema:unenforced-primary-key": "true"}),
-        ...     pa.field("val", pa.float32()),
-        ... ])
-        table = pa.table({"id": [1], "val": [0.1]}, schema=schema)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ds = lance.write_dataset(table, tmpdir)
-            ds.initialize_mem_wal()
-
-        With a region spec for automatic routing by ``tenant_id``:
-
-        from lance.mem_wal import RegionField, RegionSpec
-        spec = RegionSpec(
-        ...     spec_id=1,
-        ...     fields=[RegionField(field_id="tenant_id", source_ids=[0],
-        ...                        result_type="int64")],
-        ... )
-        ds.initialize_mem_wal(region_spec=spec)
+        ValueError
+            More than one sharding mode was selected, or bucket sharding was
+            given only one of ``bucket_column`` / ``num_buckets``.
         """
         self._ds.initialize_mem_wal(
             maintained_indexes=maintained_indexes,
-            region_spec=region_spec,
+            bucket_column=bucket_column,
+            num_buckets=num_buckets,
+            identity_column=identity_column,
+            unsharded=unsharded,
+            durable_write=durable_write,
+            sync_indexed_write=sync_indexed_write,
+            max_wal_buffer_size=max_wal_buffer_size,
+            max_wal_flush_interval_ms=max_wal_flush_interval_ms,
+            max_memtable_size=max_memtable_size,
+            max_memtable_rows=max_memtable_rows,
+            max_memtable_batches=max_memtable_batches,
+            max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
+            manifest_scan_batch_size=manifest_scan_batch_size,
+            async_index_buffer_rows=async_index_buffer_rows,
+            async_index_interval_ms=async_index_interval_ms,
+            backpressure_log_interval_ms=backpressure_log_interval_ms,
+            stats_log_interval_ms=stats_log_interval_ms,
         )
+
+    def mem_wal_index_details(self) -> Optional[dict]:
+        """Return the MemWAL index details, or ``None`` if not initialized.
+
+        Returns
+        -------
+        dict or None
+            A dict with ``num_shards``, ``maintained_indexes``,
+            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
+            MemWAL has not been initialized on this dataset.
+        """
+        return self._ds.mem_wal_index_details()
 
     def mem_wal_writer(
         self,
@@ -6036,8 +6191,8 @@ class LanceScanner(pa.dataset.Scanner):
         """
         blob_mode = _normalize_blob_pandas_mode(blob_mode)
         schema = self.projected_schema
-        blob_columns = _blob_columns_in_schema(schema)
-        if not blob_columns or blob_mode == _BLOB_PANDAS_MODE_DESCRIPTIONS:
+        blob_paths = _blob_paths_in_schema(schema)
+        if not blob_paths or blob_mode == _BLOB_PANDAS_MODE_DESCRIPTIONS:
             return self.to_table().to_pandas(**kwargs)
 
         if self._snapshot is None:
@@ -6064,7 +6219,15 @@ class LanceScanner(pa.dataset.Scanner):
             raise RuntimeError("blob-aware to_pandas expected _rowaddr in scan results")
 
         row_addrs = table.column(_BLOB_ROW_ADDR_COLUMN).to_pylist()
-        columns_to_drop = [name for name in blob_columns if name in table.schema.names]
+        blob_files = _fetch_blob_files_for_paths(
+            self._ds, table, blob_paths, blob_sources, row_addrs
+        )
+
+        columns_to_drop = []
+        for path in blob_files:
+            segments = _parse_field_path(path)
+            if len(segments) == 1 and segments[0] in table.schema.names:
+                columns_to_drop.append(segments[0])
         if not requested_rowaddr:
             columns_to_drop.append(_BLOB_ROW_ADDR_COLUMN)
         non_blob_table = (
@@ -6075,32 +6238,7 @@ class LanceScanner(pa.dataset.Scanner):
         else:
             dataframe = non_blob_table.to_pandas(**kwargs)
 
-        output_names = [field.name for field in schema]
-        for index, name in enumerate(output_names):
-            if name not in blob_columns:
-                continue
-
-            descriptions = table.column(name).to_pylist()
-            non_null_positions = [
-                pos
-                for pos, description in enumerate(descriptions)
-                if not _is_null_blob_description(description)
-            ]
-            non_null_addrs = [row_addrs[pos] for pos in non_null_positions]
-            blob_files = (
-                self._ds.take_blobs(blob_sources[name], addresses=non_null_addrs)
-                if non_null_addrs
-                else []
-            )
-            blob_iter = iter(blob_files)
-            values = []
-            for description in descriptions:
-                if _is_null_blob_description(description):
-                    values.append(None)
-                    continue
-                values.append(next(blob_iter))
-            dataframe.insert(index, name, values)
-
+        _place_blob_files(dataframe, blob_files, schema)
         return dataframe
 
     @property

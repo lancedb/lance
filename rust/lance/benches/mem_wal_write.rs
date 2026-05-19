@@ -59,7 +59,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -406,10 +406,9 @@ async fn create_dataset(
 
     // Initialize MemWAL with specified maintained indexes
     dataset
-        .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
-            maintained_indexes: maintained_indexes.to_vec(),
-        })
+        .initialize_mem_wal()
+        .maintained_indexes(maintained_indexes.to_vec())
+        .execute()
         .await
         .expect("Failed to initialize MemWAL");
 

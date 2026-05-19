@@ -71,6 +71,33 @@ geo = [
     "geoarrow-rust-io",
 ]
 
+[dependency-groups]
+tests = [
+    "boto3==1.40.43",
+    "datasets==4.1.1; python_version >= '3.10'",
+    "duckdb==1.4.0",
+    "ml_dtypes==0.5.3",
+    "pillow==11.3.0",
+    "pandas==2.3.3",
+    "polars[pyarrow,pandas]==1.34.0",
+    "psutil==7.1.0",
+    "pytest==8.4.2",
+    "tensorflow==2.20.0; sys_platform == 'linux' and python_version >= '3.10'",
+    "tqdm==4.67.1",
+    "datafusion==53.0.0; python_version >= '3.10'",
+]
+dev = [
+    "maturin==1.13.3",
+    "pyright==1.1.406",
+    "ruff==0.11.2",
+]
+benchmarks = [
+    "pytest-benchmark==5.1.0",
+]
+
+[tool.uv]
+default-groups = ["dev", "tests"]
+
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 

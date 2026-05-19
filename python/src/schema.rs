@@ -252,3 +252,14 @@ pub(crate) fn logical_arrow_schema(schema: &ArrowSchema) -> ArrowSchema {
 pub(crate) fn logical_schema_from_lance(schema: &Schema) -> ArrowSchema {
     logical_arrow_schema(&ArrowSchema::from(schema))
 }
+
+#[pyfunction(name = "_parse_field_path")]
+pub fn parse_field_path(path: &str) -> PyResult<Vec<String>> {
+    lance_core::datatypes::parse_field_path(path).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+#[pyfunction(name = "_format_field_path")]
+pub fn format_field_path(segments: Vec<String>) -> String {
+    let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+    lance_core::datatypes::format_field_path(&refs)
+}

@@ -61,7 +61,7 @@ use lance::dataset::mem_wal::scanner::{
     ActiveMemTableRef, LsmDataSourceCollector, LsmPointLookupPlanner, LsmScanner,
     LsmVectorSearchPlanner, ShardSnapshot,
 };
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemWalConfig, ShardWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance_linalg::distance::DistanceType;
 #[cfg(target_os = "linux")]
@@ -230,13 +230,7 @@ async fn setup_benchmark(
         .unwrap();
 
     // Initialize MemWAL
-    lsm_dataset
-        .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
-            maintained_indexes: vec![],
-        })
-        .await
-        .unwrap();
+    lsm_dataset.initialize_mem_wal().execute().await.unwrap();
 
     let lsm_dataset = Arc::new(lsm_dataset);
 
@@ -839,13 +833,7 @@ async fn setup_vector_benchmark(
         .unwrap();
 
     // Initialize MemWAL
-    lsm_dataset
-        .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
-            maintained_indexes: vec![],
-        })
-        .await
-        .unwrap();
+    lsm_dataset.initialize_mem_wal().execute().await.unwrap();
 
     let lsm_dataset = Arc::new(lsm_dataset);
 

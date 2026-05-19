@@ -4,7 +4,7 @@
 //! MemWAL Index operations.
 //!
 //! The MemWAL Index stores:
-//! - Configuration (shard_specs, maintained_indexes)
+//! - Configuration (sharding_specs, maintained_indexes)
 //! - Merge progress (merged_generations per shard)
 //! - Shard state snapshots (eventually consistent)
 //!

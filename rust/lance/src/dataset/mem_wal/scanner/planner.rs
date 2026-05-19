@@ -496,7 +496,7 @@ mod integration_tests {
     use uuid::Uuid;
 
     use crate::dataset::mem_wal::scanner::LsmScanner;
-    use crate::dataset::mem_wal::scanner::collector::ActiveMemTableRef;
+    use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
@@ -559,7 +559,7 @@ mod integration_tests {
     async fn setup_multi_level_lsm() -> (
         Arc<Dataset>,
         Vec<ShardSnapshot>,
-        Option<(Uuid, ActiveMemTableRef)>,
+        Option<(Uuid, InMemoryMemTables)>,
         Vec<String>,
         String, // temp_dir path for cleanup
     ) {
@@ -595,11 +595,14 @@ mod integration_tests {
         let active_batch = create_test_batch(&schema, &[5, 6, 7], "active");
         let _ = batch_store.append(active_batch);
 
-        let active_memtable = ActiveMemTableRef {
-            batch_store,
-            index_store,
-            schema: schema.clone(),
-            generation: 3,
+        let active_memtable = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store,
+                index_store,
+                schema: schema.clone(),
+                generation: 3,
+            },
+            frozen: vec![],
         };
 
         let pk_columns = vec!["id".to_string()];
@@ -624,7 +627,7 @@ mod integration_tests {
         // Create scanner without requesting _memtable_gen
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -661,7 +664,7 @@ mod integration_tests {
         let mut scanner =
             LsmScanner::new(base_dataset, shard_snapshots, pk_columns).with_memtable_gen();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -705,7 +708,7 @@ mod integration_tests {
         // Create scanner
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -757,6 +760,109 @@ mod integration_tests {
         assert_eq!(results.get(&7), Some(&"active_7".to_string()));
     }
 
+    /// Regression for the concurrent-read-vs-flush hole: a sealed
+    /// (frozen-awaiting-flush) memtable is not yet recorded as a flushed
+    /// generation, but its rows must still be in the scan's read union and
+    /// dedup correctly by generation across the active/frozen seam.
+    ///
+    /// Layout: base(0) ids 1-5, flushed gen1 ids 3,4, flushed gen2 ids
+    /// 4,5,6, frozen memtable gen3 ids 6,7, active memtable gen4 ids 7,8.
+    #[tokio::test]
+    async fn test_lsm_scan_frozen_memtable_in_read_union() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+
+        let base_uri = format!("{}/base", base_path);
+        let base_dataset = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&schema, &[1, 2, 3, 4, 5], "base")],
+            )
+            .await,
+        );
+
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![create_test_batch(&schema, &[3, 4], "gen1")]).await;
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
+        create_dataset(
+            &gen2_uri,
+            vec![create_test_batch(&schema, &[4, 5, 6], "gen2")],
+        )
+        .await;
+
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(4)
+            .with_flushed_generation(1, "gen_1".to_string())
+            .with_flushed_generation(2, "gen_2".to_string());
+
+        // Frozen gen3 (sealed, NOT in the manifest) and active gen4.
+        let frozen_store = Arc::new(BatchStore::with_capacity(100));
+        let _ = frozen_store.append(create_test_batch(&schema, &[6, 7], "frozen"));
+        let frozen = InMemoryMemTableRef {
+            batch_store: frozen_store,
+            index_store: Arc::new(IndexStore::new()),
+            schema: schema.clone(),
+            generation: 3,
+        };
+
+        let active_store = Arc::new(BatchStore::with_capacity(100));
+        let _ = active_store.append(create_test_batch(&schema, &[7, 8], "active"));
+        let in_memory = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store: active_store,
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation: 4,
+            },
+            frozen: vec![frozen],
+        };
+
+        let scanner = LsmScanner::new(base_dataset, vec![shard_snapshot], vec!["id".to_string()])
+            .with_in_memory_memtables(shard_id, in_memory);
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        assert_eq!(results.len(), 8, "ids 1-8 should all be present");
+        assert_eq!(results.get(&1), Some(&"base_1".to_string()));
+        assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"gen2_5".to_string()));
+        // id=6: in flushed gen2 AND frozen gen3 -> frozen wins. This is the
+        // bug: pre-fix the frozen memtable fell out of the read union and
+        // id=6 resolved to "gen2_6".
+        assert_eq!(results.get(&6), Some(&"frozen_6".to_string()));
+        // id=7: in frozen gen3 AND active gen4 -> active wins across the seam.
+        assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+        assert_eq!(results.get(&8), Some(&"active_8".to_string()));
+    }
+
     #[tokio::test]
     async fn test_lsm_scan_with_projection() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
@@ -766,7 +872,7 @@ mod integration_tests {
         let mut scanner =
             LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&["id"]);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -796,7 +902,7 @@ mod integration_tests {
         // Create scanner with limit
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).limit(3, None);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and collect results
@@ -918,7 +1024,7 @@ mod integration_tests {
         let mut scanner =
             LsmScanner::new(base_dataset, shard_snapshots, pk_columns).with_row_address();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -985,7 +1091,7 @@ mod integration_tests {
             .with_memtable_gen()
             .with_row_address();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -1027,7 +1133,7 @@ mod integration_tests {
     async fn setup_multi_level_lsm_with_btree_index() -> (
         Arc<Dataset>,
         Vec<ShardSnapshot>,
-        Option<(Uuid, ActiveMemTableRef)>,
+        Option<(Uuid, InMemoryMemTables)>,
         Vec<String>,
         String,
     ) {
@@ -1092,11 +1198,14 @@ mod integration_tests {
 
         let index_store = Arc::new(index_store);
 
-        let active_memtable = ActiveMemTableRef {
-            batch_store,
-            index_store,
-            schema: schema.clone(),
-            generation: 3,
+        let active_memtable = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store,
+                index_store,
+                schema: schema.clone(),
+                generation: 3,
+            },
+            frozen: vec![],
         };
 
         let pk_columns = vec!["id".to_string()];
@@ -1121,7 +1230,7 @@ mod integration_tests {
             .filter("id = 5")
             .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
@@ -1213,7 +1322,7 @@ mod integration_tests {
             .filter("id = 3")
             .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Execute and verify result
@@ -1264,7 +1373,7 @@ mod integration_tests {
         let mut scanner =
             LsmScanner::without_base_table(schema, base_uri, shard_snapshots, pk_columns);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         // Verify the plan does not include a LanceRead for the base table.
@@ -1346,7 +1455,7 @@ mod integration_tests {
                 .filter("id > 3")
                 .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let batches: Vec<RecordBatch> = scanner
@@ -1426,7 +1535,7 @@ mod integration_tests {
             "_rowid",
         ]);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let batches: Vec<RecordBatch> = scanner
@@ -1516,7 +1625,7 @@ mod integration_tests {
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
             .project(&["id", "_rowid", "name"]);
         if let Some((shard_id, memtable)) = active_memtable {
-            scanner = scanner.with_active_memtable(shard_id, memtable);
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
         let plan = scanner.create_plan().await.unwrap();
