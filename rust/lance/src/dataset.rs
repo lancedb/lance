@@ -3032,36 +3032,45 @@ impl Dataset {
 
     /// Merge a distributed scalar index into a single root artifact and report
     /// progress via the supplied callback.
+    ///
+    /// Returns `Some(MergeResult)` for BTree indices that require deferred
+    /// shard-file cleanup. The caller **must** call
+    /// [`lance_index::scalar::btree::cleanup_shard_files`] only after the
+    /// transaction that commits this index has been successfully applied.
+    /// If the commit fails, the shard files must remain so the merge can be
+    /// retried.
+    ///
+    /// For all other index types, returns `Ok(None)`.
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,
         index_type: IndexType,
         batch_readhead: Option<usize>,
         progress: Arc<dyn IndexBuildProgress>,
-    ) -> Result<()> {
+    ) -> Result<Option<lance_index::scalar::btree::MergeResult>> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
         let index_dir = self.indices_dir().join(index_uuid);
         match index_type {
             IndexType::Inverted => {
-                // Call merge_index_files function for inverted index
                 lance_index::scalar::inverted::builder::merge_index_files(
                     self.object_store.as_ref(),
                     &index_dir,
                     Arc::new(store),
                     progress,
                 )
-                .await
+                .await?;
+                Ok(None)
             }
             IndexType::BTree => {
-                // Call merge_index_files function for btree index
-                lance_index::scalar::btree::merge_index_files(
+                let merge_result = lance_index::scalar::btree::merge_index_files(
                     self.object_store.as_ref(),
                     &index_dir,
                     Arc::new(store),
                     batch_readhead,
                     progress,
                 )
-                .await
+                .await?;
+                Ok(Some(merge_result))
             }
             IndexType::Bitmap => {
                 lance_index::scalar::bitmap::merge_index_files(
@@ -3070,7 +3079,8 @@ impl Dataset {
                     Arc::new(store),
                     progress,
                 )
-                .await
+                .await?;
+                Ok(None)
             }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(

@@ -249,6 +249,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
+    m.add_class::<BTreeMergeResult>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;

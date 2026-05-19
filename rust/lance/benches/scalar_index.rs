@@ -18,7 +18,7 @@ use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::scalar::{
     IndexStore, SargableQuery, ScalarIndex, SearchResult,
-    btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
+    btree::{DEFAULT_BTREE_BATCH_SIZE, DistributedMode, train_btree_index},
     lance_format::LanceIndexStore,
     registry::ScalarIndexPlugin,
 };
@@ -67,8 +67,7 @@ impl BenchmarkFixture {
             test_data_stream(),
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            None,
-            None,
+            DistributedMode::Single,
         )
         .await
         .unwrap();

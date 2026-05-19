@@ -2959,6 +2959,7 @@ class LanceDataset(pa.dataset.Dataset):
         train: bool = True,
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
+        range_partitions: Optional[int] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ):
@@ -3061,6 +3062,13 @@ class LanceDataset(pa.dataset.Dataset):
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated. This parameter is
             passed via kwargs internally.
+        range_partitions : int, optional
+            Only effective for BTree indices. When set, the BTree index will be
+            built with range-based partitioning: the data is sampled to find
+            partition boundaries, then each partition is written as a separate
+            page file. This allows queries to only read the relevant partition(s)
+            instead of the entire index. Must be >= 2. Requires ``train=True``.
+            Ignored (with an error) for non-BTree index types.
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
@@ -3250,7 +3258,9 @@ class LanceDataset(pa.dataset.Dataset):
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
 
-        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
+        self._ds.create_index(
+            [column], index_type, name, replace, train, None, range_partitions, kwargs
+        )
 
     def _create_index_impl(
         self,
@@ -3281,6 +3291,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        range_partitions: Optional[int] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -3605,7 +3616,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         timers["final_create_index:start"] = time.time()
         index = self._ds.create_index(
-            column, index_type, name, replace, train, storage_options, kwargs
+            column, index_type, name, replace, train, storage_options, range_partitions, kwargs
         )
         timers["final_create_index:end"] = time.time()
         final_create_index_time = (
@@ -3653,6 +3664,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        range_partitions: Optional[int] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -3733,6 +3745,13 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
+        range_partitions : int, optional
+            Only effective for BTree indices. When set, the BTree index will be
+            built with range-based partitioning: the data is sampled to find
+            partition boundaries, then each partition is written as a separate
+            page file. This allows queries to only read the relevant partition(s)
+            instead of the entire index. Must be >= 2. Requires ``train=True``.
+            Raises an error for non-BTree index types.
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
@@ -3862,6 +3881,7 @@ class LanceDataset(pa.dataset.Dataset):
             index_uuid=index_uuid,
             target_partition_size=target_partition_size,
             skip_transpose=skip_transpose,
+            range_partitions=range_partitions,
             require_commit=True,
             **kwargs,
         )
@@ -3896,6 +3916,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        range_partitions: Optional[int] = None,
         **kwargs,
     ) -> Index:
         """
@@ -3951,6 +3972,7 @@ class LanceDataset(pa.dataset.Dataset):
             index_uuid=index_uuid,
             target_partition_size=target_partition_size,
             skip_transpose=skip_transpose,
+            range_partitions=range_partitions,
             require_commit=False,
             **kwargs,
         )
@@ -4008,6 +4030,14 @@ class LanceDataset(pa.dataset.Dataset):
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
 
+        For BTree indices, this method returns a ``BTreeMergeResult`` that
+        holds references to shard files that are no longer needed after merge.
+        Callers **must** call ``result.cleanup()`` only after the commit has
+        succeeded.  If the commit fails, do **not** call cleanup — the shard
+        files are still needed for a retry.
+
+        For all other index types, returns ``None``.
+
         Parameters
         ----------
         index_uuid: str
@@ -4021,8 +4051,12 @@ class LanceDataset(pa.dataset.Dataset):
         progress_callback: callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             metadata is being merged.
+
+        Returns
+        -------
+        BTreeMergeResult or None
+            A cleanup handle for BTree indices, or ``None`` for other types.
         """
-        # Normalize type
         t = index_type.upper()
 
         valid = {member.name for member in SupportedDistributedIndices}
@@ -4031,9 +4065,7 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Only {', '.join(sorted(valid))} are supported, received {index_type}"
             )
 
-        # Merge physical index files at the index directory
-        self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
-        return None
+        return self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
 
     def create_index_segment_builder(self):
         """

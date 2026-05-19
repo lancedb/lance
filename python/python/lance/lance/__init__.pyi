@@ -94,6 +94,11 @@ class CleanupStats:
     index_files_removed: int
     deletion_files_removed: int
 
+class BTreeMergeResult:
+    part_lookup_files: List[str]
+    part_page_files: List[str]
+    def cleanup(self) -> None: ...
+
 class LanceFileWriter:
     def __init__(
         self,
@@ -408,7 +413,7 @@ class _Dataset:
         index_type: str,
         batch_readhead: Optional[int] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
-    ): ...
+    ) -> Optional[BTreeMergeResult]: ...
     def create_index_segment_builder(self) -> IndexSegmentBuilder: ...
     def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
     def commit_existing_index_segments(

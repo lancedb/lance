@@ -399,7 +399,7 @@ mod tests {
     use crate::scalar::{
         LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
         bitmap::BitmapIndex,
-        btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
+        btree::{DEFAULT_BTREE_BATCH_SIZE, DistributedMode, train_btree_index},
     };
 
     use super::*;
@@ -977,8 +977,7 @@ mod tests {
             data,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            None,
-            None,
+            DistributedMode::Single,
         )
         .await
         .unwrap();

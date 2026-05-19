@@ -5,6 +5,7 @@ use crate::{
     Error, Result,
     dataset::{
         Dataset,
+        index::LanceIndexStoreExt,
         transaction::{Operation, TransactionBuilder},
     },
     index::{
@@ -61,8 +62,14 @@ pub struct CreateIndexBuilder<'a> {
     index_uuid: Option<String>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
-    /// Transaction properties to store with this commit.
+    range_partitions: Option<u32>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    pending_shard_cleanup: Option<PendingShardCleanup>,
+}
+
+struct PendingShardCleanup {
+    index_uuid: String,
+    merge_result: lance_index::scalar::btree::MergeResult,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -84,7 +91,9 @@ impl<'a> CreateIndexBuilder<'a> {
             index_uuid: None,
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
+            range_partitions: None,
             transaction_properties: None,
+            pending_shard_cleanup: None,
         }
     }
 
@@ -126,11 +135,29 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
+    /// Set the number of range partitions for a BTree index.
+    ///
+    /// When set, the BTree index will be built with range-based partitioning:
+    /// the data is sampled to find partition boundaries, then each partition
+    /// is written as a separate page file. This allows queries to only read
+    /// the relevant partition(s) instead of the entire index.
+    ///
+    /// Only supported for BTree indices. Must be >= 2. Requires `train=true`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_partitions` is less than 2.
+    pub fn range_partitions(mut self, num_partitions: u32) -> Self {
+        assert!(num_partitions >= 2, "range_partitions must be >= 2, got {num_partitions}");
+        self.range_partitions = Some(num_partitions);
+        self
+    }
+
     /// Set transaction properties to store with this commit.
     ///
-    /// These key-value pairs are stored in the transaction file
-    /// and can be read later to identify the source of the commit
-    /// (e.g., job_id for tracking completed index jobs).
+    /// These are arbitrary key-value pairs that will be persisted with the
+    /// transaction. They can be used for tracking provenance (e.g., job_id)
+    /// or other metadata.
     pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.transaction_properties = Some(Arc::new(properties));
         self
@@ -257,17 +284,59 @@ impl<'a> CreateIndexBuilder<'a> {
                     .preprocessed_data
                     .take()
                     .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    &params,
-                    train,
-                    self.fragments.clone(),
-                    preprocesssed_data,
-                    self.progress.clone(),
-                )
-                .await?
+
+                if self.index_type == IndexType::BTree {
+                    if let Some(range_partitions) = self.range_partitions.take() {
+                        let (created_index, merge_result) =
+                            super::scalar::build_btree_index_partitioned(
+                                self.dataset,
+                                column,
+                                &index_id.to_string(),
+                                &params,
+                                range_partitions,
+                                train,
+                                self.fragments.clone(),
+                                self.progress.clone(),
+                            )
+                            .await?;
+                        if let Some(merge_result) = merge_result {
+                            self.pending_shard_cleanup = Some(PendingShardCleanup {
+                                index_uuid: index_id.to_string(),
+                                merge_result,
+                            });
+                        }
+                        created_index
+                    } else {
+                        build_scalar_index(
+                            self.dataset,
+                            column,
+                            &index_id.to_string(),
+                            &params,
+                            train,
+                            self.fragments.clone(),
+                            preprocesssed_data,
+                            self.progress.clone(),
+                        )
+                        .await?
+                    }
+                } else {
+                    if self.range_partitions.is_some() {
+                        return Err(Error::invalid_input(
+                            "range_partitions is only supported for BTree indices".to_string(),
+                        ));
+                    }
+                    build_scalar_index(
+                        self.dataset,
+                        column,
+                        &index_id.to_string(),
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                        preprocesssed_data,
+                        self.progress.clone(),
+                    )
+                    .await?
+                }
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -544,6 +613,19 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
+        // Now that the transaction has been committed successfully, clean up
+        // any shard files that were used during the distributed build.
+        // This is deferred until after commit to ensure that if the commit fails,
+        // the shard files are still available for a retry.
+        if let Some(pending) = self.pending_shard_cleanup.take() {
+            let index_store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
+                self.dataset,
+                &pending.index_uuid,
+            )?;
+            lance_index::scalar::btree::cleanup_shard_files(&index_store, &pending.merge_result)
+                .await;
+        }
+
         // Fetch the committed index metadata from the dataset.
         // This ensures we return the version that may have been modified by the commit.
         let indices = self.dataset.load_indices().await?;
@@ -750,6 +832,7 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use lance_index::scalar::lance_format::LanceIndexStore;
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatchIterator};
@@ -1185,7 +1268,7 @@ mod tests {
         }
 
         let merge_progress = Arc::new(RecordingProgress::default());
-        dataset
+        let merge_result = dataset
             .merge_index_metadata(
                 &shared_uuid,
                 IndexType::Inverted,
@@ -1194,6 +1277,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            merge_result.is_none(),
+            "Inverted merge should not return a MergeResult"
+        );
 
         let build_tags = build_progress
             .recorded_events()
@@ -1312,7 +1399,7 @@ mod tests {
         }
 
         let merge_progress = Arc::new(RecordingProgress::default());
-        dataset
+        let merge_result = dataset
             .merge_index_metadata(
                 &shared_uuid,
                 IndexType::BTree,
@@ -1320,7 +1407,8 @@ mod tests {
                 merge_progress.clone(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("BTree merge should return a MergeResult");
 
         let build_tags = build_progress
             .recorded_events()
@@ -1337,37 +1425,26 @@ mod tests {
             .iter()
             .map(|(kind, stage, _)| format!("{kind}:{stage}"))
             .collect::<Vec<_>>();
-        let pages_start = merge_tags
+        let lookups_start = merge_tags
             .iter()
-            .position(|e| e == "start:merge_pages")
-            .expect("missing merge_pages start");
-        let pages_complete = merge_tags
+            .position(|e| e == "start:merge_lookups")
+            .expect("missing merge_lookups start");
+        let lookups_complete = merge_tags
             .iter()
-            .position(|e| e == "complete:merge_pages")
-            .expect("missing merge_pages complete");
-        let write_start = merge_tags
-            .iter()
-            .position(|e| e == "start:write_lookup_file")
-            .expect("missing write_lookup_file start");
-        let write_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:write_lookup_file")
-            .expect("missing write_lookup_file complete");
-        assert!(pages_start < pages_complete);
-        assert!(pages_complete < write_start);
-        assert!(write_start < write_complete);
+            .position(|e| e == "complete:merge_lookups")
+            .expect("missing merge_lookups complete");
+        assert!(lookups_start < lookups_complete);
         assert!(
-            merge_tags.iter().any(|e| e == "progress:merge_pages"),
-            "expected merge_pages progress during public merge"
+            merge_tags.iter().any(|e| e == "progress:merge_lookups"),
+            "expected merge_lookups progress during public merge"
         );
         assert!(
-            merge_tags.iter().any(|e| e == "progress:write_lookup_file"),
-            "expected write_lookup_file progress during public merge"
+            !merge_tags.iter().any(|e| e == "start:merge_pages"),
+            "fragment-based distributed BTREE merge should not use merge_pages"
         );
-        assert!(
-            !merge_tags.iter().any(|e| e == "start:merge_lookups"),
-            "fragment-based distributed BTREE merge should not use merge_lookups"
-        );
+
+        let store = LanceIndexStore::from_dataset_for_new(&dataset, &shared_uuid).unwrap();
+        lance_index::scalar::btree::cleanup_shard_files(&store, &merge_result).await;
     }
 
     #[tokio::test]
@@ -1435,7 +1512,7 @@ mod tests {
             }
         }
 
-        dataset
+        let merge_result = dataset
             .merge_index_metadata(
                 &shared_uuid,
                 IndexType::Bitmap,
@@ -1444,6 +1521,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            merge_result.is_none(),
+            "Bitmap merge should not return a MergeResult"
+        );
 
         let mut committed_index_metadata = shard_metadata.unwrap();
         committed_index_metadata.fragment_bitmap = Some(fragment_ids.iter().copied().collect());

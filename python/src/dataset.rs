@@ -755,6 +755,36 @@ impl From<DatasetBasePath> for BasePath {
     }
 }
 
+#[pyclass(name = "BTreeMergeResult", module = "_lib")]
+pub struct BTreeMergeResult {
+    #[pyo3(get)]
+    part_lookup_files: Vec<String>,
+    #[pyo3(get)]
+    part_page_files: Vec<String>,
+    index_uuid: String,
+    dataset_uri: String,
+}
+
+#[pymethods]
+impl BTreeMergeResult {
+    fn cleanup(&self) -> PyResult<()> {
+        rt().block_on(None, async {
+            let dataset = LanceDataset::open(&self.dataset_uri).await?;
+            let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
+                &dataset,
+                &self.index_uuid,
+            )?;
+            lance_index::scalar::btree::cleanup_shard_files(&store, &lance_index::scalar::btree::MergeResult {
+                part_lookup_files: self.part_lookup_files.clone(),
+                part_page_files: self.part_page_files.clone(),
+            })
+            .await;
+            Ok(())
+        })
+        .map_err(|err: lance_core::Error| PyIOError::new_err(err.to_string()))
+    }
+}
+
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib", from_py_object)]
 #[derive(Clone)]
@@ -2269,7 +2299,7 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, kwargs = None))]
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, range_partitions = None, kwargs = None))]
     #[allow(clippy::too_many_arguments)]
     fn create_index(
         &mut self,
@@ -2279,6 +2309,7 @@ impl Dataset {
         replace: Option<bool>,
         train: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
+        range_partitions: Option<u32>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<PyLance<IndexMetadata>> {
         let columns: Vec<&str> = columns.iter().map(|s| &**s).collect();
@@ -2455,6 +2486,9 @@ impl Dataset {
         if let Some(index_uuid) = index_uuid {
             builder = builder.index_uuid(index_uuid);
         }
+        if let Some(rp) = range_partitions {
+            builder = builder.range_partitions(rp);
+        }
         if let Some(progress_handler) = progress_handler.as_ref() {
             builder = builder.progress(progress_handler.progress.clone());
         }
@@ -2552,7 +2586,7 @@ impl Dataset {
         index_type: &str,
         batch_readhead: Option<usize>,
         progress_callback: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Option<BTreeMergeResult>> {
         let mut progress_handler =
             Self::make_index_progress_handler_from_callback(progress_callback)?;
         let progress: Arc<dyn IndexBuildProgress> = progress_handler
@@ -2560,6 +2594,8 @@ impl Dataset {
             .map(|handler| handler.progress.clone() as Arc<dyn IndexBuildProgress>)
             .unwrap_or_else(|| Arc::new(NoopIndexBuildProgress));
 
+        let index_uuid_owned = index_uuid.to_string();
+        let dataset_uri = self.uri.clone();
         Self::run_index_future(
             async {
                 self.ds
@@ -2574,6 +2610,14 @@ impl Dataset {
             progress_handler.as_mut(),
         )?
         .map_err(|err| PyValueError::new_err(err.to_string()))
+        .map(|opt| {
+            opt.map(|mr| BTreeMergeResult {
+                part_lookup_files: mr.part_lookup_files,
+                part_page_files: mr.part_page_files,
+                index_uuid: index_uuid_owned,
+                dataset_uri,
+            })
+        })
     }
 
     fn count_fragments(&self) -> usize {

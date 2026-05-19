@@ -140,7 +140,7 @@ def btree_comparison_datasets(tmp_path):
         )
 
     # Merge fragment indices
-    fragment_ds.merge_index_metadata(fragment_index_id, index_type="BTREE")
+    merge_result = fragment_ds.merge_index_metadata(fragment_index_id, index_type="BTREE")
 
     # Create Index object for fragment-based index
     from lance.dataset import Index
@@ -167,6 +167,10 @@ def btree_comparison_datasets(tmp_path):
         create_fragment_index_op,
         read_version=fragment_ds.version,
     )
+
+    # Cleanup shard files after successful commit
+    if merge_result is not None:
+        merge_result.cleanup()
 
     # Build complete B-tree index
     complete_index_name = f"complete_btree_{uuid.uuid4().hex[:8]}"
@@ -3775,7 +3779,7 @@ def test_distribute_btree_index_build(tmp_path):
     assert results.num_rows == 1, f"No results found for id = {test_id}"
 
     # Merge the B-tree index metadata
-    ds.merge_index_metadata(index_id, index_type="BTREE")
+    merge_result = ds.merge_index_metadata(index_id, index_type="BTREE")
 
     # Create an Index object using the new dataclass format
     from lance.dataset import Index
@@ -3804,6 +3808,10 @@ def test_distribute_btree_index_build(tmp_path):
         create_index_op,
         read_version=ds.version,
     )
+
+    # Cleanup shard files after successful commit
+    if merge_result is not None:
+        merge_result.cleanup()
 
     # Verify the index was created and is functional
     stats = ds_committed.stats.index_stats(index_name)
