@@ -2319,56 +2319,71 @@ mod tests {
         assert_eq!(merged_array.len(), 2);
     }
 
+    #[test]
+    fn test_merge_with_schema_sliced_list_struct() {
+        test_merge_with_schema_sliced_list_struct_generic::<i32>();
+    }
+
+    #[test]
+    fn test_merge_with_schema_sliced_large_list_struct() {
+        test_merge_with_schema_sliced_list_struct_generic::<i64>();
+    }
+
     // Regression for #6580: merge_with_schema panicked when the left list was a
     // sliced view whose offsets did not start at zero (common after a filtered
     // scan). Cloning those offsets alongside `trimmed_values` produced offsets
-    // larger than the trimmed child, panicking in `ListArray::new`.
-    #[test]
-    fn test_merge_with_schema_sliced_list_struct() {
+    // larger than the trimmed child, panicking in `(Large)ListArray::new`.
+    fn test_merge_with_schema_sliced_list_struct_generic<O: OffsetSizeTrait>() {
+        let make_list_dtype = |item_field: Arc<Field>| {
+            if O::IS_LARGE {
+                DataType::LargeList(item_field)
+            } else {
+                DataType::List(item_field)
+            }
+        };
+
         // Build a List<Struct> with two rows of 5 items each, then slice away
         // the first row so the remaining list's offsets start at 5, not 0.
-        let struct_fields = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
-        let values = Arc::new(StructArray::new(
-            struct_fields.clone(),
+        let struct_fields_a = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
+        let left_values = Arc::new(StructArray::new(
+            struct_fields_a.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef],
             None,
         ));
-        let full_list = ListArray::new(
-            Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
-            OffsetBuffer::from_lengths([5, 5]),
-            values,
+        let full_list = GenericListArray::<O>::new(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields_a), true)),
+            OffsetBuffer::<O>::from_lengths([5, 5]),
+            left_values,
             None,
         );
         let sliced_left = full_list.slice(1, 1);
-        assert_eq!(sliced_left.offsets()[0], 5);
-        assert_eq!(sliced_left.offsets()[1], 10);
+        assert_eq!(sliced_left.offsets()[0].as_usize(), 5);
+        assert_eq!(sliced_left.offsets()[1].as_usize(), 10);
 
-        let right_struct = Arc::new(StructArray::new(
-            Fields::from(vec![Field::new("b", DataType::Int32, true)]),
+        let struct_fields_b = Fields::from(vec![Field::new("b", DataType::Int32, true)]);
+        let right_values = Arc::new(StructArray::new(
+            struct_fields_b.clone(),
             vec![Arc::new(Int32Array::from_iter_values(100..105)) as ArrayRef],
             None,
         ));
-        let right_list = ListArray::new(
-            Arc::new(Field::new(
-                "item",
-                DataType::Struct(right_struct.fields().clone()),
-                true,
-            )),
-            OffsetBuffer::from_lengths([5]),
-            right_struct,
+        let right_list = GenericListArray::<O>::new(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields_b), true)),
+            OffsetBuffer::<O>::from_lengths([5]),
+            right_values,
             None,
         );
 
+        let target_item_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ])),
+            true,
+        ));
         let target_fields = Fields::from(vec![Field::new(
             "items",
-            DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Struct(Fields::from(vec![
-                    Field::new("a", DataType::Int32, true),
-                    Field::new("b", DataType::Int32, true),
-                ])),
-                true,
-            ))),
+            make_list_dtype(target_item_field),
             true,
         )]);
 
@@ -2399,10 +2414,10 @@ mod tests {
             .column_by_name("items")
             .unwrap()
             .as_any()
-            .downcast_ref::<ListArray>()
+            .downcast_ref::<GenericListArray<O>>()
             .unwrap();
         assert_eq!(merged_list.len(), 1);
-        assert_eq!(merged_list.value_length(0), 5);
+        assert_eq!(merged_list.value_length(0).as_usize(), 5);
         let merged_struct = merged_list.values().as_struct();
         assert_eq!(merged_struct.num_columns(), 2);
         let a = merged_struct
