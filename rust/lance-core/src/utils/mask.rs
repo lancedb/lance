@@ -659,6 +659,29 @@ impl RowAddrTreeMap {
                 }),
             })
     }
+
+    /// Iterate the selected row addresses as `(fragment_id, run)` pairs.
+    ///
+    /// Range-shaped counterpart to [`Self::into_addr_iter`]. A contiguous
+    /// run of N selected rows yields one item, not N. Uses roaring's
+    /// `Iter::next_range`, which walks each underlying container's runs
+    /// rather than its individual bits, so dense ranges cost
+    /// O(num_containers) (roughly num_rows / 65536) instead of O(num_rows).
+    ///
+    /// # Safety
+    /// Same contract as [`Self::into_addr_iter`]: panics if any entry is
+    /// `Full`, since the fragment size is unknown at this layer.
+    pub unsafe fn iter_runs(&self) -> impl Iterator<Item = (u32, RangeInclusive<u32>)> + '_ {
+        self.inner
+            .iter()
+            .flat_map(|(&fragment, selection)| match selection {
+                RowAddrSelection::Full => panic!("Size of full fragment is unknown"),
+                RowAddrSelection::Partial(bitmap) => {
+                    let mut iter = bitmap.iter();
+                    std::iter::from_fn(move || iter.next_range().map(|r| (fragment, r)))
+                }
+            })
+    }
 }
 
 impl std::ops::BitOr<Self> for RowAddrTreeMap {
@@ -1553,6 +1576,38 @@ mod tests {
         let expected = vec![0u64, 1, 1 << 32 | 5, 2 << 32 | 10];
         let actual: Vec<u64> = unsafe { mask.into_addr_iter().collect() };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_map_iter_runs() {
+        // Three contiguous regions across two fragments.
+        let mut mask = RowAddrTreeMap::default();
+        mask.insert_range(0..3);
+        mask.insert_range(10..15);
+        mask.insert_range((1u64 << 32) + 100..(1u64 << 32) + 103);
+
+        // SAFETY: only Partial entries.
+        let runs: Vec<(u32, RangeInclusive<u32>)> = unsafe { mask.iter_runs().collect() };
+        assert_eq!(runs, vec![(0, 0..=2), (0, 10..=14), (1, 100..=102)]);
+    }
+
+    #[test]
+    fn test_map_iter_runs_matches_into_addr_iter() {
+        // Confirm iter_runs and into_addr_iter agree on a non-trivial shape.
+        let mut mask = RowAddrTreeMap::default();
+        mask.insert_range(5..7);
+        mask.insert_range(11..12);
+        mask.insert_range(20..25);
+        mask.insert_range((1u64 << 32)..(1u64 << 32) + 3);
+
+        let from_runs: Vec<u64> = unsafe { mask.iter_runs() }
+            .flat_map(|(frag, run)| {
+                let frag = u64::from(frag);
+                (*run.start()..=*run.end()).map(move |v| (frag << 32) | u64::from(v))
+            })
+            .collect();
+        let from_bits: Vec<u64> = unsafe { mask.clone().into_addr_iter() }.collect();
+        assert_eq!(from_runs, from_bits);
     }
 
     #[test]

@@ -392,9 +392,27 @@ impl RowIdSequence {
                 U64Segment::Range(range) => {
                     let mut ids = RowAddrTreeMap::from(range.clone());
                     ids.mask(mask);
-                    ranges.extend(GroupingIterator::new(
-                        unsafe { ids.into_addr_iter() }.map(|addr| addr - range.start + offset),
-                    ));
+                    // Range-aware path: walk the bitmap's runs directly via
+                    // iter_runs so the per-row cost collapses to per-run cost.
+                    // SAFETY: built from a u64 range; no Full entries possible.
+                    let mut cur: Option<Range<u64>> = None;
+                    for (fragment, run) in unsafe { ids.iter_runs() } {
+                        let frag = u64::from(fragment);
+                        let run_start = (frag << 32) | u64::from(*run.start());
+                        let run_end_excl = (frag << 32) | (u64::from(*run.end()) + 1);
+                        let start = run_start - range.start + offset;
+                        let end = run_end_excl - range.start + offset;
+                        match cur.as_mut() {
+                            Some(c) if c.end == start => c.end = end,
+                            Some(c) => {
+                                ranges.push(std::mem::replace(c, start..end));
+                            }
+                            None => cur = Some(start..end),
+                        }
+                    }
+                    if let Some(c) = cur {
+                        ranges.push(c);
+                    }
                     offset += range.end - range.start;
                 }
                 U64Segment::RangeWithHoles { range, holes } => {

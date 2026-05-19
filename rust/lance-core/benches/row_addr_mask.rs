@@ -108,6 +108,31 @@ fn bench_iter_runs(c: &mut Criterion) {
     group.finish();
 }
 
+/// Range-aware consumer cost via the public `RowAddrTreeMap::iter_runs`
+/// API. The map is built the ordinary way (`insert_range` → Partial
+/// bitmap); `iter_runs` walks the bitmap's run containers via
+/// `Iter::next_range`. Compare against `into_addr_iter_single_run` to see
+/// the consumer-side speedup callers get without changing the underlying
+/// representation.
+fn bench_iter_runs_partial(c: &mut Criterion) {
+    let mut group = c.benchmark_group("iter_runs_partial_single_run");
+    for &n in ROW_COUNTS {
+        let map = make_range_mask(n);
+        group.throughput(Throughput::Elements(n));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                // SAFETY: map only contains Partial selections.
+                let mut runs: u64 = 0;
+                for _ in unsafe { map.iter_runs() } {
+                    runs += 1;
+                }
+                std::hint::black_box(runs);
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Set intersection of two range-shaped masks.
 ///
 /// Both inputs are single contiguous runs that overlap in their middle
@@ -164,6 +189,32 @@ fn bench_range_to_ranges_round_trip(c: &mut Criterion) {
     group.finish();
 }
 
+/// Same end-to-end shape as `mask_to_offset_ranges_inner_loop`, but the
+/// final per-bit walk is replaced by `iter_runs`. Quantifies the speedup
+/// the consumer side gets purely from switching iteration APIs — no
+/// representation change.
+fn bench_range_to_ranges_round_trip_runs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mask_to_offset_ranges_inner_loop_runs");
+    for &n in ROW_COUNTS {
+        let mask_range = n..(2 * n);
+        let mask = RowAddrMask::AllowList(RowAddrTreeMap::from(mask_range));
+        let src: Range<u64> = 0..(2 * n);
+        group.throughput(Throughput::Elements(n));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                let mut ids = RowAddrTreeMap::from(src.clone());
+                ids.mask(&mask);
+                // SAFETY: only Partial selections in play.
+                let count: u64 = unsafe { ids.iter_runs() }
+                    .map(|(_, r)| (*r.end() as u64) - (*r.start() as u64) + 1)
+                    .sum();
+                std::hint::black_box(count);
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Many small runs vs one big run with the same total cardinality.
 ///
 /// A range-aware representation should be O(num_runs), so the
@@ -206,8 +257,10 @@ criterion_group!(
     bench_insert_range,
     bench_iter_addrs,
     bench_iter_runs,
+    bench_iter_runs_partial,
     bench_intersect_ranges,
     bench_range_to_ranges_round_trip,
+    bench_range_to_ranges_round_trip_runs,
     bench_runs_vs_rows,
 );
 criterion_main!(benches);
