@@ -1520,9 +1520,7 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_build_zonemap() {
         use datafusion::common::ScalarValue;
-        use lance_index::scalar::{
-            SargableQuery, SearchResult, zonemap::ZONEMAP_FILENAME,
-        };
+        use lance_index::scalar::{SargableQuery, SearchResult, zonemap::ZONEMAP_FILENAME};
         use std::ops::Bound;
 
         let tmpdir = TempStrDir::default();
@@ -1563,8 +1561,7 @@ mod tests {
         .await
         .unwrap();
 
-        let params =
-            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap);
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap);
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
         assert!(fragment_ids.len() >= 2);
@@ -1651,14 +1648,10 @@ mod tests {
         // Open the merged zonemap and exercise pruning. Range [150, 250] only
         // overlaps fragment 1 (100..115) and fragment 2 (200..215), so the
         // returned mask should be a strict subset of the dataset.
-        let scalar_index = crate::index::scalar::open_scalar_index(
-            &dataset,
-            "id",
-            index,
-            &NoOpMetricsCollector,
-        )
-        .await
-        .unwrap();
+        let scalar_index =
+            crate::index::scalar::open_scalar_index(&dataset, "id", index, &NoOpMetricsCollector)
+                .await
+                .unwrap();
         assert_eq!(scalar_index.index_type(), IndexType::ZoneMap);
 
         let result = scalar_index

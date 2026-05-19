@@ -750,11 +750,7 @@ impl ZoneMapIndexBuilder {
     /// Write the zone-map record batch to a specific file name. Used by the
     /// distributed build path where each worker writes a `part_<id>_zonemap.lance`
     /// file that is later merged by [`merge_index_files`].
-    pub async fn write_index_to(
-        self,
-        index_store: &dyn IndexStore,
-        file_name: &str,
-    ) -> Result<()> {
+    pub async fn write_index_to(self, index_store: &dyn IndexStore, file_name: &str) -> Result<()> {
         let record_batch = self.zonemap_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -1089,9 +1085,7 @@ pub async fn merge_index_files(
     if first_num_rows > 0 {
         writer.write_record_batch(first_batch).await?;
     }
-    progress
-        .stage_progress("concat_zonemap_parts", 1)
-        .await?;
+    progress.stage_progress("concat_zonemap_parts", 1).await?;
 
     for (idx, file_name) in part_files.iter().enumerate().skip(1) {
         let reader = store.open_index_file(file_name).await?;
