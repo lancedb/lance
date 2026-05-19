@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::{DatasetMemWalExt, MemTableScanner, MemWalConfig, ShardWriterConfig};
+use lance::dataset::mem_wal::{DatasetMemWalExt, MemTableScanner, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_core::Result;
@@ -396,14 +396,13 @@ async fn build_seed_dataset(
             .await?;
     }
     dataset
-        .initialize_mem_wal(MemWalConfig {
-            shard_spec: None,
-            maintained_indexes: if indexed {
-                vec![FTS_INDEX_NAME.to_string()]
-            } else {
-                vec![]
-            },
+        .initialize_mem_wal()
+        .maintained_indexes(if indexed {
+            vec![FTS_INDEX_NAME.to_string()]
+        } else {
+            vec![]
         })
+        .execute()
         .await?;
     Ok(start.elapsed().as_secs_f64())
 }
