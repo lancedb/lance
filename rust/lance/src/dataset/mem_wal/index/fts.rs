@@ -78,6 +78,26 @@ pub struct FtsEntry {
     pub score: f32,
 }
 
+/// Per-candidate sufficient statistics for global-stats rescoring.
+///
+/// Carries everything a downstream coordinator needs to recompute BM25 with a
+/// globally-aggregated `MemBM25Scorer`: the doc length and the per-query-term
+/// frequencies. `local_score` is the score this index already computed under
+/// its own corpus statistics — useful for diagnostics and for the `Local`
+/// scoring mode that doesn't rescore.
+#[derive(Debug, Clone)]
+pub struct FtsCandidate {
+    /// Row position in MemTable.
+    pub row_position: RowPosition,
+    /// Token count for this document (`|d|`).
+    pub doc_len: u32,
+    /// One frequency per query term, in the order terms were passed to
+    /// `search_candidates`. A zero means the term is absent from the doc.
+    pub term_freqs: Vec<u32>,
+    /// BM25 score under this index's local corpus statistics.
+    pub local_score: f32,
+}
+
 /// Full-text search query expression for composable queries.
 #[derive(Debug, Clone)]
 pub enum FtsQueryExpr {
@@ -1387,6 +1407,153 @@ impl FtsMemIndex {
             out.push(t.text.clone());
         }
         out
+    }
+
+    // ------------------------------------------------------------------
+    // Stats export and rescore-friendly candidate search
+    // ------------------------------------------------------------------
+
+    /// Segment summary for the supplied terms.
+    ///
+    /// Returns `(total_tokens, num_docs, df_per_term)` where each `df_per_term[i]`
+    /// is the number of visible documents containing `terms[i]`. The element
+    /// order matches `terms`, so callers can feed this directly into
+    /// `build_global_bm25_scorer`-style aggregation without re-keying.
+    ///
+    /// All inputs are tokenized exactly as the caller passes them — no extra
+    /// search-time tokenization is applied. Pass already-tokenized strings if
+    /// the goal is to compare against `bm25_search`'s scorer.
+    pub fn bm25_stats_for_terms(&self, terms: &[String]) -> (u64, usize, Vec<usize>) {
+        let st = self.state.load_full();
+        let tail_snap = st.tail.snapshot();
+        let mut total_tokens = tail_snap.cumulative_total_tokens;
+        let mut num_docs = tail_snap.cumulative_doc_count as usize;
+        for p in st.partitions.iter() {
+            total_tokens += p.total_tokens();
+            num_docs += p.doc_count();
+        }
+        let dfs: Vec<usize> = terms
+            .iter()
+            .map(|t| {
+                let mut df = tail_token_df(&st.tail.terms, t, tail_snap.visible_count);
+                for p in st.partitions.iter() {
+                    df += p.token_df(t);
+                }
+                df
+            })
+            .collect();
+        (total_tokens, num_docs, dfs)
+    }
+
+    /// Search and return the top-`k_prime` candidates with raw BM25
+    /// sufficient statistics for downstream global rescoring.
+    ///
+    /// `query_terms` must already be tokenized — this method does not invoke
+    /// the index tokenizer. Tokens not present in the index contribute zero
+    /// frequencies and zero score (matching the OR semantics of
+    /// `search_match`).
+    ///
+    /// Documents are ranked by local BM25 (this index's own corpus stats);
+    /// the per-candidate `local_score` is reported alongside `doc_len` and
+    /// `term_freqs` so a coordinator can recompute with global stats without
+    /// touching the index again.
+    pub fn search_candidates(&self, query_terms: &[String], k_prime: usize) -> Vec<FtsCandidate> {
+        if query_terms.is_empty() || k_prime == 0 {
+            return Vec::new();
+        }
+        let st = self.state.load_full();
+        let tail_snap = st.tail.snapshot();
+        let scorer = build_scorer(&st, &tail_snap, query_terms);
+        if scorer.num_docs() == 0 {
+            return Vec::new();
+        }
+
+        // Aggregate (doc_len, tfs_per_query_term) per matching row.
+        let num_terms = query_terms.len();
+        let mut per_doc: HashMap<RowPosition, (u32, Vec<u32>)> = HashMap::new();
+
+        // Tail contribution.
+        for (ti, token) in query_terms.iter().enumerate() {
+            let Some(entry) = st.tail.terms.get(token.as_str()) else {
+                continue;
+            };
+            let slice = entry.value().load_full();
+            for chunk in &slice.chunks {
+                if chunk.batch_position >= tail_snap.visible_count {
+                    continue;
+                }
+                let Some(meta) = tail_snap.batch_for(chunk.batch_position) else {
+                    continue;
+                };
+                for (i, &row_position) in chunk.row_positions.iter().enumerate() {
+                    let dl = meta.dl(row_position).unwrap_or(1);
+                    let freq = chunk.frequencies[i];
+                    let slot = per_doc
+                        .entry(row_position)
+                        .or_insert_with(|| (dl, vec![0u32; num_terms]));
+                    // dl can come in from a later term but for a tail row
+                    // it's the same value either way; keep the first write.
+                    slot.0 = dl;
+                    slot.1[ti] = freq;
+                }
+            }
+        }
+
+        // Frozen partitions contribution.
+        for partition in st.partitions.iter() {
+            for (ti, token) in query_terms.iter().enumerate() {
+                let Some(term_id) = partition.term_id(token) else {
+                    continue;
+                };
+                let mut cursor = PostingCursor::new(partition, term_id);
+                while let Some(local_doc) = cursor.cursor_doc() {
+                    let row_pos = partition.docs.row_id(local_doc);
+                    let dl = partition.docs.num_tokens(local_doc);
+                    let freq = cursor.freq();
+                    let slot = per_doc
+                        .entry(row_pos)
+                        .or_insert_with(|| (dl, vec![0u32; num_terms]));
+                    slot.0 = dl;
+                    slot.1[ti] = freq;
+                    cursor.advance();
+                }
+            }
+        }
+
+        // Score each row with local stats and keep the top-K'.
+        let mut candidates: Vec<FtsCandidate> = per_doc
+            .into_iter()
+            .map(|(row_position, (doc_len, term_freqs))| {
+                let mut score = 0f32;
+                for (ti, &tf) in term_freqs.iter().enumerate() {
+                    if tf > 0 {
+                        score +=
+                            scorer.query_weight(&query_terms[ti]) * scorer.doc_weight(tf, doc_len);
+                    }
+                }
+                FtsCandidate {
+                    row_position,
+                    doc_len,
+                    term_freqs,
+                    local_score: score,
+                }
+            })
+            .collect();
+
+        if candidates.len() > k_prime {
+            candidates.select_nth_unstable_by(k_prime, |a, b| {
+                b.local_score
+                    .partial_cmp(&a.local_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(k_prime);
+        }
+        candidates.sort_by(|a, b| {
+            b.local_score
+                .partial_cmp(&a.local_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates
     }
 
     // ------------------------------------------------------------------
@@ -2765,6 +2932,124 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_bm25_stats_for_terms_tail_only() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = create_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        let (total_tokens, num_docs, df) = index.bm25_stats_for_terms(&[
+            "hello".to_string(),
+            "world".to_string(),
+            "missing".to_string(),
+        ]);
+        assert_eq!(num_docs, 3);
+        // "hello world" (2) + "goodbye world" (2) + "hello again" (2) = 6 tokens
+        assert_eq!(total_tokens, 6);
+        assert_eq!(df, vec![2, 2, 0]);
+    }
+
+    #[test]
+    fn test_bm25_stats_for_terms_with_frozen_partition() {
+        let schema = create_test_schema();
+        // Freeze after every batch so the partition path is exercised.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(1);
+        let batch = create_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        let (total_tokens, num_docs, df) =
+            index.bm25_stats_for_terms(&["hello".to_string(), "world".to_string()]);
+        // Same corpus, just lives in frozen partitions now. Stats must match
+        // the tail-only result exactly so global aggregation is freeze-invariant.
+        assert_eq!(num_docs, 3);
+        assert_eq!(total_tokens, 6);
+        assert_eq!(df, vec![2, 2]);
+    }
+
+    #[test]
+    fn test_search_candidates_returns_doc_len_and_tfs() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = create_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        // Query terms: "hello" matches rows 0,2; "world" matches rows 0,1.
+        // Row 0 contains both → tfs = [1, 1]; row 1 → [0, 1]; row 2 → [1, 0].
+        let candidates = index.search_candidates(&["hello".to_string(), "world".to_string()], 10);
+        assert_eq!(candidates.len(), 3);
+
+        let by_pos: HashMap<u64, &FtsCandidate> =
+            candidates.iter().map(|c| (c.row_position, c)).collect();
+
+        let c0 = by_pos.get(&0).expect("row 0 hit");
+        assert_eq!(c0.doc_len, 2);
+        assert_eq!(c0.term_freqs, vec![1, 1]);
+        assert!(c0.local_score > 0.0);
+
+        let c1 = by_pos.get(&1).expect("row 1 hit");
+        assert_eq!(c1.doc_len, 2);
+        assert_eq!(c1.term_freqs, vec![0, 1]);
+
+        let c2 = by_pos.get(&2).expect("row 2 hit");
+        assert_eq!(c2.doc_len, 2);
+        assert_eq!(c2.term_freqs, vec![1, 0]);
+
+        // Output must be sorted by local_score DESC.
+        for w in candidates.windows(2) {
+            assert!(w[0].local_score >= w[1].local_score);
+        }
+    }
+
+    #[test]
+    fn test_search_candidates_k_prime_truncation() {
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = create_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        let top1 = index.search_candidates(&["world".to_string()], 1);
+        assert_eq!(top1.len(), 1);
+
+        let top0 = index.search_candidates(&["world".to_string()], 0);
+        assert!(
+            top0.is_empty(),
+            "k_prime=0 must return empty without panicking"
+        );
+
+        let none = index.search_candidates(&[], 10);
+        assert!(none.is_empty(), "empty query must return empty");
+    }
+
+    #[test]
+    fn test_search_candidates_consistent_across_freeze() {
+        // search_candidates must return identical stats whether the data is
+        // in the tail or already frozen into a partition — this is the
+        // invariant the LSM rescore path depends on.
+        let schema = create_test_schema();
+
+        let tail_only = FtsMemIndex::new(1, "description".to_string());
+        tail_only.insert(&create_test_batch(&schema), 0).unwrap();
+
+        let frozen = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(1);
+        frozen.insert(&create_test_batch(&schema), 0).unwrap();
+
+        let terms = vec!["hello".to_string(), "world".to_string()];
+        let a = tail_only.search_candidates(&terms, 10);
+        let b = frozen.search_candidates(&terms, 10);
+        assert_eq!(a.len(), b.len());
+
+        let a_map: HashMap<u64, (u32, Vec<u32>)> = a
+            .into_iter()
+            .map(|c| (c.row_position, (c.doc_len, c.term_freqs)))
+            .collect();
+        let b_map: HashMap<u64, (u32, Vec<u32>)> = b
+            .into_iter()
+            .map(|c| (c.row_position, (c.doc_len, c.term_freqs)))
+            .collect();
+        assert_eq!(a_map, b_map);
     }
 
     #[test]
