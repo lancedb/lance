@@ -113,22 +113,13 @@ pub async fn cleanup_shard_files(store: &dyn IndexStore, result: &MergeResult) {
 
     for file_name in &result.part_page_files {
         if file_name.starts_with("part_") && file_name.ends_with("_page_data.lance") {
-            match store.delete_index_file(file_name).await {
-                Ok(()) => {
-                    debug!("Successfully deleted partition page file: {}", file_name);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to delete partition page file '{}': {}. \
-                        This does not affect the merge operation, but may leave \
-                        partition files that should be cleaned up manually.",
-                        file_name, e
-                    );
-                }
-            }
+            debug!(
+                "Keeping partition page file '{}' — it is still needed for range-partitioned queries",
+                file_name
+            );
         } else {
             warn!(
-                "Skipping deletion of file '{}' as it does not match the expected \
+                "Skipping file '{}' as it does not match the expected \
                 partition page file pattern (part_*_page_data.lance)",
                 file_name
             );
