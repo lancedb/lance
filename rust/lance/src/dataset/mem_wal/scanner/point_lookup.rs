@@ -19,7 +19,7 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
-use super::flushed_cache::{FlushedDatasetCache, open_flushed_dataset};
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, project_to_canonical, wants_row_address,
     wants_row_id,
@@ -75,7 +75,7 @@ pub struct LsmPointLookupPlanner {
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<FlushedDatasetCache>>,
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmPointLookupPlanner {
@@ -110,7 +110,7 @@ impl LsmPointLookupPlanner {
 
     /// Inject a cache of opened flushed-generation datasets, making repeated
     /// lookups against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedDatasetCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
         self
     }

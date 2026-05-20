@@ -19,7 +19,7 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
-use super::flushed_cache::{FlushedDatasetCache, open_flushed_dataset};
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
 };
@@ -36,7 +36,7 @@ pub struct LsmScanPlanner {
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<FlushedDatasetCache>>,
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmScanPlanner {
@@ -64,7 +64,7 @@ impl LsmScanPlanner {
 
     /// Inject a cache of opened flushed-generation datasets, making repeated
     /// queries against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedDatasetCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
         self
     }

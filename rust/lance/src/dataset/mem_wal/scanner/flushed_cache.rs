@@ -15,7 +15,7 @@
 //!                                  │
 //!            cache.is_some() ──────┤────── cache.is_none()
 //!                  │                              │
-//!     FlushedDatasetCache::get_or_open      DatasetBuilder::from_uri
+//!     FlushedMemTableCache::get_or_open      DatasetBuilder::from_uri
 //!     (single-flight, shared Arc)           (cold open every call)
 //! ```
 
@@ -38,14 +38,14 @@ use crate::session::Session;
 /// The key is the resolved absolute flushed path
 /// (`{base}/_mem_wal/{shard}/{folder}`), which is globally unique, so a single
 /// cache can safely span multiple tables.
-pub struct FlushedDatasetCache {
+pub struct FlushedMemTableCache {
     // `moka`'s async cache gives a bounded size plus single-flight
     // `try_get_with`, so concurrent first-queries on a just-flushed
     // generation open the dataset exactly once.
     inner: moka::future::Cache<String, Arc<Dataset>>,
 }
 
-impl FlushedDatasetCache {
+impl FlushedMemTableCache {
     /// Create a cache holding at most `max_entries` opened datasets.
     ///
     /// Eviction is size-only (no TTL): an evicted-then-re-requested generation
@@ -105,9 +105,9 @@ impl FlushedDatasetCache {
     }
 }
 
-impl std::fmt::Debug for FlushedDatasetCache {
+impl std::fmt::Debug for FlushedMemTableCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FlushedDatasetCache")
+        f.debug_struct("FlushedMemTableCache")
             .field("entry_count", &self.inner.entry_count())
             .finish()
     }
@@ -116,7 +116,7 @@ impl std::fmt::Debug for FlushedDatasetCache {
 /// Open a flushed-generation dataset, shared by all three LSM open sites
 /// (scan, point lookup, vector search).
 ///
-/// - `cache` present: route through [`FlushedDatasetCache`] (single-flight,
+/// - `cache` present: route through [`FlushedMemTableCache`] (single-flight,
 ///   shared `Arc`, manifest read amortized across queries).
 /// - `cache` absent: cold open via [`DatasetBuilder`]. Passing `session`
 ///   still reuses the shared index / metadata caches; `None`/`None`
@@ -124,7 +124,7 @@ impl std::fmt::Debug for FlushedDatasetCache {
 pub(super) async fn open_flushed_dataset(
     path: &str,
     session: Option<&Arc<Session>>,
-    cache: Option<&Arc<FlushedDatasetCache>>,
+    cache: Option<&Arc<FlushedMemTableCache>>,
 ) -> Result<Arc<Dataset>> {
     match cache {
         Some(cache) => cache.get_or_open(path, session.cloned()).await,
@@ -172,7 +172,7 @@ mod tests {
         let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
         write_dataset(&uri, &[1, 2, 3]).await;
 
-        let cache = FlushedDatasetCache::new(8);
+        let cache = FlushedMemTableCache::new(8);
         let first = cache.get_or_open(&uri, None).await.unwrap();
         let second = cache.get_or_open(&uri, None).await.unwrap();
 
@@ -195,7 +195,7 @@ mod tests {
         let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
         write_dataset(&uri, &[1, 2, 3]).await;
 
-        let cache = Arc::new(FlushedDatasetCache::new(8));
+        let cache = Arc::new(FlushedMemTableCache::new(8));
         let calls = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::new();
@@ -232,7 +232,7 @@ mod tests {
         write_dataset(&keep_uri, &[1]).await;
         write_dataset(&drop_uri, &[2]).await;
 
-        let cache = FlushedDatasetCache::new(8);
+        let cache = FlushedMemTableCache::new(8);
         cache.get_or_open(&keep_uri, None).await.unwrap();
         cache.get_or_open(&drop_uri, None).await.unwrap();
         cache.inner.run_pending_tasks().await;
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(a.count_rows(None).await.unwrap(), 3);
 
         // With a cache, the second call is a shared clone.
-        let cache = Arc::new(FlushedDatasetCache::new(8));
+        let cache = Arc::new(FlushedMemTableCache::new(8));
         let c = open_flushed_dataset(&uri, None, Some(&cache))
             .await
             .unwrap();

@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::ShardSnapshot;
-use super::flushed_cache::FlushedDatasetCache;
+use super::flushed_cache::FlushedMemTableCache;
 use super::planner::LsmScanPlanner;
 use crate::dataset::Dataset;
 use crate::session::Session;
@@ -82,7 +82,7 @@ pub struct LsmScanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
-    flushed_cache: Option<Arc<FlushedDatasetCache>>,
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmScanner {
@@ -204,9 +204,9 @@ impl LsmScanner {
     ///
     /// With a cache, repeated queries against the same generation become a
     /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
-    /// is owned and sized by the caller (see [`FlushedDatasetCache`]); not
+    /// is owned and sized by the caller (see [`FlushedMemTableCache`]); not
     /// set by default, so behavior is unchanged unless opted in.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedDatasetCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
         self
     }
