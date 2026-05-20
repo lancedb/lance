@@ -15,19 +15,24 @@
 //!   coordinates stats across sources.
 //! - [`FtsScoringMode::LocalWithGlobalRescore`] — each source returns
 //!   top-K' candidates with the raw BM25 sufficient statistics
-//!   (`doc_len`, per-term frequencies), and a coordinator rescores
-//!   them with globally-aggregated stats. NOT YET IMPLEMENTED at the
-//!   planner level — returns a descriptive error today; will land
-//!   alongside the rescore-aware per-source exec nodes.
+//!   (`doc_len`, per-term frequencies); the planner aggregates
+//!   per-source `(N, sumdl, df_t)` into one global `MemBM25Scorer`,
+//!   rescores every candidate with the global stats, and returns the
+//!   pre-materialized top-k as a [`MemorySourceConfig`] exec.
 //!
 //! Staleness: per-source results are returned as-is. The same primary
 //! key may appear from multiple sources if it was updated across
 //! generations; the caller is responsible for dedup if they need it.
 //! This is the user-chosen behavior captured in `DESIGN.md §3`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::{Array, Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
+use arrow_select::concat::concat_batches;
+use arrow_select::take::take;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
@@ -35,13 +40,23 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use lance_core::{Error, Result, is_system_column};
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::prefilter::NoFilter;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::document_tokenizer::DocType;
+use lance_index::scalar::inverted::query::{
+    FtsQuery as IndexFtsQuery, FtsSearchParams, Operator, Tokens, collect_query_tokens,
+};
+use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexCandidate, MemBM25Scorer, Scorer};
 use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::projection::project_to_canonical;
+use crate::Dataset;
+use crate::dataset::mem_wal::index::FtsCandidate;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// `_score` column name in FTS results — kept aligned with
 /// `lance_index::scalar::inverted::SCORE_COL` so this module doesn't
@@ -148,12 +163,310 @@ impl LsmFtsSearchPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match mode {
             FtsScoringMode::Local => self.plan_local(column, query, k, projection).await,
-            FtsScoringMode::LocalWithGlobalRescore { .. } => Err(Error::not_supported(format!(
-                "LocalWithGlobalRescore FTS planner not yet implemented; tracked under \
-                 ~/ai/analysis/lance/FTSRead/lsm-fts-search-with-global-rescore/PLAN.md \
-                 (T3 phase 2). Use FtsScoringMode::Local for now (k={k}, column={column})."
-            ))),
+            FtsScoringMode::LocalWithGlobalRescore { rescore_factor } => {
+                self.plan_rescore(column, query, k, projection, rescore_factor)
+                    .await
+            }
         }
+    }
+
+    /// Single-node implementation of wjones127's `LocalWithGlobalRescore`
+    /// mode (discussion #6789). Orchestrates synchronously:
+    ///
+    /// 1. Tokenize the query against the first available source's
+    ///    tokenizer (we assume all sources share the same FTS params).
+    /// 2. Open the InvertedIndex for each Lance source and gather
+    ///    `(N_i, sumdl_i, df_t_i)` from every source.
+    /// 3. Aggregate into a single global `MemBM25Scorer`.
+    /// 4. Run each source's candidate search with LOCAL stats (so each
+    ///    segment uses its own WAND pruning thresholds).
+    /// 5. Rescore the union of candidates with the global scorer.
+    /// 6. Take the top-k by rescored `_score`.
+    /// 7. Materialize user columns (active arm reads BatchStore; Lance
+    ///    arms `take_rows`), assemble the output RecordBatch, and
+    ///    return it as a `MemorySourceConfig` exec.
+    ///
+    /// The output is pre-materialized rather than streaming because
+    /// rescore needs every candidate from every source in scope before
+    /// it can pick the global top-k — a buffered exec would be the same
+    /// shape under the hood. For the bench-relevant single-node case
+    /// this is a clear win on simplicity at no correctness cost.
+    async fn plan_rescore(
+        &self,
+        column: &str,
+        query: FullTextSearchQuery,
+        k: usize,
+        projection: Option<&[String]>,
+        rescore_factor: u32,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let sources = self.collector.collect()?;
+        let target_schema = self.canonical_fts_schema(projection);
+        if sources.is_empty() || k == 0 {
+            return self.empty_plan(&target_schema);
+        }
+
+        // Step 1: pull a tokenizer + tokenize the query text.
+        let match_text = extract_match_text(&query)?;
+        let mut tokenizer = self.resolve_tokenizer(&sources, column).await?;
+        let tokens_obj = collect_query_tokens(&match_text, &mut tokenizer);
+        let token_strs: Vec<String> = (0..tokens_obj.len())
+            .map(|i| tokens_obj.get_token(i).to_owned())
+            .collect();
+        if token_strs.is_empty() {
+            return self.empty_plan(&target_schema);
+        }
+
+        let k_prime = FtsScoringMode::LocalWithGlobalRescore { rescore_factor }.rescore_k_prime(k);
+
+        // Step 2: resolve each source to a `SourceHandle` and gather its stats.
+        let mut handles: Vec<SourceHandle> = Vec::with_capacity(sources.len());
+        let mut total_tokens: u64 = 0;
+        let mut num_docs: usize = 0;
+        let mut df_map: HashMap<String, usize> =
+            token_strs.iter().map(|t| (t.clone(), 0usize)).collect();
+        for source in &sources {
+            let handle = self.resolve_handle(source, column).await?;
+            let (tt, nd, df_vec) = handle.stats_for_terms(&token_strs)?;
+            total_tokens += tt;
+            num_docs += nd;
+            for (t, c) in token_strs.iter().zip(df_vec.into_iter()) {
+                *df_map.get_mut(t).expect("df entry seeded above") += c;
+            }
+            handles.push(handle);
+        }
+        if num_docs == 0 {
+            return self.empty_plan(&target_schema);
+        }
+        let global_scorer = MemBM25Scorer::new(total_tokens, num_docs, df_map);
+
+        // Step 3: per-source candidate search with LOCAL pruning (no base_scorer).
+        let tokens_arc = Arc::new(Tokens::new(token_strs.clone(), DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(k_prime)));
+        let mut rescored: Vec<RescoredCandidate> = Vec::new();
+        for (source_idx, handle) in handles.iter().enumerate() {
+            let candidates = handle
+                .candidate_search(&tokens_arc, &params, &token_strs)
+                .await?;
+            for c in candidates {
+                // Step 4: rescore with global scorer in-place.
+                let score = bm25_score(&global_scorer, &token_strs, &c.term_freqs, c.doc_len);
+                rescored.push(RescoredCandidate {
+                    source_idx,
+                    row_id: c.row_id,
+                    score,
+                });
+            }
+        }
+
+        // Step 5: pick global top-k.
+        rescored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rescored.truncate(k);
+        if rescored.is_empty() {
+            return self.empty_plan(&target_schema);
+        }
+
+        // Step 6: materialize user columns per source, in the order
+        // determined by `rescored`. Each candidate carries the source it
+        // came from so we know which BatchStore / Dataset to take from.
+        let final_batch = self
+            .materialize_rescored(&handles, &rescored, projection, &target_schema)
+            .await?;
+
+        // Step 7: wrap pre-computed batch in MemorySourceConfig.
+        let exec =
+            MemorySourceConfig::try_new_exec(&[vec![final_batch]], target_schema.clone(), None)
+                .map_err(|e| Error::internal(format!("MemorySourceConfig failed: {e}")))?;
+        Ok(exec)
+    }
+
+    /// Acquire a tokenizer compatible with every source's FTS index.
+    ///
+    /// We assume FTS-indexed sources in an LSM hierarchy share their
+    /// `InvertedIndexParams` (otherwise their indexes wouldn't be
+    /// merge-compatible). Pulls the tokenizer from the first source
+    /// that has one; any later mismatch is the caller's bug.
+    async fn resolve_tokenizer(
+        &self,
+        sources: &[LsmDataSource],
+        column: &str,
+    ) -> Result<Box<dyn lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer>>
+    {
+        for source in sources {
+            match source {
+                LsmDataSource::ActiveMemTable { index_store, .. } => {
+                    if let Some(idx) = index_store.get_fts_by_column(column) {
+                        return idx.params().build();
+                    }
+                }
+                LsmDataSource::BaseTable { dataset } => {
+                    if let Some(idx) = open_inverted_index(dataset, column).await? {
+                        return Ok(idx.tokenizer());
+                    }
+                }
+                LsmDataSource::FlushedMemTable { path, .. } => {
+                    let dataset = crate::dataset::DatasetBuilder::from_uri(path)
+                        .load()
+                        .await?;
+                    if let Some(idx) = open_inverted_index(&dataset, column).await? {
+                        return Ok(idx.tokenizer());
+                    }
+                }
+            }
+        }
+        Err(Error::invalid_input(format!(
+            "No source carries an FTS index on column '{column}'; \
+             cannot tokenize the query for LocalWithGlobalRescore mode."
+        )))
+    }
+
+    async fn resolve_handle(&self, source: &LsmDataSource, column: &str) -> Result<SourceHandle> {
+        match source {
+            LsmDataSource::ActiveMemTable {
+                batch_store,
+                index_store,
+                schema,
+                ..
+            } => {
+                let _ = index_store.get_fts_by_column(column).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Active memtable is missing an FTS index on column '{column}'"
+                    ))
+                })?;
+                Ok(SourceHandle::Active {
+                    batch_store: batch_store.clone(),
+                    index_store: index_store.clone(),
+                    schema: schema.clone(),
+                    column: column.to_string(),
+                })
+            }
+            LsmDataSource::BaseTable { dataset } => {
+                let index = open_inverted_index(dataset, column).await?.ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Base table is missing an FTS index on column '{column}'"
+                    ))
+                })?;
+                Ok(SourceHandle::Lance {
+                    dataset: dataset.clone(),
+                    index,
+                })
+            }
+            LsmDataSource::FlushedMemTable { path, .. } => {
+                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
+                    .load()
+                    .await?;
+                let index = open_inverted_index(&dataset, column).await?.ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Flushed memtable at {path} is missing an FTS index on column '{column}'"
+                    ))
+                })?;
+                Ok(SourceHandle::Lance {
+                    dataset: Arc::new(dataset),
+                    index,
+                })
+            }
+        }
+    }
+
+    /// Materialize the rescored top-k into a single RecordBatch with
+    /// the canonical FTS schema. Groups by source so we can issue one
+    /// take per Lance source, then rebuilds the original row order.
+    async fn materialize_rescored(
+        &self,
+        handles: &[SourceHandle],
+        rescored: &[RescoredCandidate],
+        projection: Option<&[String]>,
+        target_schema: &SchemaRef,
+    ) -> Result<RecordBatch> {
+        let cols = self.fts_scanner_projection(projection);
+        // Group candidate positions by source.
+        let mut by_source: HashMap<usize, Vec<(usize, u64, f32)>> = HashMap::new();
+        for (i, r) in rescored.iter().enumerate() {
+            by_source
+                .entry(r.source_idx)
+                .or_default()
+                .push((i, r.row_id, r.score));
+        }
+
+        // For each source, materialize its rows into a partial batch
+        // that includes a synthetic `_order` column (the index in
+        // `rescored`) so we can re-sort at the end.
+        let mut partials: Vec<RecordBatch> = Vec::new();
+        for (source_idx, mut entries) in by_source.into_iter() {
+            // Stable to preserve relative order; not strictly needed
+            // because we re-sort by `_order` below, but cheaper to keep
+            // related row ids adjacent for take.
+            entries.sort_by_key(|(_, rid, _)| *rid);
+            let row_ids: Vec<u64> = entries.iter().map(|(_, rid, _)| *rid).collect();
+            let scores: Vec<f32> = entries.iter().map(|(_, _, s)| *s).collect();
+            let orders: Vec<u32> = entries.iter().map(|(i, _, _)| *i as u32).collect();
+
+            let materialized = handles[source_idx]
+                .materialize_rows(&row_ids, &cols)
+                .await?;
+            let mut columns: Vec<Arc<dyn Array>> = materialized.columns().to_vec();
+            let mut fields: Vec<Arc<Field>> =
+                materialized.schema().fields().iter().cloned().collect();
+            columns.push(Arc::new(Float32Array::from(scores)));
+            fields.push(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)));
+            columns.push(Arc::new(UInt32Array::from(orders)));
+            fields.push(Arc::new(Field::new(
+                "__lsm_fts_order",
+                DataType::UInt32,
+                false,
+            )));
+
+            let schema = Arc::new(Schema::new(
+                fields.iter().map(|f| (**f).clone()).collect::<Vec<_>>(),
+            ));
+            partials.push(RecordBatch::try_new(schema, columns)?);
+        }
+
+        if partials.is_empty() {
+            // All sources returned 0 candidates after rescore.
+            return Ok(RecordBatch::new_empty(target_schema.clone()));
+        }
+
+        // Concat across sources.
+        let stitch_schema = partials[0].schema();
+        let stitched = concat_batches(&stitch_schema, &partials)?;
+
+        // Sort by `__lsm_fts_order` ASC so the output reflects the
+        // top-k order from `rescored`.
+        let order_col = stitched
+            .column_by_name("__lsm_fts_order")
+            .expect("__lsm_fts_order present after materialize")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("__lsm_fts_order is UInt32");
+        let mut indices_with_order: Vec<(usize, u32)> = (0..order_col.len())
+            .map(|i| (i, order_col.value(i)))
+            .collect();
+        indices_with_order.sort_by_key(|(_, o)| *o);
+        let take_idx: UInt32Array = indices_with_order.iter().map(|(i, _)| *i as u32).collect();
+
+        // Drop `__lsm_fts_order` from the final output by projecting on
+        // the canonical schema's column names.
+        let final_cols: Vec<Arc<dyn Array>> = target_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let src = stitched.column_by_name(f.name()).ok_or_else(|| {
+                    Error::internal(format!(
+                        "rescore materialization missing column '{}'",
+                        f.name()
+                    ))
+                })?;
+                let taken = take(src.as_ref(), &take_idx, None).map_err(|e| {
+                    Error::internal(format!("take failed on column '{}': {e}", f.name()))
+                })?;
+                Ok::<_, Error>(taken)
+            })
+            .collect::<Result<_>>()?;
+        Ok(RecordBatch::try_new(target_schema.clone(), final_cols)?)
     }
 
     async fn plan_local(
@@ -354,6 +667,294 @@ impl LsmFtsSearchPlanner {
     }
 }
 
+/// One rescored hit threaded through the rescore orchestrator.
+#[derive(Debug)]
+struct RescoredCandidate {
+    /// Index into the `handles` slice — tells materialization which
+    /// source the `row_id` is relative to.
+    source_idx: usize,
+    /// Source-local row identifier.
+    ///
+    /// * Active arm: BatchStore row position.
+    /// * Lance arm: Lance row id.
+    row_id: u64,
+    /// Score under the globally-aggregated BM25 statistics.
+    score: f32,
+}
+
+/// Pre-resolved handle for a single LSM source. Created once per
+/// rescore plan so we don't reopen `Dataset` / `InvertedIndex` twice
+/// (once for stats, once for candidates).
+enum SourceHandle {
+    Active {
+        batch_store: Arc<BatchStore>,
+        index_store: Arc<IndexStore>,
+        schema: SchemaRef,
+        column: String,
+    },
+    Lance {
+        dataset: Arc<Dataset>,
+        index: Arc<InvertedIndex>,
+    },
+}
+
+impl SourceHandle {
+    fn stats_for_terms(&self, terms: &[String]) -> Result<(u64, usize, Vec<usize>)> {
+        match self {
+            Self::Active {
+                index_store,
+                column,
+                ..
+            } => {
+                let idx = index_store
+                    .get_fts_by_column(column)
+                    .expect("active handle invariant: FTS index present");
+                Ok(idx.bm25_stats_for_terms(terms))
+            }
+            Self::Lance { index, .. } => Ok(index.bm25_stats_for_terms(terms)),
+        }
+    }
+
+    async fn candidate_search(
+        &self,
+        tokens: &Arc<Tokens>,
+        params: &Arc<FtsSearchParams>,
+        token_strs: &[String],
+    ) -> Result<Vec<UnifiedCandidate>> {
+        match self {
+            Self::Active {
+                index_store,
+                column,
+                ..
+            } => {
+                let idx = index_store
+                    .get_fts_by_column(column)
+                    .expect("active handle invariant: FTS index present");
+                let k_prime = params.limit.unwrap_or(usize::MAX);
+                let candidates = idx.search_candidates(token_strs, k_prime);
+                Ok(candidates
+                    .into_iter()
+                    .map(UnifiedCandidate::from_fts_candidate)
+                    .collect())
+            }
+            Self::Lance { index, .. } => {
+                let prefilter = Arc::new(NoFilter);
+                let metrics = Arc::new(NoOpMetricsCollector);
+                let raw = index
+                    .bm25_candidate_search(
+                        tokens.clone(),
+                        params.clone(),
+                        Operator::Or,
+                        prefilter,
+                        metrics,
+                        None,
+                    )
+                    .await?;
+                Ok(raw
+                    .into_iter()
+                    .map(UnifiedCandidate::from_inverted_candidate)
+                    .collect())
+            }
+        }
+    }
+
+    async fn materialize_rows(&self, row_ids: &[u64], cols: &[String]) -> Result<RecordBatch> {
+        match self {
+            Self::Active {
+                batch_store,
+                schema,
+                ..
+            } => active_materialize(batch_store, schema, row_ids, cols),
+            Self::Lance { dataset, .. } => {
+                // Project the dataset's Lance schema down to the requested
+                // columns by name. Unknown names are dropped (`take_rows`
+                // would otherwise error on schema construction).
+                let names: Vec<&str> = cols
+                    .iter()
+                    .filter(|n| dataset.schema().field(n).is_some())
+                    .map(|n| n.as_str())
+                    .collect();
+                let projection = dataset.schema().project(&names)?;
+                Ok(dataset.take_rows(row_ids, Arc::new(projection)).await?)
+            }
+        }
+    }
+}
+
+/// Common shape for one candidate, regardless of where it came from.
+struct UnifiedCandidate {
+    row_id: u64,
+    doc_len: u32,
+    term_freqs: Vec<u32>,
+}
+
+impl UnifiedCandidate {
+    fn from_fts_candidate(c: FtsCandidate) -> Self {
+        Self {
+            row_id: c.row_position,
+            doc_len: c.doc_len,
+            term_freqs: c.term_freqs,
+        }
+    }
+
+    fn from_inverted_candidate(c: InvertedIndexCandidate) -> Self {
+        Self {
+            row_id: c.row_id,
+            doc_len: c.doc_length,
+            term_freqs: c.term_freqs,
+        }
+    }
+}
+
+/// BM25 score from a scorer + raw per-doc stats.
+fn bm25_score(scorer: &MemBM25Scorer, tokens: &[String], freqs: &[u32], doc_len: u32) -> f32 {
+    let mut score = 0f32;
+    for (ti, tok) in tokens.iter().enumerate() {
+        let f = freqs[ti];
+        if f > 0 {
+            score += scorer.query_weight(tok) * scorer.doc_weight(f, doc_len);
+        }
+    }
+    score
+}
+
+/// Pull the raw text out of a `FullTextSearchQuery` for tokenization.
+///
+/// Today we only handle `MatchQuery`; other shapes return a clear
+/// `not_supported` error mirroring the Local-mode active-arm
+/// restriction. Lifting this requires plumbing structured query shapes
+/// through the rescore path, tracked in `PLAN.md`.
+fn extract_match_text(query: &FullTextSearchQuery) -> Result<String> {
+    match &query.query {
+        IndexFtsQuery::Match(m) => Ok(m.terms.clone()),
+        other => Err(Error::not_supported(format!(
+            "LocalWithGlobalRescore currently supports only MatchQuery; got: {other:?}"
+        ))),
+    }
+}
+
+/// Open the column's inverted index from a Lance dataset, or `None`
+/// if no FTS index exists for the column.
+async fn open_inverted_index(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<Option<Arc<InvertedIndex>>> {
+    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+
+    // Resolve the column's field id so we can match against `IndexMetadata.fields`.
+    let field_id = match dataset.schema().field(column) {
+        Some(f) => f.id,
+        None => return Ok(None),
+    };
+
+    let indices = dataset.load_indices().await?;
+    for meta in indices.iter() {
+        if !meta.fields.contains(&field_id) {
+            continue;
+        }
+        // Mixed index types on the same field would be unusual but
+        // possible; the canonical filter is the downcast below.
+        let uuid = meta.uuid.to_string();
+        let Ok(opened) = dataset
+            .open_generic_index(column, &uuid, &lance_index::metrics::NoOpMetricsCollector)
+            .await
+        else {
+            continue;
+        };
+        if let Some(inv) = opened.as_any().downcast_ref::<InvertedIndex>() {
+            return Ok(Some(Arc::new(inv.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// Materialize user-projected columns from the active memtable's
+/// BatchStore for a sequence of BatchStore-row-position row ids.
+fn active_materialize(
+    batch_store: &Arc<BatchStore>,
+    schema: &SchemaRef,
+    row_ids: &[u64],
+    cols: &[String],
+) -> Result<RecordBatch> {
+    // Pre-compute (start, end] ranges per batch so we can binary-search
+    // a row position to its batch.
+    struct BatchRange {
+        start: u64,
+        end: u64,
+        batch_id: usize,
+    }
+    let mut ranges: Vec<BatchRange> = Vec::new();
+    let mut cur: u64 = 0;
+    for (batch_id, stored) in batch_store.iter().enumerate() {
+        ranges.push(BatchRange {
+            start: cur,
+            end: cur + stored.num_rows as u64,
+            batch_id,
+        });
+        cur += stored.num_rows as u64;
+    }
+    let find = |row_pos: u64| -> Option<&BatchRange> {
+        let idx = ranges.partition_point(|r| r.end <= row_pos);
+        ranges
+            .get(idx)
+            .filter(|r| row_pos >= r.start && row_pos < r.end)
+    };
+
+    // For each row id, append the relevant column slice to a vector.
+    let col_indices: Vec<usize> = cols
+        .iter()
+        .map(|name| {
+            schema.index_of(name).map_err(|_| {
+                Error::internal(format!(
+                    "active materialize: column '{name}' missing from BatchStore schema"
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+    let mut per_col: Vec<Vec<Arc<dyn Array>>> = vec![Vec::new(); col_indices.len()];
+    for &row_pos in row_ids {
+        let br = find(row_pos).ok_or_else(|| {
+            Error::internal(format!(
+                "active materialize: row position {row_pos} out of range"
+            ))
+        })?;
+        let stored = batch_store.get(br.batch_id).ok_or_else(|| {
+            Error::internal(format!(
+                "active materialize: batch {} missing from store",
+                br.batch_id
+            ))
+        })?;
+        let local = (row_pos - br.start) as u32;
+        let take_idx = UInt64Array::from(vec![local as u64]);
+        for (slot, &src_idx) in per_col.iter_mut().zip(col_indices.iter()) {
+            let col = stored.data.column(src_idx);
+            let taken = take(col.as_ref(), &take_idx, None)?;
+            slot.push(taken);
+        }
+    }
+    let mut fields: Vec<Field> = Vec::with_capacity(col_indices.len());
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(col_indices.len());
+    for (name, slot) in cols.iter().zip(per_col.into_iter()) {
+        let src_field = schema.field_with_name(name).map_err(|e| {
+            Error::internal(format!(
+                "active materialize: field '{name}' lookup failed: {e}"
+            ))
+        })?;
+        fields.push(src_field.clone());
+        if slot.is_empty() {
+            // No rows to take — build an empty array of the right type.
+            let empty = arrow_array::new_empty_array(src_field.data_type());
+            columns.push(empty);
+        } else {
+            let refs: Vec<&dyn Array> = slot.iter().map(|a| a.as_ref()).collect();
+            let concatenated = arrow_select::concat::concat(&refs)?;
+            columns.push(concatenated);
+        }
+    }
+    let out_schema = Arc::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(out_schema, columns)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,29 +1011,187 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rescore_mode_returns_clear_not_implemented_error() {
+    async fn rescore_mode_unions_base_and_active_with_global_scores() {
+        // End-to-end smoke for LocalWithGlobalRescore: a base + active
+        // shape where the "lance" term appears in both. Score
+        // recomputation under the global scorer must yield identical
+        // scores for the two hits because both have freq=1 and dl=2 —
+        // the global stats are corpus-wide so they see the same
+        // (idf, avgdl) for both rows.
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
         let schema = fts_schema();
         let tmp = tempfile::tempdir().unwrap();
-        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
-        write_dataset(&base_uri, vec![make_batch(&schema, &[1], &["hello"])]).await;
-        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
-        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
 
-        let err = planner
+        // Base Lance dataset with FTS index.
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(
+                &schema,
+                &[1, 2],
+                &["lance fast", "unrelated text"],
+            )],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        // Active memtable with FTS index over a different row.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(&schema, &[3, 4], &["lance quick", "completely unrelated"]);
+        batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let plan = planner
             .plan_search(
                 "text",
-                FullTextSearchQuery::new("hello".to_string()),
+                FullTextSearchQuery::new("lance".to_string()),
                 10,
                 None,
                 FtsScoringMode::local_with_global_rescore_default(),
             )
             .await
-            .expect_err("rescore mode must error until phase 2 lands");
-        let msg = format!("{err}");
+            .expect("rescore planner should produce a base+active plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // Both base id=1 and active id=3 contain "lance" → 2 hits.
+        assert_eq!(total, 2, "expected exactly the 2 'lance' hits");
+
+        let out = batches[0].schema();
+        assert!(out.field_with_name(SCORE_COLUMN).is_ok());
+        assert!(out.field_with_name("id").is_ok());
+
+        // Collect (id, score) pairs.
+        let mut hits: Vec<(i32, f32)> = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let scores = b
+                .column_by_name(SCORE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                hits.push((ids.value(i), scores.value(i)));
+            }
+        }
+        // Both hits must be present.
+        let by_id: std::collections::HashMap<i32, f32> = hits.iter().copied().collect();
+        let s1 = *by_id.get(&1).expect("base hit id=1 missing");
+        let s3 = *by_id.get(&3).expect("active hit id=3 missing");
+        // Global stats see N=4 docs, df("lance")=2. Both id=1 and id=3
+        // have freq=1 and doc_len=2 → identical BM25 under global stats.
         assert!(
-            msg.contains("LocalWithGlobalRescore"),
-            "error must name the mode the user asked for: {msg}"
+            (s1 - s3).abs() < 1e-5,
+            "global rescore should give identical scores for symmetric hits; got s1={s1}, s3={s3}"
         );
+        // Sort: scores descending.
+        for w in hits.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rescore_mode_active_only_runs_end_to_end() {
+        // Cheaper regression that doesn't need a base Lance dataset:
+        // just an active memtable. Validates the active-only candidate
+        // path + rescore math.
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let batch = make_batch(
+            &schema,
+            &[1, 2, 3],
+            &["lance lance lance", "lance once", "no match here"],
+        );
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                10,
+                None,
+                FtsScoringMode::local_with_global_rescore_default(),
+            )
+            .await
+            .expect("rescore planner should produce a plan");
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // id=1 (3 occurrences) and id=2 (1 occurrence) match; id=3 doesn't.
+        assert_eq!(total, 2);
+        // id=1 should outrank id=2 because tf is higher and doc length is similar.
+        let first_id = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(first_id, 1, "highest-tf doc should rank first");
     }
 
     #[tokio::test]
