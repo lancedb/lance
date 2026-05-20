@@ -1034,7 +1034,32 @@ pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    let policy = build_cleanup_policy(dataset, manifest).await?;
+    let config = if manifest.config.contains_key("lance.auto_cleanup.interval") {
+        match dataset.latest_manifest().await {
+            Ok((latest, _)) => {
+                if latest.config.contains_key("lance.auto_cleanup.interval") {
+                    latest.config.clone()
+                } else {
+                    log::info!(
+                        "auto_cleanup skipped: committed manifest has auto_cleanup config but latest manifest (v{}) does not. \
+                         This likely means auto_cleanup was disabled by a concurrent commit.",
+                        latest.version
+                    );
+                    return Ok(None);
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to load latest manifest for auto_cleanup_hook, falling back to committed manifest config: {}",
+                    e
+                );
+                manifest.config.clone()
+            }
+        }
+    } else {
+        manifest.config.clone()
+    };
+    let policy = build_cleanup_policy_from_config(dataset, &config, manifest.version).await?;
     if let Some(policy) = policy {
         Ok(Some(dataset.cleanup_with_policy(policy).await?))
     } else {
@@ -1062,7 +1087,15 @@ pub async fn build_cleanup_policy(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<CleanupPolicy>> {
-    if let Some(interval) = manifest.config.get("lance.auto_cleanup.interval") {
+    build_cleanup_policy_from_config(dataset, &manifest.config, manifest.version).await
+}
+
+pub async fn build_cleanup_policy_from_config(
+    dataset: &Dataset,
+    config: &HashMap<String, String>,
+    version: u64,
+) -> Result<Option<CleanupPolicy>> {
+    if let Some(interval) = config.get("lance.auto_cleanup.interval") {
         let interval: u64 = match interval.parse() {
             Ok(i) => i,
             Err(e) => {
@@ -1075,7 +1108,7 @@ pub async fn build_cleanup_policy(
             }
         };
 
-        if interval != 0 && !manifest.version.is_multiple_of(interval) {
+        if interval != 0 && !version.is_multiple_of(interval) {
             return Ok(None);
         }
     } else {
@@ -1083,7 +1116,7 @@ pub async fn build_cleanup_policy(
     }
 
     let mut builder = CleanupPolicyBuilder::default();
-    if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
+    if let Some(older_than) = config.get("lance.auto_cleanup.older_than") {
         let std_older_than = match parse_duration(older_than) {
             Ok(t) => t,
             Err(e) => {
@@ -1098,7 +1131,7 @@ pub async fn build_cleanup_policy(
         let timestamp = utc_now() - TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
         builder = builder.before_timestamp(timestamp);
     }
-    if let Some(retain_versions) = manifest.config.get("lance.auto_cleanup.retain_versions") {
+    if let Some(retain_versions) = config.get("lance.auto_cleanup.retain_versions") {
         let retain_versions: usize = match retain_versions.parse() {
             Ok(n) => n,
             Err(e) => {
@@ -1112,7 +1145,7 @@ pub async fn build_cleanup_policy(
         };
         builder = builder.retain_n_versions(dataset, retain_versions).await?;
     }
-    if let Some(referenced_branch) = manifest.config.get("lance.auto_cleanup.referenced_branch") {
+    if let Some(referenced_branch) = config.get("lance.auto_cleanup.referenced_branch") {
         let clean_referenced: bool = match referenced_branch.parse() {
             Ok(b) => b,
             Err(e) => {
@@ -1124,10 +1157,9 @@ pub async fn build_cleanup_policy(
                 });
             }
         };
-        // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
     }
-    if let Some(delete_rate_limit) = manifest.config.get("lance.auto_cleanup.delete_rate_limit") {
+    if let Some(delete_rate_limit) = config.get("lance.auto_cleanup.delete_rate_limit") {
         let rate: u64 = match delete_rate_limit.parse() {
             Ok(r) => r,
             Err(e) => {
