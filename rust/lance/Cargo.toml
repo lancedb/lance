@@ -259,6 +259,11 @@ path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
 harness = false
 
 [[bench]]
+name = "lsm_fts_modes"
+path = "benches/mem_wal/fts/lsm_fts_modes.rs"
+harness = false
+
+[[bench]]
 name = "manifest_commit"
 harness = false
 
