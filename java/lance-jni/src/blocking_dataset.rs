@@ -1111,26 +1111,22 @@ fn inner_merge_index_metadata(
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    let merge_result = RT.block_on(async {
-        dataset_guard
+    RT.block_on(async {
+        let mr = dataset_guard
             .inner
             .merge_index_metadata(&index_uuid, index_type, batch_readhead, noop_progress())
-            .await
-    })?;
+            .await?;
 
-    // TODO: Cleanup should be deferred until after the caller commits the
-    // index transaction.  For now we clean up immediately to preserve the
-    // existing Java behaviour.  A follow-up should expose the MergeResult
-    // to Java so callers can call cleanup() after commit.
-    if let Some(mr) = merge_result {
-        let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
-            &dataset_guard.inner,
-            &index_uuid,
-        )?;
-        RT.block_on(async {
-            lance_index::scalar::btree::cleanup_shard_files(&store, &mr).await;
-        });
-    }
+        if let Some(ref mr) = mr {
+            let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
+                &dataset_guard.inner,
+                &index_uuid,
+            )?;
+            lance_index::scalar::btree::cleanup_shard_files(&store, mr).await;
+        }
+
+        Ok::<(), crate::error::Error>(())
+    })?;
 
     Ok(())
 }
