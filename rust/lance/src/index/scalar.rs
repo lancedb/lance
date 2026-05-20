@@ -241,8 +241,8 @@ pub(crate) async fn sample_partition_boundaries(
         return Ok(Vec::new());
     }
 
-    let sample_size = (total_rows / 100).clamp(1_000, 1_000_000) as usize;
-    let stride = (total_rows as usize).div_ceil(sample_size).max(1);
+    let sample_size = (total_rows / 100).clamp(1_000, 1_000_000);
+    let stride = total_rows.div_ceil(sample_size).max(1);
 
     let mut scan = dataset.scan();
     scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])?;
