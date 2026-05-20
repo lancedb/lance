@@ -38,6 +38,7 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
+use lance::dataset::index::LanceIndexStoreExt;
 use lance::index::{DatasetIndexExt, IndexSegment};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
