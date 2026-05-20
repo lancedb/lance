@@ -210,15 +210,17 @@ name = "memtable_read"
 harness = false
 
 [[bench]]
-name = "mem_wal_read"
+name = "mem_wal_point_lookup_bench"
+path = "benches/mem_wal/point_lookup/mem_wal_point_lookup_bench.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_vector_bench"
+path = "benches/mem_wal/vector/mem_wal_vector_bench.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_replay"
-harness = false
-
-[[bench]]
-name = "mem_wal_vector"
 harness = false
 
 [[bench]]
