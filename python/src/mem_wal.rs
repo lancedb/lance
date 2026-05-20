@@ -21,10 +21,7 @@ use lance::dataset::mem_wal::scanner::{
     FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
-use lance::dataset::mem_wal::{
-    LsmScanner, ShardSnapshot as RegionSnapshot, ShardWriter as RegionWriter,
-    evaluate_sharding_spec,
-};
+use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
 use lance_index::mem_wal::{
     MergedGeneration as LanceMergedGeneration, ShardingField, ShardingSpec,
 };
@@ -92,27 +89,27 @@ fn optional_string(value: Bound<'_, PyAny>) -> PyResult<Option<String>> {
     }
 }
 
-/// Represents a single generation of a MemWAL region that has been merged
+/// Represents a single generation of a MemWAL shard that has been merged
 /// into the base table. Used with `MergeInsertBuilder.mark_generations_as_merged()`.
 #[pyclass(name = "_MergedGeneration", module = "_lib")]
 pub struct PyMergedGeneration {
-    pub region_id: String,
+    pub shard_id: String,
     pub generation: u64,
 }
 
 #[pymethods]
 impl PyMergedGeneration {
     #[new]
-    pub fn new(region_id: String, generation: u64) -> Self {
+    pub fn new(shard_id: String, generation: u64) -> Self {
         Self {
-            region_id,
+            shard_id,
             generation,
         }
     }
 
     #[getter]
-    pub fn region_id(&self) -> &str {
-        &self.region_id
+    pub fn shard_id(&self) -> &str {
+        &self.shard_id
     }
 
     #[getter]
@@ -122,42 +119,42 @@ impl PyMergedGeneration {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_MergedGeneration(region_id='{}', generation={})",
-            self.region_id, self.generation
+            "_MergedGeneration(shard_id='{}', generation={})",
+            self.shard_id, self.generation
         )
     }
 }
 
 impl PyMergedGeneration {
     pub fn to_lance(&self) -> PyResult<LanceMergedGeneration> {
-        let uuid = Uuid::parse_str(&self.region_id)
-            .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
+        let uuid = Uuid::parse_str(&self.shard_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
         Ok(LanceMergedGeneration::new(uuid, self.generation))
     }
 }
 
-/// Snapshot of a MemWAL region's state at a point in time.
+/// Snapshot of a MemWAL shard's state at a point in time.
 ///
 /// Used to specify which flushed generations to include when creating an
 /// `_LsmScanner`. Supports a builder pattern for adding generations.
-#[pyclass(name = "_RegionSnapshot", module = "_lib", skip_from_py_object)]
+#[pyclass(name = "_ShardSnapshot", module = "_lib", skip_from_py_object)]
 #[derive(Clone)]
-pub struct PyRegionSnapshot {
-    pub inner: RegionSnapshot,
+pub struct PyShardSnapshot {
+    pub inner: ShardSnapshot,
 }
 
 #[pymethods]
-impl PyRegionSnapshot {
+impl PyShardSnapshot {
     #[new]
-    pub fn new(region_id: String) -> PyResult<Self> {
-        let uuid = Uuid::parse_str(&region_id)
-            .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
+    pub fn new(shard_id: String) -> PyResult<Self> {
+        let uuid = Uuid::parse_str(&shard_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
         Ok(Self {
-            inner: RegionSnapshot::new(uuid),
+            inner: ShardSnapshot::new(uuid),
         })
     }
 
-    /// Set the RegionSpec ID for this snapshot.
+    /// Set the sharding spec ID for this snapshot.
     pub fn with_spec_id(mut slf: PyRefMut<'_, Self>, spec_id: u32) -> PyRefMut<'_, Self> {
         slf.inner = slf.inner.clone().with_spec_id(spec_id);
         slf
@@ -183,13 +180,13 @@ impl PyRegionSnapshot {
     }
 
     #[getter]
-    pub fn region_id(&self) -> String {
+    pub fn shard_id(&self) -> String {
         self.inner.shard_id.to_string()
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_RegionSnapshot(region_id='{}', current_gen={}, flushed_gens={})",
+            "_ShardSnapshot(shard_id='{}', current_gen={}, flushed_gens={})",
             self.inner.shard_id,
             self.inner.current_generation,
             self.inner.flushed_generations.len()
@@ -197,26 +194,26 @@ impl PyRegionSnapshot {
     }
 }
 
-/// Long-lived stateful writer for a MemWAL region.
+/// Long-lived stateful writer for a MemWAL shard.
 ///
 /// Supports writing batches, querying statistics, creating LSM scanners,
 /// and graceful shutdown. Supports the Python context manager protocol.
-#[pyclass(name = "_RegionWriter", module = "_lib")]
-pub struct PyRegionWriter {
-    inner: Arc<TokioMutex<Option<RegionWriter>>>,
-    closed_state: Arc<TokioMutex<Option<ClosedRegionWriterState>>>,
-    region_id: Uuid,
+#[pyclass(name = "_ShardWriter", module = "_lib")]
+pub struct PyShardWriter {
+    inner: Arc<TokioMutex<Option<ShardWriter>>>,
+    closed_state: Arc<TokioMutex<Option<ClosedShardWriterState>>>,
+    shard_id: Uuid,
     dataset: Arc<LanceDataset>,
 }
 
 #[derive(Clone)]
-struct ClosedRegionWriterState {
+struct ClosedShardWriterState {
     stats: WriteStatsSnapshot,
     memtable_stats: MemTableStats,
 }
 
 #[pymethods]
-impl PyRegionWriter {
+impl PyShardWriter {
     /// Write data batches to the MemWAL.
     ///
     /// Accepts any PyArrow-compatible data source (RecordBatch, Table,
@@ -238,7 +235,7 @@ impl PyRegionWriter {
             match guard.as_ref() {
                 Some(writer) => writer.put(batches).await.map(|_| ()),
                 None => Err(lance_core::Error::invalid_input(
-                    "RegionWriter is already closed",
+                    "ShardWriter is already closed",
                 )),
             }
         })?
@@ -263,7 +260,7 @@ impl PyRegionWriter {
                 writer.close().await?;
                 let closed_memtable_stats = closed_memtable_stats(memtable_stats_before_close);
                 let mut closed_guard = closed_state.lock().await;
-                *closed_guard = Some(ClosedRegionWriterState {
+                *closed_guard = Some(ClosedShardWriterState {
                     stats: stats_snapshot,
                     memtable_stats: closed_memtable_stats,
                 });
@@ -293,7 +290,7 @@ impl PyRegionWriter {
                         .as_ref()
                         .map(|state| state.stats.clone())
                         .ok_or_else(|| {
-                            lance_core::Error::invalid_input("RegionWriter is already closed")
+                            lance_core::Error::invalid_input("ShardWriter is already closed")
                         })
                 }
             })?
@@ -320,7 +317,7 @@ impl PyRegionWriter {
                             .as_ref()
                             .map(|state| state.memtable_stats.clone())
                             .ok_or_else(|| {
-                                lance_core::Error::invalid_input("RegionWriter is already closed")
+                                lance_core::Error::invalid_input("ShardWriter is already closed")
                             })
                     }
                 }
@@ -333,13 +330,13 @@ impl PyRegionWriter {
     /// Create an LSM scanner that includes the active MemTable for strong consistency.
     ///
     /// The scanner covers: base table + given flushed generations + current active MemTable.
-    #[pyo3(signature = (region_snapshots=vec![]))]
+    #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
         py: Python<'_>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
     ) -> PyResult<PyLsmScanner> {
-        let mut snapshots: Vec<RegionSnapshot> = region_snapshots
+        let mut snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -347,7 +344,7 @@ impl PyRegionWriter {
         let pk_columns = get_pk_columns(&self.dataset)?;
         let inner = self.inner.clone();
         let dataset = self.dataset.clone();
-        let region_id = self.region_id;
+        let shard_id = self.shard_id;
 
         let (active_ref, writer_snapshot) = rt()
             .block_on(Some(py), async move {
@@ -358,31 +355,31 @@ impl PyRegionWriter {
                         let writer_snapshot = w
                             .manifest()
                             .await?
-                            .map(region_snapshot_from_manifest)
-                            .unwrap_or_else(|| RegionSnapshot::new(region_id));
+                            .map(shard_snapshot_from_manifest)
+                            .unwrap_or_else(|| ShardSnapshot::new(shard_id));
                         Ok((active_ref, writer_snapshot))
                     }
                     None => Err(lance_core::Error::invalid_input(
-                        "RegionWriter is already closed",
+                        "ShardWriter is already closed",
                     )),
                 }
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        snapshots.retain(|snapshot| snapshot.shard_id != region_id);
+        snapshots.retain(|snapshot| snapshot.shard_id != shard_id);
         snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
-            .with_active_memtable(region_id, active_ref);
+            .with_active_memtable(shard_id, active_ref);
 
         Ok(PyLsmScanner {
             inner: Some(scanner),
         })
     }
 
-    /// Return the region ID as a UUID string.
+    /// Return the shard ID as a UUID string.
     #[getter]
-    pub fn region_id(&self) -> String {
-        self.region_id.to_string()
+    pub fn shard_id(&self) -> String {
+        self.shard_id.to_string()
     }
 
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -401,13 +398,13 @@ impl PyRegionWriter {
     }
 }
 
-impl PyRegionWriter {
-    /// Create from a Rust RegionWriter and dataset reference.
-    pub fn new(writer: RegionWriter, region_id: Uuid, dataset: Arc<LanceDataset>) -> Self {
+impl PyShardWriter {
+    /// Create from a Rust ShardWriter and dataset reference.
+    pub fn new(writer: ShardWriter, shard_id: Uuid, dataset: Arc<LanceDataset>) -> Self {
         Self {
             inner: Arc::new(TokioMutex::new(Some(writer))),
             closed_state: Arc::new(TokioMutex::new(None)),
-            region_id,
+            shard_id,
             dataset,
         }
     }
@@ -496,14 +493,14 @@ pub struct PyLsmScanner {
 
 #[pymethods]
 impl PyLsmScanner {
-    /// Create a scanner from dataset and region snapshots (without active MemTable).
+    /// Create a scanner from dataset and shard snapshots (without active MemTable).
     #[staticmethod]
     pub fn from_snapshots(
         dataset: &Bound<'_, PyDataset>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
-        let snapshots: Vec<RegionSnapshot> = region_snapshots
+        let snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -642,14 +639,14 @@ pub struct PyLsmPointLookupPlanner {
 #[pymethods]
 impl PyLsmPointLookupPlanner {
     #[new]
-    #[pyo3(signature = (dataset, region_snapshots, pk_columns=None))]
+    #[pyo3(signature = (dataset, shard_snapshots, pk_columns=None))]
     pub fn new(
         dataset: &Bound<'_, PyDataset>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
         pk_columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
-        let snapshots: Vec<RegionSnapshot> = region_snapshots
+        let snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -707,16 +704,16 @@ pub struct PyLsmVectorSearchPlanner {
 #[pymethods]
 impl PyLsmVectorSearchPlanner {
     #[new]
-    #[pyo3(signature = (dataset, region_snapshots, vector_column, pk_columns=None, distance_type=None))]
+    #[pyo3(signature = (dataset, shard_snapshots, vector_column, pk_columns=None, distance_type=None))]
     pub fn new(
         dataset: &Bound<'_, PyDataset>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
         vector_column: String,
         pk_columns: Option<Vec<String>>,
         distance_type: Option<String>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
-        let snapshots: Vec<RegionSnapshot> = region_snapshots
+        let snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -936,8 +933,8 @@ fn scalar_values_from_pk_value(
     Ok(pk_values)
 }
 
-fn region_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> RegionSnapshot {
-    RegionSnapshot {
+fn shard_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> ShardSnapshot {
+    ShardSnapshot {
         shard_id: manifest.shard_id,
         spec_id: manifest.shard_spec_id,
         current_generation: manifest.current_generation,

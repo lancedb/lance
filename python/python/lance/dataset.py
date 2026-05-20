@@ -4747,12 +4747,12 @@ class LanceDataset(pa.dataset.Dataset):
         At most one sharding mode may be selected: bucket sharding
         (``bucket_column`` + ``num_buckets``), identity sharding
         (``identity_column``), or ``unsharded``. With none selected, shards are
-        managed manually by passing region IDs to `mem_wal_writer`.
+        managed manually by passing shard IDs to `mem_wal_writer`.
 
         Any writer-configuration keyword arguments (``durable_write``,
         ``max_memtable_size``, ``max_wal_flush_interval_ms``, etc. — the same
         knobs accepted by `mem_wal_writer`) are recorded as the default
-        `~lance.mem_wal.RegionWriter` configuration in the MemWAL index, so
+        `~lance.mem_wal.ShardWriter` configuration in the MemWAL index, so
         every writer starts from the same defaults.
 
         Parameters
@@ -4813,7 +4813,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def mem_wal_writer(
         self,
-        region_id: str,
+        shard_id: str,
         *,
         durable_write: Optional[bool] = None,
         sync_indexed_write: Optional[bool] = None,
@@ -4828,17 +4828,17 @@ class LanceDataset(pa.dataset.Dataset):
         async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
-    ) -> "mem_wal.RegionWriter":
-        """Get a RegionWriter for the specified region.
+    ) -> "mem_wal.ShardWriter":
+        """Get a ShardWriter for the specified shard.
 
         `initialize_mem_wal` must be called before using this method.
-        Each *region* is an independent write shard; use different region IDs
+        Each shard is an independent write path; use different shard IDs
         to achieve parallel ingestion without writer contention.
 
         Parameters
         ----------
-        region_id : str
-            UUID string identifying the write region (e.g.
+        shard_id : str
+            UUID string identifying the write shard (e.g.
             ``str(uuid.uuid4())``).
         durable_write : bool, optional
             Whether to fsync WAL writes (default: ``True``).
@@ -4871,8 +4871,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        RegionWriter
-            A context-manager-compatible writer for the specified region.
+        ShardWriter
+            A context-manager-compatible writer for the specified shard.
 
         Examples
         --------
@@ -4891,9 +4891,9 @@ class LanceDataset(pa.dataset.Dataset):
         ...         tmpdir,
         ...     )
         ...     ds.initialize_mem_wal()
-        ...     region_id = str(uuid.uuid4())
+        ...     shard_id = str(uuid.uuid4())
         ...     new_data = pa.table({"id": [2], "val": [0.2]}, schema=schema)
-        ...     with ds.mem_wal_writer(region_id) as writer:
+        ...     with ds.mem_wal_writer(shard_id) as writer:
         ...         writer.put(new_data)
         """
         import lance.mem_wal as _mw
@@ -4917,8 +4917,8 @@ class LanceDataset(pa.dataset.Dataset):
             ]
             if val is not None
         }
-        raw = self._ds.mem_wal_writer(region_id, **kwargs)
-        return _mw.RegionWriter(raw)
+        raw = self._ds.mem_wal_writer(shard_id, **kwargs)
+        return _mw.ShardWriter(raw)
 
 
 class SqlQuery:
