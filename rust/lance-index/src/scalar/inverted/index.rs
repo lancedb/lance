@@ -4379,7 +4379,20 @@ impl DocSet {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
+        Self::from_columns(row_id_col, num_tokens_col, is_legacy, frag_reuse_index)
+    }
 
+    /// Build a `DocSet` from already-loaded `row_id` and `num_tokens`
+    /// arrow columns. Lets callers that have one column already in hand
+    /// (e.g. [`crate::scalar::inverted::lazy_docset::LazyDocSet`] after
+    /// `total_tokens_num` pre-fetched `num_tokens`) skip re-reading that
+    /// column.
+    pub fn from_columns(
+        row_id_col: &UInt64Array,
+        num_tokens_col: &arrow_array::UInt32Array,
+        is_legacy: bool,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
         // for legacy format, the row id is doc id; sorting keeps binary search viable
         if is_legacy {
             let (row_ids, num_tokens): (Vec<_>, Vec<_>) = row_id_col
