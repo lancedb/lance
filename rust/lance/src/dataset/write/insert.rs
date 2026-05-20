@@ -8,7 +8,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
 use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
-use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_WRITING};
+use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
@@ -192,7 +192,7 @@ impl<'a> InsertBuilder<'a> {
         let mut context = self.resolve_context().await?;
 
         info!(
-            target: TRACE_DATASET_WRITING,
+            target: TRACE_DATASET_EVENTS,
             event=DATASET_WRITING_EVENT,
             uri=context.dest.uri(),
             mode=?context.params.mode

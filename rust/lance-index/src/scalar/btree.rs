@@ -51,7 +51,7 @@ use lance_core::{
     utils::{
         mask::NullableRowAddrSet,
         tokio::get_num_compute_intensive_cpus,
-        tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_LOAD_SCALAR_PART},
+        tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
 };
 use lance_datafusion::{
@@ -1093,7 +1093,7 @@ impl BTreeIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<FlatIndex> {
         metrics.record_part_load();
-        info!(target: TRACE_IO_LOAD_SCALAR_PART, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
+        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
         let index_reader = index_reader.get().await?;
         let mut serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)

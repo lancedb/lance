@@ -105,7 +105,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::Error;
 use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_COMPACTING};
+use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -744,7 +744,7 @@ pub async fn compact_files(
     options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
-    info!(target: TRACE_DATASET_COMPACTING, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     let planner = DefaultCompactionPlanner::new(options);
     compact_files_with_planner(dataset, remap_options, &planner).await
 }

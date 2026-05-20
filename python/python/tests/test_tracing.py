@@ -84,28 +84,28 @@ capture_trace_events(callback)
 lance.write_dataset(pa.table({"x": range(100)}), "memory://test")
 wait_until(lambda: len(events) == 6)
 
-assert events[0].target == "lance::events::dataset_events::loading"
+assert events[0].target == "lance::dataset_events"
 assert events[0].args["event"] == "loading"
 assert events[0].args["uri"] == "memory://test"
 
-assert events[1].target == "lance::events::dataset_events::writing"
+assert events[1].target == "lance::dataset_events"
 assert events[1].args["event"] == "writing"
 assert events[1].args["uri"] == "memory://test"
 assert events[1].args["mode"] == "Create"
 
-assert events[2].target == "lance::events::file_audit"
+assert events[2].target == "lance::file_audit"
 assert events[2].args["mode"] == "create"
 assert events[2].args["type"] == "data"
 
-assert events[3].target == "lance::events::dataset_events::loading"
+assert events[3].target == "lance::dataset_events"
 assert events[3].args["event"] == "loading"
 assert events[3].args["uri"] == "memory://test"
 
-assert events[4].target == "lance::events::file_audit"
+assert events[4].target == "lance::file_audit"
 assert events[4].args["mode"] == "create"
 assert events[4].args["type"] == "manifest"
 
-assert events[5].target == "lance::events::dataset_events::committed"
+assert events[5].target == "lance::dataset_events"
 assert events[5].args["event"] == "committed"
 assert events[5].args["uri"] == "memory://test"
 assert events[5].args["read_version"] == "0"

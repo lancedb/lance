@@ -50,7 +50,7 @@ use lance_core::{
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::parse::parse_env_as_bool,
-    utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_LOAD_VECTOR_PART},
+    utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
 use lance_file::{
     format::MAGIC,
@@ -225,7 +225,7 @@ impl IVFIndex {
             part_idx
         } else {
             metrics.record_part_load();
-            tracing::info!(target: TRACE_IO_LOAD_VECTOR_PART, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
+            tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
 
             let mtx = self.partition_locks.get_partition_mutex(partition_id);
             let _guard = mtx.lock().await;

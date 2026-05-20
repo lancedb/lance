@@ -164,7 +164,7 @@ def test_lance_log_filters_trace_event_targets(tmp_path):
         ],
         capture_output=True,
         env={
-            "LANCE_LOG": "warn,lance::events::dataset_events::writing=info",
+            "LANCE_LOG": "warn,lance::events::dataset_events=info",
             "LANCE_LOG_FILE": str(log_file),
         },
     )
@@ -172,9 +172,10 @@ def test_lance_log_filters_trace_event_targets(tmp_path):
     assert result.returncode == 0, f"Command failed: {result.stderr.decode()}"
 
     log_content = log_file.read_text()
-    assert "lance::events::dataset_events::writing" in log_content
-    assert "lance::events::dataset_events::loading" not in log_content
+    assert "lance::events::dataset_events" in log_content
+    assert 'target="lance::dataset_events"' in log_content
     assert "lance::events::file_audit" not in log_content
+    assert "lance::file_audit" not in log_content
 
 
 @pytest.mark.skipif(

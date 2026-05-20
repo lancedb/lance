@@ -28,7 +28,7 @@ use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_LOAD_VECTOR_PART};
+use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
@@ -861,7 +861,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             let entry = self
                 .index_cache
                 .get_or_insert_with_key(cache_key, || async {
-                    info!(target: TRACE_IO_LOAD_VECTOR_PART, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
+                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
                     metrics.record_part_load();
                     self.load_partition_entry(partition_id).await
                 })
@@ -871,7 +871,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
                 return Ok(part_idx);
             }
-            info!(target: TRACE_IO_LOAD_VECTOR_PART, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
             metrics.record_part_load();
             Ok(Arc::new(self.load_partition_entry(partition_id).await?))
         }
