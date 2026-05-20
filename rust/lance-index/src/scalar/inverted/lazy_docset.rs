@@ -19,14 +19,17 @@
 
 use std::sync::Arc;
 
+use arrow::array::AsArray;
+use arrow::datatypes::{UInt32Type, UInt64Type};
+use arrow_array::{UInt32Array, UInt64Array};
 use lance_core::Result;
 use tokio::sync::OnceCell;
+
+use lance_core::ROW_ID;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::IndexReader;
 use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
-use arrow::array::AsArray;
-use arrow::datatypes::UInt32Type;
 
 /// Lazy view over an inverted-index partition's `DocSet`.
 ///
@@ -44,6 +47,11 @@ pub struct LazyDocSet {
     /// `sum(num_tokens)` cached on first request, either from the
     /// fully-loaded DocSet or from a single-column read.
     total_tokens: OnceCell<u64>,
+    /// `NUM_TOKEN_COL` arrow buffer cached the first time it's read (by
+    /// either `total_tokens_num` or `ensure_loaded`). Reusing it on the
+    /// scoring path avoids re-reading the same column for hit partitions
+    /// after the stats path already pulled it.
+    num_tokens_col: OnceCell<Arc<UInt32Array>>,
     /// Full DocSet, materialized lazily when scoring needs per-doc
     /// `row_id`/`num_tokens`.
     full: OnceCell<Arc<DocSet>>,
@@ -61,11 +69,17 @@ impl std::fmt::Debug for LazyDocSet {
 
 impl deepsize::DeepSizeOf for LazyDocSet {
     fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
-        // Approximate: only account for the fully-loaded DocSet if present.
+        // Approximate: only account for the fully-loaded DocSet and the
+        // cached num_tokens column when present.
         self.full
             .get()
             .map(|d| d.deep_size_of_children(ctx))
             .unwrap_or(0)
+            + self
+                .num_tokens_col
+                .get()
+                .map(|arr| arr.len() * std::mem::size_of::<u32>())
+                .unwrap_or(0)
     }
 }
 
@@ -82,6 +96,7 @@ impl LazyDocSet {
             frag_reuse_index,
             num_rows,
             total_tokens: OnceCell::new(),
+            num_tokens_col: OnceCell::new(),
             full: OnceCell::new(),
         }
     }
@@ -99,6 +114,7 @@ impl LazyDocSet {
             frag_reuse_index: None,
             num_rows,
             total_tokens: OnceCell::new(),
+            num_tokens_col: OnceCell::new(),
             full: OnceCell::new(),
         };
         let _ = me.total_tokens.set(total_tokens);
@@ -121,7 +137,9 @@ impl LazyDocSet {
     /// Sum of `num_tokens` across all docs. Lazy-computed on first call:
     /// if the full DocSet is loaded, reads from it; otherwise issues a
     /// single-column read of `NUM_TOKEN_COL` from the docs file (about
-    /// half the bytes of a full DocSet load). Result is cached.
+    /// half the bytes of a full DocSet load). Caches both the sum and
+    /// the per-row arrow buffer so a subsequent `ensure_loaded` can
+    /// reuse the buffer instead of re-reading.
     pub async fn total_tokens_num(&self) -> Result<u64> {
         if let Some(v) = self.total_tokens.get() {
             return Ok(*v);
@@ -131,35 +149,60 @@ impl LazyDocSet {
             let _ = self.total_tokens.set(v);
             return Ok(v);
         }
-        // Read just the num_tokens column. Avoids pulling row_ids (the
-        // other half of the DocSet bytes).
-        let batch = self
-            .reader
-            .read_range(0..self.num_rows, Some(&[NUM_TOKEN_COL]))
-            .await?;
-        let col = batch[NUM_TOKEN_COL].as_primitive::<UInt32Type>();
+        let col = self.read_num_tokens_column().await?;
         let sum: u64 = col.values().iter().map(|&n| n as u64).sum();
         let _ = self.total_tokens.set(sum);
         Ok(sum)
     }
 
-    /// Materialize the full [`DocSet`] and cache it. Cheap to call
-    /// repeatedly.
+    /// Internal helper: read (or return cached) `NUM_TOKEN_COL`.
+    async fn read_num_tokens_column(&self) -> Result<Arc<UInt32Array>> {
+        if let Some(arr) = self.num_tokens_col.get() {
+            return Ok(arr.clone());
+        }
+        let batch = self
+            .reader
+            .read_range(0..self.num_rows, Some(&[NUM_TOKEN_COL]))
+            .await?;
+        let arr = Arc::new(batch[NUM_TOKEN_COL].as_primitive::<UInt32Type>().clone());
+        // `set` errors if another caller raced; their value is equivalent.
+        let _ = self.num_tokens_col.set(arr.clone());
+        Ok(self.num_tokens_col.get().unwrap().clone())
+    }
+
+    /// Materialize the full [`DocSet`] and cache it. If a prior
+    /// `total_tokens_num` already pulled `NUM_TOKEN_COL`, we read only
+    /// `ROW_ID` here and rebuild the DocSet from the two columns —
+    /// halving the bytes pulled for hit partitions whose stats path
+    /// already paid the num_tokens read.
     pub async fn ensure_loaded(&self) -> Result<Arc<DocSet>> {
         if let Some(full) = self.full.get() {
             return Ok(full.clone());
         }
-        let docs = DocSet::load(
-            self.reader.clone(),
-            self.is_legacy,
-            self.frag_reuse_index.clone(),
-        )
-        .await?;
+        let docs = if self.num_tokens_col.get().is_some() {
+            let num_tokens = self.read_num_tokens_column().await?;
+            let batch = self
+                .reader
+                .read_range(0..self.num_rows, Some(&[ROW_ID]))
+                .await?;
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            DocSet::from_columns(
+                row_ids,
+                num_tokens.as_ref(),
+                self.is_legacy,
+                self.frag_reuse_index.clone(),
+            )?
+        } else {
+            // Cold path: nothing cached yet, fall back to the full read.
+            DocSet::load(
+                self.reader.clone(),
+                self.is_legacy,
+                self.frag_reuse_index.clone(),
+            )
+            .await?
+        };
         let docs = Arc::new(docs);
-        // Use OnceCell::set; another caller may have raced ahead, in which
-        // case we discard ours.
         let _ = self.full.set(docs.clone());
-        // Also seed total_tokens so subsequent queries don't re-read.
         let _ = self.total_tokens.set(docs.total_tokens_num());
         Ok(self.full.get().unwrap().clone())
     }
