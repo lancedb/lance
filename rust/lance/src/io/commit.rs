@@ -971,7 +971,17 @@ pub(crate) async fn commit_transaction(
         let needs_rebase = !strict_overwrite
             && match commit_config.commit_strategy {
                 CommitStrategy::Pessimistic => true,
-                CommitStrategy::Optimistic => backoff.attempt() > 0,
+                CommitStrategy::Optimistic => {
+                    backoff.attempt() > 0
+                        || matches!(
+                            &transaction.operation,
+                            Operation::UpdateConfig { .. }
+                                | Operation::Overwrite {
+                                    config_upsert_values: Some(_),
+                                    ..
+                                }
+                        )
+                }
             };
 
         if needs_rebase {

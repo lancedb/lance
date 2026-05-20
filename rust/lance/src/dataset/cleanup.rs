@@ -1041,8 +1041,10 @@ pub async fn auto_cleanup_hook(
                     latest.config.clone()
                 } else {
                     log::info!(
-                        "auto_cleanup skipped: committed manifest has auto_cleanup config but latest manifest (v{}) does not. \
-                         This likely means auto_cleanup was disabled by a concurrent commit.",
+                        "auto_cleanup skipped: committed manifest (v{}) has auto_cleanup config but latest manifest (v{}) does not. \
+                         This likely means auto_cleanup was disabled by a concurrent commit or the committed manifest inherited \
+                         stale config from an outdated dataset snapshot under Optimistic commit strategy.",
+                        manifest.version,
                         latest.version
                     );
                     return Ok(None);
@@ -1057,7 +1059,7 @@ pub async fn auto_cleanup_hook(
             }
         }
     } else {
-        manifest.config.clone()
+        return Ok(None);
     };
     let policy = build_cleanup_policy_from_config(dataset, &config, manifest.version).await?;
     if let Some(policy) = policy {
