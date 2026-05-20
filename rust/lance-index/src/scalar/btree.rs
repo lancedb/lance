@@ -59,7 +59,7 @@ use lance_datafusion::{
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
 use lance_io::object_store::ObjectStore;
-use log::debug;
+use log::{debug, warn};
 use object_store::{Error as ObjectStoreError, path::Path};
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
@@ -74,11 +74,67 @@ pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
 const DEFAULT_RANGE_PARTITIONED: bool = false;
 const RANGE_PARTITIONED_META_KEY: &str = "range_partitioned";
-const FRAGMENT_PARTITIONED_META_KEY: &str = "fragment_partitioned";
 const PAGE_NUM_PER_RANGE_PARTITION_META_KEY: &str = "page_num_per_range_partition";
 pub const BTREE_INDEX_VERSION: u32 = 0;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct MergeResult {
+    pub part_lookup_files: Vec<String>,
+    pub part_page_files: Vec<String>,
+}
+
+pub async fn cleanup_shard_files(store: &dyn IndexStore, result: &MergeResult) {
+    for file_name in &result.part_lookup_files {
+        if file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance") {
+            match store.delete_index_file(file_name).await {
+                Ok(()) => {
+                    debug!("Successfully deleted partition lookup file: {}", file_name);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to delete partition lookup file '{}': {}. \
+                        This does not affect the merge operation, but may leave \
+                        partition files that should be cleaned up manually.",
+                        file_name, e
+                    );
+                }
+            }
+        } else {
+            warn!(
+                "Skipping deletion of file '{}' as it does not match the expected \
+                partition lookup file pattern (part_*_page_lookup.lance)",
+                file_name
+            );
+        }
+    }
+
+    for file_name in &result.part_page_files {
+        if file_name.starts_with("part_") && file_name.ends_with("_page_data.lance") {
+            match store.delete_index_file(file_name).await {
+                Ok(()) => {
+                    debug!("Successfully deleted partition page file: {}", file_name);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to delete partition page file '{}': {}. \
+                        This does not affect the merge operation, but may leave \
+                        partition files that should be cleaned up manually.",
+                        file_name, e
+                    );
+                }
+            }
+        } else {
+            warn!(
+                "Skipping deletion of file '{}' as it does not match the expected \
+                partition page file pattern (part_*_page_data.lance)",
+                file_name
+            );
+        }
+    }
+}
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -613,17 +669,6 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 }
 
 /// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
-///
-/// # Page ordering assumptions
-///
-/// When `may_overlap` is `false` (the default), pages are assumed to be globally ordered:
-/// each page's min is >= the previous page's min, and pages do not overlap in value space.
-/// This allows `pages_between` to use an efficient "peek one step left" strategy.
-///
-/// When `may_overlap` is `true` (fragment-partitioned indices), pages from different fragments
-/// may overlap in value space. In this mode, `pages_between` scans from the beginning of the
-/// tree and relies on per-page max filtering to eliminate non-matching pages. This is correct
-/// but may produce more false-positive page candidates that are filtered out by `FlatIndex`.
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
@@ -631,11 +676,6 @@ pub struct BTreeLookup {
     null_pages: Vec<u32>,
     /// Pages that are entirely null
     all_null_pages: Vec<u32>,
-    /// Whether pages from different partitions may overlap in value space.
-    ///
-    /// When true, `pages_between` cannot assume that the BTreeMap's min-key ordering
-    /// implies non-overlapping page ranges, and must scan more broadly.
-    may_overlap: bool,
 }
 
 impl BTreeLookup {
@@ -644,7 +684,6 @@ impl BTreeLookup {
             tree: BTreeMap::new(),
             null_pages: Vec::new(),
             all_null_pages: Vec::new(),
-            may_overlap: false,
         }
     }
 }
@@ -669,13 +708,11 @@ impl BTreeLookup {
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
         null_pages: Vec<u32>,
         all_null_pages: Vec<u32>,
-        may_overlap: bool,
     ) -> Self {
         Self {
             tree,
             null_pages,
             all_null_pages,
-            may_overlap,
         }
     }
 
@@ -715,20 +752,16 @@ impl BTreeLookup {
         &self,
         range: (Bound<&OrderableScalarValue>, Bound<&OrderableScalarValue>),
     ) -> Vec<Matches> {
-        // Determine the lower bound for the BTreeMap range scan.
-        //
-        // When pages are globally ordered (may_overlap == false), we can use an efficient
-        // "peek one step left" strategy: find the largest min key strictly less than the
-        // query lower bound. Because pages don't overlap, at most one entry to the left
-        // of the query can have a max that extends past the lower bound.
-        //
-        // When pages may overlap (fragment-partitioned indices), this assumption breaks:
-        // multiple entries far to the left may have max values that extend past the lower
-        // bound. In this case, we scan from the beginning and rely on the per-page max
-        // filter in the loop body to eliminate non-matching entries.
+        // We need to grab a little bit left of the given range because the query might be 7
+        // and the first page might be something like 5-10.
         let lower_bound = match range.0 {
             Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(_) | Bound::Excluded(_) if self.may_overlap => Bound::Unbounded,
+            // It doesn't matter if the bound is exclusive or inclusive.  We are going to grab
+            // the first node whose min is strictly less than the given bound.  Then we grab
+            // all nodes greater than or equal to that
+            //
+            // We have to peek a bit to the left because we might have something like a lower
+            // bound of 7 and there is a page [5-10] we want to search for.
             Bound::Included(lower) => self
                 .tree
                 .largest_node_less(lower)
@@ -1164,7 +1197,6 @@ impl BTreeIndex {
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        may_overlap: bool,
     ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
         // Pages that have at least one null value
@@ -1226,12 +1258,7 @@ impl BTreeIndex {
 
         let data_type = mins.data_type();
 
-        let page_lookup = Arc::new(BTreeLookup::new(
-            map,
-            null_pages,
-            all_null_pages,
-            may_overlap,
-        ));
+        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
 
         Ok(Self::new(
             page_lookup,
@@ -1281,48 +1308,41 @@ impl BTreeIndex {
             .get(RANGE_PARTITIONED_META_KEY)
             .map(|bs| bs.parse().unwrap_or(DEFAULT_RANGE_PARTITIONED))
             .unwrap_or(DEFAULT_RANGE_PARTITIONED);
-        let fragment_partitioned = file_schema
-            .metadata
-            .get(FRAGMENT_PARTITIONED_META_KEY)
-            .map(|bs| bs.parse().unwrap_or(false))
-            .unwrap_or(false);
-        let partitioned = range_partitioned || fragment_partitioned;
-        // For partitioned indices, construct the `ranges_to_files` map.
+        // For range-partitioned indices, construct the `ranges_to_files` map.
         // This converts the list of (partition ID, page count) from metadata into a map
         // from a global page range to its corresponding file and starting offset.
-        let ranges_to_files =
-            if let Some(page_file_name) = standalone_partition_page_file {
-                let page_numbers = serialized_lookup
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .unwrap();
-                let max_page_number = page_numbers.values().iter().copied().max().unwrap_or(0);
-                let mut range_map = RangeInclusiveMap::new();
-                range_map.insert(0..=max_page_number, (page_file_name, 0));
-                Some(Arc::new(range_map))
-            } else if partitioned {
-                let part_sizes_str = file_schema
+        let ranges_to_files = if let Some(page_file_name) = standalone_partition_page_file {
+            let page_numbers = serialized_lookup
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let max_page_number = page_numbers.values().iter().copied().max().unwrap_or(0);
+            let mut range_map = RangeInclusiveMap::new();
+            range_map.insert(0..=max_page_number, (page_file_name, 0));
+            Some(Arc::new(range_map))
+        } else if range_partitioned {
+            let part_sizes_str = file_schema
             .metadata
             .get(PAGE_NUM_PER_RANGE_PARTITION_META_KEY)
-            .expect("Partitioned Btree lookup file must have page-number-per-range-file metadata!");
-                let part_sizes_vec: Vec<(u64, u32)> = serde_json::from_str(part_sizes_str)?;
-                let mut offset: u32 = 0;
+            .expect("Range-partitioned Btree lookup file must have page-number-per-range-file metadata!");
+            let part_sizes_vec: Vec<(u64, u32)> = serde_json::from_str(part_sizes_str)?;
+            let mut offset: u32 = 0;
 
-                let range_map = part_sizes_vec
-                    .into_iter()
-                    .map(|(id, size)| {
-                        let range = offset..=(offset + size - 1);
-                        let file_with_size = (part_page_data_file_path(id), offset);
-                        offset += size;
-                        (range, file_with_size)
-                    })
-                    .collect();
+            let range_map = part_sizes_vec
+                .into_iter()
+                .map(|(id, size)| {
+                    let range = offset..=(offset + size - 1);
+                    let file_with_size = (part_page_data_file_path(id), offset);
+                    offset += size;
+                    (range, file_with_size)
+                })
+                .collect();
 
-                Some(Arc::new(range_map))
-            } else {
-                None
-            };
+            Some(Arc::new(range_map))
+        } else {
+            None
+        };
 
         Ok(Arc::new(Self::try_from_serialized(
             serialized_lookup,
@@ -1331,7 +1351,6 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-            fragment_partitioned,
         )?))
     }
 
@@ -1754,10 +1773,7 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // TODO: This currently rebuilds the entire index as a single monolithic index,
-        // discarding any partition structure (range or fragment) from the original.
-        // To preserve partitioning, we would need to route new data to the correct
-        // partition and re-merge only the affected partition's lookup entries.
+        // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
             .combine_old_new(new_data, self.batch_size, old_data_filter)
@@ -1783,11 +1799,10 @@ impl ScalarIndex for BTreeIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        let num_partitions = self.ranges_to_files.as_ref().map(|r| r.len() as u32);
         let params = serde_json::to_value(BTreeParameters {
             zone_size: Some(self.batch_size),
             range_id: None,
-            num_partitions,
+            num_partitions: None,
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
@@ -1908,20 +1923,10 @@ fn btree_stats_as_batch(stats: Vec<EncodedBatch>, value_type: &DataType) -> Resu
 }
 
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum DistributedMode {
     Single,
-    Fragment { first_frag_id: u32 },
+    Fragment { frag_ids: Vec<u32> },
     Range { range_id: u32 },
-}
-
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct BTreeShardManifest {
-    pub partition_id: u64,
-    pub num_pages: u32,
-    pub page_data_file: String,
-    pub page_lookup_file: String,
 }
 
 /// Train a btree index from a stream of sorted page-size batches of values and row ids
@@ -1930,10 +1935,12 @@ pub async fn train_btree_index(
     index_store: &dyn IndexStore,
     batch_size: u64,
     mode: DistributedMode,
-) -> Result<BTreeShardManifest> {
-    let partition_id: Option<u64> = match &mode {
+) -> Result<()> {
+    let partition_id = match &mode {
         DistributedMode::Single => None,
-        DistributedMode::Fragment { first_frag_id } => Some((*first_frag_id as u64) << 32),
+        DistributedMode::Fragment { frag_ids } => {
+            Some((frag_ids.first().copied().unwrap_or(0) as u64) << 32)
+        }
         DistributedMode::Range { range_id } => Some((*range_id as u64) << 32),
     };
 
@@ -2012,21 +2019,7 @@ pub async fn train_btree_index(
     };
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
-    let page_data_file = match partition_id {
-        None => BTREE_PAGES_NAME.to_string(),
-        Some(pid) => part_page_data_file_path(pid),
-    };
-    let page_lookup_file = match partition_id {
-        None => BTREE_LOOKUP_NAME.to_string(),
-        Some(pid) => part_lookup_file_path(pid),
-    };
-    let manifest = BTreeShardManifest {
-        partition_id: partition_id.unwrap_or(0),
-        num_pages: batch_idx,
-        page_data_file,
-        page_lookup_file,
-    };
-    Ok(manifest)
+    Ok(())
 }
 
 /// Train a BTree index using range partitioning.
@@ -2052,27 +2045,16 @@ pub async fn train_btree_index_partitioned(
     index_store: &dyn IndexStore,
     batch_size: u64,
     boundaries: &[ScalarValue],
-) -> Result<Vec<BTreeShardManifest>> {
+) -> Result<Vec<String>> {
     if boundaries.is_empty() {
-        return train_btree_index(
+        train_btree_index(
             batches_source,
             index_store,
             batch_size,
             DistributedMode::Single,
         )
-        .await
-        .map(|m| vec![m]);
-    }
-
-    for window in boundaries.windows(2) {
-        let a = OrderableScalarValue(window[0].clone());
-        let b = OrderableScalarValue(window[1].clone());
-        if a >= b {
-            return Err(Error::invalid_input(format!(
-                "Partition boundaries must be in strictly ascending order, but found {:?} >= {:?}",
-                window[0], window[1]
-            )));
-        }
+        .await?;
+        return Ok(Vec::new());
     }
 
     let schema = batches_source.schema();
@@ -2084,7 +2066,7 @@ pub async fn train_btree_index_partitioned(
     let mut current_partition: u32 = 0;
     let mut partition_buffer: Vec<RecordBatch> = Vec::new();
     let mut pending_batch: Option<RecordBatch> = None;
-    let mut manifests: Vec<BTreeShardManifest> = Vec::new();
+    let mut part_lookup_files: Vec<String> = Vec::new();
 
     let mut source = Box::pin(chunk_concat_stream(batches_source, batch_size as usize));
 
@@ -2116,36 +2098,6 @@ pub async fn train_btree_index_partitioned(
             }
             Some(0) => {
                 if !partition_buffer.is_empty() {
-                    manifests.push(
-                        flush_partition(
-                            &partition_buffer,
-                            index_store,
-                            batch_size,
-                            current_partition,
-                            &schema,
-                        )
-                        .await?,
-                    );
-                    partition_buffer.clear();
-                } else {
-                    manifests.push(
-                        write_empty_partition(
-                            index_store,
-                            batch_size,
-                            current_partition,
-                            &value_type,
-                        )
-                        .await?,
-                    );
-                }
-                current_partition += 1;
-                pending_batch = Some(batch);
-            }
-            Some(split_idx) => {
-                let left = batch.slice(0, split_idx);
-                let right = batch.slice(split_idx, batch.num_rows() - split_idx);
-                partition_buffer.push(left);
-                manifests.push(
                     flush_partition(
                         &partition_buffer,
                         index_store,
@@ -2153,9 +2105,30 @@ pub async fn train_btree_index_partitioned(
                         current_partition,
                         &schema,
                     )
-                    .await?,
-                );
+                    .await?;
+                    partition_buffer.clear();
+                } else {
+                    write_empty_partition(index_store, batch_size, current_partition, &value_type)
+                        .await?;
+                }
+                part_lookup_files.push(part_lookup_file_path((current_partition as u64) << 32));
+                current_partition += 1;
+                pending_batch = Some(batch);
+            }
+            Some(split_idx) => {
+                let left = batch.slice(0, split_idx);
+                let right = batch.slice(split_idx, batch.num_rows() - split_idx);
+                partition_buffer.push(left);
+                flush_partition(
+                    &partition_buffer,
+                    index_store,
+                    batch_size,
+                    current_partition,
+                    &schema,
+                )
+                .await?;
                 partition_buffer.clear();
+                part_lookup_files.push(part_lookup_file_path((current_partition as u64) << 32));
                 current_partition += 1;
                 pending_batch = Some(right);
             }
@@ -2163,23 +2136,21 @@ pub async fn train_btree_index_partitioned(
     }
 
     if !partition_buffer.is_empty() {
-        manifests.push(
-            flush_partition(
-                &partition_buffer,
-                index_store,
-                batch_size,
-                current_partition,
-                &schema,
-            )
-            .await?,
-        );
+        flush_partition(
+            &partition_buffer,
+            index_store,
+            batch_size,
+            current_partition,
+            &schema,
+        )
+        .await?;
+        part_lookup_files.push(part_lookup_file_path((current_partition as u64) << 32));
     } else if current_partition < boundaries.len() as u32 {
-        manifests.push(
-            write_empty_partition(index_store, batch_size, current_partition, &value_type).await?,
-        );
+        write_empty_partition(index_store, batch_size, current_partition, &value_type).await?;
+        part_lookup_files.push(part_lookup_file_path((current_partition as u64) << 32));
     }
 
-    Ok(manifests)
+    Ok(part_lookup_files)
 }
 
 fn find_partition_split_point(array: &dyn Array, boundary: &ScalarValue) -> Result<Option<usize>> {
@@ -2203,7 +2174,7 @@ async fn flush_partition(
     batch_size: u64,
     range_id: u32,
     schema: &Arc<Schema>,
-) -> Result<BTreeShardManifest> {
+) -> Result<()> {
     let batches_iter: Vec<std::result::Result<RecordBatch, DataFusionError>> =
         batches.iter().cloned().map(Ok).collect();
     let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(batches_iter));
@@ -2223,7 +2194,7 @@ async fn write_empty_partition(
     batch_size: u64,
     range_id: u32,
     value_type: &DataType,
-) -> Result<BTreeShardManifest> {
+) -> Result<()> {
     let empty_schema = Arc::new(Schema::new(vec![
         Field::new(VALUE_COLUMN_NAME, value_type.clone(), true),
         Field::new(ROW_ID, DataType::UInt64, false),
@@ -2241,46 +2212,28 @@ async fn write_empty_partition(
     .await
 }
 
-pub struct MergeResult {
-    pub part_lookup_files: Vec<String>,
-    pub part_page_files: Vec<String>,
-}
-
-pub async fn cleanup_shard_files(store: &dyn IndexStore, merge_result: &MergeResult) {
-    for file in &merge_result.part_lookup_files {
-        let _ = store.delete_index_file(file).await;
-    }
-}
-
 pub async fn merge_from_manifests(
     store: Arc<dyn IndexStore>,
-    manifests: &[BTreeShardManifest],
+    part_lookup_files: &[String],
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<MergeResult> {
-    let mut sorted_manifests: Vec<_> = manifests.iter().collect();
-    sorted_manifests.sort_by_key(|m| m.partition_id);
-
-    let part_page_files: Vec<String> = sorted_manifests
+    let part_page_files: Vec<String> = part_lookup_files
         .iter()
-        .map(|m| m.page_data_file.clone())
-        .collect();
-    let part_lookup_files: Vec<String> = sorted_manifests
-        .iter()
-        .map(|m| m.page_lookup_file.clone())
+        .map(|lookup_file| lookup_file.replace("_page_lookup.lance", "_page_data.lance"))
         .collect();
 
     merge_metadata_files(
         store.as_ref(),
         &part_page_files,
-        &part_lookup_files,
+        part_lookup_files,
         batch_readhead,
         progress,
     )
     .await?;
 
     Ok(MergeResult {
-        part_lookup_files,
+        part_lookup_files: part_lookup_files.to_vec(),
         part_page_files,
     })
 }
@@ -2292,7 +2245,6 @@ pub async fn merge_index_files(
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<MergeResult> {
-    // List all partition page / lookup files in the index directory
     let (part_page_files, part_lookup_files) =
         list_page_lookup_files(object_store, index_dir).await?;
     merge_metadata_files(
@@ -2302,7 +2254,11 @@ pub async fn merge_index_files(
         batch_readhead,
         progress,
     )
-    .await
+    .await?;
+    Ok(MergeResult {
+        part_lookup_files,
+        part_page_files,
+    })
 }
 
 /// List and filter files from the index directory
@@ -2400,14 +2356,14 @@ async fn merge_metadata_files(
     part_lookup_files: &[String],
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<MergeResult> {
+) -> Result<()> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
         return Err(Error::internal(
             "No partition files provided for merging".to_string(),
         ));
     }
 
-    // Step 1: Validate that lookup and page files match
+    // Step 1: Create lookup map for page files by partition ID
     if part_lookup_files.len() != part_page_files.len() {
         return Err(Error::internal(format!(
             "Number of partition lookup files ({}) does not match number of partition page files ({})",
@@ -2415,13 +2371,16 @@ async fn merge_metadata_files(
             part_page_files.len()
         )));
     }
-    let page_partition_ids: HashSet<u64> = part_page_files
-        .iter()
-        .map(|f| extract_partition_id(f))
-        .collect::<Result<_>>()?;
+    let mut page_files_map = HashMap::new();
+    for page_file in part_page_files {
+        let partition_id = extract_partition_id(page_file)?;
+        page_files_map.insert(partition_id, page_file);
+    }
+
+    // Step 2: Validate that all lookup files have corresponding page files
     for lookup_file in part_lookup_files {
         let partition_id = extract_partition_id(lookup_file)?;
-        if !page_partition_ids.contains(&partition_id) {
+        if !page_files_map.contains_key(&partition_id) {
             return Err(Error::internal(format!(
                 "No corresponding page file found for lookup file: {} (partition_id: {})",
                 lookup_file, partition_id
@@ -2461,31 +2420,32 @@ async fn merge_metadata_files(
         Field::new("page_idx", DataType::UInt32, false),
     ]));
 
-    let sorted_part_page_files = sort_files_by_partition_id(part_page_files)?
-        .into_iter()
-        .map(|(_, f)| f)
-        .collect::<Vec<_>>();
-    let sorted_part_lookup_files = sort_files_by_partition_id(part_lookup_files)?
-        .into_iter()
-        .map(|(_, f)| f)
-        .collect::<Vec<_>>();
-
-    merge_partition_lookups(
-        store,
-        &sorted_part_lookup_files,
-        lookup_schema,
-        metadata,
-        batch_size,
-        range_partitioned,
-        batch_readhead,
-        progress,
-    )
-    .await?;
-
-    Ok(MergeResult {
-        part_lookup_files: sorted_part_lookup_files,
-        part_page_files: sorted_part_page_files,
-    })
+    // Step 4: Merge pages and lookups and generate new index files
+    if range_partitioned {
+        merge_range_partitioned_lookups(
+            store,
+            part_lookup_files,
+            lookup_schema,
+            metadata,
+            batch_size,
+            batch_readhead,
+            progress,
+        )
+        .await
+    } else {
+        merge_pages_and_lookups(
+            store,
+            part_page_files,
+            part_lookup_files,
+            &page_files_map,
+            lookup_schema,
+            metadata,
+            batch_size,
+            batch_readhead,
+            progress,
+        )
+        .await
+    }
 }
 
 /// Merges multiple lookup files from a range-partitioned index into a single, unified lookup file.
@@ -2517,14 +2477,12 @@ async fn merge_metadata_files(
 ///
 /// The final, merged `_page_lookup.lance` will have a single `page_idx` column containing
 /// `[0, 1, 2, 3, 4, 5, 6]`.
-#[allow(clippy::too_many_arguments)]
-async fn merge_partition_lookups(
+async fn merge_range_partitioned_lookups(
     store: &dyn IndexStore,
     part_lookup_files: &[String],
     lookup_schema: Arc<Schema>,
     mut metadata: HashMap<String, String>,
     batch_size: u64,
-    range_partitioned: bool,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
@@ -2533,6 +2491,7 @@ async fn merge_partition_lookups(
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
         .await?;
 
+    // stores partition id and the number of pages in that partition
     let mut pages_per_file: Vec<(u64, u32)> = Vec::with_capacity(sorted_part_lookup_files.len());
     let mut num_pages_written = 0u32;
 
@@ -2560,14 +2519,7 @@ async fn merge_partition_lookups(
             .await?;
     }
 
-    if range_partitioned {
-        metadata.insert(RANGE_PARTITIONED_META_KEY.to_string(), "true".to_string());
-    } else {
-        metadata.insert(
-            FRAGMENT_PARTITIONED_META_KEY.to_string(),
-            "true".to_string(),
-        );
-    }
+    metadata.insert(RANGE_PARTITIONED_META_KEY.to_string(), "true".to_string());
     metadata.insert(
         PAGE_NUM_PER_RANGE_PARTITION_META_KEY.to_string(),
         serde_json::to_string(&pages_per_file)?,
@@ -2575,6 +2527,77 @@ async fn merge_partition_lookups(
 
     lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_complete("merge_lookups").await?;
+
+    Ok(())
+}
+
+/// Merges partition files using a K-way sort-merge algorithm.
+///
+/// This function assumes its inputs have been pre-validated. It reads from all
+/// partitioned page files simultaneously, merges them into a single sorted stream,
+/// writes a new global page file, and generates a corresponding global lookup file.
+#[allow(clippy::too_many_arguments)]
+async fn merge_pages_and_lookups(
+    store: &dyn IndexStore,
+    _part_page_files: &[String],
+    part_lookup_files: &[String],
+    page_files_map: &HashMap<u64, &String>,
+    lookup_schema: Arc<Schema>,
+    metadata: HashMap<String, String>,
+    batch_size: u64,
+    batch_readhead: Option<usize>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<()> {
+    // Create a new global page file
+    let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
+    let page_file = page_files_map.get(&partition_id).unwrap();
+    let page_reader = store.open_index_file(page_file).await?;
+    let page_schema = page_reader.schema().clone();
+
+    let arrow_schema = Arc::new(Schema::from(&page_schema));
+    let mut page_file = store
+        .new_index_file(BTREE_PAGES_NAME, arrow_schema.clone())
+        .await?;
+    progress.stage_start("merge_pages", None, "pages").await?;
+    let lookup_entries = merge_pages(
+        part_lookup_files,
+        page_files_map,
+        store,
+        batch_size,
+        &mut page_file,
+        arrow_schema.clone(),
+        batch_readhead,
+        progress.clone(),
+    )
+    .await?;
+    page_file.finish().await?;
+    progress.stage_complete("merge_pages").await?;
+
+    let lookup_batch = RecordBatch::try_new(
+        lookup_schema.clone(),
+        vec![
+            ScalarValue::iter_to_array(lookup_entries.iter().map(|(min, _, _, _)| min.clone()))?,
+            ScalarValue::iter_to_array(lookup_entries.iter().map(|(_, max, _, _)| max.clone()))?,
+            Arc::new(UInt32Array::from_iter_values(
+                lookup_entries
+                    .iter()
+                    .map(|(_, _, null_count, _)| *null_count),
+            )),
+            Arc::new(UInt32Array::from_iter_values(
+                lookup_entries.iter().map(|(_, _, _, page_idx)| *page_idx),
+            )),
+        ],
+    )?;
+    let mut lookup_file = store
+        .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
+        .await?;
+    progress
+        .stage_start("write_lookup_file", Some(1), "files")
+        .await?;
+    lookup_file.write_record_batch(lookup_batch).await?;
+    lookup_file.finish_with_metadata(metadata).await?;
+    progress.stage_progress("write_lookup_file", 1).await?;
+    progress.stage_complete("write_lookup_file").await?;
 
     Ok(())
 }
@@ -2597,6 +2620,109 @@ fn add_offset_to_page_idx(batch: &RecordBatch, offset: u32) -> Result<RecordBatc
     new_columns[page_idx_pos] = new_page_idx_array_ref;
     let new_batch = RecordBatch::try_new(batch.schema(), new_columns)?;
     Ok(new_batch)
+}
+
+/// Merge pages using Datafusion's SortPreservingMergeExec
+/// which implements a K-way merge algorithm with fixed-size output batches
+#[allow(clippy::too_many_arguments)]
+async fn merge_pages(
+    part_lookup_files: &[String],
+    page_files_map: &HashMap<u64, &String>,
+    store: &dyn IndexStore,
+    batch_size: u64,
+    page_file: &mut Box<dyn IndexWriter>,
+    arrow_schema: Arc<Schema>,
+    batch_readhead: Option<usize>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<Vec<(ScalarValue, ScalarValue, u32, u32)>> {
+    let mut lookup_entries = Vec::new();
+    let mut page_idx = 0u32;
+
+    debug!(
+        "Starting SortPreservingMerge with {} partitions",
+        part_lookup_files.len()
+    );
+
+    let value_field = arrow_schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+    let row_id_field = arrow_schema.field(1).clone().with_name(ROW_ID);
+    let stream_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+
+    // Create execution plans for each stream
+    let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+    for lookup_file in part_lookup_files {
+        let partition_id = extract_partition_id(lookup_file)?;
+        let page_file_name = (*page_files_map.get(&partition_id).ok_or_else(|| {
+            Error::internal(format!(
+                "Page file not found for partition ID: {}",
+                partition_id
+            ))
+        })?)
+        .clone();
+
+        let reader = store.open_index_file(&page_file_name).await?;
+
+        let reader_stream = IndexReaderStream::new(reader, batch_size).await;
+
+        let stream = reader_stream
+            .map(|fut| fut.map_err(DataFusionError::from))
+            .buffered(batch_readhead.unwrap_or(1))
+            .boxed();
+
+        let sendable_stream =
+            Box::pin(RecordBatchStreamAdapter::new(stream_schema.clone(), stream));
+        inputs.push(Arc::new(OneShotExec::new(sendable_stream)));
+    }
+
+    // Create Union execution plan to combine all partitions
+    let union_inputs = UnionExec::try_new(inputs)?;
+
+    // Create SortPreservingMerge execution plan
+    let value_column_index = stream_schema.index_of(VALUE_COLUMN_NAME)?;
+    let sort_expr = PhysicalSortExpr {
+        expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
+        options: SortOptions {
+            descending: false,
+            nulls_first: true,
+        },
+    };
+
+    let merge_exec = Arc::new(SortPreservingMergeExec::new(
+        [sort_expr].into(),
+        union_inputs,
+    ));
+
+    let unchunked = execute_plan(
+        merge_exec,
+        LanceExecutionOptions {
+            use_spilling: false,
+            ..Default::default()
+        },
+    )?;
+
+    // Use chunk_concat_stream to ensure fixed batch sizes
+    let mut chunked_stream = chunk_concat_stream(unchunked, batch_size as usize);
+
+    // Process chunked stream
+    while let Some(batch) = chunked_stream.try_next().await? {
+        let writer_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![batch.column(0).clone(), batch.column(1).clone()],
+        )?;
+
+        page_file.write_record_batch(writer_batch).await?;
+
+        let min_val = ScalarValue::try_from_array(batch.column(0), 0)?;
+        let max_val = ScalarValue::try_from_array(batch.column(0), batch.num_rows() - 1)?;
+        let null_count = batch.column(0).null_count() as u32;
+
+        lookup_entries.push((min_val, max_val, null_count, page_idx));
+        page_idx += 1;
+        progress
+            .stage_progress("merge_pages", page_idx as u64)
+            .await?;
+    }
+
+    Ok(lookup_entries)
 }
 
 // Sorts file paths by the partition ID extracted from file name.
@@ -2642,12 +2768,82 @@ fn extract_partition_id(filename: &str) -> Result<u64> {
     })
 }
 
+/// Clean up partition files after successful merge
+///
+/// This function safely deletes partition lookup and page files after a successful merge operation.
+/// File deletion failures are logged but do not affect the overall success of the merge operation.
+#[allow(dead_code)]
+async fn cleanup_partition_files(
+    store: &dyn IndexStore,
+    part_lookup_files: &[String],
+    part_page_files: &[String],
+) {
+    // Clean up partition lookup files
+    for file_name in part_lookup_files {
+        cleanup_single_file(
+            store,
+            file_name,
+            "part_",
+            "_page_lookup.lance",
+            "partition lookup",
+        )
+        .await;
+    }
+
+    // Clean up partition page files
+    for file_name in part_page_files {
+        cleanup_single_file(
+            store,
+            file_name,
+            "part_",
+            "_page_data.lance",
+            "partition page",
+        )
+        .await;
+    }
+}
+
+/// Helper function to clean up a single partition file
+///
+/// Performs safety checks on the filename pattern before attempting deletion.
+#[allow(dead_code)]
+async fn cleanup_single_file(
+    store: &dyn IndexStore,
+    file_name: &str,
+    expected_prefix: &str,
+    expected_suffix: &str,
+    file_type: &str,
+) {
+    if file_name.starts_with(expected_prefix) && file_name.ends_with(expected_suffix) {
+        match store.delete_index_file(file_name).await {
+            Ok(()) => {
+                debug!("Successfully deleted {} file: {}", file_type, file_name);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to delete {} file '{}': {}. \
+                    This does not affect the merge operation, but may leave \
+                    partition files that should be cleaned up manually.",
+                    file_type, file_name, e
+                );
+            }
+        }
+    } else {
+        // If the filename doesn't match the expected format, log a warning but don't attempt deletion
+        warn!(
+            "Skipping deletion of file '{}' as it does not match the expected \
+            {} file pattern ({}*{})",
+            file_name, file_type, expected_prefix, expected_suffix
+        );
+    }
+}
+
 pub(crate) fn part_page_data_file_path(partition_id: u64) -> String {
-    format!("part_{:020}_{}", partition_id, BTREE_PAGES_NAME)
+    format!("part_{}_{}", partition_id, BTREE_PAGES_NAME)
 }
 
 pub(crate) fn part_lookup_file_path(partition_id: u64) -> String {
-    format!("part_{:020}_{}", partition_id, BTREE_LOOKUP_NAME)
+    format!("part_{}_{}", partition_id, BTREE_LOOKUP_NAME)
 }
 
 /// A stream that reads the original training data back out of the index
@@ -2728,14 +2924,11 @@ pub struct BTreeParameters {
     /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
     pub range_id: Option<u32>,
 
-    /// The number of range partitions for a distributed BTree index build.
+    /// The total number of partitions for a distributed BTree index build.
     ///
-    /// When `Some(n)`, the index is built with `n` range partitions, allowing
-    /// parallel construction and efficient per-partition queries. When `None`,
-    /// a single monolithic index is built.
-    ///
-    /// This field is preserved through `derive_index_params` so that index
-    /// initialization and updates can maintain the partition structure.
+    /// When set, this indicates the total number of partitions that will be
+    /// combined to form the complete index. This is used for validation and
+    /// metadata purposes during distributed index construction.
     pub num_partitions: Option<u32>,
 }
 
@@ -2820,20 +3013,6 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             .as_any()
             .downcast_ref::<BTreeTrainingRequest>()
             .unwrap();
-        let mode = match (fragment_ids, request.parameters.range_id) {
-            (Some(_frag_ids), Some(_)) => {
-                return Err(Error::invalid_input_source(
-                    "Cannot specify both fragment_ids and range_id; they are mutually exclusive"
-                        .into(),
-                ));
-            }
-            (Some(frag_ids), None) => {
-                let first_frag_id = frag_ids.first().copied().unwrap_or(0);
-                DistributedMode::Fragment { first_frag_id }
-            }
-            (None, Some(range_id)) => DistributedMode::Range { range_id },
-            (None, None) => DistributedMode::Single,
-        };
         train_btree_index(
             data,
             index_store,
@@ -2841,7 +3020,11 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
                 .parameters
                 .zone_size
                 .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
-            mode,
+            match (fragment_ids, request.parameters.range_id) {
+                (Some(frag_ids), _) => DistributedMode::Fragment { frag_ids },
+                (None, Some(range_id)) => DistributedMode::Range { range_id },
+                (None, None) => DistributedMode::Single,
+            },
         )
         .await?;
         Ok(CreatedIndex {
@@ -3331,7 +3514,7 @@ mod tests {
             fragment1_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 1 },
+            DistributedMode::Fragment { frag_ids: vec![1] },
         )
         .await
         .unwrap();
@@ -3354,7 +3537,7 @@ mod tests {
             fragment2_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 2 },
+            DistributedMode::Fragment { frag_ids: vec![2] },
         )
         .await
         .unwrap();
@@ -3388,20 +3571,30 @@ mod tests {
             .collect::<Vec<_>>();
         let merge_start = tags
             .iter()
-            .position(|e| e == "start:merge_lookups")
-            .expect("missing merge_lookups start");
+            .position(|e| e == "start:merge_pages")
+            .expect("missing merge_pages start");
         let merge_complete = tags
             .iter()
-            .position(|e| e == "complete:merge_lookups")
-            .expect("missing merge_lookups complete");
+            .position(|e| e == "complete:merge_pages")
+            .expect("missing merge_pages complete");
+        let lookup_start = tags
+            .iter()
+            .position(|e| e == "start:write_lookup_file")
+            .expect("missing write_lookup_file start");
+        let lookup_complete = tags
+            .iter()
+            .position(|e| e == "complete:write_lookup_file")
+            .expect("missing write_lookup_file complete");
         assert!(merge_start < merge_complete);
+        assert!(merge_complete < lookup_start);
+        assert!(lookup_start < lookup_complete);
         assert!(
-            tags.iter().any(|e| e == "progress:merge_lookups"),
-            "expected merge_lookups progress callbacks"
+            tags.iter().any(|e| e == "progress:merge_pages"),
+            "expected merge_pages progress callbacks"
         );
         assert!(
-            !tags.iter().any(|e| e == "start:merge_pages"),
-            "fragment-based merge should not use merge_pages"
+            tags.iter().any(|e| e == "progress:write_lookup_file"),
+            "expected write_lookup_file progress callbacks"
         );
 
         // Load both indexes
@@ -3536,7 +3729,7 @@ mod tests {
             fragment1_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 1 },
+            DistributedMode::Fragment { frag_ids: vec![1] },
         )
         .await
         .unwrap();
@@ -3559,7 +3752,7 @@ mod tests {
             fragment2_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 2 },
+            DistributedMode::Fragment { frag_ids: vec![2] },
         )
         .await
         .unwrap();
@@ -3582,7 +3775,7 @@ mod tests {
             fragment3_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 3 },
+            DistributedMode::Fragment { frag_ids: vec![3] },
         )
         .await
         .unwrap();
@@ -3925,6 +4118,34 @@ mod tests {
         assert!(super::extract_partition_id("part_abc_page_data.lance").is_err());
         assert!(super::extract_partition_id("part_123").is_err());
         assert!(super::extract_partition_id("part_").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_partition_files() {
+        // Create a test store
+        let tmpdir = TempObjDir::default();
+        let test_store: Arc<dyn crate::scalar::IndexStore> = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Test files with different patterns
+        let lookup_files = vec![
+            "part_123_page_lookup.lance".to_string(),
+            "invalid_lookup_file.lance".to_string(),
+            "part_456_page_lookup.lance".to_string(),
+        ];
+
+        let page_files = vec![
+            "part_123_page_data.lance".to_string(),
+            "invalid_page_file.lance".to_string(),
+            "part_456_page_data.lance".to_string(),
+        ];
+
+        // The cleanup function should handle both valid and invalid file patterns gracefully
+        // This test mainly verifies that the function doesn't panic and handles edge cases
+        super::cleanup_partition_files(test_store.as_ref(), &lookup_files, &page_files).await;
     }
 
     #[tokio::test]
@@ -4881,7 +5102,7 @@ mod tests {
 
         let boundaries = vec![ScalarValue::Int32(Some(10))];
 
-        super::train_btree_index_partitioned(
+        let part_lookup_files = super::train_btree_index_partitioned(
             stream,
             index_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
@@ -4890,14 +5111,10 @@ mod tests {
         .await
         .unwrap();
 
-        let part_page_files = vec![
-            part_page_data_file_path(0 << 32),
-            part_page_data_file_path(1 << 32),
-        ];
-        let part_lookup_files = vec![
-            part_lookup_file_path(0 << 32),
-            part_lookup_file_path(1 << 32),
-        ];
+        let part_page_files: Vec<String> = part_lookup_files
+            .iter()
+            .map(|f| f.replace("_page_lookup.lance", "_page_data.lance"))
+            .collect();
 
         super::merge_metadata_files(
             index_store.as_ref(),
@@ -4939,474 +5156,6 @@ mod tests {
                     .map(u64::from)
                     .collect();
                 assert!(ids.contains(&7), "Should contain row 7 (value=15)");
-            }
-            _ => panic!("Expected Exact result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_partitioned_all_data_in_first_partition() {
-        use arrow::datatypes::DataType;
-        use arrow_array::{Int32Array, RecordBatch, UInt64Array};
-        use arrow_schema::{Field, Schema};
-
-        let tmpdir = TempObjDir::default();
-        let index_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, true),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from((0..100i32).collect::<Vec<_>>())),
-                Arc::new(UInt64Array::from((0..100u64).collect::<Vec<_>>())),
-            ],
-        )
-        .unwrap();
-
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
-        let stream: SendableRecordBatchStream = Box::pin(stream);
-
-        let boundaries = vec![ScalarValue::Int32(Some(1000))];
-
-        let manifests = super::train_btree_index_partitioned(
-            stream,
-            index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE,
-            &boundaries,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(manifests.len(), 1);
-        assert!(manifests[0].num_pages > 0);
-
-        let part_page_files = vec![part_page_data_file_path(0 << 32)];
-        let part_lookup_files = vec![part_lookup_file_path(0 << 32)];
-
-        super::merge_metadata_files(
-            index_store.as_ref(),
-            &part_page_files,
-            &part_lookup_files,
-            None,
-            noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        let index = BTreeIndex::load(index_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(50)));
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        match result {
-            SearchResult::Exact(row_ids) => {
-                let ids: Vec<u64> = row_ids
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .collect();
-                assert!(ids.contains(&50), "Should contain row 50 (value=50)");
-            }
-            _ => panic!("Expected Exact result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_partitioned_all_data_in_last_partition() {
-        use arrow::datatypes::DataType;
-        use arrow_array::{Int32Array, RecordBatch, UInt64Array};
-        use arrow_schema::{Field, Schema};
-
-        let tmpdir = TempObjDir::default();
-        let index_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, true),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-
-        let values: Vec<i32> = std::iter::once(0).chain(1000..1100i32).collect();
-        let row_ids: Vec<u64> = (0..101u64).collect();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(values)),
-                Arc::new(UInt64Array::from(row_ids)),
-            ],
-        )
-        .unwrap();
-
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
-        let stream: SendableRecordBatchStream = Box::pin(stream);
-
-        let boundaries = vec![ScalarValue::Int32(Some(1))];
-
-        let manifests = super::train_btree_index_partitioned(
-            stream,
-            index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE,
-            &boundaries,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(manifests.len(), 2);
-        assert!(manifests[0].num_pages > 0);
-        assert!(manifests[1].num_pages > 0);
-
-        let part_page_files = vec![
-            part_page_data_file_path(0 << 32),
-            part_page_data_file_path(1 << 32),
-        ];
-        let part_lookup_files = vec![
-            part_lookup_file_path(0 << 32),
-            part_lookup_file_path(1 << 32),
-        ];
-
-        super::merge_metadata_files(
-            index_store.as_ref(),
-            &part_page_files,
-            &part_lookup_files,
-            None,
-            noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        let index = BTreeIndex::load(index_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        match result {
-            SearchResult::Exact(row_ids) => {
-                let ids: Vec<u64> = row_ids
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .collect();
-                assert!(ids.contains(&0), "Should contain row 0 (value=0)");
-            }
-            _ => panic!("Expected Exact result"),
-        }
-
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(1050)));
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        match result {
-            SearchResult::Exact(row_ids) => {
-                let ids: Vec<u64> = row_ids
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .collect();
-                assert!(ids.contains(&51), "Should contain row 51 (value=1050)");
-            }
-            _ => panic!("Expected Exact result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_partitioned_multiple_boundaries() {
-        use arrow::datatypes::DataType;
-        use arrow_array::{Int32Array, RecordBatch, UInt64Array};
-        use arrow_schema::{Field, Schema};
-
-        let tmpdir = TempObjDir::default();
-        let index_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, true),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from((0..300i32).collect::<Vec<_>>())),
-                Arc::new(UInt64Array::from((0..300u64).collect::<Vec<_>>())),
-            ],
-        )
-        .unwrap();
-
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
-        let stream: SendableRecordBatchStream = Box::pin(stream);
-
-        let boundaries = vec![ScalarValue::Int32(Some(100)), ScalarValue::Int32(Some(200))];
-
-        let manifests = super::train_btree_index_partitioned(
-            stream,
-            index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE,
-            &boundaries,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(manifests.len(), 3);
-        assert!(manifests[0].num_pages > 0);
-        assert!(manifests[1].num_pages > 0);
-        assert!(manifests[2].num_pages > 0);
-
-        let part_page_files = vec![
-            part_page_data_file_path(0 << 32),
-            part_page_data_file_path(1 << 32),
-            part_page_data_file_path(2 << 32),
-        ];
-        let part_lookup_files = vec![
-            part_lookup_file_path(0 << 32),
-            part_lookup_file_path(1 << 32),
-            part_lookup_file_path(2 << 32),
-        ];
-
-        super::merge_metadata_files(
-            index_store.as_ref(),
-            &part_page_files,
-            &part_lookup_files,
-            None,
-            noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        let index = BTreeIndex::load(index_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        for (val, expected_row_id) in [(50, 50u64), (150, 150u64), (250, 250u64)] {
-            let query = SargableQuery::Equals(ScalarValue::Int32(Some(val)));
-            let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-            match result {
-                SearchResult::Exact(row_ids) => {
-                    let ids: Vec<u64> = row_ids
-                        .true_rows()
-                        .row_addrs()
-                        .unwrap()
-                        .map(u64::from)
-                        .collect();
-                    assert!(
-                        ids.contains(&expected_row_id),
-                        "Should contain row {expected_row_id} (value={val})"
-                    );
-                }
-                _ => panic!("Expected Exact result for value={val}"),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_partitioned_with_nulls() {
-        use arrow::datatypes::DataType;
-        use arrow_array::{Int32Array, RecordBatch, UInt64Array};
-        use arrow_schema::{Field, Schema};
-
-        let tmpdir = TempObjDir::default();
-        let index_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, true),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-
-        let values: Vec<Option<i32>> = (0..20)
-            .map(|i| if i % 5 == 0 { None } else { Some(i) })
-            .collect();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(values)),
-                Arc::new(UInt64Array::from((0..20u64).collect::<Vec<_>>())),
-            ],
-        )
-        .unwrap();
-
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
-        let stream: SendableRecordBatchStream = Box::pin(stream);
-
-        let boundaries = vec![ScalarValue::Int32(Some(10))];
-
-        let manifests = super::train_btree_index_partitioned(
-            stream,
-            index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE,
-            &boundaries,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(manifests.len(), 2);
-
-        let part_page_files = vec![
-            part_page_data_file_path(0 << 32),
-            part_page_data_file_path(1 << 32),
-        ];
-        let part_lookup_files = vec![
-            part_lookup_file_path(0 << 32),
-            part_lookup_file_path(1 << 32),
-        ];
-
-        super::merge_metadata_files(
-            index_store.as_ref(),
-            &part_page_files,
-            &part_lookup_files,
-            None,
-            noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        let index = BTreeIndex::load(index_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(7)));
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        match result {
-            SearchResult::Exact(row_ids) => {
-                let ids: Vec<u64> = row_ids
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .collect();
-                assert!(ids.contains(&7), "Should contain row 7 (value=7)");
-            }
-            _ => panic!("Expected Exact result"),
-        }
-
-        let query = SargableQuery::IsNull();
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        match result {
-            SearchResult::Exact(row_ids) => {
-                let null_ids: Vec<u64> = row_ids
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .collect();
-                assert!(null_ids.contains(&0), "Null rows should contain row 0");
-                assert!(null_ids.contains(&5), "Null rows should contain row 5");
-                assert!(null_ids.contains(&10), "Null rows should contain row 10");
-                assert!(null_ids.contains(&15), "Null rows should contain row 15");
-            }
-            _ => panic!("Expected Exact result for IsNull query"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_partitioned_batch_crosses_boundary() {
-        use arrow::datatypes::DataType;
-        use arrow_array::{Int32Array, RecordBatch, UInt64Array};
-        use arrow_schema::{Field, Schema};
-
-        let tmpdir = TempObjDir::default();
-        let index_store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int32, true),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from((0..200i32).collect::<Vec<_>>())),
-                Arc::new(UInt64Array::from((0..200u64).collect::<Vec<_>>())),
-            ],
-        )
-        .unwrap();
-
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
-        let stream: SendableRecordBatchStream = Box::pin(stream);
-
-        let boundaries = vec![ScalarValue::Int32(Some(100))];
-
-        let manifests =
-            super::train_btree_index_partitioned(stream, index_store.as_ref(), 200, &boundaries)
-                .await
-                .unwrap();
-
-        assert_eq!(manifests.len(), 2);
-        assert!(manifests[0].num_pages > 0);
-        assert!(manifests[1].num_pages > 0);
-
-        let part_page_files = vec![
-            part_page_data_file_path(0 << 32),
-            part_page_data_file_path(1 << 32),
-        ];
-        let part_lookup_files = vec![
-            part_lookup_file_path(0 << 32),
-            part_lookup_file_path(1 << 32),
-        ];
-
-        super::merge_metadata_files(
-            index_store.as_ref(),
-            &part_page_files,
-            &part_lookup_files,
-            None,
-            noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        let index = BTreeIndex::load(index_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(50)));
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        match result {
-            SearchResult::Exact(row_ids) => {
-                let ids: Vec<u64> = row_ids
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .collect();
-                assert!(ids.contains(&50), "Should contain row 50 (value=50)");
-            }
-            _ => panic!("Expected Exact result"),
-        }
-
-        let query = SargableQuery::Equals(ScalarValue::Int32(Some(150)));
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        match result {
-            SearchResult::Exact(row_ids) => {
-                let ids: Vec<u64> = row_ids
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .collect();
-                assert!(ids.contains(&150), "Should contain row 150 (value=150)");
             }
             _ => panic!("Expected Exact result"),
         }
