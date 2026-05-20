@@ -253,6 +253,7 @@ class _Dataset:
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[List[_Fragment]] = None,
+        index_segments: Optional[List[str]] = None,
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
