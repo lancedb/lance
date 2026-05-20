@@ -385,8 +385,16 @@ def test_initialize_mem_wal_bucket_sharding(tmp_path):
     assert details["num_shards"] == 8
     field = details["sharding_specs"][0]["fields"][0]
     assert field["transform"] == "bucket"
+    assert "expression" in field
     assert field["parameters"]["num_buckets"] == "8"
     assert len(field["source_ids"]) == 1
+
+    batch = _lookup_table([1, 2, 3], "base").to_batches()[0]
+    result = evaluate_sharding_spec(
+        batch, details["sharding_specs"][0], LanceSchema.from_pyarrow(batch.schema)
+    )
+    assert result.column_names == [field["field_id"]]
+    assert result.num_rows == batch.num_rows
 
 
 def test_initialize_mem_wal_bucket_sharding_without_primary_key(tmp_path):

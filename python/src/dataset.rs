@@ -3375,6 +3375,7 @@ impl Dataset {
                 field_dict.set_item("field_id", &field.field_id)?;
                 field_dict.set_item("source_ids", field.source_ids.clone())?;
                 field_dict.set_item("transform", field.transform.clone())?;
+                field_dict.set_item("expression", field.expression.clone())?;
                 field_dict.set_item("result_type", &field.result_type)?;
                 field_dict.set_item("parameters", field.parameters.clone())?;
                 fields.append(field_dict)?;
