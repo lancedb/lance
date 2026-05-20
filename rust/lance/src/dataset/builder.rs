@@ -10,7 +10,7 @@ use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::{Dataset, Error, Result, session::Session};
 use futures::FutureExt;
-use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_LOADING};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
@@ -582,11 +582,11 @@ impl DatasetBuilder {
         let target_ref = self.version.clone();
         match self.load_impl().boxed().await {
             Ok(dataset) => {
-                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, version=dataset.manifest.version, status="success");
+                info!(target: TRACE_DATASET_LOADING, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, version=dataset.manifest.version, status="success");
                 Ok(dataset)
             }
             Err(e) => {
-                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, status="error");
+                info!(target: TRACE_DATASET_LOADING, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, status="error");
                 Err(e)
             }
         }

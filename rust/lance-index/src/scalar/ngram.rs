@@ -37,7 +37,7 @@ use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_LOAD_SCALAR_PART};
 use lance_core::{Error, utils::mask::RowAddrTreeMap};
 use lance_core::{ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
@@ -233,7 +233,7 @@ impl NGramPostingListReader {
     ) -> Result<Arc<NGramPostingList>> {
         self.index_cache.get_or_insert_with_key(NGramPostingListKey { row_offset }, || async move {
             metrics.record_part_load();
-                tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
+                tracing::info!(target: TRACE_IO_LOAD_SCALAR_PART, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="ngram", part_id=row_offset);
                 let batch = self
                     .reader
                     .read_range(

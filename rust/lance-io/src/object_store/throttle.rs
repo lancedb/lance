@@ -30,6 +30,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
+use lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE;
 #[cfg(test)]
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -383,7 +384,7 @@ impl OperationThrottle {
         let outcome = match result {
             Ok(_) => RequestOutcome::Success,
             Err(err) if is_throttle_error(err) => {
-                debug!("Throttle error detected in stream");
+                debug!(target: TRACE_OBJECT_STORE_THROTTLE, "Throttle error detected in stream");
                 RequestOutcome::Throttled
             }
             Err(_) => RequestOutcome::Success,
@@ -392,6 +393,7 @@ impl OperationThrottle {
         let new_rate = self.controller.record_outcome(outcome);
         if new_rate < prev_rate {
             warn!(
+                target: TRACE_OBJECT_STORE_THROTTLE,
                 previous_rate = format!("{prev_rate:.1}"),
                 new_rate = format!("{new_rate:.1}"),
                 "AIMD throttle: rate reduced due to throttle errors"
@@ -416,7 +418,7 @@ impl OperationThrottle {
             let outcome = match &result {
                 Ok(_) => RequestOutcome::Success,
                 Err(err) if is_throttle_error(err) => {
-                    debug!("Throttle error detected");
+                    debug!(target: TRACE_OBJECT_STORE_THROTTLE, "Throttle error detected");
                     RequestOutcome::Throttled
                 }
                 Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
@@ -425,6 +427,7 @@ impl OperationThrottle {
             let new_rate = self.controller.record_outcome(outcome);
             if new_rate < prev_rate {
                 warn!(
+                    target: TRACE_OBJECT_STORE_THROTTLE,
                     previous_rate = format!("{prev_rate:.1}"),
                     new_rate = format!("{new_rate:.1}"),
                     "AIMD throttle: rate reduced due to throttle errors"
@@ -437,6 +440,7 @@ impl OperationThrottle {
                     let backoff_ms =
                         rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
                         attempt = attempt + 1,
                         max_retries = self.max_retries,
                         backoff_ms,

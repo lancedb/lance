@@ -25,7 +25,7 @@ use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
-    TRACE_DATASET_EVENTS,
+    TRACE_DATASET_CLEANING, TRACE_DATASET_DELETING, TRACE_DATASET_DROPPING_COLUMN,
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -1200,7 +1200,7 @@ impl Dataset {
         &self,
         policy: CleanupPolicy,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
+        info!(target: TRACE_DATASET_CLEANING, event=DATASET_CLEANING_EVENT, uri=&self.uri);
         cleanup::cleanup_old_versions(self, policy).boxed()
     }
 
@@ -1609,7 +1609,7 @@ impl Dataset {
 
     /// Delete rows based on a predicate.
     pub async fn delete(&mut self, predicate: &str) -> Result<write::delete::DeleteResult> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
+        info!(target: TRACE_DATASET_DELETING, event=DATASET_DELETING_EVENT, uri = &self.uri, predicate=predicate);
         write::delete::delete(self, predicate).await
     }
 
@@ -2928,7 +2928,7 @@ impl Dataset {
     /// call [optimize::compact_files()] to rewrite the data without the removed columns and
     /// then call [cleanup::cleanup_old_versions()] to remove the old files.
     pub async fn drop_columns(&mut self, columns: &[&str]) -> Result<()> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
+        info!(target: TRACE_DATASET_DROPPING_COLUMN, event=DATASET_DROPPING_COLUMN_EVENT, uri = &self.uri, columns = columns.join(","));
         schema_evolution::drop_columns(self, columns).await
     }
 

@@ -19,7 +19,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
-    TRACE_IO_EVENTS,
+    TRACE_IO_OPEN_FRAG_REUSE, TRACE_IO_OPEN_MEM_WAL, TRACE_IO_OPEN_SCALAR, TRACE_IO_OPEN_VECTOR,
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
@@ -1779,7 +1779,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let index = scalar::open_scalar_index(self, column, &index_meta, metrics).await?;
 
-        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
+        info!(target: TRACE_IO_OPEN_SCALAR, index_uuid=uuid, r#type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
         metrics.record_index_load();
 
         self.index_cache
@@ -1844,7 +1844,7 @@ impl DatasetIndexInternalExt for Dataset {
             minor_version,
         ) {
             (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                info!(target: TRACE_IO_OPEN_VECTOR, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -1866,7 +1866,7 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                info!(target: TRACE_IO_OPEN_VECTOR, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = PreviousFileReader::try_new_self_described_from_reader(
                     reader.clone(),
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
@@ -1915,7 +1915,7 @@ impl DatasetIndexInternalExt for Dataset {
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
-                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+                info!(target: TRACE_IO_OPEN_VECTOR, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
@@ -2125,7 +2125,7 @@ impl DatasetIndexInternalExt for Dataset {
                     let index =
                         open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await?;
 
-                    info!(target: TRACE_IO_EVENTS, index_uuid=uuid_clone, r#type=IO_TYPE_OPEN_FRAG_REUSE);
+                    info!(target: TRACE_IO_OPEN_FRAG_REUSE, index_uuid=uuid_clone, r#type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();
 
                     Ok(index)
@@ -2161,7 +2161,7 @@ impl DatasetIndexInternalExt for Dataset {
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index = open_mem_wal_index(index_meta)?;
 
-        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
+        info!(target: TRACE_IO_OPEN_MEM_WAL, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
         metrics.record_index_load();
 
         self.index_cache

@@ -58,7 +58,7 @@ impl<S: Stream> StreamTracingExt for S {
     }
 }
 
-pub const TRACE_FILE_AUDIT: &str = "lance::file_audit";
+pub const TRACE_FILE_AUDIT: &str = "lance::events::file_audit";
 pub const AUDIT_MODE_CREATE: &str = "create";
 pub const AUDIT_MODE_DELETE: &str = "delete";
 pub const AUDIT_MODE_DELETE_UNVERIFIED: &str = "delete_unverified";
@@ -67,20 +67,35 @@ pub const AUDIT_TYPE_MANIFEST: &str = "manifest";
 pub const AUDIT_TYPE_INDEX: &str = "index";
 pub const AUDIT_TYPE_DATA: &str = "data";
 pub const TRACE_FILE_CREATE: &str = "create";
-pub const TRACE_IO_EVENTS: &str = "lance::io_events";
+pub const TRACE_IO_EVENTS: &str = "lance::events::io_events";
 pub const IO_TYPE_OPEN_SCALAR: &str = "open_scalar_index";
+pub const TRACE_IO_OPEN_SCALAR: &str = "lance::events::io_events::open_scalar_index";
 pub const IO_TYPE_OPEN_VECTOR: &str = "open_vector_index";
+pub const TRACE_IO_OPEN_VECTOR: &str = "lance::events::io_events::open_vector_index";
 pub const IO_TYPE_OPEN_FRAG_REUSE: &str = "open_frag_reuse_index";
+pub const TRACE_IO_OPEN_FRAG_REUSE: &str = "lance::events::io_events::open_frag_reuse_index";
 pub const IO_TYPE_OPEN_MEM_WAL: &str = "open_mem_wal_index";
+pub const TRACE_IO_OPEN_MEM_WAL: &str = "lance::events::io_events::open_mem_wal_index";
 pub const IO_TYPE_LOAD_VECTOR_PART: &str = "load_vector_part";
+pub const TRACE_IO_LOAD_VECTOR_PART: &str = "lance::events::io_events::load_vector_part";
 pub const IO_TYPE_LOAD_SCALAR_PART: &str = "load_scalar_part";
-pub const TRACE_EXECUTION: &str = "lance::execution";
+pub const TRACE_IO_LOAD_SCALAR_PART: &str = "lance::events::io_events::load_scalar_part";
+pub const TRACE_EXECUTION: &str = "lance::events::execution";
 pub const EXECUTION_PLAN_RUN: &str = "plan_run";
-pub const TRACE_DATASET_EVENTS: &str = "lance::dataset_events";
+pub const TRACE_EXECUTION_PLAN_RUN: &str = "lance::events::execution::plan_run";
+pub const TRACE_DATASET_EVENTS: &str = "lance::events::dataset_events";
 pub const DATASET_WRITING_EVENT: &str = "writing";
+pub const TRACE_DATASET_WRITING: &str = "lance::events::dataset_events::writing";
 pub const DATASET_COMMITTED_EVENT: &str = "committed";
+pub const TRACE_DATASET_COMMITTED: &str = "lance::events::dataset_events::committed";
 pub const DATASET_DROPPING_COLUMN_EVENT: &str = "dropping_column";
+pub const TRACE_DATASET_DROPPING_COLUMN: &str = "lance::events::dataset_events::dropping_column";
 pub const DATASET_DELETING_EVENT: &str = "deleting";
+pub const TRACE_DATASET_DELETING: &str = "lance::events::dataset_events::deleting";
 pub const DATASET_COMPACTING_EVENT: &str = "compacting";
+pub const TRACE_DATASET_COMPACTING: &str = "lance::events::dataset_events::compacting";
 pub const DATASET_CLEANING_EVENT: &str = "cleaning";
+pub const TRACE_DATASET_CLEANING: &str = "lance::events::dataset_events::cleaning";
 pub const DATASET_LOADING_EVENT: &str = "loading";
+pub const TRACE_DATASET_LOADING: &str = "lance::events::dataset_events::loading";
+pub const TRACE_OBJECT_STORE_THROTTLE: &str = "lance::events::object_store::throttle";

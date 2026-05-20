@@ -44,7 +44,7 @@ use lance_core::{
     Error, Result,
     utils::{
         futures::FinallyStreamExt,
-        tracing::{EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION},
+        tracing::{EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION_PLAN_RUN},
     },
 };
 use log::{debug, info, warn};
@@ -541,7 +541,7 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
     collect_execution_metrics(plan, &mut counts);
     if !options.skip_logging {
         tracing::info!(
-            target: TRACE_EXECUTION,
+            target: TRACE_EXECUTION_PLAN_RUN,
             r#type = EXECUTION_PLAN_RUN,
             plan_summary = display_plan_one_liner(plan),
             output_rows,

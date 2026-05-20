@@ -248,7 +248,7 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
 
         let mut fields = EventToStr::default();
         event.record(&mut fields);
-        log::log!(target: "lance::events", state.level, "target=\"{}\" {}", event.metadata().target(), fields.str);
+        log::log!(target: event.metadata().target(), state.level, "{}", fields.str);
 
         if let Some(callback_sender) = state.callback_sender.as_ref() {
             let mut args = EventToMap::default();

@@ -43,7 +43,7 @@ use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
+use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_LOAD_SCALAR_PART};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use roaring::RoaringBitmap;
 use std::sync::LazyLock;
@@ -1804,7 +1804,7 @@ impl PostingListReader {
             .index_cache
             .get_or_insert_with_key(cache_key, || async move {
                 metrics.record_part_load();
-                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                info!(target: TRACE_IO_LOAD_SCALAR_PART, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
                 self.posting_list_from_batch(&batch, token_id)
             })

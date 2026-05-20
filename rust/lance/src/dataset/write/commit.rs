@@ -27,7 +27,7 @@ use crate::{
 use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
-use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_COMMITTED};
 use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
@@ -360,7 +360,7 @@ impl<'a> CommitBuilder<'a> {
         };
 
         info!(
-            target: TRACE_DATASET_EVENTS,
+            target: TRACE_DATASET_COMMITTED,
             event=DATASET_COMMITTED_EVENT,
             uri=dest.uri(),
             read_version=transaction.read_version,
