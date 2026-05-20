@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+from typing import Iterable, Optional, Union
 
 import pyarrow as pa
 from pyarrow import RecordBatch
@@ -12,16 +12,15 @@ from . import dataset
 from .dependencies import _check_for_hugging_face, _check_for_pandas
 from .dependencies import pandas as pd
 
-if TYPE_CHECKING:
-    ReaderLike = Union[
-        pd.Timestamp,
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        pa.RecordBatch,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
+ReaderLike = Union[
+    pd.Timestamp,
+    pa.Table,
+    pa.dataset.Dataset,
+    pa.dataset.Scanner,
+    pa.RecordBatch,
+    Iterable[RecordBatch],
+    pa.RecordBatchReader,
+]
 
 
 def _casting_recordbatch_iter(
