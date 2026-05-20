@@ -164,9 +164,9 @@ impl<'a> CommitBuilder<'a> {
 
     /// Set the commit strategy for conflict resolution.
     ///
-    /// - [`CommitStrategy::Pessimistic`] (default): Always rebase before commit.
+    /// - [`CommitStrategy::Pessimistic`]: Always rebase before commit.
     ///   Safer for high-contention workloads with Delete/Update/Rewrite.
-    /// - [`CommitStrategy::Optimistic`]: Attempt to commit first, rebase only on conflict.
+    /// - [`CommitStrategy::Optimistic`] (default): Attempt to commit first, rebase only on conflict.
     ///   Faster for all operation types under concurrent writes.
     pub fn with_commit_strategy(mut self, strategy: CommitStrategy) -> Self {
         self.commit_config.commit_strategy = strategy;

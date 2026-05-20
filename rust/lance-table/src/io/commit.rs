@@ -1125,13 +1125,13 @@ pub enum CommitStrategy {
     /// scenarios with Delete/Update/Rewrite operations, but adds IO overhead
     /// (load_and_sort_new_transactions + TransactionRebase::try_new) on every
     /// attempt even when there is no conflict.
-    #[default]
     Pessimistic,
     /// Attempt to commit first without rebase, and only rebase on conflict.
     /// Faster for all operation types under concurrent writes by skipping
     /// the rebase IO on the fast path. Even for fragment-modifying operations
     /// (Delete, Update, Rewrite), the cost of a failed commit attempt is
     /// typically lower than the rebase IO overhead.
+    #[default]
     Optimistic,
 }
 
