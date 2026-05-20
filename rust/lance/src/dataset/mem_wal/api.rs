@@ -287,6 +287,8 @@ fn bucket_sharding_spec(dataset: &Dataset, column: &str, num_buckets: u32) -> Re
         [single] => {
             let pk = *single;
             if pk.name.as_str() != column {
+                // TODO: Drop this primary-key-column restriction once MemWAL update routing can
+                // handle shard keys that are independent from the row key.
                 return Err(Error::invalid_input(format!(
                     "bucket_sharding: column '{}' does not match the unenforced primary key column '{}'",
                     column, pk.name
@@ -309,7 +311,7 @@ fn bucket_sharding_spec(dataset: &Dataset, column: &str, num_buckets: u32) -> Re
     };
 
     let data_type = source_field.data_type();
-    if data_type.is_nested() || data_type.is_null() {
+    if !is_bucket_sharding_supported_type(&data_type) {
         return Err(Error::invalid_input(format!(
             "bucket_sharding: column '{}' has type {:?}, which cannot be used as a shard key",
             column, data_type
@@ -357,6 +359,29 @@ fn identity_sharding_spec(dataset: &Dataset, column: &str) -> Result<ShardingSpe
             parameters: HashMap::new(),
         }],
     })
+}
+
+fn is_bucket_sharding_supported_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Date32
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+    )
 }
 
 /// The Arrow type name for a scalar column usable as a shard key, or `None`

@@ -195,6 +195,86 @@ public class MemWalTest {
   }
 
   @Test
+  void testShardingEvaluatorBucketAndIdentity(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("append_only").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeAppendOnlyDataset(allocator, path, new long[] {1}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams().withBucketSharding("id", 4));
+      ShardingSpec bucketSpec = dataset.memWalIndexDetails().get().shardingSpecs().get(0);
+      ShardingField bucketField = bucketSpec.fields().get(0);
+      Map<Integer, String> sourceIdToColumn =
+          Collections.singletonMap(bucketField.sourceIds().get(0), "id");
+
+      try (VectorSchemaRoot root = appendOnlyRoot(allocator, new long[] {1, 2, 3}, "eval");
+          ArrowReader reader =
+              ShardingEvaluator.evaluate(allocator, root, bucketSpec, sourceIdToColumn)) {
+        assertTrue(reader.loadNextBatch());
+        VectorSchemaRoot result = reader.getVectorSchemaRoot();
+        IntVector buckets = (IntVector) result.getVector(bucketField.fieldId());
+        assertEquals(3, result.getRowCount());
+        assertEquals(0, buckets.get(0));
+        assertEquals(0, buckets.get(1));
+        assertEquals(3, buckets.get(2));
+        assertFalse(reader.loadNextBatch());
+      }
+
+      ShardingSpec identitySpec =
+          new ShardingSpec(
+              7,
+              Collections.singletonList(
+                  new ShardingField(
+                      "name_identity",
+                      Collections.singletonList(99),
+                      "identity",
+                      null,
+                      "utf8",
+                      Collections.emptyMap())));
+      try (VectorSchemaRoot root = appendOnlyRoot(allocator, new long[] {1}, "eval");
+          ArrowReader reader =
+              ShardingEvaluator.evaluate(
+                  allocator, root, identitySpec, Collections.singletonMap(99, "name"))) {
+        assertTrue(reader.loadNextBatch());
+        VarCharVector names =
+            (VarCharVector) reader.getVectorSchemaRoot().getVector("name_identity");
+        assertEquals("eval_1", new String(names.get(0), StandardCharsets.UTF_8));
+        assertFalse(reader.loadNextBatch());
+      }
+
+      ShardingSpec stringBucketSpec =
+          new ShardingSpec(
+              8,
+              Collections.singletonList(
+                  new ShardingField(
+                      "key_bucket",
+                      Collections.singletonList(100),
+                      "bucket",
+                      null,
+                      "int32",
+                      Collections.singletonMap("num_buckets", "8"))));
+      Schema stringSchema =
+          new Schema(Collections.singletonList(Field.nullable("key", new ArrowType.Utf8())));
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(stringSchema, allocator)) {
+        VarCharVector keyVector = (VarCharVector) root.getVector("key");
+        keyVector.allocateNew();
+        keyVector.setSafe(0, "a".getBytes(StandardCharsets.UTF_8));
+        keyVector.setSafe(1, "b".getBytes(StandardCharsets.UTF_8));
+        keyVector.setNull(2);
+        root.setRowCount(3);
+        try (ArrowReader reader =
+            ShardingEvaluator.evaluate(
+                allocator, root, stringBucketSpec, Collections.singletonMap(100, "key"))) {
+          assertTrue(reader.loadNextBatch());
+          IntVector buckets = (IntVector) reader.getVectorSchemaRoot().getVector("key_bucket");
+          assertEquals(1, buckets.get(0));
+          assertEquals(5, buckets.get(1));
+          assertEquals(0, buckets.get(2));
+          assertFalse(reader.loadNextBatch());
+        }
+      }
+    }
+  }
+
+  @Test
   void testInitializeMemWalRejectsConflictingSharding(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("base").toString();
     try (BufferAllocator allocator = new RootAllocator();

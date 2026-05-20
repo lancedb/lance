@@ -7,6 +7,7 @@
 //! [`ShardWriter`], an LSM-aware [`LsmScanner`], an [`ExecutionPlan`] wrapper,
 //! and the point-lookup / vector-search planners.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use datafusion::common::ScalarValue;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString, JValueGen};
+use jni::objects::{JClass, JMap, JObject, JString, JValueGen};
 use jni::sys::{jint, jlong};
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
@@ -30,6 +31,7 @@ use lance::dataset::mem_wal::scanner::{
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
+    evaluate_sharding_spec,
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{MemWalIndexDetails, ShardManifest, ShardingField, ShardingSpec};
@@ -42,6 +44,7 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::{IntoJava, export_vec, import_vec, import_vec_to_rust};
+use crate::utils::to_rust_map;
 
 const NATIVE_SHARD_WRITER: &str = "nativeShardWriterHandle";
 const NATIVE_LSM_SCANNER: &str = "nativeLsmScannerHandle";
@@ -594,6 +597,62 @@ fn inner_plan_open_stream(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -
         batches.into_iter().map(Ok),
         schema,
     ));
+    let ffi_stream = FFI_ArrowArrayStream::new(reader);
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
+    Ok(())
+}
+
+//////////////////////////
+// Sharding evaluation  //
+//////////////////////////
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_memwal_ShardingEvaluator_nativeEvaluate<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    arrow_array_addr: jlong,
+    arrow_schema_addr: jlong,
+    sharding_spec: JObject<'local>,
+    source_id_to_column: JObject<'local>,
+    stream_addr: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_evaluate_sharding(
+            &mut env,
+            arrow_array_addr,
+            arrow_schema_addr,
+            sharding_spec,
+            source_id_to_column,
+            stream_addr,
+        )
+    );
+}
+
+fn inner_evaluate_sharding(
+    env: &mut JNIEnv,
+    arrow_array_addr: jlong,
+    arrow_schema_addr: jlong,
+    sharding_spec: JObject,
+    source_id_to_column: JObject,
+    stream_addr: jlong,
+) -> Result<()> {
+    let input = import_ffi_array(arrow_array_addr, arrow_schema_addr)?;
+    let struct_array = input
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            Error::input_error(
+                "ShardingEvaluator expects a VectorSchemaRoot struct array".to_string(),
+            )
+        })?;
+    let input_batch = RecordBatch::from(struct_array.clone());
+    let spec = sharding_spec_from_java(env, &sharding_spec)?;
+    let source_id_to_column = i32_string_map_from_java(env, source_id_to_column)?;
+    let result = evaluate_sharding_spec(&input_batch, &spec, &source_id_to_column)?;
+    let schema = result.schema();
+    let reader: Box<dyn RecordBatchReader + Send> =
+        Box::new(RecordBatchIterator::new([Ok(result)].into_iter(), schema));
     let ffi_stream = FFI_ArrowArrayStream::new(reader);
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
     Ok(())
@@ -1299,6 +1358,87 @@ fn sharding_field_to_java<'a>(env: &mut JNIEnv<'a>, field: &ShardingField) -> Re
             JValueGen::Object(&parameters),
         ],
     )?)
+}
+
+fn sharding_spec_from_java(env: &mut JNIEnv, spec: &JObject) -> Result<ShardingSpec> {
+    if spec.is_null() {
+        return Err(Error::input_error(
+            "ShardingSpec must not be null".to_string(),
+        ));
+    }
+
+    env.with_local_frame(32, |env| {
+        let spec_id = env.call_method(spec, "specId", "()I", &[])?.i()? as u32;
+        let fields_obj = env
+            .call_method(spec, "fields", "()Ljava/util/List;", &[])?
+            .l()?;
+        let fields_list = env.get_list(&fields_obj)?;
+        let mut iter = fields_list.iter(env)?;
+        let mut fields = Vec::with_capacity(fields_list.size(env)? as usize);
+        while let Some(field_obj) = iter.next(env)? {
+            fields.push(sharding_field_from_java(env, &field_obj)?);
+        }
+
+        Ok::<_, Error>(ShardingSpec { spec_id, fields })
+    })
+}
+
+fn sharding_field_from_java(env: &mut JNIEnv, field: &JObject) -> Result<ShardingField> {
+    env.with_local_frame(32, |env| {
+        let field_id = string_from_method(env, field, "fieldId")?;
+        let source_ids_obj = env
+            .call_method(field, "sourceIds", "()Ljava/util/List;", &[])?
+            .l()?;
+        let source_ids = env.get_integers(&source_ids_obj)?;
+        let transform = env.get_optional_string_from_method(field, "transform")?;
+        let expression = env.get_optional_string_from_method(field, "expression")?;
+        let result_type = string_from_method(env, field, "resultType")?;
+        let parameters_obj = env
+            .call_method(field, "parameters", "()Ljava/util/Map;", &[])?
+            .l()?;
+        let parameters = if parameters_obj.is_null() {
+            HashMap::new()
+        } else {
+            let parameters_map = JMap::from_env(env, &parameters_obj)?;
+            to_rust_map(env, &parameters_map)?
+        };
+
+        Ok::<_, Error>(ShardingField {
+            field_id,
+            source_ids,
+            transform,
+            expression,
+            result_type,
+            parameters,
+        })
+    })
+}
+
+fn i32_string_map_from_java(env: &mut JNIEnv, map_obj: JObject) -> Result<HashMap<i32, String>> {
+    if map_obj.is_null() {
+        return Ok(HashMap::new());
+    }
+
+    env.with_local_frame(32, |env| {
+        let jmap = JMap::from_env(env, &map_obj)?;
+        let mut iter = jmap.iter(env)?;
+        let mut map = HashMap::new();
+        while let Some((key, value)) = iter.next(env)? {
+            let key = env.call_method(&key, "intValue", "()I", &[])?.i()?;
+            let value = JString::from(value);
+            let value: String = env.get_string(&value)?.into();
+            map.insert(key, value);
+        }
+        Ok::<_, Error>(map)
+    })
+}
+
+fn string_from_method(env: &mut JNIEnv, obj: &JObject, method: &str) -> Result<String> {
+    let value = env
+        .call_method(obj, method, "()Ljava/lang/String;", &[])?
+        .l()?;
+    let value = JString::from(value);
+    Ok(env.get_string(&value)?.into())
 }
 
 fn int_list_to_java<'a>(env: &mut JNIEnv<'a>, ints: &[i32]) -> Result<JObject<'a>> {
