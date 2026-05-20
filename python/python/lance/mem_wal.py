@@ -493,6 +493,7 @@ class LsmVectorSearchPlanner:
         k: int = 10,
         nprobes: int = 20,
         columns: Optional[List[str]] = None,
+        refine_factor: Optional[int] = None,
     ) -> ExecutionPlan:
         """Plan a KNN vector search.
 
@@ -507,6 +508,11 @@ class LsmVectorSearchPlanner:
         columns : list of str, optional
             Columns to project.  Returns all columns + ``_distance`` if
             omitted.
+        refine_factor : int, optional
+            When set, the base-table arm fetches ``k * refine_factor``
+            candidates and re-ranks with exact distances.  Useful when
+            the base index is approximate (e.g. IVF-PQ).  Memtable arms
+            use exact HNSW and are unaffected.
 
         Returns
         -------
@@ -514,7 +520,9 @@ class LsmVectorSearchPlanner:
             Physical plan for the vector search. Execute it via
             `to_table`, `to_reader`, or `to_batches`.
         """
-        return ExecutionPlan(self._raw.plan_search(query, k, nprobes, columns))
+        return ExecutionPlan(
+            self._raw.plan_search(query, k, nprobes, columns, refine_factor)
+        )
 
 
 def _unwrap_region_id(region_id: str) -> str:

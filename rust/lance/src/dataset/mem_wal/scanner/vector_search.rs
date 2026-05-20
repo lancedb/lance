@@ -13,12 +13,18 @@ use arrow_schema::SortOptions;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
+#[allow(deprecated)]
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use lance_core::Result;
+use lance_core::datatypes::OnMissing;
 use tracing::instrument;
+
+use crate::dataset::Dataset;
+use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
@@ -40,24 +46,25 @@ use super::projection::{
 /// # Query Plan Structure
 ///
 /// ```text
-/// SortPreservingMergeExec: order_by=[_distance ASC], fetch=k
-///   SortExec: order_by=[_distance ASC], fetch=k          (per partition, parallel)
-///     ProjectionExec (drops _memtable_gen, _freshness)
-///       LsmGlobalPkDedupExec: pk=[…], gen=_memtable_gen, freshness=_freshness
-///         CoalescePartitionsExec
-///           UnionExec
-///             ProjectionExec (canonical internal schema)
-///               ProjectionExec (null_columns _rowid)        (non-base only)
-///                 LsmSourceTagExec: gen=N+1, polarity=InsertOrder        (active)
-///                   KNNExec: active memtable, k=k
-///             ProjectionExec (canonical internal schema)
-///               ProjectionExec (null_columns _rowid)
-///                 LsmSourceTagExec: gen=N, polarity=ReverseWrite        (flushed)
-///                   KNNExec: flushed gen N, k=k (fast_search)
-///             … one per flushed gen …
-///             ProjectionExec (canonical internal schema)
-///               LsmSourceTagExec: gen=0, polarity=InsertOrder            (base)
-///                 KNNExec: base table, k=k (fast_search)[.refine()?]
+/// TakeExec (optional: fetch user-projected cols from base dataset)
+///   SortPreservingMergeExec: order_by=[_distance ASC], fetch=k
+///     SortExec: order_by=[_distance ASC], fetch=k          (per partition, parallel)
+///       ProjectionExec (drops _memtable_gen, _freshness)
+///         LsmGlobalPkDedupExec: pk=[…], gen=_memtable_gen, freshness=_freshness
+///           CoalescePartitionsExec
+///             UnionExec
+///               ProjectionExec (canonical internal schema)
+///                 ProjectionExec (null_columns _rowid)        (non-base only)
+///                   LsmSourceTagExec: gen=N+1, polarity=InsertOrder        (active)
+///                     KNNExec: active memtable, k=k
+///               ProjectionExec (canonical internal schema)
+///                 ProjectionExec (null_columns _rowid)
+///                   LsmSourceTagExec: gen=N, polarity=ReverseWrite        (flushed)
+///                     KNNExec: flushed gen N, k=k (fast_search)
+///               … one per flushed gen …
+///               ProjectionExec (canonical internal schema)
+///                 LsmSourceTagExec: gen=0, polarity=InsertOrder            (base)
+///                   KNNExec: base table, k=k (fast_search)[.refine()?]
 /// ```
 ///
 /// # Index-Only Search (fast_search)
@@ -86,14 +93,14 @@ pub struct LsmVectorSearchPlanner {
     vector_column: String,
     /// Distance metric type (L2, Cosine, Dot, etc.).
     distance_type: lance_linalg::distance::DistanceType,
-    /// Refine factor applied to the base-table KNN scan.
+    /// Base dataset reference for post-rerank take.
     ///
-    /// `None` (default): no refine — base distances may be approximate
-    /// (e.g. when the base table is indexed with IVF-PQ). `Some(n)`: fetch
-    /// `k * n` candidates and re-rank with exact distances using the
-    /// original vectors. Set this to make cross-source distance comparison
-    /// across the LSM merge fully exact.
-    base_table_refine_factor: Option<u32>,
+    /// After the global PK dedup and sort, a `TakeExec` against this
+    /// dataset materializes any user-projected columns that were not
+    /// part of the per-source KNN output. Rows from memtables already
+    /// carry all columns; the take only fetches additional data for
+    /// base-table rows (which have a real `_rowid`).
+    dataset: Option<Arc<Dataset>>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -119,20 +126,19 @@ impl LsmVectorSearchPlanner {
             base_schema,
             vector_column,
             distance_type,
-            base_table_refine_factor: None,
+            dataset: None,
         }
     }
 
-    /// Enable base-table refine.
+    /// Set the base dataset for post-rerank take.
     ///
-    /// When set, the base-table arm of the KNN plan asks the scanner for
-    /// `k * factor` candidates and re-ranks them with exact distances. This
-    /// is useful when the base table uses an approximate index (IVF-PQ) and
-    /// you need exact distances for cross-source merging in the LSM scan.
-    ///
-    /// Default: disabled (base table returns approximate distances).
-    pub fn with_base_table_refine_factor(mut self, factor: u32) -> Self {
-        self.base_table_refine_factor = Some(factor);
+    /// After global PK dedup and sort, a `TakeExec` against this dataset
+    /// materializes any user-projected columns that were not part of the
+    /// per-source KNN output. This is necessary because per-source KNN
+    /// only returns the columns needed for dedup and ranking; the take
+    /// step fetches the full user projection for the final top-k rows.
+    pub fn with_dataset(mut self, dataset: Arc<Dataset>) -> Self {
+        self.dataset = Some(dataset);
         self
     }
 
@@ -144,6 +150,11 @@ impl LsmVectorSearchPlanner {
     /// * `k` - Number of nearest neighbors to return
     /// * `nprobes` - Number of IVF partitions to search (for IVF-based indexes)
     /// * `projection` - Columns to include in output (None = all columns)
+    /// * `refine_factor` - When set, the base-table arm of the KNN plan fetches
+    ///   `k * refine_factor` candidates and re-ranks them with exact distances.
+    ///   Useful when the base table uses an approximate index (IVF-PQ) so that
+    ///   cross-source distance comparison is exact. Memtable arms use exact
+    ///   HNSW search and do not need refine.
     ///
     /// # Returns
     ///
@@ -156,6 +167,7 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
+        refine_factor: Option<u32>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
 
@@ -180,7 +192,7 @@ impl LsmVectorSearchPlanner {
             let generation = source.generation();
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let knn = self
-                .build_knn_plan(source, query_vector, k, nprobes, projection)
+                .build_knn_plan(source, query_vector, k, nprobes, projection, refine_factor)
                 .await?;
             // Tag rows with `(_memtable_gen, _freshness)`. Polarity differs
             // per source — see [`LsmSourceTagExec`] / [`FreshnessPolarity`]:
@@ -271,7 +283,30 @@ impl LsmVectorSearchPlanner {
             SortPreservingMergeExec::new(lex_ordering, per_partition_sorted).with_fetch(Some(k)),
         );
 
-        Ok(merged_sorted)
+        // After global rerank, take any user-projected columns that the
+        // per-source KNN didn't return. This fetches from the base dataset
+        // using `_rowid`; memtable rows (NULL `_rowid`) already carry all
+        // their data so the take is a no-op for them.
+        #[allow(deprecated)]
+        let result = if let Some(dataset) = &self.dataset {
+            let cols = build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+            let output_projection = dataset
+                .empty_projection()
+                .union_columns(cols, OnMissing::Ignore)?;
+            let coalesced: Arc<dyn ExecutionPlan> =
+                Arc::new(CoalesceBatchesExec::new(merged_sorted.clone(), 8192));
+            if let Some(take_plan) =
+                TakeExec::try_new(dataset.clone(), coalesced, output_projection)?
+            {
+                Arc::new(take_plan) as Arc<dyn ExecutionPlan>
+            } else {
+                merged_sorted
+            }
+        } else {
+            merged_sorted
+        };
+
+        Ok(result)
     }
 
     /// Build KNN plan for a single data source.
@@ -282,6 +317,7 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
+        refine_factor: Option<u32>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -304,7 +340,7 @@ impl LsmVectorSearchPlanner {
                 scanner.fast_search();
                 // Re-rank base candidates with exact distances when set, so
                 // they're directly comparable to MemTable distances in the merge.
-                if let Some(factor) = self.base_table_refine_factor {
+                if let Some(factor) = refine_factor {
                     scanner.refine(factor);
                 }
                 scanner.create_plan().await
@@ -474,7 +510,7 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 10, 8, None).await;
+        let plan = planner.plan_search(&query, 10, 8, None, None).await;
 
         // Plan construction must succeed. Execution against empty data is a
         // separate concern handled by integration tests.
@@ -562,7 +598,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None)
+            .plan_search(&query, 3, 1, None, None)
             .await
             .expect("planner should produce a plan");
 
@@ -683,7 +719,7 @@ mod tests {
         let query = create_query_vector();
         let projection = vec!["vector".to_string()];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection))
+            .plan_search(&query, 3, 1, Some(&projection), None)
             .await
             .expect("planner should produce a plan");
 
@@ -765,7 +801,7 @@ mod tests {
             "_rowid".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection))
+            .plan_search(&query, 3, 1, Some(&projection), None)
             .await
             .expect(
                 "planner must accept `_distance`/`_rowid` in projection without breaking the plan",
@@ -876,7 +912,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None)
+            .plan_search(&query, 3, 1, None, None)
             .await
             .expect("planner should produce a plan");
 
@@ -1018,7 +1054,7 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None).await.unwrap();
+        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -1138,7 +1174,7 @@ mod tests {
             "vector".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection))
+            .plan_search(&query, 3, 1, Some(&projection), None)
             .await
             .expect("planner should produce a plan");
 
@@ -1214,7 +1250,7 @@ mod tests {
         ];
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, Some(&projection))
+            .plan_search(&query, 5, 1, Some(&projection), None)
             .await
             .expect("empty plan must accept system columns in projection");
 
@@ -1259,7 +1295,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 8, None)
+            .plan_search(&query, 10, 8, None, None)
             .await
             .expect("planner should produce a plan without a base table");
 
@@ -1386,7 +1422,7 @@ mod tests {
         // the older row's vector is far from the query but still a graph
         // node. After dedup we should see pk=1 exactly once.
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None).await.unwrap();
+        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
 
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
