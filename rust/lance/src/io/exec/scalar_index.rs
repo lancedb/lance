@@ -361,9 +361,10 @@ impl MapIndexExec {
             needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
-        let IndexExprResult::Exact(mut row_addr_mask) = query_result else {
+        if !query_result.is_exact() {
             todo!("Support for non-exact query results as input for merge_insert")
-        };
+        }
+        let mut row_addr_mask = query_result.upper;
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
             row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
@@ -555,21 +556,26 @@ impl MaterializeIndexExec {
             // when the index was trained will still be deleted when the index is queried.
             DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
         });
+        // MaterializeIndexExec emits a deterministic set of row ids. The
+        // `upper` mask of the interval is the candidate set (the answer is
+        // a subset of `upper`). For `Exact` results this is the exact
+        // answer; for `AtMost` and Refined results it's a superset that
+        // gets pruned downstream by `LanceFilterExec` (the full filter
+        // runs on the materialized batches via the scan plan, so any
+        // non-matching candidates in `upper` are dropped before they
+        // reach the user). `AtLeast` carries an unbounded upper, so the
+        // candidate set is the whole row space — not actionable here.
+        let take_upper = |result: IndexExprResult| -> Result<RowAddrMask> {
+            if result.is_at_least() && !result.is_exact() {
+                todo!("Support AtLeast in MaterializeIndexExec")
+            }
+            Ok(result.upper)
+        };
         let mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
-            let mask = match expr_result {
-                IndexExprResult::Exact(mask) => mask,
-                IndexExprResult::AtMost(mask) => mask,
-                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
-            };
-            mask & (*prefilter).clone()
+            take_upper(expr_result)? & (*prefilter).clone()
         } else {
-            let expr_result = expr_result.await?;
-            match expr_result {
-                IndexExprResult::Exact(mask) => mask,
-                IndexExprResult::AtMost(mask) => mask,
-                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
-            }
+            take_upper(expr_result.await?)?
         };
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);

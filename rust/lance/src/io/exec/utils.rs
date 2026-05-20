@@ -97,18 +97,19 @@ pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
-        let batch = self
-            .0
-            .try_next()
-            .await?
-            .ok_or_else(|| {
-                Error::internal("Selection vector source for prefilter did not yield any batches")
-            })
-            .unwrap();
-        RowAddrMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
+        let batch = self.0.try_next().await?.ok_or_else(|| {
+            Error::internal("Selection vector source for prefilter did not yield any batches")
+        })?;
+        // The vector-search prefilter wants the set of rows the search is
+        // allowed to consider. Under the {lower, upper} interval form the
+        // `upper` mask is exactly that — rows outside it are guaranteed
+        // not to match. For an `Exact` result `upper == lower`; for
+        // `AtLeast` `upper` is the universe (which lets the search see
+        // everything, matching the AtLeast semantics).
+        RowAddrMask::from_arrow(batch["upper"].as_binary_opt::<i32>().ok_or_else(|| {
             Error::internal(format!(
                 "Expected selection vector input to yield binary arrays but got {}",
-                batch["result"].data_type()
+                batch["upper"].data_type()
             ))
         })?)
     }

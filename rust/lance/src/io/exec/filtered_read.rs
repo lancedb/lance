@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::runtime::SpawnedTask;
@@ -99,9 +98,9 @@ impl EvaluatedIndex {
                 .into(),
             ));
         }
-        let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
-        let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
-        let index_result = index_expr_result_from_parts(row_addr_mask, match_type)?;
+        let lower = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
+        let upper = RowAddrMask::from_arrow(batch.column(1).as_binary())?;
+        let index_result = index_expr_result_from_parts(lower, upper);
 
         let applicable_fragments = batch.column(2).as_binary::<i32>();
         let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
@@ -612,14 +611,17 @@ impl FilteredReadStream {
                     // Resolve filter for this fragment
                     let filter = if let Some(evaluated_index) = evaluated_index {
                         if evaluated_index.applicable_fragments.contains(fragment_id) {
-                            match &evaluated_index.index_result {
-                                IndexExprResult::Exact(_) => options.refine_filter.clone(),
-                                IndexExprResult::AtLeast(_)
-                                    if scan_planned_with_limit_pushed_down =>
-                                {
-                                    options.refine_filter.clone()
-                                }
-                                _ => options.full_filter.clone(),
+                            let r = &evaluated_index.index_result;
+                            // `Exact` results don't need a recheck. `AtLeast`
+                            // results can also skip recheck when the
+                            // skip/take pushdown is in play (we only read the
+                            // guaranteed-match ranges in that case).
+                            let can_skip_recheck = r.is_exact()
+                                || (r.is_at_least() && scan_planned_with_limit_pushed_down);
+                            if can_skip_recheck {
+                                options.refine_filter.clone()
+                            } else {
+                                options.full_filter.clone()
                             }
                         } else {
                             options.full_filter.clone()
@@ -728,29 +730,40 @@ impl FilteredReadStream {
             if evaluated_index.applicable_fragments.contains(fragment_id) {
                 let _span = tracing::span!(tracing::Level::DEBUG, "apply_index_result").entered();
 
-                match &evaluated_index.index_result {
-                    IndexExprResult::Exact(row_addr_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, matched_ranges.clone());
+                let index_result = &evaluated_index.index_result;
+                if index_result.is_exact() {
+                    // lower == upper; either side gives the precise answer.
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.upper);
+                    let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
-                        Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
-                        scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
-                    }
-                    IndexExprResult::AtMost(row_addr_mask) => {
-                        // Cannot push down skip/take for AtMost
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, matched_ranges);
-                    }
-                    IndexExprResult::AtLeast(row_addr_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
+                    Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
+                    scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
+                } else if index_result.is_at_least() {
+                    // upper is universe; lower is the guaranteed-match set
+                    // used for the skip/take push-down path.
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.lower);
+                    let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
-                        Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
-                        scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
-                    }
+                    Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
+                    scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                } else {
+                    // AtMost or true Refined: read everything in `upper`
+                    // and rely on the full-filter recheck for survivors.
+                    //
+                    // For AtMost the index gives no lower bound, so there's
+                    // no skip/take push-down to do. For Refined the lower
+                    // bound *is* a guaranteed-match set, but exploiting it
+                    // requires per-range filter push-down (different filter
+                    // per range within a fragment), which the current plan
+                    // doesn't support. The recheck-skip opportunity on the
+                    // `lower` portion would also be visible up at the
+                    // `can_skip_recheck` block — both are deferred. See
+                    // TODO(refined-pushdown).
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.upper);
+                    let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, matched_ranges);
                 }
             } else {
                 // Fragment not indexed.  Normally we add the full fragment to keep
@@ -2370,6 +2383,59 @@ mod tests {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
+    }
+
+    /// Round-trip every interval shape through the arrow wire format and
+    /// confirm the endpoints survive. Exercises both
+    /// `serialize_index_expr_result` and `EvaluatedIndex::try_from_arrow`
+    /// so the schema names stay in sync.
+    #[test]
+    fn test_index_expr_result_serialize_roundtrip() {
+        use lance_index::scalar::expression::serialize_index_expr_result;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        let mk = |rows: &[u64]| RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(rows));
+
+        let mut frags = RoaringBitmap::new();
+        frags.insert(0);
+        frags.insert(7);
+
+        let cases = vec![
+            ("exact", IndexExprResult::exact(mk(&[1, 2, 3]))),
+            ("at_most", IndexExprResult::at_most(mk(&[1, 2, 3]))),
+            ("at_least", IndexExprResult::at_least(mk(&[1, 2]))),
+            // Refined: non-empty lower strictly inside non-universe upper.
+            (
+                "refined",
+                IndexExprResult {
+                    lower: mk(&[1, 2]),
+                    upper: mk(&[1, 2, 3]),
+                },
+            ),
+        ];
+
+        for (name, original) in cases {
+            let batch = serialize_index_expr_result(&original, &frags)
+                .unwrap_or_else(|e| panic!("serialize {name}: {e}"));
+            let decoded = EvaluatedIndex::try_from_arrow(&batch)
+                .unwrap_or_else(|e| panic!("try_from_arrow {name}: {e}"));
+
+            // The underlying RowAddrTreeMap is PartialEq; compare via mask
+            // emptiness + symmetric difference being empty would be more
+            // robust, but the canonical builders preserve representation.
+            assert_eq!(
+                decoded.index_result.lower, original.lower,
+                "{name}: lower endpoint changed across round-trip",
+            );
+            assert_eq!(
+                decoded.index_result.upper, original.upper,
+                "{name}: upper endpoint changed across round-trip",
+            );
+            assert_eq!(
+                decoded.applicable_fragments, frags,
+                "{name}: applicable fragments changed across round-trip",
+            );
+        }
     }
 
     #[test_log::test(tokio::test)]

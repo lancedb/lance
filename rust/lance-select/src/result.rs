@@ -1,51 +1,150 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Certainty-tagged wrappers around a row-address mask returned by a
+//! Interval-shaped wrappers around a row-address mask returned by a
 //! scalar-index expression evaluation.
 //!
-//! These types model the three possible degrees of knowledge an index
-//! search can return:
+//! Each result describes a closed interval `[lower, upper]` in the
+//! lattice of subsets:
 //!
-//! * [`Exact`] — the mask is the precise answer; no recheck needed.
-//! * [`AtMost`] — the mask is a *superset* of the true answer; the rows
-//!   inside the mask must be rechecked against the predicate.
-//! * [`AtLeast`] — the mask is a *subset* of the true answer; the rows
-//!   outside the mask must be rechecked against the predicate.
+//! * `lower` — rows the index *guarantees* are in the answer.
+//! * `upper` — rows that *might* be in the answer; rows outside `upper`
+//!   are guaranteed not in the answer.
 //!
-//! The boolean algebra (`Not`/`BitAnd`/`BitOr`) is implemented on both
-//! [`NullableIndexExprResult`] (the form during evaluation, carrying SQL
-//! three-valued logic via [`NullableRowAddrMask`]) and
-//! [`IndexExprResult`] (the form consumed by the read planner, after
-//! `drop_nulls` collapses NULL rows into FALSE).
+//! The three pre-existing "shapes" map onto degenerate intervals:
 //!
-//! [`Exact`]: IndexExprResult::Exact
-//! [`AtMost`]: IndexExprResult::AtMost
-//! [`AtLeast`]: IndexExprResult::AtLeast
+//! | Old variant | Interval form                          |
+//! |-------------|----------------------------------------|
+//! | `Exact(m)`  | `{lower: m, upper: m}`                 |
+//! | `AtMost(m)` | `{lower: allow_nothing(), upper: m}`   |
+//! | `AtLeast(m)`| `{lower: m, upper: all_rows()}`        |
+//!
+//! Use [`IndexExprResult::exact`] / [`IndexExprResult::at_most`] /
+//! [`IndexExprResult::at_least`] to construct those shapes, and the
+//! matching [`IndexExprResult::is_exact`] etc. predicates to inspect
+//! them. Intervals that are neither (the "Refined" case — a non-empty
+//! `lower` strictly inside a non-universe `upper`) arise from indices
+//! that can distinguish guaranteed-match from candidate-match rows
+//! within a single search (e.g. a zone map answering `IS NOT NULL`).
+//!
+//! The boolean algebra (`Not` / `BitAnd` / `BitOr`) is elementwise on
+//! the endpoints:
+//!
+//! ```text
+//! !{l, u}                = {!u, !l}
+//! {l1, u1} & {l2, u2}    = {l1 & l2, u1 & u2}
+//! {l1, u1} | {l2, u2}    = {l1 | l2, u1 | u2}
+//! ```
+//!
+//! This works for both the post-`drop_nulls` form ([`IndexExprResult`],
+//! backed by [`RowAddrMask`]) and the during-evaluation form
+//! ([`NullableIndexExprResult`], backed by [`NullableRowAddrMask`]) —
+//! the per-endpoint algebra already implements two-valued and SQL
+//! three-valued logic correctly inside each mask type.
 
-use crate::mask::{NullableRowAddrMask, RowAddrMask};
+use crate::mask::{NullableRowAddrMask, RowAddrMask, RowSetOps};
 
-/// Result of an index search before NULL rows are dropped. Carries
-/// three-valued-logic information via [`NullableRowAddrMask`].
-#[derive(Debug)]
-pub enum NullableIndexExprResult {
-    Exact(NullableRowAddrMask),
-    AtMost(NullableRowAddrMask),
-    AtLeast(NullableRowAddrMask),
+/// Result of an index search before NULL rows are dropped. Each endpoint
+/// is a [`NullableRowAddrMask`] carrying SQL three-valued logic info.
+#[derive(Debug, Clone)]
+pub struct NullableIndexExprResult {
+    /// Rows the index *guarantees* are TRUE.
+    pub lower: NullableRowAddrMask,
+    /// Rows that may be TRUE. Rows outside `upper` are guaranteed to be
+    /// FALSE / NULL (and so not in a `WHERE` answer set).
+    pub upper: NullableRowAddrMask,
+}
+
+impl NullableIndexExprResult {
+    /// Precise result — every row in `mask` is in the answer and every
+    /// row outside is not. Equivalent to the old `Exact` variant.
+    pub fn exact(mask: NullableRowAddrMask) -> Self {
+        Self {
+            lower: mask.clone(),
+            upper: mask,
+        }
+    }
+
+    /// Upper-bound-only result — rows outside `mask` are guaranteed not
+    /// to match; rows inside may match and require a recheck.
+    /// Equivalent to the old `AtMost` variant.
+    pub fn at_most(mask: NullableRowAddrMask) -> Self {
+        Self {
+            lower: NullableRowAddrMask::allow_nothing(),
+            upper: mask,
+        }
+    }
+
+    /// Lower-bound-only result — rows in `mask` are guaranteed to match;
+    /// rows outside may match too and require a recheck. Equivalent to
+    /// the old `AtLeast` variant.
+    pub fn at_least(mask: NullableRowAddrMask) -> Self {
+        Self {
+            lower: mask,
+            upper: NullableRowAddrMask::all_rows(),
+        }
+    }
+
+    /// True if `lower == upper` — the answer is precisely the lower
+    /// (== upper) mask.
+    ///
+    /// This is a **structural** check on the canonical form produced by
+    /// the constructors / algebra: an `Exact(m)` built with
+    /// [`Self::exact`] holds equal masks, and elementwise `&` / `|` / `!`
+    /// preserve that. It is not a semantic emptiness test — a
+    /// hand-constructed `IndexExprResult` whose endpoints are
+    /// representationally distinct but semantically equal (e.g.
+    /// `AllowList(universe)` vs `BlockList(empty)`) will report
+    /// `is_exact() == false`. All in-tree code paths construct results
+    /// through the canonical builders, so this is sound in practice.
+    ///
+    /// The three shape predicates are not mutually exclusive — see the
+    /// note on [`Self::is_at_least`] for the precedence convention.
+    pub fn is_exact(&self) -> bool {
+        self.lower == self.upper
+    }
+
+    /// True if `lower` matches no rows (canonical `AllowList(∅)`) — the
+    /// index gives only an upper bound on the answer.
+    ///
+    /// Like [`Self::is_exact`], this is a structural check on the
+    /// canonical form. See that doc for the caveat.
+    pub fn is_at_most(&self) -> bool {
+        matches!(&self.lower, NullableRowAddrMask::AllowList(set) if set.is_empty())
+    }
+
+    /// True if `upper` covers every row (canonical `BlockList(∅)`) — the
+    /// index gives only a lower bound on the answer.
+    ///
+    /// **Precedence convention** for consumers branching on shape: check
+    /// [`Self::is_exact`] *first* (Exact-of-empty satisfies both
+    /// `is_exact` and `is_at_most`; Exact-of-universe satisfies both
+    /// `is_exact` and `is_at_least`); then `is_at_least`; finally treat
+    /// the residual as `is_at_most` or Refined. The branches in
+    /// `filtered_read::apply_index_to_fragment` follow this order.
+    pub fn is_at_least(&self) -> bool {
+        matches!(&self.upper, NullableRowAddrMask::BlockList(set) if set.is_empty())
+    }
+
+    /// Project NULL rows out of the result.
+    ///
+    /// Under a `WHERE` clause NULL is treated as FALSE, so `drop_nulls`
+    /// folds NULL rows out of the answer at each endpoint.
+    pub fn drop_nulls(self) -> IndexExprResult {
+        IndexExprResult {
+            lower: self.lower.drop_nulls(),
+            upper: self.upper.drop_nulls(),
+        }
+    }
 }
 
 impl std::ops::Not for NullableIndexExprResult {
     type Output = Self;
 
     fn not(self) -> Self {
-        // Flip certainty: NOT(AtMost) → AtLeast, NOT(AtLeast) → AtMost.
-        // NULL info is preserved by `NullableRowAddrMask::not` (it flips
-        // AllowList ↔ BlockList without touching the `nulls` field), which
-        // is the 3VL-correct negation: TRUE↔FALSE swap, NULL stays NULL.
-        match self {
-            Self::Exact(mask) => Self::Exact(!mask),
-            Self::AtMost(mask) => Self::AtLeast(!mask),
-            Self::AtLeast(mask) => Self::AtMost(!mask),
+        Self {
+            lower: !self.upper,
+            upper: !self.lower,
         }
     }
 }
@@ -54,22 +153,9 @@ impl std::ops::BitAnd<Self> for NullableIndexExprResult {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs & rhs),
-            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(lhs), Self::Exact(rhs)) => {
-                Self::AtMost(lhs & rhs)
-            }
-            (Self::Exact(exact), Self::AtLeast(_)) | (Self::AtLeast(_), Self::Exact(exact)) => {
-                // We could do better here, elements in both lhs and rhs are known
-                // to be true and don't require a recheck.  We only need to recheck
-                // elements in lhs that are not in rhs
-                Self::AtMost(exact)
-            }
-            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs & rhs),
-            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs & rhs),
-            (Self::AtMost(most), Self::AtLeast(_)) | (Self::AtLeast(_), Self::AtMost(most)) => {
-                Self::AtMost(most)
-            }
+        Self {
+            lower: self.lower & rhs.lower,
+            upper: self.upper & rhs.upper,
         }
     }
 }
@@ -78,74 +164,103 @@ impl std::ops::BitOr<Self> for NullableIndexExprResult {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs | rhs),
-            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(rhs), Self::Exact(lhs)) => {
-                // We could do better here, elements in lhs are known to be true
-                // and don't require a recheck.  We only need to recheck elements
-                // in rhs that are not in lhs
-                Self::AtMost(lhs | rhs)
-            }
-            (Self::Exact(lhs), Self::AtLeast(rhs)) | (Self::AtLeast(rhs), Self::Exact(lhs)) => {
-                Self::AtLeast(lhs | rhs)
-            }
-            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs | rhs),
-            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs | rhs),
-            (Self::AtMost(_), Self::AtLeast(least)) | (Self::AtLeast(least), Self::AtMost(_)) => {
-                Self::AtLeast(least)
-            }
-        }
-    }
-}
-
-impl NullableIndexExprResult {
-    /// Project NULL rows out of the result.
-    ///
-    /// Under a `WHERE` clause, NULL is treated as FALSE — so `drop_nulls`
-    /// removes them from `AllowList`s (NULL rows are not selected) and
-    /// folds them into `BlockList`s (NULL rows are still blocked).
-    pub fn drop_nulls(self) -> IndexExprResult {
-        match self {
-            Self::Exact(mask) => IndexExprResult::Exact(mask.drop_nulls()),
-            Self::AtMost(mask) => IndexExprResult::AtMost(mask.drop_nulls()),
-            Self::AtLeast(mask) => IndexExprResult::AtLeast(mask.drop_nulls()),
+        Self {
+            lower: self.lower | rhs.lower,
+            upper: self.upper | rhs.upper,
         }
     }
 }
 
 /// Result of an index search after NULL rows have been dropped. This is
 /// what the read planner consumes.
-#[derive(Debug)]
-pub enum IndexExprResult {
-    /// The answer is exactly the rows in the allow list minus the rows
-    /// in the block list.
-    Exact(RowAddrMask),
-    /// The answer is at most the rows in the allow list minus the rows
-    /// in the block list. Some of the rows in the allow list may not be
-    /// in the result and will need to be filtered by a recheck. Every
-    /// row in the block list is definitely not in the result.
-    AtMost(RowAddrMask),
-    /// The answer is at least the rows in the allow list minus the rows
-    /// in the block list. Some of the rows in the block list might be in
-    /// the result. Every row in the allow list is definitely in the
-    /// result.
-    AtLeast(RowAddrMask),
+#[derive(Debug, Clone)]
+pub struct IndexExprResult {
+    /// Rows the index *guarantees* are in the answer.
+    pub lower: RowAddrMask,
+    /// Rows that may be in the answer. Rows outside `upper` are
+    /// guaranteed not in the answer.
+    pub upper: RowAddrMask,
 }
 
 impl IndexExprResult {
-    pub fn row_addr_mask(&self) -> &RowAddrMask {
-        match self {
-            Self::Exact(mask) => mask,
-            Self::AtMost(mask) => mask,
-            Self::AtLeast(mask) => mask,
+    /// Precise result — every row in `mask` is in the answer and every
+    /// row outside is not. Equivalent to the old `Exact` variant.
+    pub fn exact(mask: RowAddrMask) -> Self {
+        Self {
+            lower: mask.clone(),
+            upper: mask,
         }
     }
 
-    pub fn discriminant(&self) -> u32 {
-        match self {
-            Self::Exact(_) => 0,
-            Self::AtMost(_) => 1,
-            Self::AtLeast(_) => 2,
+    /// Upper-bound-only result. Equivalent to the old `AtMost` variant.
+    pub fn at_most(mask: RowAddrMask) -> Self {
+        Self {
+            lower: RowAddrMask::allow_nothing(),
+            upper: mask,
+        }
+    }
+
+    /// Lower-bound-only result. Equivalent to the old `AtLeast` variant.
+    pub fn at_least(mask: RowAddrMask) -> Self {
+        Self {
+            lower: mask,
+            upper: RowAddrMask::all_rows(),
+        }
+    }
+
+    /// True if `lower == upper` — the answer is precisely the lower
+    /// (== upper) mask. See [`NullableIndexExprResult::is_exact`] for the
+    /// structural-form caveat and the precedence convention shared with
+    /// [`Self::is_at_most`] / [`Self::is_at_least`].
+    pub fn is_exact(&self) -> bool {
+        self.lower == self.upper
+    }
+
+    /// True if `lower` matches no rows (canonical `AllowList(∅)`) — the
+    /// index gives only an upper bound on the answer. See
+    /// [`NullableIndexExprResult::is_exact`] for caveats.
+    pub fn is_at_most(&self) -> bool {
+        matches!(&self.lower, RowAddrMask::AllowList(set) if set.is_empty())
+    }
+
+    /// True if `upper` covers every row (canonical `BlockList(∅)`) — the
+    /// index gives only a lower bound on the answer. See
+    /// [`NullableIndexExprResult::is_at_least`] for the precedence
+    /// convention consumers should follow.
+    pub fn is_at_least(&self) -> bool {
+        matches!(&self.upper, RowAddrMask::BlockList(set) if set.is_empty())
+    }
+}
+
+impl std::ops::Not for IndexExprResult {
+    type Output = Self;
+
+    fn not(self) -> Self {
+        Self {
+            lower: !self.upper,
+            upper: !self.lower,
+        }
+    }
+}
+
+impl std::ops::BitAnd<Self> for IndexExprResult {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self {
+        Self {
+            lower: self.lower & rhs.lower,
+            upper: self.upper & rhs.upper,
+        }
+    }
+}
+
+impl std::ops::BitOr<Self> for IndexExprResult {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self {
+            lower: self.lower | rhs.lower,
+            upper: self.upper | rhs.upper,
         }
     }
 }
