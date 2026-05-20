@@ -581,7 +581,7 @@ def _format_field_path(segments: list[str]) -> str: ...
 def _evaluate_sharding_spec(
     batch: pa.RecordBatch,
     spec: Dict[str, Any],
-    source_id_to_column: Optional[Dict[int, str]] = None,
+    schema: LanceSchema,
 ) -> pa.RecordBatch: ...
 
 class _MergedGeneration:

@@ -31,7 +31,7 @@ use lance::dataset::mem_wal::scanner::{
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, ShardWriterConfig,
-    evaluate_sharding_spec,
+    evaluate_sharding_spec_with_source_columns,
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{MemWalIndexDetails, ShardManifest, ShardingField, ShardingSpec};
@@ -649,7 +649,8 @@ fn inner_evaluate_sharding(
     let input_batch = RecordBatch::from(struct_array.clone());
     let spec = sharding_spec_from_java(env, &sharding_spec)?;
     let source_id_to_column = i32_string_map_from_java(env, source_id_to_column)?;
-    let result = evaluate_sharding_spec(&input_batch, &spec, &source_id_to_column)?;
+    let result =
+        evaluate_sharding_spec_with_source_columns(&input_batch, &spec, &source_id_to_column)?;
     let schema = result.schema();
     let reader: Box<dyn RecordBatchReader + Send> =
         Box::new(RecordBatchIterator::new([Ok(result)].into_iter(), schema));

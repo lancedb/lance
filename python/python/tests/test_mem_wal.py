@@ -16,6 +16,7 @@ from lance.mem_wal import (
     ShardSnapshot,
     evaluate_sharding_spec,
 )
+from lance.schema import LanceSchema
 
 _PK_META = {"lance-schema:unenforced-primary-key": "true"}
 _LOOKUP_SCHEMA = pa.schema(
@@ -470,7 +471,7 @@ def test_evaluate_sharding_spec_python_binding():
         [
             ShardingField(
                 field_id="bucket",
-                source_ids=[1],
+                source_ids=[0],
                 transform="bucket",
                 result_type="int32",
                 parameters={"num_buckets": "8"},
@@ -478,7 +479,7 @@ def test_evaluate_sharding_spec_python_binding():
         ],
     )
 
-    result = evaluate_sharding_spec(batch, spec, {1: "id"})
+    result = evaluate_sharding_spec(batch, spec, LanceSchema.from_pyarrow(batch.schema))
 
     assert result.column_names == ["bucket"]
     assert result.column(0).to_pylist() == [2, 7, 0, 1]
@@ -494,16 +495,16 @@ def test_evaluate_sharding_spec_python_binding_column_parameter():
         "fields": [
             {
                 "field_id": "key_bucket",
-                "source_ids": [],
+                "source_ids": [0],
                 "transform": "bucket",
                 "expression": None,
                 "result_type": "int32",
-                "parameters": {"column": "key", "num_buckets": "8"},
+                "parameters": {"num_buckets": "8"},
             }
         ],
     }
 
-    result = evaluate_sharding_spec(batch, spec)
+    result = evaluate_sharding_spec(batch, spec, LanceSchema.from_pyarrow(batch.schema))
 
     assert result.column_names == ["key_bucket"]
     assert result.column(0).to_pylist() == [1, 5, 0]

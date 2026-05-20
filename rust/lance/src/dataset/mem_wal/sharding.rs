@@ -17,7 +17,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, LargeStringArray, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, datatypes::Schema as LanceSchema};
 use lance_index::mem_wal::{ShardingField, ShardingSpec};
 
 const BUCKET_TRANSFORM: &str = "bucket";
@@ -34,6 +34,31 @@ const MURMUR3_SEED: i32 = 0;
 /// IDs. Identity sharding returns the source column unchanged. Unsharded
 /// sharding returns `Int32` zeros.
 pub fn evaluate_sharding_spec(
+    batch: &RecordBatch,
+    spec: &ShardingSpec,
+    schema: &LanceSchema,
+) -> Result<RecordBatch> {
+    let source_id_to_column = source_id_to_column_map(schema);
+    evaluate_sharding_spec_with_source_columns(batch, spec, &source_id_to_column)
+}
+
+/// Evaluate a MemWAL sharding specification that embeds source column names.
+///
+/// Prefer [`evaluate_sharding_spec`] for table-bound evaluation. This helper is
+/// for specs that carry a `column` parameter for each source-dependent field.
+pub fn evaluate_sharding_spec_with_embedded_columns(
+    batch: &RecordBatch,
+    spec: &ShardingSpec,
+) -> Result<RecordBatch> {
+    evaluate_sharding_spec_with_source_columns(batch, spec, &HashMap::new())
+}
+
+/// Evaluate a MemWAL sharding specification with an explicit field-id mapping.
+///
+/// Prefer [`evaluate_sharding_spec`] for table-bound evaluation. This helper is
+/// intended for binding layers that have already derived the mapping from a
+/// table schema.
+pub fn evaluate_sharding_spec_with_source_columns(
     batch: &RecordBatch,
     spec: &ShardingSpec,
     source_id_to_column: &HashMap<i32, String>,
@@ -55,6 +80,24 @@ pub fn evaluate_sharding_spec(
         Arc::new(ArrowSchema::new(fields)),
         columns,
     )?)
+}
+
+fn source_id_to_column_map(schema: &LanceSchema) -> HashMap<i32, String> {
+    schema
+        .fields_pre_order()
+        .map(|field| {
+            let column = schema
+                .field_ancestry_by_id(field.id)
+                .map(|path| {
+                    path.iter()
+                        .map(|field| field.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .unwrap_or_else(|| field.name.clone());
+            (field.id, column)
+        })
+        .collect()
 }
 
 fn evaluate_sharding_field(
@@ -333,6 +376,7 @@ mod tests {
     use arrow_array::{
         BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, StringArray,
     };
+    use lance_core::datatypes::Schema as LanceSchema;
     use lance_index::mem_wal::ShardingField;
 
     fn single_field_spec(field: ShardingField) -> ShardingSpec {
@@ -345,7 +389,7 @@ mod tests {
     fn bucket_field(num_buckets: i32) -> ShardingField {
         ShardingField {
             field_id: "bucket".to_string(),
-            source_ids: vec![1],
+            source_ids: vec![0],
             transform: Some(BUCKET_TRANSFORM.to_string()),
             expression: None,
             result_type: "int32".to_string(),
@@ -353,8 +397,15 @@ mod tests {
         }
     }
 
-    fn source_map() -> HashMap<i32, String> {
-        HashMap::from([(1, "id".to_string())])
+    fn lance_schema(batch: &RecordBatch) -> LanceSchema {
+        LanceSchema::try_from(batch.schema().as_ref()).unwrap()
+    }
+
+    fn bucket_field_for_source(source_id: i32, num_buckets: i32) -> ShardingField {
+        ShardingField {
+            source_ids: vec![source_id],
+            ..bucket_field(num_buckets)
+        }
     }
 
     #[test]
@@ -364,9 +415,12 @@ mod tests {
             Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(3)])) as ArrayRef,
         )])
         .unwrap();
-        let result =
-            evaluate_sharding_spec(&batch, &single_field_spec(bucket_field(8)), &source_map())
-                .unwrap();
+        let result = evaluate_sharding_spec(
+            &batch,
+            &single_field_spec(bucket_field(8)),
+            &lance_schema(&batch),
+        )
+        .unwrap();
         let buckets = as_primitive_array::<Int32Type>(result.column(0).as_ref());
         assert_eq!(buckets.values(), &[2, 7, 0, 1]);
     }
@@ -378,9 +432,12 @@ mod tests {
             Arc::new(Date32Array::from(vec![Some(1), Some(2), None, Some(3)])) as ArrayRef,
         )])
         .unwrap();
-        let result =
-            evaluate_sharding_spec(&batch, &single_field_spec(bucket_field(8)), &source_map())
-                .unwrap();
+        let result = evaluate_sharding_spec(
+            &batch,
+            &single_field_spec(bucket_field(8)),
+            &lance_schema(&batch),
+        )
+        .unwrap();
         let buckets = as_primitive_array::<Int32Type>(result.column(0).as_ref());
         assert_eq!(buckets.values(), &[2, 7, 0, 1]);
     }
@@ -392,9 +449,12 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
         )])
         .unwrap();
-        let result =
-            evaluate_sharding_spec(&batch, &single_field_spec(bucket_field(8)), &source_map())
-                .unwrap();
+        let result = evaluate_sharding_spec(
+            &batch,
+            &single_field_spec(bucket_field(8)),
+            &lance_schema(&batch),
+        )
+        .unwrap();
         let buckets = as_primitive_array::<Int32Type>(result.column(0).as_ref());
         assert_eq!(buckets.values(), &[1, 5, 0]);
     }
@@ -413,21 +473,31 @@ mod tests {
             ),
         ])
         .unwrap();
-        let mut mapping = HashMap::from([(1, "bool".to_string())]);
-        let result =
-            evaluate_sharding_spec(&batch, &single_field_spec(bucket_field(8)), &mapping).unwrap();
+        let schema = lance_schema(&batch);
+        let result = evaluate_sharding_spec(
+            &batch,
+            &single_field_spec(bucket_field_for_source(0, 8)),
+            &schema,
+        )
+        .unwrap();
         let buckets = as_primitive_array::<Int32Type>(result.column(0).as_ref());
         assert_eq!(buckets.values(), &[2]);
 
-        mapping.insert(1, "f32".to_string());
-        let result =
-            evaluate_sharding_spec(&batch, &single_field_spec(bucket_field(8)), &mapping).unwrap();
+        let result = evaluate_sharding_spec(
+            &batch,
+            &single_field_spec(bucket_field_for_source(1, 8)),
+            &schema,
+        )
+        .unwrap();
         let buckets = as_primitive_array::<Int32Type>(result.column(0).as_ref());
         assert_eq!(buckets.values(), &[0]);
 
-        mapping.insert(1, "f64".to_string());
-        let result =
-            evaluate_sharding_spec(&batch, &single_field_spec(bucket_field(8)), &mapping).unwrap();
+        let result = evaluate_sharding_spec(
+            &batch,
+            &single_field_spec(bucket_field_for_source(2, 8)),
+            &schema,
+        )
+        .unwrap();
         let buckets = as_primitive_array::<Int32Type>(result.column(0).as_ref());
         assert_eq!(buckets.values(), &[0]);
     }
@@ -441,13 +511,32 @@ mod tests {
         .unwrap();
         let spec = single_field_spec(ShardingField {
             field_id: "identity".to_string(),
-            source_ids: vec![1],
+            source_ids: vec![0],
             transform: Some(IDENTITY_TRANSFORM.to_string()),
             expression: None,
             result_type: "utf8".to_string(),
             parameters: HashMap::new(),
         });
-        let result = evaluate_sharding_spec(&batch, &spec, &source_map()).unwrap();
+        let result = evaluate_sharding_spec(&batch, &spec, &lance_schema(&batch)).unwrap();
         assert_eq!(result.column(0).as_ref(), batch.column(0).as_ref());
+    }
+
+    #[test]
+    fn test_evaluate_bucket_sharding_embedded_column() {
+        let batch = RecordBatch::try_from_iter([(
+            "key",
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut field = bucket_field(8);
+        field.source_ids = Vec::new();
+        field
+            .parameters
+            .insert(COLUMN_PARAM.to_string(), "key".to_string());
+        let result =
+            evaluate_sharding_spec_with_embedded_columns(&batch, &single_field_spec(field))
+                .unwrap();
+        let buckets = as_primitive_array::<Int32Type>(result.column(0).as_ref());
+        assert_eq!(buckets.values(), &[1, 5, 0]);
     }
 }

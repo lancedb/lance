@@ -34,19 +34,19 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
 use crate::rt;
+use crate::schema::LanceSchema as PyLanceSchema;
 
 /// Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
-#[pyfunction(name = "_evaluate_sharding_spec", signature = (batch, spec, source_id_to_column=None))]
+#[pyfunction(name = "_evaluate_sharding_spec", signature = (batch, spec, schema))]
 pub fn py_evaluate_sharding_spec<'py>(
     py: Python<'py>,
     batch: PyArrowType<RecordBatch>,
     spec: &Bound<'_, PyAny>,
-    source_id_to_column: Option<HashMap<i32, String>>,
+    schema: &PyLanceSchema,
 ) -> PyResult<Bound<'py, PyAny>> {
     let PyArrowType(batch) = batch;
     let spec = sharding_spec_from_py(spec)?;
-    let source_id_to_column = source_id_to_column.unwrap_or_default();
-    let result = evaluate_sharding_spec(&batch, &spec, &source_id_to_column)
+    let result = evaluate_sharding_spec(&batch, &spec, &schema.0)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     result.to_pyarrow(py)
 }

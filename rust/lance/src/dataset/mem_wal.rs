@@ -47,7 +47,10 @@ pub use api::{DatasetMemWalExt, InitializeMemWalBuilder};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};
-pub use sharding::evaluate_sharding_spec;
+pub use sharding::{
+    evaluate_sharding_spec, evaluate_sharding_spec_with_embedded_columns,
+    evaluate_sharding_spec_with_source_columns,
+};
 pub use wal::{WalAppendResult, WalAppender, WalReadEntry, WalTailer};
 pub use write::ShardWriter;
 pub use write::ShardWriterConfig;

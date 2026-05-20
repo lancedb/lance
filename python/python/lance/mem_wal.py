@@ -93,7 +93,7 @@ class ShardingSpec:
 def evaluate_sharding_spec(
     batch: pa.RecordBatch,
     spec: Union[ShardingSpec, Mapping[str, object]],
-    source_id_to_column: Optional[Dict[int, str]] = None,
+    schema: "lance.schema.LanceSchema",
 ) -> pa.RecordBatch:
     """Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
 
@@ -103,16 +103,16 @@ def evaluate_sharding_spec(
         Input batch containing the sharding source columns.
     spec : ShardingSpec or dict
         MemWAL sharding spec to evaluate.
-    source_id_to_column : dict of int to str, optional
-        Mapping from Lance schema field IDs in the spec to input batch column
-        names. Not required when the spec embeds a ``column`` parameter.
+    schema : LanceSchema
+        Lance table schema used to resolve source field IDs in the spec to
+        input batch column names.
     """
     if not isinstance(batch, pa.RecordBatch):
         raise TypeError(f"Expected pyarrow.RecordBatch, got {type(batch)!r}")
     return _evaluate_sharding_spec(
         batch,
         _sharding_spec_to_dict(spec),
-        source_id_to_column or {},
+        schema,
     )
 
 
