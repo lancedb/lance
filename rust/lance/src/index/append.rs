@@ -4,10 +4,7 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
-use lance_core::{
-    Error, Result,
-    utils::mask::{RowAddrTreeMap, RowSetOps},
-};
+use lance_core::{Error, Result};
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     metrics::NoOpMetricsCollector,
@@ -17,6 +14,7 @@ use lance_index::{
         CreatedIndex, OldIndexDataFilter, inverted::InvertedIndex, lance_format::LanceIndexStore,
     },
 };
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, list_index_files_with_sizes};
 use roaring::RoaringBitmap;
 use uuid::Uuid;

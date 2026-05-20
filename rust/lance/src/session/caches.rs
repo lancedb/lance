@@ -15,8 +15,9 @@ use std::{borrow::Cow, ops::Deref};
 use deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, LanceCache},
-    utils::{deletion::DeletionVector, mask::RowAddrMask},
+    utils::deletion::DeletionVector,
 };
+use lance_select::RowAddrMask;
 use lance_table::{
     format::{DeletionFile, Manifest},
     rowids::{RowIdIndex, RowIdSequence},

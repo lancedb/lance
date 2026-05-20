@@ -48,16 +48,11 @@ log.workspace = true
 libc = { version = "0.2" }
 
 [dev-dependencies]
-criterion.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 
 [features]
 datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
-
-[[bench]]
-name = "row_addr_mask"
-harness = false
 
 [lints]
 workspace = true

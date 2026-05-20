@@ -29,14 +29,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
-use lance_core::utils::mask::RowSetOps;
-use lance_core::{
-    Error, ROW_ID_FIELD, Result,
-    utils::{
-        address::RowAddress,
-        mask::{RowAddrMask, RowAddrTreeMap},
-    },
-};
+use lance_core::{Error, ROW_ID_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
     utils::{
@@ -49,10 +42,11 @@ use lance_index::{
         SargableQuery, ScalarIndex,
         expression::{
             INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, ScalarIndexExpr, ScalarIndexLoader,
-            ScalarIndexSearch,
+            ScalarIndexSearch, serialize_index_expr_result,
         },
     },
 };
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::{debug_span, instrument};
@@ -159,7 +153,7 @@ impl ScalarIndexExec {
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
-            query_result.serialize_to_arrow(&fragments_covered_by_result)
+            serialize_index_expr_result(&query_result, &fragments_covered_by_result)
         }
     }
 }

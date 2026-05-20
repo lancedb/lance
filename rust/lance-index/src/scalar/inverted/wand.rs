@@ -12,7 +12,7 @@ use arrow_array::Array;
 use itertools::Itertools;
 use lance_core::Result;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowAddrMask;
+use lance_select::RowAddrMask;
 
 use crate::metrics::MetricsCollector;
 

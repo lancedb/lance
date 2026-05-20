@@ -14,12 +14,12 @@
 //! ranges fixed at 1. A range-aware representation should make these
 //! near-constant time; today they are linear in N.
 //!
-//! Run with `cargo bench -p lance-core --bench row_addr_mask`.
+//! Run with `cargo bench -p lance-select --bench row_addr_mask`.
 
 use std::ops::Range;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 
 /// Row counts we sweep across. Chosen to cover the realistic range of
 /// matches a zonemap produces for an `IS NULL`-like predicate on a single

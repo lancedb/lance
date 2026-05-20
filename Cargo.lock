@@ -4378,6 +4378,7 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-namespace",
+ "lance-select",
  "lance-table",
  "lance-test-macros",
  "lance-testing",
@@ -4487,7 +4488,6 @@ dependencies = [
  "async-trait",
  "byteorder",
  "bytes",
- "criterion",
  "datafusion-common",
  "datafusion-sql",
  "deepsize",
@@ -4740,6 +4740,7 @@ dependencies = [
  "lance-geo",
  "lance-io",
  "lance-linalg",
+ "lance-select",
  "lance-table",
  "lance-testing",
  "lance-tokenizer",
@@ -4925,6 +4926,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-select"
+version = "7.1.0-beta.1"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "byteorder",
+ "bytes",
+ "criterion",
+ "deepsize",
+ "itertools 0.13.0",
+ "lance-core",
+ "proptest",
+ "roaring",
+ "rstest",
+]
+
+[[package]]
 name = "lance-table"
 version = "7.1.0-beta.1"
 dependencies = [
@@ -4947,6 +4965,7 @@ dependencies = [
  "lance-datagen",
  "lance-file",
  "lance-io",
+ "lance-select",
  "log",
  "object_store",
  "pprof",

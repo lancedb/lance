@@ -13,10 +13,9 @@ use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
-use crate::cache::CacheCodecImpl;
-use crate::{Error, Result};
-
-use super::address::RowAddress;
+use lance_core::cache::CacheCodecImpl;
+use lance_core::utils::address::RowAddress;
+use lance_core::{Error, Result};
 
 mod nullable;
 
@@ -460,7 +459,7 @@ impl RowAddrTreeMap {
     /// Returns true if the value was not already in the set.
     ///
     /// ```rust
-    /// use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
+    /// use lance_select::{RowAddrTreeMap, RowSetOps};
     ///
     /// let mut set = RowAddrTreeMap::new();
     /// assert_eq!(set.insert(10), true);

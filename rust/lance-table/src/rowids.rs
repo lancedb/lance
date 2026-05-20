@@ -26,15 +26,12 @@ use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
-use lance_core::{
-    Error, Result,
-    utils::mask::{RowAddrMask, RowAddrTreeMap},
-};
+use lance_core::{Error, Result};
 use lance_io::ReadBatchParams;
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 pub use serde::{read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;
-use lance_core::utils::mask::RowSetOps;
 use segment::U64Segment;
 use tracing::instrument;
 

@@ -28,9 +28,9 @@ use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use std::future::Future;
 
 use crate::Dataset;
