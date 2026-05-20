@@ -4064,6 +4064,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-arrow-scalar"
+version = "58.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
+ "arrow-row",
+ "arrow-schema",
+ "half",
+]
+
+[[package]]
 name = "lance-bitpacking"
 version = "7.0.0-beta.12"
 dependencies = [
@@ -4272,6 +4285,7 @@ dependencies = [
  "jieba-rs",
  "jsonb",
  "lance-arrow",
+ "lance-arrow-scalar",
  "lance-core",
  "lance-datafusion",
  "lance-datagen",
