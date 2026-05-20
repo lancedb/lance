@@ -12,6 +12,9 @@ from lance.mem_wal import (
     LsmPointLookupPlanner,
     LsmScanner,
     RegionSnapshot,
+    ShardingField,
+    ShardingSpec,
+    evaluate_sharding_spec,
 )
 
 _PK_META = {"lance-schema:unenforced-primary-key": "true"}
@@ -375,13 +378,14 @@ def test_initialize_mem_wal_unsharded(tmp_path):
 
 def test_initialize_mem_wal_bucket_sharding(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
-    ds.initialize_mem_wal(bucket_column="id", num_buckets=8)
+    ds.initialize_mem_wal(bucket_column="name", num_buckets=8)
 
     details = ds.mem_wal_index_details()
     assert details["num_shards"] == 8
     field = details["sharding_specs"][0]["fields"][0]
     assert field["transform"] == "bucket"
     assert field["parameters"]["num_buckets"] == "8"
+    assert len(field["source_ids"]) == 1
 
 
 def test_initialize_mem_wal_bucket_sharding_without_primary_key(tmp_path):
@@ -454,6 +458,55 @@ def test_initialize_mem_wal_rejects_partial_bucket(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
     with pytest.raises(ValueError, match="num_buckets"):
         ds.initialize_mem_wal(bucket_column="id")
+
+
+def test_evaluate_sharding_spec_python_binding():
+    batch = pa.record_batch(
+        [pa.array([1, 2, None, 3], type=pa.int32())],
+        names=["id"],
+    )
+    spec = ShardingSpec(
+        1,
+        [
+            ShardingField(
+                field_id="bucket",
+                source_ids=[1],
+                transform="bucket",
+                result_type="int32",
+                parameters={"num_buckets": "8"},
+            )
+        ],
+    )
+
+    result = evaluate_sharding_spec(batch, spec, {1: "id"})
+
+    assert result.column_names == ["bucket"]
+    assert result.column(0).to_pylist() == [2, 7, 0, 1]
+
+
+def test_evaluate_sharding_spec_python_binding_column_parameter():
+    batch = pa.record_batch(
+        [pa.array(["a", "b", None], type=pa.utf8())],
+        names=["key"],
+    )
+    spec = {
+        "spec_id": 1,
+        "fields": [
+            {
+                "field_id": "key_bucket",
+                "source_ids": [],
+                "transform": "bucket",
+                "expression": None,
+                "result_type": "int32",
+                "parameters": {"column": "key", "num_buckets": "8"},
+            }
+        ],
+    }
+
+    result = evaluate_sharding_spec(batch, spec)
+
+    assert result.column_names == ["key_bucket"]
+    assert result.column(0).to_pylist() == [1, 5, 0]
 
 
 def test_mem_wal_index_details_none_before_init(tmp_path):

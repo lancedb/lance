@@ -15,12 +15,13 @@ dataset via an LSM-tree structure.  Data flows through three levels:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Union
 
 import pyarrow as pa
 
 from .lance import (
+    _evaluate_sharding_spec,
     _ExecutionPlan,
     _LsmPointLookupPlanner,
     _LsmScanner,
@@ -35,8 +36,11 @@ if TYPE_CHECKING:
     import lance
 
 __all__ = [
+    "ShardingField",
+    "ShardingSpec",
     "RegionField",
     "RegionSpec",
+    "evaluate_sharding_spec",
     "MergedGeneration",
     "RegionSnapshot",
     "RegionWriter",
@@ -48,13 +52,13 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# RegionSpec
+# ShardingSpec
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class RegionField:
-    """Defines one derived field used in region partitioning.
+class ShardingField:
+    """Defines one MemWAL sharding field.
 
     Parameters
     ----------
@@ -81,11 +85,47 @@ class RegionField:
 
 
 @dataclass
-class RegionSpec:
-    """Partitioning specification for deriving MemWAL region IDs."""
+class ShardingSpec:
+    """Specification for deriving MemWAL shard routing values."""
 
     spec_id: int
-    fields: List[RegionField]
+    fields: List[ShardingField]
+
+
+RegionField = ShardingField
+RegionSpec = ShardingSpec
+
+
+def evaluate_sharding_spec(
+    batch: pa.RecordBatch,
+    spec: Union[ShardingSpec, Mapping[str, object]],
+    source_id_to_column: Optional[Dict[int, str]] = None,
+) -> pa.RecordBatch:
+    """Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
+
+    Parameters
+    ----------
+    batch : pyarrow.RecordBatch
+        Input batch containing the sharding source columns.
+    spec : ShardingSpec or dict
+        MemWAL sharding spec to evaluate.
+    source_id_to_column : dict of int to str, optional
+        Mapping from Lance schema field IDs in the spec to input batch column
+        names. Not required when the spec embeds a ``column`` parameter.
+    """
+    if not isinstance(batch, pa.RecordBatch):
+        raise TypeError(f"Expected pyarrow.RecordBatch, got {type(batch)!r}")
+    return _evaluate_sharding_spec(
+        batch,
+        _sharding_spec_to_dict(spec),
+        source_id_to_column or {},
+    )
+
+
+def _sharding_spec_to_dict(spec: Union[ShardingSpec, Mapping[str, object]]) -> dict:
+    if isinstance(spec, Mapping):
+        return dict(spec)
+    return asdict(spec)
 
 
 @dataclass

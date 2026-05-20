@@ -195,6 +195,27 @@ public class MemWalTest {
   }
 
   @Test
+  void testInitializeMemWalBucketShardingUsesConfiguredColumn(@TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("base").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {1, 2, 3}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams().withBucketSharding("name", 4));
+
+      MemWalIndexDetails details = dataset.memWalIndexDetails().get();
+      ShardingField field = details.shardingSpecs().get(0).fields().get(0);
+      int nameFieldId =
+          dataset.getLanceSchema().fields().stream()
+              .filter(f -> f.getName().equals("name"))
+              .findFirst()
+              .get()
+              .getId();
+      assertEquals("bucket", field.transform().get());
+      assertEquals(nameFieldId, field.sourceIds().get(0));
+    }
+  }
+
+  @Test
   void testShardingEvaluatorBucketAndIdentity(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("append_only").toString();
     try (BufferAllocator allocator = new RootAllocator();

@@ -137,10 +137,10 @@ fn source_column_name(
     field: &ShardingField,
     source_id_to_column: &HashMap<i32, String>,
 ) -> Result<String> {
-    if let Some(column) = field.parameters.get(COLUMN_PARAM) {
-        if !column.trim().is_empty() {
-            return Ok(column.clone());
-        }
+    if let Some(column) = field.parameters.get(COLUMN_PARAM)
+        && !column.trim().is_empty()
+    {
+        return Ok(column.clone());
     }
     let Some(source_id) = field.source_ids.first() else {
         return Err(Error::invalid_input(format!(

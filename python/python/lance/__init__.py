@@ -43,6 +43,9 @@ from .mem_wal import (
     RegionSnapshot,
     RegionSpec,
     RegionWriter,
+    ShardingField,
+    ShardingSpec,
+    evaluate_sharding_spec,
 )
 from .namespace import (
     DescribeTableRequest,
@@ -103,6 +106,9 @@ __all__ = [
     "RegionSpec",
     "RegionSnapshot",
     "RegionWriter",
+    "ShardingField",
+    "ShardingSpec",
+    "evaluate_sharding_spec",
 ]
 
 

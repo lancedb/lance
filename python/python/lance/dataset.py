@@ -4740,9 +4740,9 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> None:
         """Initialize MemWAL on this dataset.
 
-        Must be called once before any calls to `mem_wal_writer`. The dataset
-        schema must have at least one field annotated with the
-        ``lance-schema:unenforced-primary-key`` Arrow field metadata.
+        Must be called once before any calls to `mem_wal_writer`. Append-only
+        tables may omit primary-key metadata; primary keys are only required
+        for primary-key lookup and last-write-wins deduplication workflows.
 
         At most one sharding mode may be selected: bucket sharding
         (``bucket_column`` + ``num_buckets``), identity sharding
@@ -4761,8 +4761,7 @@ class LanceDataset(pa.dataset.Dataset):
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
         bucket_column : str, optional
-            With ``num_buckets``, hash-bucket writes by this column, which must
-            be the single-column unenforced primary key.
+            With ``num_buckets``, hash-bucket writes by this scalar column.
         num_buckets : int, optional
             Number of hash buckets (shards). Required with ``bucket_column``.
         identity_column : str, optional
@@ -4773,7 +4772,6 @@ class LanceDataset(pa.dataset.Dataset):
         Raises
         ------
         IOError
-            - Dataset has no ``lance-schema:unenforced-primary-key`` field.
             - An entry in *maintained_indexes* does not exist on the dataset.
             - MemWAL has already been initialized on this dataset.
         ValueError

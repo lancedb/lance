@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -22,8 +23,11 @@ use lance::dataset::mem_wal::scanner::{
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
     LsmScanner, ShardSnapshot as RegionSnapshot, ShardWriter as RegionWriter,
+    evaluate_sharding_spec,
 };
-use lance_index::mem_wal::MergedGeneration as LanceMergedGeneration;
+use lance_index::mem_wal::{
+    MergedGeneration as LanceMergedGeneration, ShardingField, ShardingSpec,
+};
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -33,6 +37,60 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
 use crate::rt;
+
+/// Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
+#[pyfunction(name = "_evaluate_sharding_spec", signature = (batch, spec, source_id_to_column=None))]
+pub fn py_evaluate_sharding_spec<'py>(
+    py: Python<'py>,
+    batch: PyArrowType<RecordBatch>,
+    spec: &Bound<'_, PyAny>,
+    source_id_to_column: Option<HashMap<i32, String>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let PyArrowType(batch) = batch;
+    let spec = sharding_spec_from_py(spec)?;
+    let source_id_to_column = source_id_to_column.unwrap_or_default();
+    let result = evaluate_sharding_spec(&batch, &spec, &source_id_to_column)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    result.to_pyarrow(py)
+}
+
+fn sharding_spec_from_py(spec: &Bound<'_, PyAny>) -> PyResult<ShardingSpec> {
+    let spec_id = get_py_value(spec, "spec_id")?.extract::<u32>()?;
+    let fields_obj = get_py_value(spec, "fields")?;
+    let mut fields = Vec::new();
+    for field_obj in fields_obj.try_iter()? {
+        fields.push(sharding_field_from_py(&field_obj?)?);
+    }
+    Ok(ShardingSpec { spec_id, fields })
+}
+
+fn sharding_field_from_py(field: &Bound<'_, PyAny>) -> PyResult<ShardingField> {
+    Ok(ShardingField {
+        field_id: get_py_value(field, "field_id")?.extract::<String>()?,
+        source_ids: get_py_value(field, "source_ids")?.extract::<Vec<i32>>()?,
+        transform: optional_string(get_py_value(field, "transform")?)?,
+        expression: optional_string(get_py_value(field, "expression")?)?,
+        result_type: get_py_value(field, "result_type")?.extract::<String>()?,
+        parameters: get_py_value(field, "parameters")?.extract::<HashMap<String, String>>()?,
+    })
+}
+
+fn get_py_value<'py>(obj: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        dict.get_item(name)?
+            .ok_or_else(|| PyValueError::new_err(format!("Missing sharding spec field '{name}'")))
+    } else {
+        obj.getattr(name)
+    }
+}
+
+fn optional_string(value: Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    if value.is_none() {
+        Ok(None)
+    } else {
+        value.extract::<String>().map(Some)
+    }
+}
 
 /// Represents a single generation of a MemWAL region that has been merged
 /// into the base table. Used with `MergeInsertBuilder.mark_generations_as_merged()`.

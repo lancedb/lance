@@ -112,11 +112,9 @@ impl<'a> InitializeMemWalBuilder<'a> {
 
     /// Hash-bucket `column` into `num_buckets` shards.
     ///
-    /// For primary-key tables, `column` must name the dataset's single-column
-    /// unenforced primary key so every update for the same key routes to the
-    /// same shard. Append-only tables without a primary key may use any scalar
-    /// column. `num_buckets` must be in `[1, 1024]`. These constraints are
-    /// validated by [`execute`](Self::execute).
+    /// `column` must name a scalar dataset column that can be hash-bucketed.
+    /// `num_buckets` must be in `[1, 1024]`. These constraints are validated
+    /// by [`execute`](Self::execute).
     pub fn bucket_sharding(mut self, column: impl Into<String>, num_buckets: u32) -> Self {
         self.sharding = Sharding::Bucket {
             column: column.into(),
@@ -282,33 +280,12 @@ fn bucket_sharding_spec(dataset: &Dataset, column: &str, num_buckets: u32) -> Re
         )));
     }
 
-    let pk_fields = dataset.schema().unenforced_primary_key();
-    let source_field = match pk_fields.as_slice() {
-        [single] => {
-            let pk = *single;
-            if pk.name.as_str() != column {
-                // TODO: Drop this primary-key-column restriction once MemWAL update routing can
-                // handle shard keys that are independent from the row key.
-                return Err(Error::invalid_input(format!(
-                    "bucket_sharding: column '{}' does not match the unenforced primary key column '{}'",
-                    column, pk.name
-                )));
-            }
-            pk
-        }
-        [] => dataset.schema().field(column).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "bucket_sharding: column '{}' not found on the dataset",
-                column
-            ))
-        })?,
-        _ => {
-            return Err(Error::invalid_input(
-                "bucket_sharding requires a single-column unenforced primary key; \
-                 use unsharded() for a multi-column key",
-            ));
-        }
-    };
+    let source_field = dataset.schema().field(column).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "bucket_sharding: column '{}' not found on the dataset",
+            column
+        ))
+    })?;
 
     let data_type = source_field.data_type();
     if !is_bucket_sharding_supported_type(&data_type) {
