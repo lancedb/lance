@@ -505,13 +505,15 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     let schema = make_schema();
 
     let shard_id = Uuid::new_v4();
+    let row_bytes = VECTOR_DIM * 4 + 8; // embedding + id
     let config = ShardWriterConfig {
         shard_id,
         shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: false,
-        max_memtable_size: args.max_memtable_rows * VECTOR_DIM * 4 * 2,
+        max_memtable_size: args.max_memtable_rows * row_bytes * 2,
         max_memtable_rows: args.max_memtable_rows,
+        max_unflushed_memtable_bytes: args.max_memtable_rows * row_bytes * 6,
         max_wal_flush_interval: Some(Duration::from_secs(60)),
         ..ShardWriterConfig::default()
     };
