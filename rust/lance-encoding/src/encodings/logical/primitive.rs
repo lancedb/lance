@@ -4871,6 +4871,19 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    fn expand_boolean_to_bytes(fixed: FixedWidthDataBlock) -> FixedWidthDataBlock {
+        debug_assert_eq!(fixed.bits_per_value, 1);
+        let num_values = fixed.num_values as usize;
+        let bool_buf = BooleanBuffer::new(fixed.data.into_buffer(), 0, num_values);
+        let expanded: Vec<u8> = (0..num_values).map(|i| bool_buf.value(i) as u8).collect();
+        FixedWidthDataBlock {
+            data: LanceBuffer::from(expanded),
+            bits_per_value: 8,
+            num_values: fixed.num_values,
+            block_info: BlockInfo::new(),
+        }
+    }
+
     fn encode_full_zip(
         column_idx: u32,
         field: &Field,
@@ -4914,6 +4927,14 @@ impl PrimitiveStructuralEncoder {
         );
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
+
+        // Full-zip requires byte-aligned values; expand 1-bit booleans to 1 byte each.
+        let data = match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            other => other,
+        };
 
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
@@ -7503,5 +7524,26 @@ mod tests {
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+
+    // https://github.com/lance-format/lance/issues/6681
+    #[tokio::test]
+    async fn test_sparse_boolean_list_roundtrip() {
+        use arrow_array::builder::{BooleanBuilder, ListBuilder};
+
+        let mut list_builder = ListBuilder::new(BooleanBuilder::new());
+        for i in 0..1000i32 {
+            if i % 64 == 0 {
+                // Alternate true/false so the array is not constant (constant path avoids the bug).
+                list_builder.values().append_value(i % 128 == 0);
+                list_builder.append(true);
+            } else {
+                list_builder.append(false);
+            }
+        }
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 }

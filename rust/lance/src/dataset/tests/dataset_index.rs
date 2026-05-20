@@ -2194,6 +2194,109 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     );
 }
 
+/// BTree analogue of `test_fts_prewarm_with_serializing_backend_serves_query_with_no_io`:
+/// after prewarming a BTree scalar index through a serializing cache backend,
+/// an indexed-filter query serves results without any further IO. The
+/// serializing backend forces every cache hit through the `BTreeIndexState`
+/// and `FlatIndex` `CacheCodec` impls, so this also smoke-tests those
+/// round-trip paths on a multi-page index.
+#[tokio::test]
+async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    // Enough rows to span several BTree pages (default page size is 4096) so
+    // the query has to consult more than one cached `FlatIndex`.
+    let num_rows = 16_384;
+    let values = Int32Array::from_iter_values(0..num_rows);
+    let ids = UInt64Array::from_iter_values(0..num_rows as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", DataType::Int32, false),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(values) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Re-open on a session whose cache backend serializes every entry through
+    // its codec, with a generous capacity so nothing is evicted before we query.
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // Reset IO counters to isolate prewarm + query traffic from open/load.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    dataset.prewarm_index("value_idx").await.unwrap();
+
+    // Prewarm opens the index (serializing `BTreeIndexState`) and loads every
+    // page (serializing each `FlatIndex`), so the serialized store must be
+    // non-empty. The unsized fallback keys cannot have a codec by design.
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the BTree state and pages through CacheCodec, \
+         but the serializing store was empty"
+    );
+
+    // After prewarm, an indexed-filter query must reconstruct the index and
+    // every page it touches from the cache, deserializing via the codec, with
+    // no disk IO. Project only `_rowid` so the scan does not read a data column.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("value >= 100 AND value < 200")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        100,
+        "indexed filter should still return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "BTree filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every page from memory"
+    );
+}
+
 #[tokio::test]
 async fn test_fts_phrase_query_with_removed_stop_words() {
     let tmpdir = TempStrDir::default();

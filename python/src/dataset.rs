@@ -3228,9 +3228,9 @@ impl Dataset {
 
     /// Initialize MemWAL on this dataset.
     ///
-    /// Must be called once before any `mem_wal_writer()` calls. Requires the
-    /// dataset schema to have at least one field with the
-    /// `lance-schema:unenforced-primary-key` metadata.
+    /// Must be called once before any `mem_wal_writer()` calls. Append-only
+    /// tables may omit primary-key metadata; primary keys are only required
+    /// for primary-key lookup and last-write-wins deduplication workflows.
     ///
     /// At most one sharding mode may be selected: bucket sharding
     /// (`bucket_column` + `num_buckets`), identity sharding (`identity_column`),
@@ -4286,6 +4286,12 @@ fn prepare_vector_index_params(
             sq_params.sample_rate = sample_rate;
         }
 
+        if let Some(max_iters) = kwargs.get_item("max_iters")? {
+            let max_iters: usize = max_iters.extract()?;
+            ivf_params.max_iters = max_iters;
+            pq_params.max_iters = max_iters;
+        }
+
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
             ivf_params.num_partitions = Some(n.extract()?)
@@ -4443,6 +4449,13 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
+    if let Some(kwargs) = kwargs
+        && let Some(acc) = kwargs.get_item("accelerator")?
+    {
+        params
+            .runtime_hints
+            .insert("lancedb.accelerator".to_string(), acc.to_string());
+    }
     Ok(params)
 }
 

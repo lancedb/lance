@@ -70,6 +70,13 @@ use {
 pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
+/// File name for the JSON version hint file, stored under `_versions/`.
+///
+/// The file contains `{"version":N}` where `N` is the latest committed version
+/// at the time of writing. It enables O(1)/O(k) latest-version lookup via HEAD
+/// requests on object stores where listing is not lexicographically ordered
+/// (e.g. S3 Express, local filesystem) instead of an O(n) listing.
+const VERSION_HINT_FILE: &str = "latest_version_hint.json";
 
 /// How manifest files should be named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,17 +267,292 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     }
 }
 
-/// Get the latest manifest path
+/// Get the latest manifest path.
+///
+/// - Local filesystem: a single directory read.
+/// - Stores where listing is not lexicographically ordered (e.g. S3 Express):
+///   the version hint (read the hint file, then probe higher versions with
+///   HEADs), falling back to a listing if the hint is missing or stale. A full
+///   listing on these stores is O(n) in the number of versions.
+/// - Lexicographically ordered stores (e.g. S3 Standard, GCS): the listing
+///   already resolves the latest version in roughly one request.
 async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
 ) -> Result<ManifestLocation> {
-    if object_store.is_local()
-        && let Ok(Some(location)) = current_manifest_local(base)
+    if object_store.is_local() {
+        if let Ok(Some(location)) = current_manifest_local(base) {
+            return Ok(location);
+        }
+    } else if uses_version_hint(object_store)
+        && let Some(location) = read_version_hint_and_probe(object_store, base).await
     {
         return Ok(location);
     }
 
+    resolve_version_from_listing(object_store, base).await
+}
+
+/// JSON body of the version hint file: `{"version":N}`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VersionHint {
+    version: u64,
+}
+
+/// Set `LANCE_USE_VERSION_HINT=0` (or `false`) to globally disable the version
+/// hint — writers stop emitting the hint file and readers stop consulting it,
+/// falling back to plain listing. Intended as a benchmark/escape-hatch knob;
+/// the hint is on by default.
+const VERSION_HINT_ENV: &str = "LANCE_USE_VERSION_HINT";
+
+fn version_hint_globally_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var(VERSION_HINT_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Whether this object store benefits from a version hint.
+///
+/// On stores where listing is lexicographically ordered (S3 Standard, GCS,
+/// Azure, ...) the latest version is already resolved in roughly one request,
+/// so the hint would only add a write per commit for nothing. We write (and
+/// read) it only on stores where listing is not lexicographically ordered —
+/// S3 Express and the local filesystem. Can be force-disabled with the
+/// `LANCE_USE_VERSION_HINT=0` environment variable.
+pub fn uses_version_hint(object_store: &ObjectStore) -> bool {
+    version_hint_globally_enabled() && !object_store.list_is_lexically_ordered
+}
+
+/// Path to the JSON version hint file for a dataset.
+fn version_hint_path(base: &Path) -> Path {
+    base.clone().join(VERSIONS_DIR).join(VERSION_HINT_FILE)
+}
+
+/// Write the version hint file after a successful commit.
+///
+/// The hint is stored as JSON: `{"version":N}`. This write is best-effort —
+/// failures are logged and ignored, since the hint only accelerates reads and
+/// never affects correctness (readers verify the hinted version and probe
+/// upward from there). It is a no-op for detached versions and for stores that
+/// do not benefit from a hint (see [`uses_version_hint`]).
+pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version: u64) {
+    if is_detached_version(version) || !uses_version_hint(object_store) {
+        return;
+    }
+    let hint_path = version_hint_path(base);
+    let content = serde_json::to_vec(&VersionHint { version }).expect("serialize version hint");
+    if let Err(e) = object_store.put(&hint_path, content.as_slice()).await {
+        warn!("Failed to write version hint file for version {version}: {e}");
+    }
+}
+
+/// Read the latest version from the hint file, or `None` if it does not exist
+/// or cannot be parsed.
+async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
+    let bytes = object_store
+        .inner
+        .get(&version_hint_path(base))
+        .await
+        .ok()?
+        .bytes()
+        .await
+        .ok()?;
+    Some(serde_json::from_slice::<VersionHint>(&bytes).ok()?.version)
+}
+
+/// Read the version hint and probe upward to find the true latest manifest.
+///
+/// Returns `None` if the hint file is missing, the hinted version no longer
+/// exists, or any error occurred — callers should fall back to listing.
+async fn read_version_hint_and_probe(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Option<ManifestLocation> {
+    let hint_version = read_version_from_hint(object_store, base).await?;
+    let (version, scheme, mut probed) = probe_versions_upward(object_store, base, hint_version)
+        .await
+        .ok()
+        .flatten()?;
+    // `probed` is non-empty and its last entry is the highest version found.
+    let (_, meta) = probed.pop()?;
+    Some(ManifestLocation {
+        version,
+        path: scheme.manifest_path(base, version),
+        size: Some(meta.size),
+        naming_scheme: scheme,
+        e_tag: meta.e_tag,
+    })
+}
+
+/// Maximum version gap between the hint and the read version for which we use
+/// the hint-based parallel-HEAD path; beyond this a single (paginated) listing
+/// is cheaper, so callers fall back to it.
+const MAX_HINT_PROBE_GAP: u64 = 1000;
+
+/// Probe `from_version`, then `from_version + 1`, `+ 2`, ... with HEAD requests
+/// until one is not found.
+///
+/// Assumes attached versions are contiguous above `from_version` (true in
+/// practice: every commit increments by one, and cleanup only removes *old*
+/// versions, never ones newer than the latest). A `NotFound` therefore marks
+/// the end of the history.
+///
+/// - `Ok(Some((true_latest_version, naming_scheme, [(version, meta), ...])))`:
+///   the vec covers every version from `from_version` through the true latest
+///   in ascending order.
+/// - `Ok(None)`: `from_version` itself does not exist (a `NotFound` for both
+///   naming schemes) — i.e. the hint pointed past the end.
+/// - `Err(_)`: a transient object-store error was hit, so the probed range may
+///   be incomplete; callers should fall back to a full listing rather than
+///   trust a possibly-stale result.
+async fn probe_versions_upward(
+    object_store: &ObjectStore,
+    base: &Path,
+    from_version: u64,
+) -> Result<
+    Option<(
+        u64,
+        ManifestNamingScheme,
+        Vec<(u64, object_store::ObjectMeta)>,
+    )>,
+> {
+    // Newer datasets use V2; fall back to V1 if the V2 path is not found.
+    let mut scheme = ManifestNamingScheme::V2;
+    let meta = match object_store
+        .inner
+        .head(&scheme.manifest_path(base, from_version))
+        .await
+    {
+        Ok(meta) => meta,
+        Err(ObjectStoreError::NotFound { .. }) => {
+            scheme = ManifestNamingScheme::V1;
+            match object_store
+                .inner
+                .head(&scheme.manifest_path(base, from_version))
+                .await
+            {
+                Ok(meta) => meta,
+                Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut probed = vec![(from_version, meta)];
+    let mut version = from_version;
+    loop {
+        let next = version + 1;
+        match object_store
+            .inner
+            .head(&scheme.manifest_path(base, next))
+            .await
+        {
+            Ok(meta) => {
+                probed.push((next, meta));
+                version = next;
+            }
+            // NotFound means we found the latest version.
+            Err(ObjectStoreError::NotFound { .. }) => break,
+            // A transient error means a newer version might exist that we
+            // failed to observe — surface it so callers fall back to listing.
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Some((version, scheme, probed)))
+}
+
+/// List manifest locations with version `> since_version` using the version
+/// hint, in descending order of version.
+///
+/// Returns `None` if the hint is missing or stale enough that this is not
+/// usable — callers should fall back to a full listing. `Some(vec![])` is the
+/// fast path where the hint confirms there are no new versions.
+async fn list_manifests_since_version_with_hint(
+    object_store: &ObjectStore,
+    base: &Path,
+    since_version: u64,
+) -> Option<Vec<ManifestLocation>> {
+    let hint_version = read_version_from_hint(object_store, base).await?;
+
+    // A reader that is very far behind is cheaper to serve with one paginated
+    // listing than with thousands of HEADs.
+    if hint_version.saturating_sub(since_version) > MAX_HINT_PROBE_GAP {
+        return None;
+    }
+
+    // If the hint is not newer than the read version, the only versions that
+    // could exist are right above it; otherwise start at the hint.
+    let probe_from = if hint_version > since_version {
+        hint_version
+    } else {
+        since_version + 1
+    };
+
+    let (scheme, probed) = match probe_versions_upward(object_store, base, probe_from).await {
+        Ok(Some((_true_latest, scheme, probed))) => (scheme, probed),
+        // Nothing at `probe_from`. If we were probing from the hint, the hint
+        // is stale — bail to a full listing. If we were probing from
+        // `since_version + 1`, there are simply no new versions.
+        Ok(None) if hint_version > since_version => return None,
+        Ok(None) => return Some(Vec::new()),
+        // Transient error: don't trust the hint path, fall back to listing.
+        Err(_) => return None,
+    };
+
+    let mut locations: Vec<ManifestLocation> = probed
+        .into_iter()
+        .filter(|(v, _)| *v > since_version)
+        .map(|(version, meta)| ManifestLocation {
+            version,
+            path: scheme.manifest_path(base, version),
+            size: Some(meta.size),
+            naming_scheme: scheme,
+            e_tag: meta.e_tag,
+        })
+        .collect();
+
+    // Fill the gap between `since_version` and the hint with HEADs (the probe
+    // above already covered `hint_version` and up). The range is contiguous, so
+    // any error here (including a `NotFound`) means we can't trust the hint path
+    // — fall back to a full listing.
+    if hint_version > since_version + 1 {
+        let gap_locations: Vec<ManifestLocation> =
+            futures::stream::iter((since_version + 1)..hint_version)
+                .map(|version| async move {
+                    object_store
+                        .inner
+                        .head(&scheme.manifest_path(base, version))
+                        .await
+                        .map(|meta| ManifestLocation {
+                            version,
+                            path: scheme.manifest_path(base, version),
+                            size: Some(meta.size),
+                            naming_scheme: scheme,
+                            e_tag: meta.e_tag,
+                        })
+                })
+                .buffer_unordered(object_store.io_parallelism())
+                .try_collect()
+                .await
+                .ok()?;
+        locations.extend(gap_locations);
+    }
+
+    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+    Some(locations)
+}
+
+/// Resolve the latest manifest by listing the versions directory.
+async fn resolve_version_from_listing(
+    object_store: &ObjectStore,
+    base: &Path,
+) -> Result<ManifestLocation> {
     let manifest_files = object_store.list(Some(base.clone().join(VERSIONS_DIR)));
 
     let mut valid_manifests = manifest_files.try_filter_map(|res| {
@@ -588,6 +870,51 @@ pub trait CommitHandler: Debug + Send + Sync {
         }
     }
 
+    /// List manifest locations with version `> since_version`, in descending
+    /// order of version.
+    ///
+    /// On lexically-ordered stores this is the standard listing with early
+    /// termination. On non-lexically-ordered stores (e.g. S3 Express) it uses
+    /// the version hint to avoid an O(n) listing, falling back to a full
+    /// listing if the hint is missing or stale.
+    fn list_manifest_locations_since<'a>(
+        &self,
+        base_path: &Path,
+        object_store: &'a ObjectStore,
+        since_version: u64,
+    ) -> BoxStream<'a, Result<ManifestLocation>> {
+        if !uses_version_hint(object_store) {
+            return self
+                .list_manifest_locations(base_path, object_store, true)
+                .try_take_while(move |loc| future::ready(Ok(loc.version > since_version)))
+                .boxed();
+        }
+
+        let base_path = base_path.clone();
+        futures::stream::once(async move {
+            let locations = match list_manifests_since_version_with_hint(
+                object_store,
+                &base_path,
+                since_version,
+            )
+            .await
+            {
+                Some(locations) => locations,
+                None => {
+                    let mut locations = list_manifests(&base_path, &object_store.inner)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    locations.retain(|loc| loc.version > since_version);
+                    locations.sort_by_key(|loc| std::cmp::Reverse(loc.version));
+                    locations
+                }
+            };
+            Ok::<_, Error>(futures::stream::iter(locations.into_iter().map(Ok)))
+        })
+        .try_flatten()
+        .boxed()
+    }
+
     /// Commit a manifest.
     ///
     /// This function should return an [CommitError::CommitConflict] if another
@@ -877,6 +1204,8 @@ impl CommitHandler for UnsafeCommitHandler {
         let res =
             manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
 
+        write_version_hint(object_store, base_path, manifest.version).await;
+
         Ok(ManifestLocation {
             version: manifest.version,
             size: Some(res.size as u64),
@@ -960,6 +1289,9 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         lease.release(res.is_ok()).await?;
 
         let res = res?;
+
+        write_version_hint(object_store, base_path, manifest.version).await;
+
         Ok(ManifestLocation {
             version: manifest.version,
             size: Some(res.size as u64),
@@ -1028,6 +1360,7 @@ impl CommitHandler for RenameCommitHandler {
         {
             Ok(_) => {
                 // Successfully committed
+                write_version_hint(object_store, base_path, manifest.version).await;
                 Ok(ManifestLocation {
                     version: manifest.version,
                     path,
@@ -1102,6 +1435,8 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 }
                 _ => CommitError::OtherError(err.into()),
             })?;
+
+        write_version_hint(object_store, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
@@ -1280,6 +1615,196 @@ mod tests {
         assert_eq!(location.version, 11);
         assert_eq!(location.naming_scheme, naming_scheme);
         assert_eq!(location.path, naming_scheme.manifest_path(&base, 11));
+    }
+
+    /// A memory store that reports `list_is_lexically_ordered == false`, like
+    /// S3 Express, so the version-hint paths are exercised.
+    fn non_lexical_memory_store() -> Box<ObjectStore> {
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = false;
+        Box::new(object_store)
+    }
+
+    #[tokio::test]
+    async fn test_write_version_hint() {
+        let base = Path::from("base");
+
+        // No hint is written on lexically-ordered stores (it would not be read).
+        let lexical = ObjectStore::memory();
+        write_version_hint(&lexical, &base, 42).await;
+        assert_eq!(read_version_from_hint(&lexical, &base).await, None);
+
+        let object_store = non_lexical_memory_store();
+        write_version_hint(&object_store, &base, 42).await;
+        assert_eq!(read_version_from_hint(&object_store, &base).await, Some(42));
+
+        // A later commit overwrites the hint.
+        write_version_hint(&object_store, &base, 100).await;
+        assert_eq!(
+            read_version_from_hint(&object_store, &base).await,
+            Some(100)
+        );
+
+        // Detached versions are never written to the hint.
+        write_version_hint(
+            &object_store,
+            &base,
+            crate::format::DETACHED_VERSION_MASK | 7,
+        )
+        .await;
+        assert_eq!(
+            read_version_from_hint(&object_store, &base).await,
+            Some(100)
+        );
+
+        // A corrupt / non-JSON hint file is treated as missing.
+        let hint_path = version_hint_path(&base);
+        object_store
+            .put(&hint_path, b"not json".as_slice())
+            .await
+            .unwrap();
+        assert_eq!(read_version_from_hint(&object_store, &base).await, None);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_read_version_hint_and_probe(
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+
+        // No hint file yet.
+        assert!(
+            read_version_hint_and_probe(&object_store, &base)
+                .await
+                .is_none()
+        );
+
+        for version in 1..=5 {
+            object_store
+                .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        // Stale hint: should probe forward and find version 5.
+        write_version_hint(&object_store, &base, 3).await;
+        let location = read_version_hint_and_probe(&object_store, &base)
+            .await
+            .unwrap();
+        assert_eq!(location.version, 5);
+        assert_eq!(location.naming_scheme, naming_scheme);
+
+        // Up-to-date hint: returns version 5 directly.
+        write_version_hint(&object_store, &base, 5).await;
+        let location = read_version_hint_and_probe(&object_store, &base)
+            .await
+            .unwrap();
+        assert_eq!(location.version, 5);
+
+        // Hint points past the latest version: not usable.
+        write_version_hint(&object_store, &base, 10).await;
+        assert!(
+            read_version_hint_and_probe(&object_store, &base)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_manifests_since_version_with_hint() {
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+        let scheme = ManifestNamingScheme::V2;
+
+        for version in 1..=10 {
+            object_store
+                .put(&scheme.manifest_path(&base, version), b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        // No hint yet -> not usable, caller must fall back.
+        assert!(
+            list_manifests_since_version_with_hint(&object_store, &base, 7)
+                .await
+                .is_none()
+        );
+
+        // Hint exactly at the read version -> fast path, nothing new.
+        write_version_hint(&object_store, &base, 10).await;
+        assert!(matches!(
+            list_manifests_since_version_with_hint(&object_store, &base, 10).await,
+            Some(v) if v.is_empty()
+        ));
+
+        // Hint ahead of the read version, with a gap to fill (8, 9) plus probing
+        // from the hint (10). Results are descending by version.
+        let locations = list_manifests_since_version_with_hint(&object_store, &base, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.version).collect::<Vec<_>>(),
+            vec![10, 9, 8]
+        );
+
+        // Slightly stale hint (points at 8) still probes up to the true latest.
+        write_version_hint(&object_store, &base, 8).await;
+        let locations = list_manifests_since_version_with_hint(&object_store, &base, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            locations.iter().map(|l| l.version).collect::<Vec<_>>(),
+            vec![10, 9, 8]
+        );
+
+        // Hint points past the latest -> not usable, caller falls back.
+        write_version_hint(&object_store, &base, 20).await;
+        assert!(
+            list_manifests_since_version_with_hint(&object_store, &base, 7)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_current_manifest_path_with_hint_non_lexical() {
+        // Simulate S3 Express (non-lexically ordered list) with many versions.
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+        let naming_scheme = ManifestNamingScheme::V2;
+
+        for version in 1..=100 {
+            object_store
+                .put(&naming_scheme.manifest_path(&base, version), b"".as_slice())
+                .await
+                .unwrap();
+        }
+
+        // Slightly stale hint: probing from 98 still resolves the true latest.
+        write_version_hint(&object_store, &base, 98).await;
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 100);
+    }
+
+    #[tokio::test]
+    async fn test_current_manifest_path_with_stale_hint_falls_back_to_listing() {
+        let object_store = non_lexical_memory_store();
+        let base = Path::from("base");
+        let naming_scheme = ManifestNamingScheme::V2;
+
+        // Only version 5 exists, but the hint claims version 10.
+        object_store
+            .put(&naming_scheme.manifest_path(&base, 5), b"".as_slice())
+            .await
+            .unwrap();
+        write_version_hint(&object_store, &base, 10).await;
+
+        // The stale hint is ignored; listing finds version 5.
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 5);
     }
 
     #[test]

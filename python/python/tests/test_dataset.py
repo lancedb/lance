@@ -436,18 +436,27 @@ def test_has_stable_row_ids_property(tmp_path: Path):
     assert lance.dataset(non_stable_path).has_stable_row_ids is False
 
 
+def _list_manifests(versions_dir):
+    # Ignore the version hint file, which is not a manifest.
+    return [
+        name
+        for name in os.listdir(versions_dir)
+        if not name.startswith("latest_version_hint")
+    ]
+
+
 def test_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
 def test_default_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(pa.table({"a": range(100)}), tmp_path)
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
@@ -457,12 +466,12 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert manifest_path == ["1.manifest"]
 
     # Migrate to v2 manifest paths
     lance.dataset(tmp_path).migrate_manifest_paths_v2()
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 

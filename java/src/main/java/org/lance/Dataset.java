@@ -2030,8 +2030,9 @@ public class Dataset implements Closeable {
   /**
    * Initialize MemWAL on this dataset.
    *
-   * <p>Must be called once before any call to {@link #memWalWriter}. The dataset schema must have
-   * at least one field carrying the {@code lance-schema:unenforced-primary-key} metadata.
+   * <p>Must be called once before any call to {@link #memWalWriter}. Append-only tables may omit
+   * primary-key metadata; primary keys are only required for primary-key lookup and last-write-wins
+   * deduplication workflows.
    *
    * @param params MemWAL initialization parameters
    */
