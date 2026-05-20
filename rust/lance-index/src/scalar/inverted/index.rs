@@ -521,18 +521,12 @@ impl InvertedIndex {
         })
     }
 
-    /// Build a single-segment [`MemBM25Scorer`] whose per-term IDF table
-    /// covers every token that the per-partition scoring loop will look
-    /// up. For fuzzy queries that means the union of Levenshtein
-    /// expansions, not just the raw query tokens — otherwise
-    /// `query_weight(expanded_token)` returns 0 and the BM25 contribution
-    /// of every expanded match is discarded.
     pub async fn bm25_base_scorer(
         &self,
         query_tokens: &Tokens,
         params: &FtsSearchParams,
     ) -> Result<MemBM25Scorer> {
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let (total_tokens, num_docs) = self.aggregate_corpus_stats().await?;
         let mut terms: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
         if matches!(params.fuzziness, Some(n) if n != 0) {
@@ -555,18 +549,37 @@ impl InvertedIndex {
             let df = self.df_for_term(term).await?;
             token_docs.insert(term.clone(), df);
         }
-        Ok(MemBM25Scorer::new(
-            scorer.total_tokens(),
-            scorer.num_docs(),
-            token_docs,
-        ))
+        Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
     }
 
     pub async fn bm25_stats_for_terms(&self, terms: &[String]) -> Result<(u64, usize, Vec<usize>)> {
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let (total_tokens, num_docs) = self.aggregate_corpus_stats().await?;
         let token_docs =
             futures::future::try_join_all(terms.iter().map(|term| self.df_for_term(term))).await?;
-        Ok((scorer.total_tokens(), scorer.num_docs(), token_docs))
+        Ok((total_tokens, num_docs, token_docs))
+    }
+
+    /// Aggregate per-partition `total_tokens` and `num_docs` across the
+    /// index. `len` is cheap (no IO); `total_tokens_num` reads only the
+    /// num_tokens column the first time per partition and caches it on
+    /// `LazyDocSet`. Avoids materializing the full DocSet just to get
+    /// these two scalars.
+    async fn aggregate_corpus_stats(&self) -> Result<(u64, usize)> {
+        let io_parallelism = self.store.io_parallelism();
+        let num_docs: usize = self.partitions.iter().map(|p| p.docs.len()).sum();
+        let futures = self
+            .partitions
+            .iter()
+            .map(|p| {
+                let docs = p.docs.clone();
+                async move { docs.total_tokens_num().await }
+            })
+            .collect::<Vec<_>>();
+        let totals: Vec<u64> = stream::iter(futures)
+            .buffer_unordered(io_parallelism)
+            .try_collect()
+            .await?;
+        Ok((totals.into_iter().sum(), num_docs))
     }
 
     /// Sum the posting-list length for `term` across this index's partitions
@@ -671,8 +684,14 @@ impl InvertedIndex {
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
                         .await?;
                     if postings.is_empty() {
+                        // No hits in this partition; its DocSet stays
+                        // unloaded, so we never pay the per-doc
+                        // row_id/num_tokens download for it.
                         return Result::Ok(PartitionCandidates::empty());
                     }
+                    // Wand needs the full DocSet sync. Materialize it now,
+                    // only for partitions that actually contribute hits.
+                    part.docs.ensure_loaded().await?;
                     let max_position = postings
                         .iter()
                         .map(|posting| posting.term_index() as usize)
@@ -806,7 +825,7 @@ impl InvertedIndex {
                 store,
                 tokens,
                 inverted_list,
-                docs,
+                docs: Arc::new(crate::scalar::inverted::lazy_docset::LazyDocSet::from_loaded(docs)),
                 token_set_format: TokenSetFormat::Arrow,
             })],
             deleted_fragments: RoaringBitmap::new(),
@@ -1098,7 +1117,10 @@ pub struct InvertedPartition {
     store: Arc<dyn IndexStore>,
     pub(crate) tokens: TokenSet,
     pub(crate) inverted_list: Arc<PostingListReader>,
-    pub(crate) docs: DocSet,
+    /// Per-doc row_id + num_tokens. Wrapped in [`LazyDocSet`] so partitions
+    /// that don't contribute hits to a query never pay the full-array
+    /// download. Scoring paths call `ensure_loaded` before walking wand.
+    pub(crate) docs: Arc<crate::scalar::inverted::lazy_docset::LazyDocSet>,
     token_set_format: TokenSetFormat,
 }
 
@@ -1140,8 +1162,15 @@ impl InvertedPartition {
         let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        // Defer the per-doc row_id/num_tokens read. Construction only
+        // calls reader.num_rows() (no IO); the bulk load happens on first
+        // scoring use, and partitions that never score skip it entirely.
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
+        let docs = Arc::new(crate::scalar::inverted::lazy_docset::LazyDocSet::new(
+            docs_file,
+            false,
+            frag_reuse_index,
+        ));
 
         Ok(Self {
             id,
@@ -1265,12 +1294,21 @@ impl InvertedPartition {
             return Ok(Vec::new());
         }
 
-        // let local_metrics = LocalMetricsCollector::default();
+        // self.docs is wrapped in LazyDocSet; callers must materialize it
+        // via `docs.ensure_loaded()` before entering wand. We unwrap here
+        // and panic if that contract was missed.
+        let docs = self
+            .docs
+            .loaded()
+            .expect(
+                "InvertedPartition::bm25_search requires docs to be materialized; \
+                 caller must `partition.docs.ensure_loaded().await` first",
+            )
+            .as_ref();
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
-        let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer)
+        let mut wand = Wand::new(operator, postings.into_iter(), docs, scorer)
             .with_shared_threshold(shared_threshold);
         let hits = wand.search(params, mask, metrics)?;
-        // local_metrics.dump_into(metrics);
         Ok(hits)
     }
 
@@ -1282,7 +1320,10 @@ impl InvertedPartition {
             self.inverted_list.posting_tail_codec(),
         );
         builder.tokens = self.tokens.into_mutable();
-        builder.docs = self.docs;
+        // into_builder rewrites every doc, so materialize the full
+        // DocSet now and clone it out of the Arc.
+        let docs_arc = self.docs.ensure_loaded().await?;
+        builder.docs = (*docs_arc).clone();
 
         builder
             .posting_lists
