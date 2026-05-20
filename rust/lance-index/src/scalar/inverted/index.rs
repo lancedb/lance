@@ -516,13 +516,45 @@ impl InvertedIndex {
         })
     }
 
-    pub fn bm25_base_scorer(&self, query_tokens: &Tokens) -> MemBM25Scorer {
+    /// Build a single-segment [`MemBM25Scorer`] whose per-term IDF table
+    /// covers every token that the per-partition scoring loop will look
+    /// up. For fuzzy queries that means the union of Levenshtein
+    /// expansions, not just the raw query tokens — otherwise
+    /// `query_weight(expanded_token)` returns 0 and the BM25 contribution
+    /// of every expanded match is discarded.
+    pub async fn bm25_base_scorer(
+        &self,
+        query_tokens: &Tokens,
+        params: &FtsSearchParams,
+    ) -> Result<MemBM25Scorer> {
         let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
-        let token_docs = query_tokens
-            .into_iter()
-            .map(|token| (token.to_string(), scorer.num_docs_containing_token(token)))
-            .collect::<HashMap<_, _>>();
-        MemBM25Scorer::new(scorer.total_tokens(), scorer.num_docs(), token_docs)
+        let mut terms: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        if matches!(params.fuzziness, Some(n) if n != 0) {
+            let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
+            for idx in 0..expanded.len() {
+                let token = expanded.get_token(idx);
+                if seen.insert(token.to_string()) {
+                    terms.push(token.to_string());
+                }
+            }
+        } else {
+            for token in query_tokens {
+                if seen.insert(token.to_string()) {
+                    terms.push(token.to_string());
+                }
+            }
+        }
+        let mut token_docs = HashMap::with_capacity(terms.len());
+        for term in &terms {
+            let df = self.df_for_term(term).await?;
+            token_docs.insert(term.clone(), df);
+        }
+        Ok(MemBM25Scorer::new(
+            scorer.total_tokens(),
+            scorer.num_docs(),
+            token_docs,
+        ))
     }
 
     pub async fn bm25_stats_for_terms(&self, terms: &[String]) -> Result<(u64, usize, Vec<usize>)> {
@@ -593,29 +625,15 @@ impl InvertedIndex {
         metrics: Arc<dyn MetricsCollector>,
         base_scorer: Option<&MemBM25Scorer>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
-        // [`IndexBM25Scorer::query_weight`] and the per-partition wand both
-        // read `posting_len` synchronously; for v2 partitions that
-        // requires the bulk metadata to already be in memory. Force the load
-        // once up front so the hot scoring loop doesn't await per call.
-        let io_parallelism = self.store.io_parallelism();
-        let load_futures = self
-            .partitions
-            .iter()
-            .map(|part| {
-                let part = part.clone();
-                async move { part.inverted_list.ensure_metadata_loaded().await }
-            })
-            .collect::<Vec<_>>();
-        stream::iter(load_futures)
-            .buffer_unordered(io_parallelism)
-            .try_collect::<Vec<_>>()
-            .await?;
-
+        // The wand only consults `scorer.doc_weight`, which is metadata-free.
+        // The outer aggregation below consults `scorer.query_weight`, which
+        // hits per-token `posting_len`; building a `MemBM25Scorer` with
+        // precomputed per-term IDFs avoids the v2 bulk metadata pull.
         let local_scorer;
         let scorer: &dyn Scorer = if let Some(base_scorer) = base_scorer {
             base_scorer
         } else {
-            local_scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+            local_scorer = self.bm25_base_scorer(tokens.as_ref(), params.as_ref()).await?;
             &local_scorer
         };
 
@@ -1806,21 +1824,20 @@ impl PostingListReader {
     /// that contract before kicking off wand. The stats path uses
     /// [`Self::posting_len_for_token`] instead, which avoids the bulk load.
     pub(crate) fn posting_len(&self, token_id: u32) -> usize {
-        let token_id_us = token_id as usize;
-
+        let token_id = token_id as usize;
         match &self.metadata {
             PostingMetadata::LegacyV1 { offsets, .. } => {
                 let next_offset = offsets
-                    .get(token_id_us + 1)
+                    .get(token_id + 1)
                     .copied()
                     .unwrap_or(self.reader.num_rows());
-                next_offset - offsets[token_id_us]
+                next_offset - offsets[token_id]
             }
             PostingMetadata::V2 { metadata } => {
                 let metadata = metadata
                     .get()
                     .expect("v2 posting metadata must be bulk-loaded before sync posting_len; call ensure_metadata_loaded first");
-                metadata.lengths[token_id_us] as usize
+                metadata.lengths[token_id] as usize
             }
         }
     }
@@ -1844,6 +1861,42 @@ impl PostingListReader {
                     .await?;
                 let len = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
                 Ok(len as usize)
+            }
+        }
+    }
+
+    /// Async access to a single token's `(max_score, length)` pair. Mirrors
+    /// [`Self::posting_len_for_token`] but covers both columns the scoring
+    /// path needs, in one read. For v2 indexes that have not been
+    /// bulk-loaded this issues one `read_range(token..token+1, [MAX_SCORE,
+    /// LENGTH])`; for legacy v1 the values come from in-memory schema
+    /// metadata.
+    pub(crate) async fn posting_metadata_for_token(
+        &self,
+        token_id: u32,
+    ) -> Result<(Option<f32>, Option<u32>)> {
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { max_scores, .. } => {
+                Ok((max_scores.as_ref().map(|m| m[token_id as usize]), None))
+            }
+            PostingMetadata::V2 { metadata } => {
+                if let Some(loaded) = metadata.get() {
+                    return Ok((
+                        Some(loaded.max_scores[token_id as usize]),
+                        Some(loaded.lengths[token_id as usize]),
+                    ));
+                }
+                let token_id_usize = token_id as usize;
+                let batch = self
+                    .reader
+                    .read_range(
+                        token_id_usize..token_id_usize + 1,
+                        Some(&[MAX_SCORE_COL, LENGTH_COL]),
+                    )
+                    .await?;
+                let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
+                let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+                Ok((Some(max_score), Some(length)))
             }
         }
     }
@@ -1943,18 +1996,21 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
-        // `posting_list_from_batch` reads the bulk v2 metadata
-        // synchronously; ensure it is loaded before we hand off to the cache
-        // closure below. Cheap after the first call.
-        self.ensure_metadata_loaded().await?;
         let cache_key = PostingListKey { token_id };
         let mut posting = self
             .index_cache
             .get_or_insert_with_key(cache_key, || async move {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-                let batch = self.posting_batch(token_id, false).await?;
-                self.posting_list_from_batch(&batch, token_id)
+                // Fetch the posting batch and this token's (max_score,
+                // length) in parallel; for cold v2 partitions this is one
+                // single-row metadata read plus one posting-row read,
+                // instead of pulling the full per-token metadata table.
+                let (batch, (max_score, length)) = futures::try_join!(
+                    self.posting_batch(token_id, false),
+                    self.posting_metadata_for_token(token_id),
+                )?;
+                self.posting_list_from_batch(&batch, max_score, length)
             })
             .await?
             .as_ref()
@@ -1989,22 +2045,9 @@ impl PostingListReader {
     pub(crate) fn posting_list_from_batch(
         &self,
         batch: &RecordBatch,
-        token_id: u32,
+        max_score: Option<f32>,
+        length: Option<u32>,
     ) -> Result<PostingList> {
-        let (max_score, length) = match &self.metadata {
-            PostingMetadata::LegacyV1 { max_scores, .. } => {
-                (max_scores.as_ref().map(|m| m[token_id as usize]), None)
-            }
-            PostingMetadata::V2 { metadata } => {
-                let metadata = metadata.get().expect(
-                    "v2 metadata must be bulk-loaded before posting_list_from_batch; call ensure_metadata_loaded first",
-                );
-                (
-                    Some(metadata.max_scores[token_id as usize]),
-                    Some(metadata.lengths[token_id as usize]),
-                )
-            }
-        };
         Self::posting_list_from_batch_parts(
             batch,
             max_score,
@@ -2141,17 +2184,39 @@ impl PostingListReader {
         &self,
         with_position: bool,
     ) -> Result<impl Iterator<Item = Result<PostingList>> + '_> {
-        // `posting_list_from_batch` reads from the v2 bulk metadata
-        // expecting it to already be populated; populate it before handing out
-        // the iterator.
+        // read_all walks every posting list; the bulk metadata is paid for
+        // unconditionally, so just load it once up front and index into it
+        // synchronously below.
         self.ensure_metadata_loaded().await?;
         let batch = self.read_batch(with_position).await?;
         Ok((0..self.len()).map(move |i| {
             let token_id = i as u32;
             let range = self.posting_list_range(token_id);
             let batch = batch.slice(i, range.end - range.start);
-            self.posting_list_from_batch(&batch, token_id)
+            let (max_score, length) = self.bulk_metadata_for_token(token_id);
+            self.posting_list_from_batch(&batch, max_score, length)
         }))
+    }
+
+    /// Sync lookup of `(max_score, length)` from the bulk-loaded metadata.
+    /// Only safe after [`Self::ensure_metadata_loaded`]; callers that hold
+    /// the OnceCell-loaded reference (e.g. read_all, prewarm) use this to
+    /// avoid the per-token IO path.
+    fn bulk_metadata_for_token(&self, token_id: u32) -> (Option<f32>, Option<u32>) {
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { max_scores, .. } => {
+                (max_scores.as_ref().map(|m| m[token_id as usize]), None)
+            }
+            PostingMetadata::V2 { metadata } => {
+                let loaded = metadata.get().expect(
+                    "v2 metadata must be bulk-loaded before bulk_metadata_for_token; call ensure_metadata_loaded first",
+                );
+                (
+                    Some(loaded.max_scores[token_id as usize]),
+                    Some(loaded.lengths[token_id as usize]),
+                )
+            }
+        }
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<CompressedPositionStorage> {
@@ -5606,8 +5671,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_posting_list_loads_share_one_metadata_read() {
+    async fn test_posting_list_metadata_reads_scale_with_query_size() {
+        // Cold-start scoring used to bulk-read `0..num_tokens` of the
+        // [MAX_SCORE_COL, LENGTH_COL] columns the first time `bm25_search`
+        // ran against a partition. Now `posting_list` fetches each token's
+        // (max_score, length) as a single-row read alongside its posting
+        // batch, so K concurrent posting_list lookups should pull O(K)
+        // metadata rows, not O(num_tokens).
         let num_tokens = 32;
+        let queried_tokens: [u32; 4] = [0, 1, 2, 3];
         let (index, counter) = load_counted_v2_index(num_tokens).await;
         let inverted_list = index.partitions[0].inverted_list.clone();
         assert!(
@@ -5616,7 +5688,7 @@ mod tests {
         );
 
         let metrics = Arc::new(NoOpMetricsCollector);
-        stream::iter([0_u32, 1, 2, 3])
+        stream::iter(queried_tokens)
             .map(|token_id| {
                 let inverted_list = inverted_list.clone();
                 let metrics = metrics.clone();
@@ -5627,15 +5699,16 @@ mod tests {
                         .unwrap();
                 }
             })
-            .buffer_unordered(4)
+            .buffer_unordered(queried_tokens.len())
             .collect::<Vec<_>>()
             .await;
 
         assert_eq!(
             counter.metadata_rows_read(),
+            queried_tokens.len(),
+            "K posting_list calls should read K metadata rows (not the full \
+             {}-row metadata table); got {} rows across {} read_range calls",
             num_tokens,
-            "concurrent posting-list loads should bulk-read metadata once; \
-             got {} metadata rows across {} read_range calls",
             counter.metadata_rows_read(),
             counter.read_range_calls(),
         );
