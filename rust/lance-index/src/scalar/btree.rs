@@ -86,6 +86,15 @@ pub struct MergeResult {
     pub part_page_files: Vec<String>,
 }
 
+impl MergeResult {
+    pub fn new(part_lookup_files: Vec<String>, part_page_files: Vec<String>) -> Self {
+        Self {
+            part_lookup_files,
+            part_page_files,
+        }
+    }
+}
+
 pub async fn cleanup_shard_files(store: &dyn IndexStore, result: &MergeResult) {
     for file_name in &result.part_lookup_files {
         if file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance") {

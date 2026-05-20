@@ -777,10 +777,10 @@ impl BTreeMergeResult {
             )?;
             lance_index::scalar::btree::cleanup_shard_files(
                 &store,
-                &lance_index::scalar::btree::MergeResult {
-                    part_lookup_files: self.part_lookup_files.clone(),
-                    part_page_files: self.part_page_files.clone(),
-                },
+                &lance_index::scalar::btree::MergeResult::new(
+                    self.part_lookup_files.clone(),
+                    self.part_page_files.clone(),
+                ),
             )
             .await;
             Ok(())
