@@ -43,7 +43,9 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{BTreeMergeResult, DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
+use dataset::{
+    BTreeMergeResult, DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter,
+};
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
