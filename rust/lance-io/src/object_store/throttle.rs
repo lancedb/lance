@@ -395,16 +395,16 @@ impl OperationThrottle {
         };
         let prev_rate = self.controller.current_rate();
         let new_rate = self.controller.record_outcome(outcome);
-        if new_rate < prev_rate {
-            if let Err(err) = result.as_ref() {
-                warn!(
-                    target: TRACE_OBJECT_STORE_THROTTLE,
-                    previous_rate = format!("{prev_rate:.1}"),
-                    new_rate = format!("{new_rate:.1}"),
-                    error = %err,
-                    "AIMD throttle: rate reduced due to throttle errors"
-                );
-            }
+        if new_rate < prev_rate
+            && let Err(err) = result.as_ref()
+        {
+            warn!(
+                target: TRACE_OBJECT_STORE_THROTTLE,
+                previous_rate = format!("{prev_rate:.1}"),
+                new_rate = format!("{new_rate:.1}"),
+                error = %err,
+                "AIMD throttle: rate reduced due to throttle errors"
+            );
         }
         if let Ok(mut bucket) = self.bucket.try_lock() {
             bucket.rate = new_rate;
@@ -436,16 +436,16 @@ impl OperationThrottle {
             };
             let prev_rate = self.controller.current_rate();
             let new_rate = self.controller.record_outcome(outcome);
-            if new_rate < prev_rate {
-                if let Err(err) = result.as_ref() {
-                    warn!(
-                        target: TRACE_OBJECT_STORE_THROTTLE,
-                        previous_rate = format!("{prev_rate:.1}"),
-                        new_rate = format!("{new_rate:.1}"),
-                        error = %err,
-                        "AIMD throttle: rate reduced due to throttle errors"
-                    );
-                }
+            if new_rate < prev_rate
+                && let Err(err) = result.as_ref()
+            {
+                warn!(
+                    target: TRACE_OBJECT_STORE_THROTTLE,
+                    previous_rate = format!("{prev_rate:.1}"),
+                    new_rate = format!("{new_rate:.1}"),
+                    error = %err,
+                    "AIMD throttle: rate reduced due to throttle errors"
+                );
             }
             self.update_bucket_rate(new_rate).await;
 
