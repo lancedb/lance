@@ -2033,7 +2033,7 @@ pub async fn train_btree_index(
 /// * `index_store` - The index store to write partition files to
 /// * `batch_size` - The page size for the BTree index
 /// * `boundaries` - N-1 boundary values that define N partitions. Boundary i means:
-///   partition i contains values < boundaries[i], partition i+1 contains values >= boundaries[i].
+///   partition i contains values < boundaries\[i\], partition i+1 contains values >= boundaries\[i\].
 ///   The boundaries must be in ascending order.
 ///
 /// # Guarantees

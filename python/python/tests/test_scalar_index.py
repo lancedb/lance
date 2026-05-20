@@ -140,7 +140,9 @@ def btree_comparison_datasets(tmp_path):
         )
 
     # Merge fragment indices
-    merge_result = fragment_ds.merge_index_metadata(fragment_index_id, index_type="BTREE")
+    merge_result = fragment_ds.merge_index_metadata(
+        fragment_index_id, index_type="BTREE"
+    )
 
     # Create Index object for fragment-based index
     from lance.dataset import Index
