@@ -354,17 +354,74 @@ fn extract_result_ids(batches: &[RecordBatch]) -> Vec<i64> {
 }
 
 // ----------------------------------------------------------------------
-// Load embeddings from HuggingFace dataset
+// Synthetic embedding generation
 // ----------------------------------------------------------------------
 
-async fn load_hf_embeddings(offset: usize, count: usize) -> Result<Vec<RecordBatch>> {
-    let hf_uri = "hf://datasets/lance-format/fineweb-edu/data/train.lance";
-    let hf_ds = Dataset::open(hf_uri).await?;
-    let mut scanner = hf_ds.scan();
-    scanner.project(&[VECTOR_COL])?;
-    scanner.limit(Some(count as i64), Some(offset as i64))?;
-    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
-    Ok(batches)
+/// Generate `count` synthetic 384-dim embedding vectors starting at
+/// logical offset `offset`. Uses a deterministic cluster+noise scheme
+/// (same approach as mem_wal_hnsw_bench.rs) so vectors are clustered
+/// enough for IVF to be meaningful but noisy enough for recall to be
+/// non-trivial.
+const NUM_CLUSTERS: usize = 1024;
+const NOISE: f32 = 0.05;
+const SEED: u64 = 42;
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn unit_f32(key: u64) -> f32 {
+    let bits = splitmix64(key) >> 40;
+    (bits as f32) * (1.0 / 16_777_216.0)
+}
+
+fn generate_vector(row: usize) -> Vec<f32> {
+    let cluster = row % NUM_CLUSTERS;
+    (0..VECTOR_DIM)
+        .map(|col| {
+            let base_key = SEED
+                ^ (cluster as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                ^ (col as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+            let noise_key = SEED
+                ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                ^ (col as u64).wrapping_mul(0xd2b7_4407_b1ce_6e93);
+            let base = unit_f32(base_key) * 2.0 - 1.0;
+            let noise = (unit_f32(noise_key) * 2.0 - 1.0) * NOISE;
+            base + noise
+        })
+        .collect()
+}
+
+fn generate_embedding_batches(offset: usize, count: usize, batch_size: usize) -> Vec<RecordBatch> {
+    let field = Arc::new(Field::new("item", DataType::Float32, true));
+    let fsl_type = DataType::FixedSizeList(field, VECTOR_DIM as i32);
+    let emb_field = Arc::new(Field::new(VECTOR_COL, fsl_type, false));
+    let schema = Arc::new(ArrowSchema::new(vec![emb_field]));
+
+    let mut batches = Vec::new();
+    let mut cursor = offset;
+    let end = offset + count;
+    while cursor < end {
+        let n = batch_size.min(end - cursor);
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), VECTOR_DIM as i32);
+        for row in cursor..(cursor + n) {
+            let vec = generate_vector(row);
+            for v in &vec {
+                builder.values().append_value(*v);
+            }
+            builder.append(true);
+        }
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(builder.finish()) as ArrayRef])
+                .unwrap();
+        batches.push(batch);
+        cursor += n;
+    }
+    batches
 }
 
 fn is_cloud_uri(uri: &str) -> bool {
@@ -376,11 +433,14 @@ fn is_cloud_uri(uri: &str) -> bool {
 // ----------------------------------------------------------------------
 
 async fn run_prepare(args: &Args) -> Result<()> {
-    println!("loading {} embeddings from HuggingFace ...", args.base_rows);
-    let start = Instant::now();
-    let raw_batches = load_hf_embeddings(0, args.base_rows).await?;
     println!(
-        "  loaded {} batches in {:.1}s",
+        "generating {} synthetic {}-dim embeddings ...",
+        args.base_rows, VECTOR_DIM
+    );
+    let start = Instant::now();
+    let raw_batches = generate_embedding_batches(0, args.base_rows, args.batch_rows);
+    println!(
+        "  generated {} batches in {:.1}s",
         raw_batches.len(),
         start.elapsed().as_secs_f64()
     );
@@ -473,10 +533,11 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     gen_sizes.push(active_rows);
 
     println!(
-        "loading {} memtable embeddings from HuggingFace ...",
+        "generating {} synthetic memtable embeddings ...",
         total_memtable_rows
     );
-    let mt_batches = load_hf_embeddings(args.base_rows, total_memtable_rows).await?;
+    let mt_batches =
+        generate_embedding_batches(args.base_rows, total_memtable_rows, args.batch_rows);
 
     // Flatten the memtable embeddings for ground truth computation later
     let (mt_all_ids_raw, mt_all_vecs) = {
