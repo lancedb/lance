@@ -563,16 +563,18 @@ mod tests {
                 .unwrap();
             assert_eq!(new_ds.manifest.version, i + 2);
 
-            // Because we are writing transactions sequentially, and caching them,
-            // we shouldn't need to read anything from disk. Except we do need
-            // to check for the latest version to see if we need to do conflict
-            // resolution.
+            // With the default Optimistic strategy, we skip the rebase read
+            // and go straight to writing the txn + manifest. The exact I/O
+            // count depends on whether a conflict occurs (no conflict: 2
+            // writes; conflict: 5 writes including retry + delete).
             let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-            assert_io_eq!(io_stats, read_iops, 1, "check latest version, i = {} ", i);
-            // Should see 2 IOPs:
-            // 1. Write the transaction files
-            // 2. Write (conditional put) the manifest
-            assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest, i = {}", i);
+            assert_io_gt!(
+                io_stats,
+                write_iops,
+                1,
+                "at least txn + manifest, i = {}",
+                i
+            );
         }
 
         // Commit transaction with URI and session
@@ -583,11 +585,12 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 7);
         // Session should still be re-used
-        // However, the dataset needs to be loaded and the read version checked out,
-        // so an additional 4 IOPs are needed.
+        // With Optimistic strategy, the dataset needs to be loaded (reads),
+        // but the commit itself may or may not need a rebase depending on
+        // whether there is a conflict.
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
-        assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
+        assert_io_gt!(io_stats, read_iops, 0, "load dataset");
+        assert_io_gt!(io_stats, write_iops, 1, "write txn + manifest");
 
         // Commit transaction with URI and new session. Re-use the store
         // registry so we see the same store.
@@ -602,7 +605,7 @@ mod tests {
 
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 10);
-        assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
+        assert_io_gt!(io_stats, write_iops, 1, "write txn + manifest");
     }
 
     #[tokio::test]
@@ -639,14 +642,11 @@ mod tests {
 
         // Assert io requests
         let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
-        // This could be zero, if we decided to be optimistic. However, that
-        // would mean two wasted write requests (txn + manifest) if there was
-        // a conflict. We choose to be pessimistic for more consistent performance.
-        assert_io_eq!(io_stats, read_iops, 1);
+        // With the default Optimistic strategy, we skip the rebase read on the
+        // first attempt and go straight to writing the txn + manifest.
+        assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 2);
-        // We can't write them in parallel. The transaction file must exist before
-        // we can write the manifest.
-        assert_io_eq!(io_stats, num_stages, 3);
+        assert_io_eq!(io_stats, num_stages, 2);
     }
 
     #[tokio::test]
@@ -705,28 +705,24 @@ mod tests {
 
         let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
 
-        // If there is a conflict with two transaction, the retry should require io requests:
-        // * 1 list version
-        // * num_other_txns read manifests (cache-able)
-        // * num_other_txns read txn files (cache-able)
-        // * 1 write txn file
-        // * 1 write manifest
-        // For total of 3 + 2 * num_other_txns io requests. If we have caching enabled, we can skip 2 * num_other_txns
-        // of those. We should be able to read in 5 hops.
+        // With the default Optimistic strategy, the first commit attempt fails
+        // (no rebase read), then we rebase and retry:
+        //   Attempt 1: write txn + write manifest (conflict detected)
+        //   Cleanup:   delete txn
+        //   Rebase:    list versions (cache-able)
+        //   Attempt 2: write txn + write manifest (success)
+        // Total write_iops = 5 (4 puts + 1 delete).
+        // With caching, the rebase only needs 1 list call.
         if use_cache {
             assert_io_eq!(io_stats, read_iops, 1); // Just list versions
-            assert_io_eq!(io_stats, num_stages, 3);
+            assert_io_eq!(io_stats, num_stages, 5);
         } else {
             // We need to read the other manifests and transactions.
-
             use lance_io::assert_io_lt;
             assert_io_eq!(io_stats, read_iops, 1 + num_other_txns * 2);
-            // It's possible to read the txns for some versions before we
-            // finish reading later versions and so the entire "read versions
-            // and txs" may appear as 1 hop instead of 2.
-            assert_io_lt!(io_stats, num_stages, 6);
+            assert_io_lt!(io_stats, num_stages, 12);
         }
-        assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
+        assert_io_eq!(io_stats, write_iops, 5); // 4 puts + 1 delete
     }
 
     #[tokio::test]

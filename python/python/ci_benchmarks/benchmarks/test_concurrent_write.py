@@ -5,15 +5,15 @@
 Concurrent write benchmark for Lance datasets.
 
 Measures throughput and latency of concurrent append, delete, and update
-operations under different commit strategies (Pessimistic vs Optimistic).
+operations under different commit strategies (Optimistic vs Pessimistic).
 
 Usage:
-    # Run with default Pessimistic strategy
+    # Run with default Optimistic strategy
     pytest python/ci_benchmarks/benchmarks/test_concurrent_write.py \
         --benchmark-only
 
-    # Run with Optimistic strategy (set env var)
-    LANCE_COMMIT_STRATEGY=optimistic \
+    # Run with Pessimistic strategy (set env var)
+    LANCE_COMMIT_STRATEGY=pessimistic \
         pytest python/ci_benchmarks/benchmarks/test_concurrent_write.py \
         --benchmark-only
 
