@@ -2702,7 +2702,8 @@ mod tests {
             builder = builder
                 .name(index_name.to_string())
                 .fragments(vec![fragment_id]);
-            segments.push(builder.execute_uncommitted().await.unwrap());
+            let seg = builder.execute_uncommitted().await.unwrap();
+            segments.push(seg);
         }
 
         let segment_ids = segments

@@ -25,7 +25,9 @@ use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
-use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, DistributedMode, train_btree_index};
+use lance_index::scalar::btree::{
+    BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, DistributedMode, train_btree_index,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::{SargableQuery, ScalarIndex};
@@ -106,9 +108,14 @@ async fn create_int_unique_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_unique_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, DistributedMode::Single)
-        .await
-        .unwrap();
+    train_btree_index(
+        stream,
+        store.as_ref(),
+        DEFAULT_BTREE_BATCH_SIZE,
+        DistributedMode::Single,
+    )
+    .await
+    .unwrap();
 
     let cache = get_cache(use_cache, "int_unique");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
@@ -126,9 +133,14 @@ async fn create_int_low_card_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_int_low_cardinality_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, DistributedMode::Single)
-        .await
-        .unwrap();
+    train_btree_index(
+        stream,
+        store.as_ref(),
+        DEFAULT_BTREE_BATCH_SIZE,
+        DistributedMode::Single,
+    )
+    .await
+    .unwrap();
 
     let cache = get_cache(use_cache, "int_low_card");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
@@ -146,9 +158,14 @@ async fn create_string_unique_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_unique_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, DistributedMode::Single)
-        .await
-        .unwrap();
+    train_btree_index(
+        stream,
+        store.as_ref(),
+        DEFAULT_BTREE_BATCH_SIZE,
+        DistributedMode::Single,
+    )
+    .await
+    .unwrap();
 
     let cache = get_cache(use_cache, "string_unique");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
@@ -166,9 +183,14 @@ async fn create_string_low_card_index(
 ) -> Arc<dyn ScalarIndex> {
     let stream = common::generate_string_low_cardinality_stream();
 
-    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, DistributedMode::Single)
-        .await
-        .unwrap();
+    train_btree_index(
+        stream,
+        store.as_ref(),
+        DEFAULT_BTREE_BATCH_SIZE,
+        DistributedMode::Single,
+    )
+    .await
+    .unwrap();
 
     let cache = get_cache(use_cache, "string_low_card");
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();

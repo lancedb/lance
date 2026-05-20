@@ -2528,7 +2528,8 @@ mod tests {
         for fragments in fragment_groups {
             let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, params);
             builder = builder.name(index_name.to_string()).fragments(fragments);
-            segments.push(builder.execute_uncommitted().await.unwrap());
+            let seg = builder.execute_uncommitted().await.unwrap();
+            segments.push(seg);
         }
 
         segments
@@ -3236,15 +3237,14 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
         let mut segments = Vec::new();
         for fragment in fragments.iter().take(2) {
-            segments.push(
-                dataset
-                    .create_index_builder(&["vector"], IndexType::Vector, &params)
-                    .name(INDEX_NAME.to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-            );
+            let seg = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name(INDEX_NAME.to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(seg);
         }
 
         let progress = Arc::new(RecordingProgress::default());

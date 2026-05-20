@@ -441,6 +441,7 @@ mod tests {
         let params = BTreeParameters {
             zone_size: Some(batch_size),
             range_id: None,
+            num_partitions: None,
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;

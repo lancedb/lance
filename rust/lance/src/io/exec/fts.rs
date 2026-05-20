@@ -2312,7 +2312,8 @@ mod tests {
                 .create_index_builder(&["text"], IndexType::Inverted, &params)
                 .name("seg_fts".to_string())
                 .fragments(vec![fragment_id]);
-            metadatas.push(builder.execute_uncommitted().await.unwrap());
+            let meta = builder.execute_uncommitted().await.unwrap();
+            metadatas.push(meta);
         }
         let segments = ds
             .create_index_segment_builder()

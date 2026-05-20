@@ -242,32 +242,28 @@ pub(crate) async fn sample_partition_boundaries(
     }
 
     let sample_size = (total_rows / 100).clamp(1_000, 1_000_000) as usize;
+    let stride = (total_rows as usize).div_ceil(sample_size).max(1);
 
     let mut scan = dataset.scan();
     scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])?;
     scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
         column.to_string(),
     )]))?;
-    scan.limit(Some(sample_size as i64), None)?;
 
     let batches = scan
         .try_into_dfstream(LanceExecutionOptions::default())
-        .await?
-        .try_collect::<Vec<_>>()
         .await?;
 
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let schema = batches[0].schema();
-    let batch = arrow::compute::concat_batches(&schema, &batches)?;
-    let col = batch.column(0);
-
-    let mut values: Vec<datafusion::scalar::ScalarValue> = Vec::with_capacity(col.len());
-    for i in 0..col.len() {
-        if !col.is_null(i) {
-            values.push(datafusion::scalar::ScalarValue::try_from_array(col, i)?);
+    let mut values: Vec<datafusion::scalar::ScalarValue> = Vec::with_capacity(sample_size);
+    let mut row_idx: usize = 0;
+    futures::pin_mut!(batches);
+    while let Some(batch) = batches.try_next().await? {
+        let col = batch.column(0);
+        for i in 0..col.len() {
+            if row_idx.is_multiple_of(stride) && !col.is_null(i) {
+                values.push(datafusion::scalar::ScalarValue::try_from_array(col, i)?);
+            }
+            row_idx += 1;
         }
     }
 
@@ -278,6 +274,10 @@ pub(crate) async fn sample_partition_boundaries(
     values.dedup();
 
     let num_boundaries = (num_partitions - 1) as usize;
+    if values.len() <= num_boundaries {
+        return Ok(Vec::new());
+    }
+
     let mut boundaries = Vec::with_capacity(num_boundaries);
     for i in 1..=num_boundaries {
         let idx = values.len() * i / (num_boundaries + 1);
@@ -298,7 +298,10 @@ pub(super) async fn build_btree_index_partitioned(
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<(CreatedIndex, Option<lance_index::scalar::btree::MergeResult>)> {
+) -> Result<(
+    CreatedIndex,
+    Option<lance_index::scalar::btree::MergeResult>,
+)> {
     let field = dataset
         .schema()
         .field(column)
@@ -316,11 +319,14 @@ pub(super) async fn build_btree_index_partitioned(
     if !train {
         return Err(Error::invalid_input(
             "range_partitions requires train=true. Partitioned indices cannot be created \
-             with an empty training stream.".to_string(),
+             with an empty training stream."
+                .to_string(),
         ));
     }
 
-    progress.stage_start("sample_boundaries", None, "boundaries").await?;
+    progress
+        .stage_start("sample_boundaries", None, "boundaries")
+        .await?;
     let boundaries = sample_partition_boundaries(dataset, column, num_partitions).await?;
     progress.stage_complete("sample_boundaries").await?;
 
@@ -351,7 +357,9 @@ pub(super) async fn build_btree_index_partitioned(
     .await?;
     progress.stage_complete("load_data").await?;
 
-    progress.stage_start("train_partitioned", None, "partitions").await?;
+    progress
+        .stage_start("train_partitioned", None, "partitions")
+        .await?;
     let manifests = lance_index::scalar::btree::train_btree_index_partitioned(
         training_data,
         &index_store,
@@ -363,7 +371,9 @@ pub(super) async fn build_btree_index_partitioned(
 
     let index_dir = dataset.indices_dir().join(uuid);
     let index_store = Arc::new(index_store);
-    progress.stage_start("merge_partitions", None, "partitions").await?;
+    progress
+        .stage_start("merge_partitions", None, "partitions")
+        .await?;
     let merge_result = lance_index::scalar::btree::merge_from_manifests(
         index_store.clone(),
         &manifests,
@@ -373,7 +383,8 @@ pub(super) async fn build_btree_index_partitioned(
     .await?;
     progress.stage_complete("merge_partitions").await?;
 
-    let files = lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+    let files =
+        lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
     // Shard cleanup is deferred to the caller, who should run it after the
     // transaction commit succeeds. This ensures that if the commit fails,
@@ -1203,6 +1214,7 @@ mod tests {
         let btree_params = BTreeParameters {
             zone_size: Some(50),
             range_id: None,
+            num_partitions: None,
         };
         let params_json = serde_json::to_value(&btree_params).unwrap();
         let index_params =
@@ -1306,6 +1318,7 @@ mod tests {
         let btree_params = BTreeParameters {
             zone_size: Some(50),
             range_id: None,
+            num_partitions: None,
         };
         let params_json = serde_json::to_value(&btree_params).unwrap();
         let index_params =
@@ -2279,13 +2292,13 @@ mod tests {
         assert_eq!(results.num_rows(), 10);
 
         // Verify the index is range-partitioned by checking file structure
-        let index_dir = dataset.indices_dir().join(indices[0].uuid.to_string().as_str());
-        let index_files = lance_table::format::list_index_files_with_sizes(
-            &dataset.object_store,
-            &index_dir,
-        )
-        .await
-        .unwrap();
+        let index_dir = dataset
+            .indices_dir()
+            .join(indices[0].uuid.to_string().as_str());
+        let index_files =
+            lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir)
+                .await
+                .unwrap();
 
         // No part_*_page_lookup shard files should remain after merge+cleanup
         // (part_*_page_data files are kept as the final partitioned page data)
@@ -2296,7 +2309,10 @@ mod tests {
         assert!(
             shard_lookup_files.is_empty(),
             "Shard lookup files should be cleaned up after merge, found: {:?}",
-            shard_lookup_files.iter().map(|f| &f.path).collect::<Vec<_>>()
+            shard_lookup_files
+                .iter()
+                .map(|f| &f.path)
+                .collect::<Vec<_>>()
         );
 
         // Should have multiple page_data files (one per partition) and one page_lookup file

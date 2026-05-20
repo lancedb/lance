@@ -291,7 +291,7 @@ async fn build_partial_fixture(dataset: &mut Dataset, bench_case: BenchCase) -> 
             .name("distributed_merge_only".to_string())
             .fragments(fragments)
             .index_uuid(fixture_uuid.to_string());
-        Box::pin(builder.execute_uncommitted()).await.unwrap();
+        let _segment = Box::pin(builder.execute_uncommitted()).await.unwrap();
     }
 
     MergeFixture {

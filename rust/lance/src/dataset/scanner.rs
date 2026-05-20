@@ -4902,7 +4902,8 @@ pub mod test_dataset {
                     self.dataset
                         .create_index_builder(&["vec"], IndexType::Vector, &params);
                 builder = builder.name("idx".to_string()).fragments(vec![fragment_id]);
-                segments.push(builder.execute_uncommitted().await?);
+                let seg = builder.execute_uncommitted().await?;
+                segments.push(seg);
             }
 
             let segment_ids = segments
@@ -8253,7 +8254,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             builder = builder
                 .name("name_zonemap".to_string())
                 .fragments(vec![fragment.id() as u32]);
-            segments.push(builder.execute_uncommitted().await.unwrap());
+            let seg = builder.execute_uncommitted().await.unwrap();
+            segments.push(seg);
         }
 
         dataset
@@ -8366,7 +8368,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             builder = builder
                 .name("name_btree".to_string())
                 .fragments(vec![fragment.id() as u32]);
-            segments.push(builder.execute_uncommitted().await.unwrap());
+            let seg = builder.execute_uncommitted().await.unwrap();
+            segments.push(seg);
         }
 
         dataset

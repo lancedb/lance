@@ -3616,7 +3616,14 @@ class LanceDataset(pa.dataset.Dataset):
 
         timers["final_create_index:start"] = time.time()
         index = self._ds.create_index(
-            column, index_type, name, replace, train, storage_options, range_partitions, kwargs
+            column,
+            index_type,
+            name,
+            replace,
+            train,
+            storage_options,
+            range_partitions,
+            kwargs,
         )
         timers["final_create_index:end"] = time.time()
         final_create_index_time = (
@@ -4065,7 +4072,9 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Only {', '.join(sorted(valid))} are supported, received {index_type}"
             )
 
-        return self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
+        return self._ds.merge_index_metadata(
+            index_uuid, t, batch_readhead, progress_callback
+        )
 
     def create_index_segment_builder(self):
         """

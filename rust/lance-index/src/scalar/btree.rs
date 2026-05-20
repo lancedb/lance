@@ -728,11 +728,7 @@ impl BTreeLookup {
         // filter in the loop body to eliminate non-matching entries.
         let lower_bound = match range.0 {
             Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(_) | Bound::Excluded(_)
-                if self.may_overlap =>
-            {
-                Bound::Unbounded
-            }
+            Bound::Included(_) | Bound::Excluded(_) if self.may_overlap => Bound::Unbounded,
             Bound::Included(lower) => self
                 .tree
                 .largest_node_less(lower)
@@ -1230,7 +1226,12 @@ impl BTreeIndex {
 
         let data_type = mins.data_type();
 
-        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages, may_overlap));
+        let page_lookup = Arc::new(BTreeLookup::new(
+            map,
+            null_pages,
+            all_null_pages,
+            may_overlap,
+        ));
 
         Ok(Self::new(
             page_lookup,
@@ -1289,38 +1290,39 @@ impl BTreeIndex {
         // For partitioned indices, construct the `ranges_to_files` map.
         // This converts the list of (partition ID, page count) from metadata into a map
         // from a global page range to its corresponding file and starting offset.
-        let ranges_to_files = if let Some(page_file_name) = standalone_partition_page_file {
-            let page_numbers = serialized_lookup
-                .column(3)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap();
-            let max_page_number = page_numbers.values().iter().copied().max().unwrap_or(0);
-            let mut range_map = RangeInclusiveMap::new();
-            range_map.insert(0..=max_page_number, (page_file_name, 0));
-            Some(Arc::new(range_map))
-        } else if partitioned {
-            let part_sizes_str = file_schema
+        let ranges_to_files =
+            if let Some(page_file_name) = standalone_partition_page_file {
+                let page_numbers = serialized_lookup
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap();
+                let max_page_number = page_numbers.values().iter().copied().max().unwrap_or(0);
+                let mut range_map = RangeInclusiveMap::new();
+                range_map.insert(0..=max_page_number, (page_file_name, 0));
+                Some(Arc::new(range_map))
+            } else if partitioned {
+                let part_sizes_str = file_schema
             .metadata
             .get(PAGE_NUM_PER_RANGE_PARTITION_META_KEY)
             .expect("Partitioned Btree lookup file must have page-number-per-range-file metadata!");
-            let part_sizes_vec: Vec<(u64, u32)> = serde_json::from_str(part_sizes_str)?;
-            let mut offset: u32 = 0;
+                let part_sizes_vec: Vec<(u64, u32)> = serde_json::from_str(part_sizes_str)?;
+                let mut offset: u32 = 0;
 
-            let range_map = part_sizes_vec
-                .into_iter()
-                .map(|(id, size)| {
-                    let range = offset..=(offset + size - 1);
-                    let file_with_size = (part_page_data_file_path(id), offset);
-                    offset += size;
-                    (range, file_with_size)
-                })
-                .collect();
+                let range_map = part_sizes_vec
+                    .into_iter()
+                    .map(|(id, size)| {
+                        let range = offset..=(offset + size - 1);
+                        let file_with_size = (part_page_data_file_path(id), offset);
+                        offset += size;
+                        (range, file_with_size)
+                    })
+                    .collect();
 
-            Some(Arc::new(range_map))
-        } else {
-            None
-        };
+                Some(Arc::new(range_map))
+            } else {
+                None
+            };
 
         Ok(Arc::new(Self::try_from_serialized(
             serialized_lookup,
@@ -1760,7 +1762,13 @@ impl ScalarIndex for BTreeIndex {
             .clone()
             .combine_old_new(new_data, self.batch_size, old_data_filter)
             .await?;
-        train_btree_index(merged_data_source, dest_store, self.batch_size, DistributedMode::Single).await?;
+        train_btree_index(
+            merged_data_source,
+            dest_store,
+            self.batch_size,
+            DistributedMode::Single,
+        )
+        .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
@@ -1775,9 +1783,11 @@ impl ScalarIndex for BTreeIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let num_partitions = self.ranges_to_files.as_ref().map(|r| r.len() as u32);
         let params = serde_json::to_value(BTreeParameters {
             zone_size: Some(self.batch_size),
             range_id: None,
+            num_partitions,
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
@@ -2044,7 +2054,25 @@ pub async fn train_btree_index_partitioned(
     boundaries: &[ScalarValue],
 ) -> Result<Vec<BTreeShardManifest>> {
     if boundaries.is_empty() {
-        return train_btree_index(batches_source, index_store, batch_size, DistributedMode::Single).await.map(|m| vec![m]);
+        return train_btree_index(
+            batches_source,
+            index_store,
+            batch_size,
+            DistributedMode::Single,
+        )
+        .await
+        .map(|m| vec![m]);
+    }
+
+    for window in boundaries.windows(2) {
+        let a = OrderableScalarValue(window[0].clone());
+        let b = OrderableScalarValue(window[1].clone());
+        if a >= b {
+            return Err(Error::invalid_input(format!(
+                "Partition boundaries must be in strictly ascending order, but found {:?} >= {:?}",
+                window[0], window[1]
+            )));
+        }
     }
 
     let schema = batches_source.schema();
@@ -2075,11 +2103,12 @@ pub async fn train_btree_index_partitioned(
             continue;
         }
 
-        let values = batch
-            .column_by_name(VALUE_COLUMN_NAME)
-            .ok_or_else(|| Error::invalid_input_source("Missing value column in training data".into()))?;
+        let values = batch.column_by_name(VALUE_COLUMN_NAME).ok_or_else(|| {
+            Error::invalid_input_source("Missing value column in training data".into())
+        })?;
 
-        let split_point = find_partition_split_point(values, &boundaries[current_partition as usize])?;
+        let split_point =
+            find_partition_split_point(values, &boundaries[current_partition as usize])?;
 
         match split_point {
             None => {
@@ -2100,8 +2129,13 @@ pub async fn train_btree_index_partitioned(
                     partition_buffer.clear();
                 } else {
                     manifests.push(
-                        write_empty_partition(index_store, batch_size, current_partition, &value_type)
-                            .await?,
+                        write_empty_partition(
+                            index_store,
+                            batch_size,
+                            current_partition,
+                            &value_type,
+                        )
+                        .await?,
                     );
                 }
                 current_partition += 1;
@@ -2148,10 +2182,7 @@ pub async fn train_btree_index_partitioned(
     Ok(manifests)
 }
 
-fn find_partition_split_point(
-    array: &dyn Array,
-    boundary: &ScalarValue,
-) -> Result<Option<usize>> {
+fn find_partition_split_point(array: &dyn Array, boundary: &ScalarValue) -> Result<Option<usize>> {
     let orderable_boundary = OrderableScalarValue(boundary.clone());
     for i in 0..array.len() {
         if array.is_null(i) {
@@ -2173,15 +2204,18 @@ async fn flush_partition(
     range_id: u32,
     schema: &Arc<Schema>,
 ) -> Result<BTreeShardManifest> {
-    let batches_iter: Vec<std::result::Result<RecordBatch, DataFusionError>> = batches
-        .iter()
-        .cloned()
-        .map(Ok)
-        .collect();
+    let batches_iter: Vec<std::result::Result<RecordBatch, DataFusionError>> =
+        batches.iter().cloned().map(Ok).collect();
     let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(batches_iter));
     let stream: SendableRecordBatchStream = Box::pin(stream);
 
-    train_btree_index(stream, index_store, batch_size, DistributedMode::Range { range_id }).await
+    train_btree_index(
+        stream,
+        index_store,
+        batch_size,
+        DistributedMode::Range { range_id },
+    )
+    .await
 }
 
 async fn write_empty_partition(
@@ -2195,13 +2229,16 @@ async fn write_empty_partition(
         Field::new(ROW_ID, DataType::UInt64, false),
     ]));
     let empty_batch = RecordBatch::new_empty(empty_schema.clone());
-    let stream = RecordBatchStreamAdapter::new(
-        empty_schema,
-        stream::iter(vec![Ok(empty_batch)]),
-    );
+    let stream = RecordBatchStreamAdapter::new(empty_schema, stream::iter(vec![Ok(empty_batch)]));
     let stream: SendableRecordBatchStream = Box::pin(stream);
 
-    train_btree_index(stream, index_store, batch_size, DistributedMode::Range { range_id }).await
+    train_btree_index(
+        stream,
+        index_store,
+        batch_size,
+        DistributedMode::Range { range_id },
+    )
+    .await
 }
 
 pub struct MergeResult {
@@ -2209,10 +2246,7 @@ pub struct MergeResult {
     pub part_page_files: Vec<String>,
 }
 
-pub async fn cleanup_shard_files(
-    store: &dyn IndexStore,
-    merge_result: &MergeResult,
-) {
+pub async fn cleanup_shard_files(store: &dyn IndexStore, merge_result: &MergeResult) {
     for file in &merge_result.part_lookup_files {
         let _ = store.delete_index_file(file).await;
     }
@@ -2529,7 +2563,10 @@ async fn merge_partition_lookups(
     if range_partitioned {
         metadata.insert(RANGE_PARTITIONED_META_KEY.to_string(), "true".to_string());
     } else {
-        metadata.insert(FRAGMENT_PARTITIONED_META_KEY.to_string(), "true".to_string());
+        metadata.insert(
+            FRAGMENT_PARTITIONED_META_KEY.to_string(),
+            "true".to_string(),
+        );
     }
     metadata.insert(
         PAGE_NUM_PER_RANGE_PARTITION_META_KEY.to_string(),
@@ -2690,6 +2727,16 @@ pub struct BTreeParameters {
     ///
     /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
     pub range_id: Option<u32>,
+
+    /// The number of range partitions for a distributed BTree index build.
+    ///
+    /// When `Some(n)`, the index is built with `n` range partitions, allowing
+    /// parallel construction and efficient per-partition queries. When `None`,
+    /// a single monolithic index is built.
+    ///
+    /// This field is preserved through `derive_index_params` so that index
+    /// initialization and updates can maintain the partition structure.
+    pub num_partitions: Option<u32>,
 }
 
 struct BTreeTrainingRequest {
@@ -2776,7 +2823,8 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         let mode = match (fragment_ids, request.parameters.range_id) {
             (Some(_frag_ids), Some(_)) => {
                 return Err(Error::invalid_input_source(
-                    "Cannot specify both fragment_ids and range_id; they are mutually exclusive".into(),
+                    "Cannot specify both fragment_ids and range_id; they are mutually exclusive"
+                        .into(),
                 ));
             }
             (Some(frag_ids), None) => {
@@ -3467,7 +3515,7 @@ mod tests {
             full_data_source,
             full_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Single
+            DistributedMode::Single,
         )
         .await
         .unwrap();
@@ -3488,7 +3536,7 @@ mod tests {
             fragment1_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 1 }
+            DistributedMode::Fragment { first_frag_id: 1 },
         )
         .await
         .unwrap();
@@ -3511,7 +3559,7 @@ mod tests {
             fragment2_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 2 }
+            DistributedMode::Fragment { first_frag_id: 2 },
         )
         .await
         .unwrap();
@@ -3534,7 +3582,7 @@ mod tests {
             fragment3_data_source,
             fragment_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Fragment { first_frag_id: 3 }
+            DistributedMode::Fragment { first_frag_id: 3 },
         )
         .await
         .unwrap();
@@ -4024,7 +4072,7 @@ mod tests {
             full_data_source,
             full_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Single
+            DistributedMode::Single,
         )
         .await
         .unwrap();
@@ -4047,7 +4095,7 @@ mod tests {
             range1_data_source,
             range_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Range { range_id: 0 }
+            DistributedMode::Range { range_id: 0 },
         )
         .await
         .unwrap();
@@ -4073,7 +4121,7 @@ mod tests {
             range2_data_source,
             range_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Range { range_id: 1 }
+            DistributedMode::Range { range_id: 1 },
         )
         .await
         .unwrap();
@@ -4363,7 +4411,7 @@ mod tests {
             range1_data_source,
             old_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Range { range_id: 1 }
+            DistributedMode::Range { range_id: 1 },
         )
         .await
         .unwrap();
@@ -4389,7 +4437,7 @@ mod tests {
             range2_data_source,
             old_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Range { range_id: 2 }
+            DistributedMode::Range { range_id: 2 },
         )
         .await
         .unwrap();
@@ -4502,7 +4550,7 @@ mod tests {
             old_data_source,
             old_store.as_ref(),
             DEFAULT_BTREE_BATCH_SIZE,
-            DistributedMode::Single
+            DistributedMode::Single,
         )
         .await
         .unwrap();
@@ -4584,9 +4632,14 @@ mod tests {
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(total_rows), BatchCount::from(1));
 
-        train_btree_index(stream, test_store.as_ref(), batch_size, DistributedMode::Single)
-            .await
-            .unwrap();
+        train_btree_index(
+            stream,
+            test_store.as_ref(),
+            batch_size,
+            DistributedMode::Single,
+        )
+        .await
+        .unwrap();
 
         let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
@@ -4715,9 +4768,14 @@ mod tests {
             schema,
             stream::iter(vec![Ok(data)]),
         ));
-        train_btree_index(stream, test_store.as_ref(), num_rows, DistributedMode::Single)
-            .await
-            .unwrap();
+        train_btree_index(
+            stream,
+            test_store.as_ref(),
+            num_rows,
+            DistributedMode::Single,
+        )
+        .await
+        .unwrap();
 
         let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
@@ -4913,10 +4971,7 @@ mod tests {
         )
         .unwrap();
 
-        let stream = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
         let stream: SendableRecordBatchStream = Box::pin(stream);
 
         let boundaries = vec![ScalarValue::Int32(Some(1000))];
@@ -4984,9 +5039,7 @@ mod tests {
             Field::new("_rowid", DataType::UInt64, false),
         ]));
 
-        let values: Vec<i32> = std::iter::once(0)
-            .chain(1000..1100i32)
-            .collect();
+        let values: Vec<i32> = std::iter::once(0).chain(1000..1100i32).collect();
         let row_ids: Vec<u64> = (0..101u64).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -4997,10 +5050,7 @@ mod tests {
         )
         .unwrap();
 
-        let stream = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
         let stream: SendableRecordBatchStream = Box::pin(stream);
 
         let boundaries = vec![ScalarValue::Int32(Some(1))];
@@ -5099,16 +5149,10 @@ mod tests {
         )
         .unwrap();
 
-        let stream = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
         let stream: SendableRecordBatchStream = Box::pin(stream);
 
-        let boundaries = vec![
-            ScalarValue::Int32(Some(100)),
-            ScalarValue::Int32(Some(200)),
-        ];
+        let boundaries = vec![ScalarValue::Int32(Some(100)), ScalarValue::Int32(Some(200))];
 
         let manifests = super::train_btree_index_partitioned(
             stream,
@@ -5189,13 +5233,7 @@ mod tests {
         ]));
 
         let values: Vec<Option<i32>> = (0..20)
-            .map(|i| {
-                if i % 5 == 0 {
-                    None
-                } else {
-                    Some(i)
-                }
-            })
+            .map(|i| if i % 5 == 0 { None } else { Some(i) })
             .collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -5206,10 +5244,7 @@ mod tests {
         )
         .unwrap();
 
-        let stream = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
         let stream: SendableRecordBatchStream = Box::pin(stream);
 
         let boundaries = vec![ScalarValue::Int32(Some(10))];
@@ -5273,22 +5308,10 @@ mod tests {
                     .unwrap()
                     .map(u64::from)
                     .collect();
-                assert!(
-                    null_ids.contains(&0),
-                    "Null rows should contain row 0"
-                );
-                assert!(
-                    null_ids.contains(&5),
-                    "Null rows should contain row 5"
-                );
-                assert!(
-                    null_ids.contains(&10),
-                    "Null rows should contain row 10"
-                );
-                assert!(
-                    null_ids.contains(&15),
-                    "Null rows should contain row 15"
-                );
+                assert!(null_ids.contains(&0), "Null rows should contain row 0");
+                assert!(null_ids.contains(&5), "Null rows should contain row 5");
+                assert!(null_ids.contains(&10), "Null rows should contain row 10");
+                assert!(null_ids.contains(&15), "Null rows should contain row 15");
             }
             _ => panic!("Expected Exact result for IsNull query"),
         }
@@ -5321,22 +5344,15 @@ mod tests {
         )
         .unwrap();
 
-        let stream = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::iter(vec![Ok(batch)]),
-        );
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(batch)]));
         let stream: SendableRecordBatchStream = Box::pin(stream);
 
         let boundaries = vec![ScalarValue::Int32(Some(100))];
 
-        let manifests = super::train_btree_index_partitioned(
-            stream,
-            index_store.as_ref(),
-            200,
-            &boundaries,
-        )
-        .await
-        .unwrap();
+        let manifests =
+            super::train_btree_index_partitioned(stream, index_store.as_ref(), 200, &boundaries)
+                .await
+                .unwrap();
 
         assert_eq!(manifests.len(), 2);
         assert!(manifests[0].num_pages > 0);

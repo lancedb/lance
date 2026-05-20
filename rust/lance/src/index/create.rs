@@ -67,9 +67,20 @@ pub struct CreateIndexBuilder<'a> {
     pending_shard_cleanup: Option<PendingShardCleanup>,
 }
 
-struct PendingShardCleanup {
+pub struct PendingShardCleanup {
     index_uuid: String,
     merge_result: lance_index::scalar::btree::MergeResult,
+}
+
+impl PendingShardCleanup {
+    pub async fn cleanup(self, dataset: &Dataset) -> Result<()> {
+        let index_store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
+            dataset,
+            &self.index_uuid,
+        )?;
+        lance_index::scalar::btree::cleanup_shard_files(&index_store, &self.merge_result).await;
+        Ok(())
+    }
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -148,7 +159,10 @@ impl<'a> CreateIndexBuilder<'a> {
     ///
     /// Panics if `num_partitions` is less than 2.
     pub fn range_partitions(mut self, num_partitions: u32) -> Self {
-        assert!(num_partitions >= 2, "range_partitions must be >= 2, got {num_partitions}");
+        assert!(
+            num_partitions >= 2,
+            "range_partitions must be >= 2, got {num_partitions}"
+        );
         self.range_partitions = Some(num_partitions);
         self
     }
@@ -511,7 +525,7 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
-        Ok(IndexMetadata {
+        let new_idx = IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
@@ -530,7 +544,22 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: created_index.files,
-        })
+        };
+        Ok(new_idx)
+    }
+
+    /// Take the pending shard cleanup handle after `execute_uncommitted()`.
+    ///
+    /// When building a range-partitioned BTree index, intermediate shard files
+    /// (per-partition lookup files) are created during the build. These files
+    /// are no longer needed after the index is committed, but must be kept
+    /// until the commit succeeds to allow retry on failure.
+    ///
+    /// Callers who use `execute_uncommitted()` directly are responsible for
+    /// calling this method after a successful commit and running the cleanup.
+    /// The `execute()` method handles this automatically.
+    pub fn take_pending_cleanup(&mut self) -> Option<PendingShardCleanup> {
+        self.pending_shard_cleanup.take()
     }
 
     #[instrument(skip_all)]
@@ -618,12 +647,7 @@ impl<'a> CreateIndexBuilder<'a> {
         // This is deferred until after commit to ensure that if the commit fails,
         // the shard files are still available for a retry.
         if let Some(pending) = self.pending_shard_cleanup.take() {
-            let index_store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
-                self.dataset,
-                &pending.index_uuid,
-            )?;
-            lance_index::scalar::btree::cleanup_shard_files(&index_store, &pending.merge_result)
-                .await;
+            pending.cleanup(self.dataset).await?;
         }
 
         // Fetch the committed index metadata from the dataset.
@@ -832,7 +856,6 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use lance_index::scalar::lance_format::LanceIndexStore;
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatchIterator};
@@ -843,6 +866,7 @@ mod tests {
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
+    use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_index::scalar::{FullTextSearchQuery, inverted::tokenizer::InvertedIndexParams};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -1388,14 +1412,15 @@ mod tests {
         let build_progress = Arc::new(RecordingProgress::default());
 
         for &fragment_id in &fragment_ids {
-            CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
-                .name("distributed_btree".to_string())
-                .fragments(vec![fragment_id])
-                .index_uuid(shared_uuid.clone())
-                .progress(build_progress.clone())
-                .execute_uncommitted()
-                .await
-                .unwrap();
+            let _segment =
+                CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                    .name("distributed_btree".to_string())
+                    .fragments(vec![fragment_id])
+                    .index_uuid(shared_uuid.clone())
+                    .progress(build_progress.clone())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
         }
 
         let merge_progress = Arc::new(RecordingProgress::default());
@@ -2173,12 +2198,13 @@ mod tests {
             HnswBuildParams::default(),
         );
 
-        CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
-            .name("vector_idx".to_string())
-            .index_uuid(uuid.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap();
+        let _segment =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .index_uuid(uuid.to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
 
         dataset
             .commit_existing_index_segments(

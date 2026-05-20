@@ -448,14 +448,13 @@ mod tests {
         let mut segments = Vec::new();
 
         for fragment in &fragments {
-            segments.push(
-                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
-                    .name("value_btree_search".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-            );
+            let seg = CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                .name("value_btree_search".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(seg);
         }
 
         dataset
@@ -574,14 +573,14 @@ mod tests {
 
         let mut first_segments = Vec::new();
         for fragment in &fragments {
-            first_segments.push(
+            let seg =
                 CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
                     .name("value_zonemap_replace".to_string())
                     .fragments(vec![fragment.id() as u32])
                     .execute_uncommitted()
                     .await
-                    .unwrap(),
-            );
+                    .unwrap();
+            first_segments.push(seg);
         }
 
         dataset
@@ -591,15 +590,15 @@ mod tests {
 
         let mut replacement_segments = Vec::new();
         for fragment in &fragments {
-            replacement_segments.push(
+            let seg =
                 CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
                     .name("value_zonemap_replace".to_string())
                     .replace(true)
                     .fragments(vec![fragment.id() as u32])
                     .execute_uncommitted()
                     .await
-                    .unwrap(),
-            );
+                    .unwrap();
+            replacement_segments.push(seg);
         }
         let replacement_uuids = replacement_segments
             .iter()

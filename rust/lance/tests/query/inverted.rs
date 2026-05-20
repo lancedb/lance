@@ -209,7 +209,8 @@ async fn test_segmented_inverted_match_query() {
             .create_index_builder(&["text"], IndexType::Inverted, &params)
             .name("segmented_fts".to_string())
             .fragments(vec![fragment_id]);
-        metadatas.push(builder.execute_uncommitted().await.unwrap());
+        let meta = builder.execute_uncommitted().await.unwrap();
+        metadatas.push(meta);
     }
     let segments = ds
         .create_index_segment_builder()
@@ -286,7 +287,8 @@ async fn test_segmented_inverted_fuzzy_match_uses_global_idf() {
             .create_index_builder(&["text"], IndexType::Inverted, &params)
             .name("segmented_fuzzy".to_string())
             .fragments(vec![fragment_id]);
-        metadatas.push(builder.execute_uncommitted().await.unwrap());
+        let meta = builder.execute_uncommitted().await.unwrap();
+        metadatas.push(meta);
     }
     let segments = ds
         .create_index_segment_builder()
@@ -372,7 +374,8 @@ async fn test_segmented_inverted_phrase_query() {
             .create_index_builder(&["text"], IndexType::Inverted, &params)
             .name("segmented_phrase_fts".to_string())
             .fragments(vec![fragment_id]);
-        metadatas.push(builder.execute_uncommitted().await.unwrap());
+        let meta = builder.execute_uncommitted().await.unwrap();
+        metadatas.push(meta);
     }
     let segments = ds
         .create_index_segment_builder()
@@ -442,7 +445,8 @@ async fn test_segmented_inverted_match_query_with_unindexed_fragments() {
             .create_index_builder(&["text"], IndexType::Inverted, &params)
             .name("segmented_mixed_fts".to_string())
             .fragments(vec![fragment_id]);
-        metadatas.push(builder.execute_uncommitted().await.unwrap());
+        let meta = builder.execute_uncommitted().await.unwrap();
+        metadatas.push(meta);
     }
     let segments = ds
         .create_index_segment_builder()

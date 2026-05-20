@@ -769,18 +769,22 @@ pub struct BTreeMergeResult {
 impl BTreeMergeResult {
     fn cleanup(&self) -> PyResult<()> {
         rt().block_on(None, async {
+            use lance::dataset::index::LanceIndexStoreExt;
             let dataset = LanceDataset::open(&self.dataset_uri).await?;
             let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
                 &dataset,
                 &self.index_uuid,
             )?;
-            lance_index::scalar::btree::cleanup_shard_files(&store, &lance_index::scalar::btree::MergeResult {
-                part_lookup_files: self.part_lookup_files.clone(),
-                part_page_files: self.part_page_files.clone(),
-            })
+            lance_index::scalar::btree::cleanup_shard_files(
+                &store,
+                &lance_index::scalar::btree::MergeResult {
+                    part_lookup_files: self.part_lookup_files.clone(),
+                    part_page_files: self.part_page_files.clone(),
+                },
+            )
             .await;
             Ok(())
-        })
+        })?
         .map_err(|err: lance_core::Error| PyIOError::new_err(err.to_string()))
     }
 }
@@ -2497,8 +2501,6 @@ impl Dataset {
 
         // Use execute_uncommitted if fragment_ids is provided, otherwise use execute
         let index_metadata = if has_fragment_ids {
-            // For fragment-level indexing, use execute_uncommitted
-            // Note: We don't update self.ds here as the index is not committed
             Self::run_index_future(builder.execute_uncommitted(), progress_handler.as_mut())?
                 .infer_error()?
         } else {
