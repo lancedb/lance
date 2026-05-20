@@ -306,7 +306,9 @@ async fn test_ddb_open_iops() {
     //    * delete staged file
     let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
-    assert_io_eq!(io_stats, read_iops, 1);
+    // With Optimistic commit strategy (default), the first attempt skips rebase,
+    // so there are no read IOPS for listing transactions.
+    assert_io_eq!(io_stats, read_iops, 0);
 
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {
@@ -334,9 +336,9 @@ async fn test_ddb_open_iops() {
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
-    // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
-    // for the DDB commit handler.
-    assert_io_eq!(io_stats, read_iops, 1);
+    // With Optimistic commit strategy (default), the first attempt skips rebase,
+    // so there are no read IOPS for listing transactions.
+    assert_io_eq!(io_stats, read_iops, 0);
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();

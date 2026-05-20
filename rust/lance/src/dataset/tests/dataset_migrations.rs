@@ -248,6 +248,7 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
     }
 
     let mut dataset = dataset.checkout_version(broken_version).await.unwrap();
+
     dataset.restore().await.unwrap();
 
     // Running compaction right away should work (this is verifying compaction
