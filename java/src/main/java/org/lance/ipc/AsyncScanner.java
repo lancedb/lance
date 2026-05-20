@@ -138,7 +138,8 @@ public class AsyncScanner implements AutoCloseable {
 
             try {
               ArrowArrayStream stream = ArrowArrayStream.wrap(streamPtr);
-              return Data.importArrayStream(allocator, stream);
+              return LanceArrowReaders.importArrayStream(
+                  allocator, stream, "AsyncScanner.scanBatchesAsync");
             } catch (Exception e) {
               throw new RuntimeException(e);
             }

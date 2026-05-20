@@ -130,7 +130,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
       try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
         openStream(s.memoryAddress());
-        return Data.importArrayStream(allocator, s);
+        return LanceArrowReaders.importArrayStream(allocator, s, "LanceScanner.scanBatches");
       } catch (IOException e) {
         // TODO: handle IO exception?
         throw new RuntimeException(e);
