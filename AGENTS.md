@@ -130,6 +130,10 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Indent content under MkDocs admonition directives (`!!! note`, etc.) with 4 spaces.
 - Proofread comments and docs for typos before committing.
 
+## Pull Requests
+
+- PR titles must follow the Conventional Commits specification because `.github/workflows/pr-title.yml` validates the PR title and body with commitlint. Use prefixes like `feat:`, `fix:`, `docs:`, `perf:`, `ci:`, `test:`, `build:`, `style:`, or `chore:`; add a scope when useful.
+
 ## Review Guidelines
 
 Contributor and maintainer attention is the most valuable resource. Less is more.
