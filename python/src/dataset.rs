@@ -3228,9 +3228,9 @@ impl Dataset {
 
     /// Initialize MemWAL on this dataset.
     ///
-    /// Must be called once before any `mem_wal_writer()` calls. Requires the
-    /// dataset schema to have at least one field with the
-    /// `lance-schema:unenforced-primary-key` metadata.
+    /// Must be called once before any `mem_wal_writer()` calls. Append-only
+    /// tables may omit primary-key metadata; primary keys are only required
+    /// for primary-key lookup and last-write-wins deduplication workflows.
     ///
     /// At most one sharding mode may be selected: bucket sharding
     /// (`bucket_column` + `num_buckets`), identity sharding (`identity_column`),

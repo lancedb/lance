@@ -53,15 +53,20 @@ use uuid::Uuid;
 /// Version 1 is the initial dataset version in the Lance format.
 const UNKNOWN_CREATED_AT_VERSION: u64 = 1;
 
-/// Look up the `created_at` version for a single row ID.
+/// Look up the `created_at` version for a single UPDATE-branch row ID.
+///
+/// Callers must only call this for row IDs that are confirmed to be present in
+/// `row_id_to_source` (i.e. UPDATE branch rows whose source exists in an existing
+/// fragment).  INSERT branch rows (no source) must use `new_version` directly and
+/// must not call this function.
 ///
 /// Uses `row_id_to_source` to find the originating fragment and row offset, then
 /// performs a O(K) random-access lookup via [`RowDatasetVersionSequence::version_at`]
 /// on the pre-decoded sequence in `version_cache` (keyed by fragment ID).
 ///
-/// Returns [`UNKNOWN_CREATED_AT_VERSION`] for any failure: unmapped row ID, missing
-/// cache entry (fragment had no `created_at_version_meta` or it failed to decode),
-/// or an out-of-range offset.
+/// Returns [`UNKNOWN_CREATED_AT_VERSION`] if the source fragment has no
+/// `created_at_version_meta` (missing or failed to decode) or the offset is
+/// out of range.
 fn resolve_created_at_version(
     row_id: u64,
     row_id_to_source: &HashMap<u64, (&Fragment, usize)>,
@@ -173,7 +178,19 @@ fn resolve_update_version_metadata(
             let physical_rows = fragment.physical_rows.unwrap_or(0);
             let created_at_versions: Vec<u64> = row_ids
                 .iter()
-                .map(|rid| resolve_created_at_version(rid, &row_id_to_source, &version_cache))
+                .map(|rid| {
+                    if row_id_to_source.contains_key(&rid) {
+                        // UPDATE branch: stable row ID resolves to a source row in an
+                        // existing fragment.  Copy created_at from the original row so
+                        // the row's first-appearance version is preserved across rewrites.
+                        resolve_created_at_version(rid, &row_id_to_source, &version_cache)
+                    } else {
+                        // INSERT branch: stable row ID has no source in existing fragments
+                        // (e.g. NOT MATCHED arm of MERGE INTO).  The row first appears in
+                        // this commit, so created_at equals the new commit version.
+                        new_version
+                    }
+                })
                 .collect();
             debug_assert_eq!(created_at_versions.len(), physical_rows);
 
@@ -5569,7 +5586,15 @@ mod tests {
     }
 
     #[test]
-    fn test_update_version_tracking_unknown_row_id_defaults_to_1() {
+    fn test_update_version_tracking_insert_branch_gets_new_version() {
+        // Simulates the INSERT branch (NOT MATCHED) of a MERGE INTO commit:
+        // the new fragment contains a mix of rewritten rows (UPDATE branch, row ID
+        // present in existing fragments) and freshly inserted rows (INSERT branch,
+        // row ID not present in any existing fragment).
+        //
+        // UPDATE branch row (10): created_at must be copied from the source fragment.
+        // INSERT branch row (999): created_at must equal new_version (the merge commit
+        // version), because the row first appeared in this commit.
         let existing_seq = RowIdSequence::from([10u64, 11].as_slice());
         let existing_created = RowDatasetVersionSequence {
             runs: vec![RowDatasetVersionRun {
@@ -5589,7 +5614,7 @@ mod tests {
             last_updated_at_version_meta: None,
         };
 
-        // New fragment has row 10 (known) and row 999 (unknown — freshly inserted)
+        // New fragment has row 10 (UPDATE branch) and row 999 (INSERT branch)
         let new_seq = RowIdSequence::from([10u64, 999].as_slice());
         let new_fragment = Fragment {
             id: 10,
@@ -5601,6 +5626,7 @@ mod tests {
             last_updated_at_version_meta: None,
         };
 
+        // update_txn uses read_version 4 → new_version is 5
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
             .build_manifest(
@@ -5611,9 +5637,68 @@ mod tests {
             )
             .unwrap();
 
-        // Row 10: offset 0 in frag 1 → version 5. Row 999: unknown → default 1
-        assert_eq!(created_at_versions(&result, 10), vec![5, 1]);
+        // Row 10 (UPDATE branch): created_at copied from source (version 5).
+        // Row 999 (INSERT branch): created_at == new_version (5).
+        assert_eq!(created_at_versions(&result, 10), vec![5, 5]);
         assert_eq!(last_updated_at_versions(&result, 10), vec![5, 5]);
+    }
+
+    #[test]
+    fn test_update_version_tracking_merge_into_distinguishes_insert_and_update_branch() {
+        // Verifies the MERGE INTO correctness contract when UPDATE branch rows and INSERT
+        // branch rows have *different* source created_at values, so we can distinguish
+        // which row got which value.
+        //
+        // Existing fragment (id=1): row IDs [10, 11], created_at = version 3.
+        // New fragment (id=20): row IDs [10, 500, 11, 501].
+        //   - Rows 10 and 11: UPDATE branch (present in existing fragment) → created_at = 3.
+        //   - Rows 500 and 501: INSERT branch (no source) → created_at = new_version = 5.
+        let existing_seq = RowIdSequence::from([10u64, 11].as_slice());
+        let existing_created = RowDatasetVersionSequence {
+            runs: vec![RowDatasetVersionRun {
+                span: U64Segment::Range(0..2),
+                version: 3,
+            }],
+        };
+        let existing_fragment = Fragment {
+            id: 1,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
+            physical_rows: Some(2),
+            created_at_version_meta: Some(
+                RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
+            ),
+            last_updated_at_version_meta: None,
+        };
+
+        let new_seq = RowIdSequence::from([10u64, 500, 11, 501].as_slice());
+        let new_fragment = Fragment {
+            id: 20,
+            files: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
+            physical_rows: Some(4),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        };
+
+        // update_txn uses read_version 4 → new_version is 5
+        let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
+        let (result, _) = update_txn(vec![new_fragment])
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // UPDATE branch rows (10, 11): created_at preserved from source (version 3).
+        // INSERT branch rows (500, 501): created_at == new_version (5).
+        assert_eq!(created_at_versions(&result, 20), vec![3, 5, 3, 5]);
+        // All rows in the new fragment get last_updated == new_version.
+        assert_eq!(last_updated_at_versions(&result, 20), vec![5, 5, 5, 5]);
     }
 
     #[test]
@@ -5691,8 +5776,9 @@ mod tests {
             .unwrap();
 
         // Fragment starts with no row_id_meta → assign_row_ids gives it fresh IDs →
-        // those IDs aren't found in existing fragments → created_at defaults to 1
-        assert_eq!(created_at_versions(&result, 10), vec![1, 1, 1]);
+        // those IDs have no source in existing fragments (INSERT branch) →
+        // created_at == new_version (5) for each row.
+        assert_eq!(created_at_versions(&result, 10), vec![5, 5, 5]);
         assert_eq!(last_updated_at_versions(&result, 10), vec![5, 5, 5]);
     }
 

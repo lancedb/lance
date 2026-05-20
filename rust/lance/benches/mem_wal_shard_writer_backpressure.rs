@@ -11,9 +11,8 @@
 //! Example:
 //!
 //! ```bash
-//! AWS_DEFAULT_REGION=us-east-1 \
 //! cargo bench -p lance --bench mem_wal_shard_writer_backpressure -- \
-//!   --uri s3://jack-devland-build/memwal-rust-native \
+//!   --uri /tmp/memwal-rust-native \
 //!   --mode async_idx \
 //!   --seed-rows 100000 \
 //!   --batch-rows 1000 \
@@ -47,6 +46,7 @@ use lance::index::vector::VectorIndexParams;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::Result;
 use lance_index::IndexType;
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::DistanceType;
@@ -55,6 +55,8 @@ use uuid::Uuid;
 
 const VECTOR_COL: &str = "vec";
 const VECTOR_INDEX_NAME: &str = "vec_idx";
+const TEXT_COL: &str = "text";
+const FTS_INDEX_NAME: &str = "text_fts";
 const TEXT_BYTES: usize = 1_500;
 const ROW_BYTES_FINEWEB_SHAPE: usize = 5_760;
 const FINEWEB_FIXED_BYTES: usize = ROW_BYTES_FINEWEB_SHAPE - TEXT_BYTES - 1024 * size_of::<f32>();
@@ -103,6 +105,40 @@ impl Mode {
     }
 }
 
+/// Which index the MemTable maintains in the indexed (`*_idx`) modes.
+/// The backpressure methodology — paced ingest, WAL-queue sampling,
+/// skip-close — is identical for both; only the indexed column and the
+/// index built differ, so vector and FTS results are directly comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexKind {
+    Vector,
+    Fts,
+}
+
+impl IndexKind {
+    fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "vector" => Ok(Self::Vector),
+            "fts" => Ok(Self::Fts),
+            _ => Err(format!("unknown index-type '{value}', expected vector|fts")),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Fts => "fts",
+        }
+    }
+
+    fn index_name(self) -> &'static str {
+        match self {
+            Self::Vector => VECTOR_INDEX_NAME,
+            Self::Fts => FTS_INDEX_NAME,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SchemaShape {
     FineWeb,
@@ -142,6 +178,7 @@ impl SchemaShape {
 struct Args {
     uri: Option<String>,
     mode: Mode,
+    index_kind: IndexKind,
     schema_shape: SchemaShape,
     seed_rows: usize,
     batch_rows: usize,
@@ -172,6 +209,7 @@ impl Default for Args {
         Self {
             uri: None,
             mode: Mode::AsyncIndexed,
+            index_kind: IndexKind::Vector,
             schema_shape: SchemaShape::FineWeb,
             seed_rows: 100_000,
             batch_rows: 1_000,
@@ -237,9 +275,10 @@ async fn run(args: Args) -> Result<()> {
     };
 
     println!(
-        "bench=mem_wal_shard_writer_backpressure uri={} mode={} schema_shape={} seed_rows={} batch_rows={} calls={} vector_dim={} text_bytes={} row_bytes={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={} skip_close={}",
+        "bench=mem_wal_shard_writer_backpressure uri={} mode={} index_type={} schema_shape={} seed_rows={} batch_rows={} calls={} vector_dim={} text_bytes={} row_bytes={} target_rows_per_sec={:?} max_memtable_size={} max_memtable_rows={} max_memtable_batches={} max_unflushed_memtable_bytes={} max_wal_buffer_size={} max_wal_flush_interval_ms={} rayon_threads={} tokio_threads={} skip_close={}",
         uri,
         args.mode.as_str(),
+        args.index_kind.as_str(),
         args.schema_shape.as_str(),
         args.seed_rows,
         args.batch_rows,
@@ -260,7 +299,6 @@ async fn run(args: Args) -> Result<()> {
     );
 
     let schema = schema_for_shape(args.schema_shape, args.vector_dim);
-    let text_value = "x".repeat(args.text_bytes);
 
     let setup_start = Instant::now();
     let seed_batch = make_batch(
@@ -270,21 +308,24 @@ async fn run(args: Args) -> Result<()> {
         0,
         args.seed_rows,
         args.vector_dim,
-        &text_value,
+        args.text_bytes,
     )?;
     let batches = RecordBatchIterator::new([Ok(seed_batch)], schema.clone());
     let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default())).await?;
 
     let index_start = Instant::now();
     if args.mode.indexed() {
-        create_base_vector_index(&mut dataset, &args).await?;
+        match args.index_kind {
+            IndexKind::Vector => create_base_vector_index(&mut dataset, &args).await?,
+            IndexKind::Fts => create_base_fts_index(&mut dataset).await?,
+        }
     }
     let index_setup_s = index_start.elapsed().as_secs_f64();
 
     dataset
         .initialize_mem_wal()
         .maintained_indexes(if args.mode.indexed() {
-            vec![VECTOR_INDEX_NAME.to_string()]
+            vec![args.index_kind.index_name().to_string()]
         } else {
             vec![]
         })
@@ -333,7 +374,7 @@ async fn run(args: Args) -> Result<()> {
             args.seed_rows + call * args.batch_rows,
             args.batch_rows,
             args.vector_dim,
-            &text_value,
+            args.text_bytes,
         )?;
         batch_build_s += batch_start.elapsed().as_secs_f64();
 
@@ -475,6 +516,7 @@ async fn run(args: Args) -> Result<()> {
     let output = json!({
         "uri": uri,
         "mode": args.mode.as_str(),
+        "index_type": args.index_kind.as_str(),
         "schema_shape": args.schema_shape.as_str(),
         "seed_rows": args.seed_rows,
         "batch_rows": args.batch_rows,
@@ -556,6 +598,19 @@ async fn create_base_vector_index(dataset: &mut Dataset, args: &Args) -> Result<
             IndexType::IvfPq,
             Some(VECTOR_INDEX_NAME.to_string()),
             &vector_params,
+            true,
+        )
+        .await
+        .map(|_| ())
+}
+
+async fn create_base_fts_index(dataset: &mut Dataset) -> Result<()> {
+    dataset
+        .create_index(
+            &[TEXT_COL],
+            IndexType::Inverted,
+            Some(FTS_INDEX_NAME.to_string()),
+            &InvertedIndexParams::default(),
             true,
         )
         .await
@@ -660,6 +715,104 @@ fn vector_only_schema(vector_dim: usize) -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(vec![id_field(), vector_field(vector_dim)]))
 }
 
+/// Deterministic pseudo-random text of roughly `target_bytes` bytes for
+/// row `row`. Drawn word-by-word from a small fixed vocabulary so the
+/// `text` column carries a realistic token distribution — essential for
+/// the FTS index to do representative work, and harmless for the vector
+/// runs where `text` is inert payload of the same size.
+fn gen_text(row: usize, target_bytes: usize) -> String {
+    const VOCAB: &[&str] = &[
+        "data",
+        "vector",
+        "search",
+        "index",
+        "query",
+        "memory",
+        "table",
+        "write",
+        "read",
+        "shard",
+        "stream",
+        "batch",
+        "flush",
+        "token",
+        "score",
+        "model",
+        "system",
+        "record",
+        "format",
+        "column",
+        "engine",
+        "result",
+        "filter",
+        "metric",
+        "latency",
+        "throughput",
+        "cache",
+        "buffer",
+        "segment",
+        "lance",
+        "arrow",
+        "schema",
+        "field",
+        "value",
+        "object",
+        "store",
+        "cloud",
+        "remote",
+        "local",
+        "build",
+        "merge",
+        "scan",
+        "rank",
+        "match",
+        "phrase",
+        "fuzzy",
+        "boolean",
+        "recall",
+        "corpus",
+        "document",
+        "passage",
+        "sentence",
+        "language",
+        "machine",
+        "learning",
+        "training",
+        "dataset",
+        "feature",
+        "embedding",
+        "cluster",
+        "graph",
+        "node",
+        "edge",
+        "path",
+        "weight",
+        "layer",
+        "tensor",
+        "kernel",
+    ];
+    // SplitMix64-ish deterministic generator seeded by the row index.
+    let mut state = (row as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(1);
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut out = String::with_capacity(target_bytes + 16);
+    while out.len() < target_bytes {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(VOCAB[(next() as usize) % VOCAB.len()]);
+    }
+    out.truncate(target_bytes);
+    out
+}
+
 fn make_batch(
     shape: SchemaShape,
     schema: &ArrowSchema,
@@ -667,7 +820,7 @@ fn make_batch(
     start_row: usize,
     num_rows: usize,
     vector_dim: usize,
-    text_value: &str,
+    text_bytes: usize,
 ) -> Result<RecordBatch> {
     let ids = StringArray::from_iter_values(
         (0..num_rows).map(|i| format!("{id_prefix}-{:012}", start_row + i)),
@@ -697,7 +850,8 @@ fn make_batch(
         .map_err(Into::into);
     }
 
-    let text = StringArray::from_iter_values((0..num_rows).map(|_| text_value));
+    let text =
+        StringArray::from_iter_values((0..num_rows).map(|i| gen_text(start_row + i, text_bytes)));
     let dump = StringArray::from_iter_values((0..num_rows).map(|i| match (start_row + i) % 5 {
         0 => "CC-MAIN-2023-50",
         1 => "CC-MAIN-2024-10",
@@ -787,6 +941,10 @@ fn parse_args() -> Result<Args> {
             "--mode" => {
                 args.mode = Mode::parse(&value).map_err(lance_core::Error::invalid_input)?;
             }
+            "--index-type" => {
+                args.index_kind =
+                    IndexKind::parse(&value).map_err(lance_core::Error::invalid_input)?;
+            }
             "--schema-shape" => {
                 args.schema_shape =
                     SchemaShape::parse(&value).map_err(lance_core::Error::invalid_input)?;
@@ -861,11 +1019,22 @@ fn parse_args() -> Result<Args> {
             max_memtable_rows, args.batch_rows
         )));
     }
-    if args.mode.indexed() && args.vector_dim % args.num_sub_vectors != 0 {
+    if args.mode.indexed()
+        && args.index_kind == IndexKind::Vector
+        && args.vector_dim % args.num_sub_vectors != 0
+    {
         return Err(lance_core::Error::invalid_input(format!(
             "vector_dim must be divisible by num_sub_vectors for IVF_PQ: vector_dim={}, num_sub_vectors={}",
             args.vector_dim, args.num_sub_vectors
         )));
+    }
+    if args.mode.indexed()
+        && args.index_kind == IndexKind::Fts
+        && args.schema_shape != SchemaShape::FineWeb
+    {
+        return Err(lance_core::Error::invalid_input(
+            "index-type=fts requires schema-shape=fineweb (it has the text column)",
+        ));
     }
 
     Ok(args)

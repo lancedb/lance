@@ -21,6 +21,12 @@ _LOOKUP_SCHEMA = pa.schema(
         pa.field("name", pa.utf8()),
     ]
 )
+_APPEND_ONLY_SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("name", pa.utf8()),
+    ]
+)
 
 
 def _lookup_table(ids, prefix: str) -> pa.Table:
@@ -31,6 +37,17 @@ def _lookup_table(ids, prefix: str) -> pa.Table:
             "name": pa.array([f"{prefix}_{i}" for i in ids], pa.utf8()),
         },
         schema=_LOOKUP_SCHEMA,
+    )
+
+
+def _append_only_table(ids, prefix: str) -> pa.Table:
+    """Build a table without primary-key metadata."""
+    return pa.table(
+        {
+            "id": pa.array(ids, pa.int64()),
+            "name": pa.array([f"{prefix}_{i}" for i in ids], pa.utf8()),
+        },
+        schema=_APPEND_ONLY_SCHEMA,
     )
 
 
@@ -358,6 +375,22 @@ def test_initialize_mem_wal_unsharded(tmp_path):
 
 def test_initialize_mem_wal_bucket_sharding(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
+    ds.initialize_mem_wal(bucket_column="id", num_buckets=8)
+
+    details = ds.mem_wal_index_details()
+    assert details["num_shards"] == 8
+    field = details["sharding_specs"][0]["fields"][0]
+    assert field["transform"] == "bucket"
+    assert field["parameters"]["num_buckets"] == "8"
+
+
+def test_initialize_mem_wal_bucket_sharding_without_primary_key(tmp_path):
+    ds_path = str(tmp_path / "append_only")
+    ds = lance.write_dataset(
+        _append_only_table([1, 2, 3], "base"),
+        ds_path,
+        schema=_APPEND_ONLY_SCHEMA,
+    )
     ds.initialize_mem_wal(bucket_column="id", num_buckets=8)
 
     details = ds.mem_wal_index_details()

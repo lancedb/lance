@@ -34,7 +34,7 @@
 
 mod api;
 mod hnsw;
-mod index;
+pub mod index;
 mod manifest;
 pub mod memtable;
 pub mod scanner;

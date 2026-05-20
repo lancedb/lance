@@ -27,6 +27,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
@@ -79,8 +80,21 @@ impl UpdateBuilder {
         }
     }
 
+    fn filterable_schema(dataset_schema: &lance_core::datatypes::Schema) -> ArrowSchema {
+        let extra_columns = ArrowSchema::new(vec![
+            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
+            ROW_OFFSET_FIELD.clone(),
+        ]);
+        let merged = dataset_schema
+            .merge(&extra_columns)
+            .expect("Failed to merge system columns into filterable schema");
+        (&merged).into()
+    }
+
     pub fn update_where(mut self, filter: &str) -> Result<Self> {
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        let filter_schema = Self::filterable_schema(self.dataset.schema());
+        let planner = Planner::new(Arc::new(filter_schema));
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
@@ -1427,6 +1441,143 @@ mod tests {
                 "vec index bitmap should not contain fragments with unindexed data, found fragment {}",
                 fragment_id
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_by_rowid() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Stable, true).await;
+
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let orig_row_ids = orig_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let orig_ids = orig_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let target_idx = 5;
+        let target_row_id = orig_row_ids.value(target_idx);
+        let target_id = orig_ids.value(target_idx);
+
+        let update_result = UpdateBuilder::new(dataset)
+            .update_where(&format!("_rowid = {}", target_row_id))
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(update_result.rows_updated, 1);
+
+        let updated_batch = update_result
+            .new_dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let updated_ids = updated_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let updated_names = updated_batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        for i in 0..updated_ids.len() {
+            if updated_ids.value(i) == target_id {
+                assert_eq!(updated_names.value(i), "updated");
+            } else {
+                assert_eq!(updated_names.value(i), "foo");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_by_rowid_in_list() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Stable, true).await;
+
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let orig_row_ids = orig_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let orig_ids = orig_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let target_indices = [3, 7, 15];
+        let target_row_ids: Vec<u64> = target_indices
+            .iter()
+            .map(|&i| orig_row_ids.value(i))
+            .collect();
+        let target_ids: std::collections::HashSet<i64> =
+            target_indices.iter().map(|&i| orig_ids.value(i)).collect();
+        let in_list: String = target_row_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let update_result = UpdateBuilder::new(dataset)
+            .update_where(&format!("_rowid IN ({})", in_list))
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(update_result.rows_updated, 3);
+
+        let updated_batch = update_result
+            .new_dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let updated_ids = updated_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let updated_names = updated_batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        for i in 0..updated_ids.len() {
+            if target_ids.contains(&updated_ids.value(i)) {
+                assert_eq!(updated_names.value(i), "updated");
+            } else {
+                assert_eq!(updated_names.value(i), "foo");
+            }
         }
     }
 }

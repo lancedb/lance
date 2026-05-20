@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -9,10 +10,13 @@ use crate::traits::{import_vec_from_method, import_vec_to_rust};
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
-use jni::objects::{JObject, JString};
+use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
-use lance::dataset::scanner::{AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance::dataset::scanner::{
+    AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
+    ExecutionSummaryCounts, Scanner,
+};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{
     BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
@@ -33,16 +37,34 @@ pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
 #[derive(Clone)]
 pub struct BlockingScanner {
     pub(crate) inner: Arc<Scanner>,
+    stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
 }
 
 impl BlockingScanner {
-    pub fn create(scanner: Scanner) -> Self {
+    pub fn create(mut scanner: Scanner, collect_stats: bool) -> Self {
+        let stats = Arc::new(Mutex::new(None));
+        if collect_stats {
+            let stats_for_callback = stats.clone();
+            let callback: ExecutionStatsCallback = Arc::new(move |counts| {
+                let mut guard = stats_for_callback.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(counts.clone());
+            });
+            scanner.scan_stats_callback(callback);
+        }
+
         Self {
             inner: Arc::new(scanner),
+            stats,
         }
     }
 
+    fn reset_stats(&self) {
+        let mut guard = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+
     pub fn open_stream(&self) -> Result<DatasetRecordBatchStream> {
+        self.reset_stats();
         let res = RT.block_on(self.inner.try_into_stream())?;
         Ok(res)
     }
@@ -55,6 +77,10 @@ impl BlockingScanner {
     pub fn count_rows(&self) -> Result<u64> {
         let res = RT.block_on(self.inner.count_rows())?;
         Ok(res)
+    }
+
+    pub fn get_stats(&self) -> Option<ExecutionSummaryCounts> {
+        self.stats.lock().unwrap().clone()
     }
 }
 
@@ -388,6 +414,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,        // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
+    collect_stats: jboolean,           // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -409,7 +436,8 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             batch_readahead,
             column_orderings,
             use_scalar_index,
-            substrait_aggregate_obj
+            substrait_aggregate_obj,
+            collect_stats,
         )
     )
 }
@@ -434,6 +462,7 @@ fn inner_create_scanner<'local>(
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     substrait_aggregate_obj: JObject<'local>,
+    collect_stats: jboolean,
 ) -> Result<JObject<'local>> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
@@ -461,7 +490,7 @@ fn inner_create_scanner<'local>(
 
     let scanner = build_scanner_with_options(env, &dataset, options)?;
 
-    let scanner = BlockingScanner::create(scanner);
+    let scanner = BlockingScanner::create(scanner, collect_stats == JNI_TRUE);
     scanner.into_java(env)
 }
 
@@ -565,4 +594,69 @@ fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
     let scanner_guard =
         unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
     scanner_guard.count_rows()
+}
+
+const SCAN_STATS_CLASS: &str = "org/lance/ipc/ScanStats";
+const SCAN_STATS_CONSTRUCTOR_SIG: &str = "(JJJJJJLjava/util/Map;Ljava/util/Map;)V";
+
+fn export_usize_map<'a>(env: &mut JNIEnv<'a>, map: &HashMap<String, usize>) -> Result<JObject<'a>> {
+    let hash_map = env.new_object("java/util/HashMap", "()V", &[])?;
+    for (key, value) in map {
+        let java_key: JObject = env.new_string(key)?.into();
+        let java_value =
+            env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(*value as i64)])?;
+        env.call_method(
+            &hash_map,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValueGen::Object(&java_key), JValueGen::Object(&java_value)],
+        )?;
+    }
+    Ok(hash_map)
+}
+
+impl IntoJava for &ExecutionSummaryCounts {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let all_counts = export_usize_map(env, &self.all_counts)?;
+        let all_times = export_usize_map(env, &self.all_times)?;
+        let obj = env.new_object(
+            SCAN_STATS_CLASS,
+            SCAN_STATS_CONSTRUCTOR_SIG,
+            &[
+                JValueGen::Long(self.iops as i64),
+                JValueGen::Long(self.requests as i64),
+                JValueGen::Long(self.bytes_read as i64),
+                JValueGen::Long(self.indices_loaded as i64),
+                JValueGen::Long(self.parts_loaded as i64),
+                JValueGen::Long(self.index_comparisons as i64),
+                JValueGen::Object(&all_counts),
+                JValueGen::Object(&all_times),
+            ],
+        )?;
+        Ok(obj)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_ipc_LanceScanner_nativeGetStats<'local>(
+    mut env: JNIEnv<'local>,
+    j_scanner: JObject<'local>,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_stats(&mut env, j_scanner))
+}
+
+fn inner_get_stats<'local>(
+    env: &mut JNIEnv<'local>,
+    j_scanner: JObject<'local>,
+) -> Result<JObject<'local>> {
+    let stats = {
+        let scanner_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
+        scanner_guard.get_stats()
+    };
+
+    match stats {
+        Some(stats) => (&stats).into_java(env),
+        None => Ok(JObject::null()),
+    }
 }

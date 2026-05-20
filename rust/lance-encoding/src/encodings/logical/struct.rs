@@ -595,7 +595,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Int32Array, ListArray, StructArray,
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StructArray,
         builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -838,6 +838,54 @@ mod tests {
                 .with_indices(vec![0])
                 .with_indices(vec![1])
                 .with_min_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_of_struct_with_constant_child_and_empty_lists() {
+        let item_fields = Fields::from(vec![
+            Field::new("maneuver", DataType::Int64, true),
+            Field::new("remaining_dist", DataType::Float64, true),
+        ]);
+        let item_array = StructArray::new(
+            item_fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(3), Some(3), Some(3)])),
+                Arc::new(Float64Array::from(vec![Some(1.0), Some(2.0), Some(3.0)])),
+            ],
+            None,
+        );
+
+        let list_field = Field::new("item", DataType::Struct(item_fields), true);
+        let list_array = ListArray::new(
+            Arc::new(list_field),
+            OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 1, 2, 3, 3, 3, 3])),
+            Arc::new(item_array),
+            None,
+        );
+
+        let data_fields = Fields::from(vec![Field::new(
+            "maneuvers",
+            list_array.data_type().clone(),
+            true,
+        )]);
+        let data_array = StructArray::new(data_fields.clone(), vec![Arc::new(list_array)], None);
+        let row_validity = NullBuffer::from(vec![true, true, true, true, true, false]);
+        let row_array = StructArray::new(
+            Fields::from(vec![Field::new(
+                "data",
+                DataType::Struct(data_fields),
+                true,
+            )]),
+            vec![Arc::new(data_array)],
+            Some(row_validity),
+        );
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(row_array)],
+            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
             HashMap::new(),
         )
         .await;

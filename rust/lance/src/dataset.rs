@@ -2760,16 +2760,15 @@ pub(crate) struct NewTransactionResult<'a> {
 }
 
 pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'_> {
-    // Re-use the same list call for getting the latest manifest and the metadata
-    // for all manifests in between.
+    // Resolve every manifest with version > our current version (the latest plus
+    // the ones in between). On non-lexically-ordered stores this uses the version
+    // hint to avoid an O(n) listing.
     let io_parallelism = dataset.object_store.as_ref().io_parallelism();
-    let latest_version = dataset.manifest.version;
-    let locations = dataset
-        .commit_handler
-        .list_manifest_locations(&dataset.base, dataset.object_store.as_ref(), true)
-        .try_take_while(move |location| {
-            futures::future::ready(Ok(location.version > latest_version))
-        });
+    let locations = dataset.commit_handler.list_manifest_locations_since(
+        &dataset.base,
+        dataset.object_store.as_ref(),
+        dataset.manifest.version,
+    );
 
     // Will send the latest manifest via a channel.
     let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();

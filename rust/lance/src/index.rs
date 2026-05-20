@@ -204,6 +204,33 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
     Ok(())
 }
 
+/// Detect vector segments while preserving the legacy pre-details fallback.
+///
+/// Older vector segments may not have `VectorIndexDetails` in the manifest, so
+/// we also recognize them by the legacy monolithic index file name.
+fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
+    segment.index_details.as_ref().map_or_else(
+        || {
+            segment
+                .files
+                .as_ref()
+                .is_some_and(|files| files.iter().any(|file| file.path == INDEX_FILE_NAME))
+        },
+        |details| details.type_url.ends_with("VectorIndexDetails"),
+    )
+}
+
+/// Detect FTS / inverted segments from manifest details.
+///
+/// Unlike vector, inverted segment support was added after index details were
+/// part of the segment contract, so there is no legacy file-name fallback here.
+fn segment_has_inverted_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub struct ScalarIndexCacheKey<'a> {
@@ -1035,28 +1062,25 @@ impl DatasetIndexExt for Dataset {
                 "merge_existing_index_segments requires segments with identical fields".to_string(),
             ));
         }
-        if !source_segments.iter().all(|segment| {
-            segment.index_details.as_ref().map_or_else(
-                || {
-                    segment
-                        .files
-                        .as_ref()
-                        .is_some_and(|files| files.iter().any(|file| file.path == INDEX_FILE_NAME))
-                },
-                |details| details.type_url.ends_with("VectorIndexDetails"),
-            )
-        }) {
+        let all_vector = source_segments.iter().all(segment_has_vector_details);
+        let all_inverted = source_segments.iter().all(segment_has_inverted_details);
+        if !all_vector && !all_inverted {
             return Err(Error::invalid_input(
-                "merge_existing_index_segments currently only supports vector segments".to_string(),
+                "merge_existing_index_segments requires all segments to have the same supported index type"
+                    .to_string(),
             ));
         }
 
-        let mut merged_segment = crate::index::vector::ivf::merge_segments(
-            self.object_store.as_ref(),
-            &self.indices_dir(),
-            source_segments,
-        )
-        .await?;
+        let mut merged_segment = if all_vector {
+            crate::index::vector::ivf::merge_segments(
+                self.object_store.as_ref(),
+                &self.indices_dir(),
+                source_segments,
+            )
+            .await?
+        } else {
+            crate::index::scalar::inverted::merge_segments(self, source_segments).await?
+        };
         merged_segment.dataset_version = self.manifest.version;
         merged_segment.fields = vec![field_id];
         Ok(merged_segment)

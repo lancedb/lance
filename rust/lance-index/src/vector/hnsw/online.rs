@@ -36,9 +36,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
-use rand::{Rng, rng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use super::builder::{HNSW, HnswBuildParams, HnswQueryParams};
+use super::builder::{HNSW, HNSW_LEVEL_RNG_SEED, HnswBuildParams, HnswQueryParams};
 use super::select_neighbors_heuristic;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
@@ -166,7 +166,7 @@ impl OnlineHnswBuilder {
         let max_level = params.max_level;
         let level_count = (0..max_level).map(|_| AtomicUsize::new(0)).collect();
 
-        let mut level_rng = rng();
+        let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
         let nodes: Vec<_> = (0..capacity)
             .map(|i| {
                 let target_level = if i == 0 {

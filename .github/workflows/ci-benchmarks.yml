@@ -47,8 +47,8 @@ jobs:
         run: |
           python -m venv venv
           source venv/bin/activate
-          pip install maturin duckdb requests pytest pytest-benchmark datasets
-          maturin develop --locked --release --features datagen
+          pip install maturin==1.13.3 uv duckdb requests pytest pytest-benchmark datasets
+          maturin develop --uv --locked --release --features datagen
       - name: Build memtest
         run: |
           source venv/bin/activate

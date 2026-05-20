@@ -203,13 +203,16 @@ impl LogicalPageDecoder for BlobFieldDecoder {
                 .zip(sizes.iter())
                 .map(|(p, s)| *p != 1 || *s != 0)
                 .collect::<BooleanBuffer>();
-            self.validity.push_back(validity);
-            self.rows_loaded = end as u64;
+            // Run the I/O before mutating decoder state, so a failed load
+            // leaves the decoder untouched and `wait_for_loaded` is the single,
+            // clean point of failure.
             let bytes = self
                 .io
                 .submit_request(ranges, self.base_priority + start as u64)
                 .await?;
+            self.validity.push_back(validity);
             self.loaded.extend(bytes);
+            self.rows_loaded = end as u64;
             Ok(())
         }
         .boxed()
@@ -228,6 +231,16 @@ impl LogicalPageDecoder for BlobFieldDecoder {
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        if num_rows as usize > self.loaded.len() {
+            // `loaded` is populated by `wait_for_loaded`; guard the
+            // load-before-drain contract so a violation surfaces as an error
+            // rather than an out-of-bounds drain panic.
+            return Err(Error::internal(format!(
+                "BlobFieldDecoder was asked to drain {num_rows} rows but only \
+                 {} are loaded",
+                self.loaded.len(),
+            )));
+        }
         let bytes = self.loaded.drain(0..num_rows as usize).collect::<Vec<_>>();
         let validity = self.drain_validity(num_rows as usize)?;
         self.rows_drained += num_rows;
@@ -389,16 +402,23 @@ impl FieldEncoder for BlobFieldEncoder {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
+        ops::Range,
         sync::{Arc, LazyLock},
     };
 
-    use arrow_array::LargeBinaryArray;
+    use arrow_array::{LargeBinaryArray, PrimitiveArray, types::UInt64Type};
     use arrow_schema::{DataType, Field};
+    use bytes::Bytes;
+    use futures::{FutureExt, future::BoxFuture};
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::{Error, Result};
 
+    use super::BlobFieldDecoder;
     use crate::{
+        EncodingsIo,
         format::pb::column_encoding,
+        previous::decoder::LogicalPageDecoder,
         testing::{TestCases, check_round_trip_encoding_of_data, check_specific_random},
         version::LanceFileVersion,
     };
@@ -458,5 +478,59 @@ mod tests {
             }));
         // Don't use blob encoding if not requested
         check_round_trip_encoding_of_data(vec![array], &test_cases, Default::default()).await;
+    }
+
+    /// An `EncodingsIo` that rejects every request, simulating cloud storage
+    /// returning a retryable error (e.g. an exhausted HTTP 503 retry budget).
+    #[derive(Debug)]
+    struct FailingScheduler;
+
+    impl EncodingsIo for FailingScheduler {
+        fn submit_request(
+            &self,
+            _ranges: Vec<Range<u64>>,
+            _priority: u64,
+        ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+            std::future::ready(Err(Error::io("simulated HTTP 503 from cloud storage"))).boxed()
+        }
+    }
+
+    /// A failed blob load must surface through `wait_for_loaded` and leave the
+    /// decoder untouched -- never half-advanced into a state where a later
+    /// `drain` reads rows that never loaded (which panicked with "range end
+    /// index N out of range for slice of length 0").
+    #[test_log::test(tokio::test)]
+    async fn test_io_failure_leaves_blob_decoder_consistent() {
+        let num_rows = 8u64;
+        // `positions`/`sizes` only need `num_rows` entries; the failing
+        // scheduler rejects the request regardless of the ranges it is given.
+        let descs = PrimitiveArray::<UInt64Type>::from_iter_values(std::iter::repeat_n(
+            0u64,
+            num_rows as usize,
+        ));
+
+        let mut decoder = BlobFieldDecoder {
+            io: Arc::new(FailingScheduler),
+            unloaded_descriptions: None,
+            positions: descs.clone(),
+            sizes: descs,
+            num_rows,
+            loaded: VecDeque::new(),
+            validity: VecDeque::new(),
+            rows_loaded: 0,
+            rows_drained: 0,
+            base_priority: 0,
+        };
+
+        // `wait_for_loaded` propagates the I/O failure...
+        assert!(decoder.wait_for_loaded(num_rows - 1).await.is_err());
+
+        // ...and leaves no half-loaded state behind.
+        assert_eq!(decoder.rows_loaded, 0);
+        assert!(decoder.loaded.is_empty());
+        assert!(decoder.validity.is_empty());
+
+        // A drain in this state errors instead of panicking on the empty buffer.
+        assert!(decoder.drain(num_rows).is_err());
     }
 }

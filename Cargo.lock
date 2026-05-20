@@ -3093,7 +3093,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -4321,7 +4321,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4343,6 +4343,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "bitpacking",
  "byteorder",
  "bytes",
  "chrono",
@@ -4420,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4468,7 +4469,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrayref",
  "paste",
@@ -4477,7 +4478,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4514,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4547,7 +4548,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4567,7 +4568,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4612,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4638,7 +4639,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4678,7 +4679,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4692,7 +4693,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4769,7 +4770,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4818,7 +4819,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4839,7 +4840,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4851,7 +4852,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4867,7 +4868,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4923,7 +4924,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4969,7 +4970,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4978,7 +4979,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4989,7 +4990,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "jieba-rs",
  "lindera",
@@ -5000,7 +5001,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "7.0.0-beta.12"
+version = "7.0.0-beta.16"
 dependencies = [
  "clap",
  "lance-core",
@@ -5596,9 +5597,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-format"
@@ -7267,7 +7268,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http 0.6.10",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -7308,7 +7309,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http 0.6.10",
+ "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -7319,9 +7320,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest-middleware"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "199dda04a536b532d0cc04d7979e39b1c763ea749bf91507017069c00b96056f"
+checksum = "07bc3f1384cffa4f274dad2d4ddd73aed32fed8f786d96c6be8aa4e5fd3c3b58"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8828,9 +8829,9 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.6.10"
+version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68d6fdd9f81c2819c9a8b0e0cd91660e7746a8e6ea2ba7c6b2b057985f6bcb51"
+checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "async-compression",
  "bitflags 2.11.1",

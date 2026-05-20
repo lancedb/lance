@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{Rng, rng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
@@ -43,6 +43,15 @@ use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
+
+/// Fixed seed for HNSW node-level assignment.
+///
+/// A constant seed makes graph construction reproducible (same data + params =>
+/// same graph), which keeps index builds deterministic and tests stable. Recall
+/// is statistically unaffected — the level distribution is identical, only the
+/// random draws become fixed. Shared by the offline ([`HNSWBuilder`]) and online
+/// ([`super::online::OnlineHnswBuilder`]) builders so both produce comparable graphs.
+pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
@@ -475,7 +484,7 @@ impl HnswBuilder {
             if len > 0 {
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
-            let mut level_rng = rng();
+            let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
             for i in 1..len {
                 nodes.push(RwLock::new(GraphBuilderNode::new(
                     i as u32,
