@@ -58,14 +58,14 @@
 //!
 //! There is **no cross-version interop**: files written by this encoder cannot be read by a
 //! pre-dispatch u128 reader, and files written by a pre-dispatch u128 encoder (none exist in
-//! released Lance, since u128 inline bitpacking is itself unreleased) would be mis-decoded by
-//! this reader on any chunk whose `bit_width` falls into the narrow regimes.
+//! released Lance, since u128 inline bitpacking is itself unreleased) would decode incorrectly
+//! under this reader on any chunk whose `bit_width` falls into the narrow regimes.
 //!
 //! ## Sign safety
 //!
 //! The narrow branches (1..=32 and 33..=64) reinterpret `&[u128]` as `&[u32] / &[u64]` and rely
 //! on every value satisfying `v >> bit_width == 0`. This invariant is supplied by
-//! [`crate::statistics::FixedWidthDataBlock::max_bit_widths`], whose OR-fold + `leading_zeros`
+//! `FixedWidthDataBlock::max_bit_widths` (see `crate::statistics`), whose OR-fold + `leading_zeros`
 //! algorithm guarantees the high lanes are all zero for any `bit_width < 128`. Negative `i128`
 //! values (after `bytemuck::cast_slice` to `u128`) have the high bit set and therefore force
 //! `bit_width = 128` for the entire chunk, routing them into the memcpy branch.
