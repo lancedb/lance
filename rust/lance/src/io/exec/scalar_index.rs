@@ -3,9 +3,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use super::utils::{
-    IndexMetrics, InstrumentedChildInputStream, InstrumentedRecordBatchStreamAdapter,
-};
+use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
     dataset::rowids::load_row_id_sequences,
@@ -22,7 +20,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
-        metrics::{ExecutionPlanMetricsSet, MetricsSet},
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
@@ -308,15 +306,21 @@ impl MapIndexExec {
             None
         };
 
-        let helper = InstrumentedChildInputStream::new(
-            input,
-            INDEX_LOOKUP_SCHEMA.clone(),
-            move |batch| {
-                let column_name = column_name.clone();
-                let index_name = index_name.clone();
-                let dataset = dataset.clone();
-                let deletion_mask = deletion_mask.clone();
-                let metrics = index_metrics.clone();
+        let baseline = BaselineMetrics::new(&metrics_set, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
+        let stream = input.then(move |batch_result| {
+            let column_name = column_name.clone();
+            let index_name = index_name.clone();
+            let dataset = dataset.clone();
+            let deletion_mask = deletion_mask.clone();
+            let metrics = index_metrics.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            async move {
+                let batch = batch_result?;
+                // Timer spans `map_batch`'s `.await` on purpose: that await is
+                // the per-batch sargable index evaluation, which is the work
+                // we want attributed here.
+                let _t = elapsed_compute.timer();
                 Self::map_batch(
                     column_name,
                     index_name,
@@ -325,12 +329,20 @@ impl MapIndexExec {
                     batch,
                     metrics,
                 )
-            },
-            1,
-            partition,
-            &metrics_set,
-        );
-        Ok(Box::pin(helper))
+                .await
+            }
+        });
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            INDEX_LOOKUP_SCHEMA.clone(),
+            stream,
+        )))
     }
 
     async fn map_batch(

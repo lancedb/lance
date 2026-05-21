@@ -34,7 +34,7 @@ use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, InstrumentedChildInputStream, build_prefilter};
+use super::utils::{IndexMetrics, build_prefilter};
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
@@ -716,42 +716,44 @@ impl FlatMatchFilterExec {
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
 
-        let helper = InstrumentedChildInputStream::new(
-            input,
-            schema,
-            move |batch| {
-                // Clone per-batch so the work runs *inside* the async block
-                // (i.e., during the helper's timed in_flight poll, not during
-                // its untimed input-pulling phase).
-                let column = column.clone();
-                let query_tokens = query_tokens.clone();
-                let mut tokenizer = tokenizer.box_clone();
-                async move {
-                    let text_column = batch.column_by_name(&column).ok_or_else(|| {
-                        DataFusionError::Execution(format!("Column {} not found in batch", column,))
-                    })?;
-                    let predicate = match text_column.data_type() {
-                        DataType::Utf8 => {
-                            Self::find_matches::<i32>(text_column, &mut tokenizer, &query_tokens)
-                        }
-                        DataType::LargeUtf8 => {
-                            Self::find_matches::<i64>(text_column, &mut tokenizer, &query_tokens)
-                        }
-                        _ => {
-                            return Err(DataFusionError::Execution(format!(
-                                "Column {} is not a string",
-                                column,
-                            )));
-                        }
-                    };
-                    Ok(arrow::compute::filter_record_batch(&batch, &predicate)?)
-                }
-            },
-            1,
-            partition,
-            &metrics_set,
-        );
-        Ok(Box::pin(helper))
+        let baseline = BaselineMetrics::new(&metrics_set, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
+        let stream = input.then(move |batch_result| {
+            let column = column.clone();
+            let query_tokens = query_tokens.clone();
+            let mut tokenizer = tokenizer.box_clone();
+            let elapsed_compute = elapsed_compute.clone();
+            async move {
+                let batch = batch_result?;
+                let _t = elapsed_compute.timer();
+                let text_column = batch.column_by_name(&column).ok_or_else(|| {
+                    DataFusionError::Execution(format!("Column {} not found in batch", column,))
+                })?;
+                let predicate = match text_column.data_type() {
+                    DataType::Utf8 => {
+                        Self::find_matches::<i32>(text_column, &mut tokenizer, &query_tokens)
+                    }
+                    DataType::LargeUtf8 => {
+                        Self::find_matches::<i64>(text_column, &mut tokenizer, &query_tokens)
+                    }
+                    _ => {
+                        return Err(DataFusionError::Execution(format!(
+                            "Column {} is not a string",
+                            column,
+                        )));
+                    }
+                };
+                Ok(arrow::compute::filter_record_batch(&batch, &predicate)?)
+            }
+        });
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
