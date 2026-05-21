@@ -286,12 +286,13 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     // MemWAL classes
     m.add_class::<mem_wal::PyMergedGeneration>()?;
-    m.add_class::<mem_wal::PyRegionSnapshot>()?;
-    m.add_class::<mem_wal::PyRegionWriter>()?;
+    m.add_class::<mem_wal::PyShardSnapshot>()?;
+    m.add_class::<mem_wal::PyShardWriter>()?;
     m.add_class::<mem_wal::PyLsmScanner>()?;
     m.add_class::<mem_wal::PyExecutionPlan>()?;
     m.add_class::<mem_wal::PyLsmPointLookupPlanner>()?;
     m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
+    m.add_wrapped(wrap_pyfunction!(mem_wal::py_evaluate_sharding_spec))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;

@@ -35,6 +35,7 @@ mod builder;
 mod collector;
 mod data_source;
 pub mod exec;
+mod flushed_cache;
 mod planner;
 mod point_lookup;
 mod projection;
@@ -45,6 +46,7 @@ pub use collector::{
     ActiveMemTableRef, InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector,
 };
 pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
+pub use flushed_cache::FlushedMemTableCache;
 pub use point_lookup::LsmPointLookupPlanner;
 pub use projection::DISTANCE_COLUMN;
 pub use vector_search::LsmVectorSearchPlanner;

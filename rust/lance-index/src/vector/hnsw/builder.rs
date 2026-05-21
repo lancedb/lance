@@ -69,6 +69,16 @@ pub struct HnswBuildParams {
     pub prefetch_distance: Option<usize>,
 }
 
+impl From<&HnswBuildParams> for crate::pb::HnswParameters {
+    fn from(params: &HnswBuildParams) -> Self {
+        Self {
+            max_connections: params.m as u32,
+            construction_ef: params.ef_construction as u32,
+            max_level: params.max_level as u32,
+        }
+    }
+}
+
 impl Default for HnswBuildParams {
     fn default() -> Self {
         Self {

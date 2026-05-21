@@ -12,14 +12,13 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::FutureExt;
 use itertools::Itertools;
-use lance_core::cache::{CacheKey, UnsizedCacheKey};
+use lance_core::cache::CacheKey;
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
-    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_SCALAR, IO_TYPE_OPEN_VECTOR,
-    TRACE_IO_EVENTS,
+    IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
 };
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
@@ -46,7 +45,7 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex};
 use lance_index::{
-    IndexCriteria, infer_system_index_type, is_system_index,
+    IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -63,6 +62,10 @@ use scalar::index_matches_criteria;
 use serde_json::json;
 use tracing::{info, instrument};
 use uuid::Uuid;
+use vector::details::{
+    derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
+};
+pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
@@ -232,34 +235,6 @@ fn segment_has_inverted_details(segment: &IndexMetadata) -> bool {
 }
 
 // Cache keys for different index types
-#[derive(Debug, Clone)]
-pub struct ScalarIndexCacheKey<'a> {
-    pub uuid: &'a str,
-    pub fri_uuid: Option<&'a Uuid>,
-}
-
-impl<'a> ScalarIndexCacheKey<'a> {
-    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
-        Self { uuid, fri_uuid }
-    }
-}
-
-impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
-    type ValueType = dyn ScalarIndex;
-
-    fn key(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(fri_uuid) = self.fri_uuid {
-            format!("{}-{}", self.uuid, fri_uuid).into()
-        } else {
-            self.uuid.into()
-        }
-    }
-
-    fn type_name() -> &'static str {
-        "ScalarIndex"
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
     uuid: &'a str,
@@ -570,7 +545,7 @@ pub(crate) async fn remap_index(
 
             CreatedIndex {
                 index_details: prost_types::Any::from_msg(
-                    &lance_table::format::pb::VectorIndexDetails::default(),
+                    &lance_index::pb::VectorIndexDetails::default(),
                 )
                 .unwrap(),
                 index_version,
@@ -619,11 +594,6 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
         read_message_from_buf(&tail_bytes.slice(offset..))?
     };
     Ok(proto)
-}
-
-fn vector_index_details() -> prost_types::Any {
-    let details = lance_table::format::pb::VectorIndexDetails::default();
-    prost_types::Any::from_msg(&details).unwrap()
 }
 
 struct IndexDescriptionImpl {
@@ -696,41 +666,16 @@ impl IndexDescriptionImpl {
         let details = IndexDetails(index_details.clone());
         let mut rows_indexed = 0;
 
-        // System indices (e.g. __lance_frag_reuse, __lance_mem_wal) are
-        // identified by name and have no entry in the scalar plugin registry,
-        // so resolve them up front. This mirrors `load_indices` in
-        // python/src/dataset.rs, keeping the two listing methods in agreement.
-        let index_type = if let Some(system_type) = infer_system_index_type(example_metadata) {
+        let index_type = if details.is_vector() {
+            derive_vector_index_type(index_details)
+        } else if let Some(system_type) = lance_index::infer_system_index_type(example_metadata) {
+            // System indices (frag-reuse, mem-wal) are identified by name, not
+            // by a plugin entry, so the plugin lookup below would return
+            // "Unknown" otherwise.
             system_type.to_string()
-        } else if details.is_vector() {
-            // Vector indices need to be opened to get the correct type
-            let column = field_ids
-                .first()
-                .and_then(|id| dataset.schema().field_by_id(*id))
-                .map(|f| f.name.clone())
-                .ok_or_else(|| {
-                    Error::index("Cannot determine column name for vector index".to_string())
-                })?;
-
-            match dataset
-                .open_generic_index(
-                    &column,
-                    &example_metadata.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
-                .await
-            {
-                Ok(idx) => idx.index_type().to_string(),
-                Err(e) => {
-                    log::warn!(
-                        "Failed to open vector index {} to determine type: {}",
-                        name,
-                        e
-                    );
-                    "Unknown".to_string()
-                }
-            }
         } else {
+            // We attempted to infer the index type when we loaded the indices,
+            // so if we hit this branch the index type is truly unknown.
             details
                 .get_plugin()
                 .map(|p| p.name().to_string())
@@ -787,10 +732,14 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 
     fn details(&self) -> Result<String> {
-        let plugin = self.details.get_plugin()?;
-        plugin
-            .details_as_json(&self.details.0)
-            .map(|v| v.to_string())
+        if self.details.is_vector() {
+            vector_details_as_json(&self.details.0)
+        } else {
+            let plugin = self.details.get_plugin()?;
+            plugin
+                .details_as_json(&self.details.0)
+                .map(|v| v.to_string())
+        }
     }
 
     fn total_size_bytes(&self) -> Option<u64> {
@@ -1000,7 +949,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
         };
-        let indices = match self.index_cache.get_with_key(&metadata_key).await {
+        let mut indices = match self.index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
                 let mut loaded_indices = read_manifest_indexes(
@@ -1017,6 +966,20 @@ impl DatasetIndexExt for Dataset {
                 loaded_indices
             }
         };
+
+        // Infer details for legacy vector indices (once per index name, concurrently).
+        // This may run on indices that were opportunistically cached during Dataset::open
+        // before the full Dataset was available for inference.
+        {
+            let mut updated = indices.as_ref().clone();
+            infer_missing_vector_details(self, &mut updated).await;
+            if updated != *indices {
+                indices = Arc::new(updated);
+                self.index_cache
+                    .insert_with_key(&metadata_key, indices.clone())
+                    .await;
+            }
+        }
 
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -1701,12 +1664,10 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
-        // Checking for cache existence is cheap so we just check both scalar and vector caches
+        // Checking for cache existence is cheap so we just check the vector caches.
+        // Scalar indices cache themselves inside `open_scalar_index` (the cache
+        // key is a plugin detail), so there is no cheap scalar check here.
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
-        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            return Ok(index.as_index());
-        }
 
         // Check sized cache for IvfIndexState (v2+ indices).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -1766,26 +1727,14 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
-        let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            return Ok(index);
-        }
-
+        // Caching (including the choice of in-memory vs. serializable state) is
+        // a plugin implementation detail handled inside `scalar::open_scalar_index`.
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
-        let index = scalar::open_scalar_index(self, column, &index_meta, metrics).await?;
-
-        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
-        metrics.record_index_load();
-
-        self.index_cache
-            .insert_unsized_with_key(&cache_key, index.clone())
-            .await;
-        Ok(index)
+        scalar::open_scalar_index(self, column, &index_meta, metrics).await
     }
 
     async fn open_vector_index(
@@ -2526,7 +2475,7 @@ mod tests {
             fields: vec![field_id],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: IndexType::Vector.version(),
             created_at: Some(chrono::Utc::now()),
             base_id: None,
@@ -4268,6 +4217,126 @@ mod tests {
             "updated_at_timestamp_ms should be null when no indices have created_at timestamps"
         );
     }
+
+    #[tokio::test]
+    async fn test_legacy_vector_index_details_inferred_on_load_and_migration() {
+        use lance_linalg::distance::DistanceType;
+
+        // Create a fresh dataset with IVF_HNSW_SQ so inference produces non-default
+        // details (HNSW config + SQ compression) that survive proto serialization.
+        let test_dir = lance_core::utils::tempfile::TempDir::default();
+        let test_uri = test_dir.path_str();
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("vec", array::rand_vec::<Float32Type>(16.into()))
+            .into_reader_rows(RowCount::from(1024), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::Cosine,
+            IvfBuildParams {
+                num_partitions: Some(2),
+                ..Default::default()
+            },
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        // Verify the index has populated details.
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].index_type(), "IVF_HNSW_SQ");
+
+        // Simulate a legacy dataset by clearing details from the manifest.
+        // Write a new manifest with empty VectorIndexDetails value bytes.
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        for idx in &mut indices {
+            if let Some(details) = idx.index_details.as_ref()
+                && details.type_url.ends_with("VectorIndexDetails")
+            {
+                idx.index_details = Some(Arc::new(vector_index_details_default()));
+            }
+        }
+        // Write back via a no-op commit that carries the cleared indices.
+        // We commit by doing a delete("false") after replacing the cached indices.
+        let metadata_key = crate::session::index_caches::IndexMetadataKey {
+            version: dataset.version().version,
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&metadata_key, Arc::new(indices))
+            .await;
+        dataset.delete("false").await.unwrap();
+
+        // -- Part 1: Inference on load --
+        // Open with a fresh session so nothing is cached.
+        let dataset = DatasetBuilder::from_uri(&test_uri)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+
+        // load_indices should detect empty details and infer from index files.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let details = indices[0].index_details.as_ref().unwrap();
+        assert!(
+            !details.value.is_empty(),
+            "Details should have been inferred from index files"
+        );
+
+        // describe_indices should return a real type (not generic "Vector").
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_ne!(
+            descriptions[0].index_type(),
+            "Vector",
+            "Should have inferred a specific index type"
+        );
+        assert_eq!(
+            descriptions[0].index_type(),
+            "IVF_HNSW_SQ",
+            "Inferred type should match the originally-built index"
+        );
+        let inferred_type = descriptions[0].index_type().to_string();
+        let details_json: serde_json::Value =
+            serde_json::from_str(&descriptions[0].details().unwrap()).unwrap();
+        assert_eq!(details_json["metric_type"], "COSINE");
+        assert_eq!(details_json["compression"]["type"], "sq");
+        assert!(
+            details_json["hnsw"]["max_connections"].is_number(),
+            "Inferred HNSW config should have max_connections; got {details_json}"
+        );
+        assert!(details_json["hnsw"]["construction_ef"].is_number());
+        assert!(details_json["hnsw"]["max_level"].is_number());
+
+        // -- Part 2: Migration persists inferred details --
+        let mut dataset = dataset;
+        dataset.delete("false").await.unwrap();
+
+        // Open with yet another fresh session.
+        let dataset = DatasetBuilder::from_uri(&test_uri)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+
+        // The migrated manifest should have non-empty details without
+        // needing to read index files again.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            !indices[0].index_details.as_ref().unwrap().value.is_empty(),
+            "Migrated manifest should have non-empty details"
+        );
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions[0].index_type(), inferred_type);
+    }
+
     #[rstest]
     #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
     #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]

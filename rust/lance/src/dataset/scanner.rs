@@ -3594,18 +3594,23 @@ impl Scanner {
                     }
                 }
             } else if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
-                // TODO: Once we do https://github.com/lance-format/lance/issues/5231, we
-                // should be able to get the metric type directly from the index metadata,
-                // at least for newer indexes.
-                let idx = self
-                    .dataset
-                    .open_vector_index(
-                        q.column.as_str(),
-                        &index.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
-                let index_metric = idx.metric_type();
+                // Try to get metric type from index metadata first (fast path for newer indices)
+                let index_metric = if let Some(metric) =
+                    crate::index::vector::details::metric_type_from_index_metadata(index)
+                {
+                    metric
+                } else {
+                    // Fall back to opening the index for legacy indices without details
+                    let idx = self
+                        .dataset
+                        .open_vector_index(
+                            q.column.as_str(),
+                            &index.uuid.to_string(),
+                            &NoOpMetricsCollector,
+                        )
+                        .await?;
+                    idx.metric_type()
+                };
 
                 let use_this_index = match q.metric_type {
                     Some(user_metric) => {
@@ -9812,6 +9817,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     ],
                     version: crate::index::vector::IndexFileVersion::Legacy,
                     skip_transpose: false,
+                    runtime_hints: Default::default(),
                 },
                 false,
             )
