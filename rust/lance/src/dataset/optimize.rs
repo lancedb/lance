@@ -631,6 +631,41 @@ impl DefaultCompactionPlanner {
         }
         false
     }
+
+    fn apply_budget_limits(&self, tasks: Vec<TaskData>) -> Vec<TaskData> {
+        if tasks.is_empty() {
+            return tasks;
+        }
+        let mut total_frags = 0usize;
+        let mut total_bytes = 0usize;
+        let mut result = Vec::new();
+        for task in tasks {
+            let task_frags = task.fragments.len();
+            let task_bytes: usize = task
+                .fragments
+                .iter()
+                .flat_map(|f| f.files.iter())
+                .filter_map(|f| f.file_size_bytes.get())
+                .map(|sz| sz.get() as usize)
+                .sum();
+            if !result.is_empty() {
+                if let Some(max_frags) = self.options.max_source_fragments
+                    && total_frags + task_frags > max_frags
+                {
+                    break;
+                }
+                if let Some(max_bytes) = self.options.max_compaction_bytes
+                    && total_bytes + task_bytes > max_bytes
+                {
+                    break;
+                }
+            }
+            total_frags += task_frags;
+            total_bytes += task_bytes;
+            result.push(task);
+        }
+        result
+    }
 }
 
 #[async_trait::async_trait]
@@ -692,6 +727,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 .map(|sz| sz.get() as usize)
                 .sum();
 
+            let would_exceed = has_budget
+                && self.exceeds_budget(
+                    total_candidate_fragments + 1,
+                    total_candidate_bytes + fragment_bytes,
+                );
+
             match (candidacy, &mut current_bin) {
                 (None, None) => {}
                 (Some(candidacy), None) => {
@@ -706,6 +747,10 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                     });
                 }
                 (Some(candidacy), Some(bin)) => {
+                    if would_exceed {
+                        candidate_bins.push(current_bin.take().unwrap());
+                        break;
+                    }
                     total_candidate_fragments += 1;
                     total_candidate_bytes += fragment_bytes;
                     if bin.indices == indices {
@@ -729,14 +774,6 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 }
             }
 
-            if has_budget
-                && current_bin.is_some()
-                && self.exceeds_budget(total_candidate_fragments, total_candidate_bytes)
-            {
-                candidate_bins.push(current_bin.take().unwrap());
-                break;
-            }
-
             i += 1;
         }
 
@@ -744,7 +781,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let tasks: Vec<TaskData> = candidate_bins
+        let all_tasks: Vec<TaskData> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
@@ -752,6 +789,8 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 fragments: bin.fragments,
             })
             .collect();
+
+        let tasks = self.apply_budget_limits(all_tasks);
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -4529,8 +4568,8 @@ mod tests {
             plan_all.num_tasks()
         );
 
-        // Plan with max_source_fragments=4 should include tasks covering <= 4
-        // source fragments
+        // Plan with max_source_fragments=4 should include tasks covering
+        // at most 4 source fragments.
         let opts_bounded = CompactionOptions {
             target_rows_per_fragment: 250,
             max_source_fragments: Some(4),
@@ -4861,10 +4900,12 @@ mod tests {
 
         assert_eq!(dataset.get_fragments().len(), 100);
 
+        // With target_rows_per_fragment=250, 100 small fragments (100 rows each)
+        // split into multiple tasks, so max_source_fragments can truncate.
         let unlimited_plan = plan_compaction(
             &dataset,
             &CompactionOptions {
-                target_rows_per_fragment: 1_000_000,
+                target_rows_per_fragment: 250,
                 ..Default::default()
             },
         )
@@ -4872,11 +4913,15 @@ mod tests {
         .unwrap();
         let unlimited_frags: usize = unlimited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
         assert_eq!(unlimited_frags, 100);
+        assert!(
+            unlimited_plan.num_tasks() > 1,
+            "need multiple tasks to test bounding"
+        );
 
         let limited_plan = plan_compaction(
             &dataset,
             &CompactionOptions {
-                target_rows_per_fragment: 1_000_000,
+                target_rows_per_fragment: 250,
                 max_source_fragments: Some(20),
                 ..Default::default()
             },
@@ -4885,8 +4930,8 @@ mod tests {
         .unwrap();
         let limited_frags: usize = limited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
         assert!(
-            limited_frags <= 21,
-            "expected at most ~20 candidate fragments (budget + current bin), got {}",
+            limited_frags <= 20,
+            "expected at most 20 candidate fragments, got {}",
             limited_frags
         );
         assert!(
