@@ -138,6 +138,21 @@ impl Scanner {
         Ok(res)
     }
 
+    /// Like [`analyze_plan`] but auto-applies a `COUNT(*)` aggregate first —
+    /// so callers without a hand-built Substrait aggregate can inspect the
+    /// plan that `count_rows()` actually executes.
+    #[pyo3(signature = (*))]
+    fn analyze_count_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
+        let scanner = self_.scanner.clone();
+        let res = rt()
+            .spawn(Some(self_.py()), async move {
+                scanner.analyze_count_plan().await
+            })?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(res)
+    }
+
     fn count_rows(self_: PyRef<'_, Self>) -> PyResult<u64> {
         let scanner = self_.scanner.clone();
         rt().spawn(Some(self_.py()), async move { scanner.count_rows().await })?

@@ -50,6 +50,12 @@ pub struct AggregateIndexSearchExec {
     aggregates: Vec<Arc<AggregateIndexSearch>>,
     aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
     prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+    /// Restrict the count to this fragment subset. `None` means "every
+    /// fragment in the dataset". The optimizer rule uses this to scope the
+    /// pushdown branch of a partial-coverage split plan to the indexed
+    /// fragments only — the uncovered ones are handled by a parallel scan
+    /// branch.
+    restrict_to_fragments: Option<RoaringBitmap>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -87,6 +93,21 @@ impl AggregateIndexSearchExec {
         aggregates: Vec<Arc<AggregateIndexSearch>>,
         aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Self> {
+        Self::try_new_restricted(dataset, aggregates, aggregate_funcs, prefilter_input, None)
+    }
+
+    /// Like [`Self::try_new`] but scopes the count to a fragment subset
+    /// rather than the whole dataset. The optimizer rule for aggregate
+    /// pushdown uses this to handle partial-index-coverage by emitting a
+    /// pushdown branch over the indexed fragments alongside a scan branch
+    /// over the rest.
+    pub fn try_new_restricted(
+        dataset: Arc<Dataset>,
+        aggregates: Vec<Arc<AggregateIndexSearch>>,
+        aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
+        prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+        restrict_to_fragments: Option<RoaringBitmap>,
     ) -> Result<Self> {
         if aggregates.len() != aggregate_funcs.len() {
             return Err(Error::invalid_input(format!(
@@ -143,6 +164,7 @@ impl AggregateIndexSearchExec {
             aggregates,
             aggregate_funcs,
             prefilter_input,
+            restrict_to_fragments,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -312,6 +334,7 @@ impl AggregateIndexSearchExec {
         dataset: Arc<Dataset>,
         aggregates: Vec<Arc<AggregateIndexSearch>>,
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
+        restrict_to_fragments: Option<RoaringBitmap>,
         context: Arc<datafusion::execution::context::TaskContext>,
         plan_metrics: ExecutionPlanMetricsSet,
         schema: SchemaRef,
@@ -342,6 +365,13 @@ impl AggregateIndexSearchExec {
                 .map(|f| f.id as u32)
                 .collect::<RoaringBitmap>()
         });
+        // Caller-supplied restriction further narrows the fragment set —
+        // used by the optimizer rule's split plan to scope this branch to
+        // the indexed fragments only.
+        let fragments_covered = match restrict_to_fragments {
+            Some(restrict) => fragments_covered & restrict,
+            None => fragments_covered,
+        };
 
         // Build the fragments allow list as concrete `[0..physical_rows)`
         // ranges rather than `Full` markers. `Full` interacts poorly with
@@ -457,6 +487,7 @@ impl ExecutionPlan for AggregateIndexSearchExec {
             aggregates: self.aggregates.clone(),
             aggregate_funcs: self.aggregate_funcs.clone(),
             prefilter_input,
+            restrict_to_fragments: self.restrict_to_fragments.clone(),
             schema: self.schema.clone(),
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
@@ -473,6 +504,7 @@ impl ExecutionPlan for AggregateIndexSearchExec {
             self.dataset.clone(),
             self.aggregates.clone(),
             self.prefilter_input.clone(),
+            self.restrict_to_fragments.clone(),
             context,
             self.metrics.clone(),
             schema.clone(),
@@ -707,6 +739,7 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt64(Some(25))),
             )),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
         let prefilter: Arc<dyn ExecutionPlan> =
             Arc::new(ScalarIndexExec::new(dataset.clone(), prefilter_expr));
@@ -739,6 +772,7 @@ mod tests {
                     Bound::Excluded(ScalarValue::UInt64(Some(25))),
                 )),
                 needs_recheck: false,
+                fragment_bitmap: None,
             })));
         let prefilter: Arc<dyn ExecutionPlan> =
             Arc::new(ScalarIndexExec::new(dataset.clone(), prefilter_expr));

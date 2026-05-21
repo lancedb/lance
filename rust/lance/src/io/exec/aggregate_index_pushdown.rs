@@ -4,28 +4,32 @@
 //! Physical optimizer rule that rewrites `COUNT`-shaped aggregates into
 //! [`AggregateIndexSearchExec`].
 //!
-//! v1 only fires for fully unfiltered counts — the simplest provably-safe
-//! envelope. Filtered counts are deferred to a follow-up that can validate
-//! the index covers every dataset fragment.
+//! Two rewritten shapes are emitted depending on whether the scalar index
+//! backing the filter covers every dataset fragment.
 //!
-//! Recognized shape:
-//!
-//! ```text
-//! AggregateExec(Single, aggs=[COUNT(*)], group_by=[])
-//!   └── FilteredReadExec { no full_filter, no refine_filter, no index_input,
-//!                          no scan range, no with_deleted_rows, no fragment
-//!                          subset, not stable-row-ids }
-//! ```
-//!
-//! Rewritten to:
+//! **Full coverage** (index ⊇ dataset, or no filter at all):
 //!
 //! ```text
 //! AggregateExec(Final, aggs=[COUNT(*)], group_by=[])
-//!   └── AggregateIndexSearchExec { prefilter_input = None }
+//!   └── AggregateIndexSearchExec { prefilter_input = index_input }
+//! ```
+//!
+//! **Partial coverage** (index ⊊ dataset — typically appended fragments):
+//!
+//! ```text
+//! AggregateExec(Final, aggs=[COUNT(*)], group_by=[])
+//!   └── UnionExec
+//!         ├── AggregateIndexSearchExec(restrict_to_fragments = indexed)
+//!         └── AggregateExec(Partial)
+//!               └── FilteredReadExec(fragments = unindexed, full_filter = …)
 //! ```
 //!
 //! [`AggregateIndexSearchExec`] emits partial-state, so the outer
-//! `AggregateExec(Final)` performs the final combine.
+//! `AggregateExec(Final)` performs the final combine in either shape.
+//!
+//! If the prefilter's index coverage is unknown (any leaf is missing
+//! `fragment_bitmap`, e.g. constructed outside scanner planning), the rule
+//! refuses to fire and leaves the existing scan path in place.
 
 use std::sync::Arc;
 
@@ -37,18 +41,22 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{
     ExecutionPlan,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
+    coalesce_partitions::CoalescePartitionsExec,
+    union::UnionExec,
 };
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Literal;
 use lance_index::expression::aggregate::{AggregateIndexSearch, CountQuery};
+use lance_index::scalar::expression::ScalarIndexExpr;
+use roaring::RoaringBitmap;
 
 use super::aggregate_index::AggregateIndexSearchExec;
-use super::filtered_read::FilteredReadExec;
+use super::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use super::scalar_index::ScalarIndexExec;
 
 /// Physical optimizer rule that pushes `COUNT`-shaped aggregates into
-/// [`AggregateIndexSearchExec`], answering them from index metadata + the
-/// deletion mask + an optional scalar-index prefilter, without scanning column
-/// data.
+/// [`AggregateIndexSearchExec`], optionally splitting into a parallel scan
+/// branch when the index has partial coverage of the dataset.
 ///
 /// Only fires when the shape is verifiably safe; everything outside that
 /// envelope (GROUP BY, residual filters, scan ranges, etc.) is left alone for
@@ -127,15 +135,14 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     }
 
     let options = filtered_read.options();
-    // No filter at all is the only case v1 can prove correct. With a filter we
-    // would also need to verify the scalar index covers every dataset fragment
-    // (otherwise rows in unindexed fragments are silently dropped). That check
-    // is async and not currently expressible in a sync PhysicalOptimizerRule;
-    // until we plumb it through, leave the filtered case on the scan path.
-    if options.full_filter.is_some()
-        || options.refine_filter.is_some()
-        || filtered_read.index_input().is_some()
-    {
+    // A refine filter is a residual the index couldn't fully evaluate — it
+    // needs column data to apply, which we can't.
+    if options.refine_filter.is_some() {
+        return Ok(None);
+    }
+    // A full_filter without an index_input means the filter is evaluated by
+    // scanning every row; not pushdownable.
+    if options.full_filter.is_some() && filtered_read.index_input().is_none() {
         return Ok(None);
     }
     // LIMIT/OFFSET would change the count.
@@ -147,16 +154,41 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     if options.with_deleted_rows {
         return Ok(None);
     }
-    // We assume the natural fragment coverage of the dataset; a fragment
-    // subset would require routing it into the exec.
+    // A pre-existing fragment subset would need to be intersected into the
+    // coverage logic below. Punt for now.
     if options.fragments.is_some() {
         return Ok(None);
     }
 
     let dataset = filtered_read.dataset().clone();
+    let dataset_fragments: RoaringBitmap =
+        dataset.fragments().iter().map(|f| f.id as u32).collect();
     let prefilter_input = filtered_read.index_input().cloned();
-    let aggregates: Vec<Arc<AggregateIndexSearch>> = agg
-        .aggr_expr()
+
+    // If there is a prefilter, compute the index coverage from its
+    // ScalarIndexExpr leaves. None means at least one leaf has no
+    // fragment_bitmap and we can't reason about coverage — refuse to fire.
+    let index_coverage = match &prefilter_input {
+        None => None,
+        Some(input) => {
+            let scalar_exec = input
+                .as_any()
+                .downcast_ref::<ScalarIndexExec>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(
+                    "AggregateIndexPushdown: FilteredReadExec.index_input is not a ScalarIndexExec"
+                        .to_string(),
+                )
+                })?;
+            let Some(coverage) = collect_coverage(scalar_exec.expr()) else {
+                return Ok(None);
+            };
+            Some(coverage)
+        }
+    };
+
+    let aggr_exprs: Vec<Arc<AggregateFunctionExpr>> = agg.aggr_expr().to_vec();
+    let aggregates: Vec<Arc<AggregateIndexSearch>> = aggr_exprs
         .iter()
         .map(|_| {
             Arc::new(AggregateIndexSearch {
@@ -169,26 +201,133 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             })
         })
         .collect();
-    let aggregate_funcs: Vec<Arc<AggregateFunctionExpr>> = agg.aggr_expr().to_vec();
 
-    let exec =
-        AggregateIndexSearchExec::try_new(dataset, aggregates, aggregate_funcs, prefilter_input)?;
-    let exec_schema = exec.schema();
-    let exec: Arc<dyn ExecutionPlan> = Arc::new(exec);
+    // Decide on the plan shape. Three cases:
+    //
+    // 1. No prefilter (no filter at all): single pushdown branch over every
+    //    dataset fragment. Always safe.
+    // 2. Prefilter + index covers every dataset fragment: single pushdown
+    //    branch, prefilter feeds in directly.
+    // 3. Prefilter + index covers a strict subset: split into pushdown over
+    //    indexed fragments + parallel scan over unindexed fragments.
+    let (combined, partial_input_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage {
+        None => {
+            // No prefilter at all (verified above): nothing to restrict.
+            let exec = AggregateIndexSearchExec::try_new_restricted(
+                dataset,
+                aggregates,
+                aggr_exprs.clone(),
+                prefilter_input,
+                None,
+            )?;
+            let schema = exec.schema();
+            (Arc::new(exec), schema)
+        }
+        Some(coverage) if (&dataset_fragments - &coverage).is_empty() => {
+            // Prefilter exists and the index covers every dataset fragment —
+            // safe to push the whole count down.
+            let exec = AggregateIndexSearchExec::try_new_restricted(
+                dataset,
+                aggregates,
+                aggr_exprs.clone(),
+                prefilter_input,
+                None,
+            )?;
+            let schema = exec.schema();
+            (Arc::new(exec), schema)
+        }
+        Some(coverage) => {
+            // Split plan: AggregateIndexSearchExec for the indexed fragments,
+            // a normal scan + AggregateExec(Partial) for the rest.
+            let uncovered = &dataset_fragments - &coverage;
+            let pushdown_exec = AggregateIndexSearchExec::try_new_restricted(
+                dataset,
+                aggregates,
+                aggr_exprs.clone(),
+                prefilter_input,
+                Some(&dataset_fragments & &coverage),
+            )?;
+            let partial_state_schema = pushdown_exec.schema();
+            let pushdown_branch: Arc<dyn ExecutionPlan> = Arc::new(pushdown_exec);
+
+            let scan_branch =
+                build_scan_branch(filtered_read, options, &uncovered, aggr_exprs.clone())?;
+
+            // Union exposes one partition per input; CoalescePartitionsExec
+            // flattens them so the Final aggregate sees a single partition
+            // with all the partial-state rows.
+            let union = UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
+            let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
+            (coalesced, partial_state_schema)
+        }
+    };
 
     // Wrap with AggregateExec(Final) so a downstream consumer that expected
     // the original AggregateExec output schema continues to see it.
     let null_filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
-        (0..agg.aggr_expr().len()).map(|_| None).collect();
+        (0..aggr_exprs.len()).map(|_| None).collect();
     let final_agg = AggregateExec::try_new(
         AggregateMode::Final,
         PhysicalGroupBy::default(),
-        agg.aggr_expr().to_vec(),
+        aggr_exprs,
         null_filters,
-        exec,
-        exec_schema,
+        combined,
+        partial_input_schema,
     )?;
     Ok(Some(Arc::new(final_agg)))
+}
+
+/// Build the scan branch of a partial-coverage split: a `FilteredReadExec`
+/// restricted to the uncovered fragments (no `index_input`, the original
+/// `full_filter` applied per row) wrapped in `AggregateExec(Partial)` so its
+/// partial state can be unioned with the pushdown branch.
+fn build_scan_branch(
+    filtered_read: &FilteredReadExec,
+    options: &FilteredReadOptions,
+    uncovered: &RoaringBitmap,
+    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let dataset = filtered_read.dataset().clone();
+    let uncovered_fragments: Vec<_> = dataset
+        .manifest()
+        .fragments
+        .iter()
+        .filter(|f| uncovered.contains(f.id as u32))
+        .cloned()
+        .collect();
+    let mut scan_options = options.clone();
+    scan_options.fragments = Some(Arc::new(uncovered_fragments));
+    let scan = FilteredReadExec::try_new(dataset, scan_options, None)?;
+    let scan: Arc<dyn ExecutionPlan> = Arc::new(scan);
+    let scan_schema = scan.schema();
+    let null_filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
+        (0..aggr_exprs.len()).map(|_| None).collect();
+    let partial = AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::default(),
+        aggr_exprs,
+        null_filters,
+        scan,
+        scan_schema,
+    )?;
+    Ok(Arc::new(partial))
+}
+
+/// Walk a `ScalarIndexExpr` and intersect the per-leaf `fragment_bitmap`.
+///
+/// Returns `None` if any leaf is missing a bitmap (coverage unknown). All
+/// three combinators (`And`, `Or`, `Not`) reduce to "every leaf must cover the
+/// fragment for us to give a definitive answer about it" — i.e. intersection.
+fn collect_coverage(expr: &ScalarIndexExpr) -> Option<RoaringBitmap> {
+    match expr {
+        ScalarIndexExpr::Not(inner) => collect_coverage(inner),
+        ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+            let l = collect_coverage(lhs)?;
+            let r = collect_coverage(rhs)?;
+            Some(l & r)
+        }
+        ScalarIndexExpr::Query(search) => search.fragment_bitmap.clone(),
+    }
 }
 
 /// Returns `true` if `af` is `COUNT(<literal>)` with no DISTINCT.
@@ -263,7 +402,6 @@ mod tests {
         }
     }
 
-    /// True if `plan` contains an `AggregateIndexSearchExec` anywhere in its tree.
     fn plan_contains_pushdown(plan: &Arc<dyn ExecutionPlan>) -> bool {
         let mut found = false;
         plan.apply(|node| {
@@ -278,9 +416,20 @@ mod tests {
         found
     }
 
-    /// Drive the rule via `Scanner::create_plan` (which registers the rule
-    /// through `get_physical_optimizer`) and return both the plan and the
-    /// final count for inspection.
+    fn plan_contains_union(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if node.as_any().is::<UnionExec>() {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+        .unwrap();
+        found
+    }
+
     async fn run_count(
         scanner: &mut crate::dataset::scanner::Scanner,
     ) -> (Arc<dyn ExecutionPlan>, i64) {
@@ -320,35 +469,40 @@ mod tests {
             "expected AggregateIndexSearchExec in plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
+        assert!(
+            !plan_contains_union(&plan),
+            "no union expected for unfiltered count, got: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
     }
 
     #[tokio::test]
-    async fn rule_skips_when_filter_present_even_if_indexed() {
-        // Deferred until the rule can verify the index covers every dataset
-        // fragment — without that check, an index built before a fragment
-        // append silently drops rows. See `rule_skips_partial_index_coverage`
-        // below for the regression scenario this protects against.
+    async fn rule_fires_when_filter_fully_indexed() {
         let fixture = make_fixture().await;
         let mut scanner = fixture.dataset.scan();
         scanner.filter("ordered < 25").unwrap();
         let (plan, count) = run_count(&mut scanner).await;
         assert_eq!(count, 25);
         assert!(
-            !plan_contains_pushdown(&plan),
-            "rule should not fire with any filter in v1, got plan: {}",
+            plan_contains_pushdown(&plan),
+            "expected AggregateIndexSearchExec in plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_contains_union(&plan),
+            "no union expected when index covers every fragment, got: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
 
     #[tokio::test]
-    async fn rule_skips_partial_index_coverage() {
-        // Regression: when an index doesn't cover every dataset fragment
-        // (here, by appending a fragment after the index was built), the rule
-        // must not fire — otherwise rows in unindexed fragments are silently
-        // dropped. Today this is enforced by the blanket "no filter" gate.
+    async fn rule_emits_split_plan_for_partial_index_coverage() {
+        // Build index over 4 fragments, then append a 5th — the index now
+        // covers a strict subset of the dataset. The rule must split into a
+        // pushdown branch over the indexed fragments and a scan branch over
+        // the rest, then sum the partials.
         use crate::dataset::WriteParams;
         let tmp = TempStrDir::default();
-        // Build a 4×10 dataset with a BTree index covering all 4 fragments.
         let mut dataset = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())
             .into_dataset(
@@ -368,7 +522,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // Append a fragment after the index was built — it is unindexed.
         let extra = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())
             .into_reader_rows(
@@ -394,17 +547,19 @@ mod tests {
         // 5 fragments × 10 rows, all match `< 100`.
         assert_eq!(count, 50);
         assert!(
-            !plan_contains_pushdown(&plan),
-            "rule must not fire when the index has partial coverage, got plan: {}",
+            plan_contains_pushdown(&plan),
+            "expected pushdown branch in split plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_contains_union(&plan),
+            "expected UnionExec for partial-coverage split, got: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
 
     #[tokio::test]
     async fn rule_skips_with_stable_row_ids() {
-        // Regression: with stable row IDs the deletion mask is built in
-        // stable-id space while fragments_allow is in row-address space.
-        // ANDing across the two undercounts; refuse to fire.
         use crate::dataset::WriteParams;
         let tmp = TempStrDir::default();
         let mut dataset = gen_batch()
@@ -421,14 +576,11 @@ mod tests {
             )
             .await
             .unwrap();
-        // Touch a deletion so we exercise the masks that would otherwise
-        // collide across id spaces.
         dataset.delete("ordered = 0").await.unwrap();
         let dataset = Arc::new(dataset);
 
         let mut scanner = dataset.scan();
         let (plan, count) = run_count(&mut scanner).await;
-        // 2 × 10 rows, minus the one deletion.
         assert_eq!(count, 19);
         assert!(
             !plan_contains_pushdown(&plan),
@@ -439,8 +591,6 @@ mod tests {
 
     #[tokio::test]
     async fn rule_skips_when_filter_needs_refine() {
-        // No index on `unindexed`, so the filter must be applied during the
-        // scan; the rule must not fire.
         let tmp = TempStrDir::default();
         let mut dataset = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())
@@ -467,8 +617,6 @@ mod tests {
         let mut scanner = dataset.scan();
         scanner.filter("unindexed > 5").unwrap();
         let (plan, count) = run_count(&mut scanner).await;
-        // 40 rows total, values are 0..40 across fragments; `> 5` drops 0..6.
-        // Right answer either way; the point is the rule didn't fire.
         assert_eq!(count, 34);
         assert!(
             !plan_contains_pushdown(&plan),
@@ -480,7 +628,6 @@ mod tests {
     #[tokio::test]
     async fn rule_skips_count_with_group_by() {
         let fixture = make_fixture().await;
-        // GROUP BY isn't supported by the rule yet — make sure we leave it alone.
         let mut scanner = fixture.dataset.scan();
         scanner
             .aggregate(

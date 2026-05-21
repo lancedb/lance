@@ -6433,6 +6433,19 @@ class LanceScanner(pa.dataset.Scanner):
 
         return self._scanner.analyze_plan()
 
+    def analyze_count_plan(self) -> str:
+        """Execute the plan that ``count_rows()`` would use, with runtime
+        metrics. Equivalent to :py:meth:`analyze_plan` but with a ``COUNT(*)``
+        aggregate auto-applied to the scanner, so the returned plan reflects
+        the optimizer's count-pushdown decisions.
+
+        Returns
+        -------
+        plan : str
+        """
+
+        return self._scanner.analyze_count_plan()
+
 
 class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):

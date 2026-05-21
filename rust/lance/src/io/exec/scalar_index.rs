@@ -116,6 +116,7 @@ impl ScalarIndexExec {
         &self.dataset
     }
 
+    /// The parsed scalar-index expression this node will evaluate.
     pub fn expr(&self) -> &ScalarIndexExpr {
         &self.expr
     }
@@ -374,6 +375,7 @@ impl MapIndexExec {
             index_type: String::new(),
             query: Arc::new(SargableQuery::IsIn(index_vals)),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         if !query_result.is_exact() {
@@ -842,6 +844,7 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
 
         let fragments = dataset.fragments().clone();
@@ -937,6 +940,7 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
 
         // These plans aren't even valid but it appears we defer all work (even validation) until

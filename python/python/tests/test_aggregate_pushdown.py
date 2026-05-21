@@ -5,19 +5,23 @@
 
 The optimizer rule under test (`AggregateIndexPushdown`) rewrites
 ``SELECT COUNT(*) ... WHERE indexed_col <op> v`` into
-``AggregateExec(Final) → AggregateIndexSearchExec → ScalarIndexExec``,
-so the count is answered from index metadata + the deletion mask
-without reading any column data.
+``AggregateExec(Final) → AggregateIndexSearchExec → ScalarIndexExec`` when the
+index covers every dataset fragment, or splits into a Union of a pushdown
+branch over the indexed fragments and a scan branch over the rest when
+coverage is partial.
 
 Each test exercises a different state of the dataset (clean, with deletions,
-with updates, with a fully-deleted indexed fragment) and asserts both:
+with updates that introduce unindexed fragments, with a fully-deleted indexed
+fragment) and asserts:
 
   1. The returned count matches the ground truth (correctness), and
   2. The plan routes through ``AggregateIndexSearchExec`` (the rule fired).
 
-The happy-path test additionally re-runs the query and asserts the second
-call performs no I/O — proof that the count is being answered from the
-already-cached index/deletion-mask metadata, not by re-scanning columns.
+For the cases where the index covers the whole dataset, the tests also assert
+no ``LanceRead`` is present in the plan — proof that the count is being
+answered from index metadata, not by scanning column data. The happy-path
+test additionally re-runs the query and asserts the second call performs no
+I/O.
 """
 
 from __future__ import annotations
@@ -27,7 +31,6 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-import pytest
 
 
 # --------------------------------------------------------------------------
@@ -54,16 +57,24 @@ def _make_dataset(tmp_path: Path) -> lance.LanceDataset:
 
 
 def _filtered_count_plan(dataset: lance.LanceDataset, filter: str) -> str:
-    """Return the `analyze_plan()` output for a filtered COUNT(*)."""
-    return dataset.scanner(columns=[], with_row_id=True, filter=filter).analyze_plan()
+    """Return the ``analyze_count_plan()`` output for a filtered ``COUNT(*)``
+    — the same plan ``count_rows(filter=…)`` actually executes."""
+    return dataset.scanner(
+        columns=[], with_row_id=True, filter=filter
+    ).analyze_count_plan()
 
 
 def _assert_pushdown_fired(plan: str) -> None:
     assert "AggregateIndexSearch" in plan, (
         f"expected AggregateIndexSearchExec in plan, got:\n{plan}"
     )
+
+
+def _assert_no_column_scan(plan: str) -> None:
+    """Stricter: no LanceRead anywhere. Only applies when the index covers
+    every dataset fragment (no partial-coverage split branch)."""
     assert "LanceRead" not in plan, (
-        f"unexpected LanceRead in plan — column data was scanned, the rule didn't fire:\n{plan}"
+        f"unexpected LanceRead in plan — column data was scanned:\n{plan}"
     )
 
 
@@ -99,6 +110,7 @@ def test_filtered_count_with_scalar_index(tmp_path: Path):
     # and read the runtime I/O metrics.
     plan = _filtered_count_plan(dataset, filter)
     _assert_pushdown_fired(plan)
+    _assert_no_column_scan(plan)
     assert _io_bytes_read(plan) == 0, (
         f"expected zero I/O on the cached call, got:\n{plan}"
     )
@@ -106,12 +118,17 @@ def test_filtered_count_with_scalar_index(tmp_path: Path):
 
 
 def test_filtered_count_with_deleted_rows(tmp_path: Path):
-    """Some matching rows are deleted — the count must reflect the deletions."""
+    """Some matching rows are deleted — the count must reflect the deletions.
+
+    Deletions don't change fragment coverage, so the index still covers every
+    dataset fragment and the rule emits a single pushdown branch (no scan).
+    """
     dataset = _make_dataset(tmp_path)
     # Delete three rows that match the filter (x < 50).
     dataset.delete("x = 10 OR x = 20 OR x = 30")
     plan = _filtered_count_plan(dataset, "x < 50")
     _assert_pushdown_fired(plan)
+    _assert_no_column_scan(plan)
     assert dataset.count_rows(filter="x < 50") == 50 - 3
 
 
@@ -126,10 +143,11 @@ def test_filtered_count_with_updated_rows(tmp_path: Path):
       - x = 70 → x = 9         (another joins)
 
     Net change: −2 + 2 = 0, so the final count is still 50, but the
-    underlying row identities have shifted. The point is the deletion-mask
-    plumbing in the rewritten plan handles the rewritten fragments
-    correctly (each row update is materialized as a delete + insert in
-    Lance, which the rule has to see through).
+    underlying row identities have shifted. Each update is materialized as
+    a delete + insert into a new fragment in Lance — the new fragments are
+    not in the index's coverage, so the optimizer rule emits a split plan:
+    pushdown for the originally-indexed fragments, plus a scan branch for
+    the rewritten fragments. The final count must still be correct.
     """
     dataset = _make_dataset(tmp_path)
     dataset.update({"x": "100"}, where="x = 5")
@@ -148,9 +166,15 @@ def test_filtered_count_with_whole_fragment_deleted(tmp_path: Path):
 
     Fragment 0 covers x ∈ [0, 25). Deleting all of those rows removes 25
     matches of `x < 50`, dropping the count from 50 to 25.
+
+    Lance retires the now-empty fragment, so the dataset has 3 fragments
+    while the index still claims 4 — the index is a strict *superset* of
+    the dataset, which is safe (the extra index entries simply don't
+    apply). The rule emits a single pushdown branch (no scan needed).
     """
     dataset = _make_dataset(tmp_path)
     dataset.delete("x < 25")
     plan = _filtered_count_plan(dataset, "x < 50")
     _assert_pushdown_fired(plan)
+    _assert_no_column_scan(plan)
     assert dataset.count_rows(filter="x < 50") == 25
