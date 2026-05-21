@@ -3663,6 +3663,42 @@ class DatasetOptimizer:
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
+    def merge_existing_index_segments(
+        self,
+        indices: List[dict],
+        num_indices_to_merge: int = 1,
+    ) -> dict:
+        """Merge existing index segments into a single index, without committing.
+
+        This takes a list of index metadata dictionaries (as returned by
+        ``create_scalar_index(fragment_ids=...)`` or ``list_indices()``) and
+        merges them into a single new index. The merged index is not committed
+        to the dataset manifest; instead, its metadata dictionary is returned.
+
+        This is useful for incrementally building up a scalar index by creating
+        uncommitted index segments for new fragments and then merging them with
+        existing committed indices.
+
+        Parameters
+        ----------
+        indices : list of dict
+            A list of index metadata dictionaries. Each dict must contain
+            the keys: ``uuid``, ``name``, ``fields``, ``dataset_version``,
+            and ``fragment_bitmap``.
+        num_indices_to_merge : int, default 1
+            The number of indices to merge.
+
+        Returns
+        -------
+        dict
+            The metadata dictionary of the merged index, containing keys:
+            ``uuid``, ``name``, ``fields``, ``dataset_version``,
+            ``fragment_bitmap``.
+        """
+        return self._dataset._ds.merge_existing_index_segments(
+            indices, {"num_indices_to_merge": num_indices_to_merge}
+        )
+
 
 class Tags:
     """

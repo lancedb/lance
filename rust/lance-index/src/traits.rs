@@ -99,6 +99,20 @@ pub trait DatasetIndexExt {
         index_id: Uuid,
     ) -> Result<()>;
 
+    /// Merge existing index segments (deltas) into a single index,
+    /// without committing the result to the dataset manifest.
+    ///
+    /// This takes a list of [`Index`] metadata (which may include both
+    /// committed and uncommitted index segments) and merges them into
+    /// a single new index.
+    ///
+    /// Returns the new [`Index`] metadata for the merged index.
+    async fn merge_existing_index_segments(
+        &self,
+        indices: Vec<Index>,
+        options: &OptimizeOptions,
+    ) -> Result<Index>;
+
     async fn read_index_partition(
         &self,
         index_name: &str,

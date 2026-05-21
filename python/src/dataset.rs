@@ -1161,7 +1161,84 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
+    #[pyo3(signature = (indices, kwargs=None))]
+    fn merge_existing_index_segments(
+        &self,
+        indices: &Bound<'_, PyList>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PyObject> {
+        let mut index_metas: Vec<lance_table::format::Index> = Vec::with_capacity(indices.len());
+        for item in indices.iter() {
+            let idx_dict = item.downcast::<PyDict>()?;
+            let uuid_str: String = idx_dict
+                .get_item("uuid")?
+                .ok_or_else(|| PyValueError::new_err("index dict must have 'uuid' key"))?
+                .extract()?;
+            let uuid = uuid::Uuid::parse_str(&uuid_str)
+                .map_err(|e| PyValueError::new_err(format!("invalid uuid: {}", e)))?;
+            let name: String = idx_dict
+                .get_item("name")?
+                .ok_or_else(|| PyValueError::new_err("index dict must have 'name' key"))?
+                .extract()?;
+            let fields: Vec<i32> = idx_dict
+                .get_item("fields")?
+                .ok_or_else(|| PyValueError::new_err("index dict must have 'fields' key"))?
+                .extract()?;
+            let dataset_version: u64 = idx_dict
+                .get_item("dataset_version")?
+                .ok_or_else(|| PyValueError::new_err("index dict must have 'dataset_version' key"))?
+                .extract()?;
+            let fragment_bitmap = match idx_dict.get_item("fragment_bitmap")? {
+                Some(item) => {
+                    let ids: Vec<u32> = item.extract()?;
+                    let mut bitmap = roaring::RoaringBitmap::new();
+                    for id in ids {
+                        bitmap.insert(id);
+                    }
+                    Some(bitmap)
+                }
+                None => None,
+            };
+
+            index_metas.push(lance_table::format::Index {
+                uuid,
+                name,
+                fields,
+                dataset_version,
+                fragment_bitmap,
+                index_details: None,
+            });
+        }
+
+        let mut options: OptimizeOptions = Default::default();
+        if let Some(kwargs) = kwargs {
+            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
+                options.num_indices_to_merge = num_indices_to_merge.extract()?;
+            }
+        }
+
+        let merged = RT
+            .block_on(
+                None,
+                self.ds.merge_existing_index_segments(index_metas, &options),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("uuid", merged.uuid.to_string())?;
+            dict.set_item("name", merged.name.clone())?;
+            dict.set_item("fields", merged.fields.clone())?;
+            dict.set_item("dataset_version", merged.dataset_version)?;
+            if let Some(bitmap) = &merged.fragment_bitmap {
+                let frag_ids: Vec<u32> = bitmap.iter().collect();
+                dict.set_item("fragment_bitmap", frag_ids)?;
+            } else {
+                dict.set_item("fragment_bitmap", py.None())?;
+            }
+            Ok(dict.into())
+        })
+    }
     fn create_index(
         &mut self,
         columns: Vec<PyBackedStr>,

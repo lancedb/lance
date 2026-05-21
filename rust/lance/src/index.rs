@@ -742,6 +742,44 @@ impl DatasetIndexExt for Dataset {
             ))),
         }
     }
+
+    async fn merge_existing_index_segments(
+        &self,
+        indices: Vec<IndexMetadata>,
+        options: &OptimizeOptions,
+    ) -> Result<IndexMetadata> {
+        if indices.is_empty() {
+            return Err(Error::Index {
+                message: "merge_existing_index_segments: no indices provided".to_string(),
+                location: location!(),
+            });
+        }
+
+        let dataset = Arc::new(self.clone());
+        let indices_refs: Vec<&IndexMetadata> = indices.iter().collect();
+
+        let (new_uuid, removed, mut new_frag_ids) =
+            merge_indices(dataset, &indices_refs, options)
+                .await?
+                .ok_or_else(|| Error::Index {
+                    message: "merge_existing_index_segments: merge produced no result".to_string(),
+                    location: location!(),
+                })?;
+
+        for removed_idx in removed.iter() {
+            new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
+        }
+
+        let last_idx = indices.last().expect("indices should not be empty");
+        Ok(IndexMetadata {
+            uuid: new_uuid,
+            name: last_idx.name.clone(),
+            fields: last_idx.fields.clone(),
+            dataset_version: self.manifest.version,
+            fragment_bitmap: Some(new_frag_ids),
+            index_details: last_idx.index_details.clone(),
+        })
+    }
 }
 
 /// A trait for internal dataset utilities
