@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Physical optimizer rule that rewrites index-answerable aggregates into
-//! [`AggregateIndexSearchExec`].
+//! Physical optimizer rule that rewrites a `COUNT(*)`-style aggregate into
+//! [`CountFromMaskExec`], answering the count from index metadata and the
+//! deletion mask without scanning column data.
 //!
-//! The v1 implementation only recognizes non-distinct `COUNT(<literal>)`
-//! aggregates, but the surrounding plumbing — the exec, the trait, the rule
-//! shape — is built to grow to other aggregates (`MIN`/`MAX` over a zone
-//! map, `COUNT(DISTINCT)` over a bitmap dictionary, etc.) without changing
-//! the plan layout below.
+//! This is the "count-from-mask" category of aggregate pushdown — one of
+//! four planned. The other categories (mask-to-answer, zone-aware,
+//! dimension-keyed) will each need their own rule and exec; the surrounding
+//! infrastructure (the `fragment_bitmap` plumbed on each `ScalarIndexSearch`,
+//! the `IndexInformationProvider::fragment_bitmap` lookup) is general
+//! enough to be reused.
 //!
 //! Two rewritten shapes are emitted depending on whether the scalar index
 //! backing the filter covers every dataset fragment.
@@ -16,21 +18,21 @@
 //! **Full coverage** (index ⊇ dataset, or no filter at all):
 //!
 //! ```text
-//! AggregateExec(Final, aggs=[…], group_by=[])
-//!   └── AggregateIndexSearchExec { prefilter_input = index_input }
+//! AggregateExec(Final, aggs=[count(...)], group_by=[])
+//!   └── CountFromMaskExec { prefilter_input = index_input }
 //! ```
 //!
 //! **Partial coverage** (index ⊊ dataset — typically appended fragments):
 //!
 //! ```text
-//! AggregateExec(Final, aggs=[…], group_by=[])
+//! AggregateExec(Final, aggs=[count(...)], group_by=[])
 //!   └── UnionExec
-//!         ├── AggregateIndexSearchExec(restrict_to_fragments = indexed)
+//!         ├── CountFromMaskExec(restrict_to_fragments = indexed)
 //!         └── AggregateExec(Partial)
 //!               └── FilteredReadExec(fragments = unindexed, full_filter = …)
 //! ```
 //!
-//! [`AggregateIndexSearchExec`] emits partial-state, so the outer
+//! [`CountFromMaskExec`] emits partial-state, so the outer
 //! `AggregateExec(Final)` performs the final combine in either shape.
 //!
 //! If the prefilter's index coverage is unknown (any leaf is missing
@@ -42,7 +44,6 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::lit;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
@@ -54,32 +55,27 @@ use datafusion::physical_plan::{
     repartition::RepartitionExec,
     union::UnionExec,
 };
-use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
-use datafusion_physical_expr::expressions::Literal;
-use log::warn;
-use lance_index::expression::aggregate::{AggregateIndexSearch, CountQuery};
+use datafusion_physical_expr::expressions::{Column, Literal};
 use lance_index::scalar::expression::ScalarIndexExpr;
+use log::warn;
 use roaring::RoaringBitmap;
 
-use super::aggregate_index::AggregateIndexSearchExec;
+use super::count_from_mask::CountFromMaskExec;
 use super::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use super::scalar_index::ScalarIndexExec;
 
-/// Physical optimizer rule that pushes index-answerable aggregates into
-/// [`AggregateIndexSearchExec`], optionally splitting into a parallel scan
-/// branch when the index has partial coverage of the dataset.
+/// Physical optimizer rule that rewrites a `COUNT(*)`-style aggregate into
+/// [`CountFromMaskExec`], optionally splitting into a parallel scan branch
+/// when the index has partial coverage of the dataset.
 ///
 /// Only fires when the shape is verifiably safe; everything outside that
-/// envelope (GROUP BY, residual filters, scan ranges, etc.) is left alone for
-/// the normal scan path. v1 only recognizes non-distinct `COUNT(<literal>)`;
-/// future aggregates plug in via the same rewrite, just with different
-/// [`AggregateIndexSearch`] queries and `ScalarIndex::calculate_aggregate`
-/// impls.
+/// envelope (GROUP BY, residual filters, scan ranges, etc.) is left alone
+/// for the normal scan path.
 #[derive(Debug)]
-pub struct AggregateIndexPushdown;
+pub struct CountPushdown;
 
-impl PhysicalOptimizerRule for AggregateIndexPushdown {
+impl PhysicalOptimizerRule for CountPushdown {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -99,7 +95,7 @@ impl PhysicalOptimizerRule for AggregateIndexPushdown {
     }
 
     fn name(&self) -> &str {
-        "aggregate_index_pushdown"
+        "count_pushdown"
     }
 
     fn schema_check(&self) -> bool {
@@ -126,12 +122,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         return Ok(None);
     }
 
-    // v1: every aggregate must be a `COUNT(<literal>)` shape (i.e. COUNT(*) /
-    // COUNT(1) / etc.) with no per-aggregate FILTER. As more aggregates grow
-    // their own `ScalarIndex::calculate_aggregate` impls (MIN/MAX off a zone
-    // map, exact `COUNT(DISTINCT)` off a bitmap, …) this gate should grow
-    // accordingly — keep the per-aggregate FILTER rejection regardless,
-    // since per-aggregate filters depend on column values we can't scan.
+    // Every aggregate must be a `COUNT(<literal>)` shape (i.e. COUNT(*) /
+    // COUNT(1) / etc.) with no per-aggregate `FILTER (WHERE ...)`. This rule
+    // is scoped to the count-from-mask category only; other aggregate
+    // categories (mask-to-answer, zone-aware, dimension-keyed) will need
+    // their own rules with their own gates.
     for (af, filter) in agg.aggr_expr().iter().zip(agg.filter_expr().iter()) {
         if !is_count_star(af) {
             return Ok(None);
@@ -151,16 +146,17 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         return Ok(None);
     };
 
-    // Stable-row-id mode: `DatasetPreFilter::create_deletion_mask` produces an
-    // AllowList in stable-id space, but `AggregateIndexSearchExec` builds its
-    // fragments-allow list in row-address space. ANDing across the two yields
-    // a silently wrong count (rows in fragments > 0 are dropped because their
-    // stable ids and row addresses share a fragment-id bucket only by accident).
-    // Until the exec can reconcile the two id spaces, refuse to fire — but
-    // warn so we notice the lost optimization opportunity.
+    // Stable-row-id mode: `DatasetPreFilter::create_deletion_mask` produces
+    // an AllowList in stable-id space, but `CountFromMaskExec` builds its
+    // fragments-allow list in row-address space. ANDing across the two
+    // yields a silently wrong count (rows in fragments > 0 are dropped
+    // because their stable ids and row addresses share a fragment-id bucket
+    // only by accident). Until the exec can reconcile the two id spaces,
+    // refuse to fire — but warn so we notice the lost optimization
+    // opportunity.
     if filtered_read.dataset().manifest().uses_stable_row_ids() {
         warn!(
-            "aggregate_index_pushdown: skipped because the dataset uses stable row ids; \
+            "count_pushdown: skipped because the dataset uses stable row ids; \
              the count will be computed via a full scan. Reconciling the two id spaces \
              would let this query be answered from index metadata."
         );
@@ -188,8 +184,8 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     // shape we could in principle accelerate but currently can't.
     if options.with_deleted_rows {
         warn!(
-            "aggregate_index_pushdown: skipped because the FilteredReadExec was \
-             built with with_deleted_rows; the count will be computed via a full \
+            "count_pushdown: skipped because the FilteredReadExec was built \
+             with with_deleted_rows; the count will be computed via a full \
              scan."
         );
         return Ok(None);
@@ -198,9 +194,9 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     // alongside an aggregate, and we lose the pushdown opportunity.
     if options.fragments.is_some() {
         warn!(
-            "aggregate_index_pushdown: skipped because the FilteredReadExec was \
-             scoped to an explicit fragment subset; the count will be computed via \
-             a full scan. Intersecting that subset into the coverage logic would \
+            "count_pushdown: skipped because the FilteredReadExec was scoped \
+             to an explicit fragment subset; the count will be computed via a \
+             full scan. Intersecting that subset into the coverage logic would \
              let this query be answered from index metadata."
         );
         return Ok(None);
@@ -228,9 +224,9 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
                 .downcast_ref::<ScalarIndexExec>()
                 .ok_or_else(|| {
                     datafusion::error::DataFusionError::Internal(
-                    "AggregateIndexPushdown: FilteredReadExec.index_input is not a ScalarIndexExec"
-                        .to_string(),
-                )
+                        "count_pushdown: FilteredReadExec.index_input is not a ScalarIndexExec"
+                            .to_string(),
+                    )
                 })?;
             if scalar_exec.expr().needs_recheck() {
                 return Ok(None);
@@ -243,19 +239,6 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     };
 
     let aggr_exprs: Vec<Arc<AggregateFunctionExpr>> = agg.aggr_expr().to_vec();
-    let aggregates: Vec<Arc<AggregateIndexSearch>> = aggr_exprs
-        .iter()
-        .map(|_| {
-            Arc::new(AggregateIndexSearch {
-                index_name: None,
-                query: Arc::new(CountQuery::basic()),
-                filter: None,
-                // `original_expr` is only used for `Display`; the physical
-                // plan no longer carries the source `Expr`.
-                original_expr: lit(0i64),
-            })
-        })
-        .collect();
 
     // Decide on the plan shape. Three cases:
     //
@@ -269,9 +252,8 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     {
         None => {
             // No prefilter at all (verified above): nothing to restrict.
-            let exec = AggregateIndexSearchExec::try_new_restricted(
+            let exec = CountFromMaskExec::try_new_restricted(
                 dataset,
-                aggregates,
                 aggr_exprs.clone(),
                 prefilter_input,
                 None,
@@ -282,9 +264,8 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         Some(coverage) if (&dataset_fragments - &coverage).is_empty() => {
             // Prefilter exists and the index covers every dataset fragment —
             // safe to push the whole count down.
-            let exec = AggregateIndexSearchExec::try_new_restricted(
+            let exec = CountFromMaskExec::try_new_restricted(
                 dataset,
-                aggregates,
                 aggr_exprs.clone(),
                 prefilter_input,
                 None,
@@ -293,12 +274,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             (Arc::new(exec), schema)
         }
         Some(coverage) => {
-            // Split plan: AggregateIndexSearchExec for the indexed fragments,
-            // a normal scan + AggregateExec(Partial) for the rest.
+            // Split plan: CountFromMaskExec for the indexed fragments, a
+            // normal scan + AggregateExec(Partial) for the rest.
             let uncovered = &dataset_fragments - &coverage;
-            let pushdown_exec = AggregateIndexSearchExec::try_new_restricted(
+            let pushdown_exec = CountFromMaskExec::try_new_restricted(
                 dataset,
-                aggregates,
                 aggr_exprs.clone(),
                 prefilter_input,
                 Some(&dataset_fragments & &coverage),
@@ -536,7 +516,7 @@ mod tests {
     fn plan_contains_pushdown(plan: &Arc<dyn ExecutionPlan>) -> bool {
         let mut found = false;
         plan.apply(|node| {
-            if node.as_any().is::<AggregateIndexSearchExec>() {
+            if node.as_any().is::<CountFromMaskExec>() {
                 found = true;
                 Ok(TreeNodeRecursion::Stop)
             } else {
@@ -597,7 +577,7 @@ mod tests {
         assert_eq!(count, 40);
         assert!(
             plan_contains_pushdown(&plan),
-            "expected AggregateIndexSearchExec in plan: {}",
+            "expected CountFromMaskExec in plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
         assert!(
@@ -616,7 +596,7 @@ mod tests {
         assert_eq!(count, 25);
         assert!(
             plan_contains_pushdown(&plan),
-            "expected AggregateIndexSearchExec in plan: {}",
+            "expected CountFromMaskExec in plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
         assert!(
@@ -759,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn rule_skips_when_index_is_inexact() {
         // Zonemap-style indices return AtMost (over-approximation) and set
-        // ScalarIndexSearch.needs_recheck = true. AggregateIndexSearchExec
+        // ScalarIndexSearch.needs_recheck = true. CountFromMaskExec
         // ignores the discriminant on the prefilter batch, so firing the
         // rule against an inexact index would silently overcount. The rule
         // must refuse — and the scan path with its recheck still answers

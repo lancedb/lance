@@ -3,7 +3,7 @@
 
 // NOTE: we only create one integration test binary, to keep compilation overhead down.
 
-mod aggregate_pushdown;
+mod count_pushdown;
 #[cfg(feature = "slow_tests")]
 mod query;
 #[cfg(feature = "slow_tests")]

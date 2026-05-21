@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-"""End-to-end tests for aggregate pushdown.
+"""End-to-end tests for count-from-mask pushdown.
 
-The optimizer rule under test (`AggregateIndexPushdown`) rewrites
+The optimizer rule under test (`CountPushdown`) rewrites
 ``SELECT COUNT(*) ... WHERE indexed_col <op> v`` into
-``AggregateExec(Final) → AggregateIndexSearchExec → ScalarIndexExec`` when the
+``AggregateExec(Final) → CountFromMaskExec → ScalarIndexExec`` when the
 index covers every dataset fragment, or splits into a Union of a pushdown
 branch over the indexed fragments and a scan branch over the rest when
-coverage is partial.
+coverage is partial. This is category 1 (count-from-mask) of the four
+aggregate-acceleration categories; the other three (mask-to-answer,
+zone-aware, dimension-keyed) are not implemented yet.
 
 Each test exercises a different state of the dataset (clean, with deletions,
 with updates that introduce unindexed fragments, with a fully-deleted indexed
 fragment) and asserts:
 
   1. The returned count matches the ground truth (correctness), and
-  2. The plan routes through ``AggregateIndexSearchExec`` (the rule fired).
+  2. The plan routes through ``CountFromMaskExec`` (the rule fired).
 
 For the cases where the index covers the whole dataset, the tests also assert
 no ``LanceRead`` is present in the plan — proof that the count is being
@@ -64,8 +66,8 @@ def _filtered_count_plan(dataset: lance.LanceDataset, filter: str) -> str:
 
 
 def _assert_pushdown_fired(plan: str) -> None:
-    assert "AggregateIndexSearch" in plan, (
-        f"expected AggregateIndexSearchExec in plan, got:\n{plan}"
+    assert "CountFromMask" in plan, (
+        f"expected CountFromMaskExec in plan, got:\n{plan}"
     )
 
 

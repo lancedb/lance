@@ -269,8 +269,8 @@ async fn test_count_star_single_fragment() {
         vec![],
     );
 
-    // COUNT(*) is rewritten by AggregateIndexPushdown into a Final aggregate
-    // over AggregateIndexSearchExec, which answers from manifest metadata + the
+    // COUNT(*) is rewritten by CountPushdown into a Final aggregate
+    // over CountFromMaskExec, which answers from manifest metadata + the
     // deletion mask instead of scanning column data.
     let mut scanner = ds.scan();
     scanner
@@ -280,7 +280,7 @@ async fn test_count_star_single_fragment() {
     assert_plan_node_equals(
         plan,
         "AggregateExec: mode=Final, gby=[], aggr=[count(...)]
-  AggregateIndexSearch: aggs=[count@\"*\"]",
+  CountFromMask",
     )
     .await
     .unwrap();
@@ -1207,12 +1207,12 @@ async fn test_scanner_count_rows() {
         .unwrap();
     let plan = scanner.create_plan().await.unwrap();
 
-    // COUNT(*) is rewritten by AggregateIndexPushdown into a Final aggregate
-    // over AggregateIndexSearchExec.
+    // COUNT(*) is rewritten by CountPushdown into a Final aggregate
+    // over CountFromMaskExec.
     assert_plan_node_equals(
         plan.clone(),
         "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
-  AggregateIndexSearch: aggs=[count@\"*\"]",
+  CountFromMask",
     )
     .await
     .unwrap();
@@ -1263,7 +1263,7 @@ async fn test_scanner_count_rows_with_filter() {
 async fn test_scanner_count_rows_with_indexed_filter() {
     // When the filter is fully evaluable by a scalar index that covers
     // every dataset fragment, the rule rewrites COUNT(*) into a Final
-    // aggregate over AggregateIndexSearchExec, with the ScalarIndexExec
+    // aggregate over CountFromMaskExec, with the ScalarIndexExec
     // wired in as the prefilter — no LanceRead, no column scan.
     let mut ds = create_numeric_dataset("memory://test_count_indexed", 2, 50).await;
     ds.create_index(
@@ -1286,7 +1286,7 @@ async fn test_scanner_count_rows_with_indexed_filter() {
     assert_plan_node_equals(
         plan.clone(),
         "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
-  AggregateIndexSearch: aggs=[count@\"*\"]
+  CountFromMask
     ScalarIndexQuery: query=[x < 50]@x_idx(BTree)",
     )
     .await
@@ -1305,7 +1305,7 @@ async fn test_scanner_count_rows_with_indexed_filter() {
 async fn test_scanner_count_rows_with_partial_index_coverage() {
     // Index covers the first two fragments, then a third fragment is
     // appended. The rule cannot answer the count from the index alone for
-    // the appended fragment, so it emits a split plan: AggregateIndexSearch
+    // the appended fragment, so it emits a split plan: CountFromMaskExec
     // over the indexed fragments + AggregateExec(Partial)/FilteredReadExec
     // over the rest, both unioned and summed by AggregateExec(Final).
     let tmp = tempdir().unwrap();
@@ -1358,7 +1358,7 @@ async fn test_scanner_count_rows_with_partial_index_coverage() {
         "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
   CoalescePartitionsExec
     UnionExec
-      AggregateIndexSearch: aggs=[count@\"*\"]
+      CountFromMask
         ScalarIndexQuery: query=[x < 1000]@x_idx(BTree)
       AggregateExec: mode=Partial, gby=[], aggr=[count(Int32(1))]
         LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=x < Int64(1000), refine_filter=--",

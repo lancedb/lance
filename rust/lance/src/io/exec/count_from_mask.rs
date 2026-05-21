@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Execute-time half of aggregate pushdown.
+//! Execute-time half of the count-from-mask category of aggregate pushdown.
 //!
-//! [`AggregateIndexSearchExec`] computes partial aggregate state for one or
-//! more aggregates by probing scalar indices, without scanning column data.
+//! [`CountFromMaskExec`] computes a `COUNT(*)`-style aggregate's partial
+//! state directly from index/manifest metadata, without scanning column
+//! data. Conceptually:
+//!
+//! ```text
+//! result = | fragments_allow ∩ optional_prefilter_mask − deletion_mask |
+//! ```
+//!
 //! Its output schema matches what `AggregateExec(AggregateMode::Partial)`
-//! would produce for the same aggregates, so a downstream `AggregateExec`
-//! in `Final`/`FinalPartitioned` mode can combine us unchanged.
+//! would produce for the same `COUNT` aggregates, so a downstream
+//! `AggregateExec(Final)` can combine the result unchanged.
+//!
+//! This is one of four categories of aggregate acceleration we plan to
+//! support; the others (mask-to-answer, zone-aware, dimension-keyed) each
+//! need additional plumbing — see the corresponding design issue.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,122 +32,86 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap};
+use lance_core::utils::mask::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_core::{Error, Result};
-use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC};
-use lance_index::expression::aggregate::{AggregateIndexSearch, CountQuery};
-use lance_index::scalar::{ScalarIndex, SearchResult};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
-use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::utils::InstrumentedRecordBatchStreamAdapter;
 use crate::Dataset;
-use crate::index::DatasetIndexExt;
 use crate::index::prefilter::DatasetPreFilter;
-use crate::index::scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap};
 
-/// An execution node that answers a set of aggregates from scalar indices.
+/// An execution node that computes a `COUNT(*)`-style aggregate from an
+/// optional row-address mask supplied by an upstream scalar-index search,
+/// combined with the dataset's deletion mask and an optional restriction to
+/// a fragment subset.
 ///
-/// The node returns a single record batch whose schema is the concatenation
-/// of `state_fields()` for each aggregate in `aggregate_funcs`.
-///
-/// It optionally has a single child [`super::scalar_index::ScalarIndexExec`]
-/// whose output is used as a prefilter for each aggregate.
+/// The node returns one record batch with one row whose columns are the
+/// partial-state representation of each `COUNT` in `aggregate_funcs` — i.e.
+/// the same shape an `AggregateExec(Partial)` would emit.
 #[derive(Debug)]
-pub struct AggregateIndexSearchExec {
+pub struct CountFromMaskExec {
     dataset: Arc<Dataset>,
-    aggregates: Vec<Arc<AggregateIndexSearch>>,
+    /// One per output column. Used only for `state_fields()` to build the
+    /// output schema; the actual count is computed identically for all of
+    /// them since every entry is a non-distinct `COUNT(<literal>)`.
     aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
+    /// Optional [`super::scalar_index::ScalarIndexExec`] producing the row-
+    /// address mask to count.
     prefilter_input: Option<Arc<dyn ExecutionPlan>>,
     /// Restrict the count to this fragment subset. `None` means "every
-    /// fragment in the dataset". The optimizer rule uses this to scope the
+    /// fragment in the dataset." The optimizer rule uses this to scope the
     /// pushdown branch of a partial-coverage split plan to the indexed
-    /// fragments only — the uncovered ones are handled by a parallel scan
-    /// branch.
+    /// fragments only — the uncovered fragments are handled by a parallel
+    /// scan branch.
     restrict_to_fragments: Option<RoaringBitmap>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
-impl DisplayAs for AggregateIndexSearchExec {
+impl DisplayAs for CountFromMaskExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let names = self
-            .aggregates
-            .iter()
-            .map(|agg| agg.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "AggregateIndexSearch: aggs=[{}]", names)
+                write!(f, "CountFromMask")
             }
-            DisplayFormatType::TreeRender => {
-                write!(f, "AggregateIndexSearch\naggs=[{}]", names)
-            }
+            DisplayFormatType::TreeRender => write!(f, "CountFromMask"),
         }
     }
 }
 
-impl AggregateIndexSearchExec {
+impl CountFromMaskExec {
     /// Build a new node.
     ///
-    /// `aggregates` and `aggregate_funcs` must have the same length — each
-    /// aggregate query is paired with its DataFusion partial-state spec.
-    /// `prefilter_input`, if present, must produce a single batch in the
-    /// scalar-index result schema; that mask is intersected with the
-    /// aggregate's natural fragment coverage and the active deletion mask.
+    /// `aggregate_funcs` must be a non-empty set of non-distinct `COUNT`
+    /// aggregates (the optimizer rule guarantees this). `prefilter_input`,
+    /// if present, must produce a single batch in the scalar-index result
+    /// schema; that mask is intersected with the dataset's covered
+    /// fragments and the active deletion mask.
     pub fn try_new(
         dataset: Arc<Dataset>,
-        aggregates: Vec<Arc<AggregateIndexSearch>>,
         aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
-        Self::try_new_restricted(dataset, aggregates, aggregate_funcs, prefilter_input, None)
+        Self::try_new_restricted(dataset, aggregate_funcs, prefilter_input, None)
     }
 
     /// Like [`Self::try_new`] but scopes the count to a fragment subset
-    /// rather than the whole dataset. The optimizer rule for aggregate
-    /// pushdown uses this to handle partial-index-coverage by emitting a
-    /// pushdown branch over the indexed fragments alongside a scan branch
-    /// over the rest.
+    /// rather than the whole dataset. The optimizer rule uses this for the
+    /// pushdown branch of a partial-coverage split plan, so the count only
+    /// covers the fragments the prefilter's index can answer for.
     pub fn try_new_restricted(
         dataset: Arc<Dataset>,
-        aggregates: Vec<Arc<AggregateIndexSearch>>,
         aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
         restrict_to_fragments: Option<RoaringBitmap>,
     ) -> Result<Self> {
-        if aggregates.len() != aggregate_funcs.len() {
-            return Err(Error::invalid_input(format!(
-                "AggregateIndexSearchExec: aggregates ({}) and aggregate_funcs ({}) length mismatch",
-                aggregates.len(),
-                aggregate_funcs.len()
-            )));
-        }
-
-        for agg in &aggregates {
-            if agg.index_name.is_none() {
-                // The only aggregate we can answer without an associated index
-                // is a non-distinct COUNT.
-                let count = agg
-                    .query
-                    .as_any()
-                    .downcast_ref::<CountQuery>()
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "AggregateIndexSearchExec: aggregate {} has no associated index but is not a count",
-                            agg
-                        ))
-                    })?;
-                if count.is_distinct() {
-                    return Err(Error::invalid_input(format!(
-                        "AggregateIndexSearchExec: aggregate {} has no associated index but is a distinct count",
-                        agg
-                    )));
-                }
-            }
+        if aggregate_funcs.is_empty() {
+            return Err(Error::invalid_input(
+                "CountFromMaskExec requires at least one aggregate".to_string(),
+            ));
         }
 
         let state_fields = aggregate_funcs
@@ -161,7 +135,6 @@ impl AggregateIndexSearchExec {
 
         Ok(Self {
             dataset,
-            aggregates,
             aggregate_funcs,
             prefilter_input,
             restrict_to_fragments,
@@ -171,8 +144,8 @@ impl AggregateIndexSearchExec {
         })
     }
 
-    /// Drain `prefilter_input` (a [`super::scalar_index::ScalarIndexExec`]) to
-    /// produce the row-address mask it serialized.
+    /// Drain `prefilter_input` (a [`super::scalar_index::ScalarIndexExec`])
+    /// to produce the row-address mask it serialized.
     async fn load_prefilter(
         prefilter_input: Arc<dyn ExecutionPlan>,
         context: Arc<datafusion::execution::context::TaskContext>,
@@ -184,7 +157,7 @@ impl AggregateIndexSearchExec {
             .map_err(Error::from)?
             .ok_or_else(|| {
                 Error::internal(
-                    "AggregateIndexSearchExec: prefilter input produced no batches".to_string(),
+                    "CountFromMaskExec: prefilter input produced no batches".to_string(),
                 )
             })?;
         // Drain any remaining batches so the upstream sees a clean shutdown.
@@ -196,82 +169,15 @@ impl AggregateIndexSearchExec {
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
                 Error::internal(format!(
-                    "AggregateIndexSearchExec: prefilter result column has type {:?}, expected Binary",
+                    "CountFromMaskExec: prefilter result column has type {:?}, expected Binary",
                     batch.column(0).data_type()
                 ))
             })?;
         RowAddrMask::from_arrow(result_col)
     }
 
-    /// Look up the column name an index lives on by inspecting manifest metadata.
-    async fn column_for_index(dataset: &Dataset, index_name: &str) -> Result<String> {
-        let indices = dataset.load_indices_by_name(index_name).await?;
-        let index = indices.into_iter().next().ok_or_else(|| {
-            Error::internal(format!(
-                "AggregateIndexSearchExec: no index named '{}' found",
-                index_name
-            ))
-        })?;
-        let field_id = *index.fields.first().ok_or_else(|| {
-            Error::internal(format!(
-                "AggregateIndexSearchExec: index '{}' has no field bindings",
-                index_name
-            ))
-        })?;
-        let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
-            Error::internal(format!(
-                "AggregateIndexSearchExec: index '{}' references unknown field id {}",
-                index_name, field_id
-            ))
-        })?;
-        Ok(field.name.clone())
-    }
-
-    /// Load every backing index referenced by the aggregates and the fragment
-    /// bitmap each one covers.
-    ///
-    /// The returned vectors are aligned with `aggregates`: aggregates without
-    /// an `index_name` produce `None` in `indices` and contribute no fragment
-    /// bitmap to the intersection.
-    async fn load_indices(
-        dataset: Arc<Dataset>,
-        aggregates: Vec<Arc<AggregateIndexSearch>>,
-        index_metrics: IndexMetrics,
-    ) -> Result<(Vec<Option<Arc<dyn ScalarIndex>>>, Option<RoaringBitmap>)> {
-        let mut indices = Vec::with_capacity(aggregates.len());
-        let mut fragments_intersection: Option<RoaringBitmap> = None;
-        for agg in &aggregates {
-            match &agg.index_name {
-                None => indices.push(None),
-                Some(index_name) => {
-                    let column = Self::column_for_index(&dataset, index_name).await?;
-                    let bitmap = scalar_index_fragment_bitmap(&dataset, &column, index_name)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::internal(format!(
-                                "AggregateIndexSearchExec: index '{}' has no fragment bitmap",
-                                index_name
-                            ))
-                        })?;
-                    fragments_intersection = Some(match fragments_intersection.take() {
-                        None => bitmap,
-                        Some(existing) => existing & bitmap,
-                    });
-                    let index =
-                        open_named_scalar_index(&dataset, &column, index_name, &index_metrics)
-                            .await?;
-                    indices.push(Some(index));
-                }
-            }
-        }
-        Ok((indices, fragments_intersection))
-    }
-
-    /// Apply the user's algorithm to fold the prefilter, fragment allow list,
-    /// and deletion mask into a single [`RowAddrMask`].
-    ///
-    /// The result is always an `AllowList` so it can be wrapped in a
-    /// [`SearchResult::Exact`] for [`ScalarIndex::calculate_aggregate`].
+    /// Fold the prefilter, fragment allow list, and deletion mask into a
+    /// single `AllowList`-shaped [`RowAddrMask`] suitable for counting.
     fn combine_masks(
         fragments_allow: RowAddrTreeMap,
         prefilter: Option<RowAddrMask>,
@@ -289,12 +195,11 @@ impl AggregateIndexSearchExec {
     }
 
     /// Count the rows selected by `mask`, looking up `Full`-marker fragments
-    /// in the manifest so we never need to materialize a `RoaringBitmap::full()`.
+    /// in the manifest so we never need to materialize a
+    /// `RoaringBitmap::full()`.
     fn count_from_mask(mask: &RowAddrMask, dataset: &Dataset) -> Result<i64> {
         let allow = mask.allow_list().ok_or_else(|| {
-            Error::internal(
-                "AggregateIndexSearchExec: combined mask is not an AllowList".to_string(),
-            )
+            Error::internal("CountFromMaskExec: combined mask is not an AllowList".to_string())
         })?;
         let frag_map: HashMap<u32, &Fragment> = dataset
             .fragments()
@@ -309,13 +214,13 @@ impl AggregateIndexSearchExec {
                     // touching it — its row count is the physical row count.
                     let frag = frag_map.get(frag_id).ok_or_else(|| {
                         Error::internal(format!(
-                            "AggregateIndexSearchExec: fragment {} not found in manifest",
+                            "CountFromMaskExec: fragment {} not found in manifest",
                             frag_id
                         ))
                     })?;
                     let n = frag.physical_rows.ok_or_else(|| {
                         Error::internal(format!(
-                            "AggregateIndexSearchExec: physical_rows missing for fragment {}",
+                            "CountFromMaskExec: physical_rows missing for fragment {}",
                             frag_id
                         ))
                     })?;
@@ -329,57 +234,36 @@ impl AggregateIndexSearchExec {
         Ok(count)
     }
 
-    #[instrument(name = "aggregate_index_search", skip_all, level = "debug")]
+    #[instrument(name = "count_from_mask", skip_all, level = "debug")]
     async fn do_execute(
         dataset: Arc<Dataset>,
-        aggregates: Vec<Arc<AggregateIndexSearch>>,
+        aggregate_funcs_len: usize,
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
         restrict_to_fragments: Option<RoaringBitmap>,
         context: Arc<datafusion::execution::context::TaskContext>,
-        plan_metrics: ExecutionPlanMetricsSet,
         schema: SchemaRef,
     ) -> Result<RecordBatch> {
-        let index_metrics = IndexMetrics::new(&plan_metrics, 0);
-
-        // Kick off the prefilter load and index loads in parallel.
-        let prefilter_fut = async {
-            match prefilter_input {
-                None => Ok::<Option<RowAddrMask>, Error>(None),
-                Some(input) => Self::load_prefilter(input, context.clone()).await.map(Some),
-            }
+        let prefilter = match prefilter_input {
+            None => None,
+            Some(input) => Some(Self::load_prefilter(input, context.clone()).await?),
         };
-        let indices_fut = async {
-            let timer = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
-            let _guard = timer.timer();
-            Self::load_indices(dataset.clone(), aggregates.clone(), index_metrics.clone()).await
-        };
-        let (prefilter, (loaded_indices, fragments_intersection)) =
-            futures::try_join!(prefilter_fut, indices_fut)?;
 
-        // Fall back to all dataset fragments when no aggregate has an index —
-        // we still need a set of fragments to anchor the deletion mask against.
-        let fragments_covered = fragments_intersection.unwrap_or_else(|| {
-            dataset
-                .fragments()
-                .iter()
-                .map(|f| f.id as u32)
-                .collect::<RoaringBitmap>()
-        });
-        // Caller-supplied restriction further narrows the fragment set —
-        // used by the optimizer rule's split plan to scope this branch to
-        // the indexed fragments only.
+        // Anchor the deletion mask against either every dataset fragment or
+        // the caller-supplied restricted subset.
+        let dataset_fragments: RoaringBitmap =
+            dataset.fragments().iter().map(|f| f.id as u32).collect();
         let fragments_covered = match restrict_to_fragments {
-            Some(restrict) => fragments_covered & restrict,
-            None => fragments_covered,
+            Some(restrict) => dataset_fragments & restrict,
+            None => dataset_fragments,
         };
 
         // Build the fragments allow list as concrete `[0..physical_rows)`
         // ranges rather than `Full` markers. `Full` interacts poorly with
         // `BlockList` subtraction — `RowAddrTreeMap::Sub` materializes a
-        // `RoaringBitmap::full()` (2^32 rows) per fragment when a `Full` entry
-        // gets a partial block subtracted from it, which inflates counts and
-        // is expensive. Concrete ranges avoid that path entirely and keep
-        // `len()` exact at every combine step.
+        // `RoaringBitmap::full()` (2^32 rows) per fragment when a `Full`
+        // entry gets a partial block subtracted from it, which inflates
+        // counts and is expensive. Concrete ranges avoid that path entirely
+        // and keep `len()` exact at every combine step.
         let frag_map: HashMap<u32, &Fragment> = dataset
             .fragments()
             .iter()
@@ -389,13 +273,13 @@ impl AggregateIndexSearchExec {
         for frag_id in fragments_covered.iter() {
             let frag = frag_map.get(&frag_id).ok_or_else(|| {
                 Error::internal(format!(
-                    "AggregateIndexSearchExec: fragment {} not in manifest",
+                    "CountFromMaskExec: fragment {} not in manifest",
                     frag_id
                 ))
             })?;
             let physical = frag.physical_rows.ok_or_else(|| {
                 Error::internal(format!(
-                    "AggregateIndexSearchExec: physical_rows missing for fragment {}",
+                    "CountFromMaskExec: physical_rows missing for fragment {}",
                     frag_id
                 ))
             })?;
@@ -411,46 +295,21 @@ impl AggregateIndexSearchExec {
                 None => None,
             };
 
-        // Combine prefilter ∩ fragment-allow − deletion into a single AllowList.
         let combined = Self::combine_masks(fragments_allow, prefilter, deletion_mask);
+        let count = Self::count_from_mask(&combined, dataset.as_ref())?;
 
-        // Compute partial state, one aggregate at a time.
-        let total_rows = dataset.count_all_rows().await? as u64;
-        let mut arrays: Vec<Arc<dyn Array>> = Vec::with_capacity(aggregates.len());
-        for (agg, index) in aggregates.iter().zip(loaded_indices.iter()) {
-            match index {
-                Some(index) => {
-                    let allow_list = combined.allow_list().cloned().unwrap_or_default();
-                    let search_result = SearchResult::Exact(NullableRowAddrSet::new(
-                        allow_list,
-                        RowAddrTreeMap::new(),
-                    ));
-                    let scalar = index
-                        .calculate_aggregate(
-                            agg.query.as_ref(),
-                            Some(search_result),
-                            total_rows,
-                            &index_metrics,
-                        )
-                        .await?;
-                    arrays.push(scalar.as_array().clone());
-                }
-                None => {
-                    // Validated in `try_new`: this can only be non-distinct COUNT.
-                    let count = Self::count_from_mask(&combined, dataset.as_ref())?;
-                    let arr = Arc::new(Int64Array::from(vec![count])) as Arc<dyn Array>;
-                    arrays.push(arr);
-                }
-            }
-        }
-
+        // Every aggregate is the same non-distinct COUNT shape — emit the
+        // count once per output column.
+        let arrays: Vec<Arc<dyn Array>> = (0..aggregate_funcs_len)
+            .map(|_| Arc::new(Int64Array::from(vec![count])) as Arc<dyn Array>)
+            .collect();
         Ok(RecordBatch::try_new(schema, arrays)?)
     }
 }
 
-impl ExecutionPlan for AggregateIndexSearchExec {
+impl ExecutionPlan for CountFromMaskExec {
     fn name(&self) -> &str {
-        "AggregateIndexSearchExec"
+        "CountFromMaskExec"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -477,14 +336,13 @@ impl ExecutionPlan for AggregateIndexSearchExec {
             1 => Some(children.into_iter().next().unwrap()),
             n => {
                 return Err(datafusion::error::DataFusionError::Internal(format!(
-                    "AggregateIndexSearchExec accepts 0 or 1 children, got {}",
+                    "CountFromMaskExec accepts 0 or 1 children, got {}",
                     n
                 )));
             }
         };
         Ok(Arc::new(Self {
             dataset: self.dataset.clone(),
-            aggregates: self.aggregates.clone(),
             aggregate_funcs: self.aggregate_funcs.clone(),
             prefilter_input,
             restrict_to_fragments: self.restrict_to_fragments.clone(),
@@ -502,11 +360,10 @@ impl ExecutionPlan for AggregateIndexSearchExec {
         let schema = self.schema.clone();
         let batch_fut = Self::do_execute(
             self.dataset.clone(),
-            self.aggregates.clone(),
+            self.aggregate_funcs.len(),
             self.prefilter_input.clone(),
             self.restrict_to_fragments.clone(),
             context,
-            self.metrics.clone(),
             schema.clone(),
         );
         let stream = futures::stream::iter(vec![batch_fut])
@@ -561,7 +418,6 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::IndexType;
-    use lance_index::expression::aggregate::{AggregateIndexSearch, CountQuery};
     use lance_index::scalar::{
         SargableQuery, ScalarIndexParams,
         expression::{ScalarIndexExpr, ScalarIndexSearch},
@@ -587,15 +443,6 @@ mod tests {
         agg_expr
     }
 
-    fn count_search(index_name: Option<&str>) -> Arc<AggregateIndexSearch> {
-        Arc::new(AggregateIndexSearch {
-            index_name: index_name.map(str::to_string),
-            query: Arc::new(CountQuery::basic()),
-            filter: None,
-            original_expr: lit(0i64),
-        })
-    }
-
     struct Fixture {
         dataset: Arc<Dataset>,
         _tmp: TempStrDir,
@@ -613,7 +460,6 @@ mod tests {
             )
             .await
             .unwrap();
-
         dataset
             .create_index(
                 &["ordered"],
@@ -624,7 +470,6 @@ mod tests {
             )
             .await
             .unwrap();
-
         Fixture {
             dataset: Arc::new(dataset),
             _tmp: tmp,
@@ -639,7 +484,7 @@ mod tests {
         )]))
     }
 
-    async fn run(plan: AggregateIndexSearchExec) -> i64 {
+    async fn run(plan: CountFromMaskExec) -> i64 {
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
         assert_eq!(batches.len(), 1);
@@ -653,44 +498,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_new_rejects_length_mismatch() {
+    async fn try_new_rejects_empty_aggregate_funcs() {
         let fixture = make_fixture().await;
-        let schema = input_schema();
-        let err = AggregateIndexSearchExec::try_new(
-            fixture.dataset,
-            vec![count_search(None)],
-            vec![count_star_expr(&schema), count_star_expr(&schema)],
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("length mismatch"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn try_new_rejects_distinct_count_without_index() {
-        let fixture = make_fixture().await;
-        let schema = input_schema();
-        let distinct = Arc::new(AggregateIndexSearch {
-            index_name: None,
-            query: Arc::new(CountQuery::distinct()),
-            filter: None,
-            original_expr: lit(0i64),
-        });
-        let err = AggregateIndexSearchExec::try_new(
-            fixture.dataset,
-            vec![distinct],
-            vec![count_star_expr(&schema)],
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("distinct count"), "{err}");
+        let err = CountFromMaskExec::try_new(fixture.dataset, vec![], None).unwrap_err();
+        assert!(err.to_string().contains("at least one aggregate"), "{err}");
     }
 
     #[tokio::test]
     async fn count_from_mask_mixes_full_and_partial() {
-        // Synthesize an AllowList containing one Full-marker fragment and one
-        // Partial bitmap; verify the Full fragment falls back to physical_rows
-        // from the manifest and Partial falls back to bitmap.len().
+        // Synthesize an AllowList containing one Full-marker fragment and
+        // one Partial bitmap; verify the Full fragment falls back to
+        // physical_rows from the manifest and Partial falls back to
+        // bitmap.len().
         let fixture = make_fixture().await;
         let mut tm = RowAddrTreeMap::new();
         // Fragment 0: full (10 physical rows).
@@ -702,19 +521,16 @@ mod tests {
         tm.insert(row_addr_for(1, 2));
 
         let mask = RowAddrMask::AllowList(tm);
-        let count =
-            AggregateIndexSearchExec::count_from_mask(&mask, fixture.dataset.as_ref()).unwrap();
+        let count = CountFromMaskExec::count_from_mask(&mask, fixture.dataset.as_ref()).unwrap();
         assert_eq!(count, 10 + 3);
     }
 
     #[tokio::test]
     async fn execute_count_no_prefilter() {
         let fixture = make_fixture().await;
-        let dataset = fixture.dataset.clone();
         let schema = input_schema();
-        let plan = AggregateIndexSearchExec::try_new(
-            dataset.clone(),
-            vec![count_search(None)],
+        let plan = CountFromMaskExec::try_new(
+            fixture.dataset.clone(),
             vec![count_star_expr(&schema)],
             None,
         )
@@ -726,7 +542,6 @@ mod tests {
     #[tokio::test]
     async fn execute_count_with_allow_list_prefilter() {
         let fixture = make_fixture().await;
-        let dataset = fixture.dataset.clone();
         let schema = input_schema();
 
         // `ordered < 25` matches 25 rows across the four fragments.
@@ -741,12 +556,13 @@ mod tests {
             needs_recheck: false,
             fragment_bitmap: None,
         });
-        let prefilter: Arc<dyn ExecutionPlan> =
-            Arc::new(ScalarIndexExec::new(dataset.clone(), prefilter_expr));
+        let prefilter: Arc<dyn ExecutionPlan> = Arc::new(ScalarIndexExec::new(
+            fixture.dataset.clone(),
+            prefilter_expr,
+        ));
 
-        let plan = AggregateIndexSearchExec::try_new(
-            dataset.clone(),
-            vec![count_search(None)],
+        let plan = CountFromMaskExec::try_new(
+            fixture.dataset.clone(),
             vec![count_star_expr(&schema)],
             Some(prefilter),
         )
@@ -758,7 +574,6 @@ mod tests {
     #[tokio::test]
     async fn execute_count_with_block_list_prefilter() {
         let fixture = make_fixture().await;
-        let dataset = fixture.dataset.clone();
         let schema = input_schema();
 
         // NOT(ordered < 25) is a block list of those 25 rows — 40 − 25 = 15.
@@ -774,12 +589,13 @@ mod tests {
                 needs_recheck: false,
                 fragment_bitmap: None,
             })));
-        let prefilter: Arc<dyn ExecutionPlan> =
-            Arc::new(ScalarIndexExec::new(dataset.clone(), prefilter_expr));
+        let prefilter: Arc<dyn ExecutionPlan> = Arc::new(ScalarIndexExec::new(
+            fixture.dataset.clone(),
+            prefilter_expr,
+        ));
 
-        let plan = AggregateIndexSearchExec::try_new(
-            dataset.clone(),
-            vec![count_search(None)],
+        let plan = CountFromMaskExec::try_new(
+            fixture.dataset.clone(),
             vec![count_star_expr(&schema)],
             Some(prefilter),
         )
@@ -797,13 +613,8 @@ mod tests {
         let dataset = Arc::new(dataset);
 
         let schema = input_schema();
-        let plan = AggregateIndexSearchExec::try_new(
-            dataset.clone(),
-            vec![count_search(None)],
-            vec![count_star_expr(&schema)],
-            None,
-        )
-        .unwrap();
+        let plan = CountFromMaskExec::try_new(dataset, vec![count_star_expr(&schema)], None)
+            .unwrap();
         let count = run(plan).await;
         assert_eq!(count, 30);
     }

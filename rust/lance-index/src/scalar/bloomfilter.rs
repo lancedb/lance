@@ -7,7 +7,6 @@
 //! It is a space-efficient data structure that can be used to test whether an element is a member of a set.
 //! It's an inexact filter - they may include false positives that require rechecking.
 
-use crate::expression::aggregate::AnyAggregateQuery;
 use crate::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -21,7 +20,6 @@ use arrow_array::{Array, UInt64Array};
 mod as_bytes;
 pub mod sbbf;
 use arrow_schema::{DataType, Field};
-use lance_arrow_scalar::ArrowScalar;
 use lance_arrow_stats::StatisticsAccumulator;
 use serde::{Deserialize, Serialize};
 
@@ -442,17 +440,6 @@ impl ScalarIndex for BloomFilterIndex {
         ))
     }
 
-    async fn calculate_aggregate(
-        &self,
-        query: &dyn AnyAggregateQuery,
-        _filter: Option<SearchResult>,
-        _total_rows: u64,
-        _metrics: &dyn MetricsCollector,
-    ) -> Result<ArrowScalar> {
-        Err(Error::invalid_input(format!(
-            "this index cannot accelerate the aggregate {query:?}"
-        )))
-    }
 
     async fn update(
         &self,

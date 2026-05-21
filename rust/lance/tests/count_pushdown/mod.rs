@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! End-to-end integration tests for [`AggregateIndexPushdown`] when DataFusion
+//! End-to-end integration tests for [`CountPushdown`] when DataFusion
 //! does the planning (i.e. an aggregate built from SQL through the public
 //! [`LanceTableProvider`] surface), as opposed to going through
 //! `Scanner::create_plan`.
@@ -9,9 +9,8 @@
 //! The plan shape DataFusion produces for a SQL aggregate differs from the
 //! scanner's: it emits `AggregateExec(Final) → CoalescePartitionsExec →
 //! AggregateExec(Partial) → LanceTableScan` rather than a single
-//! `AggregateExec(Single)`. This file exists to pin that down so future
-//! aggregates (e.g. `COUNT(DISTINCT)` via a bitmap-backed
-//! `calculate_aggregate`) can be added here with the test scaffolding already
+//! `AggregateExec(Single)`. This file pins that down so future aggregate-
+//! pushdown categories can be added here with the test scaffolding already
 //! in place.
 
 use std::sync::Arc;
@@ -27,8 +26,8 @@ use lance::Dataset;
 use lance::dataset::WriteParams;
 use lance::datafusion::LanceTableProvider;
 use lance::index::DatasetIndexExt;
-use lance::io::exec::aggregate_index::AggregateIndexSearchExec;
-use lance::io::exec::aggregate_index_pushdown::AggregateIndexPushdown;
+use lance::io::exec::count_from_mask::CountFromMaskExec;
+use lance::io::exec::count_pushdown::CountPushdown;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
@@ -68,7 +67,7 @@ async fn make_indexed_dataset() -> (Arc<Dataset>, TempStrDir) {
 fn lance_aware_context(dataset: Arc<Dataset>) -> SessionContext {
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_physical_optimizer_rule(Arc::new(AggregateIndexPushdown))
+        .with_physical_optimizer_rule(Arc::new(CountPushdown))
         .build();
     let ctx = SessionContext::new_with_state(state);
     ctx.register_table(
@@ -82,7 +81,7 @@ fn lance_aware_context(dataset: Arc<Dataset>) -> SessionContext {
 fn plan_contains_pushdown(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let mut found = false;
     plan.apply(|node| {
-        if node.as_any().is::<AggregateIndexSearchExec>() {
+        if node.as_any().is::<CountFromMaskExec>() {
             found = true;
             Ok(TreeNodeRecursion::Stop)
         } else {
@@ -121,7 +120,7 @@ async fn sql_count_star_with_indexed_filter() {
     //
     // The rule should fire on DataFusion's `AggregateExec(Partial)` node at
     // the leaf of the aggregate pipeline, replacing the column scan with
-    // `AggregateIndexSearchExec` while the outer `AggregateExec(Final)` keeps
+    // `CountFromMaskExec` while the outer `AggregateExec(Final)` keeps
     // doing the cross-partition combine.
     let (dataset, _tmp) = make_indexed_dataset().await;
     let ctx = lance_aware_context(dataset);
@@ -133,7 +132,7 @@ async fn sql_count_star_with_indexed_filter() {
     let plan = df.create_physical_plan().await.unwrap();
     assert!(
         plan_contains_pushdown(&plan),
-        "expected AggregateIndexSearchExec in SQL plan, got:\n{}",
+        "expected CountFromMaskExec in SQL plan, got:\n{}",
         displayable(plan.as_ref()).indent(true)
     );
     assert_eq!(execute_count(plan).await, 25);
@@ -162,10 +161,10 @@ async fn sql_unfiltered_count_star_uses_statistics() {
 async fn sql_count_distinct_does_not_fire_yet() {
     // SELECT COUNT(DISTINCT x) FROM t WHERE x < 25
     //
-    // `is_count_star` rejects distinct, so the rule should leave the plan
-    // alone today. Once a `ScalarIndex::calculate_aggregate` impl lands for a
-    // bitmap-style index this assertion will need to flip — that's the
-    // future test we're scaffolding for.
+    // `is_count_star` rejects distinct, so this rule never fires for
+    // distinct counts — they belong to the mask-to-answer category and will
+    // need their own rule (e.g. over a bitmap-index dictionary). This test
+    // pins the not-firing behaviour and the scaffold for the future test.
     let (dataset, _tmp) = make_indexed_dataset().await;
     let ctx = lance_aware_context(dataset);
 
@@ -176,7 +175,7 @@ async fn sql_count_distinct_does_not_fire_yet() {
     let plan = df.create_physical_plan().await.unwrap();
     assert!(
         !plan_contains_pushdown(&plan),
-        "AggregateIndexSearchExec must not fire for COUNT(DISTINCT) yet: \n{}",
+        "CountFromMaskExec must not fire for COUNT(DISTINCT) yet: \n{}",
         displayable(plan.as_ref()).indent(true)
     );
     // Correctness via the scan path: values 0..25 are all distinct.

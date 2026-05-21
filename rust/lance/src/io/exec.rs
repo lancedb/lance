@@ -5,8 +5,8 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
-pub mod aggregate_index;
-pub mod aggregate_index_pushdown;
+pub mod count_from_mask;
+pub mod count_pushdown;
 #[cfg(feature = "substrait")]
 pub mod ann_proto;
 mod filter;

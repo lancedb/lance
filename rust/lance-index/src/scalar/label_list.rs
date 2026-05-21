@@ -20,7 +20,6 @@ use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
-use lance_arrow_scalar::ArrowScalar;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache};
 use lance_core::error::LanceOptionExt;
 use lance_core::{Error, ROW_ID, Result};
@@ -40,7 +39,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
-use crate::{expression::aggregate::AnyAggregateQuery, frag_reuse::FragReuseIndex};
+use crate::frag_reuse::FragReuseIndex;
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const LABEL_LIST_NULLS_METADATA_KEY: &str = "lance:label_list_nulls";
@@ -207,18 +206,6 @@ impl ScalarIndex for LabelListIndex {
             row_ids.with_nulls(nulls)
         };
         Ok(SearchResult::Exact(row_ids))
-    }
-
-    async fn calculate_aggregate(
-        &self,
-        query: &dyn AnyAggregateQuery,
-        _filter: Option<SearchResult>,
-        _total_rows: u64,
-        _metrics: &dyn MetricsCollector,
-    ) -> Result<ArrowScalar> {
-        Err(Error::invalid_input(format!(
-            "this index cannot accelerate the aggregate {query:?}"
-        )))
     }
 
     fn can_remap(&self) -> bool {
