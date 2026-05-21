@@ -38,6 +38,8 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt, ready};
 
+use super::pk::{compute_pk_hash, resolve_pk_indices};
+
 /// Cross-source PK dedup. Keeps one row per primary key — the one with
 /// the largest `(generation, freshness)` tuple.
 ///
@@ -269,56 +271,6 @@ impl GlobalPkDedupStream {
         arrow_select::concat::concat_batches(&self.schema, batch_refs)
             .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
-}
-
-fn resolve_pk_indices(batch: &RecordBatch, pk_columns: &[String]) -> DFResult<Vec<usize>> {
-    pk_columns
-        .iter()
-        .map(|col| {
-            batch
-                .schema()
-                .column_with_name(col)
-                .map(|(idx, _)| idx)
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(format!(
-                        "Primary key column '{}' not found",
-                        col
-                    ))
-                })
-        })
-        .collect()
-}
-
-/// Hash a row's primary key. Mirrors the variants supported by
-/// [`super::WithinSourceDedupExec`] / `BloomFilterGuardExec`, so a single
-/// PK produces the same hash everywhere in the LSM scanner.
-fn compute_pk_hash(batch: &RecordBatch, pk_indices: &[usize], row_idx: usize) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    for &col_idx in pk_indices {
-        let col = batch.column(col_idx);
-        let is_null = col.is_null(row_idx);
-        is_null.hash(&mut hasher);
-
-        if !is_null {
-            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int32Array>() {
-                arr.value(row_idx).hash(&mut hasher);
-            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
-                arr.value(row_idx).hash(&mut hasher);
-            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
-                arr.value(row_idx).hash(&mut hasher);
-            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::BinaryArray>() {
-                arr.value(row_idx).hash(&mut hasher);
-            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::UInt32Array>() {
-                arr.value(row_idx).hash(&mut hasher);
-            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
-                arr.value(row_idx).hash(&mut hasher);
-            }
-        }
-    }
-    hasher.finish()
 }
 
 impl Stream for GlobalPkDedupStream {
