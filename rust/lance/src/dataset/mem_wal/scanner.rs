@@ -31,17 +31,14 @@
 //! let stream = scanner.try_into_stream().await?;
 //! ```
 
-// Block-list machinery for the LSM vector-search stale-read fix: per-generation
-// PK membership and the per-source block bitmaps. Built and tested here; the
-// `dead_code` allow is removed once the KNN prefilter execution path consumes
-// them (follow-up: Scanner pre-filter API).
-#[allow(dead_code)]
 mod block_list;
 mod builder;
 mod collector;
 mod data_source;
 pub mod exec;
 mod flushed_cache;
+// Retains general-purpose constructors/accessors (`from_hashed`, `len`,
+// `is_empty`) used by unit tests; the block-list path uses the rest.
 #[allow(dead_code)]
 mod gen_pk_index;
 mod planner;

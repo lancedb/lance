@@ -14,6 +14,7 @@
 //! - [`LsmGlobalPkDedupExec`]: Single-pass cross-source PK dedup over the merged vector-search stream
 //! - [`WithinSourceDedupExec`]: Deduplicates rows with the same PK from a single source (used by point lookup)
 
+mod block_list_filter;
 mod bloom_guard;
 mod coalesce_first;
 mod deduplicate;
@@ -23,6 +24,7 @@ mod pk;
 mod source_tag;
 mod within_source_dedup;
 
+pub use block_list_filter::BlockListFilterExec;
 pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
 pub use coalesce_first::CoalesceFirstExec;
 pub use deduplicate::{DeduplicateExec, ROW_ADDRESS_COLUMN};
