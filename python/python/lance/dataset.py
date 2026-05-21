@@ -6418,33 +6418,22 @@ class LanceScanner(pa.dataset.Scanner):
 
         return self._scanner.explain_plan(verbose=verbose)
 
-    def analyze_plan(self) -> str:
+    def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
 
         Parameters
         ----------
-        verbose : bool, default False
-            Use a verbose output format.
+        count_rows : bool, default False
+            If True, auto-apply a ``COUNT(*)`` aggregate before analyzing so
+            the returned plan reflects what :py:meth:`count_rows` would
+            execute (including the optimizer's count-pushdown decisions).
 
         Returns
         -------
         plan : str
         """
 
-        return self._scanner.analyze_plan()
-
-    def analyze_count_plan(self) -> str:
-        """Execute the plan that ``count_rows()`` would use, with runtime
-        metrics. Equivalent to :py:meth:`analyze_plan` but with a ``COUNT(*)``
-        aggregate auto-applied to the scanner, so the returned plan reflects
-        the optimizer's count-pushdown decisions.
-
-        Returns
-        -------
-        plan : str
-        """
-
-        return self._scanner.analyze_count_plan()
+        return self._scanner.analyze_plan(count_rows=count_rows)
 
 
 class DatasetOptimizer:

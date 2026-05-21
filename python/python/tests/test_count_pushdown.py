@@ -58,11 +58,11 @@ def _make_dataset(tmp_path: Path) -> lance.LanceDataset:
 
 
 def _filtered_count_plan(dataset: lance.LanceDataset, filter: str) -> str:
-    """Return the ``analyze_count_plan()`` output for a filtered ``COUNT(*)``
-    — the same plan ``count_rows(filter=…)`` actually executes."""
+    """Return the ``analyze_plan(count_rows=True)`` output for a filtered
+    ``COUNT(*)`` — the same plan ``count_rows(filter=…)`` actually executes."""
     return dataset.scanner(
         columns=[], with_row_id=True, filter=filter
-    ).analyze_count_plan()
+    ).analyze_plan(count_rows=True)
 
 
 def _assert_pushdown_fired(plan: str) -> None:
