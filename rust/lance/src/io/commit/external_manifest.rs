@@ -267,6 +267,15 @@ mod test {
                         .to_string_lossy()
                         .contains(".manifest#")
                 })
+                // The version hint file is expected to be present.
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    !entry
+                        .file_name()
+                        .as_os_str()
+                        .to_string_lossy()
+                        .starts_with("latest_version_hint")
+                })
                 .collect::<Vec<_>>();
             assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
         }
@@ -372,6 +381,15 @@ mod test {
                     .as_os_str()
                     .to_string_lossy()
                     .ends_with(".manifest")
+            })
+            // The version hint file is expected to be present.
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                !entry
+                    .file_name()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with("latest_version_hint")
             })
             .collect::<Vec<_>>();
         assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);

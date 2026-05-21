@@ -14,7 +14,9 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
 use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
+use lance_arrow::ipc::{read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream};
 use lance_core::Result;
+use lance_core::cache::CacheCodecImpl;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -233,6 +235,45 @@ impl FlatIndex {
     }
 }
 
+impl CacheCodecImpl for FlatIndex {
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        // Format:
+        // [len-prefixed all_addrs_map][len-prefixed null_addrs_map][batch IPC stream]
+        writer.write_all(&(self.all_addrs_map.serialized_size() as u64).to_le_bytes())?;
+        self.all_addrs_map.serialize_into(&mut *writer)?;
+
+        writer.write_all(&(self.null_addrs_map.serialized_size() as u64).to_le_bytes())?;
+        self.null_addrs_map.serialize_into(&mut *writer)?;
+
+        write_ipc_stream(self.data.as_ref(), writer)?;
+
+        Ok(())
+    }
+
+    fn deserialize(data: &bytes::Bytes) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let mut offset = 0;
+        let all_addrs_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let all_addrs_map = RowAddrTreeMap::deserialize_from(all_addrs_bytes.as_ref())?;
+
+        let null_addrs_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let null_addrs_map = RowAddrTreeMap::deserialize_from(null_addrs_bytes.as_ref())?;
+
+        let batch = read_ipc_stream_single_at(data, &mut offset)?;
+
+        let df_schema = DFSchema::try_from(batch.schema())?;
+
+        Ok(Self {
+            data: Arc::new(batch),
+            all_addrs_map,
+            null_addrs_map,
+            df_schema,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -264,6 +305,34 @@ mod tests {
         let expected =
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(expected), Default::default());
         assert_eq!(actual, expected);
+    }
+
+    fn assert_roundtrips(index: &FlatIndex) {
+        let mut buf = Vec::new();
+        index.serialize(&mut buf).unwrap();
+        let restored = FlatIndex::deserialize(&bytes::Bytes::from(buf)).unwrap();
+
+        assert_eq!(restored.data, index.data);
+        assert_eq!(restored.all_addrs_map, index.all_addrs_map);
+        assert_eq!(restored.null_addrs_map, index.null_addrs_map);
+    }
+
+    #[test]
+    fn test_cache_codec_roundtrip() {
+        // No nulls
+        assert_roundtrips(&example_index());
+
+        // With nulls in the values column
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, Int32, [None, Some(0), Some(5)]),
+            (BTREE_IDS_COLUMN, UInt64, [0, 1, 2])
+        )
+        .unwrap();
+        assert_roundtrips(&FlatIndex::try_new(batch).unwrap());
+
+        // Empty index
+        let empty = RecordBatch::new_empty(example_index().data.schema());
+        assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
     }
 
     #[tokio::test]

@@ -175,7 +175,17 @@ impl FixedWidthDataBlock {
         num_values: u64,
         validate: bool,
     ) -> Result<ArrayData> {
-        let data_buffer = self.data.into_buffer();
+        // Booleans expanded for full-zip (bits_per_value==8, one byte each) need re-packing to
+        // Arrow's bit-packed format.
+        let data_buffer = if matches!(data_type, DataType::Boolean) && self.bits_per_value == 8 {
+            let mut builder = BooleanBufferBuilder::new(num_values as usize);
+            for &byte in self.data.as_ref().iter().take(num_values as usize) {
+                builder.append(byte != 0);
+            }
+            builder.finish().into_inner()
+        } else {
+            self.data.into_buffer()
+        };
         let builder = ArrayDataBuilder::new(data_type)
             .add_buffer(data_buffer)
             .len(num_values as usize)

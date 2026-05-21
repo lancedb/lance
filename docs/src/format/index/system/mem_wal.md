@@ -4,6 +4,8 @@ The MemWAL Index is a system index that serves as the centralized structure for 
 It stores configuration (shard specs, indexes to maintain), merge progress, and shard state snapshots.
 
 A table has at most one MemWAL index.
+The table may be a primary-key table or an append-only table without primary-key metadata.
+Primary-key-dependent lookup and deduplication semantics only apply when a primary key is defined.
 
 For the complete specification, see:
 

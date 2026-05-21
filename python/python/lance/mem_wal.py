@@ -15,19 +15,20 @@ dataset via an LSM-tree structure.  Data flows through three levels:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Union
 
 import pyarrow as pa
 
 from .lance import (
+    _evaluate_sharding_spec,
     _ExecutionPlan,
     _LsmPointLookupPlanner,
     _LsmScanner,
     _LsmVectorSearchPlanner,
     _MergedGeneration,
-    _RegionSnapshot,
-    _RegionWriter,
+    _ShardSnapshot,
+    _ShardWriter,
 )
 from .types import _coerce_reader
 
@@ -35,11 +36,12 @@ if TYPE_CHECKING:
     import lance
 
 __all__ = [
-    "RegionField",
-    "RegionSpec",
+    "ShardingField",
+    "ShardingSpec",
+    "evaluate_sharding_spec",
     "MergedGeneration",
-    "RegionSnapshot",
-    "RegionWriter",
+    "ShardSnapshot",
+    "ShardWriter",
     "LsmScanner",
     "ExecutionPlan",
     "LsmPointLookupPlanner",
@@ -48,13 +50,13 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# RegionSpec
+# ShardingSpec
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class RegionField:
-    """Defines one derived field used in region partitioning.
+class ShardingField:
+    """Defines one MemWAL sharding field.
 
     Parameters
     ----------
@@ -81,11 +83,43 @@ class RegionField:
 
 
 @dataclass
-class RegionSpec:
-    """Partitioning specification for deriving MemWAL region IDs."""
+class ShardingSpec:
+    """Specification for deriving MemWAL shard routing values."""
 
     spec_id: int
-    fields: List[RegionField]
+    fields: List[ShardingField]
+
+
+def evaluate_sharding_spec(
+    batch: pa.RecordBatch,
+    spec: Union[ShardingSpec, Mapping[str, object]],
+    schema: "lance.schema.LanceSchema",
+) -> pa.RecordBatch:
+    """Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
+
+    Parameters
+    ----------
+    batch : pyarrow.RecordBatch
+        Input batch containing the sharding source columns.
+    spec : ShardingSpec or dict
+        MemWAL sharding spec to evaluate.
+    schema : LanceSchema
+        Lance table schema used to resolve source field IDs in the spec to
+        input batch column names.
+    """
+    if not isinstance(batch, pa.RecordBatch):
+        raise TypeError(f"Expected pyarrow.RecordBatch, got {type(batch)!r}")
+    return _evaluate_sharding_spec(
+        batch,
+        _sharding_spec_to_dict(spec),
+        schema,
+    )
+
+
+def _sharding_spec_to_dict(spec: Union[ShardingSpec, Mapping[str, object]]) -> dict:
+    if isinstance(spec, Mapping):
+        return dict(spec)
+    return asdict(spec)
 
 
 @dataclass
@@ -97,45 +131,45 @@ class MergedGeneration:
 
     Parameters
     ----------
-    region_id : str
-        UUID string for the write region.
+    shard_id : str
+        UUID string for the write shard.
     generation : int
         Generation number (from
-        :attr:`RegionSnapshot.flushed_generations`).
+        :attr:`ShardSnapshot.flushed_generations`).
     """
 
-    region_id: str
+    shard_id: str
     generation: int
 
 
-class RegionSnapshot:
-    """Snapshot of a MemWAL region's state, used when constructing scanners.
+class ShardSnapshot:
+    """Snapshot of a MemWAL shard's state, used when constructing scanners.
 
     Parameters
     ----------
-    region_id : str
-        UUID string for the write region.
+    shard_id : str
+        UUID string for the write shard.
     """
 
-    def __init__(self, region_id: str) -> None:
-        self._raw = _RegionSnapshot(region_id)
+    def __init__(self, shard_id: str) -> None:
+        self._raw = _ShardSnapshot(shard_id)
 
     @property
-    def region_id(self) -> str:
-        """UUID string for this region."""
-        return self._raw.region_id
+    def shard_id(self) -> str:
+        """UUID string for this shard."""
+        return self._raw.shard_id
 
-    def with_spec_id(self, spec_id: int) -> "RegionSnapshot":
-        """Set the RegionSpec ID."""
+    def with_spec_id(self, spec_id: int) -> "ShardSnapshot":
+        """Set the sharding spec ID."""
         self._raw = self._raw.with_spec_id(spec_id)
         return self
 
-    def with_current_generation(self, generation: int) -> "RegionSnapshot":
+    def with_current_generation(self, generation: int) -> "ShardSnapshot":
         """Set the current (active) generation number."""
         self._raw = self._raw.with_current_generation(generation)
         return self
 
-    def with_flushed_generation(self, generation: int, path: str) -> "RegionSnapshot":
+    def with_flushed_generation(self, generation: int, path: str) -> "ShardSnapshot":
         """Add a flushed generation with its storage path."""
         self._raw = self._raw.with_flushed_generation(generation, path)
         return self
@@ -144,28 +178,28 @@ class RegionSnapshot:
         return repr(self._raw)
 
 
-class RegionWriter:
-    """Stateful writer for one MemWAL region.
+class ShardWriter:
+    """Stateful writer for one MemWAL shard.
 
     Obtain an instance via mem_wal_writer.
     Use as a context manager so the writer is closed automatically::
 
-        with dataset.mem_wal_writer(region_id) as writer:
+        with dataset.mem_wal_writer(shard_id) as writer:
             writer.put(batch)
 
     Parameters
     ----------
-    _raw : _RegionWriter
+    _raw : _ShardWriter
         Internal PyO3 object — do not construct directly.
     """
 
-    def __init__(self, _raw: _RegionWriter) -> None:
+    def __init__(self, _raw: _ShardWriter) -> None:
         self._raw = _raw
 
     @property
-    def region_id(self) -> str:
-        """UUID string for this writer's region."""
-        return self._raw.region_id
+    def shard_id(self) -> str:
+        """UUID string for this writer's shard."""
+        return self._raw.shard_id
 
     def put(self, data, *, schema: Optional[pa.Schema] = None) -> None:
         """Write data to the MemWAL.
@@ -222,7 +256,7 @@ class RegionWriter:
         return self._raw.memtable_stats()
 
     def lsm_scanner(
-        self, region_snapshots: Optional[List[RegionSnapshot]] = None
+        self, shard_snapshots: Optional[List[ShardSnapshot]] = None
     ) -> "LsmScanner":
         """Create an LSM scanner that includes the active MemTable.
 
@@ -232,18 +266,18 @@ class RegionWriter:
 
         Parameters
         ----------
-        region_snapshots : list of RegionSnapshot, optional
-            Snapshots of other regions to include.  This writer's own region
+        shard_snapshots : list of ShardSnapshot, optional
+            Snapshots of other shards to include.  This writer's own shard
             is automatically included.
 
         Returns
         -------
         LsmScanner
         """
-        raw_snaps = [s._raw for s in (region_snapshots or [])]
+        raw_snaps = [s._raw for s in (shard_snapshots or [])]
         return LsmScanner(self._raw.lsm_scanner(raw_snaps))
 
-    def __enter__(self) -> "RegionWriter":
+    def __enter__(self) -> "ShardWriter":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -257,7 +291,7 @@ class LsmScanner:
     Deduplicates by primary key, always returning the newest version of
     each row across base table, flushed MemTables, and the active MemTable.
 
-    Obtain an instance from `RegionWriter.lsm_scanner` (includes
+    Obtain an instance from `ShardWriter.lsm_scanner` (includes
     active MemTable) or `LsmScanner.from_snapshots` (flushed only).
 
     The builder methods (`project`, `filter`, `limit`)
@@ -276,23 +310,21 @@ class LsmScanner:
     @staticmethod
     def from_snapshots(
         dataset: "lance.LanceDataset",
-        region_snapshots: List[RegionSnapshot],
+        shard_snapshots: List[ShardSnapshot],
     ) -> "LsmScanner":
-        """Create a scanner from dataset and region snapshots.
+        """Create a scanner from dataset and shard snapshots.
 
         Does **not** include the active MemTable; use
-        `RegionWriter.lsm_scanner` for that.
+        `ShardWriter.lsm_scanner` for that.
 
         Parameters
         ----------
         dataset : LanceDataset
             The base dataset to scan.
-        region_snapshots : list of RegionSnapshot
-            Region snapshots specifying flushed generations to include.
+        shard_snapshots : list of ShardSnapshot
+            Shard snapshots specifying flushed generations to include.
         """
-        raw = _LsmScanner.from_snapshots(
-            dataset._ds, [s._raw for s in region_snapshots]
-        )
+        raw = _LsmScanner.from_snapshots(dataset._ds, [s._raw for s in shard_snapshots])
         return LsmScanner(raw)
 
     def project(self, columns: List[str]) -> "LsmScanner":
@@ -389,8 +421,8 @@ class LsmPointLookupPlanner:
     ----------
     dataset : LanceDataset
         The base dataset.
-    region_snapshots : list of RegionSnapshot
-        Region snapshots specifying flushed generations to include.
+    shard_snapshots : list of ShardSnapshot
+        Shard snapshots specifying flushed generations to include.
     pk_columns : list of str, optional
         Primary key column names.  Inferred from schema metadata if omitted.
 
@@ -404,12 +436,12 @@ class LsmPointLookupPlanner:
     def __init__(
         self,
         dataset: "lance.LanceDataset",
-        region_snapshots: List[RegionSnapshot],
+        shard_snapshots: List[ShardSnapshot],
         pk_columns: Optional[List[str]] = None,
     ) -> None:
         self._raw = _LsmPointLookupPlanner(
             dataset._ds,
-            [s._raw for s in region_snapshots],
+            [s._raw for s in shard_snapshots],
             pk_columns,
         )
 
@@ -448,8 +480,8 @@ class LsmVectorSearchPlanner:
     ----------
     dataset : LanceDataset
         The base dataset.
-    region_snapshots : list of RegionSnapshot
-        Region snapshots specifying flushed generations to include.
+    shard_snapshots : list of ShardSnapshot
+        Shard snapshots specifying flushed generations to include.
     vector_column : str
         Name of the ``FixedSizeList<float32>`` vector column.
     pk_columns : list of str, optional
@@ -470,7 +502,7 @@ class LsmVectorSearchPlanner:
     def __init__(
         self,
         dataset: "lance.LanceDataset",
-        region_snapshots: List[RegionSnapshot],
+        shard_snapshots: List[ShardSnapshot],
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
         distance_type: Optional[str] = None,
@@ -482,7 +514,7 @@ class LsmVectorSearchPlanner:
             kwargs["distance_type"] = distance_type
         self._raw = _LsmVectorSearchPlanner(
             dataset._ds,
-            [s._raw for s in region_snapshots],
+            [s._raw for s in shard_snapshots],
             vector_column,
             **kwargs,
         )
@@ -517,16 +549,16 @@ class LsmVectorSearchPlanner:
         return ExecutionPlan(self._raw.plan_search(query, k, nprobes, columns))
 
 
-def _unwrap_region_id(region_id: str) -> str:
-    """Validate region_id is a UUID string."""
+def _unwrap_shard_id(shard_id: str) -> str:
+    """Validate shard_id is a UUID string."""
     import uuid as _uuid
 
-    _uuid.UUID(region_id)  # raises ValueError if invalid
-    return region_id
+    _uuid.UUID(shard_id)  # raises ValueError if invalid
+    return shard_id
 
 
 def _to_raw_merged_generations(
     generations: Iterable[MergedGeneration],
 ) -> list:
     """Convert Python MergedGeneration list to PyO3 _MergedGeneration list."""
-    return [_MergedGeneration(g.region_id, g.generation) for g in generations]
+    return [_MergedGeneration(g.shard_id, g.generation) for g in generations]

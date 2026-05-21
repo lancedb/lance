@@ -4213,6 +4213,21 @@ mod shard_writer_tests {
         ]))
     }
 
+    fn create_append_only_schema(vector_dim: i32) -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    vector_dim,
+                ),
+                true,
+            ),
+            Field::new("text", DataType::Utf8, true),
+        ]))
+    }
+
     fn create_test_batch(
         schema: &ArrowSchema,
         start_id: i64,
@@ -4329,23 +4344,54 @@ mod shard_writer_tests {
             .await;
         assert!(result.is_err(), "num_buckets = 0 should be rejected");
 
-        // The bucket column must be the unenforced primary key column.
-        let result = dataset
+        dataset
             .initialize_mem_wal()
             .bucket_sharding("text", 8)
             .execute()
-            .await;
-        assert!(
-            result.is_err(),
-            "a non-primary-key bucket column should be rejected"
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .expect("Failed to read MemWAL index details")
+            .expect("MemWAL index details should exist");
+
+        assert_eq!(details.num_shards, 8);
+        assert_eq!(details.sharding_specs.len(), 1);
+        let field = &details.sharding_specs[0].fields[0];
+        assert_eq!(field.transform.as_deref(), Some("bucket"));
+        assert_eq!(
+            field.parameters.get("num_buckets").map(String::as_str),
+            Some("8")
         );
+        assert_eq!(field.source_ids.len(), 1);
+        let source_id = field.source_ids[0];
+        let source_field = dataset.schema().field("text").expect("text field exists");
+        assert_eq!(source_id, source_field.id);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_bucket_sharding_without_primary_key() {
+        let vector_dim = 128;
+        let schema = create_append_only_schema(vector_dim);
+        let uri = format!(
+            "memory://test_bucket_sharding_no_primary_key_{}",
+            Uuid::new_v4()
+        );
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
 
         dataset
             .initialize_mem_wal()
             .bucket_sharding("id", 8)
             .execute()
             .await
-            .expect("Failed to initialize MemWAL");
+            .expect("Failed to initialize append-only MemWAL");
 
         let details = dataset
             .mem_wal_index_details()

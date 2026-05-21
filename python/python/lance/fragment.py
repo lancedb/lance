@@ -655,6 +655,7 @@ class LanceFragment(pa.dataset.Fragment):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        batch_size: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
         blob_mode: str = "lazy",
@@ -664,7 +665,8 @@ class LanceFragment(pa.dataset.Fragment):
         """Read this fragment into a :py:class:`pandas.DataFrame`.
 
         Parameters are the same as :meth:`to_table`, except pandas export uses
-        ``blob_mode`` instead of Arrow-facing ``blob_handling``.
+        ``blob_mode`` instead of Arrow-facing ``blob_handling`` and accepts
+        ``batch_size`` for scan batching.
 
         Parameters
         ----------
@@ -674,6 +676,8 @@ class LanceFragment(pa.dataset.Fragment):
             - ``"lazy"``: return :class:`lance.BlobFile` objects
             - ``"bytes"``: return Python ``bytes``
             - ``"descriptions"``: preserve ``to_table().to_pandas()`` behavior
+        batch_size: int, optional
+            The maximum number of rows per scan batch.
         **kwargs
             Forwarded to :meth:`pyarrow.Table.to_pandas` for non-blob columns.
         """
@@ -682,6 +686,7 @@ class LanceFragment(pa.dataset.Fragment):
             filter=filter,
             limit=limit,
             offset=offset,
+            batch_size=batch_size,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             order_by=order_by,

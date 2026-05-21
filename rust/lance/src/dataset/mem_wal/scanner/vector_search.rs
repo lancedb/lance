@@ -24,10 +24,12 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{FilterStaleExec, GenerationBloomFilter, MemtableGenTagExec};
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, wants_row_id,
 };
+use crate::session::Session;
 
 /// Plans vector search queries over LSM data.
 ///
@@ -90,6 +92,10 @@ pub struct LsmVectorSearchPlanner {
     /// original vectors. Set this to make cross-source distance comparison
     /// across the LSM merge fully exact.
     base_table_refine_factor: Option<u32>,
+    /// Session threaded into flushed-generation opens (shared caches).
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -117,7 +123,23 @@ impl LsmVectorSearchPlanner {
             vector_column,
             distance_type,
             base_table_refine_factor: None,
+            session: None,
+            flushed_cache: None,
         }
+    }
+
+    /// Thread a session into flushed-generation opens so the first open
+    /// populates the shared index / file-metadata caches.
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// searches against the same generation a pure `Arc::clone`.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
+        self
     }
 
     /// Enable base-table refine.
@@ -315,9 +337,9 @@ impl LsmVectorSearchPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                    .load()
-                    .await?;
+                let dataset =
+                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await?;
                 let mut scanner = dataset.scan();
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);

@@ -39,10 +39,11 @@ from .mem_wal import (
     LsmScanner,
     LsmVectorSearchPlanner,
     MergedGeneration,
-    RegionField,
-    RegionSnapshot,
-    RegionSpec,
-    RegionWriter,
+    ShardingField,
+    ShardingSpec,
+    ShardSnapshot,
+    ShardWriter,
+    evaluate_sharding_spec,
 )
 from .namespace import (
     DescribeTableRequest,
@@ -99,10 +100,11 @@ __all__ = [
     "LsmScanner",
     "LsmVectorSearchPlanner",
     "MergedGeneration",
-    "RegionField",
-    "RegionSpec",
-    "RegionSnapshot",
-    "RegionWriter",
+    "ShardSnapshot",
+    "ShardWriter",
+    "ShardingField",
+    "ShardingSpec",
+    "evaluate_sharding_spec",
 ]
 
 

@@ -12,6 +12,14 @@ pub struct SQBuildParams {
     pub sample_rate: usize,
 }
 
+impl From<&SQBuildParams> for crate::pb::vector_index_details::ScalarQuantization {
+    fn from(params: &SQBuildParams) -> Self {
+        Self {
+            num_bits: params.num_bits as u32,
+        }
+    }
+}
+
 impl Default for SQBuildParams {
     fn default() -> Self {
         Self {

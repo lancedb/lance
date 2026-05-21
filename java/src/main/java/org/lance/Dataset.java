@@ -28,6 +28,10 @@ import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.memwal.InitializeMemWalParams;
+import org.lance.memwal.MemWalIndexDetails;
+import org.lance.memwal.ShardWriter;
+import org.lance.memwal.ShardWriterConfig;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 import org.lance.namespace.LanceNamespace;
@@ -2022,6 +2026,61 @@ public class Dataset implements Closeable {
 
   private native MergeInsertResult nativeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Initialize MemWAL on this dataset.
+   *
+   * <p>Must be called once before any call to {@link #memWalWriter}. Append-only tables may omit
+   * primary-key metadata; primary keys are only required for primary-key lookup and last-write-wins
+   * deduplication workflows.
+   *
+   * @param params MemWAL initialization parameters
+   */
+  public void initializeMemWal(InitializeMemWalParams params) {
+    Preconditions.checkNotNull(params, "params must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeInitializeMemWal(params);
+    }
+  }
+
+  private native void nativeInitializeMemWal(InitializeMemWalParams params);
+
+  /**
+   * Return the MemWAL index details for this dataset, or {@link Optional#empty()} if MemWAL has not
+   * been initialized.
+   *
+   * @return the MemWAL index details, if any
+   */
+  public Optional<MemWalIndexDetails> memWalIndexDetails() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeMemWalIndexDetails());
+    }
+  }
+
+  private native MemWalIndexDetails nativeMemWalIndexDetails();
+
+  /**
+   * Get a {@link ShardWriter} for the specified shard.
+   *
+   * <p>{@link #initializeMemWal} must be called before using this method.
+   *
+   * @param shardId UUID string identifying the write shard
+   * @param config writer configuration; pass {@code null} to use the Lance default configuration
+   * @return a ShardWriter for the shard
+   */
+  public ShardWriter memWalWriter(String shardId, ShardWriterConfig config) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return ShardWriter.create(this, shardId, config);
+    }
+  }
+
+  /** Get a {@link ShardWriter} for the specified shard using the Lance default configuration. */
+  public ShardWriter memWalWriter(String shardId) {
+    return memWalWriter(shardId, null);
+  }
 
   private native void nativeCreateTag(String tag, Ref ref);
 

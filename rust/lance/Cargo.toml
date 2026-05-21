@@ -42,6 +42,7 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 async-recursion.workspace = true
 async-trait.workspace = true
+bitpacking = { workspace = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -54,6 +55,7 @@ deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
+moka.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
 aws-credential-types.optional = true
@@ -234,6 +236,24 @@ harness = false
 
 [[bench]]
 name = "mem_wal_shard_writer_backpressure"
+harness = false
+
+[[bench]]
+name = "mem_wal_fineweb_fts"
+path = "benches/mem_wal/fts/mem_wal_fineweb_fts.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_fts_bench"
+path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
+harness = false
+
+[[bench]]
+name = "manifest_commit"
+harness = false
+
+[[bench]]
+name = "concurrent_append"
 harness = false
 
 [lints]

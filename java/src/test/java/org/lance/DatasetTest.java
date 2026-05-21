@@ -528,7 +528,12 @@ public class DatasetTest {
         assertEquals(1, dataset1.version());
         Path manifestPath = datasetPath.resolve("_versions");
         try (Stream<Path> fileStream = Files.list(manifestPath)) {
-          assertEquals(1, fileStream.count());
+          // Ignore the version hint file, which is not a manifest.
+          assertEquals(
+              1,
+              fileStream
+                  .filter(p -> !p.getFileName().toString().startsWith("latest_version_hint"))
+                  .count());
           ByteBuffer manifestBuffer = readManifest(manifestPath.resolve("1.manifest"));
           try (Dataset dataset2 = testDataset.write(1, 5)) {
             assertEquals(2, dataset2.version());

@@ -19,10 +19,12 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, project_to_canonical, wants_row_address,
     wants_row_id,
 };
+use crate::session::Session;
 
 /// Plans point lookup queries over LSM data.
 ///
@@ -70,6 +72,10 @@ pub struct LsmPointLookupPlanner {
     /// Bloom filters for each memtable generation.
     /// Map: generation -> bloom filter
     bloom_filters: std::collections::HashMap<u64, Arc<Sbbf>>,
+    /// Session threaded into flushed-generation opens (shared caches).
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmPointLookupPlanner {
@@ -90,7 +96,23 @@ impl LsmPointLookupPlanner {
             pk_columns,
             base_schema,
             bloom_filters: std::collections::HashMap::new(),
+            session: None,
+            flushed_cache: None,
         }
+    }
+
+    /// Thread a session into flushed-generation opens so the first open
+    /// populates the shared index / file-metadata caches.
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// lookups against the same generation a pure `Arc::clone`.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
+        self
     }
 
     /// Add a bloom filter for a generation.
@@ -234,9 +256,9 @@ impl LsmPointLookupPlanner {
                 scanner.create_plan().await?
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                    .load()
-                    .await?;
+                let dataset =
+                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await?;
                 let mut scanner = dataset.scan();
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());

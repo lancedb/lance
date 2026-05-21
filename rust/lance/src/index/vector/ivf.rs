@@ -2251,7 +2251,7 @@ pub(crate) async fn merge_segments_with_progress(
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(crate::index::vector_index_details())),
+        index_details: Some(Arc::new(crate::index::vector_index_details_default())),
         index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
@@ -2350,12 +2350,16 @@ fn build_segment_plan(
         Some(index_type) => index_type.version(),
         None => infer_source_index_version(&group)?,
     };
-    let segment = IndexSegment::new(
-        segment_uuid,
-        fragment_bitmap,
-        Arc::new(crate::index::vector_index_details()),
-        index_version,
-    );
+
+    // Legacy source segments may not carry index_details. Fall back to an empty
+    // placeholder; `needs_vector_details_inference` will pick this up on the
+    // next manifest load and populate the real details from the index files.
+    let index_details = match first.index_details.as_ref() {
+        Some(d) => d.clone(),
+        None => Arc::new(crate::index::vector::details::vector_index_details_default()),
+    };
+
+    let segment = IndexSegment::new(segment_uuid, fragment_bitmap, index_details, index_version);
 
     Ok(IndexSegmentPlan::new(
         segment,
@@ -2722,7 +2726,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::IndexFileVersion;
-    use crate::index::vector_index_details;
+    use crate::index::vector_index_details_default;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
     use crate::utils::test::copy_test_data_to_tmp;
 
@@ -3195,7 +3199,7 @@ mod tests {
             fields: vec![field.id],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
@@ -3234,7 +3238,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
@@ -3294,7 +3298,7 @@ mod tests {
             fields: vec![field.id],
             name: format!("{}_remapped", INDEX_NAME),
             fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
