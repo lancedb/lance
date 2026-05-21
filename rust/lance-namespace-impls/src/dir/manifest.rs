@@ -3535,7 +3535,7 @@ impl LanceNamespace for ManifestNamespace {
 
     /// Add columns to a table.
     ///
-    /// Converts the API `NewColumnTransform` (SQL expressions) into Lance's
+    /// Converts the API `AddColumnsEntry` (SQL expressions) into Lance's
     /// `NewColumnTransform::SqlExpressions` and delegates to `Dataset::add_columns`.
     async fn alter_table_add_columns(
         &self,
@@ -5543,7 +5543,7 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_add_columns(#[case] inline_optimization: bool) {
         use lance_namespace::models::{
-            AlterTableAddColumnsRequest, DescribeTableRequest, NewColumnTransform,
+            AddColumnsEntry, AlterTableAddColumnsRequest, DescribeTableRequest,
         };
 
         let temp_dir = TempStdDir::default();
@@ -5565,8 +5565,8 @@ mod tests {
             .unwrap();
 
         // Add a new column using SQL expression
-        let mut new_col = NewColumnTransform::new("doubled_id".to_string());
-        new_col.expression = Some("id * 2".to_string());
+        let mut new_col = AddColumnsEntry::new("doubled_id".to_string());
+        new_col.expression = Some(Some("id * 2".to_string()));
         let mut add_request = AlterTableAddColumnsRequest::new(vec![new_col]);
         add_request.id = Some(vec!["test_table".to_string()]);
 
@@ -5601,7 +5601,7 @@ mod tests {
     #[case::without_optimization(false)]
     #[tokio::test]
     async fn test_alter_table_add_columns_missing_id(#[case] inline_optimization: bool) {
-        use lance_namespace::models::{AlterTableAddColumnsRequest, NewColumnTransform};
+        use lance_namespace::models::{AddColumnsEntry, AlterTableAddColumnsRequest};
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -5613,7 +5613,7 @@ mod tests {
             .unwrap();
 
         // Request without ID should fail
-        let new_col = NewColumnTransform::new("col".to_string());
+        let new_col = AddColumnsEntry::new("col".to_string());
         let request = AlterTableAddColumnsRequest::new(vec![new_col]);
         let result = dir_namespace.alter_table_add_columns(request).await;
         assert!(result.is_err(), "Should fail when table ID is missing");
@@ -5624,7 +5624,7 @@ mod tests {
     #[case::without_optimization(false)]
     #[tokio::test]
     async fn test_alter_table_add_columns_nonexistent_table(#[case] inline_optimization: bool) {
-        use lance_namespace::models::{AlterTableAddColumnsRequest, NewColumnTransform};
+        use lance_namespace::models::{AddColumnsEntry, AlterTableAddColumnsRequest};
 
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
@@ -5636,7 +5636,7 @@ mod tests {
             .unwrap();
 
         // Request with non-existent table should fail
-        let new_col = NewColumnTransform::new("col".to_string());
+        let new_col = AddColumnsEntry::new("col".to_string());
         let mut request = AlterTableAddColumnsRequest::new(vec![new_col]);
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = dir_namespace.alter_table_add_columns(request).await;
@@ -5671,8 +5671,8 @@ mod tests {
             .unwrap();
 
         // Rename the "name" column to "full_name"
-        let mut entry = AlterColumnsEntry::new("name".to_string(), serde_json::Value::Null);
-        entry.rename = Some("full_name".to_string());
+        let mut entry = AlterColumnsEntry::new("name".to_string());
+        entry.rename = Some(Some("full_name".to_string()));
         let mut alter_request = AlterTableAlterColumnsRequest::new(vec![entry]);
         alter_request.id = Some(vec!["test_table".to_string()]);
 
@@ -5722,7 +5722,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entry = AlterColumnsEntry::new("name".to_string(), serde_json::Value::Null);
+        let entry = AlterColumnsEntry::new("name".to_string());
         let request = AlterTableAlterColumnsRequest::new(vec![entry]);
         let result = dir_namespace.alter_table_alter_columns(request).await;
         assert!(result.is_err(), "Should fail when table ID is missing");
