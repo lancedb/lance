@@ -52,6 +52,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Literal;
+use log::warn;
 use lance_index::expression::aggregate::{AggregateIndexSearch, CountQuery};
 use lance_index::scalar::expression::ScalarIndexExpr;
 use roaring::RoaringBitmap;
@@ -141,8 +142,14 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     // fragments-allow list in row-address space. ANDing across the two yields
     // a silently wrong count (rows in fragments > 0 are dropped because their
     // stable ids and row addresses share a fragment-id bucket only by accident).
-    // Until the exec can reconcile the two id spaces, refuse to fire.
+    // Until the exec can reconcile the two id spaces, refuse to fire — but
+    // warn so we notice the lost optimization opportunity.
     if filtered_read.dataset().manifest().uses_stable_row_ids() {
+        warn!(
+            "aggregate_index_pushdown: skipped because the dataset uses stable row ids; \
+             the count will be computed via a full scan. Reconciling the two id spaces \
+             would let this query be answered from index metadata."
+        );
         return Ok(None);
     }
 
@@ -162,13 +169,26 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         return Ok(None);
     }
     // We rely on the deletion mask being applied; with_deleted_rows changes
-    // that contract.
+    // that contract. Surfacing as a warning because it shouldn't normally
+    // pair with an aggregate plan — if we see it, the planner produced a
+    // shape we could in principle accelerate but currently can't.
     if options.with_deleted_rows {
+        warn!(
+            "aggregate_index_pushdown: skipped because the FilteredReadExec was \
+             built with with_deleted_rows; the count will be computed via a full \
+             scan."
+        );
         return Ok(None);
     }
-    // A pre-existing fragment subset would need to be intersected into the
-    // coverage logic below. Punt for now.
+    // Same story for an explicit fragment subset: legitimate, but unexpected
+    // alongside an aggregate, and we lose the pushdown opportunity.
     if options.fragments.is_some() {
+        warn!(
+            "aggregate_index_pushdown: skipped because the FilteredReadExec was \
+             scoped to an explicit fragment subset; the count will be computed via \
+             a full scan. Intersecting that subset into the coverage logic would \
+             let this query be answered from index metadata."
+        );
         return Ok(None);
     }
 
