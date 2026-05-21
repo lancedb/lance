@@ -669,8 +669,7 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
       CreateMaterializedViewRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    String responseJson =
-        createMaterializedViewNative(nativeDirectoryNamespaceHandle, requestJson);
+    String responseJson = createMaterializedViewNative(nativeDirectoryNamespaceHandle, requestJson);
     return fromJson(responseJson, CreateMaterializedViewResponse.class);
   }
 
