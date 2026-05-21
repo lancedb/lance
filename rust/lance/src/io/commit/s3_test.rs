@@ -16,7 +16,6 @@ use futures::future::try_join_all;
 use lance_datagen::{RowCount, array, gen_batch};
 use lance_io::assert_io_eq;
 use lance_io::utils::tracking_store::IOTracker;
-use lance_table::io::commit::CommitStrategy;
 
 const CONFIG: &[(&str, &str)] = &[
     ("access_key_id", "ACCESS_KEY"),
@@ -296,7 +295,6 @@ async fn test_ddb_open_iops() {
 
     let committed_ds = CommitBuilder::new(&uri)
         .with_store_params(store_params.clone())
-        .with_commit_strategy(CommitStrategy::Pessimistic)
         .execute(transaction)
         .await
         .unwrap();
@@ -308,9 +306,9 @@ async fn test_ddb_open_iops() {
     //    * delete staged file
     let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
-    // With Pessimistic commit strategy, rebase always happens before commit,
-    // so there is 1 read IOP for listing transactions.
-    assert_io_eq!(io_stats, read_iops, 1);
+    // With optimistic commit, the first attempt skips rebase,
+    // so there are no read IOPS for listing transactions.
+    assert_io_eq!(io_stats, read_iops, 0);
 
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {
@@ -330,7 +328,6 @@ async fn test_ddb_open_iops() {
     let dataset = InsertBuilder::new(Arc::new(dataset))
         .with_params(&WriteParams {
             mode: WriteMode::Append,
-            commit_strategy: Some(CommitStrategy::Pessimistic),
             ..Default::default()
         })
         .execute(vec![data.clone()])
@@ -339,9 +336,9 @@ async fn test_ddb_open_iops() {
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
-    // With Pessimistic commit strategy, rebase always happens before commit,
-    // so there is 1 read IOP for listing transactions.
-    assert_io_eq!(io_stats, read_iops, 1);
+    // With optimistic commit, the first attempt skips rebase,
+    // so there are no read IOPS for listing transactions.
+    assert_io_eq!(io_stats, read_iops, 0);
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();

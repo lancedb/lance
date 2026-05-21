@@ -35,8 +35,7 @@ use lance_table::format::{
     WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
-    CommitConfig, CommitError, CommitHandler, CommitStrategy, ManifestLocation,
-    ManifestNamingScheme,
+    CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use rand::{Rng, rng};
 
@@ -965,24 +964,18 @@ pub(crate) async fn commit_transaction(
     let mut current_transaction_file = String::new();
 
     while backoff.attempt() < num_attempts {
-        // Determine whether rebase is needed based on commit strategy:
-        // - Pessimistic: always rebase before commit (safest, original behavior)
-        // - Optimistic: skip rebase on first attempt, only rebase on conflict
+        // Skip rebase on first attempt (optimistic), only rebase on conflict
+        // or when the operation semantics require the latest state.
         let needs_rebase = !strict_overwrite
-            && match commit_config.commit_strategy {
-                CommitStrategy::Pessimistic => true,
-                CommitStrategy::Optimistic => {
-                    backoff.attempt() > 0
-                        || matches!(
-                            &transaction.operation,
-                            Operation::UpdateConfig { .. }
-                                | Operation::Overwrite {
-                                    config_upsert_values: Some(_),
-                                    ..
-                                }
-                        )
-                }
-            };
+            && (backoff.attempt() > 0
+                || matches!(
+                    &transaction.operation,
+                    Operation::UpdateConfig { .. }
+                        | Operation::Overwrite {
+                            config_upsert_values: Some(_),
+                            ..
+                        }
+                ));
 
         if needs_rebase {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;

@@ -1454,43 +1454,17 @@ impl Debug for ConditionalPutCommitHandler {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CommitStrategy {
-    /// Always rebase before attempting to commit. Safer for high-contention
-    /// scenarios with Delete/Update/Rewrite operations, but adds IO overhead
-    /// (load_and_sort_new_transactions + TransactionRebase::try_new) on every
-    /// attempt even when there is no conflict.
-    Pessimistic,
-    /// Attempt to commit first without rebase, and only rebase on conflict.
-    /// Faster for all operation types under concurrent writes by skipping
-    /// the rebase IO on the fast path. Even for fragment-modifying operations
-    /// (Delete, Update, Rewrite), the cost of a failed commit attempt is
-    /// typically lower than the rebase IO overhead.
-    #[default]
-    Optimistic,
-}
-
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
-    pub commit_strategy: CommitStrategy,
 }
 
 impl Default for CommitConfig {
     fn default() -> Self {
-        let commit_strategy = match std::env::var("LANCE_COMMIT_STRATEGY")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "pessimistic" => CommitStrategy::Pessimistic,
-            _ => CommitStrategy::default(),
-        };
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
-            commit_strategy,
         }
     }
 }

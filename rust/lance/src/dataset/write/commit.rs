@@ -9,7 +9,7 @@ use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
-    io::commit::{CommitConfig, CommitHandler, CommitStrategy, ManifestNamingScheme},
+    io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
 use crate::{
@@ -159,17 +159,6 @@ impl<'a> CommitBuilder<'a> {
 
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
-        self
-    }
-
-    /// Set the commit strategy for conflict resolution.
-    ///
-    /// - [`CommitStrategy::Pessimistic`]: Always rebase before commit.
-    ///   Safer for high-contention workloads with Delete/Update/Rewrite.
-    /// - [`CommitStrategy::Optimistic`] (default): Attempt to commit first, rebase only on conflict.
-    ///   Faster for all operation types under concurrent writes.
-    pub fn with_commit_strategy(mut self, strategy: CommitStrategy) -> Self {
-        self.commit_config.commit_strategy = strategy;
         self
     }
 

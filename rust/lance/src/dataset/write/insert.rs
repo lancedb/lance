@@ -139,10 +139,6 @@ impl<'a> InsertBuilder<'a> {
             .with_object_store(context.object_store.clone())
             .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
 
-        if let Some(strategy) = context.params.commit_strategy {
-            commit_builder = commit_builder.with_commit_strategy(strategy);
-        }
-
         if let Some(params) = context.params.store_params.as_ref() {
             commit_builder = commit_builder.with_store_params(params.clone());
         }

@@ -45,10 +45,6 @@ import pyarrow as pa
 import pytest
 
 
-def _get_commit_strategy():
-    return os.environ.get("LANCE_COMMIT_STRATEGY", "optimistic").lower()
-
-
 def _get_storage_options(bucket_name: str = ""):
     key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
     secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
@@ -93,8 +89,6 @@ async def _run_concurrent_writes(
     rows_per_write: int,
     storage_options: dict | None,
 ):
-    commit_strategy = _get_commit_strategy()
-
     init_table = pa.table(
         {
             "id": pa.array([0], type=pa.int64()),
@@ -213,7 +207,7 @@ async def _run_concurrent_writes(
     n_upd = len(update_latencies)
 
     print(f"\n{'=' * 60}")
-    print(f"Concurrent Write Benchmark Results ({commit_strategy})")
+    print(f"Concurrent Write Benchmark Results")
     print(f"{'=' * 60}")
     print(
         f"  Total ops:     {total_ops} (append={n_app}, delete={n_del}, update={n_upd})"
@@ -259,8 +253,7 @@ def _run_benchmark(
     rows_per_write=100,
 ):
     storage_options = _get_storage_options()
-    commit_strategy = _get_commit_strategy()
-    label = f"w{num_writers}_d{num_deleters}_u{num_updaters}_{commit_strategy}"
+    label = f"w{num_writers}_d{num_deleters}_u{num_updaters}"
     dataset_uri = _get_dataset_uri(label)
     bucket_name = _extract_bucket_name(dataset_uri)
     storage_options = _get_storage_options(bucket_name)

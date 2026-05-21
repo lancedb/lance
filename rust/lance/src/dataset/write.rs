@@ -24,7 +24,7 @@ use lance_file::version::LanceFileVersion;
 use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{BasePath, DataFile, Fragment};
-use lance_table::io::commit::{CommitHandler, CommitStrategy, commit_handler_from_url};
+use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use std::collections::{HashMap, HashSet};
@@ -313,11 +313,6 @@ pub struct WriteParams {
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
-
-    /// The commit strategy to use when committing transactions.
-    ///
-    /// If not set, the default commit strategy will be used (currently Optimistic).
-    pub commit_strategy: Option<CommitStrategy>,
 }
 
 impl Default for WriteParams {
@@ -347,7 +342,6 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
-            commit_strategy: None,
         }
     }
 }
