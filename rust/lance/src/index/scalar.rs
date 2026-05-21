@@ -438,11 +438,8 @@ pub(crate) async fn merge_btree_segments(
 
     lance_index::scalar::btree::cleanup_shard_files(store.as_ref(), &merge_result).await;
 
-    let files = lance_table::format::list_index_files_with_sizes(
-        &dataset.object_store,
-        &index_dir,
-    )
-    .await?;
+    let files =
+        lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
     Ok(IndexMetadata {
         uuid,
@@ -2442,10 +2439,12 @@ mod tests {
         let index_dir_before = dataset
             .indices_dir()
             .join(indices[0].uuid.to_string().as_str());
-        let files_before =
-            lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir_before)
-                .await
-                .unwrap();
+        let files_before = lance_table::format::list_index_files_with_sizes(
+            &dataset.object_store,
+            &index_dir_before,
+        )
+        .await
+        .unwrap();
         let page_data_files_before: Vec<_> = files_before
             .iter()
             .filter(|f| f.path.starts_with("part_") && f.path.contains("page_data"))
@@ -2456,19 +2455,18 @@ mod tests {
             page_data_files_before.len()
         );
 
-        let lookup_file_before = files_before
-            .iter()
-            .find(|f| f.path.contains("page_lookup"))
-            .expect("Should have a page_lookup file");
-        let lookup_reader_before = dataset
-            .object_store
-            .open(&index_dir_before.join(&lookup_file_before.path))
+        let index_store_before =
+            crate::index::LanceIndexStore::from_dataset_for_existing(&dataset, &indices[0])
+                .await
+                .unwrap();
+        let lookup_reader_before = index_store_before
+            .open_index_file(lance_index::scalar::btree::BTREE_LOOKUP_NAME)
             .await
             .unwrap();
         let range_partitioned_before = lookup_reader_before
             .schema()
             .metadata
-            .contains_key("range_partitioned");
+            .contains_key(RANGE_PARTITIONED_META_KEY);
         assert!(
             range_partitioned_before,
             "Range-partitioned index lookup should have range_partitioned metadata"
@@ -2476,7 +2474,7 @@ mod tests {
 
         // Append new data and run optimize_indices
         let new_reader = lance_datagen::gen_batch()
-            .col("id", array::step::<Int32Type>().starting_at(1000))
+            .col("id", array::step::<Int32Type>())
             .col(
                 "value",
                 array::cycle::<Int32Type>((0..100i32).collect::<Vec<_>>()),
@@ -2497,29 +2495,22 @@ mod tests {
             .or_else(|| indices_after.last());
 
         let meta = new_index_meta.expect("Should have a new index segment after optimize");
-        let index_dir_after = dataset.indices_dir().join(meta.uuid.to_string().as_str());
-        let files_after =
-            lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir_after)
+        let index_store_after =
+            crate::index::LanceIndexStore::from_dataset_for_existing(&dataset, meta)
                 .await
                 .unwrap();
 
-        let lookup_file_after = files_after.iter().find(|f| f.path.contains("page_lookup"));
-        if let Some(lookup_file) = lookup_file_after {
-            let lookup_reader_after = dataset
-                .object_store
-                .open(&index_dir_after.join(&lookup_file.path))
-                .await
-                .unwrap();
-            let range_partitioned_after = lookup_reader_after
+        let lookup_reader_after = index_store_after
+            .open_index_file(lance_index::scalar::btree::BTREE_LOOKUP_NAME)
+            .await;
+        if let Ok(lookup_reader) = lookup_reader_after {
+            let range_partitioned_after = lookup_reader
                 .schema()
                 .metadata
-                .contains_key("range_partitioned");
+                .contains_key(RANGE_PARTITIONED_META_KEY);
             assert!(
                 range_partitioned_after,
-                "After optimize, the new index should still be range-partitioned but range_partitioned metadata is lost. \
-                 Files before optimize: {:?}, files after: {:?}",
-                files_before.iter().map(|f| &f.path).collect::<Vec<_>>(),
-                files_after.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                "After optimize, the new index should still be range-partitioned but range_partitioned metadata is lost."
             );
         }
 
