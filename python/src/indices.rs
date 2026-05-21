@@ -537,8 +537,7 @@ async fn do_load_shuffled_vectors(
         dataset_version: ds.manifest.version,
         fragment_bitmap: Some(ds.fragments().iter().map(|f| f.id as u32).collect()),
         index_details: Some(Arc::new(
-            prost_types::Any::from_msg(&lance_table::format::pb::VectorIndexDetails::default())
-                .unwrap(),
+            prost_types::Any::from_msg(&lance_index::pb::VectorIndexDetails::default()).unwrap(),
         )),
         index_version: IndexType::IvfPq.version(),
         created_at: Some(Utc::now()),

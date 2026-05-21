@@ -28,7 +28,7 @@ use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::load_training_data;
-use crate::index::vector_index_details;
+use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -268,7 +268,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 vec![removed_segment],
                 new_fragment_bitmap,
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
                     files: Some(files),
                 },
@@ -313,6 +313,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 }
             }
 
+            // Carry forward existing index details, preferring the first segment
+            // that has populated (non-empty) details.
+            let index_details = old_indices
+                .iter()
+                .rev()
+                .filter_map(|idx| idx.index_details.as_ref())
+                .find(|d| !d.value.is_empty())
+                .map(|d| d.as_ref().clone())
+                .unwrap_or_else(vector_index_details_default);
+
             let index_dir = dataset.indices_dir().join(new_uuid.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
@@ -321,7 +331,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 removed_indices,
                 frag_bitmap,
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details,
+                    // retain_supported_indices guarantees all old_indices have
+                    // index_version <= our max supported version, so we can safely
+                    // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
                     files: Some(files),
                 },

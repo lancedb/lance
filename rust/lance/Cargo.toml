@@ -55,6 +55,7 @@ deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
+moka.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
 aws-credential-types.optional = true

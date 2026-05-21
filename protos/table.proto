@@ -474,8 +474,7 @@ message ExternalFile {
   uint64 size = 3;
 }
 
-// Empty details messages for older indexes that don't take advantage of the details field.
-message VectorIndexDetails {}
+// VectorIndexDetails and HnswParameters (formerly HnswIndexDetails) moved to index.proto
 
 message FragmentReuseIndexDetails {
 

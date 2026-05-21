@@ -4344,20 +4344,9 @@ mod shard_writer_tests {
             .await;
         assert!(result.is_err(), "num_buckets = 0 should be rejected");
 
-        // The bucket column must be the unenforced primary key column.
-        let result = dataset
-            .initialize_mem_wal()
-            .bucket_sharding("text", 8)
-            .execute()
-            .await;
-        assert!(
-            result.is_err(),
-            "a non-primary-key bucket column should be rejected"
-        );
-
         dataset
             .initialize_mem_wal()
-            .bucket_sharding("id", 8)
+            .bucket_sharding("text", 8)
             .execute()
             .await
             .expect("Failed to initialize MemWAL");
@@ -4376,6 +4365,10 @@ mod shard_writer_tests {
             field.parameters.get("num_buckets").map(String::as_str),
             Some("8")
         );
+        assert_eq!(field.source_ids.len(), 1);
+        let source_id = field.source_ids[0];
+        let source_field = dataset.schema().field("text").expect("text field exists");
+        assert_eq!(source_id, source_field.id);
     }
 
     #[tokio::test]

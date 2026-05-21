@@ -21,8 +21,13 @@ The Python/Java logger can be configured with several environment variables:
 
 ## Trace Events
 
-Lance uses tracing to log events. If you are running `pylance` then these events will be emitted to
+Lance uses tracing to log events. If you are running `pylance` then these events will be emitted
 as log messages. For Rust connections you can use the `tracing` crate to capture these events.
+
+Rust tracing targets are listed below. In `pylance` logs, trace events are emitted under a
+`lance::events::` prefix so they can be filtered separately from normal log records. For example,
+`LANCE_LOG="warn,lance::events::object_store::throttle=info"` shows storage throttling events
+without enabling other Lance event logs.
 
 ### File Audit
 
@@ -32,6 +37,31 @@ File audit events are emitted when significant files are created or deleted.
 | ------------------- | --------- | -------------------------------------------------------------------------- |
 | `lance::file_audit` | `mode`    | The mode of I/O operation (create, delete, delete_unverified)              |
 | `lance::file_audit` | `type`    | The type of file affected (manifest, data file, index file, deletion file) |
+
+### Dataset Events
+
+Dataset events are emitted when datasets are loaded, written, committed, deleted, compacted, or cleaned.
+
+| Event                   | Parameter   | Description                                                               |
+| ----------------------- | ----------- | ------------------------------------------------------------------------- |
+| `lance::dataset_events` | `event`     | The dataset event type (loading, writing, committed, deleting, and others) |
+| `lance::dataset_events` | `uri`       | The dataset URI                                                           |
+| `lance::dataset_events` | `mode`      | The write mode                                                            |
+| `lance::dataset_events` | `operation` | The committed transaction operation                                       |
+| `lance::dataset_events` | `predicate` | The delete predicate                                                      |
+| `lance::dataset_events` | `columns`   | The removed columns                                                       |
+
+### Object Store Throttle Events
+
+Object store throttle events are emitted when Lance observes cloud storage throttle responses and
+reduces or retries request rates.
+
+| Event                            | Parameter       | Description                              |
+| -------------------------------- | --------------- | ---------------------------------------- |
+| `lance::object_store::throttle`  | `previous_rate` | The request rate before AIMD adjustment  |
+| `lance::object_store::throttle`  | `new_rate`      | The request rate after AIMD adjustment   |
+| `lance::object_store::throttle`  | `attempt`       | The retry attempt for retry debug events |
+| `lance::object_store::throttle`  | `error`         | The underlying object store throttle error      |
 
 ### I/O Events
 

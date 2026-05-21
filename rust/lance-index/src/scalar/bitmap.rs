@@ -19,10 +19,14 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt, stream};
+use lance_arrow::ipc::{
+    read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
+    write_len_prefixed_bytes,
+};
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     Error, ROW_ID, Result,
-    cache::{CacheKey, LanceCache, WeakLanceCache},
+    cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
         mask::{NullableRowAddrSet, RowAddrTreeMap},
@@ -144,6 +148,151 @@ impl CacheKey for BitmapKey {
 
     fn type_name() -> &'static str {
         "Bitmap"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<RowAddrTreeMap>())
+    }
+}
+
+/// The serializable state of a [`BitmapIndex`].
+///
+/// `BitmapIndex` holds non-serializable infrastructure (an `IndexStore`, a
+/// cache handle, a lazy reader, a fragment-reuse index). `BitmapIndexState`
+/// captures just the data needed to rebuild it: the value→file-offset map,
+/// the null bitmap, and the value type.
+#[derive(Debug, Clone)]
+pub struct BitmapIndexState {
+    /// Value-to-row-offset lookup, encoded as an Arrow `RecordBatch` so we can
+    /// reuse the existing IPC utilities for zero-copy round trips.
+    ///
+    /// Schema: `keys: <value_type>`, `offsets: UInt64`. Iteration order of
+    /// `index_map` is preserved on serialize and the `BTreeMap` resorts the
+    /// entries on deserialize, so the wire form does not need to be sorted.
+    lookup_batch: RecordBatch,
+    /// Already-remapped null bitmap (remapping is applied during load, so the
+    /// cached state matches the in-memory representation).
+    null_map: Arc<RowAddrTreeMap>,
+    /// Cached separately from the schema for the empty-index case where the
+    /// `lookup_batch` is empty but we still need to remember the column type.
+    value_type: DataType,
+}
+
+impl DeepSizeOf for BitmapIndexState {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.lookup_batch.get_array_memory_size() + self.null_map.deep_size_of_children(context)
+    }
+}
+
+impl BitmapIndexState {
+    pub(crate) fn from_index(index: &BitmapIndex) -> Result<Self> {
+        Ok(Self {
+            lookup_batch: build_lookup_batch(&index.index_map, &index.value_type)?,
+            null_map: index.null_map.clone(),
+            value_type: index.value_type.clone(),
+        })
+    }
+
+    pub(crate) fn into_bitmap_index(
+        self,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<BitmapIndex>> {
+        let index_map = parse_lookup_batch(&self.lookup_batch)?;
+        Ok(Arc::new(BitmapIndex::new(
+            index_map,
+            self.null_map,
+            self.value_type,
+            store,
+            WeakLanceCache::from(index_cache),
+            frag_reuse_index,
+        )))
+    }
+}
+
+fn build_lookup_batch(
+    index_map: &BTreeMap<OrderableScalarValue, usize>,
+    value_type: &DataType,
+) -> Result<RecordBatch> {
+    let keys = if index_map.is_empty() {
+        arrow_array::new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(index_map.keys().map(|k| k.0.clone()))?
+    };
+    let offsets = Arc::new(UInt64Array::from_iter_values(
+        index_map.values().map(|v| *v as u64),
+    ));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("keys", value_type.clone(), true),
+        Field::new("offsets", DataType::UInt64, false),
+    ]));
+    Ok(RecordBatch::try_new(schema, vec![keys, offsets])?)
+}
+
+fn parse_lookup_batch(batch: &RecordBatch) -> Result<BTreeMap<OrderableScalarValue, usize>> {
+    let keys = batch.column(0);
+    let offsets = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            Error::internal("BitmapIndexState: expected UInt64 offsets column".to_string())
+        })?;
+    let mut index_map = BTreeMap::new();
+    for idx in 0..batch.num_rows() {
+        let value = OrderableScalarValue(ScalarValue::try_from_array(keys, idx)?);
+        index_map.insert(value, offsets.value(idx) as usize);
+    }
+    Ok(index_map)
+}
+
+impl CacheCodecImpl for BitmapIndexState {
+    /// Wire format:
+    /// ```text
+    /// [u64 null_map_len][null_map bytes]
+    /// [arrow IPC stream: (keys: <value_type>, offsets: UInt64)]
+    /// ```
+    /// The value type is recovered from the IPC stream schema.
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        let mut null_bytes = Vec::with_capacity(self.null_map.serialized_size());
+        self.null_map.serialize_into(&mut null_bytes)?;
+        write_len_prefixed_bytes(writer, &null_bytes)?;
+        write_ipc_stream(&self.lookup_batch, writer)?;
+        Ok(())
+    }
+
+    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let null_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
+        let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let value_type = lookup_batch.schema().field(0).data_type().clone();
+        Ok(Self {
+            lookup_batch,
+            null_map,
+            value_type,
+        })
+    }
+}
+
+/// Cache key for a [`BitmapIndexState`]. The cache is already namespaced
+/// per-index by the caller, so a constant key suffices.
+struct BitmapIndexStateKey;
+
+impl CacheKey for BitmapIndexStateKey {
+    type ValueType = BitmapIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+
+    fn type_name() -> &'static str {
+        "BitmapIndexState"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<BitmapIndexState>())
     }
 }
 
@@ -1542,6 +1691,34 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
 
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
+            return Ok(None);
+        };
+        let state = (*state).clone();
+        let index = state.into_bitmap_index(index_store, cache, frag_reuse_index)?;
+        Ok(Some(index as Arc<dyn ScalarIndex>))
+    }
+
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+        let bitmap = index
+            .as_any()
+            .downcast_ref::<BitmapIndex>()
+            .ok_or_else(|| {
+                Error::internal("BitmapIndexPlugin::put_in_cache called with a non-bitmap index")
+            })?;
+        let state = BitmapIndexState::from_index(bitmap)?;
+        cache
+            .insert_with_key(&BitmapIndexStateKey, Arc::new(state))
+            .await;
+        Ok(())
+    }
+
     async fn load_statistics(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -1588,6 +1765,41 @@ mod tests {
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use std::collections::HashMap;
+
+    fn assert_state_roundtrips(state: &BitmapIndexState) {
+        let mut buf = Vec::new();
+        state.serialize(&mut buf).unwrap();
+        let restored = BitmapIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        assert_eq!(restored.lookup_batch, state.lookup_batch);
+        assert_eq!(&*restored.null_map, &*state.null_map);
+        assert_eq!(restored.value_type, state.value_type);
+    }
+
+    #[test]
+    fn test_bitmap_index_state_codec_roundtrip() {
+        // Non-empty state with a few keys and a populated null map.
+        let mut index_map = BTreeMap::new();
+        index_map.insert(OrderableScalarValue(ScalarValue::Int32(Some(1))), 0);
+        index_map.insert(OrderableScalarValue(ScalarValue::Int32(Some(7))), 1);
+        index_map.insert(OrderableScalarValue(ScalarValue::Int32(Some(42))), 2);
+        let mut null_map = RowAddrTreeMap::new();
+        null_map.insert(RowAddress::new_from_parts(0, 3).into());
+        null_map.insert(RowAddress::new_from_parts(0, 5).into());
+        let state = BitmapIndexState {
+            lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
+            null_map: Arc::new(null_map),
+            value_type: DataType::Int32,
+        };
+        assert_state_roundtrips(&state);
+
+        // Empty state: no keys, empty null map. Schema still carries the type.
+        let empty_state = BitmapIndexState {
+            lookup_batch: build_lookup_batch(&BTreeMap::new(), &DataType::Utf8).unwrap(),
+            null_map: Arc::new(RowAddrTreeMap::new()),
+            value_type: DataType::Utf8,
+        };
+        assert_state_roundtrips(&empty_state);
+    }
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {

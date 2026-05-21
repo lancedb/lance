@@ -434,7 +434,10 @@ fn bench_vector_search(c: &mut Criterion) {
                         "vector".to_string(),
                         DistanceType::L2,
                     );
-                    let plan = planner.plan_search(&query, k, nprobes, None).await.unwrap();
+                    let plan = planner
+                        .plan_search(&query, k, nprobes, None, None)
+                        .await
+                        .unwrap();
                     let session_ctx = SessionContext::new();
                     let stream = plan.execute(0, session_ctx.task_ctx()).unwrap();
                     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();

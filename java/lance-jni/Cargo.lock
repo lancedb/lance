@@ -2344,9 +2344,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.15.0"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "encoding_rs"
@@ -2509,7 +2509,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3616,7 +3616,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3663,6 +3663,7 @@ dependencies = [
  "lance-table",
  "lance-tokenizer",
  "log",
+ "moka",
  "object_store",
  "permutation",
  "pin-project",
@@ -3686,7 +3687,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3706,7 +3707,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrayref",
  "paste",
@@ -3715,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3750,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3782,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3800,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3835,7 +3836,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3866,7 +3867,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -3880,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3947,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3989,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4025,7 +4026,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4041,7 +4042,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4053,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4083,9 +4084,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.7.6"
+version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65e31bdaa13e01dab6e7cf566da31df243c34a542f0d915d3601ec0e01e61d2"
+checksum = "6369eee4682fb11edf538388b43c61ce288b8302fe89bb40944d7daa7faaae99"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -4097,7 +4098,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4134,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.0.0-beta.16"
+version = "7.0.0-beta.17"
 dependencies = [
  "rust-stemmers",
  "serde",
