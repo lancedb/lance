@@ -1159,6 +1159,7 @@ pub async fn build_cleanup_policy_from_config(
                 });
             }
         };
+        // Map config to policy flag controlling whether referenced branches are cleaned
         builder = builder.clean_referenced_branches(clean_referenced);
     }
     if let Some(delete_rate_limit) = config.get("lance.auto_cleanup.delete_rate_limit") {

@@ -1458,6 +1458,7 @@ impl Debug for ConditionalPutCommitHandler {
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
+    // TODO: add isolation_level
 }
 
 impl Default for CommitConfig {
