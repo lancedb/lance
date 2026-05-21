@@ -5342,7 +5342,7 @@ mod tests {
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(1000), BatchCount::from(5));
-        train_btree_index(stream, test_store.as_ref(), 1000, None, None)
+        train_btree_index(stream, test_store.as_ref(), 1000, DistributedMode::Single)
             .await
             .unwrap();
 
@@ -5421,7 +5421,7 @@ mod tests {
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(1000), BatchCount::from(1));
-        train_btree_index(stream, test_store.as_ref(), 1000, None, None)
+        train_btree_index(stream, test_store.as_ref(), 1000, DistributedMode::Single)
             .await
             .unwrap();
 
@@ -5486,7 +5486,7 @@ mod tests {
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(half), BatchCount::from(1));
-        train_btree_index(part0, store.as_ref(), half, None, Some(0u32))
+        train_btree_index(part0, store.as_ref(), half, DistributedMode::Range { range_id: 0 })
             .await
             .unwrap();
 
@@ -5496,7 +5496,7 @@ mod tests {
             .col("value", array::cycle::<Int32Type>(values))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids))
             .into_df_stream(RowCount::from(half), BatchCount::from(1));
-        train_btree_index(part1, store.as_ref(), half, None, Some(1u32))
+        train_btree_index(part1, store.as_ref(), half, DistributedMode::Range { range_id: 1 })
             .await
             .unwrap();
 
