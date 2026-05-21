@@ -299,6 +299,22 @@ pub trait DatasetIndexExt {
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
+    /// Sample partition boundaries for a column to enable range-partitioned
+    /// distributed BTree index construction.
+    ///
+    /// Returns `num_partitions - 1` boundary values that divide the column's
+    /// data into approximately equal-sized ranges. These boundaries can be
+    /// passed to worker nodes so each worker builds a BTree index partition
+    /// for its assigned value range.
+    ///
+    /// When `num_partitions < 2` or the column has insufficient distinct
+    /// values, an empty vector is returned (indicating a single partition).
+    async fn sample_partition_boundaries(
+        &self,
+        column: &str,
+        num_partitions: u32,
+    ) -> Result<Vec<datafusion::scalar::ScalarValue>>;
+
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(
         &self,

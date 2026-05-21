@@ -226,7 +226,7 @@ pub(crate) async fn load_training_data(
     }
 }
 
-pub(crate) async fn sample_partition_boundaries(
+pub(super) async fn sample_partition_boundaries(
     dataset: &Dataset,
     column: &str,
     num_partitions: u32,
@@ -398,6 +398,64 @@ pub(super) async fn build_btree_index_partitioned(
         },
         Some(merge_result),
     ))
+}
+
+pub(crate) async fn merge_btree_segments(
+    dataset: &Dataset,
+    segments: Vec<IndexMetadata>,
+) -> Result<IndexMetadata> {
+    if segments.is_empty() {
+        return Err(Error::index("No segment metadata was provided".to_string()));
+    }
+
+    let field_id = *segments[0].fields.first().ok_or_else(|| {
+        Error::invalid_input(format!(
+            "CreateIndex: segment {} is missing field ids",
+            segments[0].uuid
+        ))
+    })?;
+
+    let uuid = segments[0].uuid;
+    let index_dir = dataset.indices_dir().join(uuid.to_string());
+    let store = LanceIndexStore::from_dataset_for_new(dataset, &uuid.to_string())?;
+    let store = Arc::new(store);
+
+    let merge_result = lance_index::scalar::btree::merge_index_files(
+        dataset.object_store.as_ref(),
+        &index_dir,
+        store.clone(),
+        None,
+        lance_index::progress::noop_progress(),
+    )
+    .await?;
+
+    let mut fragment_bitmap = roaring::RoaringBitmap::new();
+    for segment in &segments {
+        if let Some(fb) = &segment.fragment_bitmap {
+            fragment_bitmap |= fb.clone();
+        }
+    }
+
+    lance_index::scalar::btree::cleanup_shard_files(store.as_ref(), &merge_result).await;
+
+    let files = lance_table::format::list_index_files_with_sizes(
+        &dataset.object_store,
+        &index_dir,
+    )
+    .await?;
+
+    Ok(IndexMetadata {
+        uuid,
+        fields: vec![field_id],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: segments[0].index_details.clone(),
+        index_version: segments[0].index_version,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: Some(files),
+        ..segments[0].clone()
+    })
 }
 
 // TODO: Allow users to register their own plugins
@@ -2351,6 +2409,132 @@ mod tests {
             1,
             "Expected exactly one page_lookup file, found {}",
             lookup_files.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_btree_range_partitioned_optimize_loses_range_info() {
+        use lance_datagen::{BatchCount, RowCount};
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/test_btree_range_optimize", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col(
+                "value",
+                array::cycle::<Int32Type>((0..100i32).collect::<Vec<_>>()),
+            )
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index_builder(&["value"], IndexType::BTree, &params)
+            .range_partitions(4)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+
+        let index_dir_before = dataset
+            .indices_dir()
+            .join(indices[0].uuid.to_string().as_str());
+        let files_before =
+            lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir_before)
+                .await
+                .unwrap();
+        let page_data_files_before: Vec<_> = files_before
+            .iter()
+            .filter(|f| f.path.starts_with("part_") && f.path.contains("page_data"))
+            .collect();
+        assert!(
+            page_data_files_before.len() >= 2,
+            "Range-partitioned index should have multiple part_*_page_data files, found {}",
+            page_data_files_before.len()
+        );
+
+        let lookup_file_before = files_before
+            .iter()
+            .find(|f| f.path.contains("page_lookup"))
+            .expect("Should have a page_lookup file");
+        let lookup_reader_before = dataset
+            .object_store
+            .open(&index_dir_before.join(&lookup_file_before.path))
+            .await
+            .unwrap();
+        let range_partitioned_before = lookup_reader_before
+            .schema()
+            .metadata
+            .contains_key("range_partitioned");
+        assert!(
+            range_partitioned_before,
+            "Range-partitioned index lookup should have range_partitioned metadata"
+        );
+
+        // Append new data and run optimize_indices
+        let new_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>().starting_at(1000))
+            .col(
+                "value",
+                array::cycle::<Int32Type>((0..100i32).collect::<Vec<_>>()),
+            )
+            .into_reader_rows(RowCount::from(500), BatchCount::from(1));
+        dataset.append(new_reader, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let indices_after = dataset.load_indices().await.unwrap();
+
+        let new_index_meta = indices_after
+            .iter()
+            .find(|idx| idx.uuid != indices[0].uuid)
+            .or_else(|| indices_after.last());
+
+        let meta = new_index_meta.expect("Should have a new index segment after optimize");
+        let index_dir_after = dataset.indices_dir().join(meta.uuid.to_string().as_str());
+        let files_after =
+            lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir_after)
+                .await
+                .unwrap();
+
+        let lookup_file_after = files_after.iter().find(|f| f.path.contains("page_lookup"));
+        if let Some(lookup_file) = lookup_file_after {
+            let lookup_reader_after = dataset
+                .object_store
+                .open(&index_dir_after.join(&lookup_file.path))
+                .await
+                .unwrap();
+            let range_partitioned_after = lookup_reader_after
+                .schema()
+                .metadata
+                .contains_key("range_partitioned");
+            assert!(
+                range_partitioned_after,
+                "After optimize, the new index should still be range-partitioned but range_partitioned metadata is lost. \
+                 Files before optimize: {:?}, files after: {:?}",
+                files_before.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                files_after.iter().map(|f| &f.path).collect::<Vec<_>>(),
+            );
+        }
+
+        // Verify query correctness after optimize
+        let results = dataset
+            .scan()
+            .filter("value = 50")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            results.num_rows(),
+            15,
+            "After optimize, query should return 15 rows (10 from original + 5 from new data)"
         );
     }
 }

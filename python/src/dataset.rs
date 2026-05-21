@@ -2303,7 +2303,7 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, range_partitions = None, kwargs = None))]
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, range_partitions = None, range_id = None, kwargs = None))]
     #[allow(clippy::too_many_arguments)]
     fn create_index(
         &mut self,
@@ -2314,6 +2314,7 @@ impl Dataset {
         train: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         range_partitions: Option<u32>,
+        range_id: Option<u32>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<PyLance<IndexMetadata>> {
         let columns: Vec<&str> = columns.iter().map(|s| &**s).collect();
@@ -2339,10 +2340,16 @@ impl Dataset {
 
         log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
-            "BTREE" => Box::new(ScalarIndexParams {
-                index_type: "btree".to_string(),
-                params: None,
-            }),
+            "BTREE" => {
+                let btree_params = match range_id {
+                    Some(rid) => Some(format!("{{\"range_id\": {}}}", rid)),
+                    None => None,
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "btree".to_string(),
+                    params: btree_params,
+                })
+            }
             "BITMAP" => Box::new(ScalarIndexParams {
                 index_type: "bitmap".to_string(),
                 params: None,
@@ -2536,6 +2543,24 @@ impl Dataset {
             )?
             .infer_error()?;
         Ok(PyLance(merged))
+    }
+
+    #[pyo3(signature = (column, num_partitions))]
+    fn sample_partition_boundaries(
+        &self,
+        column: &str,
+        num_partitions: u32,
+    ) -> PyResult<Vec<String>> {
+        let boundaries = rt()
+            .block_on(
+                None,
+                self.ds.sample_partition_boundaries(column, num_partitions),
+            )?
+            .infer_error()?;
+        Ok(boundaries
+            .iter()
+            .map(|v| v.to_string())
+            .collect())
     }
 
     fn commit_existing_index_segments(
