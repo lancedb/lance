@@ -197,9 +197,15 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         dataset.fragments().iter().map(|f| f.id as u32).collect();
     let prefilter_input = filtered_read.index_input().cloned();
 
-    // If there is a prefilter, compute the index coverage from its
-    // ScalarIndexExpr leaves. None means at least one leaf has no
-    // fragment_bitmap and we can't reason about coverage — refuse to fire.
+    // If there is a prefilter, inspect its ScalarIndexExpr leaves:
+    //   - Refuse to fire if any leaf is inexact (`needs_recheck`). The
+    //     prefilter's serialized batch carries an Exact/AtMost/AtLeast
+    //     discriminant but `load_prefilter` only reads the row-address mask
+    //     and would treat AtMost as Exact, silently overcounting (and
+    //     symmetrically AtLeast would undercount).
+    //   - Compute the index's fragment coverage from leaf `fragment_bitmap`s.
+    //     `None` means at least one leaf has no bitmap and we can't reason
+    //     about coverage synchronously — refuse to fire.
     let index_coverage = match &prefilter_input {
         None => None,
         Some(input) => {
@@ -212,6 +218,9 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
                         .to_string(),
                 )
                 })?;
+            if scalar_exec.expr().needs_recheck() {
+                return Ok(None);
+            }
             let Some(coverage) = collect_coverage(scalar_exec.expr()) else {
                 return Ok(None);
             };
@@ -401,7 +410,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::IndexType;
-    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     use super::*;
     use crate::Dataset;
@@ -661,6 +670,48 @@ mod tests {
         assert!(
             !plan_contains_pushdown(&plan),
             "rule should not fire with non-indexed filter, got plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_skips_when_index_is_inexact() {
+        // Zonemap-style indices return AtMost (over-approximation) and set
+        // ScalarIndexSearch.needs_recheck = true. AggregateIndexSearchExec
+        // ignores the discriminant on the prefilter batch, so firing the
+        // rule against an inexact index would silently overcount. The rule
+        // must refuse — and the scan path with its recheck still answers
+        // correctly.
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::ZoneMap,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                true,
+            )
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let mut scanner = dataset.scan();
+        scanner.filter("ordered < 25").unwrap();
+        let (plan, count) = run_count(&mut scanner).await;
+        assert_eq!(count, 25);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "rule must not fire when the index produces inexact (needs_recheck) results, \
+             got plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
