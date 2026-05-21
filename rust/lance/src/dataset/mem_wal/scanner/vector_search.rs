@@ -2015,4 +2015,102 @@ mod tests {
             rows
         );
     }
+
+    #[tokio::test]
+    async fn test_vector_search_same_l0_override_newest_wins() {
+        // Ported from the #6844 spec. The DANGEROUS within-memtable direction:
+        // a PK is re-inserted in the SAME active memtable with a *farther* vector,
+        // while the stale earlier copy sits ON the query. Newest-wins must keep
+        // the newer far copy and exclude the stale near one — unlike
+        // `test_vector_search_dedup_within_active_memtable`, which keeps the newer
+        // copy only because it is also the closer one (a weaker check).
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let on_query = [0.1, 0.2, 0.3, 0.4]; // == query: the STALE copy of id=1
+        let far = [9.0, 9.0, 9.0, 9.0]; // the FRESH (newer) copy of id=1
+        let other = [1.0, 1.0, 1.0, 1.0]; // unrelated id=2, not on the query
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        // Batch 0 @ positions 0,1: stale id=1 on the query, plus id=2.
+        let b0 = batch_rows(&schema, &[(1, on_query), (2, other)]);
+        let (_, _, bp0) = batch_store.append(b0.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b0, 0, Some(bp0))
+            .unwrap();
+        // Batch 1 @ position 2: id=1 re-inserted with the newer far vector.
+        let b1 = batch_rows(&schema, &[(1, far)]);
+        let (_, _, bp1) = batch_store.append(b1.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b1, 2, Some(bp1))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        let id1: Vec<f32> = rows
+            .iter()
+            .filter(|&&(id, _)| id == 1)
+            .map(|&(_, d)| d)
+            .collect();
+        assert_eq!(
+            id1.len(),
+            1,
+            "newest-wins: id=1 must appear exactly once after a same-L0 override, got {:?}",
+            rows
+        );
+        assert!(
+            id1[0] > 1.0,
+            "newest-wins: surviving id=1 must be the newer far vector, not the stale near one — got distance {}",
+            id1[0]
+        );
+        assert!(
+            rows.iter().all(|&(_, d)| d.abs() >= 1e-3),
+            "newest-wins: the stale on-query copy (distance ~0) must be excluded, got {:?}",
+            rows
+        );
+    }
 }
