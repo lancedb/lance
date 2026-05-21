@@ -97,7 +97,7 @@ impl FlushedMemTableCache {
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
     }
 
-    /// Get the cached [`GenPkIndex`] for `path`, building it (exactly once) on a
+    /// Get the cached `GenPkIndex` for `path`, building it (exactly once) on a
     /// miss via `build`. The flushed path is immutable, so a cached index is
     /// never stale; concurrent first-queries share one build via `moka`'s
     /// single-flight `try_get_with`.
