@@ -26,7 +26,6 @@ I/O.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import lance
@@ -78,15 +77,6 @@ def _assert_no_column_scan(plan: str) -> None:
     )
 
 
-def _io_bytes_read(plan: str) -> int:
-    """Sum every ``bytes_read=N`` metric in the plan."""
-    return sum(int(m) for m in re.findall(r"bytes_read=(\d+)", plan))
-
-
-def _io_iops(plan: str) -> int:
-    return sum(int(m) for m in re.findall(r"iops=(\d+)", plan))
-
-
 # --------------------------------------------------------------------------
 # Tests
 # --------------------------------------------------------------------------
@@ -97,24 +87,29 @@ def test_filtered_count_with_scalar_index(tmp_path: Path):
 
     The second call must perform zero I/O — proof the rule routed the count
     through the index/deletion-mask metadata both times and the second call
-    re-used the cache.
+    re-used the cache. The check uses ``dataset.io_stats_incremental()``
+    rather than parsing the plan's ``bytes_read=…`` so we get a direct
+    accounting of every object-store read the dataset performed during the
+    second call, not just what the plan happens to surface.
     """
     dataset = _make_dataset(tmp_path)
     filter = "x < 50"
     expected = 50
 
+    # Verify the rule fires for this shape.
+    _assert_pushdown_fired(_filtered_count_plan(dataset, filter))
+    _assert_no_column_scan(_filtered_count_plan(dataset, filter))
+
     # First call warms the index + deletion-mask caches.
     assert dataset.count_rows(filter=filter) == expected
+    # Reset counters so the next snapshot only reflects the second call.
+    dataset.io_stats_incremental()
 
-    # Re-run via `analyze_plan` so we can both inspect the plan shape
-    # and read the runtime I/O metrics.
-    plan = _filtered_count_plan(dataset, filter)
-    _assert_pushdown_fired(plan)
-    _assert_no_column_scan(plan)
-    assert _io_bytes_read(plan) == 0, (
-        f"expected zero I/O on the cached call, got:\n{plan}"
-    )
-    assert _io_iops(plan) == 0, f"expected zero iops on the cached call, got:\n{plan}"
+    # Second call: must do zero I/O.
+    assert dataset.count_rows(filter=filter) == expected
+    stats = dataset.io_stats_incremental()
+    assert stats.read_iops == 0, f"expected 0 read_iops, got {stats.read_iops}"
+    assert stats.read_bytes == 0, f"expected 0 read_bytes, got {stats.read_bytes}"
 
 
 def test_filtered_count_with_deleted_rows(tmp_path: Path):
