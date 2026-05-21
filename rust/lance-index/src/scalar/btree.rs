@@ -5486,9 +5486,14 @@ mod tests {
             .col("value", array::step::<Int32Type>())
             .col("_rowid", array::step::<UInt64Type>())
             .into_df_stream(RowCount::from(half), BatchCount::from(1));
-        train_btree_index(part0, store.as_ref(), half, DistributedMode::Range { range_id: 0 })
-            .await
-            .unwrap();
+        train_btree_index(
+            part0,
+            store.as_ref(),
+            half,
+            DistributedMode::Range { range_id: 0 },
+        )
+        .await
+        .unwrap();
 
         let values: Vec<i32> = (half as i32..total).collect();
         let row_ids: Vec<u64> = (half..total as u64).collect();
@@ -5496,9 +5501,14 @@ mod tests {
             .col("value", array::cycle::<Int32Type>(values))
             .col("_rowid", array::cycle::<UInt64Type>(row_ids))
             .into_df_stream(RowCount::from(half), BatchCount::from(1));
-        train_btree_index(part1, store.as_ref(), half, DistributedMode::Range { range_id: 1 })
-            .await
-            .unwrap();
+        train_btree_index(
+            part1,
+            store.as_ref(),
+            half,
+            DistributedMode::Range { range_id: 1 },
+        )
+        .await
+        .unwrap();
 
         super::merge_metadata_files(
             store.as_ref(),
