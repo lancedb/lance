@@ -312,6 +312,10 @@ pub struct ManifestNamespace {
     /// Number of retries for commit operations on the manifest table.
     /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
     commit_retries: Option<u32>,
+    /// Whether table version records are stored as rows in the `__manifest` table.
+    /// When false, drop_table / deregister_table can skip scanning for version rows
+    /// since none are ever written.
+    table_version_storage_enabled: bool,
     /// Serialize manifest mutations within a single namespace instance so concurrent
     /// create/drop calls do not compete with each other on the same in-memory snapshot.
     manifest_mutation_lock: Arc<Mutex<()>>,
@@ -421,6 +425,7 @@ impl ManifestNamespace {
             dir_listing_enabled,
             inline_optimization_enabled,
             commit_retries,
+            table_version_storage_enabled,
             manifest_mutation_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -1153,6 +1158,9 @@ impl ManifestNamespace {
     /// Shared helper that executes a delete against the manifest dataset
     /// using the given filter predicate, then runs inline optimization.
     async fn delete_by_filter(&self, filter: &str, error_context: &str) -> Result<()> {
+        // Serialize manifest mutations within this process to avoid unnecessary
+        // commit conflicts with other in-process writers.
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
         let dataset_guard = self.manifest_dataset.get().await?;
         let dataset = Arc::new(dataset_guard.clone());
         drop(dataset_guard);
@@ -1473,6 +1481,14 @@ impl ManifestNamespace {
     /// Uses a `starts_with` filter on object_id to match all versions of the table,
     /// since version object_ids are formatted as `{table_object_id}${zero_padded_version}`.
     pub async fn delete_all_table_versions_for_table(&self, table_object_id: &str) -> Result<()> {
+        // When table version storage is disabled, no version rows are ever
+        // written to the __manifest table, so there is nothing to delete.
+        // Skipping the delete entirely also avoids producing an empty commit
+        // (and an inline-optimization run) on every drop_table / deregister_table.
+        if !self.table_version_storage_enabled {
+            return Ok(());
+        }
+
         let escaped_id = table_object_id.replace('\'', "''");
         let prefix = format!("{}{}", escaped_id, DELIMITER);
         let filter = format!(
@@ -1480,8 +1496,6 @@ impl ManifestNamespace {
             prefix
         );
 
-        // Directly execute the delete without pre-scanning; DeleteBuilder is a
-        // no-op when no rows match, matching the delete_from_manifest pattern.
         self.delete_by_filter(&filter, "Failed to delete table version entries")
             .await
     }
