@@ -53,7 +53,6 @@ use lance_core::datatypes::{
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::aggregate::Aggregate;
@@ -66,7 +65,9 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::ScalarIndexExpr;
-use lance_index::scalar::expression::{INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt};
+use lance_index::scalar::expression::{
+    INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt, serialize_index_expr_result,
+};
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
@@ -75,6 +76,7 @@ use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use tracing::{Span, info_span, instrument};
@@ -2834,7 +2836,7 @@ impl Scanner {
         let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
         let index_result = IndexExprResult::Exact(row_addr_mask);
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
-        let batch = index_result.serialize_to_arrow(&fragments_covered)?;
+        let batch = serialize_index_expr_result(&index_result, &fragments_covered)?;
         let stream = futures::stream::once(async move { Ok(batch) });
         let stream = Box::pin(RecordBatchStreamAdapter::new(
             INDEX_EXPR_RESULT_SCHEMA.clone(),

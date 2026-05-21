@@ -15,6 +15,7 @@ rust-version.workspace = true
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-file.workspace = true
+lance-select.workspace = true
 lance-io.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true

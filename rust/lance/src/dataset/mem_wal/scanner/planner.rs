@@ -19,9 +19,11 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
 };
+use crate::session::Session;
 
 /// Plans scan queries over LSM data.
 pub struct LsmScanPlanner {
@@ -31,6 +33,10 @@ pub struct LsmScanPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
+    /// Session threaded into flushed-generation opens (shared caches).
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmScanPlanner {
@@ -44,7 +50,23 @@ impl LsmScanPlanner {
             collector,
             pk_columns,
             base_schema,
+            session: None,
+            flushed_cache: None,
         }
+    }
+
+    /// Thread a session into flushed-generation opens so the first open
+    /// populates the shared index / file-metadata caches.
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// queries against the same generation a pure `Arc::clone`.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
+        self
     }
 
     /// Create scan plan with deduplication.
@@ -351,9 +373,9 @@ impl LsmScanPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                    .load()
-                    .await?;
+                let dataset =
+                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await?;
                 let mut scanner = dataset.scan();
 
                 let cols =

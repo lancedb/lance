@@ -28,6 +28,8 @@ from lance_namespace import (
     AlterTransactionResponse,
     AnalyzeTableQueryPlanRequest,
     CountTableRowsRequest,
+    CreateMaterializedViewRequest,
+    CreateMaterializedViewResponse,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
     CreateTableIndexRequest,
@@ -806,6 +808,13 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.refresh_materialized_view(request.model_dump())
         return RefreshMaterializedViewResponse.from_dict(response_dict)
 
+    def create_materialized_view(
+        self, request: CreateMaterializedViewRequest
+    ) -> CreateMaterializedViewResponse:
+        """Create a materialized view backed by an optional UDTF/chunker."""
+        response_dict = self._inner.create_materialized_view(request.model_dump())
+        return CreateMaterializedViewResponse.from_dict(response_dict)
+
     # Table tag operations
 
     def list_table_tags(self, request: ListTableTagsRequest) -> ListTableTagsResponse:
@@ -1368,6 +1377,13 @@ class RestNamespace(LanceNamespace):
         """Trigger an async materialized view refresh."""
         response_dict = self._inner.refresh_materialized_view(request.model_dump())
         return RefreshMaterializedViewResponse.from_dict(response_dict)
+
+    def create_materialized_view(
+        self, request: CreateMaterializedViewRequest
+    ) -> CreateMaterializedViewResponse:
+        """Create a materialized view backed by an optional UDTF/chunker."""
+        response_dict = self._inner.create_materialized_view(request.model_dump())
+        return CreateMaterializedViewResponse.from_dict(response_dict)
 
     # Table tag operations
 

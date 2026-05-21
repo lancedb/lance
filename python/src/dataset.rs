@@ -3375,6 +3375,7 @@ impl Dataset {
                 field_dict.set_item("field_id", &field.field_id)?;
                 field_dict.set_item("source_ids", field.source_ids.clone())?;
                 field_dict.set_item("transform", field.transform.clone())?;
+                field_dict.set_item("expression", field.expression.clone())?;
                 field_dict.set_item("result_type", &field.result_type)?;
                 field_dict.set_item("parameters", field.parameters.clone())?;
                 fields.append(field_dict)?;
@@ -3386,12 +3387,12 @@ impl Dataset {
         Ok(Some(dict))
     }
 
-    /// Get a RegionWriter for the specified region.
+    /// Get a ShardWriter for the specified shard.
     ///
     /// `initialize_mem_wal()` must be called before using this method.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature=(
-        region_id,
+        shard_id,
         *,
         durable_write=None,
         sync_indexed_write=None,
@@ -3410,7 +3411,7 @@ impl Dataset {
     fn mem_wal_writer(
         &self,
         py: Python<'_>,
-        region_id: String,
+        shard_id: String,
         durable_write: Option<bool>,
         sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
@@ -3424,11 +3425,11 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
-    ) -> PyResult<crate::mem_wal::PyRegionWriter> {
+    ) -> PyResult<crate::mem_wal::PyShardWriter> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
-        let uuid = uuid::Uuid::parse_str(&region_id)
-            .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
+        let uuid = uuid::Uuid::parse_str(&shard_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
 
         let config = writer_config_from_kwargs(
             durable_write,
@@ -3455,7 +3456,7 @@ impl Dataset {
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        Ok(crate::mem_wal::PyRegionWriter::new(
+        Ok(crate::mem_wal::PyShardWriter::new(
             writer,
             uuid,
             self.ds.clone(),

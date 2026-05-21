@@ -18,8 +18,10 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::ShardSnapshot;
+use super::flushed_cache::FlushedMemTableCache;
 use super::planner::LsmScanPlanner;
 use crate::dataset::Dataset;
+use crate::session::Session;
 
 /// Either a base Lance table, or an explicit base path used to resolve
 /// flushed-generation directories when no base dataset is configured.
@@ -73,6 +75,14 @@ pub struct LsmScanner {
 
     // Primary key columns (required for deduplication)
     pk_columns: Vec<String>,
+
+    /// Session threaded into flushed-generation opens so the first open of
+    /// each generation populates the shared index / file-metadata caches.
+    /// Defaults to the base table's session when one is present.
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets. When set, repeated
+    /// queries against the same generation skip the manifest read entirely.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmScanner {
@@ -90,6 +100,10 @@ impl LsmScanner {
     ) -> Self {
         let lance_schema = base_table.schema();
         let arrow_schema: arrow_schema::Schema = lance_schema.into();
+        // Default the session to the base table's so the common path reuses
+        // the shared index / metadata caches without extra wiring. An
+        // explicit `with_session` still overrides this.
+        let session = Some(base_table.session());
         Self {
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),
@@ -102,6 +116,8 @@ impl LsmScanner {
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
+            session,
+            flushed_cache: None,
         }
     }
 
@@ -138,6 +154,8 @@ impl LsmScanner {
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
+            session: None,
+            flushed_cache: None,
         }
     }
 
@@ -167,6 +185,29 @@ impl LsmScanner {
         memtables: InMemoryMemTables,
     ) -> Self {
         self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Thread an existing session into flushed-generation opens.
+    ///
+    /// The first open of each flushed generation then populates the shared
+    /// index / file-metadata caches, so later queries skip re-decoding them.
+    /// When a base table is configured this defaults to its session; call
+    /// this to override (e.g. on a fresh-tier-only scanner that owns its own
+    /// long-lived session).
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets.
+    ///
+    /// With a cache, repeated queries against the same generation become a
+    /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
+    /// is owned and sized by the caller (see [`FlushedMemTableCache`]); not
+    /// set by default, so behavior is unchanged unless opted in.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
         self
     }
 
@@ -239,7 +280,13 @@ impl LsmScanner {
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
-        let planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        let mut planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        if let Some(session) = &self.session {
+            planner = planner.with_session(session.clone());
+        }
+        if let Some(cache) = &self.flushed_cache {
+            planner = planner.with_flushed_cache(cache.clone());
+        }
 
         planner
             .plan_scan(

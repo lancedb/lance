@@ -18,11 +18,16 @@ use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
-use super::projection::{
-    build_scanner_projection, canonical_output_schema, project_to_canonical, wants_row_address,
-    wants_row_id,
+use super::exec::{
+    BloomFilterGuardExec, CoalesceFirstExec, DedupDirection, WithinSourceDedupExec,
+    compute_pk_hash_from_scalars,
 };
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::projection::{
+    build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
+    wants_row_address, wants_row_id,
+};
+use crate::session::Session;
 
 /// Plans point lookup queries over LSM data.
 ///
@@ -70,6 +75,10 @@ pub struct LsmPointLookupPlanner {
     /// Bloom filters for each memtable generation.
     /// Map: generation -> bloom filter
     bloom_filters: std::collections::HashMap<u64, Arc<Sbbf>>,
+    /// Session threaded into flushed-generation opens (shared caches).
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmPointLookupPlanner {
@@ -90,7 +99,23 @@ impl LsmPointLookupPlanner {
             pk_columns,
             base_schema,
             bloom_filters: std::collections::HashMap::new(),
+            session: None,
+            flushed_cache: None,
         }
+    }
+
+    /// Thread a session into flushed-generation opens so the first open
+    /// populates the shared index / file-metadata caches.
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// lookups against the same generation a pure `Arc::clone`.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
+        self
     }
 
     /// Add a bloom filter for a generation.
@@ -234,9 +259,9 @@ impl LsmPointLookupPlanner {
                 scanner.create_plan().await?
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                    .load()
-                    .await?;
+                let dataset =
+                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await?;
                 let mut scanner = dataset.scan();
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
@@ -254,7 +279,26 @@ impl LsmPointLookupPlanner {
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await?
+                // Expose `_rowid` (the BatchStore row offset, monotonic with
+                // insert order) so we can pick the most recently inserted
+                // duplicate below. Without this, a `FilterExec → LIMIT 1`
+                // over insert-ordered scan would return the *oldest* of
+                // multiple rows sharing the target primary key.
+                scanner.with_row_id();
+                let raw = scanner.create_plan().await?;
+                // Within the active memtable, larger `_rowid` = newer
+                // insert. After dedup there is exactly one row per PK.
+                let deduped: Arc<dyn ExecutionPlan> = Arc::new(WithinSourceDedupExec::new(
+                    raw,
+                    self.pk_columns.clone(),
+                    lance_core::ROW_ID,
+                    DedupDirection::KeepMaxRowAddr,
+                ));
+                // Per-source `_rowid` would collide with the base table's;
+                // NULL it before canonicalization (the value is internal to
+                // this arm). project_to_canonical drops it entirely when
+                // the user didn't request `_rowid` in the projection.
+                null_columns(deduped, &[lance_core::ROW_ID])?
             }
         };
         project_to_canonical(scan, &target)
@@ -605,6 +649,131 @@ mod tests {
                 "_rowid".to_string(),
             ],
             "empty point-lookup plan must honor user column order including system columns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_active_memtable_returns_newest_duplicate() {
+        // Regression: same primary key inserted twice into one active
+        // memtable must return the *newest* row. The bug was that
+        // `FilterExec → LIMIT 1` over an insert-ordered scan returned the
+        // first (oldest) match. `WithinSourceDedupExec` collapses by PK,
+        // keeping the row with the largest `_rowid` (insert order).
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use futures::TryStreamExt;
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        // BTree on the PK so that `max_visible_batch_position` advances as
+        // we insert, otherwise the scanner sees no batches at all.
+        index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+
+        // Two writes to pk=1, then an unrelated pk=2. The "new" row goes
+        // *second* so its `_rowid` is larger.
+        let b_old = create_test_batch(&schema, &[1], "old");
+        let b_new = create_test_batch(&schema, &[1], "new");
+        let b_other = create_test_batch(&schema, &[2], "two");
+        let (_, _, bp_old) = batch_store.append(b_old.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_old, 0, Some(bp_old))
+            .unwrap();
+        let (_, _, bp_new) = batch_store.append(b_new.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_new, 1, Some(bp_new))
+            .unwrap();
+        let (_, _, bp_other) = batch_store.append(b_other.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_other, 2, Some(bp_other))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let plan = planner
+            .plan_lookup(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "expected exactly one row for pk=1");
+        let name_col = batches[0].column_by_name("name").unwrap();
+        let name_arr = name_col.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            name_arr.value(0),
+            "new_1",
+            "active-arm lookup must return the newer insert, not the oldest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_flushed_memtable_returns_newest_duplicate() {
+        // Regression / invariant pin: when a flushed memtable contains two
+        // rows for the same PK, the lookup must return the newer one. The
+        // flushed dataset is reverse-written (newest at the smallest
+        // physical position), so we simulate that here by writing the
+        // dataset with the new row first. The point-lookup plan today
+        // returns the first match (smallest `_rowid`) under reverse-write,
+        // and remains so after this change.
+        use futures::TryStreamExt;
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+        let base_uri = format!("{}/base", base_path);
+
+        // Simulated reverse-write: newest insert lives at row 0.
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let row_new = create_test_batch(&schema, &[1], "new");
+        let row_old = create_test_batch(&schema, &[1], "old");
+        create_dataset(&gen1_uri, vec![row_new, row_old]).await;
+
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let plan = planner
+            .plan_lookup(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "expected exactly one row for pk=1");
+        let name_col = batches[0].column_by_name("name").unwrap();
+        let name_arr = name_col.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            name_arr.value(0),
+            "new_1",
+            "flushed-arm lookup must return the row at the smallest _rowid (newest under reverse-write)"
         );
     }
 }

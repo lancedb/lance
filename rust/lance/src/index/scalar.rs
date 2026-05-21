@@ -389,10 +389,6 @@ pub async fn open_scalar_index(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    if index_details.type_url.ends_with("LabelListIndexDetails") {
-        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
-    }
-
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 
     let index_cache = dataset
@@ -403,7 +399,14 @@ pub async fn open_scalar_index(
         .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
         .await?
     {
+        // Compatibility check is only needed on first load; a cache hit means
+        // the index was already validated when it was originally opened in
+        // this session, so we can skip the extra `open_index_file` IOP.
         return Ok(index);
+    }
+
+    if index_details.type_url.ends_with("LabelListIndexDetails") {
+        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
     }
 
     let index = plugin

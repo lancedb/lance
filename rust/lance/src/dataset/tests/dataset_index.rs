@@ -2297,6 +2297,199 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
     );
 }
 
+/// Bitmap analogue of `test_btree_prewarm_with_serializing_backend_serves_query_with_no_io`:
+/// after prewarming a Bitmap scalar index through a serializing cache backend,
+/// an indexed-filter query serves results without any further IO. The
+/// serializing backend forces every cache hit through the `BitmapIndexState`
+/// (top-level state) and `RowAddrTreeMap` (per-value bitmap) `CacheCodec`
+/// impls, so this exercises both round-trip paths.
+#[tokio::test]
+async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    // Low-cardinality column so the index has several per-value bitmaps to
+    // round-trip through the per-key codec.
+    let num_rows: i32 = 8_000;
+    let values = Int32Array::from_iter_values((0..num_rows).map(|i| i % 16));
+    let ids = UInt64Array::from_iter_values(0..num_rows as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", DataType::Int32, false),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(values) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Bitmap,
+            Some("value_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.prewarm_index("value_idx").await.unwrap();
+
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the bitmap state and per-value bitmaps through \
+         CacheCodec, but the serializing store was empty"
+    );
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("value = 7")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected = (num_rows as usize) / 16;
+    assert_eq!(
+        result.num_rows(),
+        expected,
+        "indexed bitmap filter should return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "Bitmap filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every per-value bitmap from memory"
+    );
+}
+
+/// LabelList analogue: after prewarming, an `array_has_any` query against a
+/// `LabelList` index serves results without any further IO. Exercises the
+/// `LabelListIndexState` codec (which embeds the inner bitmap state and the
+/// list-nulls bitmap) plus the same per-value bitmap codec.
+#[tokio::test]
+async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    let mut dataset = gen_batch()
+        .col(
+            "labels",
+            lance_datagen::array::rand_list_any(
+                lance_datagen::array::cycle::<arrow::datatypes::Int64Type>(vec![1, 2, 3, 4, 5]),
+                false,
+            ),
+        )
+        .into_dataset(&uri, FragmentCount::from(2), FragmentRowCount::from(2000))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let expected = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("array_has_any(labels, [3])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()
+        .num_rows();
+    assert!(
+        expected > 0,
+        "test dataset must contain at least one row whose labels include 3"
+    );
+
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.prewarm_index("labels_idx").await.unwrap();
+
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the label-list state and per-value bitmaps through \
+         CacheCodec, but the serializing store was empty"
+    );
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("array_has_any(labels, [3])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        expected,
+        "indexed label-list filter should return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "LabelList filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every per-value bitmap from memory"
+    );
+}
+
 #[tokio::test]
 async fn test_fts_phrase_query_with_removed_stop_words() {
     let tmpdir = TempStrDir::default();

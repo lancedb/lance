@@ -416,9 +416,9 @@ mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
-    use lance_core::utils::mask::{RowAddrTreeMap, RowSetOps};
     use lance_core::utils::tempfile::TempDir;
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
+    use lance_select::{RowAddrTreeMap, RowSetOps};
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.obj_path();

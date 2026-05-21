@@ -152,6 +152,36 @@ def test_lance_log_file_with_directory_creation(tmp_path):
     sys.platform == "win32",
     reason="subprocess does not work correctly in CI on Windows",
 )
+def test_lance_log_filters_trace_event_targets(tmp_path):
+    log_file = tmp_path / "lance_rust.log"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import lance; import pyarrow as pa; "
+            "lance.write_dataset(pa.table({'x': range(10)}), 'memory://test')",
+        ],
+        capture_output=True,
+        env={
+            "LANCE_LOG": "warn,lance::events::dataset_events=info",
+            "LANCE_LOG_FILE": str(log_file),
+        },
+    )
+
+    assert result.returncode == 0, f"Command failed: {result.stderr.decode()}"
+
+    log_content = log_file.read_text()
+    assert "lance::events::dataset_events" in log_content
+    assert 'target="lance::dataset_events"' in log_content
+    assert "lance::events::file_audit" not in log_content
+    assert "lance::file_audit" not in log_content
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="subprocess does not work correctly in CI on Windows",
+)
 def test_lance_log_file_invalid_path():
     invalid_path = "/invalid/path/that/cannot/be/created/lance.log"
 

@@ -101,7 +101,7 @@ use lance_core::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{InvalidInputSnafu, box_error},
-    utils::{futures::Capacity, mask::RowAddrTreeMap, tokio::get_num_compute_intensive_cpus},
+    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
 };
 use lance_datafusion::{
     chunker::chunk_stream,
@@ -115,6 +115,7 @@ use lance_datafusion::{
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::MergedGeneration;
+use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;

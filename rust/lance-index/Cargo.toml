@@ -45,6 +45,7 @@ lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
 lance-linalg.workspace = true
+lance-select.workspace = true
 lance-tokenizer.workspace = true
 lance-table.workspace = true
 libm.workspace = true

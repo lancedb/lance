@@ -26,10 +26,10 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
+use lance_select::RowAddrTreeMap;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
     WriterVersion, is_detached_version, list_index_files_with_sizes, pb,

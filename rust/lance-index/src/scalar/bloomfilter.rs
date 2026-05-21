@@ -1154,12 +1154,9 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::{StreamExt, stream};
-    use lance_core::{
-        ROW_ADDR,
-        cache::LanceCache,
-        utils::{mask::RowAddrTreeMap, tempfile::TempObjDir},
-    };
+    use lance_core::{ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
+    use lance_select::RowAddrTreeMap;
 
     use crate::scalar::{
         BloomFilterQuery, ScalarIndex, SearchResult,

@@ -50,7 +50,6 @@ use lance_core::{
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
-        mask::NullableRowAddrSet,
         tokio::get_num_compute_intensive_cpus,
         tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
     },
@@ -60,6 +59,7 @@ use lance_datafusion::{
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
 use lance_io::object_store::ObjectStore;
+use lance_select::NullableRowAddrSet;
 use log::{debug, warn};
 use object_store::{Error as ObjectStoreError, path::Path};
 use rangemap::RangeInclusiveMap;
@@ -2987,12 +2987,12 @@ mod tests {
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use futures::stream;
-    use lance_core::utils::mask::RowSetOps;
+    use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
+    use lance_select::{RowAddrTreeMap, RowSetOps};
     use object_store::path::Path;
 
     use crate::metrics::LocalMetricsCollector;

@@ -29,6 +29,7 @@ lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
+lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 arrow-arith = { workspace = true }
@@ -55,6 +56,7 @@ deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
+moka.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
 aws-credential-types.optional = true
