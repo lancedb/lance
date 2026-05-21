@@ -212,12 +212,14 @@ impl LsmVectorSearchPlanner {
         // Per-source block-lists: the `_rowid`s superseded by a newer generation.
         // A present entry means that source must drop those rows before the union
         // (and over-fetch to backfill the holes). See [`super::block_list`].
-        let block_lists = super::block_list::compute_source_block_lists(
+        // `Box::pin` keeps this sizeable sub-future off `plan_search`'s own future
+        // (avoids `clippy::large_futures` at every call site).
+        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
             &sources,
             &self.pk_columns,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
-        )
+        ))
         .await?;
 
         let canonical_schema = canonical_output_schema(
@@ -244,16 +246,15 @@ impl LsmVectorSearchPlanner {
             } else {
                 k
             };
-            let knn = self
-                .build_knn_plan(
-                    source,
-                    query_vector,
-                    fetch_k,
-                    nprobes,
-                    projection,
-                    refine_factor,
-                )
-                .await?;
+            let knn = Box::pin(self.build_knn_plan(
+                source,
+                query_vector,
+                fetch_k,
+                nprobes,
+                projection,
+                refine_factor,
+            ))
+            .await?;
             // Drop rows superseded by a newer generation (matched by `_rowid`)
             // before tagging/union, so a stale row never reaches the merge — this
             // is what closes the top-k stale-read gap the global dedup can't.
@@ -1659,6 +1660,358 @@ mod tests {
              stale base-table copy (distance ~0) was served because fresh \
              pk=1 fell out of the active arm's top-k and never deduped it; \
              got {:?}",
+            rows
+        );
+    }
+
+    /// Build a multi-row (id, vector) batch with explicit vectors, so a test can
+    /// place some rows on the query and others nearby.
+    fn batch_rows(schema: &ArrowSchema, rows: &[(i32, [f32; 4])]) -> RecordBatch {
+        use arrow_array::builder::Float32Builder;
+        let mut vb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        for (_, v) in rows {
+            for x in v {
+                vb.values().append_value(*x);
+            }
+            vb.append(true);
+        }
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+        )
+        .unwrap()
+    }
+
+    /// Collect (id, distance) pairs from a KNN result stream.
+    fn collect_id_dist(batches: &[RecordBatch]) -> Vec<(i32, f32)> {
+        let mut rows = Vec::new();
+        for b in batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dist = b
+                .column_by_name(DISTANCE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), dist.value(i)));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_overfetch_backfills_when_top_k_all_stale() {
+        // A source whose entire top-k is stale must still yield k live results
+        // from its next-nearest rows: the over-fetch backfills the dropped rows.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // Base (gen 0): pk 1,2,3 sit ON the query (stale); pk 4,5,6 are nearby
+        // and live. The nearest 3 base rows are all about to be superseded.
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let near = [0.12, 0.22, 0.32, 0.42];
+        let base_batch = batch_rows(
+            &schema,
+            &[(1, q), (2, q), (3, q), (4, near), (5, near), (6, near)],
+        );
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Active (gen 1): pk 1,2,3 re-inserted with a far vector (the fresh value).
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let far = [9.0, 9.0, 9.0, 9.0];
+        let active_batch = batch_rows(&schema, &[(1, far), (2, far), (3, far)]);
+        let (_, _, bp) = batch_store.append(active_batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&active_batch, 0, Some(bp))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner.plan_search(&query, 3, 1, None, None).await.unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        // No under-fill: still exactly k=3 rows, the next-nearest live ones.
+        assert_eq!(rows.len(), 3, "expected k=3 live results, got {:?}", rows);
+        let ids: std::collections::HashSet<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from([4, 5, 6]),
+            "expected the next-nearest live rows {{4,5,6}}, got {:?}",
+            rows
+        );
+        // No stale read: no pk in 1..=3 served at the superseded ~0 distance.
+        assert!(
+            rows.iter()
+                .all(|&(id, d)| !((1..=3).contains(&id) && d.abs() < 1e-3)),
+            "stale read: a superseded base row was served; got {:?}",
+            rows
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_flushed_superseded_by_newer_flushed() {
+        // An older flushed generation's stale row must be suppressed by a newer
+        // flushed generation (cross-flushed blocking, no base/active involved).
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let far = [9.0, 9.0, 9.0, 9.0];
+        let near = [0.12, 0.22, 0.32, 0.42];
+
+        // gen 1 (older): stale pk=1 sitting on the query.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 = create_dataset(&gen1_uri, vec![batch_rows(&schema, &[(1, q)])]).await;
+        gen1.create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+
+        // gen 2 (newer): fresh pk=1 (far) + an unrelated nearby pk=2.
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
+        let mut gen2 =
+            create_dataset(&gen2_uri, vec![batch_rows(&schema, &[(1, far), (2, near)])]).await;
+        gen2.create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(3)
+            .with_flushed_generation(1, "gen_1".to_string())
+            .with_flushed_generation(2, "gen_2".to_string());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot]);
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner.plan_search(&query, 1, 1, None, None).await.unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        // gen1's stale pk=1 (distance ~0) is blocked by gen2; the nearest live
+        // neighbor is the unrelated pk=2.
+        assert_eq!(rows.len(), 1, "expected one result, got {:?}", rows);
+        assert_eq!(
+            rows[0].0, 2,
+            "expected nearest live row pk=2, got {:?}",
+            rows
+        );
+    }
+
+    fn create_multicol_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id1", DataType::Int32, false),
+            Field::new("id2", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        ]))
+    }
+
+    fn multicol_batch(schema: &ArrowSchema, rows: &[((i32, i32), [f32; 4])]) -> RecordBatch {
+        use arrow_array::builder::Float32Builder;
+        let mut vb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        for (_, v) in rows {
+            for x in v {
+                vb.values().append_value(*x);
+            }
+            vb.append(true);
+        }
+        let id1: Vec<i32> = rows.iter().map(|((a, _), _)| *a).collect();
+        let id2: Vec<i32> = rows.iter().map(|((_, b), _)| *b).collect();
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(id1)),
+                Arc::new(Int32Array::from(id2)),
+                Arc::new(vb.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_stale_read_with_composite_pk() {
+        // The block-list must key on the full composite PK: a base row updated in
+        // the active memtable (matched on (id1,id2)) must be suppressed.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_multicol_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let far = [9.0, 9.0, 9.0, 9.0];
+        let near = [0.12, 0.22, 0.32, 0.42];
+
+        // Base: composite pk (1,1) on the query (stale).
+        let base_batch = multicol_batch(&schema, &[((1, 1), q)]);
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Active: (1,1) re-inserted far (fresh) + an unrelated nearby (2,2).
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let active_batch = multicol_batch(&schema, &[((1, 1), far), ((2, 2), near)]);
+        let (_, _, bp) = batch_store.append(active_batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&active_batch, 0, Some(bp))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id1".to_string(), "id2".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner.plan_search(&query, 1, 1, None, None).await.unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        // The stale composite-key (1,1) at distance ~0 must not be served; the
+        // nearest live neighbor is (2,2).
+        let mut rows: Vec<(i32, i32, f32)> = Vec::new();
+        for b in &batches {
+            let id1 = b
+                .column_by_name("id1")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let id2 = b
+                .column_by_name("id2")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dist = b
+                .column_by_name(DISTANCE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((id1.value(i), id2.value(i), dist.value(i)));
+            }
+        }
+        assert_eq!(rows.len(), 1, "expected one result, got {:?}", rows);
+        assert_eq!(
+            (rows[0].0, rows[0].1),
+            (2, 2),
+            "expected nearest live composite key (2,2), got {:?}",
             rows
         );
     }

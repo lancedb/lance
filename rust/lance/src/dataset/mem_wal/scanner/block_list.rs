@@ -150,16 +150,21 @@ async fn flushed_pk_index(
             let build_session = session.cloned();
             let build_pk = pk_columns.to_vec();
             cache
-                .get_or_build_pk_index(path, async move {
-                    let dataset = open_flushed_dataset(
-                        &build_path,
-                        build_session.as_ref(),
-                        Some(&build_cache),
-                    )
-                    .await?;
-                    let batches = scan_pk_rowid(&dataset, &build_pk).await?;
-                    pk_index_from_scanned(&batches, &build_pk)
-                })
+                .get_or_build_pk_index(
+                    path,
+                    // `Box::pin` keeps this build future off the caller's future
+                    // (avoids `clippy::large_futures`).
+                    Box::pin(async move {
+                        let dataset = open_flushed_dataset(
+                            &build_path,
+                            build_session.as_ref(),
+                            Some(&build_cache),
+                        )
+                        .await?;
+                        let batches = scan_pk_rowid(&dataset, &build_pk).await?;
+                        pk_index_from_scanned(&batches, &build_pk)
+                    }),
+                )
                 .await
         }
         None => {
@@ -292,9 +297,14 @@ mod tests {
         // Active gen 2: pk=1 re-written @ 0, pk=2 @ 1.
         let sources = vec![mk(&[&[1]], 1), mk(&[&[1], &[2]], 2)];
 
-        let masks = compute_source_block_lists(&sources, &["id".to_string()], None, None)
-            .await
-            .unwrap();
+        let masks = Box::pin(compute_source_block_lists(
+            &sources,
+            &["id".to_string()],
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
 
         let g1 = LsmGeneration::memtable(1);
         let g2 = LsmGeneration::memtable(2);
@@ -340,9 +350,14 @@ mod tests {
             },
         ];
 
-        let masks = compute_source_block_lists(&sources, &["id".to_string()], None, None)
-            .await
-            .unwrap();
+        let masks = Box::pin(compute_source_block_lists(
+            &sources,
+            &["id".to_string()],
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
 
         // Base's stale pk=1 (_rowid 0) is blocked; the unrelated live pk=3
         // (_rowid 1) survives — base is blocked cross-generation only.
