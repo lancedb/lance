@@ -1561,6 +1561,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         *,
         replace: bool = True,
+        fragment_ids: Optional[List[int]] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -1637,6 +1638,11 @@ class LanceDataset(pa.dataset.Dataset):
             column name.
         replace : bool, default True
             Replace the existing index if it exists.
+        fragment_ids : list of int, optional
+            If provided, only build the index for the specified fragment IDs.
+            The index will not be committed to the dataset manifest; instead,
+            an index metadata dictionary is returned. This is useful for building
+            index deltas that can later be merged with existing indices.
 
         with_position: bool, default True
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -1761,6 +1767,11 @@ class LanceDataset(pa.dataset.Dataset):
         if pa.types.is_duration(field_type):
             raise TypeError(
                 f"Scalar index column {column} cannot currently be a duration"
+            )
+
+        if fragment_ids is not None:
+            return self._ds.create_scalar_index_uncommitted(
+                column, index_type, name, fragment_ids, kwargs
             )
 
         self._ds.create_index([column], index_type, name, replace, None, kwargs)

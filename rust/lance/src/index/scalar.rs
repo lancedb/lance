@@ -27,6 +27,7 @@ use lance_index::scalar::{
 };
 use lance_table::format::Index;
 use log::info;
+use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::instrument;
 
@@ -42,6 +43,7 @@ const TRAINING_UPDATE_FREQ: usize = 1000000;
 struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
+    fragment_ids: Option<RoaringBitmap>,
 }
 
 #[async_trait]
@@ -67,8 +69,6 @@ impl TrainingRequest {
         chunk_size: u32,
         sort: bool,
     ) -> Result<SendableRecordBatchStream> {
-        let num_rows = self.dataset.count_all_rows().await?;
-
         let mut scan = self.dataset.scan();
 
         let column_field =
@@ -79,6 +79,34 @@ impl TrainingRequest {
                     source: format!("No column with name {}", self.column).into(),
                     location: location!(),
                 })?;
+
+        if let Some(ref fragment_ids) = self.fragment_ids {
+            let fragments: Vec<_> = self
+                .dataset
+                .get_fragments()
+                .into_iter()
+                .filter(|f| fragment_ids.contains(f.id() as u32))
+                .map(|f| f.metadata().clone())
+                .collect();
+            if fragments.is_empty() {
+                return Err(Error::InvalidInput {
+                    source: "No fragments match the given fragment_ids".into(),
+                    location: location!(),
+                });
+            }
+            scan.with_fragments(fragments);
+        }
+
+        let num_rows = if let Some(ref fragment_ids) = self.fragment_ids {
+            self.dataset
+                .get_fragments()
+                .iter()
+                .filter(|f| fragment_ids.contains(f.id() as u32))
+                .filter_map(|f| f.metadata().num_rows())
+                .sum::<usize>()
+        } else {
+            self.dataset.count_all_rows().await?
+        };
 
         // Datafusion currently has bugs with spilling on string columns
         // See https://github.com/apache/datafusion/issues/10073
@@ -232,10 +260,12 @@ pub(super) async fn build_scalar_index(
     column: &str,
     uuid: &str,
     params: &ScalarIndexParams,
+    fragment_ids: Option<RoaringBitmap>,
 ) -> Result<prost_types::Any> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
+        fragment_ids,
     });
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -320,10 +350,12 @@ pub(super) async fn build_inverted_index(
     column: &str,
     uuid: &str,
     params: &InvertedIndexParams,
+    fragment_ids: Option<RoaringBitmap>,
 ) -> Result<()> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
+        fragment_ids,
     });
     let index_store = LanceIndexStore::from_dataset(dataset, uuid);
     train_inverted_index(training_request, &index_store, params.clone()).await

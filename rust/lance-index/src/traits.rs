@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::Result;
+use roaring::RoaringBitmap;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
 use lance_table::format::Index;
@@ -98,6 +99,22 @@ pub trait DatasetIndexExt {
         column: &str,
         index_id: Uuid,
     ) -> Result<()>;
+
+    /// Create a scalar index on the given column for the specified fragments,
+    /// without committing it to the dataset manifest.
+    ///
+    /// This is useful for building index deltas that can later be merged
+    /// with existing indices via `optimize_indices`.
+    ///
+    /// Returns the [`Index`] metadata for the uncommitted index.
+    async fn create_index_uncommitted(
+        &self,
+        column: &str,
+        index_type: IndexType,
+        name: Option<String>,
+        params: &dyn IndexParams,
+        fragment_ids: Option<RoaringBitmap>,
+    ) -> Result<Index>;
 
     async fn read_index_partition(
         &self,

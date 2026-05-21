@@ -1271,6 +1271,83 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature = (column, index_type, name=None, fragment_ids=None, kwargs=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn create_scalar_index_uncommitted(
+        &self,
+        column: &str,
+        index_type: &str,
+        name: Option<String>,
+        fragment_ids: Option<Vec<u32>>,
+        kwargs: Option<&Bound<PyDict>>,
+    ) -> PyResult<PyObject> {
+        let idx_type = match index_type.to_uppercase().as_str() {
+            "BTREE" => IndexType::Scalar,
+            "BITMAP" => IndexType::Bitmap,
+            "NGRAM" => IndexType::NGram,
+            "LABEL_LIST" => IndexType::LabelList,
+            "INVERTED" | "FTS" => IndexType::Inverted,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Scalar index type '{index_type}' is not supported."
+                )))
+            }
+        };
+
+        let params: Box<dyn IndexParams> = match index_type.to_uppercase().as_str() {
+            "BTREE" => Box::<ScalarIndexParams>::default(),
+            "BITMAP" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::Bitmap),
+            }),
+            "NGRAM" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::NGram),
+            }),
+            "LABEL_LIST" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::LabelList),
+            }),
+            "INVERTED" | "FTS" => {
+                let mut params = InvertedIndexParams::default();
+                if let Some(kwargs) = kwargs {
+                    if let Some(with_position) = kwargs.get_item("with_position")? {
+                        params.with_position = with_position.extract()?;
+                    }
+                }
+                Box::new(params)
+            }
+            _ => unreachable!(),
+        };
+
+        let fragment_bitmap = fragment_ids.map(|ids| {
+            let mut bitmap = roaring::RoaringBitmap::new();
+            for id in ids {
+                bitmap.insert(id);
+            }
+            bitmap
+        });
+
+        let index_meta = RT
+            .block_on(
+                None,
+                self.ds.create_index_uncommitted(column, idx_type, name, params.as_ref(), fragment_bitmap),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("uuid", index_meta.uuid.to_string())?;
+            dict.set_item("name", index_meta.name.clone())?;
+            dict.set_item("fields", index_meta.fields.clone())?;
+            dict.set_item("dataset_version", index_meta.dataset_version)?;
+            if let Some(bitmap) = &index_meta.fragment_bitmap {
+                let frag_ids: Vec<u32> = bitmap.iter().collect();
+                dict.set_item("fragment_bitmap", frag_ids)?;
+            } else {
+                dict.set_item("fragment_bitmap", py.None())?;
+            }
+            Ok(dict.into())
+        })
+    }
+
     fn drop_index(&mut self, name: &str) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         RT.block_on(None, new_self.drop_index(name))?

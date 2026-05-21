@@ -250,7 +250,7 @@ impl DatasetIndexExt for Dataset {
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(index_type.try_into()?);
-                build_scalar_index(self, column, &index_id.to_string(), &params).await?
+                build_scalar_index(self, column, &index_id.to_string(), &params, None).await?
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -261,7 +261,7 @@ impl DatasetIndexExt for Dataset {
                         message: "Scalar index type must take a ScalarIndexParams".to_string(),
                         location: location!(),
                     })?;
-                build_scalar_index(self, column, &index_id.to_string(), params).await?
+                build_scalar_index(self, column, &index_id.to_string(), params, None).await?
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
@@ -273,7 +273,7 @@ impl DatasetIndexExt for Dataset {
                         location: location!(),
                     })?;
 
-                build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
+                build_inverted_index(self, column, &index_id.to_string(), inverted_params, None).await?;
                 inverted_index_details()
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
@@ -741,6 +741,83 @@ impl DatasetIndexExt for Dataset {
                 stream::empty(),
             ))),
         }
+    }
+
+    async fn create_index_uncommitted(
+        &self,
+        column: &str,
+        index_type: IndexType,
+        name: Option<String>,
+        params: &dyn IndexParams,
+        fragment_ids: Option<RoaringBitmap>,
+    ) -> Result<IndexMetadata> {
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
+            });
+        };
+
+        let index_id = Uuid::new_v4();
+        let index_name = name.unwrap_or(format!("{column}_idx"));
+
+        let index_details: prost_types::Any = match (index_type, params.index_name()) {
+            (
+                IndexType::Bitmap
+                | IndexType::BTree
+                | IndexType::Inverted
+                | IndexType::NGram
+                | IndexType::LabelList,
+                LANCE_SCALAR_INDEX,
+            ) => {
+                let params = ScalarIndexParams::new(index_type.try_into()?);
+                build_scalar_index(self, column, &index_id.to_string(), &params, fragment_ids.clone()).await?
+            }
+            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
+                let params = params
+                    .as_any()
+                    .downcast_ref::<ScalarIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+                build_scalar_index(self, column, &index_id.to_string(), params, fragment_ids.clone()).await?
+            }
+            (IndexType::Inverted, _) => {
+                let inverted_params = params
+                    .as_any()
+                    .downcast_ref::<InvertedIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+
+                build_inverted_index(self, column, &index_id.to_string(), inverted_params, fragment_ids.clone()).await?;
+                inverted_index_details()
+            }
+            (index_type, index_name) => {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index type {index_type} with name {index_name} is not supported for uncommitted index creation"
+                    ),
+                    location: location!(),
+                });
+            }
+        };
+
+        let fragment_bitmap = match fragment_ids {
+            Some(ids) => ids,
+            None => self.get_fragments().iter().map(|f| f.id() as u32).collect(),
+        };
+
+        Ok(IndexMetadata {
+            uuid: index_id,
+            name: index_name,
+            fields: vec![field.id],
+            dataset_version: self.manifest.version,
+            fragment_bitmap: Some(fragment_bitmap),
+            index_details: Some(index_details),
+        })
     }
 }
 
