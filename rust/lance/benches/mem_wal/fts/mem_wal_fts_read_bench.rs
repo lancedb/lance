@@ -578,14 +578,24 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
 
     let shard_id = Uuid::new_v4();
     let row_bytes = 2048; // rough FineWeb text row size
+    // The memtable flush trigger is `estimated_size >= max_memtable_size ||
+    // batch_store_full`. FineWeb text rows vary in size, so a byte threshold
+    // is an unreliable way to flush exactly one generation per
+    // `max_memtable_rows`. Instead make the *batch-count* cap the trigger:
+    // set `max_memtable_batches` to one generation's worth of batches so the
+    // store fills (and flushes) precisely at each generation boundary,
+    // independent of text length. Keep `max_memtable_size` high so it never
+    // pre-empts the batch-count trigger.
+    let batches_per_gen = (args.max_memtable_rows / args.batch_rows).max(1);
     let config = ShardWriterConfig {
         shard_id,
         shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: false,
-        max_memtable_size: args.max_memtable_rows * row_bytes * 2,
+        max_memtable_size: args.max_memtable_rows * row_bytes * 100,
         max_memtable_rows: args.max_memtable_rows,
-        max_unflushed_memtable_bytes: args.max_memtable_rows * row_bytes * 6,
+        max_memtable_batches: batches_per_gen,
+        max_unflushed_memtable_bytes: args.max_memtable_rows * row_bytes * 20,
         max_wal_flush_interval: Some(Duration::from_secs(60)),
         ..ShardWriterConfig::default()
     };
@@ -628,6 +638,10 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
             tokio::time::sleep(flush_wait).await;
         }
     }
+    // Wait for any triggered (sealed) memtable flushes to commit to the
+    // manifest before we snapshot it — otherwise the flushed generations
+    // race the read and may not all be visible yet.
+    writer.wait_for_flush_drain().await?;
     println!(
         "ingested {} memtable rows in {:.1}s",
         cursor,
