@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
@@ -47,6 +47,7 @@ use lance_index::scalar::inverted::document_tokenizer::DocType;
 use lance_index::scalar::inverted::query::{
     FtsQuery as IndexFtsQuery, FtsSearchParams, Operator, Tokens, collect_query_tokens,
 };
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexCandidate, MemBM25Scorer, Scorer};
 use tracing::instrument;
 
@@ -205,9 +206,10 @@ impl LsmFtsSearchPlanner {
             return self.empty_plan(&target_schema);
         }
 
-        // Step 1: pull a tokenizer + tokenize the query text.
+        // Step 1: resolve shared FTS params + tokenize the query text.
         let match_text = extract_match_text(&query)?;
-        let mut tokenizer = self.resolve_tokenizer(&sources, column).await?;
+        let params = self.resolve_params(&sources, column).await?;
+        let mut tokenizer = params.build()?;
         let tokens_obj = collect_query_tokens(&match_text, &mut tokenizer);
         let token_strs: Vec<String> = (0..tokens_obj.len())
             .map(|i| tokens_obj.get_token(i).to_owned())
@@ -225,7 +227,9 @@ impl LsmFtsSearchPlanner {
         let mut df_map: HashMap<String, usize> =
             token_strs.iter().map(|t| (t.clone(), 0usize)).collect();
         for source in &sources {
-            let handle = self.resolve_handle(source, column).await?;
+            let handle = self
+                .resolve_handle(source, column, &params, &token_strs)
+                .await?;
             let (tt, nd, df_vec) = handle.stats_for_terms(&token_strs)?;
             total_tokens += tt;
             num_docs += nd;
@@ -283,28 +287,30 @@ impl LsmFtsSearchPlanner {
         Ok(exec)
     }
 
-    /// Acquire a tokenizer compatible with every source's FTS index.
+    /// Resolve the `InvertedIndexParams` shared by the LSM sources.
     ///
     /// We assume FTS-indexed sources in an LSM hierarchy share their
-    /// `InvertedIndexParams` (otherwise their indexes wouldn't be
-    /// merge-compatible). Pulls the tokenizer from the first source
-    /// that has one; any later mismatch is the caller's bug.
-    async fn resolve_tokenizer(
+    /// params (otherwise their indexes wouldn't be merge-compatible).
+    /// Pulls from the first source that carries an index (active
+    /// `FtsMemIndex` or a Lance dataset with an on-disk inverted index);
+    /// these params are then used both to tokenize the query and to
+    /// build tokenizers for flat-scanning index-less flushed
+    /// generations.
+    async fn resolve_params(
         &self,
         sources: &[LsmDataSource],
         column: &str,
-    ) -> Result<Box<dyn lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer>>
-    {
+    ) -> Result<InvertedIndexParams> {
         for source in sources {
             match source {
                 LsmDataSource::ActiveMemTable { index_store, .. } => {
                     if let Some(idx) = index_store.get_fts_by_column(column) {
-                        return idx.params().build();
+                        return Ok(idx.params().clone());
                     }
                 }
                 LsmDataSource::BaseTable { dataset } => {
                     if let Some(idx) = open_inverted_index(dataset, column).await? {
-                        return Ok(idx.tokenizer());
+                        return Ok(idx.params().clone());
                     }
                 }
                 LsmDataSource::FlushedMemTable { path, .. } => {
@@ -312,7 +318,7 @@ impl LsmFtsSearchPlanner {
                         .load()
                         .await?;
                     if let Some(idx) = open_inverted_index(&dataset, column).await? {
-                        return Ok(idx.tokenizer());
+                        return Ok(idx.params().clone());
                     }
                 }
             }
@@ -323,7 +329,22 @@ impl LsmFtsSearchPlanner {
         )))
     }
 
-    async fn resolve_handle(&self, source: &LsmDataSource, column: &str) -> Result<SourceHandle> {
+    /// Resolve a source to a `SourceHandle`.
+    ///
+    /// Lance sources (base + flushed generations) may or may not carry
+    /// an on-disk inverted index. Flushed memtable generations are
+    /// written without one (the maintained FTS index lives only in the
+    /// active/frozen memtable), so for those we fall back to a flat
+    /// scan-and-tokenize candidate path keyed off `params` + the query
+    /// `tokens` — mirroring the flat fallback `scanner.full_text_search`
+    /// uses for Local mode.
+    async fn resolve_handle(
+        &self,
+        source: &LsmDataSource,
+        column: &str,
+        params: &InvertedIndexParams,
+        tokens: &[String],
+    ) -> Result<SourceHandle> {
         match source {
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -344,30 +365,35 @@ impl LsmFtsSearchPlanner {
                 })
             }
             LsmDataSource::BaseTable { dataset } => {
-                let index = open_inverted_index(dataset, column).await?.ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Base table is missing an FTS index on column '{column}'"
-                    ))
-                })?;
-                Ok(SourceHandle::Lance {
-                    dataset: dataset.clone(),
-                    index,
-                })
+                Self::lance_handle(dataset.clone(), column, params, tokens).await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                    .load()
-                    .await?;
-                let index = open_inverted_index(&dataset, column).await?.ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Flushed memtable at {path} is missing an FTS index on column '{column}'"
-                    ))
-                })?;
-                Ok(SourceHandle::Lance {
-                    dataset: Arc::new(dataset),
-                    index,
-                })
+                let dataset = Arc::new(
+                    crate::dataset::DatasetBuilder::from_uri(path)
+                        .load()
+                        .await?,
+                );
+                Self::lance_handle(dataset, column, params, tokens).await
             }
+        }
+    }
+
+    /// Build a Lance `SourceHandle`: indexed when an on-disk inverted
+    /// index exists, otherwise a flat (scan + tokenize) handle.
+    async fn lance_handle(
+        dataset: Arc<Dataset>,
+        column: &str,
+        params: &InvertedIndexParams,
+        tokens: &[String],
+    ) -> Result<SourceHandle> {
+        if let Some(index) = open_inverted_index(&dataset, column).await? {
+            Ok(SourceHandle::Lance { dataset, index })
+        } else {
+            let flat = FlatData::compute(&dataset, column, params, tokens).await?;
+            Ok(SourceHandle::LanceFlat {
+                dataset,
+                flat: Arc::new(flat),
+            })
         }
     }
 
@@ -696,6 +722,13 @@ enum SourceHandle {
         dataset: Arc<Dataset>,
         index: Arc<InvertedIndex>,
     },
+    /// A Lance dataset with no on-disk FTS index (e.g., a flushed
+    /// memtable generation). Candidates + stats come from a one-shot
+    /// flat scan-and-tokenize computed at handle resolution.
+    LanceFlat {
+        dataset: Arc<Dataset>,
+        flat: Arc<FlatData>,
+    },
 }
 
 impl SourceHandle {
@@ -712,6 +745,10 @@ impl SourceHandle {
                 Ok(idx.bm25_stats_for_terms(terms))
             }
             Self::Lance { index, .. } => Ok(index.bm25_stats_for_terms(terms)),
+            Self::LanceFlat { flat, .. } => {
+                debug_assert_eq!(flat.df.len(), terms.len());
+                Ok((flat.total_tokens, flat.num_docs, flat.df.clone()))
+            }
         }
     }
 
@@ -755,6 +792,10 @@ impl SourceHandle {
                     .map(UnifiedCandidate::from_inverted_candidate)
                     .collect())
             }
+            Self::LanceFlat { flat, .. } => {
+                let k_prime = params.limit.unwrap_or(usize::MAX);
+                Ok(flat.top_candidates(token_strs, k_prime))
+            }
         }
     }
 
@@ -765,7 +806,9 @@ impl SourceHandle {
                 schema,
                 ..
             } => active_materialize(batch_store, schema, row_ids, cols),
-            Self::Lance { dataset, .. } => {
+            // Both Lance variants materialize the same way: `row_id` is a
+            // Lance `_rowid`, so `take_rows` fetches the user columns.
+            Self::Lance { dataset, .. } | Self::LanceFlat { dataset, .. } => {
                 // Project the dataset's Lance schema down to the requested
                 // columns by name. Unknown names are dropped (`take_rows`
                 // would otherwise error on schema construction).
@@ -778,6 +821,169 @@ impl SourceHandle {
                 Ok(dataset.take_rows(row_ids, Arc::new(projection)).await?)
             }
         }
+    }
+}
+
+/// Flat (index-less) FTS state for one Lance source, computed by a
+/// single scan-and-tokenize pass over the dataset's text column.
+///
+/// Holds corpus-wide stats (`total_tokens`, `num_docs`, per-term `df`)
+/// plus the candidate docs that contain at least one query term, each
+/// carrying its `_rowid`, `doc_len`, and per-query-term frequencies.
+struct FlatData {
+    /// Per query term (input order): number of docs containing it.
+    df: Vec<usize>,
+    total_tokens: u64,
+    num_docs: usize,
+    /// Candidate docs (those matching >=1 term): `_rowid`, `doc_len`,
+    /// and `term_freqs` in query-token order.
+    cand_row_ids: Vec<u64>,
+    cand_doc_lens: Vec<u32>,
+    cand_tfs: Vec<Vec<u32>>,
+}
+
+impl FlatData {
+    /// Scan `dataset`'s `column`, tokenizing each doc with `params`, to
+    /// build corpus stats + per-doc query-term frequencies.
+    async fn compute(
+        dataset: &Dataset,
+        column: &str,
+        params: &InvertedIndexParams,
+        tokens: &[String],
+    ) -> Result<Self> {
+        use futures::TryStreamExt;
+
+        let term_to_idx: HashMap<&str, usize> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), i))
+            .collect();
+
+        let mut scanner = dataset.scan();
+        scanner.project(&[column])?;
+        scanner.with_row_id();
+        let mut stream = scanner.try_into_stream().await?;
+
+        let mut tokenizer = params.build()?;
+        let mut df = vec![0usize; tokens.len()];
+        let mut total_tokens: u64 = 0;
+        let mut num_docs: usize = 0;
+        let mut cand_row_ids: Vec<u64> = Vec::new();
+        let mut cand_doc_lens: Vec<u32> = Vec::new();
+        let mut cand_tfs: Vec<Vec<u32>> = Vec::new();
+
+        while let Some(batch) = stream.try_next().await? {
+            let rowid_col = batch
+                .column_by_name(lance_core::ROW_ID)
+                .ok_or_else(|| Error::internal("flat scan missing _rowid".to_string()))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::internal("_rowid not UInt64".to_string()))?;
+            let text_col = batch
+                .column_by_name(column)
+                .ok_or_else(|| Error::internal(format!("flat scan missing '{column}'")))?;
+            let texts = string_values(text_col.as_ref())?;
+
+            for (i, text) in texts.iter().enumerate() {
+                num_docs += 1;
+                let mut tfs = vec![0u32; tokens.len()];
+                let mut doc_len: u32 = 0;
+                if let Some(text) = text {
+                    let mut stream = tokenizer.token_stream_for_doc(text);
+                    while let Some(tok) = stream.next() {
+                        doc_len += 1;
+                        if let Some(&ti) = term_to_idx.get(tok.text.as_str()) {
+                            tfs[ti] += 1;
+                        }
+                    }
+                }
+                total_tokens += doc_len as u64;
+                if tfs.iter().any(|&f| f > 0) {
+                    for (ti, &f) in tfs.iter().enumerate() {
+                        if f > 0 {
+                            df[ti] += 1;
+                        }
+                    }
+                    cand_row_ids.push(rowid_col.value(i));
+                    cand_doc_lens.push(doc_len);
+                    cand_tfs.push(tfs);
+                }
+            }
+        }
+
+        Ok(Self {
+            df,
+            total_tokens,
+            num_docs,
+            cand_row_ids,
+            cand_doc_lens,
+            cand_tfs,
+        })
+    }
+
+    /// Local-stats top-`k_prime` candidates. Scores each candidate with a
+    /// scorer built from this source's own stats (matching the indexed
+    /// path's local-pruning semantics) and keeps the best `k_prime`.
+    fn top_candidates(&self, tokens: &[String], k_prime: usize) -> Vec<UnifiedCandidate> {
+        if k_prime == 0 || self.cand_row_ids.is_empty() {
+            return Vec::new();
+        }
+        let token_docs: HashMap<String, usize> = tokens
+            .iter()
+            .cloned()
+            .zip(self.df.iter().copied())
+            .collect();
+        let scorer = MemBM25Scorer::new(self.total_tokens, self.num_docs, token_docs);
+
+        let mut scored: Vec<(usize, f32)> = (0..self.cand_row_ids.len())
+            .map(|i| {
+                let s = bm25_score(&scorer, tokens, &self.cand_tfs[i], self.cand_doc_lens[i]);
+                (i, s)
+            })
+            .collect();
+        if scored.len() > k_prime {
+            scored.select_nth_unstable_by(k_prime, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            scored.truncate(k_prime);
+        }
+        scored
+            .into_iter()
+            .map(|(i, _)| UnifiedCandidate {
+                row_id: self.cand_row_ids[i],
+                doc_len: self.cand_doc_lens[i],
+                term_freqs: self.cand_tfs[i].clone(),
+            })
+            .collect()
+    }
+}
+
+/// Extract optional UTF-8 strings from a Utf8 / LargeUtf8 / Utf8View array.
+fn string_values(array: &dyn Array) -> Result<Vec<Option<&str>>> {
+    use arrow_array::{LargeStringArray, StringViewArray};
+    use arrow_schema::DataType;
+    match array.data_type() {
+        DataType::Utf8 => {
+            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok((0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+                .collect())
+        }
+        DataType::LargeUtf8 => {
+            let a = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            Ok((0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+                .collect())
+        }
+        DataType::Utf8View => {
+            let a = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+            Ok((0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+                .collect())
+        }
+        other => Err(Error::invalid_input(format!(
+            "flat FTS scan: column must be Utf8/LargeUtf8/Utf8View, got {other:?}"
+        ))),
     }
 }
 
@@ -1124,6 +1330,121 @@ mod tests {
         for w in hits.windows(2) {
             assert!(w[0].1 >= w[1].1);
         }
+    }
+
+    #[tokio::test]
+    async fn rescore_mode_handles_indexless_flushed_generation() {
+        // Regression: flushed memtable generations are written WITHOUT an
+        // on-disk FTS index (only the active/frozen memtable carries the
+        // maintained index). The rescore path must flat-scan such sources
+        // for candidates + stats rather than erroring. Layout: indexed
+        // base + an index-less flushed gen + indexed active, all sharing
+        // the "lance" term.
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+        use uuid::Uuid;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Indexed base.
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(&schema, &[1, 2], &["lance base", "noise"])],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        // Index-less flushed generation at the collector's resolved path:
+        // {base_uri}/_mem_wal/{shard}/gen_1. NO create_index call.
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{base_uri}/_mem_wal/{shard_id}/gen_1");
+        write_dataset(
+            &gen1_uri,
+            vec![make_batch(
+                &schema,
+                &[3, 4],
+                &["lance flushed gen", "unrelated"],
+            )],
+        )
+        .await;
+
+        // Indexed active memtable.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(&schema, &[5, 6], &["lance active", "nothing"]);
+        batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let shard_snapshot = crate::dataset::mem_wal::scanner::ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![shard_snapshot])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                10,
+                None,
+                FtsScoringMode::local_with_global_rescore_default(),
+            )
+            .await
+            .expect("rescore must handle an index-less flushed generation via flat scan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        // One "lance" hit from each tier: base id=1, flushed id=3, active id=5.
+        assert!(ids.contains(&1), "missing base hit; got {ids:?}");
+        assert!(
+            ids.contains(&3),
+            "missing index-less flushed-gen hit (flat path broken); got {ids:?}"
+        );
+        assert!(ids.contains(&5), "missing active hit; got {ids:?}");
     }
 
     #[tokio::test]
