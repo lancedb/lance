@@ -37,16 +37,16 @@ use super::projection::{
 use crate::session::Session;
 
 /// Per-source over-fetch multiplier for the block-list post-filter. A source
-/// that may contain superseded rows fetches `k * factor` candidates so that
-/// dropping the blocked ones still leaves `k` live rows for the cross-source
-/// merge.
+/// that may contain superseded rows fetches `ceil(k * factor)` candidates so
+/// that dropping the blocked ones still leaves `k` live rows for the
+/// cross-source merge.
 ///
 /// TODO(perf/correctness): over-fetch does not *guarantee* `k` live results when
 /// a source has more than `factor` superseded rows near the query. Push the
 /// block-list into the per-source KNN as a true prefilter (the index keeps
 /// traversing until `k` rows pass), then drop both the over-fetch and the
 /// post-filter `BlockListFilterExec`.
-const STALE_OVERFETCH_FACTOR: usize = 4;
+const STALE_OVERFETCH_FACTOR: f64 = 2.5;
 
 /// Plans vector search queries over LSM data.
 ///
@@ -240,7 +240,7 @@ impl LsmVectorSearchPlanner {
             // post-filter still leaves k live candidates for the merge.
             let block_mask = block_lists.get(&generation);
             let fetch_k = if block_mask.is_some() {
-                k.saturating_mul(STALE_OVERFETCH_FACTOR)
+                ((k as f64) * STALE_OVERFETCH_FACTOR).ceil() as usize
             } else {
                 k
             };
@@ -375,6 +375,15 @@ impl LsmVectorSearchPlanner {
             }
         } else {
             merged_sorted
+        };
+
+        // When a block-list was applied, a result shorter than k signals an
+        // under-fetch (the over-fetch could not backfill the dropped rows). Only
+        // wrap then, so a genuinely small unfiltered result does not warn.
+        let result = if block_lists.is_empty() {
+            result
+        } else {
+            Arc::new(super::exec::UnderfillFilterWarnExec::new(result, k)) as Arc<dyn ExecutionPlan>
         };
 
         Ok(result)

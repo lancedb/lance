@@ -22,6 +22,7 @@ mod generation_tag;
 mod global_pk_dedup;
 mod pk;
 mod source_tag;
+mod underfill_warn;
 mod within_source_dedup;
 
 pub use block_list_filter::BlockListFilterExec;
@@ -32,4 +33,5 @@ pub use generation_tag::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec};
 pub use global_pk_dedup::LsmGlobalPkDedupExec;
 pub use pk::{compute_pk_hash, resolve_pk_indices};
 pub use source_tag::{FRESHNESS_COLUMN, FreshnessPolarity, LsmSourceTagExec};
+pub use underfill_warn::UnderfillFilterWarnExec;
 pub use within_source_dedup::{DedupDirection, WithinSourceDedupExec};
