@@ -296,13 +296,18 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
 
     // Wrap with AggregateExec(Final) so a downstream consumer that expected
     // the original AggregateExec output schema continues to see it.
-    let null_filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
+    //
+    // `AggregateExec::try_new` requires one `Option<Arc<dyn PhysicalExpr>>`
+    // per aggregate expression for the optional per-aggregate
+    // `FILTER (WHERE ...)` clause. We rejected any aggregate carrying a
+    // filter back at the gate, so every slot is `None` here.
+    let filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
         (0..aggr_exprs.len()).map(|_| None).collect();
     let final_agg = AggregateExec::try_new(
         AggregateMode::Final,
         PhysicalGroupBy::default(),
         aggr_exprs,
-        null_filters,
+        filters,
         combined,
         partial_input_schema,
     )?;
@@ -332,13 +337,16 @@ fn build_scan_branch(
     let scan = FilteredReadExec::try_new(dataset, scan_options, None)?;
     let scan: Arc<dyn ExecutionPlan> = Arc::new(scan);
     let scan_schema = scan.schema();
-    let null_filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
+    // Per-aggregate `FILTER (WHERE ...)` placeholders — see the matching
+    // comment in `try_rewrite`; we've already rejected any aggregate that
+    // carried a filter, so every slot is `None`.
+    let filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
         (0..aggr_exprs.len()).map(|_| None).collect();
     let partial = AggregateExec::try_new(
         AggregateMode::Partial,
         PhysicalGroupBy::default(),
         aggr_exprs,
-        null_filters,
+        filters,
         scan,
         scan_schema,
     )?;
