@@ -204,11 +204,20 @@ pub struct CompactionOptions {
     /// Defaults to 16MB (16 * 1024 * 1024).
     pub binary_copy_read_batch_bytes: Option<usize>,
     /// Maximum number of source fragments to compact in a single run. When set,
-    /// tasks are included in the plan until adding the next task would exceed
-    /// this limit. This allows for incremental compaction (e.g., compact 20
-    /// fragments at a time).
+    /// the planner stops collecting fragment metrics once this many fragments
+    /// have been selected as compaction candidates. This provides early
+    /// termination to limit planning time and memory for datasets with many
+    /// fragments (e.g., hundreds of thousands).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Maximum total bytes of source data to compact in a single run. When set,
+    /// the planner stops collecting fragment metrics once the cumulative size
+    /// of candidate fragments exceeds this limit. Fragments whose
+    /// `file_size_bytes` is unknown are treated as 0 bytes for budget
+    /// purposes. This provides early termination to limit planning time and
+    /// memory for large datasets.
+    /// Defaults to `None` (no limit).
+    pub max_compaction_bytes: Option<usize>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -236,6 +245,7 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            max_compaction_bytes: None,
             transaction_properties: None,
         }
     }
@@ -260,6 +270,7 @@ impl CompactionOptions {
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
+    /// - `lance.compaction.max_compaction_bytes`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -353,6 +364,14 @@ impl CompactionOptions {
                 }
                 "max_source_fragments" => {
                     self.max_source_fragments = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "max_compaction_bytes" => {
+                    self.max_compaction_bytes = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
                             key, value
@@ -598,13 +617,25 @@ impl DefaultCompactionPlanner {
         options.validate();
         Self { options }
     }
+
+    fn exceeds_budget(&self, candidate_fragments: usize, candidate_bytes: usize) -> bool {
+        if let Some(max_frags) = self.options.max_source_fragments
+            && candidate_fragments > max_frags
+        {
+            return true;
+        }
+        if let Some(max_bytes) = self.options.max_compaction_bytes
+            && candidate_bytes > max_bytes
+        {
+            return true;
+        }
+        false
+    }
 }
 
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
-        // get_fragments should be returning fragments in sorted order (by id)
-        // and fragment ids should be unique
         let fragments = dataset.get_fragments();
 
         debug_assert!(
@@ -632,7 +663,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let mut candidate_bins: Vec<CandidateBin> = Vec::new();
         let mut current_bin: Option<CandidateBin> = None;
+        let mut total_candidate_fragments: usize = 0;
+        let mut total_candidate_bytes: usize = 0;
         let mut i = 0;
+
+        let has_budget = self.options.max_source_fragments.is_some()
+            || self.options.max_compaction_bytes.is_some();
 
         while let Some(res) = fragment_metrics.next().await {
             let (fragment, metrics) = res?;
@@ -642,20 +678,25 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             {
                 Some(CompactionCandidacy::CompactItself)
             } else if metrics.physical_rows < self.options.target_rows_per_fragment {
-                // Only want to compact if their are neighbors to compact such that
-                // we can get a larger fragment.
                 Some(CompactionCandidacy::CompactWithNeighbors)
             } else {
-                // Not a candidate
                 None
             };
 
             let indices = indices_containing_frag(fragment.id as u32);
 
+            let fragment_bytes: usize = fragment
+                .files
+                .iter()
+                .filter_map(|f| f.file_size_bytes.get())
+                .map(|sz| sz.get() as usize)
+                .sum();
+
             match (candidacy, &mut current_bin) {
-                (None, None) => {} // keep searching
+                (None, None) => {}
                 (Some(candidacy), None) => {
-                    // Start a new bin
+                    total_candidate_fragments += 1;
+                    total_candidate_bytes += fragment_bytes;
                     current_bin = Some(CandidateBin {
                         fragments: vec![fragment],
                         pos_range: i..(i + 1),
@@ -665,16 +706,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                     });
                 }
                 (Some(candidacy), Some(bin)) => {
-                    // We cannot mix "indexed" and "non-indexed" fragments and so we only consider
-                    // the existing bin if it contains the same indices
+                    total_candidate_fragments += 1;
+                    total_candidate_bytes += fragment_bytes;
                     if bin.indices == indices {
-                        // Add to current bin
                         bin.fragments.push(fragment);
                         bin.pos_range.end += 1;
                         bin.candidacy.push(candidacy);
                         bin.row_counts.push(metrics.num_rows());
                     } else {
-                        // Index set is different.  Complete previous bin and start new one
                         candidate_bins.push(current_bin.take().unwrap());
                         current_bin = Some(CandidateBin {
                             fragments: vec![fragment],
@@ -686,20 +725,26 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                     }
                 }
                 (None, Some(_)) => {
-                    // Bin is complete
                     candidate_bins.push(current_bin.take().unwrap());
                 }
+            }
+
+            if has_budget
+                && current_bin.is_some()
+                && self.exceeds_budget(total_candidate_fragments, total_candidate_bytes)
+            {
+                candidate_bins.push(current_bin.take().unwrap());
+                break;
             }
 
             i += 1;
         }
 
-        // Flush the last bin
         if let Some(bin) = current_bin {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<TaskData> = candidate_bins
+        let tasks: Vec<TaskData> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
@@ -707,19 +752,6 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 fragments: bin.fragments,
             })
             .collect();
-
-        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
-            let mut total_frags = 0;
-            all_tasks
-                .into_iter()
-                .take_while(|task| {
-                    total_frags += task.fragments.len();
-                    total_frags <= max_frags
-                })
-                .collect()
-        } else {
-            all_tasks
-        };
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -4815,5 +4847,327 @@ mod tests {
             row_count, 0,
             "rows deleted before compaction must not be resurrected; found {row_count}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_plan_early_termination_max_source_fragments() {
+        use lance_datagen::generator::array;
+
+        let dataset = lance_datagen::BatchGeneratorBuilder::new()
+            .col("key", array::cycle::<Int32Type>((0..100).collect()))
+            .into_ram_dataset(FragmentCount::from(100), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 100);
+
+        let unlimited_plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let unlimited_frags: usize = unlimited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
+        assert_eq!(unlimited_frags, 100);
+
+        let limited_plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                max_source_fragments: Some(20),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let limited_frags: usize = limited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
+        assert!(
+            limited_frags <= 21,
+            "expected at most ~20 candidate fragments (budget + current bin), got {}",
+            limited_frags
+        );
+        assert!(
+            limited_frags > 0,
+            "expected at least 1 candidate fragment, got 0"
+        );
+        assert!(
+            limited_frags < unlimited_frags,
+            "limited plan should have fewer fragments than unlimited"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_plan_early_termination_max_compaction_bytes() {
+        use lance_datagen::generator::array;
+
+        let dataset = lance_datagen::BatchGeneratorBuilder::new()
+            .col("key", array::cycle::<Int32Type>((0..100).collect()))
+            .into_ram_dataset(FragmentCount::from(100), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let unlimited_plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let unlimited_frags: usize = unlimited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
+
+        let limited_plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                max_compaction_bytes: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let limited_frags: usize = limited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
+
+        assert!(
+            limited_frags < unlimited_frags,
+            "limited plan should have fewer fragments than unlimited ({} vs {})",
+            limited_frags,
+            unlimited_frags
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_plan_no_budget_unlimited() {
+        use lance_datagen::generator::array;
+
+        let dataset = lance_datagen::BatchGeneratorBuilder::new()
+            .col("key", array::cycle::<Int32Type>((0..100).collect()))
+            .into_ram_dataset(FragmentCount::from(50), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        let plan = plan_compaction(
+            &dataset,
+            &CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let total_frags: usize = plan.tasks.iter().map(|t| t.fragments.len()).sum();
+        assert_eq!(
+            total_frags, 50,
+            "without budget, all fragments should be planned"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_compaction_plan_many_fragments() {
+        use lance_datagen::generator::array;
+        use std::time::Instant;
+
+        let fragment_counts: Vec<u32> = vec![100, 500, 1_000, 5_000, 10_000];
+        let rows_per_fragment: u32 = 100;
+
+        info!(
+            "{:<12} {:<12} {:<12} {:<12} {:<20}",
+            "num_frags", "plan_time_ms", "num_tasks", "total_frags_in_plan", "plan_json_size_bytes"
+        );
+        info!("{}", "-".repeat(68));
+
+        for frag_count in fragment_counts {
+            let dataset = lance_datagen::BatchGeneratorBuilder::new()
+                .col("key", array::cycle::<Int32Type>((0..100).collect()))
+                .into_ram_dataset(
+                    FragmentCount::from(frag_count),
+                    FragmentRowCount::from(rows_per_fragment),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                dataset.get_fragments().len(),
+                frag_count as usize,
+                "expected {} fragments",
+                frag_count
+            );
+
+            let options = CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                materialize_deletions: true,
+                materialize_deletions_threshold: 0.1,
+                ..Default::default()
+            };
+
+            let start = Instant::now();
+            let plan = plan_compaction(&dataset, &options).await.unwrap();
+            let plan_time = start.elapsed();
+
+            let num_tasks = plan.num_tasks();
+            let total_frags_in_plan: usize = plan.tasks.iter().map(|t| t.fragments.len()).sum();
+
+            let plan_json_size = serde_json::to_string(&plan).unwrap().len();
+
+            info!(
+                "{:<12} {:<12} {:<12} {:<12} {:<20}",
+                frag_count,
+                plan_time.as_millis(),
+                num_tasks,
+                total_frags_in_plan,
+                plan_json_size,
+            );
+
+            drop(plan);
+            drop(dataset);
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_compaction_plan_with_max_source_fragments() {
+        use lance_datagen::generator::array;
+        use std::time::Instant;
+
+        let frag_count: u32 = 10_000;
+        let rows_per_fragment: u32 = 100;
+
+        let dataset = lance_datagen::BatchGeneratorBuilder::new()
+            .col("key", array::cycle::<Int32Type>((0..100).collect()))
+            .into_ram_dataset(
+                FragmentCount::from(frag_count),
+                FragmentRowCount::from(rows_per_fragment),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), frag_count as usize);
+
+        info!(
+            "{:<25} {:<12} {:<12} {:<12} {:<20}",
+            "max_source_fragments",
+            "plan_time_ms",
+            "num_tasks",
+            "total_frags_in_plan",
+            "plan_json_size_bytes"
+        );
+        info!("{}", "-".repeat(81));
+
+        for max_frags in [None, Some(100), Some(500), Some(1_000)] {
+            let options = CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                materialize_deletions: true,
+                materialize_deletions_threshold: 0.1,
+                max_source_fragments: max_frags,
+                ..Default::default()
+            };
+
+            let start = Instant::now();
+            let plan = plan_compaction(&dataset, &options).await.unwrap();
+            let plan_time = start.elapsed();
+
+            let num_tasks = plan.num_tasks();
+            let total_frags_in_plan: usize = plan.tasks.iter().map(|t| t.fragments.len()).sum();
+            let plan_json_size = serde_json::to_string(&plan).unwrap().len();
+
+            let max_label = match max_frags {
+                Some(v) => v.to_string(),
+                None => "None (unlimited)".to_string(),
+            };
+
+            info!(
+                "{:<25} {:<12} {:<12} {:<12} {:<20}",
+                max_label,
+                plan_time.as_millis(),
+                num_tasks,
+                total_frags_in_plan,
+                plan_json_size,
+            );
+
+            drop(plan);
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_compaction_plan_with_deletions() {
+        use lance_datagen::generator::array;
+        use std::time::Instant;
+
+        let frag_count: u32 = 10_000;
+        let rows_per_fragment: u32 = 100;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let dataset = lance_datagen::BatchGeneratorBuilder::new()
+            .col("key", array::cycle::<Int32Type>((0..100).collect()))
+            .into_dataset(
+                test_uri,
+                FragmentCount::from(frag_count),
+                FragmentRowCount::from(rows_per_fragment),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), frag_count as usize);
+
+        let mut dataset = dataset;
+        dataset.delete("key < 10").await.unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        info!(
+            "Dataset: {} fragments, {} total rows after deletions",
+            dataset.get_fragments().len(),
+            dataset.count_rows(None).await.unwrap()
+        );
+
+        info!(
+            "{:<25} {:<12} {:<12} {:<12} {:<20}",
+            "max_source_fragments",
+            "plan_time_ms",
+            "num_tasks",
+            "total_frags_in_plan",
+            "plan_json_size_bytes"
+        );
+        info!("{}", "-".repeat(81));
+
+        for max_frags in [None, Some(100), Some(500), Some(1_000)] {
+            let options = CompactionOptions {
+                target_rows_per_fragment: 1_000_000,
+                materialize_deletions: true,
+                materialize_deletions_threshold: 0.1,
+                max_source_fragments: max_frags,
+                ..Default::default()
+            };
+
+            let start = Instant::now();
+            let plan = plan_compaction(&dataset, &options).await.unwrap();
+            let plan_time = start.elapsed();
+
+            let num_tasks = plan.num_tasks();
+            let total_frags_in_plan: usize = plan.tasks.iter().map(|t| t.fragments.len()).sum();
+            let plan_json_size = serde_json::to_string(&plan).unwrap().len();
+
+            let max_label = match max_frags {
+                Some(v) => v.to_string(),
+                None => "None (unlimited)".to_string(),
+            };
+
+            info!(
+                "{:<25} {:<12} {:<12} {:<12} {:<20}",
+                max_label,
+                plan_time.as_millis(),
+                num_tasks,
+                total_frags_in_plan,
+                plan_json_size,
+            );
+
+            drop(plan);
+        }
     }
 }
