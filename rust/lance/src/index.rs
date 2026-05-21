@@ -569,8 +569,30 @@ pub(crate) async fn remap_index(
     }))
 }
 
+/// Snapshot of every scalar index on a dataset, captured at planning time
+/// and consumed by the scalar/aggregate pushdown machinery.
+///
+/// Built once per planner invocation by walking the manifest's `IndexMetadata`
+/// entries; thereafter all lookups are synchronous, so optimizer rules and the
+/// filter parser can interrogate it without needing an async context.
 #[derive(Debug)]
 pub struct ScalarIndexInfo {
+    /// Per-column dispatch table for [`apply_scalar_indices`]: keyed by the
+    /// full dotted field path (e.g. `"x"`, `"metadata.status.code"`), the same
+    /// string callers use when referring to columns in filter expressions.
+    ///
+    /// The value pairs the column's data type with a [`MultiQueryParser`]
+    /// that fans out to every per-index parser registered for that column.
+    /// When a column carries more than one index (e.g. BTree + bitmap), the
+    /// `MultiQueryParser` tries each in order and the first match wins; the
+    /// resulting [`crate::scalar::expression::ScalarIndexSearch`] records
+    /// which specific index was chosen. So *which* index served the query is
+    /// an output of parsing, not an input — that's why this map is keyed only
+    /// by column.
+    ///
+    /// `fragment_bitmaps`, by contrast, *is* keyed by `(column, index_name)`,
+    /// because by the time the optimizer needs the bitmap the index name is
+    /// already pinned in the parsed leaf.
     indexed_columns: HashMap<String, (DataType, Box<MultiQueryParser>)>,
     /// `(column, index_name) → fragment_bitmap` taken straight off each
     /// [`IndexMetadata`] at construction time. Used by the optimizer rule for

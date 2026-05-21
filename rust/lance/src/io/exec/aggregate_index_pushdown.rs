@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Physical optimizer rule that rewrites `COUNT`-shaped aggregates into
+//! Physical optimizer rule that rewrites index-answerable aggregates into
 //! [`AggregateIndexSearchExec`].
+//!
+//! The v1 implementation only recognizes non-distinct `COUNT(<literal>)`
+//! aggregates, but the surrounding plumbing — the exec, the trait, the rule
+//! shape — is built to grow to other aggregates (`MIN`/`MAX` over a zone
+//! map, `COUNT(DISTINCT)` over a bitmap dictionary, etc.) without changing
+//! the plan layout below.
 //!
 //! Two rewritten shapes are emitted depending on whether the scalar index
 //! backing the filter covers every dataset fragment.
@@ -10,14 +16,14 @@
 //! **Full coverage** (index ⊇ dataset, or no filter at all):
 //!
 //! ```text
-//! AggregateExec(Final, aggs=[COUNT(*)], group_by=[])
+//! AggregateExec(Final, aggs=[…], group_by=[])
 //!   └── AggregateIndexSearchExec { prefilter_input = index_input }
 //! ```
 //!
 //! **Partial coverage** (index ⊊ dataset — typically appended fragments):
 //!
 //! ```text
-//! AggregateExec(Final, aggs=[COUNT(*)], group_by=[])
+//! AggregateExec(Final, aggs=[…], group_by=[])
 //!   └── UnionExec
 //!         ├── AggregateIndexSearchExec(restrict_to_fragments = indexed)
 //!         └── AggregateExec(Partial)
@@ -54,13 +60,16 @@ use super::aggregate_index::AggregateIndexSearchExec;
 use super::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use super::scalar_index::ScalarIndexExec;
 
-/// Physical optimizer rule that pushes `COUNT`-shaped aggregates into
+/// Physical optimizer rule that pushes index-answerable aggregates into
 /// [`AggregateIndexSearchExec`], optionally splitting into a parallel scan
 /// branch when the index has partial coverage of the dataset.
 ///
 /// Only fires when the shape is verifiably safe; everything outside that
 /// envelope (GROUP BY, residual filters, scan ranges, etc.) is left alone for
-/// the normal scan path.
+/// the normal scan path. v1 only recognizes non-distinct `COUNT(<literal>)`;
+/// future aggregates plug in via the same rewrite, just with different
+/// [`AggregateIndexSearch`] queries and `ScalarIndex::calculate_aggregate`
+/// impls.
 #[derive(Debug)]
 pub struct AggregateIndexPushdown;
 
@@ -106,9 +115,12 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         return Ok(None);
     }
 
-    // Every aggregate must be a `COUNT(<literal>)` shape (i.e. COUNT(*) /
-    // COUNT(1) / etc.) with no per-aggregate FILTER. Anything that depends on
-    // a column value can't be answered without scanning that column.
+    // v1: every aggregate must be a `COUNT(<literal>)` shape (i.e. COUNT(*) /
+    // COUNT(1) / etc.) with no per-aggregate FILTER. As more aggregates grow
+    // their own `ScalarIndex::calculate_aggregate` impls (MIN/MAX off a zone
+    // map, exact `COUNT(DISTINCT)` off a bitmap, …) this gate should grow
+    // accordingly — keep the per-aggregate FILTER rejection regardless,
+    // since per-aggregate filters depend on column values we can't scan.
     for (af, filter) in agg.aggr_expr().iter().zip(agg.filter_expr().iter()) {
         if !is_count_star(af) {
             return Ok(None);

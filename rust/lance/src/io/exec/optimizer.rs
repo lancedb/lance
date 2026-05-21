@@ -171,7 +171,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
 
 pub fn get_physical_optimizer() -> PhysicalOptimizer {
     PhysicalOptimizer::with_rules(vec![
-        // Rewrite COUNT-shaped aggregates into AggregateIndexSearchExec so
+        // Rewrite index-answerable aggregates into AggregateIndexSearchExec so
         // they can be answered without scanning column data. Runs before the
         // generic rules so they don't see the rewritten subtree.
         Arc::new(crate::io::exec::aggregate_index_pushdown::AggregateIndexPushdown),
