@@ -1204,6 +1204,83 @@ async fn test_fts_rank() {
     assert_eq!(row_ids, &[0]);
 }
 
+#[tokio::test]
+async fn test_fts_unfiltered_after_filtered_returns_real_row_ids() {
+    // After a filtered FTS scan populates the per-partition cache,
+    // the next unfiltered scan must still return real row_ids, not
+    // partition-local doc_ids. Needs >1 fragment so the two differ
+    // (fragment N's row_ids start at N << 32).
+    let text_col = GenericStringArray::<i32>::from(vec![
+        "alpha first",
+        "alpha second",
+        "alpha third",
+        "alpha fourth",
+    ]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let fts = |ds: &Dataset, filter: Option<&str>| {
+        let mut s = ds.scan();
+        s.with_row_id()
+            .full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+            .unwrap();
+        if let Some(f) = filter {
+            s.prefilter(true).filter(f).unwrap();
+        }
+        s
+    };
+    let sorted_row_ids = |b: &RecordBatch| {
+        let mut v: Vec<u64> = b[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+        v.sort();
+        v
+    };
+
+    let fresh = sorted_row_ids(&fts(&dataset, None).try_into_batch().await.unwrap());
+    assert_eq!(fresh.len(), 4);
+
+    // Reopen so the baseline scan's cached LazyDocSet doesn't mask
+    // the regression -- the filtered scan needs to be the first
+    // thing that touches the DocSet.
+    let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    fts(&dataset, Some("text LIKE 'alpha first%'"))
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    let after = sorted_row_ids(&fts(&dataset, None).try_into_batch().await.unwrap());
+    assert_eq!(after, fresh);
+}
+
 async fn create_fts_dataset<
     Offset: arrow::array::OffsetSizeTrait,
     ListOffset: arrow::array::OffsetSizeTrait,
