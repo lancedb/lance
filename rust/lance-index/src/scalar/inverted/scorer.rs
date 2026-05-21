@@ -91,24 +91,22 @@ pub struct IndexBM25Scorer<'a> {
 }
 
 impl<'a> IndexBM25Scorer<'a> {
-    /// Sync constructor. Reads `total_tokens` directly from each partition
-    /// via `LazyDocSet::loaded()`; callers must have already materialized
-    /// the DocSets (e.g. via `ensure_loaded`). Panics with a clear message
-    /// otherwise — this is the wand-scoring path where the contract is
-    /// statically known.
+    /// Sync constructor. Reads each partition's cached `total_tokens` via
+    /// `LazyDocSet::total_tokens_cached()`; callers must have already
+    /// populated it (via `ensure_loaded`, `ensure_num_tokens_loaded`, or
+    /// `total_tokens_num`). Panics with a clear message otherwise — this
+    /// is the wand-scoring path where the contract is statically known.
     pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
         let partitions = partitions.collect::<Vec<_>>();
         let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
         let total_tokens: u64 = partitions
             .iter()
             .map(|p| {
-                p.docs
-                    .loaded()
-                    .expect(
-                        "IndexBM25Scorer::new requires every partition's DocSet to be \
-                         loaded; call `partition.docs.ensure_loaded().await` first",
-                    )
-                    .total_tokens_num()
+                p.docs.total_tokens_cached().expect(
+                    "IndexBM25Scorer::new requires each partition's total_tokens to be \
+                     cached; call `ensure_loaded` / `ensure_num_tokens_loaded` / \
+                     `total_tokens_num` first",
+                )
             })
             .sum();
         let avgdl = total_tokens as f32 / num_docs as f32;
@@ -117,11 +115,6 @@ impl<'a> IndexBM25Scorer<'a> {
             num_docs,
             avg_doc_length: avgdl,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn num_docs(&self) -> usize {
-        self.num_docs
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {
