@@ -1479,10 +1479,18 @@ pub struct CommitConfig {
 
 impl Default for CommitConfig {
     fn default() -> Self {
+        let commit_strategy = match std::env::var("LANCE_COMMIT_STRATEGY")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "pessimistic" => CommitStrategy::Pessimistic,
+            _ => CommitStrategy::default(),
+        };
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
-            commit_strategy: CommitStrategy::default(),
+            commit_strategy,
         }
     }
 }

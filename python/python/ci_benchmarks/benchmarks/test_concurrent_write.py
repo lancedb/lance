@@ -7,12 +7,15 @@ Concurrent write benchmark for Lance datasets.
 Measures throughput and latency of concurrent append, delete, and update
 operations under different commit strategies (Optimistic vs Pessimistic).
 
+The commit strategy is controlled by the LANCE_COMMIT_STRATEGY environment
+variable. It is NOT exposed as a Python API parameter.
+
 Usage:
-    # Run with default Optimistic strategy
+    # Run with Optimistic strategy (default)
     pytest python/ci_benchmarks/benchmarks/test_concurrent_write.py \
         --benchmark-only
 
-    # Run with Pessimistic strategy (set env var)
+    # Run with Pessimistic strategy
     LANCE_COMMIT_STRATEGY=pessimistic \
         pytest python/ci_benchmarks/benchmarks/test_concurrent_write.py \
         --benchmark-only
@@ -42,12 +45,19 @@ import pyarrow as pa
 import pytest
 
 
-def _get_storage_options():
+def _get_commit_strategy():
+    return os.environ.get("LANCE_COMMIT_STRATEGY", "optimistic").lower()
+
+
+def _get_storage_options(bucket_name: str = ""):
     key_id = os.environ.get("AWS_ACCESS_KEY_ID", "")
     secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     endpoint = os.environ.get("AWS_ENDPOINT", "")
     region = os.environ.get("AWS_REGION", "")
     if key_id and secret and endpoint:
+        if bucket_name and "tos-s3" in endpoint:
+            parts = endpoint.split("://", 1)
+            endpoint = f"{parts[0]}://{bucket_name}.{parts[1]}"
         return {
             "access_key_id": key_id,
             "secret_access_key": secret,
@@ -56,6 +66,13 @@ def _get_storage_options():
             "virtual_hosted_style_request": "true",
         }
     return None
+
+
+def _extract_bucket_name(uri: str) -> str:
+    if uri.startswith("s3://"):
+        path = uri[5:]
+        return path.split("/", 1)[0]
+    return ""
 
 
 def _get_dataset_uri(label: str) -> str:
@@ -76,6 +93,8 @@ async def _run_concurrent_writes(
     rows_per_write: int,
     storage_options: dict | None,
 ):
+    commit_strategy = _get_commit_strategy()
+
     init_table = pa.table(
         {
             "id": pa.array([0], type=pa.int64()),
@@ -83,7 +102,10 @@ async def _run_concurrent_writes(
         }
     )
     lance.write_dataset(
-        init_table, dataset_uri, mode="create", storage_options=storage_options
+        init_table,
+        dataset_uri,
+        mode="create",
+        storage_options=storage_options,
     )
 
     results = []
@@ -110,7 +132,10 @@ async def _run_concurrent_writes(
             )
             start = time.monotonic()
             ds = lance.write_dataset(
-                table, dataset_uri, mode="append", storage_options=storage_options
+                table,
+                dataset_uri,
+                mode="append",
+                storage_options=storage_options,
             )
             elapsed = time.monotonic() - start
             results.append(
@@ -188,7 +213,7 @@ async def _run_concurrent_writes(
     n_upd = len(update_latencies)
 
     print(f"\n{'=' * 60}")
-    print("Concurrent Write Benchmark Results")
+    print(f"Concurrent Write Benchmark Results ({commit_strategy})")
     print(f"{'=' * 60}")
     print(
         f"  Total ops:     {total_ops} (append={n_app}, delete={n_del}, update={n_upd})"
@@ -234,8 +259,11 @@ def _run_benchmark(
     rows_per_write=100,
 ):
     storage_options = _get_storage_options()
-    label = f"w{num_writers}_d{num_deleters}_u{num_updaters}"
+    commit_strategy = _get_commit_strategy()
+    label = f"w{num_writers}_d{num_deleters}_u{num_updaters}_{commit_strategy}"
     dataset_uri = _get_dataset_uri(label)
+    bucket_name = _extract_bucket_name(dataset_uri)
+    storage_options = _get_storage_options(bucket_name)
     throughput = asyncio.run(
         _run_concurrent_writes(
             dataset_uri,
