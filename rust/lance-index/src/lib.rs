@@ -20,7 +20,6 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
-pub mod expression;
 pub mod frag_reuse;
 pub mod mem_wal;
 pub mod metrics;
