@@ -44,12 +44,17 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::lit;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[allow(deprecated)]
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::{
-    ExecutionPlan,
+    ExecutionPlan, ExecutionPlanProperties,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     coalesce_partitions::CoalescePartitionsExec,
+    projection::ProjectionExec,
+    repartition::RepartitionExec,
     union::UnionExec,
 };
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Literal;
 use log::warn;
@@ -103,12 +108,17 @@ impl PhysicalOptimizerRule for AggregateIndexPushdown {
 }
 
 fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-    // We can only optimize Single at the moment. We could optimize Partial in
-    // the future if there is a need for it. This rule will never accelerate
-    // Final.
-    if !matches!(agg.mode(), AggregateMode::Single) {
-        return Ok(None);
-    }
+    // We can accelerate Single (Lance scanner shape) and Partial (the shape
+    // DataFusion's SQL planner emits at the leaf of an aggregate pipeline);
+    // both produce results we know how to compute from the index. We will
+    // never accelerate Final or FinalPartitioned — those combine an existing
+    // partial stream, and the value of this rule is replacing the work that
+    // produces the partial stream.
+    let mode = match agg.mode() {
+        AggregateMode::Single => AggregateMode::Single,
+        AggregateMode::Partial => AggregateMode::Partial,
+        _ => return Ok(None),
+    };
     if !agg.group_expr().is_empty() {
         return Ok(None);
     }
@@ -132,8 +142,12 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     }
 
     // The input must be a FilteredReadExec we can prove is safe to skip.
-    let child = &agg.children()[0];
-    let Some(filtered_read) = child.as_any().downcast_ref::<FilteredReadExec>() else {
+    // DataFusion's SQL planner inserts a few row-preserving wrappers above
+    // the leaf — a `RepartitionExec` for parallelism, an empty
+    // `ProjectionExec` once the count expression has been resolved to need
+    // no columns, and `CoalesceBatchesExec` here and there. Walk through
+    // those to reach the FilteredReadExec.
+    let Some(filtered_read) = strip_row_preserving_wrappers(agg.children()[0]) else {
         return Ok(None);
     };
 
@@ -251,7 +265,8 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     //    branch, prefilter feeds in directly.
     // 3. Prefilter + index covers a strict subset: split into pushdown over
     //    indexed fragments + parallel scan over unindexed fragments.
-    let (combined, partial_input_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage {
+    let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage
+    {
         None => {
             // No prefilter at all (verified above): nothing to restrict.
             let exec = AggregateIndexSearchExec::try_new_restricted(
@@ -290,37 +305,52 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             )?;
             let partial_state_schema = pushdown_exec.schema();
             let pushdown_branch: Arc<dyn ExecutionPlan> = Arc::new(pushdown_exec);
-
             let scan_branch =
                 build_scan_branch(filtered_read, options, &uncovered, aggr_exprs.clone())?;
-
-            // Union exposes one partition per input; CoalescePartitionsExec
-            // flattens them so the Final aggregate sees a single partition
-            // with all the partial-state rows.
-            let union = UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
-            let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
-            (coalesced, partial_state_schema)
+            let union: Arc<dyn ExecutionPlan> =
+                UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
+            (union, partial_state_schema)
         }
     };
 
-    // Wrap with AggregateExec(Final) so a downstream consumer that expected
-    // the original AggregateExec output schema continues to see it.
-    //
-    // `AggregateExec::try_new` requires one `Option<Arc<dyn PhysicalExpr>>`
-    // per aggregate expression for the optional per-aggregate
-    // `FILTER (WHERE ...)` clause. We rejected any aggregate carrying a
-    // filter back at the gate, so every slot is `None` here.
-    let filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
-        (0..aggr_exprs.len()).map(|_| None).collect();
-    let final_agg = AggregateExec::try_new(
-        AggregateMode::Final,
-        PhysicalGroupBy::default(),
-        aggr_exprs,
-        filters,
-        combined,
-        partial_input_schema,
-    )?;
-    Ok(Some(Arc::new(final_agg)))
+    match mode {
+        AggregateMode::Partial => {
+            // Caller's parent is already an AggregateExec(Final) that knows
+            // how to consume multi-partition partial state — substitute our
+            // partial stream and we're done.
+            Ok(Some(partial_stream))
+        }
+        AggregateMode::Single => {
+            // The original AggregateExec(Single) produced final output in one
+            // step; our exec emits partial state, so add a Final on top to
+            // recover the original output schema. Final expects a single
+            // partition of partial-state rows, so coalesce when we have a
+            // union producing multiple partitions.
+            let final_input: Arc<dyn ExecutionPlan> =
+                if partial_stream.output_partitioning().partition_count() > 1 {
+                    Arc::new(CoalescePartitionsExec::new(partial_stream))
+                } else {
+                    partial_stream
+                };
+            // `AggregateExec::try_new` requires one
+            // `Option<Arc<dyn PhysicalExpr>>` per aggregate expression for
+            // the optional per-aggregate `FILTER (WHERE ...)` clause. We
+            // rejected any aggregate carrying a filter back at the gate, so
+            // every slot is `None` here.
+            let filters: Vec<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> =
+                (0..aggr_exprs.len()).map(|_| None).collect();
+            let final_agg = AggregateExec::try_new(
+                AggregateMode::Final,
+                PhysicalGroupBy::default(),
+                aggr_exprs,
+                filters,
+                final_input,
+                partial_state_schema,
+            )?;
+            Ok(Some(Arc::new(final_agg)))
+        }
+        _ => unreachable!("mode was checked at the top of try_rewrite"),
+    }
 }
 
 /// Build the scan branch of a partial-coverage split: a `FilteredReadExec`
@@ -360,6 +390,58 @@ fn build_scan_branch(
         scan_schema,
     )?;
     Ok(Arc::new(partial))
+}
+
+/// Walk through row-preserving wrappers (`RepartitionExec`,
+/// `CoalesceBatchesExec`, and identity-or-empty `ProjectionExec`) that
+/// DataFusion's planner inserts between an `AggregateExec` and the leaf, and
+/// return the underlying `FilteredReadExec` if one is reached.
+///
+/// "Row-preserving" here means the wrapper changes neither the number of rows
+/// nor the predicate applied to them — it may reshape partitions, batches, or
+/// drop unused columns, but the row population at the bottom is what reaches
+/// the aggregate. That's all the rule needs from these layers, so it's safe to
+/// look past them.
+fn strip_row_preserving_wrappers(plan: &Arc<dyn ExecutionPlan>) -> Option<&FilteredReadExec> {
+    let mut current: &dyn ExecutionPlan = plan.as_ref();
+    loop {
+        if let Some(filtered_read) = current.as_any().downcast_ref::<FilteredReadExec>() {
+            return Some(filtered_read);
+        }
+        let next: &Arc<dyn ExecutionPlan> = if let Some(inner) =
+            current.as_any().downcast_ref::<RepartitionExec>()
+        {
+            inner.input()
+        } else if let Some(inner) = {
+            #[allow(deprecated)]
+            current.as_any().downcast_ref::<CoalesceBatchesExec>()
+        } {
+            inner.input()
+        } else if let Some(inner) = current.as_any().downcast_ref::<CoalescePartitionsExec>() {
+            inner.input()
+        } else if let Some(proj) = current.as_any().downcast_ref::<ProjectionExec>() {
+            // Only walk through projections that are row-preserving: every
+            // output expression is a direct column reference back to the
+            // input. (Empty projections trivially qualify — DataFusion uses
+            // one when a `COUNT(*)`'s argument no longer needs any actual
+            // columns.)
+            let input_schema = proj.input().schema();
+            let identity = proj.expr().iter().all(|projection_expr| {
+                projection_expr
+                    .expr
+                    .as_any()
+                    .downcast_ref::<Column>()
+                    .is_some_and(|c| c.name() == input_schema.field(c.index()).name())
+            });
+            if !identity {
+                return None;
+            }
+            proj.input()
+        } else {
+            return None;
+        };
+        current = next.as_ref();
+    }
 }
 
 /// Walk a `ScalarIndexExpr` and intersect the per-leaf `fragment_bitmap`.
