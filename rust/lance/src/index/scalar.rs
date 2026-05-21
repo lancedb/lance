@@ -2412,7 +2412,6 @@ mod tests {
     #[tokio::test]
     async fn test_btree_range_partitioned_optimize_loses_range_info() {
         use lance_datagen::{BatchCount, RowCount};
-        use lance_index::metrics::NoOpMetricsCollector;
 
         let test_dir = TempStrDir::default();
         let uri = format!("{}/test_btree_range_optimize", test_dir.as_str());
@@ -2460,13 +2459,13 @@ mod tests {
                 .await
                 .unwrap();
         let lookup_reader_before = index_store_before
-            .open_index_file(lance_index::scalar::btree::BTREE_LOOKUP_NAME)
+            .open_index_file("page_lookup.lance")
             .await
             .unwrap();
         let range_partitioned_before = lookup_reader_before
             .schema()
             .metadata
-            .contains_key(RANGE_PARTITIONED_META_KEY);
+            .contains_key("range_partitioned");
         assert!(
             range_partitioned_before,
             "Range-partitioned index lookup should have range_partitioned metadata"
@@ -2501,13 +2500,13 @@ mod tests {
                 .unwrap();
 
         let lookup_reader_after = index_store_after
-            .open_index_file(lance_index::scalar::btree::BTREE_LOOKUP_NAME)
+            .open_index_file("page_lookup.lance")
             .await;
         if let Ok(lookup_reader) = lookup_reader_after {
             let range_partitioned_after = lookup_reader
                 .schema()
                 .metadata
-                .contains_key(RANGE_PARTITIONED_META_KEY);
+                .contains_key("range_partitioned");
             assert!(
                 range_partitioned_after,
                 "After optimize, the new index should still be range-partitioned but range_partitioned metadata is lost."
