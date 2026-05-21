@@ -559,6 +559,9 @@ def _write_fragments(
     namespace_client: Optional[LanceNamespace],
     table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List[Any]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -573,6 +576,9 @@ def _write_fragments_transaction(
     namespace_client: Optional[LanceNamespace],
     table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List[Any]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...
