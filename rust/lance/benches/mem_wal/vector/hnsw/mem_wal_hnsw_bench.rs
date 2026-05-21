@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field};
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
 
-#[path = "../src/dataset/mem_wal/hnsw/mod.rs"]
+#[path = "../../../../src/dataset/mem_wal/hnsw/mod.rs"]
 mod hnsw;
 
 use hnsw::{ArrowFixedSizeListVectorStore, BuildParams, HnswGraph, SearchParams, VectorSource};
