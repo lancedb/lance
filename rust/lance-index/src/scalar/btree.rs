@@ -3298,9 +3298,8 @@ mod tests {
     };
 
     use super::{
-        BTreeIndexPlugin, BTreeIndexState, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        DistributedMode, OrderableScalarValue, part_lookup_file_path, part_page_data_file_path,
-        train_btree_index,
+        BTreeIndexPlugin, BTreeIndexState, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE, DistributedMode,
+        OrderableScalarValue, part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use arrow_array::RecordBatch;
