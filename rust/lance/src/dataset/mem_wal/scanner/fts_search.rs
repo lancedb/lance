@@ -835,37 +835,33 @@ fn extract_match_text(query: &FullTextSearchQuery) -> Result<String> {
 
 /// Open the column's inverted index from a Lance dataset, or `None`
 /// if no FTS index exists for the column.
+///
+/// Uses the same criteria-based lookup as the base-table FTS exec path
+/// (`load_scalar_index(... .for_column().supports_fts())`) rather than a
+/// manual field-id scan, so flushed-generation datasets resolve their
+/// maintained FTS index identically to how `scanner.full_text_search`
+/// resolves it.
 async fn open_inverted_index(
     dataset: &Dataset,
     column: &str,
 ) -> Result<Option<Arc<InvertedIndex>>> {
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+    use lance_index::IndexCriteria;
 
-    // Resolve the column's field id so we can match against `IndexMetadata.fields`.
-    let field_id = match dataset.schema().field(column) {
-        Some(f) => f.id,
-        None => return Ok(None),
+    let Some(meta) = dataset
+        .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
+        .await?
+    else {
+        return Ok(None);
     };
-
-    let indices = dataset.load_indices().await?;
-    for meta in indices.iter() {
-        if !meta.fields.contains(&field_id) {
-            continue;
-        }
-        // Mixed index types on the same field would be unusual but
-        // possible; the canonical filter is the downcast below.
-        let uuid = meta.uuid.to_string();
-        let Ok(opened) = dataset
-            .open_generic_index(column, &uuid, &lance_index::metrics::NoOpMetricsCollector)
-            .await
-        else {
-            continue;
-        };
-        if let Some(inv) = opened.as_any().downcast_ref::<InvertedIndex>() {
-            return Ok(Some(Arc::new(inv.clone())));
-        }
-    }
-    Ok(None)
+    let uuid = meta.uuid.to_string();
+    let opened = dataset
+        .open_generic_index(column, &uuid, &lance_index::metrics::NoOpMetricsCollector)
+        .await?;
+    Ok(opened
+        .as_any()
+        .downcast_ref::<InvertedIndex>()
+        .map(|inv| Arc::new(inv.clone())))
 }
 
 /// Materialize user-projected columns from the active memtable's
