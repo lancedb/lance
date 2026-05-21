@@ -2434,25 +2434,7 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
-
-        let index_dir_before = dataset
-            .indices_dir()
-            .join(indices[0].uuid.to_string().as_str());
-        let files_before = lance_table::format::list_index_files_with_sizes(
-            &dataset.object_store,
-            &index_dir_before,
-        )
-        .await
-        .unwrap();
-        let page_data_files_before: Vec<_> = files_before
-            .iter()
-            .filter(|f| f.path.starts_with("part_") && f.path.contains("page_data"))
-            .collect();
-        assert!(
-            page_data_files_before.len() >= 2,
-            "Range-partitioned index should have multiple part_*_page_data files, found {}",
-            page_data_files_before.len()
-        );
+        let original_uuid = indices[0].uuid;
 
         let index_store_before =
             crate::index::LanceIndexStore::from_dataset_for_existing(&dataset, &indices[0])
@@ -2471,7 +2453,7 @@ mod tests {
             "Range-partitioned index lookup should have range_partitioned metadata"
         );
 
-        // Append new data and run optimize_indices
+        // Append new data so there are unindexed fragments
         let new_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
             .col(
@@ -2481,6 +2463,13 @@ mod tests {
             .into_reader_rows(RowCount::from(500), BatchCount::from(1));
         dataset.append(new_reader, None).await.unwrap();
 
+        // Verify there are unindexed fragments
+        let unindexed = dataset.unindexed_fragments("value").await.unwrap();
+        assert!(
+            !unindexed.is_empty(),
+            "Should have unindexed fragments after append"
+        );
+
         dataset
             .optimize_indices(&OptimizeOptions::append())
             .await
@@ -2488,29 +2477,66 @@ mod tests {
 
         let indices_after = dataset.load_indices().await.unwrap();
 
-        let new_index_meta = indices_after
+        // After optimize, there should be a new index segment for the unindexed data
+        let new_segments: Vec<_> = indices_after
             .iter()
-            .find(|idx| idx.uuid != indices[0].uuid)
-            .or_else(|| indices_after.last());
+            .filter(|idx| idx.uuid != original_uuid)
+            .collect();
+        assert!(
+            !new_segments.is_empty(),
+            "optimize_indices should have created a new index segment for unindexed data, \
+             but only found {} segments with same UUIDs as before",
+            indices_after.len()
+        );
 
-        let meta = new_index_meta.expect("Should have a new index segment after optimize");
-        let index_store_after =
-            crate::index::LanceIndexStore::from_dataset_for_existing(&dataset, meta)
-                .await
-                .unwrap();
-
-        let lookup_reader_after = index_store_after
-            .open_index_file("page_lookup.lance")
-            .await;
-        if let Ok(lookup_reader) = lookup_reader_after {
-            let range_partitioned_after = lookup_reader
-                .schema()
-                .metadata
-                .contains_key("range_partitioned");
-            assert!(
-                range_partitioned_after,
-                "After optimize, the new index should still be range-partitioned but range_partitioned metadata is lost."
-            );
+        // Check if the new segment preserved range_partitioned metadata
+        for new_meta in &new_segments {
+            let index_store_after =
+                crate::index::LanceIndexStore::from_dataset_for_existing(&dataset, new_meta)
+                    .await
+                    .unwrap();
+            let lookup_reader_after = index_store_after.open_index_file("page_lookup.lance").await;
+            match lookup_reader_after {
+                Ok(lookup_reader) => {
+                    let range_partitioned_after = lookup_reader
+                        .schema()
+                        .metadata
+                        .contains_key("range_partitioned");
+                    assert!(
+                        range_partitioned_after,
+                        "After optimize, the new index segment {} should still be range-partitioned \
+                         but range_partitioned metadata is lost. This means BTree's update() path \
+                         uses DistributedMode::Single which discards range partitioning.",
+                        new_meta.uuid
+                    );
+                }
+                Err(e) => {
+                    // The new segment may not have a page_lookup.lance if update() created
+                    // a non-range-partitioned index. Check the file structure instead.
+                    let index_dir = dataset
+                        .indices_dir()
+                        .join(new_meta.uuid.to_string().as_str());
+                    let files = lance_table::format::list_index_files_with_sizes(
+                        &dataset.object_store,
+                        &index_dir,
+                    )
+                    .await
+                    .unwrap();
+                    let has_part_files = files
+                        .iter()
+                        .any(|f| f.path.starts_with("part_") && f.path.contains("page_data"));
+                    assert!(
+                        has_part_files,
+                        "After optimize, the new index segment {} has no page_lookup.lance (error: {}) \
+                         and no part_*_page_data files. This means BTree's update() path \
+                         used DistributedMode::Single and created a non-range-partitioned index, \
+                         losing the range partitioning from the original index. Files: {:?}",
+                        new_meta.uuid,
+                        e,
+                        files.iter().map(|f| &f.path).collect::<Vec<_>>()
+                    );
+                }
+            }
         }
 
         // Verify query correctness after optimize
