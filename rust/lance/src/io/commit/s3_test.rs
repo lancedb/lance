@@ -308,7 +308,9 @@ async fn test_ddb_open_iops() {
     assert_io_eq!(io_stats, write_iops, 4);
     // With optimistic commit, the first attempt skips rebase,
     // so there are no read IOPS for listing transactions.
-    assert_io_eq!(io_stats, read_iops, 0);
+    // However, we still need 1 read IOP to check if the dataset exists
+    // (list _versions fallback when external store has no entry).
+    assert_io_eq!(io_stats, read_iops, 1);
 
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {

@@ -221,7 +221,6 @@ impl<'a> CommitBuilder<'a> {
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
             WriteDestination::Uri(uri) => {
-                // Check if it already exists.
                 let mut builder = DatasetBuilder::from_uri(uri)
                     .with_read_params(ReadParams {
                         store_options: self.store_params.clone(),
@@ -230,9 +229,6 @@ impl<'a> CommitBuilder<'a> {
                     })
                     .with_session(session.clone());
 
-                // If we are using a detached version, we need to load the dataset.
-                // Otherwise, we are writing to the main history, and need to check
-                // out the latest version.
                 if is_detached_version(transaction.read_version) {
                     builder = builder.with_version(transaction.read_version)
                 }

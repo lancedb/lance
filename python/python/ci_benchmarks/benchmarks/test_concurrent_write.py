@@ -199,7 +199,7 @@ async def _run_concurrent_writes(
     n_upd = len(update_latencies)
 
     print(f"\n{'=' * 60}")
-    print(f"Concurrent Write Benchmark Results")
+    print("Concurrent Write Benchmark Results")
     print(f"{'=' * 60}")
     print(
         f"  Total ops:     {total_ops} (append={n_app}, delete={n_del}, update={n_upd})"
