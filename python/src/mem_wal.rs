@@ -727,14 +727,15 @@ impl PyLsmVectorSearchPlanner {
 
         let vector_dim = get_vector_dim(&ds, &vector_column)?;
 
-        let collector = LsmDataSourceCollector::new(ds, snapshots);
+        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
         let planner = LsmVectorSearchPlanner::new(
             collector,
             pk_cols,
             base_schema.clone(),
             vector_column,
             dist_type,
-        );
+        )
+        .with_dataset(ds);
 
         Ok(Self {
             planner,
@@ -746,7 +747,7 @@ impl PyLsmVectorSearchPlanner {
     /// Plan a KNN vector search.
     ///
     /// `query` should be a flat PyArrow Float32Array with `vector_dim` elements.
-    #[pyo3(signature = (query, k=10, nprobes=20, columns=None))]
+    #[pyo3(signature = (query, k=10, nprobes=20, columns=None, refine_factor=None))]
     pub fn plan_search(
         &self,
         py: Python<'_>,
@@ -754,6 +755,7 @@ impl PyLsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         columns: Option<Vec<String>>,
+        refine_factor: Option<u32>,
     ) -> PyResult<PyExecutionPlan> {
         let query_array = make_array(query.0);
         let float32_array = query_array
@@ -787,7 +789,7 @@ impl PyLsmVectorSearchPlanner {
         let plan = rt()
             .block_on(Some(py), async {
                 planner_ref
-                    .plan_search(&fsl, k, nprobes, columns.as_deref())
+                    .plan_search(&fsl, k, nprobes, columns.as_deref(), refine_factor)
                     .await
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;

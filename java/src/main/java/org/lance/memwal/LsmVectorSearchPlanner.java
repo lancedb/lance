@@ -93,9 +93,12 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param nprobes number of IVF partitions to probe
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
+   * @param refineFactor when positive, the base-table arm over-fetches {@code k * refineFactor}
+   *     candidates and re-ranks them with exact distances. Pass {@code 0} or negative to disable.
    * @return an executable plan
    */
-  public ExecutionPlan planSearch(Float4Vector query, int k, int nprobes, List<String> columns) {
+  public ExecutionPlan planSearch(
+      Float4Vector query, int k, int nprobes, List<String> columns, int refineFactor) {
     Preconditions.checkNotNull(query, "query must not be null");
     Preconditions.checkArgument(k > 0, "k must be positive, got %s", k);
     Preconditions.checkArgument(nprobes > 0, "nprobes must be positive, got %s", nprobes);
@@ -111,20 +114,40 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
                 schema.memoryAddress(),
                 k,
                 nprobes,
-                Optional.ofNullable(columns));
+                Optional.ofNullable(columns),
+                refineFactor);
         plan.allocator = allocator;
         return plan;
       }
     }
   }
 
+  /**
+   * Plan a KNN vector search without refine.
+   *
+   * @param query a flat float32 vector of length {@code vectorDim}
+   * @param k number of nearest neighbours to return
+   * @param nprobes number of IVF partitions to probe
+   * @param columns columns to project; pass {@code null} to return all columns plus {@code
+   *     _distance}
+   * @return an executable plan
+   */
+  public ExecutionPlan planSearch(Float4Vector query, int k, int nprobes, List<String> columns) {
+    return planSearch(query, k, nprobes, columns, 0);
+  }
+
   /** Plan a KNN vector search with default {@code nprobes} of 20. */
   public ExecutionPlan planSearch(Float4Vector query, int k) {
-    return planSearch(query, k, 20, null);
+    return planSearch(query, k, 20, null, 0);
   }
 
   private native ExecutionPlan nativePlanSearch(
-      long arrayAddress, long schemaAddress, int k, int nprobes, Optional<List<String>> columns);
+      long arrayAddress,
+      long schemaAddress,
+      int k,
+      int nprobes,
+      Optional<List<String>> columns,
+      int refineFactor);
 
   /**
    * Close the planner and release native resources. If the planner is already closed, invoking this

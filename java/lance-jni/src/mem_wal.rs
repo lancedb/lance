@@ -827,14 +827,15 @@ fn inner_create_vector_planner(
     let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
     let vector_dim = get_vector_dim(&dataset, &vector_column)?;
 
-    let collector = LsmDataSourceCollector::new(dataset, snapshots);
+    let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots);
     let planner = LsmVectorSearchPlanner::new(
         collector,
         pk_columns,
         base_schema.clone(),
         vector_column,
         dist_type,
-    );
+    )
+    .with_dataset(dataset);
 
     let blocking = BlockingLsmVectorSearchPlanner {
         planner,
@@ -854,10 +855,25 @@ pub extern "system" fn Java_org_lance_memwal_LsmVectorSearchPlanner_nativePlanSe
     k: jint,
     nprobes: jint,
     columns: JObject<'local>,
+    refine_factor: jint,
 ) -> JObject<'local> {
+    let refine = if refine_factor > 0 {
+        Some(refine_factor as u32)
+    } else {
+        None
+    };
     ok_or_throw!(
         env,
-        inner_plan_search(&mut env, this, array_addr, schema_addr, k, nprobes, columns)
+        inner_plan_search(
+            &mut env,
+            this,
+            array_addr,
+            schema_addr,
+            k,
+            nprobes,
+            columns,
+            refine
+        )
     )
 }
 
@@ -870,6 +886,7 @@ fn inner_plan_search<'local>(
     k: jint,
     nprobes: jint,
     columns: JObject<'local>,
+    refine_factor: Option<u32>,
 ) -> Result<JObject<'local>> {
     let query = import_ffi_array(array_addr, schema_addr)?;
     let columns = env.get_strings_opt(&columns)?;
@@ -901,6 +918,7 @@ fn inner_plan_search<'local>(
             k as usize,
             nprobes as usize,
             columns.as_deref(),
+            refine_factor,
         ))?;
         (plan, guard.dataset_schema.clone())
     };
