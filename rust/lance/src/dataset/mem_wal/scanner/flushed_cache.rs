@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 
+use super::gen_pk_index::GenPkIndex;
 use crate::dataset::{Dataset, DatasetBuilder};
 use crate::session::Session;
 
@@ -43,6 +44,10 @@ pub struct FlushedMemTableCache {
     // `try_get_with`, so concurrent first-queries on a just-flushed
     // generation open the dataset exactly once.
     inner: moka::future::Cache<String, Arc<Dataset>>,
+    // Per-generation PK index for the vector-search block-list, keyed by the
+    // same immutable flushed path. Built lazily on the first query that needs
+    // it (single-flight) so repeated searches skip re-scanning the PK column.
+    pk_indices: moka::future::Cache<String, Arc<GenPkIndex>>,
 }
 
 impl FlushedMemTableCache {
@@ -57,6 +62,10 @@ impl FlushedMemTableCache {
                 // Required for `retain_paths`: moka silently ignores
                 // `invalidate_entries_if` unless closure support is opted
                 // into at build time.
+                .support_invalidation_closures()
+                .build(),
+            pk_indices: moka::future::Cache::builder()
+                .max_capacity(max_entries)
                 .support_invalidation_closures()
                 .build(),
         }
@@ -88,6 +97,21 @@ impl FlushedMemTableCache {
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
     }
 
+    /// Get the cached [`GenPkIndex`] for `path`, building it (exactly once) on a
+    /// miss via `build`. The flushed path is immutable, so a cached index is
+    /// never stale; concurrent first-queries share one build via `moka`'s
+    /// single-flight `try_get_with`.
+    pub async fn get_or_build_pk_index(
+        &self,
+        path: &str,
+        build: impl std::future::Future<Output = Result<GenPkIndex>>,
+    ) -> Result<Arc<GenPkIndex>> {
+        self.pk_indices
+            .try_get_with(path.to_string(), async move { build.await.map(Arc::new) })
+            .await
+            .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
+    }
+
     /// Drop cached entries whose path is not in `live_paths`.
     ///
     /// Called by the consumer after compaction retires generations. Purely a
@@ -101,6 +125,10 @@ impl FlushedMemTableCache {
         // would just defer reclamation — never a correctness issue.
         let _ = self
             .inner
+            .invalidate_entries_if(move |path, _| !live.contains(path));
+        let live = live_paths.clone();
+        let _ = self
+            .pk_indices
             .invalidate_entries_if(move |path, _| !live.contains(path));
     }
 }
@@ -221,6 +249,36 @@ mod tests {
         }
         cache.inner.run_pending_tasks().await;
         assert_eq!(cache.inner.entry_count(), 1, "exactly one entry cached");
+    }
+
+    #[tokio::test]
+    async fn pk_index_cached_reuses_first_build() {
+        // The PK index is keyed by the immutable flushed path: a hit returns the
+        // first-built index and never runs the second build closure.
+        let cache = FlushedMemTableCache::new(8);
+        let path = "memory://shard/gen_1";
+        let first = cache
+            .get_or_build_pk_index(path, async {
+                Ok(GenPkIndex::from_hashed([(1u64, 0u64), (2, 1)]))
+            })
+            .await
+            .unwrap();
+        let second = cache
+            .get_or_build_pk_index(path, async {
+                // Different contents; must be ignored because the path is cached.
+                Ok(GenPkIndex::from_hashed([(9u64, 0u64)]))
+            })
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a PK-index cache hit must reuse the first-built index"
+        );
+        assert_eq!(
+            second.len(),
+            2,
+            "cached index keeps the first build's contents"
+        );
     }
 
     #[tokio::test]

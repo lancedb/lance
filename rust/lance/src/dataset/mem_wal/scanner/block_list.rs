@@ -72,7 +72,7 @@ pub async fn compute_source_block_lists(
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
 ) -> Result<HashMap<LsmGeneration, Arc<RowAddrMask>>> {
     // Build a GenPkIndex for every non-base source (flushed + active/frozen).
-    let mut indexed: Vec<(LsmGeneration, FreshnessPolarity, GenPkIndex)> = Vec::new();
+    let mut indexed: Vec<(LsmGeneration, FreshnessPolarity, Arc<GenPkIndex>)> = Vec::new();
     let mut base: Option<&Arc<Dataset>> = None;
     for source in sources {
         match source {
@@ -83,16 +83,15 @@ pub async fn compute_source_block_lists(
                 ..
             } => {
                 // Active and frozen memtables are insert-ordered (newest = largest position).
-                let index = pk_index_from_batch_store(batch_store, pk_columns)?;
+                let index = Arc::new(pk_index_from_batch_store(batch_store, pk_columns)?);
                 indexed.push((*generation, FreshnessPolarity::InsertOrder, index));
             }
             LsmDataSource::FlushedMemTable {
                 path, generation, ..
             } => {
                 // Flushed generations are reverse-written (newest = smallest `_rowid`).
-                let dataset = open_flushed_dataset(path, session, flushed_cache).await?;
-                let batches = scan_pk_rowid(&dataset, pk_columns).await?;
-                let index = pk_index_from_scanned(&batches, pk_columns)?;
+                // Cached by immutable path so repeated searches skip the PK scan.
+                let index = flushed_pk_index(path, pk_columns, session, flushed_cache).await?;
                 indexed.push((*generation, FreshnessPolarity::ReverseWrite, index));
             }
         }
@@ -103,7 +102,7 @@ pub async fn compute_source_block_lists(
     indexed.sort_by_key(|(generation, _, _)| std::cmp::Reverse(*generation));
     let gens_newest_first: Vec<(FreshnessPolarity, &GenPkIndex)> = indexed
         .iter()
-        .map(|(_, polarity, index)| (*polarity, index))
+        .map(|(_, polarity, index)| (*polarity, index.as_ref()))
         .collect();
     let (block_trees, membership) = compute_block_lists(&gens_newest_first);
 
@@ -131,6 +130,44 @@ pub async fn compute_source_block_lists(
     }
 
     Ok(block_lists)
+}
+
+/// Build (or fetch the cached) [`GenPkIndex`] for one flushed generation.
+///
+/// With a cache, the index is built once per immutable path (single-flight) and
+/// reused across queries; without one, it is built cold each call. The build
+/// itself opens the flushed dataset and scans `(pk_columns, _rowid)`.
+async fn flushed_pk_index(
+    path: &str,
+    pk_columns: &[String],
+    session: Option<&Arc<Session>>,
+    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+) -> Result<Arc<GenPkIndex>> {
+    match flushed_cache {
+        Some(cache) => {
+            let build_cache = cache.clone();
+            let build_path = path.to_string();
+            let build_session = session.cloned();
+            let build_pk = pk_columns.to_vec();
+            cache
+                .get_or_build_pk_index(path, async move {
+                    let dataset = open_flushed_dataset(
+                        &build_path,
+                        build_session.as_ref(),
+                        Some(&build_cache),
+                    )
+                    .await?;
+                    let batches = scan_pk_rowid(&dataset, &build_pk).await?;
+                    pk_index_from_scanned(&batches, &build_pk)
+                })
+                .await
+        }
+        None => {
+            let dataset = open_flushed_dataset(path, session, None).await?;
+            let batches = scan_pk_rowid(&dataset, pk_columns).await?;
+            Ok(Arc::new(pk_index_from_scanned(&batches, pk_columns)?))
+        }
+    }
 }
 
 /// Scan a dataset's PK columns plus `_rowid`, collecting the result batches.
