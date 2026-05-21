@@ -695,11 +695,6 @@ impl FlatMatchFilterExec {
         metrics_set: ExecutionPlanMetricsSet,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let metrics = Arc::new(FtsIndexMetrics::new(&metrics_set, partition));
-        let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
-        // Time the one-shot setup (tokenizer load + query tokenization) so it's
-        // attributed to this node's elapsed_compute. The helper itself only
-        // times per-batch work.
-        let setup_start = std::time::Instant::now();
         let column = query
             .column
             .clone()
@@ -720,7 +715,6 @@ impl FlatMatchFilterExec {
             None => Self::load_tokenizer(&dataset, &column, &metrics.index_metrics).await?,
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
-        elapsed_compute.add_duration(setup_start.elapsed());
 
         let helper = InstrumentedChildInputStream::new(
             input,
@@ -1010,11 +1004,8 @@ impl ExecutionPlan for FlatMatchQueryExec {
         // so it can attribute the spawn_cpu tokenize work and synchronous
         // scoring back onto this node's `elapsed_compute`. Sharing the same
         // `Time` handle that's already inside the FtsIndexMetrics avoids
-        // registering a duplicate metric. Cloned once for use during setup
-        // timing (below) and again moved into the async block for the
-        // streaming-phase call.
+        // registering a duplicate metric.
         let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
-        let elapsed_compute_for_stream = elapsed_compute.clone();
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -1024,9 +1015,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
-            // Time the one-shot setup (load segments / open indices / build
-            // scorer / acquire tokenizer) and attribute it to elapsed_compute.
-            let setup_start = std::time::Instant::now();
             let segments = match preset_segments {
                 Some(segments) => Some(segments),
                 None => load_segments(&ds, &column).await?,
@@ -1061,7 +1049,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     preset_base_scorer.map(|s| (*s).clone()),
                 ),
             };
-            elapsed_compute.add_duration(setup_start.elapsed());
 
             flat_bm25_search_stream_with_metrics(
                 unindexed_input,
@@ -1070,7 +1057,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 tokenizer,
                 base_scorer,
                 target_batch_size,
-                Some(elapsed_compute_for_stream),
+                Some(elapsed_compute),
             )
             .await
         })
