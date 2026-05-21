@@ -13,9 +13,10 @@ use lance_namespace_reqwest_client::models::{
     AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
     DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
@@ -444,6 +445,17 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<RefreshMaterializedViewResponse> {
         Err(Error::not_supported(
             "refresh_materialized_view not implemented",
+        ))
+    }
+
+    /// Create a materialized view (query / UDTF / chunker) backed by a
+    /// stored UDTF/chunker spec and an optional initial refresh.
+    async fn create_materialized_view(
+        &self,
+        _request: CreateMaterializedViewRequest,
+    ) -> Result<CreateMaterializedViewResponse> {
+        Err(Error::not_supported(
+            "create_materialized_view not implemented",
         ))
     }
 

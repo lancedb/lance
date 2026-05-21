@@ -124,6 +124,10 @@ impl RestAdapter {
             )
             .route("/v1/table/:id/refresh", post(refresh_materialized_view))
             .route(
+                "/v1/materialized_view/:id/refresh",
+                post(refresh_materialized_view),
+            )
+            .route(
                 "/v1/table/:id/schema_metadata/update",
                 post(update_table_schema_metadata),
             )
