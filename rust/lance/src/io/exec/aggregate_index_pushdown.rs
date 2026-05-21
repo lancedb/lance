@@ -102,9 +102,9 @@ impl PhysicalOptimizerRule for AggregateIndexPushdown {
 }
 
 fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-    // The Lance scanner emits AggregateMode::Single. Other modes mean
-    // somebody else is already wrapping us in a partial/final pair; leave them
-    // alone to avoid double-wrapping.
+    // We can only optimize Single at the moment. We could optimize Partial in
+    // the future if there is a need for it. This rule will never accelerate
+    // Final.
     if !matches!(agg.mode(), AggregateMode::Single) {
         return Ok(None);
     }
