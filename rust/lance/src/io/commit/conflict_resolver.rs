@@ -10,13 +10,10 @@ use crate::{
     dataset::transaction::{Operation, Transaction},
 };
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowSetOps;
-use lance_core::{
-    Error, Result,
-    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
-};
+use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use std::{

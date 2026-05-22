@@ -510,7 +510,7 @@ mod tests {
     use arrow_array::FixedSizeListArray;
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;

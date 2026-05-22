@@ -19,8 +19,8 @@ use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use futures::stream;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::spawn_cpu;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::Fragment;
 use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
@@ -379,7 +379,7 @@ impl PreFilter for DatasetPreFilter {
 
 #[cfg(test)]
 mod test {
-    use lance_core::utils::mask::RowSetOps;
+    use lance_select::RowSetOps;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
     use crate::dataset::WriteParams;

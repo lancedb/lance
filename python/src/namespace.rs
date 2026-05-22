@@ -12,16 +12,17 @@ use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableBackfillColumnsRequest,
     AlterTableDropColumnsRequest, AlterTransactionRequest, AnalyzeTableQueryPlanRequest,
-    CountTableRowsRequest, CreateTableIndexRequest, CreateTableTagRequest,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeleteFromTableRequest,
-    DeleteTableTagRequest, DescribeTableIndexStatsRequest, DescribeTableRequest,
-    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
-    DescribeTransactionRequest, DropTableIndexRequest, ExplainTableQueryPlanRequest,
-    GetTableStatsRequest, GetTableTagVersionRequest, InsertIntoTableRequest,
-    ListTableIndicesRequest, ListTableTagsRequest, ListTableVersionsRequest,
-    ListTableVersionsResponse, ListTablesRequest, MergeInsertIntoTableRequest, QueryTableRequest,
-    RefreshMaterializedViewRequest, RestoreTableRequest, UpdateTableRequest,
-    UpdateTableSchemaMetadataRequest, UpdateTableTagRequest,
+    CountTableRowsRequest, CreateMaterializedViewRequest, CreateTableIndexRequest,
+    CreateTableTagRequest, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeleteFromTableRequest, DeleteTableTagRequest, DescribeTableIndexStatsRequest,
+    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DescribeTransactionRequest, DropTableIndexRequest,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableTagVersionRequest,
+    InsertIntoTableRequest, ListTableIndicesRequest, ListTableTagsRequest,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
+    MergeInsertIntoTableRequest, QueryTableRequest, RefreshMaterializedViewRequest,
+    RestoreTableRequest, UpdateTableRequest, UpdateTableSchemaMetadataRequest,
+    UpdateTableTagRequest,
 };
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
@@ -685,6 +686,18 @@ impl PyDirectoryNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    fn create_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // Table tag operations
 
     fn list_table_tags<'py>(
@@ -1331,6 +1344,18 @@ impl PyRestNamespace {
         let request: RefreshMaterializedViewRequest = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.refresh_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_materialized_view(request))?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }

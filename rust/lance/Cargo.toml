@@ -29,6 +29,7 @@ lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
+lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 arrow-arith = { workspace = true }
@@ -204,38 +205,47 @@ harness = false
 
 [[bench]]
 name = "mem_wal_write"
+path = "benches/mem_wal/write/mem_wal_write.rs"
 harness = false
 
 [[bench]]
 name = "memtable_read"
+path = "benches/mem_wal/read/memtable_read.rs"
 harness = false
 
 [[bench]]
-name = "mem_wal_read"
+name = "mem_wal_point_lookup_bench"
+path = "benches/mem_wal/point_lookup/mem_wal_point_lookup_bench.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_vector_bench"
+path = "benches/mem_wal/vector/mem_wal_vector_bench.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_replay"
-harness = false
-
-[[bench]]
-name = "mem_wal_vector"
+path = "benches/mem_wal/write/mem_wal_replay.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_index_micro"
+path = "benches/mem_wal/vector/mem_wal_index_micro.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_recall_hnsw"
+path = "benches/mem_wal/vector/hnsw/mem_wal_recall_hnsw.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_hnsw_bench"
+path = "benches/mem_wal/vector/hnsw/mem_wal_hnsw_bench.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_shard_writer_backpressure"
+path = "benches/mem_wal/write/mem_wal_shard_writer_backpressure.rs"
 harness = false
 
 [[bench]]
