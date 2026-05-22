@@ -2433,6 +2433,23 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_updateTableTa
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_createMaterializedViewNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_materialized_view(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_retrieveOpsMetricsNative(
     mut env: JNIEnv,
     _obj: JObject,
@@ -3369,6 +3386,23 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_updateTableTagNati
         env,
         call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
             RT.block_on(namespace_client.inner.update_table_tag(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_namespace_RestNamespace_createMaterializedViewNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.create_materialized_view(req))
         }),
         std::ptr::null_mut()
     )

@@ -1373,8 +1373,8 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_build_bitmap() {
         use datafusion::common::ScalarValue;
-        use lance_core::utils::mask::RowSetOps;
         use lance_index::scalar::{SargableQuery, SearchResult, bitmap::BITMAP_LOOKUP_NAME};
+        use lance_select::RowSetOps;
 
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());

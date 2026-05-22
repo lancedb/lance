@@ -22,8 +22,8 @@ use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache};
 use lance_core::error::LanceOptionExt;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, ROW_ID, Result};
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
