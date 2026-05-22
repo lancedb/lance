@@ -4810,8 +4810,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            updated_index.ranges_to_files.is_none(),
-            "Updated ranged-btree-index should fall back to non-ranged"
+            updated_index.ranges_to_files.is_some(),
+            "Updated ranged-btree-index should preserve range partition structure"
         );
 
         let updated_value = (DEFAULT_BTREE_BATCH_SIZE * 2 + (DEFAULT_BTREE_BATCH_SIZE / 2)) as i32;
