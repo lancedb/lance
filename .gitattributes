@@ -1,1 +1,3 @@
 notebooks/** linguist-vendored
+Cargo.lock linguist-generated
+**/Cargo.lock linguist-generated

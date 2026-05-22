@@ -373,14 +373,18 @@ async fn do_take_rows(
                 AddRowOffsetExec::compute_row_offset_array(&row_addr_col, builder.dataset).await?;
             let row_offset_field =
                 ArrowField::new(ROW_OFFSET, arrow::datatypes::DataType::UInt64, false);
-            batch = batch.try_with_column(row_offset_field, row_offset_col)?;
+            if batch.schema().column_with_name(ROW_OFFSET).is_none() {
+                batch = batch.try_with_column(row_offset_field, row_offset_col)?;
+            }
         }
 
         if builder.with_row_address {
             // inject `ROW_ADDR` column
             let row_addr_field =
                 ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            batch = batch.try_with_column(row_addr_field, row_addr_col)?;
+            if batch.schema().column_with_name(ROW_ADDR).is_none() {
+                batch = batch.try_with_column(row_addr_field, row_addr_col)?;
+            }
         }
     }
 
@@ -526,9 +530,10 @@ impl TakeBuilder {
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
             let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                row_ids
-                    .iter()
-                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                row_id_index
+                    .get_many(row_ids)
+                    .into_iter()
+                    .filter_map(|opt| opt.map(|address| address.into()))
                     .collect::<Vec<_>>()
             } else {
                 row_ids.clone()

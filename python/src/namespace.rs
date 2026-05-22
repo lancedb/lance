@@ -10,17 +10,19 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::{
-    AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableDropColumnsRequest,
-    AlterTransactionRequest, AnalyzeTableQueryPlanRequest, CountTableRowsRequest,
-    CreateTableIndexRequest, CreateTableTagRequest, CreateTableVersionRequest,
-    CreateTableVersionResponse, DeleteFromTableRequest, DeleteTableTagRequest,
-    DescribeTableIndexStatsRequest, DescribeTableRequest, DescribeTableResponse,
-    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
-    DropTableIndexRequest, ExplainTableQueryPlanRequest, GetTableStatsRequest,
-    GetTableTagVersionRequest, InsertIntoTableRequest, ListTableIndicesRequest,
-    ListTableTagsRequest, ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
-    MergeInsertIntoTableRequest, QueryTableRequest, RestoreTableRequest, UpdateTableRequest,
-    UpdateTableSchemaMetadataRequest, UpdateTableTagRequest,
+    AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableBackfillColumnsRequest,
+    AlterTableDropColumnsRequest, AlterTransactionRequest, AnalyzeTableQueryPlanRequest,
+    CountTableRowsRequest, CreateMaterializedViewRequest, CreateTableIndexRequest,
+    CreateTableTagRequest, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeleteFromTableRequest, DeleteTableTagRequest, DescribeTableIndexStatsRequest,
+    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DescribeTransactionRequest, DropTableIndexRequest,
+    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableTagVersionRequest,
+    InsertIntoTableRequest, ListTableIndicesRequest, ListTableTagsRequest,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
+    MergeInsertIntoTableRequest, QueryTableRequest, RefreshMaterializedViewRequest,
+    RestoreTableRequest, UpdateTableRequest, UpdateTableSchemaMetadataRequest,
+    UpdateTableTagRequest,
 };
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
@@ -86,7 +88,7 @@ impl DynamicContextProvider for PyDynamicContextProvider {
                 Ok(headers_py) => {
                     // Convert Python dict to Rust HashMap
                     let bound_headers = headers_py.bind(py);
-                    if let Ok(dict) = bound_headers.downcast::<PyDict>() {
+                    if let Ok(dict) = bound_headers.cast::<PyDict>() {
                         dict_to_hashmap(dict).unwrap_or_default()
                     } else {
                         log::warn!("Context provider did not return a dict");
@@ -656,6 +658,42 @@ impl PyDirectoryNamespace {
         let request: AlterTableDropColumnsRequest = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.alter_table_drop_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn alter_table_backfill_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableBackfillColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_backfill_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn refresh_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: RefreshMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.refresh_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_materialized_view(request))?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
@@ -1286,6 +1324,42 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    fn alter_table_backfill_columns<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: AlterTableBackfillColumnsRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.alter_table_backfill_columns(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn refresh_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: RefreshMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.refresh_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn create_materialized_view<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: CreateMaterializedViewRequest = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_materialized_view(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // Table tag operations
 
     fn list_table_tags<'py>(
@@ -1549,10 +1623,10 @@ pub fn extract_namespace_arc(
     namespace_client: &Bound<'_, PyAny>,
 ) -> PyResult<Arc<dyn LanceNamespaceTrait>> {
     // Direct PyO3 class
-    if let Ok(dir_namespace_client) = namespace_client.downcast::<PyDirectoryNamespace>() {
+    if let Ok(dir_namespace_client) = namespace_client.cast::<PyDirectoryNamespace>() {
         return Ok(dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
-    if let Ok(rest_namespace_client) = namespace_client.downcast::<PyRestNamespace>() {
+    if let Ok(rest_namespace_client) = namespace_client.cast::<PyRestNamespace>() {
         return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
     }
 
@@ -1565,13 +1639,13 @@ pub fn extract_namespace_arc(
             .unwrap_or_default();
 
         if type_name == "DirectoryNamespace" {
-            if let Ok(dir_namespace_client) = inner.downcast::<PyDirectoryNamespace>() {
+            if let Ok(dir_namespace_client) = inner.cast::<PyDirectoryNamespace>() {
                 return Ok(
                     dir_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>
                 );
             }
         } else if type_name == "RestNamespace"
-            && let Ok(rest_namespace_client) = inner.downcast::<PyRestNamespace>()
+            && let Ok(rest_namespace_client) = inner.cast::<PyRestNamespace>()
         {
             return Ok(rest_namespace_client.borrow().inner.clone() as Arc<dyn LanceNamespaceTrait>);
         }

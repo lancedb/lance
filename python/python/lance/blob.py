@@ -47,10 +47,12 @@ class Blob:
         return Blob(data=bytes(data))
 
     @staticmethod
-    def from_uri(uri: str, position: int = None, size: int = None) -> "Blob":
+    def from_uri(
+        uri: str, position: Optional[int] = None, size: Optional[int] = None
+    ) -> "Blob":
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
-        if position < 0 or size < 0:
+        if (position is not None and position < 0) or (size is not None and size < 0):
             raise ValueError("External blob position and size must be non-negative")
         return Blob(uri=uri, position=position, size=size)
 
@@ -281,6 +283,10 @@ class BlobFile(io.RawIOBase):
 
     def readall(self) -> bytes:
         return self.inner.readall()
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        """Read a blob-local byte range without changing the current cursor."""
+        return self.inner.read_range(offset, length)
 
     def readinto(self, b: bytearray) -> int:
         return self.inner.read_into(b)

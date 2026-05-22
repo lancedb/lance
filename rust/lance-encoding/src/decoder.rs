@@ -263,11 +263,26 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
 const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
+const ENV_LANCE_INLINE_SCHEDULING_THRESHOLD: &str = "LANCE_INLINE_SCHEDULING_THRESHOLD";
+
+// If a request is for at most this many rows we skip the scheduler-task spawn
+// and run scheduling inline as part of the `schedule_and_decode` await.
+const DEFAULT_INLINE_SCHEDULING_THRESHOLD: u64 = 16 * 1024;
 
 fn default_cache_repetition_index() -> bool {
     static DEFAULT_CACHE_REPETITION_INDEX: OnceLock<bool> = OnceLock::new();
     *DEFAULT_CACHE_REPETITION_INDEX
         .get_or_init(|| parse_env_as_bool(ENV_LANCE_READ_CACHE_REPETITION_INDEX, true))
+}
+
+fn inline_scheduling_threshold() -> u64 {
+    static THRESHOLD: OnceLock<u64> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var(ENV_LANCE_INLINE_SCHEDULING_THRESHOLD)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INLINE_SCHEDULING_THRESHOLD)
+    })
 }
 
 /// Top-level encoding message for a page.  Wraps both the
@@ -1956,6 +1971,24 @@ pub struct DecoderConfig {
     pub cache_repetition_index: bool,
     /// Whether to validate decoded data
     pub validate_on_decode: bool,
+    /// Override the strategy used to dispatch the scheduling work in
+    /// [`schedule_and_decode`].
+    ///
+    /// `schedule_and_decode` always awaits the scheduler's `initialize` (which
+    /// performs metadata I/O) before returning.  This flag controls what
+    /// happens with the subsequent (synchronous) work of pushing decoder
+    /// messages into the channel that feeds the decode stream.
+    ///
+    /// * `None` - default behavior: the scheduling work runs inline (as part
+    ///   of the `schedule_and_decode` await) when the request is small
+    ///   (controlled by the `LANCE_INLINE_SCHEDULING_THRESHOLD` env var) and
+    ///   is dispatched onto a spawned task otherwise.
+    /// * `Some(true)` - always run scheduling inline.  The await of
+    ///   `schedule_and_decode` does not return until every decoder message
+    ///   has been queued.
+    /// * `Some(false)` - always spawn a task for scheduling so that it can
+    ///   overlap with consumption of the decode stream.
+    pub inline_scheduling: Option<bool>,
 }
 
 impl Default for DecoderConfig {
@@ -1963,6 +1996,7 @@ impl Default for DecoderConfig {
         Self {
             cache_repetition_index: default_cache_repetition_index(),
             validate_on_decode: false,
+            inline_scheduling: None,
         }
     }
 }
@@ -2089,7 +2123,7 @@ pub fn create_decode_iterator(
     }
 }
 
-fn create_scheduler_decoder(
+async fn create_scheduler_decoder(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
     filter: FilterExpression,
@@ -2120,28 +2154,35 @@ fn create_scheduler_decoder(
         config.batch_size_bytes,
     )?;
 
-    let scheduler_handle = tokio::task::spawn(async move {
-        let mut decode_scheduler = match DecodeBatchScheduler::try_new(
-            target_schema.as_ref(),
-            &column_indices,
-            &column_infos,
-            &vec![],
-            num_rows,
-            config.decoder_plugins,
-            config.io.clone(),
-            config.cache,
-            &filter,
-            &config.decoder_config,
-        )
-        .await
-        {
-            Ok(scheduler) => scheduler,
-            Err(e) => {
-                let _ = tx.send(Err(e));
-                return;
-            }
-        };
+    // The scheduler's `initialize` may perform I/O to load column metadata
+    // unless that metadata is already in the cache.  This metadata loading
+    // happens as part of this call and should be parallelized if reading
+    // multiple files.
+    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+        target_schema.as_ref(),
+        &column_indices,
+        &column_infos,
+        &vec![],
+        num_rows,
+        config.decoder_plugins,
+        config.io.clone(),
+        config.cache,
+        &filter,
+        &config.decoder_config,
+    )
+    .await?;
 
+    // For small requests the scheduling cost is dwarfed by the overhead of
+    // spawning a task, so we run scheduling inline (still as part of this
+    // await) before returning.  The threshold is configurable via
+    // `LANCE_INLINE_SCHEDULING_THRESHOLD`, and callers can force either
+    // strategy via `DecoderConfig::inline_scheduling`.
+    let inline_scheduling = config
+        .decoder_config
+        .inline_scheduling
+        .unwrap_or_else(|| num_rows <= inline_scheduling_threshold());
+
+    if inline_scheduling {
         match requested_rows {
             RequestedRows::Ranges(ranges) => {
                 decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
@@ -2150,26 +2191,50 @@ fn create_scheduler_decoder(
                 decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
         }
-    });
-
-    Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+        Ok(decode_stream)
+    } else {
+        // Spawn the (still synchronous) scheduling work so that decoder
+        // messages can stream into the channel while the consumer is
+        // already pulling from the decode stream.
+        let scheduling = async move {
+            match requested_rows {
+                RequestedRows::Ranges(ranges) => {
+                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
+                }
+                RequestedRows::Indices(indices) => {
+                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+                }
+            }
+        };
+        let scheduler_handle = tokio::task::spawn(scheduling);
+        Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+    }
 }
 
-/// Launches a scheduler on a dedicated (spawned) task and creates a decoder to
-/// decode the scheduled data and returns the decoder as a stream of record batches.
+/// Initializes the scheduler, schedules the requested rows, and returns a
+/// stream of decode tasks for the resulting batches.
 ///
-/// This is a convenience function that creates both the scheduler and the decoder
-/// which can be a little tricky to get right.
-pub fn schedule_and_decode(
+/// This is a convenience function that creates both the scheduler and the
+/// decoder, which can be a little tricky to get right.
+///
+/// # Why is this async?
+///
+/// Constructing the scheduler runs `initialize` which will perform I/O
+/// unless the data required is already in the file metadata cache.
+///
+/// When `DecoderConfig::inline_scheduling` resolves to `true`, the
+/// subsequent (synchronous) scheduling work also runs before this function
+/// returns, leaving a fully primed decode stream.
+pub async fn schedule_and_decode(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
     filter: FilterExpression,
     column_indices: Vec<u32>,
     target_schema: Arc<Schema>,
     config: SchedulerDecoderConfig,
-) -> BoxStream<'static, ReadBatchTask> {
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if requested_rows.num_rows() == 0 {
-        return stream::empty().boxed();
+        return Ok(stream::empty().boxed());
     }
 
     // If the user requested any ranges that are empty, ignore them.  They are pointless and
@@ -2178,27 +2243,19 @@ pub fn schedule_and_decode(
 
     let io = config.io.clone();
 
-    // For convenience we really want this method to be a snchronous method where all
-    // errors happen on the stream.  There is some async initialization that must happen
-    // when creating a scheduler.  We wrap that all up in the very first task.
-    match create_scheduler_decoder(
+    let stream = create_scheduler_decoder(
         column_infos,
         requested_rows,
         filter,
         column_indices,
         target_schema,
         config,
-    ) {
-        // Keep the io alive until the stream is dropped or finishes.  Otherwise the
-        // I/O drops as soon as the scheduling is finished and the I/O loop terminates.
-        Ok(stream) => stream.finally(move || drop(io)).boxed(),
-        // If the initialization failed make it look like a failed task
-        Err(e) => stream::once(std::future::ready(ReadBatchTask {
-            num_rows: 0,
-            task: std::future::ready(Err(e)).boxed(),
-        }))
-        .boxed(),
-    }
+    )
+    .await?;
+
+    // Keep the io alive until the stream is dropped or finishes.  Otherwise the
+    // I/O drops as soon as the scheduling is finished and the I/O loop terminates.
+    Ok(stream.finally(move || drop(io)).boxed())
 }
 
 pub static WAITER_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {

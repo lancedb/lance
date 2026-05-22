@@ -315,6 +315,10 @@ pub async fn maybe_sample_training_data(
 
     let should_sample = num_rows > sample_size_hint;
     if should_sample {
+        info!(
+            "Sample training data: sampling {} rows from {} rows for column {}",
+            sample_size_hint, num_rows, column
+        );
         sample_training_data(
             dataset,
             column,
@@ -327,6 +331,10 @@ pub async fn maybe_sample_training_data(
         .await
     } else {
         // too small to require sampling
+        info!(
+            "Sample training data: scanning all {} rows for column {}",
+            num_rows, column
+        );
         let batch = scan_all_training_data(dataset, column, is_nullable, fragment_ids).await?;
         vector_column_to_fsl(&batch, column)
     }
@@ -440,6 +448,10 @@ async fn sample_training_data(
             let batch = dataset
                 .sample(sample_size_hint, &projection, Some(fragment_ids))
                 .await?;
+            info!(
+                "Sample training data: retrieved {} rows by fragment-limited random sampling",
+                batch.num_rows()
+            );
             return vector_column_to_fsl(&batch, column);
         }
         let scan = sample_training_data_scan_from_fragments(
@@ -490,12 +502,12 @@ fn sample_training_data_scan(
     num_rows: usize,
     byte_width: usize,
 ) -> Result<crate::dataset::scanner::DatasetRecordBatchStream> {
-    let block_size = dataset.object_store().block_size();
+    let block_size = dataset.object_store.as_ref().block_size();
     let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width);
     Ok(dataset.take_scan(
         Box::pin(futures::stream::iter(ranges).map(Ok)),
         Arc::new(dataset.schema().project(&[column])?),
-        dataset.object_store().io_parallelism(),
+        dataset.object_store.as_ref().io_parallelism(),
     ))
 }
 
@@ -683,17 +695,39 @@ where
 {
     let mut values_buf = MutableBuffer::with_capacity(sample_size_hint * byte_width);
     let mut num_non_null: usize = 0;
+    let mut batch_count: usize = 0;
+    let mut rows_scanned: usize = 0;
 
     while num_non_null < sample_size_hint {
         let Some(batch) = scan.next().await else {
             break;
         };
         let batch = batch?;
+        batch_count += 1;
+        rows_scanned += batch.num_rows();
         let array = get_column_from_batch(&batch, column)?;
         if array.logical_null_count() >= array.len() {
+            info!(
+                "Sample training data: batch {} read {} rows ({} scanned, {}/{} sampled after null filtering)",
+                batch_count,
+                batch.num_rows(),
+                rows_scanned,
+                num_non_null.min(sample_size_hint),
+                sample_size_hint
+            );
             continue;
         }
+        let previous_num_non_null = num_non_null;
         accumulate_fsl_values(&mut values_buf, &mut num_non_null, &array, byte_width, true)?;
+        info!(
+            "Sample training data: batch {} read {} rows, accepted {} rows ({} scanned, {}/{} sampled after null filtering)",
+            batch_count,
+            batch.num_rows(),
+            num_non_null - previous_num_non_null,
+            rows_scanned,
+            num_non_null.min(sample_size_hint),
+            sample_size_hint
+        );
     }
 
     let num_rows_out = num_non_null.min(sample_size_hint);
@@ -727,10 +761,19 @@ async fn sample_fsl_uniform(
     let mut total_rows: usize = 0;
 
     const TAKE_CHUNK_SIZE: usize = 8192;
-    for chunk in indices.chunks(TAKE_CHUNK_SIZE) {
+    let total_chunks = indices.len().div_ceil(TAKE_CHUNK_SIZE);
+    for (chunk_idx, chunk) in indices.chunks(TAKE_CHUNK_SIZE).enumerate() {
         let batch = dataset.take(chunk, projection.clone()).await?;
         let array = get_column_from_batch(&batch, column)?;
         accumulate_fsl_values(&mut values_buf, &mut total_rows, &array, byte_width, false)?;
+        info!(
+            "Sample training data: batch {}/{} read {} rows ({}/{} sampled by uniform random sampling)",
+            chunk_idx + 1,
+            total_chunks,
+            batch.num_rows(),
+            total_rows.min(sample_size_hint),
+            sample_size_hint
+        );
     }
 
     info!(
@@ -794,14 +837,27 @@ where
     let mut schema = None;
     let mut filtered = Vec::new();
     let mut num_non_null: usize = 0;
+    let mut batch_count: usize = 0;
+    let mut rows_scanned: usize = 0;
 
     while num_non_null < sample_size_hint {
         let Some(batch) = scan.next().await else {
             break;
         };
         let batch = batch?;
+        batch_count += 1;
+        let batch_rows = batch.num_rows();
+        rows_scanned += batch_rows;
         let array = get_column_from_batch(&batch, column)?;
         if is_nullable && array.logical_null_count() >= array.len() {
+            info!(
+                "Sample training data (fallback): batch {} read {} rows ({} scanned, {}/{} sampled after null filtering)",
+                batch_count,
+                batch_rows,
+                rows_scanned,
+                num_non_null.min(sample_size_hint),
+                sample_size_hint
+            );
             continue;
         }
         schema.get_or_insert_with(|| batch.schema());
@@ -810,7 +866,17 @@ where
         } else {
             batch
         };
-        num_non_null += batch.num_rows();
+        let accepted_rows = batch.num_rows();
+        num_non_null += accepted_rows;
+        info!(
+            "Sample training data (fallback): batch {} read {} rows, accepted {} rows ({} scanned, {}/{} sampled)",
+            batch_count,
+            batch_rows,
+            accepted_rows,
+            rows_scanned,
+            num_non_null.min(sample_size_hint),
+            sample_size_hint
+        );
         filtered.push(batch);
     }
 

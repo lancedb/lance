@@ -16,6 +16,7 @@ package org.lance;
 import org.lance.fragment.DataFile;
 import org.lance.fragment.DeletionFile;
 import org.lance.fragment.RowIdMeta;
+import org.lance.fragment.VersionMeta;
 
 import com.google.common.base.MoreObjects;
 
@@ -31,6 +32,8 @@ public class FragmentMetadata implements Serializable {
   private final long physicalRows;
   private final DeletionFile deletionFile;
   private final RowIdMeta rowIdMeta;
+  private final VersionMeta createdAtVersionMeta;
+  private final VersionMeta lastUpdatedAtVersionMeta;
 
   public FragmentMetadata(
       int id,
@@ -38,11 +41,24 @@ public class FragmentMetadata implements Serializable {
       Long physicalRows,
       DeletionFile deletionFile,
       RowIdMeta rowIdMeta) {
+    this(id, files, physicalRows, deletionFile, rowIdMeta, null, null);
+  }
+
+  public FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta,
+      VersionMeta createdAtVersionMeta,
+      VersionMeta lastUpdatedAtVersionMeta) {
     this.id = id;
     this.files = files;
     this.physicalRows = physicalRows;
     this.deletionFile = deletionFile;
     this.rowIdMeta = rowIdMeta;
+    this.createdAtVersionMeta = createdAtVersionMeta;
+    this.lastUpdatedAtVersionMeta = lastUpdatedAtVersionMeta;
   }
 
   public int getId() {
@@ -80,6 +96,14 @@ public class FragmentMetadata implements Serializable {
     return rowIdMeta;
   }
 
+  public VersionMeta getCreatedAtVersionMeta() {
+    return createdAtVersionMeta;
+  }
+
+  public VersionMeta getLastUpdatedAtVersionMeta() {
+    return lastUpdatedAtVersionMeta;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -93,7 +117,21 @@ public class FragmentMetadata implements Serializable {
         && physicalRows == that.physicalRows
         && Objects.equals(this.files, that.files)
         && Objects.equals(deletionFile, that.deletionFile)
-        && Objects.equals(rowIdMeta, that.rowIdMeta);
+        && Objects.equals(rowIdMeta, that.rowIdMeta)
+        && Objects.equals(createdAtVersionMeta, that.createdAtVersionMeta)
+        && Objects.equals(lastUpdatedAtVersionMeta, that.lastUpdatedAtVersionMeta);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(
+        id,
+        physicalRows,
+        files,
+        deletionFile,
+        rowIdMeta,
+        createdAtVersionMeta,
+        lastUpdatedAtVersionMeta);
   }
 
   @Override
@@ -104,6 +142,8 @@ public class FragmentMetadata implements Serializable {
         .add("files", files)
         .add("deletionFile", deletionFile)
         .add("rowIdMeta", rowIdMeta)
+        .add("createdAtVersionMeta", createdAtVersionMeta)
+        .add("lastUpdatedAtVersionMeta", lastUpdatedAtVersionMeta)
         .toString();
   }
 }

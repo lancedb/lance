@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 
+use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
@@ -221,7 +223,10 @@ impl Tags<'_> {
                 message: format!("tag {} already exists", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference).await?;
+        let now = utc_now();
+        let tag_contents = self
+            .build_tag_content_by_ref(reference, Some(now), Some(now))
+            .await?;
 
         self.object_store()
             .put(
@@ -257,7 +262,15 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let tag_contents = self.build_tag_content_by_ref(reference).await?;
+        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let updated_reference = self
+            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
+            .await?;
+        tag_contents.branch = updated_reference.branch;
+        tag_contents.version = updated_reference.version;
+        tag_contents.created_at = updated_reference.created_at;
+        tag_contents.updated_at = updated_reference.updated_at;
+        tag_contents.manifest_size = updated_reference.manifest_size;
 
         self.object_store()
             .put(
@@ -268,7 +281,39 @@ impl Tags<'_> {
             .map(|_| ())
     }
 
-    async fn build_tag_content_by_ref(&self, reference: impl Into<Ref>) -> Result<TagContents> {
+    pub async fn replace_metadata(
+        &self,
+        tag: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        check_valid_tag(tag)?;
+
+        let root_location = self.refs.root()?;
+        let tag_file = tag_path(&root_location.path, tag);
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+        tag_contents.metadata = metadata;
+
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn build_tag_content_by_ref(
+        &self,
+        reference: impl Into<Ref>,
+        created_at: Option<DateTime<Utc>>,
+        updated_at: Option<DateTime<Utc>>,
+    ) -> Result<TagContents> {
         let reference = reference.into();
         let (branch, version_number) = match reference {
             Version(branch, version_number) => (branch, version_number),
@@ -313,7 +358,10 @@ impl Tags<'_> {
         let tag_contents = TagContents {
             branch,
             version: manifest_file.version,
+            created_at,
+            updated_at,
             manifest_size,
+            metadata: HashMap::new(),
         };
         Ok(tag_contents)
     }
@@ -350,6 +398,7 @@ impl Branches<'_> {
                 let contents = BranchContents::from_path(
                     &branch_contents_path(branch_path, &name),
                     self.object_store(),
+                    &name,
                 )
                 .await?;
                 Ok((name, contents))
@@ -377,7 +426,8 @@ impl Branches<'_> {
             });
         }
 
-        let branch_contents = BranchContents::from_path(&branch_file, self.object_store()).await?;
+        let branch_contents =
+            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
 
         Ok(branch_contents)
     }
@@ -433,7 +483,7 @@ impl Branches<'_> {
         let parent_branch_id = if let Some(ref parent_branch) = source_branch {
             let parent_file = branch_contents_path(&root_location.path, parent_branch);
             if self.object_store().exists(&parent_file).await? {
-                BranchContents::from_path(&parent_file, self.object_store())
+                BranchContents::from_path(&parent_file, self.object_store(), parent_branch)
                     .await?
                     .identifier
             } else {
@@ -455,7 +505,36 @@ impl Branches<'_> {
             } else {
                 self.object_store().size(&manifest_file.path).await? as usize
             },
+            metadata: HashMap::new(),
         };
+
+        self.object_store()
+            .put(
+                &branch_file,
+                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn replace_metadata(
+        &self,
+        branch: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        check_valid_branch(branch)?;
+
+        let root_location = self.refs.root()?;
+        let branch_file = branch_contents_path(&root_location.path, branch);
+        if !self.object_store().exists(&branch_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("branch {} does not exist", branch),
+            });
+        }
+
+        let mut branch_contents =
+            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
+        branch_contents.metadata = metadata;
 
         self.object_store()
             .put(
@@ -654,18 +733,32 @@ impl<'a> BranchRelativePath<'a> {
 pub struct TagContents {
     pub branch: Option<String>,
     pub version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
     pub manifest_size: usize,
+    /// Metadata associated with this tag.
+    ///
+    /// Missing metadata is deserialized as an empty map.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
-    #[serde(default = "BranchIdentifier::none")]
+    #[serde(default = "BranchIdentifier::missing_identifier_sentinel")]
     pub identifier: BranchIdentifier,
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
     pub manifest_size: usize,
+    /// Metadata associated with this branch.
+    ///
+    /// Missing metadata is deserialized as an empty map.
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -680,12 +773,58 @@ impl BranchIdentifier {
         Self { version_mapping }
     }
 
-    /// Creates a branch identifier for legacy branches without explicit lineage.
-    /// Legacy branches have parent_version=0 and are skipped during cleanup.
-    pub fn none() -> Self {
+    /// Creates a sentinel identifier for legacy branch metadata that lacks an explicit
+    /// identifier.
+    ///
+    /// `BranchContents::from_path` replaces this value with a deterministic synthetic
+    /// identifier. Keeping this sentinel stable lets us distinguish missing identifiers from
+    /// persisted identifiers without changing this field to `Option<BranchIdentifier>`.
+    pub fn missing_identifier_sentinel() -> Self {
         Self {
-            version_mapping: vec![(0, Uuid::new_v4().simple().to_string())],
+            version_mapping: vec![(0, Uuid::nil().simple().to_string())],
         }
+    }
+
+    fn synthetic_identifier(
+        branch_name: &str,
+        parent_branch: Option<&str>,
+        parent_version: u64,
+        create_at: u64,
+    ) -> Self {
+        let identifier_input = format!(
+            "branch_name={branch_name}\nparent_branch={}\nparent_version={parent_version}\ncreate_at={create_at}",
+            parent_branch.unwrap_or("")
+        );
+        Self {
+            version_mapping: vec![(
+                0,
+                Uuid::from_bytes(Self::synthetic_identifier_bytes(
+                    identifier_input.as_bytes(),
+                ))
+                .simple()
+                .to_string(),
+            )],
+        }
+    }
+
+    fn synthetic_identifier_bytes(input: &[u8]) -> [u8; 16] {
+        // Use fixed, local hashing so legacy fallback identifiers stay deterministic without
+        // enabling extra UUID generation features.
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        fn hash_with_seed(input: &[u8], seed: u64) -> u64 {
+            input.iter().fold(seed, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+            })
+        }
+
+        let first = hash_with_seed(input, FNV_OFFSET);
+        let second = hash_with_seed(input, FNV_OFFSET ^ 0x9e3779b97f4a7c15);
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&first.to_be_bytes());
+        bytes[8..].copy_from_slice(&second.to_be_bytes());
+        bytes
     }
 
     pub fn main() -> Self {
@@ -752,20 +891,20 @@ impl BranchIdentifier {
 }
 
 pub fn base_tags_path(base_path: &Path) -> Path {
-    base_path.child("_refs").child("tags")
+    base_path.clone().join("_refs").join("tags")
 }
 
 pub fn base_branches_contents_path(base_path: &Path) -> Path {
-    base_path.child("_refs").child("branches")
+    base_path.clone().join("_refs").join("branches")
 }
 
 pub fn tag_path(base_path: &Path, branch: &str) -> Path {
-    base_tags_path(base_path).child(format!("{}.json", branch))
+    base_tags_path(base_path).join(format!("{}.json", branch))
 }
 
 // Note: child will encode '/' to '%2F'
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
-    base_branches_contents_path(base_path).child(format!("{}.json", branch))
+    base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
 
 pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
@@ -805,8 +944,24 @@ impl TagContents {
 }
 
 impl BranchContents {
-    pub async fn from_path(path: &Path, object_store: &ObjectStore) -> Result<Self> {
-        from_path(path, object_store).await
+    pub async fn from_path(
+        path: &Path,
+        object_store: &ObjectStore,
+        branch_name: &str,
+    ) -> Result<Self> {
+        let mut contents: Self = from_path(path, object_store).await?;
+        if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
+            // Legacy branch files do not store an identifier. Derive a deterministic fallback
+            // from stable branch metadata so repeated reads expose the same public
+            // branch_identifier.
+            contents.identifier = BranchIdentifier::synthetic_identifier(
+                branch_name,
+                contents.parent_branch.as_deref(),
+                contents.parent_version,
+                contents.create_at,
+            );
+        }
+        Ok(contents)
     }
 }
 
@@ -1069,10 +1224,11 @@ mod tests {
     async fn test_branch_contents_serialization() {
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
-            identifier: BranchIdentifier::none(),
+            identifier: BranchIdentifier::missing_identifier_sentinel(),
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
+            metadata: HashMap::from([("description".to_string(), "production branch".to_string())]),
         };
 
         // Test serialization
@@ -1081,6 +1237,7 @@ mod tests {
         assert!(json.contains("parentVersion"));
         assert!(json.contains("createAt"));
         assert!(json.contains("manifestSize"));
+        assert!(json.contains("metadata"));
 
         // Test deserialization
         let deserialized: BranchContents = serde_json::from_str(&json).unwrap();
@@ -1088,6 +1245,53 @@ mod tests {
         assert_eq!(deserialized.parent_version, branch_contents.parent_version);
         assert_eq!(deserialized.create_at, branch_contents.create_at);
         assert_eq!(deserialized.manifest_size, branch_contents.manifest_size);
+        assert_eq!(deserialized.metadata, branch_contents.metadata);
+
+        // Backward compatibility: older serialized content does not include metadata.
+        let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
+        let legacy_deserialized: BranchContents = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy_deserialized.metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_branch_synthetic_uuid_is_stable() {
+        let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
+        let store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let first_path = branch_contents_path(&base_path, "legacy_branch");
+        store
+            .put(&first_path, legacy_json.as_bytes())
+            .await
+            .unwrap();
+        let second_path = branch_contents_path(&base_path, "legacy_branch_other");
+        store
+            .put(&second_path, legacy_json.as_bytes())
+            .await
+            .unwrap();
+
+        let first = BranchContents::from_path(&first_path, &store, "legacy_branch")
+            .await
+            .unwrap();
+        let second = BranchContents::from_path(&first_path, &store, "legacy_branch")
+            .await
+            .unwrap();
+        assert_eq!(first.identifier, second.identifier);
+        assert_ne!(
+            first.identifier,
+            BranchIdentifier::missing_identifier_sentinel()
+        );
+        assert_eq!(first.identifier.version_mapping[0].1.len(), 32);
+        assert!(
+            first.identifier.version_mapping[0]
+                .1
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        );
+
+        let other = BranchContents::from_path(&second_path, &store, "legacy_branch_other")
+            .await
+            .unwrap();
+        assert_ne!(first.identifier, other.identifier);
     }
 
     #[tokio::test]
@@ -1095,20 +1299,59 @@ mod tests {
         let tag_contents = TagContents {
             branch: Some("feature".to_string()),
             version: 10,
+            created_at: Some(chrono::DateTime::from_timestamp(1_234_567_000, 456_000_000).unwrap()),
+            updated_at: Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap()),
             manifest_size: 2048,
+            metadata: HashMap::from([("channel".to_string(), "release".to_string())]),
         };
 
         // Test serialization
         let json = serde_json::to_string(&tag_contents).unwrap();
         assert!(json.contains("branch"));
         assert!(json.contains("version"));
+        assert!(json.contains("createdAt"));
+        assert!(json.contains("updatedAt"));
         assert!(json.contains("manifestSize"));
+        assert!(json.contains("metadata"));
 
         // Test deserialization
         let deserialized: TagContents = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.branch, tag_contents.branch);
         assert_eq!(deserialized.version, tag_contents.version);
+        assert_eq!(deserialized.created_at, tag_contents.created_at);
+        assert_eq!(deserialized.updated_at, tag_contents.updated_at);
         assert_eq!(deserialized.manifest_size, tag_contents.manifest_size);
+        assert_eq!(deserialized.metadata, tag_contents.metadata);
+
+        let tag_contents_without_created_at = TagContents {
+            branch: Some("feature".to_string()),
+            version: 10,
+            created_at: None,
+            updated_at: Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap()),
+            manifest_size: 2048,
+            metadata: HashMap::new(),
+        };
+        let json_without_created_at =
+            serde_json::to_string(&tag_contents_without_created_at).unwrap();
+        assert!(!json_without_created_at.contains("createdAt"));
+        assert!(json_without_created_at.contains("updatedAt"));
+
+        // Backward compatibility: older serialized content does not include timestamps or metadata.
+        let legacy_json = r#"{"branch":"feature","version":10,"manifestSize":2048}"#;
+        let legacy_deserialized: TagContents = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_deserialized.created_at, None);
+        assert_eq!(legacy_deserialized.updated_at, None);
+        assert!(legacy_deserialized.metadata.is_empty());
+
+        let legacy_updated_only_json = r#"{"branch":"feature","version":10,"updatedAt":"2009-02-13T23:31:30.123Z","manifestSize":2048}"#;
+        let legacy_updated_only_deserialized: TagContents =
+            serde_json::from_str(legacy_updated_only_json).unwrap();
+        assert_eq!(legacy_updated_only_deserialized.created_at, None);
+        assert_eq!(
+            legacy_updated_only_deserialized.updated_at,
+            Some(chrono::DateTime::from_timestamp(1_234_567_890, 123_000_000).unwrap())
+        );
+        assert!(legacy_updated_only_deserialized.metadata.is_empty());
     }
 
     #[rstest]
@@ -1191,6 +1434,7 @@ mod tests {
                 parent_version: parent_ver,
                 create_at: 0,
                 manifest_size: 1,
+                metadata: HashMap::new(),
             }
         }
         let mut contents = HashMap::new();

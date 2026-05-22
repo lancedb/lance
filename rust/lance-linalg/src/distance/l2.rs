@@ -97,11 +97,56 @@ impl L2 for u8 {
     }
 }
 
+#[cfg(feature = "fp16kernels")]
+mod bf16_kernel {
+    use half::bf16;
+
+    // These are the `l2_bf16` function in bf16.c. Our build.rs script compiles
+    // a version of this file for each SIMD level with different suffixes.
+    unsafe extern "C" {
+        #[cfg(target_arch = "aarch64")]
+        pub fn l2_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        pub fn l2_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "x86_64")]
+        pub fn l2_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_bf16_lsx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+        #[cfg(target_arch = "loongarch64")]
+        pub fn l2_bf16_lasx(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
+    }
+}
+
 impl L2 for bf16 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        // TODO: add SIMD support
-        l2_scalar::<Self, f32, 16>(x, y)
+        match *SIMD_SUPPORT {
+            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            SimdSupport::Neon => unsafe {
+                bf16_kernel::l2_bf16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(
+                feature = "fp16kernels",
+                kernel_support = "avx512",
+                target_arch = "x86_64"
+            ))]
+            SimdSupport::Avx512FP16 => unsafe {
+                bf16_kernel::l2_bf16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+                bf16_kernel::l2_bf16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lasx => unsafe {
+                bf16_kernel::l2_bf16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
+            SimdSupport::Lsx => unsafe {
+                bf16_kernel::l2_bf16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            },
+            _ => l2_scalar::<Self, f32, 16>(x, y),
+        }
     }
 }
 
@@ -170,8 +215,50 @@ impl L2 for f32 {
 impl L2 for f64 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
-        l2_scalar::<Self, Self, 8>(x, y) as f32
+        l2_f64_simd(x, y)
     }
+}
+
+/// Explicit SIMD L2 distance for f64.
+#[inline]
+fn l2_f64_simd(x: &[f64], y: &[f64]) -> f32 {
+    use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::{FloatSimd, SIMD};
+
+    let dim = x.len();
+    let unrolled_len = dim / 8 * 8;
+
+    let mut acc8 = f64x8::zeros();
+    for i in (0..unrolled_len).step_by(8) {
+        unsafe {
+            let a = f64x8::load_unaligned(x.as_ptr().add(i));
+            let b = f64x8::load_unaligned(y.as_ptr().add(i));
+            let diff = a - b;
+            acc8.multiply_add(diff, diff);
+        }
+    }
+
+    let aligned_len = dim / 4 * 4;
+    let mut acc4 = f64x4::zeros();
+    for i in (unrolled_len..aligned_len).step_by(4) {
+        unsafe {
+            let a = f64x4::load_unaligned(x.as_ptr().add(i));
+            let b = f64x4::load_unaligned(y.as_ptr().add(i));
+            let diff = a - b;
+            acc4.multiply_add(diff, diff);
+        }
+    }
+
+    let tail: f64 = x[aligned_len..]
+        .iter()
+        .zip(y[aligned_len..].iter())
+        .map(|(&a, &b)| {
+            let diff = a - b;
+            diff * diff
+        })
+        .sum();
+
+    (acc8.reduce_sum() + acc4.reduce_sum() + tail) as f32
 }
 
 /// Accumulate squared differences for one dimension into per-target results.

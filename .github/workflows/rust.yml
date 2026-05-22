@@ -94,7 +94,6 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # pin the toolchain version to avoid surprises
       - name: Setup rust toolchain
         run: |
           rustup toolchain install nightly

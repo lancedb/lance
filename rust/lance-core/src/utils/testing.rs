@@ -10,14 +10,19 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
-    Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
+    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    Result as OSResult,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 // A policy function takes in the name of the operation (e.g. "put") and the location
 // that is being accessed / modified and returns an optional error.
@@ -121,6 +126,42 @@ impl std::fmt::Display for ProxyObjectStore {
     }
 }
 
+/// An object store wrapper that counts listing operations.
+///
+/// This increments the shared counter for both `list` and `list_with_delimiter`
+/// so tests can observe all listing-based directory and version discovery calls.
+#[derive(Debug)]
+pub struct CountingObjectStore {
+    target: Arc<dyn ObjectStore>,
+    listing_count: Arc<AtomicUsize>,
+}
+
+impl CountingObjectStore {
+    pub fn new(target: Arc<dyn ObjectStore>, listing_count: Arc<AtomicUsize>) -> Self {
+        Self {
+            target,
+            listing_count,
+        }
+    }
+
+    fn record_listing(&self) {
+        self.listing_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn delegate_list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Pin<Box<dyn futures::Stream<Item = OSResult<ObjectMeta>> + Send>> {
+        self.target.list(prefix)
+    }
+}
+
+impl std::fmt::Display for CountingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingObjectStore({})", self.target)
+    }
+}
+
 #[async_trait]
 impl ObjectStore for ProxyObjectStore {
     async fn put_opts(
@@ -144,12 +185,12 @@ impl ObjectStore for ProxyObjectStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         self.before_method("get_opts", location)?;
-        self.target.get_opts(location, options).await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
-        self.before_method("get_range", location)?;
-        self.target.get_range(location, range).await
+        let is_head = options.head;
+        let mut result = self.target.get_opts(location, options).await?;
+        if is_head {
+            result.meta = self.transform_meta("head", result.meta)?;
+        }
+        Ok(result)
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
@@ -157,15 +198,24 @@ impl ObjectStore for ProxyObjectStore {
         self.target.get_ranges(location, ranges).await
     }
 
-    async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
-        self.before_method("head", location)?;
-        let meta = self.target.head(location).await?;
-        self.transform_meta("head", meta)
-    }
-
-    async fn delete(&self, location: &Path) -> OSResult<()> {
-        self.before_method("delete", location)?;
-        self.target.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        let policy = Arc::clone(&self.policy);
+        let checked = locations
+            .and_then(move |location| {
+                let result = {
+                    let policy = policy.lock().unwrap();
+                    policy
+                        .before_policies
+                        .values()
+                        .try_for_each(|policy| policy("delete", &location).map_err(OSError::from))
+                };
+                future::ready(result.map(|_| location))
+            })
+            .boxed();
+        self.target.delete_stream(checked)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
@@ -189,18 +239,62 @@ impl ObjectStore for ProxyObjectStore {
         self.target.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
         self.before_method("copy", from)?;
-        self.target.copy(from, to).await
+        self.target.copy_opts(from, to, opts).await
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
         self.before_method("rename", from)?;
-        self.target.rename(from, to).await
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, bytes, opts).await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
-        self.before_method("copy_if_not_exists", from)?;
-        self.target.copy_if_not_exists(from, to).await
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.record_listing();
+        self.delegate_list(prefix).boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.record_listing();
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, opts).await
     }
 }

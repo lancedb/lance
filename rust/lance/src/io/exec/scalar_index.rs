@@ -3,18 +3,22 @@
 
 use std::sync::{Arc, LazyLock};
 
-use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::utils::{
+    IndexMetrics, InstrumentedChildInputStream, InstrumentedRecordBatchStreamAdapter,
+};
 use crate::{
     Dataset,
     dataset::rowids::load_row_id_sequences,
-    index::{DatasetIndexExt, DatasetIndexInternalExt, prefilter::DatasetPreFilter},
+    index::{
+        prefilter::DatasetPreFilter,
+        scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
+    },
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
-    common::{Statistics, stats::Precision},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
@@ -24,15 +28,8 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
-use lance_core::utils::mask::RowSetOps;
-use lance_core::{
-    Error, ROW_ID_FIELD, Result,
-    utils::{
-        address::RowAddress,
-        mask::{RowAddrMask, RowAddrTreeMap},
-    },
-};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
+use lance_core::{Error, ROW_ID_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
     utils::{
@@ -40,16 +37,16 @@ use lance_datafusion::{
     },
 };
 use lance_index::{
-    IndexCriteria,
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
         expression::{
             INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, ScalarIndexExpr, ScalarIndexLoader,
-            ScalarIndexSearch,
+            ScalarIndexSearch, serialize_index_expr_result,
         },
     },
 };
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::{debug_span, instrument};
@@ -62,12 +59,7 @@ impl ScalarIndexLoader for Dataset {
         index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let idx = self
-            .load_scalar_index(IndexCriteria::default().with_name(index_name))
-            .await?
-            .ok_or_else(|| Error::internal(format!("Scanner created plan for index query on index {} for column {} but no usable index exists with that name", index_name, column)))?;
-        self.open_scalar_index(column, &idx.uuid.to_string(), metrics)
-            .await
+        open_named_scalar_index(self, column, index_name, metrics).await
     }
 }
 
@@ -82,7 +74,7 @@ impl ScalarIndexLoader for Dataset {
 pub struct ScalarIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -101,12 +93,12 @@ impl DisplayAs for ScalarIndexExec {
 
 impl ScalarIndexExec {
     pub fn new(dataset: Arc<Dataset>, expr: ScalarIndexExpr) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(INDEX_EXPR_RESULT_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             expr,
@@ -133,13 +125,14 @@ impl ScalarIndexExec {
                 Self::fragments_covered_by_index_query(expr, dataset).await
             }
             ScalarIndexExpr::Query(search_key) => {
-                let idx = dataset
-                    .load_scalar_index(IndexCriteria::default().with_name(&search_key.index_name))
+                scalar_index_fragment_bitmap(dataset, &search_key.column, &search_key.index_name)
                     .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Index not found even though it must have been found earlier: {}",
+                            search_key.index_name
+                        ))
+                    })
             }
         }
     }
@@ -160,7 +153,7 @@ impl ScalarIndexExec {
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
-            query_result.serialize_to_arrow(&fragments_covered_by_result)
+            serialize_index_expr_result(&query_result, &fragments_covered_by_result)
         }
     }
 }
@@ -217,10 +210,13 @@ impl ExecutionPlan for ScalarIndexExec {
         )))
     }
 
-    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Exact(2),
-            ..Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
+        Ok(datafusion::physical_plan::Statistics {
+            num_rows: datafusion::common::stats::Precision::Exact(2),
+            ..datafusion::physical_plan::Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
         })
     }
 
@@ -228,7 +224,7 @@ impl ExecutionPlan for ScalarIndexExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -249,7 +245,7 @@ pub struct MapIndexExec {
     column_name: String,
     index_name: String,
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -272,12 +268,12 @@ impl MapIndexExec {
         index_name: String,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             column_name,
@@ -286,6 +282,62 @@ impl MapIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    async fn build_stream(
+        input: datafusion::physical_plan::SendableRecordBatchStream,
+        partition: usize,
+        dataset: Arc<Dataset>,
+        column_name: String,
+        index_name: String,
+        index_metrics: Arc<IndexMetrics>,
+        metrics_set: ExecutionPlanMetricsSet,
+    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        // Time the one-shot setup (fragment bitmap + deletion mask) so it's
+        // attributed to this node's elapsed_compute. The helper itself only
+        // times per-batch work.
+        let elapsed_compute = datafusion::physical_plan::metrics::MetricBuilder::new(&metrics_set)
+            .elapsed_compute(partition);
+        let setup_start = std::time::Instant::now();
+        let fragment_bitmap = scalar_index_fragment_bitmap(&dataset, &column_name, &index_name)
+            .await?
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "IndexedLookupExec: index '{index_name}' on column '{column_name}' disappeared after planning"
+                ))
+            })?;
+        let deletion_mask_fut =
+            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
+        let deletion_mask = if let Some(fut) = deletion_mask_fut {
+            Some(fut.await?)
+        } else {
+            None
+        };
+        elapsed_compute.add_duration(setup_start.elapsed());
+
+        let helper = InstrumentedChildInputStream::new(
+            input,
+            INDEX_LOOKUP_SCHEMA.clone(),
+            move |batch| {
+                let column_name = column_name.clone();
+                let index_name = index_name.clone();
+                let dataset = dataset.clone();
+                let deletion_mask = deletion_mask.clone();
+                let metrics = index_metrics.clone();
+                Self::map_batch(
+                    column_name,
+                    index_name,
+                    dataset,
+                    deletion_mask,
+                    batch,
+                    metrics,
+                )
+            },
+            1,
+            partition,
+            &metrics_set,
+        );
+        Ok(Box::pin(helper))
     }
 
     async fn map_batch(
@@ -303,6 +355,8 @@ impl MapIndexExec {
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: column_name,
             index_name,
+            // Internal IndexedLookup-style query — type is unknown at this layer
+            index_type: String::new(),
             query: Arc::new(SargableQuery::IsIn(index_vals)),
             needs_recheck: false,
         });
@@ -325,43 +379,6 @@ impl MapIndexExec {
             INDEX_LOOKUP_SCHEMA.clone(),
             vec![Arc::new(allow_list)],
         )?)
-    }
-
-    async fn do_execute(
-        input: datafusion::physical_plan::SendableRecordBatchStream,
-        dataset: Arc<Dataset>,
-        column_name: String,
-        index_name: String,
-        metrics: Arc<IndexMetrics>,
-    ) -> datafusion::error::Result<
-        impl Stream<Item = datafusion::error::Result<RecordBatch>> + Send + 'static,
-    > {
-        let index = dataset
-            .load_scalar_index(IndexCriteria::default().with_name(&index_name))
-            .await?
-            .unwrap();
-        let deletion_mask_fut =
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), index.fragment_bitmap.unwrap());
-        let deletion_mask = if let Some(deletion_mask_fut) = deletion_mask_fut {
-            Some(deletion_mask_fut.await?)
-        } else {
-            None
-        };
-        Ok(input.and_then(move |res| {
-            let column_name = column_name.clone();
-            let index_name = index_name.clone();
-            let dataset = dataset.clone();
-            let deletion_mask = deletion_mask.clone();
-            let metrics = metrics.clone();
-            Self::map_batch(
-                column_name,
-                index_name,
-                dataset,
-                deletion_mask,
-                res,
-                metrics,
-            )
-        }))
     }
 }
 
@@ -405,28 +422,24 @@ impl ExecutionPlan for MapIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let index_vals = self.input.execute(partition, context)?;
-        let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
-        let stream_fut = Self::do_execute(
-            index_vals,
+        let input = self.input.execute(partition, context)?;
+        let stream_fut = Self::build_stream(
+            input,
+            partition,
             self.dataset.clone(),
             self.column_name.clone(),
             self.index_name.clone(),
-            metrics,
+            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            self.metrics.clone(),
         );
-        let stream = futures::stream::iter(vec![stream_fut])
-            .then(|stream_fut| stream_fut)
-            .try_flatten()
-            .boxed();
-        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+        let stream = futures::stream::once(stream_fut).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
             INDEX_LOOKUP_SCHEMA.clone(),
             stream,
-            partition,
-            &self.metrics,
         )))
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -448,7 +461,7 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -510,12 +523,12 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(MATERIALIZE_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             expr,
@@ -712,15 +725,11 @@ impl ExecutionPlan for MaterializeIndexExec {
         )))
     }
 
-    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(&MATERIALIZE_INDEX_SCHEMA))
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -804,6 +813,7 @@ mod tests {
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "ordered".to_string(),
             index_name: "ordered_idx".to_string(),
+            index_type: "BTree".to_string(),
             query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
@@ -842,6 +852,7 @@ mod tests {
         let query = ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "ordered".to_string(),
             index_name: "ordered_idx".to_string(),
+            index_type: "BTree".to_string(),
             query: Arc::new(SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),

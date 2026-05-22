@@ -10,6 +10,7 @@ use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Huggingface};
 use url::Url;
 
+use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::parse_hf_repo_id;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
@@ -56,6 +57,89 @@ fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
     })
 }
 
+fn build_hf_base_options(
+    repo_type: &str,
+    repo_id: &str,
+    storage_options: &StorageOptions,
+) -> HashMap<String, String> {
+    let mut options = storage_options.0.clone();
+    options.insert("repo_type".to_string(), repo_type.to_string());
+    options.insert("repo_id".to_string(), repo_id.to_string());
+    options
+}
+
+fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    let mut config_map = HashMap::new();
+
+    let repo_type = options
+        .get("repo_type")
+        .cloned()
+        .ok_or_else(|| Error::invalid_input("Huggingface repo_type is required"))?;
+    let repo_id = options
+        .get("repo_id")
+        .cloned()
+        .ok_or_else(|| Error::invalid_input("Huggingface repo_id is required"))?;
+
+    config_map.insert("repo_type".to_string(), repo_type);
+    config_map.insert("repo_id".to_string(), repo_id);
+
+    if let Some(revision) = options
+        .get("hf_revision")
+        .cloned()
+        .or_else(|| options.get("revision").cloned())
+    {
+        config_map.insert("revision".to_string(), revision);
+    }
+
+    if let Some(root) = options
+        .get("hf_root")
+        .cloned()
+        .or_else(|| options.get("root").cloned())
+        && !root.is_empty()
+    {
+        config_map.insert("root".to_string(), root);
+    }
+
+    if let Some(token) = options
+        .get("hf_token")
+        .cloned()
+        .or_else(|| options.get("token").cloned())
+        && !token.is_empty()
+    {
+        config_map.insert("token".to_string(), token);
+    }
+
+    Ok(config_map)
+}
+
+fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
+    let repo_type = config_map
+        .get("repo_type")
+        .ok_or_else(|| Error::invalid_input("Huggingface repo_type is required"))?;
+    let repo_id = config_map
+        .get("repo_id")
+        .ok_or_else(|| Error::invalid_input("Huggingface repo_id is required"))?;
+
+    let mut builder = Huggingface::default().repo_type(repo_type).repo_id(repo_id);
+    if let Some(revision) = config_map.get("revision") {
+        builder = builder.revision(revision);
+    }
+    if let Some(root) = config_map.get("root") {
+        builder = builder.root(root);
+    }
+    if let Some(token) = config_map.get("token") {
+        builder = builder.token(token);
+    }
+
+    let operator = Operator::new(builder)
+        .map_err(|e| {
+            Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
+        })?
+        .finish();
+
+    Ok(OpendalStore::new(operator))
+}
+
 #[async_trait::async_trait]
 impl ObjectStoreProvider for HuggingfaceStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
@@ -67,38 +151,31 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
 
-        // Build OpenDAL config with allowed keys only.
-        let mut config_map: HashMap<String, String> = HashMap::new();
-
-        config_map.insert("repo_type".to_string(), repo_type);
-        config_map.insert("repo_id".to_string(), repo_id);
-
-        if let Some(rev) = storage_options.get("hf_revision").cloned() {
-            config_map.insert("revision".to_string(), rev);
+        let mut base_options = build_hf_base_options(&repo_type, &repo_id, &storage_options);
+        if !base_options.contains_key("hf_token") && !base_options.contains_key("token") {
+            if let Ok(token) = std::env::var("HF_TOKEN") {
+                base_options.insert("hf_token".to_string(), token);
+            } else if let Ok(token) = std::env::var("HUGGINGFACE_TOKEN") {
+                base_options.insert("hf_token".to_string(), token);
+            }
         }
 
-        if let Some(root) = storage_options.get("hf_root").cloned()
-            && !root.is_empty()
-        {
-            config_map.insert("root".to_string(), root);
-        }
-
-        if let Some(token) = storage_options
-            .get("hf_token")
-            .cloned()
-            .or_else(|| std::env::var("HF_TOKEN").ok())
-            .or_else(|| std::env::var("HUGGINGFACE_TOKEN").ok())
-        {
-            config_map.insert("token".to_string(), token);
-        }
-
-        let operator = Operator::from_iter::<Huggingface>(config_map)
-            .map_err(|e| {
-                Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
-            })?
-            .finish();
-
-        let inner: Arc<dyn OSObjectStore> = Arc::new(OpendalStore::new(operator));
+        let accessor = params.get_accessor();
+        let inner: Arc<dyn OSObjectStore> =
+            if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
+                Arc::new(
+                    DynamicOpenDalStore::new(
+                        format!("hf:{}", base_path),
+                        base_options,
+                        accessor,
+                        normalize_hf_config,
+                        build_hf_store,
+                    )
+                    .with_protected_keys(["repo_type", "repo_id"]),
+                )
+            } else {
+                Arc::new(build_hf_store(normalize_hf_config(&base_options)?)?)
+            };
 
         Ok(ObjectStore {
             scheme: "hf".to_string(),
@@ -135,6 +212,11 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::object_store::StorageOptionsAccessor;
+    use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
+    use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
 
     #[test]
     fn parse_basic_url() {
@@ -179,6 +261,24 @@ mod tests {
             config_map.insert("revision".to_string(), rev);
         }
         assert_eq!(config_map.get("revision").unwrap(), "stable");
+    }
+
+    #[test]
+    fn storage_options_cannot_override_url_repo_identity() {
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &crate::object_store::StorageOptions(HashMap::from([
+                ("repo_type".to_string(), "model".to_string()),
+                ("repo_id".to_string(), "other/repo".to_string()),
+                ("hf_revision".to_string(), "stable".to_string()),
+            ])),
+        ))
+        .unwrap();
+
+        assert_eq!(config.get("repo_type").unwrap(), "dataset");
+        assert_eq!(config.get("repo_id").unwrap(), "acme/repo");
+        assert_eq!(config.get("revision").unwrap(), "stable");
     }
 
     #[test]
@@ -234,5 +334,34 @@ mod tests {
         let url = Url::parse("hf://datasets/only-owner").unwrap();
         let err = parse_hf_url(&url).unwrap_err();
         assert!(err.to_string().contains("repository name"));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_opendal_hf_store_uses_provider_token() {
+        let parsed = parse_hf_url(&Url::parse("hf://datasets/acme/repo/path").unwrap()).unwrap();
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            StaticMockStorageOptionsProvider {
+                options: HashMap::from([("hf_token".to_string(), "dynamic-token".to_string())]),
+            },
+        )));
+
+        let store = DynamicOpenDalStore::new(
+            "hf",
+            build_hf_base_options(
+                &parsed.repo_type,
+                &parsed.repo_id,
+                &crate::object_store::StorageOptions(HashMap::new()),
+            ),
+            accessor,
+            normalize_hf_config,
+            build_hf_store,
+        );
+
+        let current_store = store
+            .current_store()
+            .await
+            .expect("dynamic OpenDAL HuggingFace store should build");
+
+        assert!(current_store.to_string().contains("Opendal"));
     }
 }

@@ -302,13 +302,12 @@ fn try_bitpack_for_block(
 
     let bit_widths = data.expect_stat(Stat::BitWidth);
     let widths = bit_widths.as_primitive::<UInt64Type>();
-    let has_all_zeros = widths.values().contains(&0);
     let max_bit_width = *widths.values().iter().max().unwrap();
 
     let too_small =
         widths.len() == 1 && InlineBitpacking::min_size_bytes(widths.value(0)) >= data.data_size();
 
-    if has_all_zeros || too_small {
+    if too_small {
         return None;
     }
 
@@ -1261,6 +1260,34 @@ mod tests {
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         // Should use RLE due to very low threshold
         assert!(format!("{:?}", compressor).contains("RleEncoder"));
+    }
+
+    // Regression for #6626: an all-zero stat segment (e.g. rep/def for a long
+    // run of empty lists) used to disable block bitpacking entirely.
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_block_bitpacks_with_zero_segment() {
+        let strategy = DefaultCompressionStrategy::new();
+        let field = create_test_field("levels", DataType::UInt16);
+
+        // First 1024 zeros, then 1024 ones; max bit width is 1.
+        let mut values: Vec<u16> = vec![0; 1024];
+        values.extend(std::iter::repeat_n(1u16, 1024));
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 16,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 2048,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        let data = DataBlock::FixedWidth(block);
+
+        let (compressor, _encoding) = strategy.create_block_compressor(&field, &data).unwrap();
+        let debug_str = format!("{:?}", compressor);
+        assert!(
+            debug_str.contains("OutOfLineBitpacking"),
+            "expected OutOfLineBitpacking, got: {debug_str}"
+        );
     }
 
     #[test]

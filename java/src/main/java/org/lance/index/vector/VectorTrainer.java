@@ -15,6 +15,7 @@ package org.lance.index.vector;
 
 import org.lance.Dataset;
 import org.lance.JniLoader;
+import org.lance.index.DistanceType;
 
 import org.apache.arrow.util.Preconditions;
 
@@ -34,40 +35,75 @@ public final class VectorTrainer {
   private VectorTrainer() {}
 
   /**
+   * Train IVF centroids for the given dataset column with {@link DistanceType#L2}.
+   *
+   * <p>Equivalent to {@link #trainIvfCentroids(Dataset, String, IvfBuildParams, DistanceType)} with
+   * {@code distanceType = DistanceType.L2}.
+   */
+  public static float[] trainIvfCentroids(Dataset dataset, String column, IvfBuildParams params) {
+    return trainIvfCentroids(dataset, column, params, DistanceType.L2);
+  }
+
+  /**
    * Train IVF centroids for the given dataset column.
+   *
+   * <p>The {@code distanceType} controls the geometry used to cluster centroids and must match the
+   * distance type later passed to per-fragment index builds. If they disagree the centroids are
+   * clustered on a different geometry than the encoded data and recall will silently degrade.
    *
    * @param dataset the dataset to sample training data from
    * @param column the vector column name
    * @param params IVF build parameters (numPartitions, sampleRate, etc.)
+   * @param distanceType distance metric used during clustering
    * @return a flattened array of centroids laid out as [numPartitions][dimension]
    */
-  public static float[] trainIvfCentroids(Dataset dataset, String column, IvfBuildParams params) {
+  public static float[] trainIvfCentroids(
+      Dataset dataset, String column, IvfBuildParams params, DistanceType distanceType) {
     Preconditions.checkArgument(dataset != null, "dataset cannot be null");
     Preconditions.checkArgument(
         column != null && !column.isEmpty(), "column cannot be null or empty");
     Preconditions.checkArgument(params != null, "params cannot be null");
-    return nativeTrainIvfCentroids(dataset, column, params);
+    Preconditions.checkArgument(distanceType != null, "distanceType cannot be null");
+    return nativeTrainIvfCentroids(dataset, column, params, distanceType.toString());
+  }
+
+  /**
+   * Train a PQ codebook for the given dataset column with {@link DistanceType#L2}.
+   *
+   * <p>Equivalent to {@link #trainPqCodebook(Dataset, String, PQBuildParams, DistanceType)} with
+   * {@code distanceType = DistanceType.L2}.
+   */
+  public static float[] trainPqCodebook(Dataset dataset, String column, PQBuildParams params) {
+    return trainPqCodebook(dataset, column, params, DistanceType.L2);
   }
 
   /**
    * Train a PQ codebook for the given dataset column.
    *
+   * <p>The {@code distanceType} controls the geometry used to fit the codebook (notably, Cosine
+   * normalizes training data before k-means) and must match the distance type later passed to
+   * per-fragment index builds. If they disagree the codebook is shaped for one geometry while
+   * encoding happens against another and recall will silently degrade.
+   *
    * @param dataset the dataset to sample training data from
    * @param column the vector column name
    * @param params PQ build parameters (numSubVectors, numBits, sampleRate, etc.)
+   * @param distanceType distance metric used during codebook training
    * @return a flattened array of codebook entries laid out as [num_centroids][dimension]
    */
-  public static float[] trainPqCodebook(Dataset dataset, String column, PQBuildParams params) {
+  public static float[] trainPqCodebook(
+      Dataset dataset, String column, PQBuildParams params, DistanceType distanceType) {
     Preconditions.checkArgument(dataset != null, "dataset cannot be null");
     Preconditions.checkArgument(
         column != null && !column.isEmpty(), "column cannot be null or empty");
     Preconditions.checkArgument(params != null, "params cannot be null");
-    return nativeTrainPqCodebook(dataset, column, params);
+    Preconditions.checkArgument(distanceType != null, "distanceType cannot be null");
+    return nativeTrainPqCodebook(dataset, column, params, distanceType.toString());
   }
 
   private static native float[] nativeTrainIvfCentroids(
-      Dataset dataset, String column, IvfBuildParams params);
+      Dataset dataset, String column, IvfBuildParams params, String distanceType);
 
   private static native float[] nativeTrainPqCodebook(
-      Dataset dataset, String column, PQBuildParams params);
+      Dataset dataset, String column, PQBuildParams params, String distanceType);
 }

@@ -252,4 +252,4 @@ pub const DELTAS_SEARCHED_METRIC: &str = "deltas_searched";
 pub const PARTITIONS_SEARCHED_METRIC: &str = "partitions_searched";
 pub const FIND_PARTITIONS_ELAPSED_METRIC: &str = "find_partitions_elapsed";
 pub const SCALAR_INDEX_SEARCH_TIME_METRIC: &str = "search_time";
-pub const SCALAR_INDEX_SER_TIME_METRIC: &str = "ser_time";
+pub const SCALAR_INDEX_SER_TIME_METRIC: &str = "serialization_time";

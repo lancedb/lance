@@ -16,6 +16,7 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 pub mod dist_table;
 pub mod f32;
+pub mod f64;
 pub mod i32;
 pub mod u8;
 

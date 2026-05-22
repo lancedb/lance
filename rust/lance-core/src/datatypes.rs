@@ -18,7 +18,8 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    BlobVersion, Encoding, Field, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
+    BlobVersion, Encoding, Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
+    LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{

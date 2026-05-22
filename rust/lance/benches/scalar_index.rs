@@ -12,7 +12,6 @@ use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::{Dataset, io::ObjectStore};
 use lance_core::cache::LanceCache;
-use lance_core::utils::mask::RowSetOps;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
@@ -23,6 +22,7 @@ use lance_index::scalar::{
     registry::ScalarIndexPlugin,
 };
 use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
+use lance_select::RowSetOps;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 

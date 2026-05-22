@@ -178,6 +178,41 @@ fn inner_blob_read_up_to<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_BlobFile_nativeReadRange<'local>(
+    mut env: JNIEnv<'local>,
+    jblob: JObject,
+    offset: jlong,
+    len: jint,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        inner_blob_read_range(&mut env, jblob, offset, len).map(|arr| arr.into_raw()),
+        JByteArray::default().into_raw()
+    )
+}
+
+fn inner_blob_read_range<'local>(
+    env: &mut JNIEnv<'local>,
+    jblob: JObject,
+    offset: jlong,
+    len: jint,
+) -> Result<JByteArray<'local>> {
+    let end = (offset as u64)
+        .checked_add(len as u64)
+        .ok_or_else(|| lance_core::Error::invalid_input("offset + len overflowed".to_string()))?;
+    let bytes = {
+        let blob = unsafe { env.get_rust_field::<_, _, BlockingBlobFile>(jblob, NATIVE_BLOB) }?;
+        RT.block_on(blob.inner.read_range(offset as u64..end))?
+    };
+    let arr = env.new_byte_array(bytes.len() as jint)?;
+    let u8_slice: &[u8] = bytes.as_ref();
+    let i8_slice: &[i8] = unsafe { transmute(u8_slice) };
+
+    env.set_byte_array_region(&arr, 0, i8_slice)?;
+    Ok(arr)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_BlobFile_nativeSeek(
     mut env: JNIEnv,
     jblob: JObject,

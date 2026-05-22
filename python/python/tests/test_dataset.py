@@ -424,18 +424,39 @@ def test_enable_stable_row_ids(tmp_path: Path):
     assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
+def test_has_stable_row_ids_property(tmp_path: Path):
+    table = pa.Table.from_pylist([{"a": 1}, {"a": 2}])
+
+    stable_path = tmp_path / "stable"
+    lance.write_dataset(table, stable_path, enable_stable_row_ids=True)
+    assert lance.dataset(stable_path).has_stable_row_ids is True
+
+    non_stable_path = tmp_path / "non_stable"
+    lance.write_dataset(table, non_stable_path, enable_stable_row_ids=False)
+    assert lance.dataset(non_stable_path).has_stable_row_ids is False
+
+
+def _list_manifests(versions_dir):
+    # Ignore the version hint file, which is not a manifest.
+    return [
+        name
+        for name in os.listdir(versions_dir)
+        if not name.startswith("latest_version_hint")
+    ]
+
+
 def test_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
 def test_default_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(pa.table({"a": range(100)}), tmp_path)
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
@@ -445,12 +466,12 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert manifest_path == ["1.manifest"]
 
     # Migrate to v2 manifest paths
     lance.dataset(tmp_path).migrate_manifest_paths_v2()
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
@@ -471,7 +492,15 @@ def test_tag(tmp_path: Path):
         ds.tags.delete("tag1")
 
     ds.tags.create("tag1", 1)
+    ds.tags.replace_metadata("tag1", {"description": "first tag"})
+    tag1_meta = ds.tags.list()["tag1"]
+    assert tag1_meta["created_at"] is not None
+    assert isinstance(tag1_meta["created_at"], datetime)
+    assert tag1_meta["updated_at"] is not None
+    assert isinstance(tag1_meta["updated_at"], datetime)
+    assert tag1_meta["created_at"] == tag1_meta["updated_at"]
     assert len(ds.tags.list()) == 1
+    assert ds.tags.list()["tag1"]["metadata"] == {"description": "first tag"}
 
     with pytest.raises(ValueError):
         ds.tags.create("tag1", 1)
@@ -505,13 +534,41 @@ def test_tag(tmp_path: Path):
     ):
         ds.tags.update("tag3", 1)
 
+    tag1_meta = ds.tags.list()["tag1"]
+    tag1_created_at = tag1_meta["created_at"]
+    tag1_updated_at = tag1_meta["updated_at"]
+    assert tag1_created_at is not None
+    assert tag1_updated_at is not None
+    ds.tags.replace_metadata("tag1", {"description": "updated tag"})
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
+    replaced_tag1_meta = ds.tags.list()["tag1"]
+    assert replaced_tag1_meta["metadata"] == {"description": "updated tag"}
+    assert replaced_tag1_meta["updated_at"] == tag1_updated_at
+
+    ds.tags.replace_metadata("tag1", {"owner": "ml-team"})
+    replaced_again_tag1_meta = ds.tags.list()["tag1"]
+    assert replaced_again_tag1_meta["metadata"] == {"owner": "ml-team"}
+    assert replaced_again_tag1_meta["updated_at"] == tag1_updated_at
+
     ds.tags.update("tag1", 2)
+    updated_tag1_meta = ds.tags.list()["tag1"]
+    assert updated_tag1_meta["created_at"] == tag1_created_at
+    assert updated_tag1_meta["updated_at"] is not None
+    assert updated_tag1_meta["updated_at"] >= tag1_updated_at
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
+    assert ds.tags.list()["tag1"]["metadata"] == {"owner": "ml-team"}
+
+    ds.tags.replace_metadata("tag1", {})
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 2
+    assert ds.tags.list()["tag1"]["metadata"] == {}
 
     ds.tags.update("tag1", 1)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
+    assert ds.tags.list()["tag1"]["metadata"] == {}
 
     version = ds.tags.get_version("tag1")
     assert version == 1
@@ -558,6 +615,11 @@ def test_tag_order(tmp_path: Path):
 
     tags_asc = ds.tags.list_ordered(order="asc")
     assert len(tags_asc) == 3
+    first_tag = tags_asc[0][1]
+    assert first_tag["created_at"] is not None
+    assert isinstance(first_tag["created_at"], datetime)
+    assert first_tag["updated_at"] is not None
+    assert isinstance(first_tag["updated_at"], datetime)
     tag_names_asc = [t[0] for t in tags_asc]
     assert tag_names_asc == sorted(expected_tags.keys()), (
         f"Unexpected ascending order: {tag_names_asc}"
@@ -2216,7 +2278,6 @@ def test_merge_insert_subcols(tmp_path: Path):
     dataset = lance.write_dataset(
         initial_data, tmp_path / "dataset", max_rows_per_file=5
     )
-    original_fragments = dataset.get_fragments()
 
     new_values = pa.table(
         {
@@ -2226,6 +2287,12 @@ def test_merge_insert_subcols(tmp_path: Path):
     )
     (dataset.merge_insert("a").when_matched_update_all().execute(new_values))
 
+    # Partial-schema upserts run through the v2 `FullSchemaMergeInsertExec`
+    # path (see Rust issue #6442). We only assert the semantic outcome here
+    # — the exact fragment / file layout is an implementation detail of the
+    # v1 RewriteColumns optimization that no longer applies. Column `c`
+    # (not in the source) must retain its original values for the updated
+    # rows.
     expected = pa.table(
         {
             "a": range(10),
@@ -2234,20 +2301,6 @@ def test_merge_insert_subcols(tmp_path: Path):
         }
     )
     assert dataset.to_table().sort_by("a") == expected
-
-    # First fragment has new file
-    fragments = dataset.get_fragments()
-    assert fragments[0].fragment_id == original_fragments[0].fragment_id
-    assert fragments[1].fragment_id == original_fragments[1].fragment_id
-
-    assert len(fragments[0].data_files()) == 2
-    assert (
-        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
-    )
-    assert len(fragments[1].data_files()) == 1
-    assert str(fragments[1].data_files()[0]) == str(
-        original_fragments[1].data_files()[0]
-    )
 
     new_values = pa.table(
         {
@@ -2263,6 +2316,8 @@ def test_merge_insert_subcols(tmp_path: Path):
     )
 
     assert dataset.count_rows() == 12
+    # Newly inserted rows (keys 10, 11) get NULL for column `c` because
+    # the source did not provide a value for it and `c` is nullable.
     expected = pa.table(
         {
             "a": range(0, 12),
@@ -2690,6 +2745,74 @@ def test_merge_insert_large():
     )
 
 
+def test_merge_insert_large_rows():
+    # Verify that merge_insert succeeds when individual batches exceed the
+    # DataFusion memory pool size (100 MiB by default).  DataFusion's sort
+    # cannot spill a single batch that is larger than the pool, so the
+    # HardCapBatchSizeExec node must rechunk before the sort.
+    #
+    # The sort path (update_fragments) is only used for partial/subcolumn
+    # updates, so the source must have a subset of the target columns.
+    #
+    # One batch of ~400 MiB which exceeds the 300 MiB memory pool.
+    # Without HardCapBatchSizeExec rechunking it before the sort, the sort
+    # would fail because it cannot handle a single batch larger than the pool.
+    os.environ["LANCE_MEM_POOL_SIZE"] = str(1024 * 1024 * 1024)
+    rows_per_batch = 2000
+    num_batches = 1
+    nrows = rows_per_batch * num_batches
+    # ~200 KiB per row → ~400 MiB per batch
+    blob_size = 200 * 1024
+
+    # Create dataset with id, blob, and an extra column so the source is partial.
+    full_schema = pa.schema(
+        [("id", pa.int64()), ("blob", pa.large_binary()), ("extra", pa.int32())]
+    )
+
+    def make_full_batches():
+        for i in range(num_batches):
+            start = i * rows_per_batch
+            ids = pa.array(range(start, start + rows_per_batch), type=pa.int64())
+            blobs = pa.array(
+                [b"x" * blob_size] * rows_per_batch, type=pa.large_binary()
+            )
+            extras = pa.array(range(start, start + rows_per_batch), type=pa.int32())
+            yield pa.record_batch([ids, blobs, extras], schema=full_schema)
+
+    reader = pa.RecordBatchReader.from_batches(full_schema, make_full_batches())
+    ds = lance.write_dataset(reader, "memory://")
+
+    # Partial update: only update the blob column (omit extra).
+    # This triggers the update_fragments path which uses the sort.
+    partial_schema = pa.schema([("id", pa.int64()), ("blob", pa.large_binary())])
+
+    def make_partial_batches():
+        for i in range(num_batches):
+            start = i * rows_per_batch
+            ids = pa.array(range(start, start + rows_per_batch), type=pa.int64())
+            blobs = pa.array(
+                [b"y" * blob_size] * rows_per_batch, type=pa.large_binary()
+            )
+            yield pa.record_batch([ids, blobs], schema=partial_schema)
+
+    new_reader = pa.RecordBatchReader.from_batches(
+        partial_schema, make_partial_batches()
+    )
+
+    stats = ds.merge_insert(on="id").when_matched_update_all().execute(new_reader)
+
+    assert stats["num_updated_rows"] == nrows
+    assert stats["num_inserted_rows"] == 0
+
+    result = ds.to_table()
+    assert result.num_rows == nrows
+    # Spot-check that the blobs were updated and extra column preserved.
+    assert result.column("blob")[0].as_py() == b"y" * blob_size
+    assert result.column("extra")[0].as_py() == 0
+
+    del os.environ["LANCE_MEM_POOL_SIZE"]
+
+
 def test_merge_insert_empty_index():
     # Reported in https://github.com/lancedb/lancedb/issues/2285
     empty_table = pa.table({"id": pa.array([], type=pa.float64())})
@@ -2965,6 +3088,37 @@ def test_update_dataset(tmp_path: Path):
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
     check_update_stats(update_dict, (100,))
+
+
+def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "name_1": pa.array(["1", "4", "7"]),
+                "name_2": pa.array(["2", "5", "8"]),
+                "name_3": pa.array(["3", "6", "9"]),
+            }
+        ),
+        tmp_path / "dataset",
+        enable_stable_row_ids=True,
+    )
+
+    update_dict = dataset.update(updates=dict(name_3="'xxxx'"), where="name_1 = '7'")
+    check_update_stats(update_dict, (1,))
+
+    expected = pa.table(
+        {
+            "name_1": pa.array(["1", "4", "7"]),
+            "name_2": pa.array(["2", "5", "8"]),
+            "name_3": pa.array(["3", "6", "xxxx"]),
+        }
+    )
+    actual = dataset.to_table().sort_by("name_1")
+    assert actual == expected
+
+    scanner_table = dataset.scanner(limit=10).to_table().sort_by("name_1")
+    assert scanner_table == expected
+    assert scanner_table == actual
 
 
 def test_update_dataset_all_types(tmp_path: Path):
@@ -5252,6 +5406,7 @@ def test_branches(tmp_path: Path):
     ds_main = lance.write_dataset(main_table, base_dir)
 
     branch1 = ds_main.create_branch("branch1")
+    ds_main.branches.replace_metadata("branch1", {"description": "branch one"})
     assert branch1.version == 1
     branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
     branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
@@ -5270,10 +5425,13 @@ def test_branches(tmp_path: Path):
     branch1.tags.create("main_latest", (None, None))
     branch1.tags.create("main_latest2", ("main", None))
     branch1.create_branch("branch_from_main", ("main", None))
+    ordered_tags = dict(branch1.tags.list_ordered())
     branches_with_main = branch1.branches.list()
     assert branch1.tags.list()["branch1_latest"]["branch"] == "branch1"
     assert branch1.tags.list()["main_latest"]["branch"] is None
     assert branch1.tags.list()["main_latest2"]["branch"] is None
+    assert ordered_tags["branch1_latest"]["branch"] == "branch1"
+    assert ordered_tags["main_latest"]["branch"] is None
     assert branches_with_main["branch_from_main"]["parent_branch"] is None
     assert branches_with_main["branch_from_main"]["branch_identifier"][0][0] == 1
     assert isinstance(
@@ -5309,6 +5467,10 @@ def test_branches(tmp_path: Path):
     assert isinstance(b1_meta["branch_identifier"][0][1], str)
     assert len(b1_meta["branch_identifier"][0][1]) > 0
     assert "create_at" in b1_meta
+    assert b1_meta["metadata"] == {"description": "branch one"}
+    ordered_branches = dict(ds_main.branches.list_ordered())
+    assert ordered_branches["branch1"]["metadata"] == {"description": "branch one"}
+    assert "metadata" in ordered_branches["branch2"]
 
     try:
         ds_main.checkout_version("branch_not_exists")

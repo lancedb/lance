@@ -18,30 +18,32 @@ use crate::context::{DynamicContextProvider, OperationInfo};
 use lance_namespace::apis::urlencode;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
-    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
+    AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
+    AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
-    DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
     DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
     DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
-    ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
+    ErrorResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
-    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
+    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
+    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest, UpdateTableTagResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -534,93 +536,38 @@ impl RestNamespace {
         }
     }
 
+    /// Map a reqwest::Error to the appropriate NamespaceError variant.
+    ///
+    /// Timeout and connection errors are mapped to `ServiceUnavailable`,
+    /// while other errors are mapped to `Internal`.
+    fn request_error(e: reqwest::Error) -> lance_core::Error {
+        let message = format!("Failed to execute request: {:?}", e);
+        if e.is_timeout() || e.is_connect() {
+            NamespaceError::ServiceUnavailable { message }.into()
+        } else {
+            NamespaceError::Internal { message }.into()
+        }
+    }
+
     /// Parse an error response body and return the appropriate NamespaceError.
     ///
-    /// Attempts to parse a JSON body with `{"error": {"code": N, "message": "..."}}`.
-    /// Falls back to mapping the HTTP status code (using the operation to disambiguate)
-    /// if the JSON body doesn't contain an error code.
-    fn parse_error_response(
-        status: reqwest::StatusCode,
-        content: &str,
-        operation: &str,
-    ) -> lance_core::Error {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content)
-            && let Some(error_obj) = json.get("error")
-        {
-            let code = error_obj
-                .get("code")
-                .and_then(|c| c.as_u64())
-                .map(|c| c as u32);
-            let message = error_obj
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or(content);
-
-            if let Some(code) = code {
-                return NamespaceError::from_code(code, message).into();
+    /// Deserializes the response as an `ErrorResponse` model (the spec-defined
+    /// flat JSON format with a required numeric `code` field). The error code is
+    /// the sole source of truth for error classification. When deserialization
+    /// fails, returns Internal with the raw response as context.
+    fn parse_error_response(status: reqwest::StatusCode, content: &str) -> lance_core::Error {
+        match serde_json::from_str::<ErrorResponse>(content) {
+            Ok(err_resp) => {
+                let message = err_resp.error.as_deref().unwrap_or(content);
+                NamespaceError::from_code(err_resp.code as u32, message).into()
             }
-        }
-
-        let message = format!("Response error: status={}, content={}", status, content);
-        Self::error_from_status(status, operation, message).into()
-    }
-
-    /// Map an HTTP status code to a NamespaceError variant.
-    ///
-    /// For unambiguous status codes (401, 403, 429, 501, 503) the mapping is direct.
-    /// For 404 and 409 the `operation` string is used to select the appropriate
-    /// "not found" or "already exists" variant.
-    fn error_from_status(
-        status: reqwest::StatusCode,
-        operation: &str,
-        message: String,
-    ) -> NamespaceError {
-        match status.as_u16() {
-            400 => NamespaceError::InvalidInput { message },
-            401 => NamespaceError::Unauthenticated { message },
-            403 => NamespaceError::PermissionDenied { message },
-            404 => Self::not_found_for_operation(operation, message),
-            409 => Self::already_exists_for_operation(operation, message),
-            429 => NamespaceError::Throttled { message },
-            501 => NamespaceError::Unsupported { message },
-            503 => NamespaceError::ServiceUnavailable { message },
-            _ => NamespaceError::Internal { message },
-        }
-    }
-
-    /// Pick the appropriate "not found" variant based on the operation.
-    fn not_found_for_operation(operation: &str, message: String) -> NamespaceError {
-        if operation.contains("namespace") {
-            NamespaceError::NamespaceNotFound { message }
-        } else if operation.contains("index") {
-            NamespaceError::TableIndexNotFound { message }
-        } else if operation.contains("tag") {
-            NamespaceError::TableTagNotFound { message }
-        } else if operation.contains("transaction") {
-            NamespaceError::TransactionNotFound { message }
-        } else if operation.contains("version") {
-            NamespaceError::TableVersionNotFound { message }
-        } else if operation.contains("column") {
-            NamespaceError::TableColumnNotFound { message }
-        } else if operation.contains("table") {
-            NamespaceError::TableNotFound { message }
-        } else {
-            NamespaceError::Internal { message }
-        }
-    }
-
-    /// Pick the appropriate "already exists" variant based on the operation.
-    fn already_exists_for_operation(operation: &str, message: String) -> NamespaceError {
-        if operation.contains("namespace") {
-            NamespaceError::NamespaceAlreadyExists { message }
-        } else if operation.contains("index") {
-            NamespaceError::TableIndexAlreadyExists { message }
-        } else if operation.contains("tag") {
-            NamespaceError::TableTagAlreadyExists { message }
-        } else if operation.contains("table") {
-            NamespaceError::TableAlreadyExists { message }
-        } else {
-            NamespaceError::Internal { message }
+            Err(e) => NamespaceError::Internal {
+                message: format!(
+                    "Failed to parse error response: status={}, body={}, error={:?}",
+                    status, content, e
+                ),
+            }
+            .into(),
         }
     }
 
@@ -639,28 +586,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -680,28 +623,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -721,11 +660,7 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
@@ -733,10 +668,10 @@ impl RestNamespace {
         } else {
             let content = resp.text().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {}", e),
+                    message: format!("Failed to read response body: {:?}", e),
                 })
             })?;
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -756,28 +691,24 @@ impl RestNamespace {
             .rest_client
             .execute(req_builder, operation, object_id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to read response body: {}", e),
+                message: format!("Failed to read response body: {:?}", e),
             })
         })?;
 
         if status.is_success() {
             serde_json::from_str(&content).map_err(|e| {
                 NamespaceError::Internal {
-                    message: format!("Failed to parse response: {}", e),
+                    message: format!("Failed to parse response: {:?}", e),
                 }
                 .into()
             })
         } else {
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -902,6 +833,11 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
+        let include_declared_str;
+        if let Some(include_declared) = request.include_declared {
+            include_declared_str = include_declared.to_string();
+            query.push(("include_declared", include_declared_str.as_str()));
+        }
         self.get_json(&path, &query, "list_tables", &id).await
     }
 
@@ -920,6 +856,11 @@ impl LanceNamespace for RestNamespace {
         if let Some(detailed) = request.load_detailed_metadata {
             detailed_str = detailed.to_string();
             query.push(("load_detailed_metadata", detailed_str.as_str()));
+        }
+        let check_declared_str;
+        if let Some(check_declared) = request.check_declared {
+            check_declared_str = check_declared.to_string();
+            query.push(("check_declared", check_declared_str.as_str()));
         }
         self.post_json(&path, &query, &request, "describe_table", &id)
             .await
@@ -991,6 +932,32 @@ impl LanceNamespace for RestNamespace {
         if let Some(ref mode) = request.mode {
             mode_str = mode.clone();
             query.push(("mode", mode_str.as_str()));
+        }
+        // The REST spec maps create_table metadata onto query parameters because the request body
+        // is already reserved for the Arrow IPC stream.
+        let properties_str;
+        if let Some(ref properties) = request.properties {
+            properties_str = serde_json::to_string(properties).map_err(|e| {
+                Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Failed to serialize create_table properties as JSON query parameter: {}",
+                        e
+                    ),
+                })
+            })?;
+            query.push(("properties", properties_str.as_str()));
+        }
+        let storage_options_str;
+        if let Some(ref storage_options) = request.storage_options {
+            storage_options_str = serde_json::to_string(storage_options).map_err(|e| {
+                Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Failed to serialize create_table storage_options as JSON query parameter: {}",
+                        e
+                    ),
+                })
+            })?;
+            query.push(("storage_options", storage_options_str.as_str()));
         }
         self.post_binary_json(&path, &query, request_data.to_vec(), "create_table", &id)
             .await
@@ -1141,26 +1108,22 @@ impl LanceNamespace for RestNamespace {
             .rest_client
             .execute(req_builder, operation, &id)
             .await
-            .map_err(|e| {
-                Error::from(NamespaceError::Internal {
-                    message: format!("Failed to execute request: {}", e),
-                })
-            })?;
+            .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
             resp.bytes().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response bytes: {}", e),
+                    message: format!("Failed to read response bytes: {:?}", e),
                 })
             })
         } else {
             let content = resp.text().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
-                    message: format!("Failed to read response body: {}", e),
+                    message: format!("Failed to read response body: {:?}", e),
                 })
             })?;
-            Err(Self::parse_error_response(status, &content, operation))
+            Err(Self::parse_error_response(status, &content))
         }
     }
 
@@ -1278,6 +1241,11 @@ impl LanceNamespace for RestNamespace {
         if let Some(limit) = request.limit {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
+        }
+        let include_declared_str;
+        if let Some(include_declared) = request.include_declared {
+            include_declared_str = include_declared.to_string();
+            query.push(("include_declared", include_declared_str.as_str()));
         }
         self.get_json(path, &query, "list_all_tables", "").await
     }
@@ -1469,6 +1437,45 @@ impl LanceNamespace for RestNamespace {
         let path = format!("/v1/table/{}/drop_columns", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "alter_table_drop_columns", &id)
+            .await
+    }
+
+    async fn alter_table_backfill_columns(
+        &self,
+        request: AlterTableBackfillColumnsRequest,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        self.record_op("alter_table_backfill_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/backfill_column", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+            .await
+    }
+
+    async fn refresh_materialized_view(
+        &self,
+        request: RefreshMaterializedViewRequest,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        self.record_op("refresh_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "refresh_materialized_view", &id)
+            .await
+    }
+
+    async fn create_materialized_view(
+        &self,
+        request: CreateMaterializedViewRequest,
+    ) -> Result<CreateMaterializedViewResponse> {
+        self.record_op("create_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_materialized_view", &id)
             .await
     }
 
@@ -1869,6 +1876,75 @@ mod tests {
 
         // Should succeed with mock server
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_create_table_sends_properties_and_storage_options_query_params() {
+        use std::collections::HashMap;
+
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/table/test$namespace$table/create".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "location": "/path/to/table",
+                "version": 1,
+                "properties": {
+                    "owner": "alice",
+                    "team": "eng"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = CreateTableRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            mode: Some("Create".to_string()),
+            properties: Some(HashMap::from([
+                ("owner".to_string(), "alice".to_string()),
+                ("team".to_string(), "eng".to_string()),
+            ])),
+            storage_options: Some(HashMap::from([
+                ("aws_region".to_string(), "us-east-1".to_string()),
+                ("timeout".to_string(), "30s".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let result = namespace
+            .create_table(request, Bytes::from("arrow data here"))
+            .await;
+
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+
+        let query_params: HashMap<String, String> =
+            request.url.query_pairs().into_owned().collect();
+        assert_eq!(query_params.get("mode"), Some(&"Create".to_string()));
+
+        let properties: serde_json::Value =
+            serde_json::from_str(query_params.get("properties").unwrap()).unwrap();
+        assert_eq!(
+            properties,
+            serde_json::json!({"owner": "alice", "team": "eng"})
+        );
+
+        let storage_options: serde_json::Value =
+            serde_json::from_str(query_params.get("storage_options").unwrap()).unwrap();
+        assert_eq!(
+            storage_options,
+            serde_json::json!({"aws_region": "us-east-1", "timeout": "30s"})
+        );
     }
 
     #[tokio::test]

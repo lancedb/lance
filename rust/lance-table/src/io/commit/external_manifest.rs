@@ -15,12 +15,13 @@ use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use log::warn;
 use object_store::ObjectMeta;
+use object_store::ObjectStoreExt;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, path::Path};
 use tracing::info;
 
 use super::{
     MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
-    default_resolve_version, make_staging_manifest_path,
+    default_resolve_version, make_staging_manifest_path, write_version_hint,
 };
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use crate::io::commit::{CommitError, CommitHandler};
@@ -48,7 +49,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
         version: u64,
     ) -> Result<ManifestLocation> {
         let path = self.get(base_uri, version).await?;
-        let path = Path::from(path);
+        let path = Path::parse(&path).map_err(|e| Error::invalid_input(e.to_string()))?;
         let naming_scheme = detect_naming_scheme_from_path(&path)?;
         Ok(ManifestLocation {
             version,
@@ -75,7 +76,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     ) -> Result<Option<ManifestLocation>> {
         self.get_latest_version(base_uri).await.and_then(|res| {
             res.map(|(version, uri)| {
-                let path = Path::from(uri);
+                let path = Path::parse(&uri).map_err(|e| Error::invalid_input(e.to_string()))?;
                 let naming_scheme = detect_naming_scheme_from_path(&path)?;
                 Ok(ManifestLocation {
                     version,
@@ -489,7 +490,10 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .await;
 
         match result {
-            Ok(location) => Ok(location),
+            Ok(location) => {
+                write_version_hint(object_store, base_path, manifest.version).await;
+                Ok(location)
+            }
             Err(_) => {
                 // delete the staging manifest
                 match object_store.inner.delete(&staging_path).await {

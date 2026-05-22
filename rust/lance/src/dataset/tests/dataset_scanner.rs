@@ -35,9 +35,9 @@ use crate::Dataset;
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
 use lance_index::scalar::inverted::query::FtsQuery;
-use lance_index::vector::Query;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -58,6 +58,7 @@ async fn test_vector_filter_fts_search() {
         refine_factor: None,
         metric_type: Some(MetricType::L2),
         use_index: true,
+        query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
     };
 
@@ -406,7 +407,7 @@ async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() 
         .unwrap();
     let column_idx = data_file.column_indices[field_pos] as usize;
 
-    let file_path = dataset.data_dir().child(data_file.path.as_str());
+    let file_path = dataset.data_dir().join(data_file.path.as_str());
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),

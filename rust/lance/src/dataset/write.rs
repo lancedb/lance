@@ -54,7 +54,7 @@ pub mod update;
 
 pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::CommitBuilder;
-pub use delete::{DeleteBuilder, DeleteResult};
+pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
 
 /// The destination to write data to.
@@ -257,11 +257,19 @@ pub struct WriteParams {
     pub session: Option<Arc<Session>>,
 
     /// If Some and this is a new dataset, old dataset versions will be
-    /// automatically cleaned up according to the parameters set out in
-    /// [`AutoCleanupParams`]. This parameter has no effect on existing datasets.
-    /// To add auto-cleanup to an existing dataset, use [`Dataset::update_config`]
-    /// to set `lance.auto_cleanup.interval` and `lance.auto_cleanup.older_than`.
-    /// Both parameters must be set to invoke auto-cleanup.
+    /// automatically cleaned up after commits according to the parameters set
+    /// out in [`AutoCleanupParams`]. This parameter has no effect on existing
+    /// datasets. To add auto-cleanup to an existing dataset, use
+    /// [`Dataset::update_config`] to set `lance.auto_cleanup.interval` and
+    /// `lance.auto_cleanup.older_than`. Both parameters must be set to invoke
+    /// auto-cleanup.
+    ///
+    /// Defaults to `None` (auto-cleanup disabled). Enabling it makes every
+    /// `interval`-th commit run a full cleanup pass, which lists and reads every
+    /// manifest in the dataset even when nothing is old enough to delete; on
+    /// object stores this adds noticeable per-commit latency that grows with the
+    /// version count. Prefer calling [`Dataset::cleanup_old_versions`] explicitly
+    /// when you actually need to reclaim space.
     pub auto_cleanup: Option<AutoCleanupParams>,
 
     /// If true, skip auto cleanup during commits. This should be set to true
@@ -325,7 +333,7 @@ impl Default for WriteParams {
             enable_stable_row_ids: false,
             enable_v2_manifest_paths: true,
             session: None,
-            auto_cleanup: Some(AutoCleanupParams::default()),
+            auto_cleanup: None,
             skip_auto_cleanup: false,
             transaction_properties: None,
             initial_bases: None,
@@ -1076,12 +1084,12 @@ async fn open_writer_with_options(
     let filename = format!("{}.lance", data_file_key);
 
     let data_dir = if add_data_dir {
-        base_dir.child(DATA_DIR)
+        base_dir.clone().join(DATA_DIR)
     } else {
         base_dir.clone()
     };
 
-    let full_path = data_dir.child(filename.as_str());
+    let full_path = data_dir.clone().join(filename.as_str());
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
@@ -1402,6 +1410,16 @@ mod tests {
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
+
+    #[test]
+    fn test_auto_cleanup_disabled_by_default() {
+        // Auto-cleanup must be off by default: the cleanup hook is expensive on
+        // object stores and the 14-day default rarely deletes anything anyway.
+        // See https://github.com/lance-format/lance/issues/6728
+        let params = WriteParams::default();
+        assert!(params.auto_cleanup.is_none());
+        assert!(!params.skip_auto_cleanup);
+    }
 
     #[tokio::test]
     async fn test_chunking_large_batches() {
@@ -1827,8 +1845,9 @@ mod tests {
         assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1, 3]);
 
         let path = base_path
-            .child(DATA_DIR)
-            .child(fragment.files[0].path.as_str());
+            .clone()
+            .join(DATA_DIR)
+            .join(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
         let reader = PreviousFileReader::try_new_from_reader(
             &path,
@@ -2903,9 +2922,10 @@ mod tests {
         use std::sync::Arc;
 
         use async_trait::async_trait;
+        use futures::stream::BoxStream;
         use object_store::{
-            GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
-            PutOptions, PutPayload, PutResult,
+            CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+            PutMultipartOptions, PutOptions, PutPayload, PutResult,
         };
 
         // Create a custom ObjectStore that simulates disk full error
@@ -2920,20 +2940,6 @@ mod tests {
 
         #[async_trait]
         impl object_store::ObjectStore for DiskFullObjectStore {
-            async fn put(
-                &self,
-                _location: &object_store::path::Path,
-                _bytes: PutPayload,
-            ) -> object_store::Result<PutResult> {
-                Err(object_store::Error::Generic {
-                    store: "DiskFullStore",
-                    source: Box::new(io::Error::new(
-                        ErrorKind::StorageFull,
-                        "No space left on device",
-                    )),
-                })
-            }
-
             async fn put_opts(
                 &self,
                 _location: &object_store::path::Path,
@@ -2949,15 +2955,6 @@ mod tests {
                 })
             }
 
-            async fn put_multipart(
-                &self,
-                _location: &object_store::path::Path,
-            ) -> object_store::Result<Box<dyn MultipartUpload>> {
-                Err(object_store::Error::NotSupported {
-                    source: "Multipart upload not supported".into(),
-                })
-            }
-
             async fn put_multipart_opts(
                 &self,
                 _location: &object_store::path::Path,
@@ -2965,16 +2962,6 @@ mod tests {
             ) -> object_store::Result<Box<dyn MultipartUpload>> {
                 Err(object_store::Error::NotSupported {
                     source: "Multipart upload not supported".into(),
-                })
-            }
-
-            async fn get(
-                &self,
-                _location: &object_store::path::Path,
-            ) -> object_store::Result<GetResult> {
-                Err(object_store::Error::NotFound {
-                    path: "".into(),
-                    source: "".into(),
                 })
             }
 
@@ -2989,11 +2976,11 @@ mod tests {
                 })
             }
 
-            async fn delete(
+            fn delete_stream(
                 &self,
-                _location: &object_store::path::Path,
-            ) -> object_store::Result<()> {
-                Ok(())
+                locations: BoxStream<'static, object_store::Result<object_store::path::Path>>,
+            ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+                locations
             }
 
             fn list(
@@ -3013,18 +3000,11 @@ mod tests {
                 })
             }
 
-            async fn copy(
+            async fn copy_opts(
                 &self,
                 _from: &object_store::path::Path,
                 _to: &object_store::path::Path,
-            ) -> object_store::Result<()> {
-                Ok(())
-            }
-
-            async fn copy_if_not_exists(
-                &self,
-                _from: &object_store::path::Path,
-                _to: &object_store::path::Path,
+                _options: CopyOptions,
             ) -> object_store::Result<()> {
                 Ok(())
             }

@@ -34,12 +34,12 @@ use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_io::object_store::ObjectStore;
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use sort::hilbert_sort::HilbertSorter;
@@ -986,7 +986,10 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(GeoQueryParser::new(index_name)))
+        Some(Box::new(GeoQueryParser::new(
+            index_name,
+            self.name().to_string(),
+        )))
     }
 
     async fn load_index(

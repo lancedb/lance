@@ -71,6 +71,17 @@ class PqVectorIndex(UpgradeDowngradeTest):
         )
         assert result.num_rows == 4
 
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        elif self.compat_version >= "0.39.0":
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0]["name"]
+            stats = ds.stats.index_stats(name)
+            assert stats["num_indexed_rows"] > 0
+
     def check_write(self):
         """Verify can insert vectors and rebuild index."""
         ds = lance.dataset(self.path)
@@ -139,6 +150,18 @@ class HnswPqVectorIndex(UpgradeDowngradeTest):
             }
         )
         assert result.num_rows == 4
+
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        else:
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0]["name"]
+
+        stats = ds.stats.index_stats(name)
+        assert stats["num_indexed_rows"] > 0
 
     def check_write(self):
         """Verify can insert vectors and rebuild index."""
@@ -209,6 +232,18 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         )
         assert result.num_rows == 4
 
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        else:
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0]["name"]
+
+        stats = ds.stats.index_stats(name)
+        assert stats["num_indexed_rows"] > 0
+
     def check_write(self):
         """Verify can insert vectors and rebuild index."""
         ds = lance.dataset(self.path)
@@ -226,9 +261,9 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(min_version="0.39.0")
+@compat_test(min_version="4.0.0-beta.8")
 class IvfRqVectorIndex(UpgradeDowngradeTest):
-    """Test IVF_RQ vector index compatibility."""
+    """Test IVF_RQ vector index compatibility. V2 was introduced in v4.0.0-beta.8"""
 
     def __init__(self, path: Path):
         self.path = path
@@ -272,6 +307,18 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
             }
         )
         assert result.num_rows == 4
+
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        else:
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+
+        stats = ds.stats.index_stats(name)
+        assert stats["num_indexed_rows"] > 0
 
     def check_write(self):
         """Verify can insert vectors and run optimize workflows."""

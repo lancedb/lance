@@ -768,7 +768,7 @@ async fn test_fts_fuzzy_query() {
             "food".to_owned(), // 1 insertion       # spellchecker:disable-line
         ]
         .into_iter()
-        .collect()
+        .collect::<HashSet<_>>()
     );
 }
 
@@ -1954,6 +1954,542 @@ async fn test_prewarm_index_with_position_validation() {
     );
 }
 
+/// Cache backend that exercises the serialization codec on every insert and
+/// returns deserialized entries on every get. Items without a codec fall
+/// through to an in-memory passthrough so that non-FTS cache traffic still
+/// works during the test.
+///
+/// Mirrors the helper in `rust/lance/src/index/vector/ivf/v2.rs` tests; if a
+/// third user appears, lift this into a shared test utility.
+mod fts_serializing_backend {
+    use std::collections::HashMap;
+    use std::pin::Pin;
+
+    use futures::Future;
+    use lance_core::Result;
+    use lance_core::cache::{
+        CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend,
+    };
+
+    type SerializedEntry = (bytes::Bytes, CacheCodec, usize);
+
+    #[derive(Debug)]
+    pub struct SerializingBackend {
+        serialized: tokio::sync::Mutex<HashMap<InternalCacheKey, SerializedEntry>>,
+        passthrough: MokaCacheBackend,
+    }
+
+    impl SerializingBackend {
+        pub fn new() -> Self {
+            Self {
+                serialized: tokio::sync::Mutex::new(HashMap::new()),
+                passthrough: MokaCacheBackend::with_capacity(256 * 1024 * 1024),
+            }
+        }
+
+        pub async fn serialized_entry_count(&self) -> usize {
+            self.serialized.lock().await.len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CacheBackend for SerializingBackend {
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            let guard = self.serialized.lock().await;
+            if let Some((bytes, stored_codec, _)) = guard.get(key) {
+                return Some(
+                    stored_codec
+                        .deserialize(&bytes.clone())
+                        .expect("deserialization should succeed"),
+                );
+            }
+            drop(guard);
+            self.passthrough.get(key, codec).await
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            size_bytes: usize,
+            codec: Option<CacheCodec>,
+        ) {
+            if let Some(codec) = codec {
+                let mut bytes = Vec::new();
+                codec
+                    .serialize(&entry, &mut bytes)
+                    .expect("serialization should succeed");
+                self.serialized
+                    .lock()
+                    .await
+                    .insert(key.clone(), (bytes::Bytes::from(bytes), codec, size_bytes));
+            } else {
+                self.passthrough.insert(key, entry, size_bytes, None).await;
+            }
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            if let Some(entry) = self.get(key, codec).await {
+                return Ok((entry, true));
+            }
+            let (entry, size) = loader.await?;
+            self.insert(key, entry.clone(), size, codec).await;
+            Ok((entry, false))
+        }
+
+        async fn invalidate_prefix(&self, prefix: &str) {
+            self.serialized
+                .lock()
+                .await
+                .retain(|k, _| !k.starts_with(prefix));
+            self.passthrough.invalidate_prefix(prefix).await;
+        }
+
+        async fn clear(&self) {
+            self.serialized.lock().await.clear();
+            self.passthrough.clear().await;
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.serialized.lock().await.len() + self.passthrough.num_entries().await
+        }
+
+        async fn size_bytes(&self) -> usize {
+            let serialized: usize = self
+                .serialized
+                .lock()
+                .await
+                .values()
+                .map(|(_, _, s)| *s)
+                .sum();
+            serialized + self.passthrough.size_bytes().await
+        }
+    }
+}
+
+/// Validates the OSS-741 contract: after FTS prewarm through a serializing
+/// cache backend, FTS queries serve results without any further IO. The
+/// serializing backend forces every cache hit through the new
+/// `CacheCodec` impls, so this also smoke-tests the round-trip path under
+/// realistic data shapes (compressed posting blocks + shared position
+/// stream when positions are enabled).
+#[tokio::test]
+async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let doc_col: Arc<dyn Array> = Arc::new(GenericStringArray::<i32>::from(vec![
+        "lance search engine",
+        "lance search with tail",
+        "phrase query example",
+        "search query terms",
+    ]));
+    let ids = UInt64Array::from_iter_values(0..doc_col.len() as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("doc", doc_col.data_type().to_owned(), true),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(doc_col) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Re-open the dataset on a session whose cache backend serializes every
+    // entry through its codec. Set a generous capacity so nothing is evicted
+    // before we query.
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // Reset IO counters to isolate prewarm + query traffic from open/load.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap();
+
+    // The FTS codec must have been exercised. Posting lists and positions
+    // enter the serialized store; non-FTS entries (e.g. the unsized
+    // `ScalarIndexCacheKey` for the index itself) legitimately fall through
+    // to the in-memory passthrough — those cannot have a codec by design.
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed FTS entries (PostingList / Positions) through CacheCodec, \
+         but the serializing store was empty"
+    );
+
+    // After prewarm, a phrase query (which exercises both posting lists and
+    // positions, deserializing them from bytes via the codec) must not hit
+    // disk.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    // Project `_rowid` so the scan does not need to read a data column from
+    // the dataset's parquet/lance files; the index path alone determines
+    // whether the FTS cache is doing its job.
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(
+            PhraseQuery::new("lance search".to_owned()).into(),
+        ))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        2,
+        "phrase query should still return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "FTS query should not perform IO after prewarm; the serializing cache \
+         backend must serve every posting list and positions entry from memory"
+    );
+}
+
+/// BTree analogue of `test_fts_prewarm_with_serializing_backend_serves_query_with_no_io`:
+/// after prewarming a BTree scalar index through a serializing cache backend,
+/// an indexed-filter query serves results without any further IO. The
+/// serializing backend forces every cache hit through the `BTreeIndexState`
+/// and `FlatIndex` `CacheCodec` impls, so this also smoke-tests those
+/// round-trip paths on a multi-page index.
+#[tokio::test]
+async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    // Enough rows to span several BTree pages (default page size is 4096) so
+    // the query has to consult more than one cached `FlatIndex`.
+    let num_rows = 16_384;
+    let values = Int32Array::from_iter_values(0..num_rows);
+    let ids = UInt64Array::from_iter_values(0..num_rows as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", DataType::Int32, false),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(values) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Re-open on a session whose cache backend serializes every entry through
+    // its codec, with a generous capacity so nothing is evicted before we query.
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // Reset IO counters to isolate prewarm + query traffic from open/load.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    dataset.prewarm_index("value_idx").await.unwrap();
+
+    // Prewarm opens the index (serializing `BTreeIndexState`) and loads every
+    // page (serializing each `FlatIndex`), so the serialized store must be
+    // non-empty. The unsized fallback keys cannot have a codec by design.
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the BTree state and pages through CacheCodec, \
+         but the serializing store was empty"
+    );
+
+    // After prewarm, an indexed-filter query must reconstruct the index and
+    // every page it touches from the cache, deserializing via the codec, with
+    // no disk IO. Project only `_rowid` so the scan does not read a data column.
+    dataset.object_store.as_ref().io_stats_incremental();
+
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("value >= 100 AND value < 200")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        100,
+        "indexed filter should still return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "BTree filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every page from memory"
+    );
+}
+
+/// Bitmap analogue of `test_btree_prewarm_with_serializing_backend_serves_query_with_no_io`:
+/// after prewarming a Bitmap scalar index through a serializing cache backend,
+/// an indexed-filter query serves results without any further IO. The
+/// serializing backend forces every cache hit through the `BitmapIndexState`
+/// (top-level state) and `RowAddrTreeMap` (per-value bitmap) `CacheCodec`
+/// impls, so this exercises both round-trip paths.
+#[tokio::test]
+async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    // Low-cardinality column so the index has several per-value bitmaps to
+    // round-trip through the per-key codec.
+    let num_rows: i32 = 8_000;
+    let values = Int32Array::from_iter_values((0..num_rows).map(|i| i % 16));
+    let ids = UInt64Array::from_iter_values(0..num_rows as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", DataType::Int32, false),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(values) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Bitmap,
+            Some("value_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.prewarm_index("value_idx").await.unwrap();
+
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the bitmap state and per-value bitmaps through \
+         CacheCodec, but the serializing store was empty"
+    );
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("value = 7")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected = (num_rows as usize) / 16;
+    assert_eq!(
+        result.num_rows(),
+        expected,
+        "indexed bitmap filter should return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "Bitmap filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every per-value bitmap from memory"
+    );
+}
+
+/// LabelList analogue: after prewarming, an `array_has_any` query against a
+/// `LabelList` index serves results without any further IO. Exercises the
+/// `LabelListIndexState` codec (which embeds the inner bitmap state and the
+/// list-nulls bitmap) plus the same per-value bitmap codec.
+#[tokio::test]
+async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_io() {
+    use lance_io::assert_io_eq;
+
+    use fts_serializing_backend::SerializingBackend;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    let mut dataset = gen_batch()
+        .col(
+            "labels",
+            lance_datagen::array::rand_list_any(
+                lance_datagen::array::cycle::<arrow::datatypes::Int64Type>(vec![1, 2, 3, 4, 5]),
+                false,
+            ),
+        )
+        .into_dataset(&uri, FragmentCount::from(2), FragmentRowCount::from(2000))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let expected = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("array_has_any(labels, [3])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()
+        .num_rows();
+    assert!(
+        expected > 0,
+        "test dataset must contain at least one row whose labels include 3"
+    );
+
+    let backend = Arc::new(SerializingBackend::new());
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.prewarm_index("labels_idx").await.unwrap();
+
+    let serialized_after_prewarm = backend.serialized_entry_count().await;
+    assert!(
+        serialized_after_prewarm > 0,
+        "prewarm should have routed the label-list state and per-value bitmaps through \
+         CacheCodec, but the serializing store was empty"
+    );
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("array_has_any(labels, [3])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        expected,
+        "indexed label-list filter should return correct results after deserialization"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "LabelList filter query should not perform IO after prewarm; the serializing \
+         cache backend must serve the index state and every per-value bitmap from memory"
+    );
+}
+
 #[tokio::test]
 async fn test_fts_phrase_query_with_removed_stop_words() {
     let tmpdir = TempStrDir::default();
@@ -2859,10 +3395,10 @@ async fn test_index_inherits_dataset_file_version() {
         .unwrap();
 
     // Get the index directory
-    let index_dir = dataset.indices_dir().child(index_meta.uuid.to_string());
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
 
     // Open the index file and check its version
-    let index_path = index_dir.child("index.idx");
+    let index_path = index_dir.clone().join("index.idx");
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),
@@ -2891,7 +3427,7 @@ async fn test_index_inherits_dataset_file_version() {
     );
 
     // Also check the auxiliary file if it exists
-    let aux_path = index_dir.child("auxiliary.idx");
+    let aux_path = index_dir.clone().join("auxiliary.idx");
     if dataset
         .object_store
         .exists(&aux_path)
@@ -2967,10 +3503,10 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
         .unwrap();
 
     // Get the index directory
-    let index_dir = dataset.indices_dir().child(index_meta.uuid.to_string());
+    let index_dir = dataset.indices_dir().join(index_meta.uuid.to_string());
 
     // Open the index file and check its version
-    let index_path = index_dir.child("index.idx");
+    let index_path = index_dir.clone().join("index.idx");
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
         SchedulerConfig::max_bandwidth(&dataset.object_store),

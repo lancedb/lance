@@ -16,6 +16,17 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from packaging.version import Version
+
+NAMESPACE_0_6_DEPENDENCY = "lance-namespace<0.7"
+NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
+
+
+def _lance_namespace_dependency(pylance_version: str) -> str:
+    if Version(pylance_version) >= Version("6.0.0b0"):
+        return NAMESPACE_0_7_DEPENDENCY
+    return NAMESPACE_0_6_DEPENDENCY
+
 
 class VenvExecutor:
     """Manages a virtual environment with a specific Lance version."""
@@ -106,6 +117,11 @@ class VenvExecutor:
                 "--extra-index-url",
                 "https://pypi.fury.io/lancedb/",
                 f"pylance=={self.version}",
+                # Older Lance wheels (e.g. 2.0.1, 4.0.0b1) import
+                # CreateEmptyTableRequest from lance_namespace, which was
+                # removed in lance-namespace 0.7.0. Pin to <0.7 so old wheels
+                # resolve a compatible transitive dep.
+                _lance_namespace_dependency(self.version),
                 "pytest",
             ],
             check=True,

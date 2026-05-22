@@ -10,7 +10,6 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
-    common::Statistics,
     execution::context::TaskContext,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -23,17 +22,17 @@ use futures::StreamExt;
 #[derive(Debug)]
 pub struct TestingExec {
     pub(crate) batches: Vec<RecordBatch>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl TestingExec {
     pub(crate) fn new(batches: Vec<RecordBatch>) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(batches[0].schema()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             batches,
             properties,
@@ -81,11 +80,7 @@ impl ExecutionPlan for TestingExec {
         Ok(Box::pin(stream))
     }
 
-    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics::new_unknown(self.schema().as_ref()))
-    }
-
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 }

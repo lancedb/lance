@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 // SPDX-License-Identifier: MIT
-// Adapted from lindera-tantivy v0.44.1.
+// Adapted from lindera-tantivy v2.0.0.
 // Copyright (c) lindera-tantivy contributors.
 
 use std::path::Path;
@@ -63,7 +63,7 @@ impl<'a> TokenStream for LinderaTokenStream<'a> {
             return false;
         }
         let token = self.tokens.remove(0);
-        self.token.text = token.text.to_string();
+        self.token.text = token.surface.to_string();
         self.token.offset_from = token.byte_start;
         self.token.offset_to = token.byte_end;
         self.token.position = token.position;

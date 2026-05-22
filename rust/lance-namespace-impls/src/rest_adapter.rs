@@ -119,6 +119,19 @@ impl RestAdapter {
             )
             .route("/v1/table/:id/drop_columns", post(alter_table_drop_columns))
             .route(
+                "/v1/table/:id/backfill_column",
+                post(alter_table_backfill_columns),
+            )
+            .route("/v1/table/:id/refresh", post(refresh_materialized_view))
+            .route(
+                "/v1/materialized_view/:id/refresh",
+                post(refresh_materialized_view),
+            )
+            .route(
+                "/v1/materialized_view/:id/create",
+                post(create_materialized_view),
+            )
+            .route(
                 "/v1/table/:id/schema_metadata/update",
                 post(update_table_schema_metadata),
             )
@@ -155,7 +168,7 @@ impl RestAdapter {
         let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
             log::error!("RestAdapter::start() failed to bind to {}: {}", addr, e);
             Error::from(NamespaceError::Internal {
-                message: format!("Failed to bind to {}: {}", addr, e),
+                message: format!("Failed to bind to {}: {:?}", addr, e),
             })
         })?;
 
@@ -287,7 +300,16 @@ struct PaginationQuery {
     delimiter: Option<String>,
     page_token: Option<String>,
     limit: Option<i32>,
+    include_declared: Option<bool>,
     descending: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeTableQuery {
+    delimiter: Option<String>,
+    with_table_uri: Option<bool>,
+    load_detailed_metadata: Option<bool>,
+    check_declared: Option<bool>,
 }
 
 // ============================================================================
@@ -309,73 +331,46 @@ fn error_code_to_status(code: u32) -> StatusCode {
         | Some(lance_namespace::error::ErrorCode::TableIndexAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::TableTagAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::ConcurrentModification) => StatusCode::CONFLICT,
+        Some(lance_namespace::error::ErrorCode::NamespaceNotEmpty)
+        | Some(lance_namespace::error::ErrorCode::InvalidTableState) => StatusCode::CONFLICT,
         Some(lance_namespace::error::ErrorCode::InvalidInput)
-        | Some(lance_namespace::error::ErrorCode::InvalidTableState)
-        | Some(lance_namespace::error::ErrorCode::TableSchemaValidationError)
-        | Some(lance_namespace::error::ErrorCode::NamespaceNotEmpty) => StatusCode::BAD_REQUEST,
-        Some(lance_namespace::error::ErrorCode::Unsupported) => StatusCode::NOT_IMPLEMENTED,
+        | Some(lance_namespace::error::ErrorCode::TableSchemaValidationError) => {
+            StatusCode::BAD_REQUEST
+        }
+        Some(lance_namespace::error::ErrorCode::Unsupported) => StatusCode::NOT_ACCEPTABLE,
         Some(lance_namespace::error::ErrorCode::PermissionDenied) => StatusCode::FORBIDDEN,
         Some(lance_namespace::error::ErrorCode::Unauthenticated) => StatusCode::UNAUTHORIZED,
         Some(lance_namespace::error::ErrorCode::ServiceUnavailable) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        Some(lance_namespace::error::ErrorCode::Throttled) => StatusCode::TOO_MANY_REQUESTS,
+        Some(lance_namespace::error::ErrorCode::Throttling) => StatusCode::TOO_MANY_REQUESTS,
         Some(lance_namespace::error::ErrorCode::Internal) | None => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
 
-/// Convert Lance errors to HTTP responses
+/// Convert Lance errors to HTTP responses using the spec's `ErrorResponse` model.
 fn error_to_response(err: Error) -> Response {
     match err {
         Error::Namespace { source, .. } => {
             if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
                 let code = ns_err.code().as_u32();
                 let status = error_code_to_status(code);
-                (
-                    status,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": ns_err.message(),
-                            "code": code
-                        }
-                    })),
-                )
-                    .into_response()
+                let mut resp = ErrorResponse::new(code as i32);
+                resp.error = Some(ns_err.message().to_string());
+                (status, Json(resp)).into_response()
             } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": source.to_string(),
-                            "code": 18
-                        }
-                    })),
-                )
-                    .into_response()
+                let mut resp = ErrorResponse::new(18);
+                resp.error = Some(source.to_string());
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response()
             }
         }
-        Error::IO { source, .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": {
-                    "message": source.to_string(),
-                    "type": "InternalServerError"
-                }
-            })),
-        )
-            .into_response(),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": {
-                    "message": err.to_string(),
-                    "type": "InternalServerError"
-                }
-            })),
-        )
-            .into_response(),
+        _ => {
+            let mut resp = ErrorResponse::new(18);
+            resp.error = Some(err.to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(resp)).into_response()
+        }
     }
 }
 
@@ -481,6 +476,7 @@ async fn list_tables(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -511,11 +507,20 @@ async fn describe_table(
     State(backend): State<Arc<dyn LanceNamespace>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<DelimiterQuery>,
+    Query(params): Query<DescribeTableQuery>,
     Json(mut request): Json<DescribeTableRequest>,
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    if params.with_table_uri.is_some() {
+        request.with_table_uri = params.with_table_uri;
+    }
+    if params.load_detailed_metadata.is_some() {
+        request.load_detailed_metadata = params.load_detailed_metadata;
+    }
+    if params.check_declared.is_some() {
+        request.check_declared = params.check_declared;
+    }
 
     match backend.describe_table(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
@@ -581,6 +586,33 @@ async fn deregister_table(
 struct CreateTableQuery {
     delimiter: Option<String>,
     mode: Option<String>,
+    properties: Option<String>,
+    storage_options: Option<String>,
+}
+
+fn parse_json_query_param<T: serde::de::DeserializeOwned>(
+    raw: Option<&str>,
+    operation: &str,
+    param_name: &str,
+) -> std::result::Result<Option<T>, Box<Response>> {
+    match raw {
+        Some(raw) => serde_json::from_str(raw).map(Some).map_err(|e| {
+            let response = (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "Failed to parse {} {} query parameter as JSON: {}",
+                            operation, param_name, e
+                        )
+                    }
+                })),
+            )
+                .into_response();
+            Box::new(response)
+        }),
+        None => Ok(None),
+    }
 }
 
 async fn create_table(
@@ -590,9 +622,24 @@ async fn create_table(
     Query(params): Query<CreateTableQuery>,
     body: Bytes,
 ) -> Response {
+    let properties =
+        match parse_json_query_param(params.properties.as_deref(), "create_table", "properties") {
+            Ok(properties) => properties,
+            Err(response) => return *response,
+        };
+    let storage_options = match parse_json_query_param(
+        params.storage_options.as_deref(),
+        "create_table",
+        "storage_options",
+    ) {
+        Ok(storage_options) => storage_options,
+        Err(response) => return *response,
+    };
     let request = CreateTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         mode: params.mode.clone(),
+        properties,
+        storage_options,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -901,6 +948,7 @@ async fn list_all_tables(
         id: None,
         page_token: params.page_token,
         limit: params.limit,
+        include_declared: params.include_declared,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -1041,6 +1089,54 @@ async fn alter_table_alter_columns(
 
     match backend.alter_table_alter_columns(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn alter_table_backfill_columns(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<AlterTableBackfillColumnsRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.alter_table_backfill_columns(request).await {
+        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn refresh_materialized_view(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<RefreshMaterializedViewRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.refresh_materialized_view(request).await {
+        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn create_materialized_view(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateMaterializedViewRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.create_materialized_view(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
 }
@@ -1986,6 +2082,17 @@ mod tests {
                 location.contains("test_table"),
                 "Location should contain table name"
             );
+            assert_eq!(response.is_only_declared, None);
+
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec!["test_namespace".to_string(), "test_table".to_string()]);
+            describe_req.check_declared = Some(true);
+            let response = fixture
+                .namespace
+                .describe_table(describe_req)
+                .await
+                .expect("Should describe declared table with check_declared");
+            assert_eq!(response.is_only_declared, Some(true));
 
             // Declared tables don't have a version until data is written
             // (version is None for declared tables)
@@ -2990,6 +3097,7 @@ mod tests {
                 ]),
                 with_table_uri: None,
                 load_detailed_metadata: None,
+                check_declared: None,
                 vend_credentials: None,
                 version: None,
                 identity: None,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use bytes::Bytes;
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
@@ -74,6 +74,17 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
         self.submit_request(vec![range], priority)
             .map_ok(|mut v| v.pop().unwrap())
             .boxed()
+    }
+
+    /// Returns a version of this I/O service that bypasses backpressure for all requests.
+    ///
+    /// This is intended for indirect I/O (e.g. fetching items after decoding offsets) where
+    /// blocking on backpressure could cause deadlocks or excessive latency.
+    ///
+    /// Returns `None` if this implementation does not support bypass (e.g. in-memory or test
+    /// schedulers), in which case the caller should fall back to using self.
+    fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
+        None
     }
 }
 

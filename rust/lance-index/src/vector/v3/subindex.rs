@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
 use crate::metrics::MetricsCollector;
+use crate::vector::graph::OrderedNode;
 use crate::vector::storage::VectorStore;
 use crate::vector::{flat, hnsw};
 use crate::{prefilter::PreFilter, vector::Query};
@@ -45,6 +46,45 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
+
+    /// Return true if this sub-index can accumulate candidates into a caller-owned heap.
+    fn supports_global_topk_heap() -> bool {
+        false
+    }
+
+    /// Search this partition and accumulate candidates into a caller-owned top-k heap.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk(
+        &self,
+        _query: ArrayRef,
+        _k: usize,
+        _params: Self::QueryParams,
+        _storage: &impl VectorStore,
+        _prefilter: Arc<dyn PreFilter>,
+        _heap: &mut BinaryHeap<OrderedNode<u64>>,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        unimplemented!("global top-k heap search is not supported for this sub-index")
+    }
+
+    /// Search this partition and accumulate candidates into a caller-owned top-k heap,
+    /// reusing scratch buffers owned by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_scratch(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        _distance_scratch: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        self.accumulate_topk(query, k, params, storage, prefilter, heap, metrics)
+    }
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
     fn index_vectors(storage: &impl VectorStore, params: Self::BuildParams) -> Result<Self>

@@ -305,9 +305,12 @@ impl LanceStream {
                         )
                         .await?;
                         let batch_stream = if let Some(range) = file_fragment.range {
-                            reader.read_range(range, config.batch_size as u32)?.boxed()
+                            reader
+                                .read_range(range, config.batch_size as u32)
+                                .await?
+                                .boxed()
                         } else {
-                            reader.read_all(config.batch_size as u32)?.boxed()
+                            reader.read_all(config.batch_size as u32).await?.boxed()
                         };
                         let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
                             batch_stream
@@ -396,13 +399,12 @@ impl LanceStream {
                     ))
                 })
                 .try_buffered(fragment_readahead);
-            let tasks = readers.and_then(move |reader| {
-                std::future::ready(
-                    reader
-                        .read_all(config.batch_size as u32)
-                        .map(|task_stream| task_stream.map(Ok))
-                        .map_err(DataFusionError::from),
-                )
+            let tasks = readers.and_then(move |reader| async move {
+                reader
+                    .read_all(config.batch_size as u32)
+                    .await
+                    .map(|task_stream| task_stream.map(Ok))
+                    .map_err(DataFusionError::from)
             });
             tasks
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
@@ -429,13 +431,12 @@ impl LanceStream {
                     ))
                 })
                 .try_buffered(fragment_readahead);
-            let tasks = readers.and_then(move |reader| {
-                std::future::ready(
-                    reader
-                        .read_all(config.batch_size as u32)
-                        .map(|task_stream| task_stream.map(Ok))
-                        .map_err(DataFusionError::from),
-                )
+            let tasks = readers.and_then(move |reader| async move {
+                reader
+                    .read_all(config.batch_size as u32)
+                    .await
+                    .map(|task_stream| task_stream.map(Ok))
+                    .map_err(DataFusionError::from)
             });
             // When we flatten the streams (one stream per fragment), we allow
             // `fragment_readahead` stream to be read concurrently.
@@ -537,7 +538,7 @@ pub struct LanceScanExec {
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
     output_schema: Arc<ArrowSchema>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     config: LanceScanConfig,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -611,12 +612,12 @@ impl LanceScanExec {
         }
         let output_schema = Arc::new(output_schema);
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             dataset,
             fragments,
@@ -710,11 +711,7 @@ impl ExecutionPlan for LanceScanExec {
         )))
     }
 
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
@@ -733,11 +730,15 @@ impl ExecutionPlan for LanceScanExec {
 
         Ok(Statistics {
             num_rows,
-            ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
+            ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

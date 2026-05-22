@@ -29,6 +29,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -94,11 +95,14 @@ public class VectorIndexTest {
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_FLAT index should not present before commit");
 
+        List<Index> builtSegments =
+            dataset.buildIndexSegments(
+                List.of(firstSegment, secondSegment), IndexType.IVF_FLAT, Optional.empty());
+        assertEquals(2, builtSegments.size());
+
         List<Index> committed =
             dataset.commitExistingIndexSegments(
-                TestVectorDataset.indexName,
-                TestVectorDataset.vectorColumnName,
-                List.of(firstSegment, secondSegment));
+                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
         assertEquals(2, committed.size());
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
@@ -184,11 +188,14 @@ public class VectorIndexTest {
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_PQ index should not present before commit");
 
+        List<Index> builtSegments =
+            dataset.buildIndexSegments(
+                List.of(firstSegment, secondSegment), IndexType.IVF_PQ, Optional.empty());
+        assertEquals(2, builtSegments.size());
+
         List<Index> committed =
             dataset.commitExistingIndexSegments(
-                TestVectorDataset.indexName,
-                TestVectorDataset.vectorColumnName,
-                List.of(firstSegment, secondSegment));
+                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
         assertEquals(2, committed.size());
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
@@ -258,11 +265,14 @@ public class VectorIndexTest {
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_SQ index should not present before commit");
 
+        List<Index> builtSegments =
+            dataset.buildIndexSegments(
+                List.of(firstSegment, secondSegment), IndexType.IVF_SQ, Optional.empty());
+        assertEquals(2, builtSegments.size());
+
         List<Index> committed =
             dataset.commitExistingIndexSegments(
-                TestVectorDataset.indexName,
-                TestVectorDataset.vectorColumnName,
-                List.of(firstSegment, secondSegment));
+                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
         assertEquals(2, committed.size());
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
@@ -311,5 +321,88 @@ public class VectorIndexTest {
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
       }
     }
+  }
+
+  /**
+   * Regression test for the metric_type passthrough in the JNI VectorTrainer.
+   *
+   * <p>Before this fix, {@code trainIvfCentroids} hardcoded {@code MetricType::L2} on the Rust
+   * side, so users requesting a non-L2 metric got centroids clustered on L2 geometry while
+   * per-fragment encoders later quantized using the requested metric — silently degraded recall.
+   *
+   * <p>This test trains the same dataset twice with L2 and Cosine and asserts the centroid arrays
+   * differ. With the bug present, the two arrays were identical because both paths fell through to
+   * L2.
+   */
+  @Test
+  public void testTrainIvfCentroidsHonorsDistanceType(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("ivf_centroids_metric"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams params =
+            new IvfBuildParams.Builder().setNumPartitions(2).setMaxIters(10).build();
+
+        float[] l2Centroids =
+            VectorTrainer.trainIvfCentroids(
+                dataset, TestVectorDataset.vectorColumnName, params, DistanceType.L2);
+        float[] cosineCentroids =
+            VectorTrainer.trainIvfCentroids(
+                dataset, TestVectorDataset.vectorColumnName, params, DistanceType.Cosine);
+
+        assertEquals(l2Centroids.length, cosineCentroids.length);
+        assertFalse(
+            arraysApproximatelyEqual(l2Centroids, cosineCentroids),
+            "L2 and Cosine centroids should differ — Cosine normalizes input before clustering."
+                + " If they are equal, the metric is not being threaded into the trainer.");
+      }
+    }
+  }
+
+  /**
+   * Regression test for the metric_type passthrough in PQ codebook training.
+   *
+   * <p>Cosine training normalizes the input vectors before k-means; L2 does not. So the resulting
+   * codebooks must differ when the metric is honored.
+   */
+  @Test
+  public void testTrainPqCodebookHonorsDistanceType(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("pq_codebook_metric"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        PQBuildParams params =
+            new PQBuildParams.Builder()
+                .setNumSubVectors(2)
+                .setNumBits(4)
+                .setMaxIters(5)
+                .setSampleRate(64)
+                .build();
+
+        float[] l2Codebook =
+            VectorTrainer.trainPqCodebook(
+                dataset, TestVectorDataset.vectorColumnName, params, DistanceType.L2);
+        float[] cosineCodebook =
+            VectorTrainer.trainPqCodebook(
+                dataset, TestVectorDataset.vectorColumnName, params, DistanceType.Cosine);
+
+        assertEquals(l2Codebook.length, cosineCodebook.length);
+        assertFalse(
+            arraysApproximatelyEqual(l2Codebook, cosineCodebook),
+            "L2 and Cosine PQ codebooks should differ — Cosine normalizes the training data."
+                + " If they are equal, the metric is not being threaded into the trainer.");
+      }
+    }
+  }
+
+  private static boolean arraysApproximatelyEqual(float[] a, float[] b) {
+    if (a.length != b.length) {
+      return false;
+    }
+    final float epsilon = 1e-6f;
+    for (int i = 0; i < a.length; i++) {
+      if (Math.abs(a[i] - b[i]) > epsilon) {
+        return false;
+      }
+    }
+    return true;
   }
 }

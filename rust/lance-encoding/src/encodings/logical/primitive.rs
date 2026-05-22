@@ -777,6 +777,7 @@ pub struct ComplexAllNullScheduler {
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
+    max_rep: u16,
     max_visible_level: u16,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
@@ -793,6 +794,7 @@ impl ComplexAllNullScheduler {
         num_rep_values: u64,
         num_def_values: u64,
     ) -> Self {
+        let max_rep = def_meaning.iter().filter(|l| l.is_list()).count() as u16;
         let max_visible_level = def_meaning
             .iter()
             .take_while(|l| !l.is_list())
@@ -802,6 +804,7 @@ impl ComplexAllNullScheduler {
             buffer_offsets_and_sizes,
             def_meaning,
             repdef: None,
+            max_rep,
             max_visible_level,
             rep_decompressor,
             def_decompressor,
@@ -940,7 +943,10 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             def: self.repdef.as_ref().unwrap().def.clone(),
             num_rows,
             def_meaning: self.def_meaning.clone(),
+            max_rep: self.max_rep,
             max_visible_level: self.max_visible_level,
+            cursor_row: 0,
+            cursor_level: 0,
         }) as Box<dyn StructuralPageDecoder>;
         let page_load_task = PageLoadTask {
             decoder_fut: std::future::ready(Ok(decoder)).boxed(),
@@ -957,7 +963,10 @@ pub struct ComplexAllNullPageDecoder {
     def: Option<ScalarBuffer<u16>>,
     num_rows: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    max_rep: u16,
     max_visible_level: u16,
+    cursor_row: u64,
+    cursor_level: usize,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -978,13 +987,80 @@ impl ComplexAllNullPageDecoder {
         }
         ranges
     }
+
+    fn take_row(&mut self) -> Result<(Range<usize>, u64)> {
+        let start = self.cursor_level;
+        let end = if let Some(rep) = &self.rep {
+            if start >= rep.len() {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: repetition buffer too short",
+                ));
+            }
+            if rep[start] != self.max_rep {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: row did not start at max repetition level",
+                ));
+            }
+            let mut end = start + 1;
+            while end < rep.len() && rep[end] != self.max_rep {
+                end += 1;
+            }
+            end
+        } else {
+            start + 1
+        };
+
+        let visible = if let Some(def) = &self.def {
+            if end > def.len() {
+                return Err(Error::internal(
+                    "Invalid complex all-null layout: definition buffer too short",
+                ));
+            }
+            def[start..end]
+                .iter()
+                .filter(|d| **d <= self.max_visible_level)
+                .count() as u64
+        } else {
+            (end - start) as u64
+        };
+
+        self.cursor_level = end;
+        self.cursor_row += 1;
+        Ok((start..end, visible))
+    }
+
+    fn skip_to_row(&mut self, target_row: u64) -> Result<()> {
+        while self.cursor_row < target_row {
+            self.take_row()?;
+        }
+        Ok(())
+    }
 }
 
 impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
+        let mut level_slices: Vec<Range<usize>> = Vec::new();
+        let mut visible_items_total = 0;
+
+        for range in drained_ranges {
+            self.skip_to_row(range.start)?;
+            for _ in range.start..range.end {
+                let (level_range, visible) = self.take_row()?;
+                visible_items_total += visible;
+                if let Some(last) = level_slices.last_mut()
+                    && last.end == level_range.start
+                {
+                    last.end = level_range.end;
+                    continue;
+                }
+                level_slices.push(level_range);
+            }
+        }
+
         Ok(Box::new(DecodeComplexAllNullTask {
-            ranges: drained_ranges,
+            level_slices,
+            visible_items_total,
             rep: self.rep.clone(),
             def: self.def.clone(),
             def_meaning: self.def_meaning.clone(),
@@ -997,11 +1073,12 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     }
 }
 
-/// We use `ranges` to slice into `rep` and `def` and create rep/def buffers
+/// We use `level_slices` to slice into `rep` and `def` and create rep/def buffers
 /// for the null data.
 #[derive(Debug)]
 pub struct DecodeComplexAllNullTask {
-    ranges: Vec<Range<u64>>,
+    level_slices: Vec<Range<usize>>,
+    visible_items_total: u64,
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
@@ -1009,19 +1086,16 @@ pub struct DecodeComplexAllNullTask {
 }
 
 impl DecodeComplexAllNullTask {
-    fn decode_level(
-        &self,
-        levels: &Option<ScalarBuffer<u16>>,
-        num_values: u64,
-    ) -> Option<Vec<u16>> {
+    fn decode_level(&self, levels: &Option<ScalarBuffer<u16>>) -> Option<Vec<u16>> {
         levels.as_ref().map(|levels| {
-            let mut referenced_levels = Vec::with_capacity(num_values as usize);
-            for range in &self.ranges {
-                referenced_levels.extend(
-                    levels[range.start as usize..range.end as usize]
-                        .iter()
-                        .copied(),
-                );
+            let num_levels = self
+                .level_slices
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum();
+            let mut referenced_levels = Vec::with_capacity(num_levels);
+            for range in &self.level_slices {
+                referenced_levels.extend(levels[range.start..range.end].iter().copied());
             }
             referenced_levels
         })
@@ -1030,9 +1104,8 @@ impl DecodeComplexAllNullTask {
 
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let rep = self.decode_level(&self.rep, num_values);
-        let def = self.decode_level(&self.def, num_values);
+        let rep = self.decode_level(&self.rep);
+        let def = self.decode_level(&self.def);
 
         // If there are definition levels there may be empty / null lists which are not visible
         // in the items array.  We need to account for that here to figure out how many values
@@ -1040,7 +1113,7 @@ impl DecodePageTask for DecodeComplexAllNullTask {
         let num_values = if let Some(def) = &def {
             def.iter().filter(|&d| *d <= self.max_visible_level).count() as u64
         } else {
-            num_values
+            self.visible_items_total
         };
 
         let data = DataBlock::AllNull(AllNullDataBlock { num_values });
@@ -3217,6 +3290,12 @@ struct PageInfoAndScheduler {
 pub struct StructuralPrimitiveFieldScheduler {
     page_schedulers: Vec<PageInfoAndScheduler>,
     column_index: u32,
+    // Identifies the requested decode shape (e.g. blob descriptor struct vs
+    // raw bytes). Blob columns can produce multiple page scheduler variants
+    // for the same physical column depending on the target field's data type,
+    // and the cached page state types differ per variant. The view tag is
+    // mixed into the cache key so different variants do not collide.
+    view_tag: String,
 }
 
 impl StructuralPrimitiveFieldScheduler {
@@ -3243,6 +3322,7 @@ impl StructuralPrimitiveFieldScheduler {
         Ok(Self {
             page_schedulers,
             column_index: column_info.index,
+            view_tag: format!("{:?}", target_field.data_type()),
         })
     }
 
@@ -3401,16 +3481,25 @@ impl DeepSizeOf for CachedFieldData {
 }
 
 // Cache key for field data
+//
+// Both `column_index` and `view_tag` are part of the key because a single
+// physical column can be decoded under more than one shape — a blob column,
+// for instance, materializes as a `Struct<position, size>` descriptor in one
+// scheduler variant and as the raw `LargeBinary` bytes in another. Each
+// variant builds different `CachedPageData` types per page, so two readers
+// that hit the same `column_index` with different shapes used to collide and
+// crash with a downcast failure when loading cached state.
 #[derive(Debug, Clone)]
 pub struct FieldDataCacheKey {
     pub column_index: u32,
+    pub view_tag: String,
 }
 
 impl CacheKey for FieldDataCacheKey {
     type ValueType = CachedFieldData;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        self.column_index.to_string().into()
+        format!("{}:{}", self.column_index, self.view_tag).into()
     }
 
     fn type_name() -> &'static str {
@@ -3426,6 +3515,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     ) -> BoxFuture<'a, Result<()>> {
         let cache_key = FieldDataCacheKey {
             column_index: self.column_index,
+            view_tag: self.view_tag.clone(),
         };
         let cache = context.cache().clone();
 
@@ -4781,6 +4871,19 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    fn expand_boolean_to_bytes(fixed: FixedWidthDataBlock) -> FixedWidthDataBlock {
+        debug_assert_eq!(fixed.bits_per_value, 1);
+        let num_values = fixed.num_values as usize;
+        let bool_buf = BooleanBuffer::new(fixed.data.into_buffer(), 0, num_values);
+        let expanded: Vec<u8> = (0..num_values).map(|i| bool_buf.value(i) as u8).collect();
+        FixedWidthDataBlock {
+            data: LanceBuffer::from(expanded),
+            bits_per_value: 8,
+            num_values: fixed.num_values,
+            block_info: BlockInfo::new(),
+        }
+    }
+
     fn encode_full_zip(
         column_idx: u32,
         field: &Field,
@@ -4824,6 +4927,14 @@ impl PrimitiveStructuralEncoder {
         );
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
+
+        // Full-zip requires byte-aligned values; expand 1-bit booleans to 1 byte each.
+        let data = match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            other => other,
+        };
 
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
@@ -7413,5 +7524,26 @@ mod tests {
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+
+    // https://github.com/lance-format/lance/issues/6681
+    #[tokio::test]
+    async fn test_sparse_boolean_list_roundtrip() {
+        use arrow_array::builder::{BooleanBuilder, ListBuilder};
+
+        let mut list_builder = ListBuilder::new(BooleanBuilder::new());
+        for i in 0..1000i32 {
+            if i % 64 == 0 {
+                // Alternate true/false so the array is not constant (constant path avoids the bug).
+                list_builder.values().append_value(i % 128 == 0);
+                list_builder.append(true);
+            } else {
+                list_builder.append(false);
+            }
+        }
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 }

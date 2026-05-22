@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_core::utils::mask::RowAddrMask;
+use lance_select::RowAddrMask;
 
 /// A trait to be implemented by anything supplying a prefilter row addr mask
 ///

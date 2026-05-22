@@ -341,12 +341,14 @@ pub async fn write_partition_rows(
     w: &mut FileWriter,
     range: Range<usize>,
 ) -> Result<()> {
-    let mut stream = reader.read_stream(
-        lance_io::ReadBatchParams::Range(range),
-        u32::MAX,
-        4,
-        lance_encoding::decoder::FilterExpression::no_filter(),
-    )?;
+    let mut stream = reader
+        .read_stream(
+            lance_io::ReadBatchParams::Range(range),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
     use futures::StreamExt as _;
     while let Some(rb) = stream.next().await {
         let rb = rb?;
@@ -626,12 +628,15 @@ async fn read_shard_window_partitions(
         return Ok(per_partition_batches);
     }
 
-    let mut stream = shard_job.reader.read_stream(
-        lance_io::ReadBatchParams::Range(shard_job.start_offset..shard_job.end_offset),
-        u32::MAX,
-        4,
-        lance_encoding::decoder::FilterExpression::no_filter(),
-    )?;
+    let mut stream = shard_job
+        .reader
+        .read_stream(
+            lance_io::ReadBatchParams::Range(shard_job.start_offset..shard_job.end_offset),
+            u32::MAX,
+            4,
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await?;
 
     let mut rel_partition = 0usize;
     while rel_partition < window_len && shard_job.window_lengths[rel_partition] == 0 {
@@ -720,7 +725,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     let mut format_version: Option<LanceFileVersion> = None;
 
     // Prepare output path; we'll create writer once when we know schema
-    let aux_out = target_dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_out = target_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
     // We'll delay creating the V2 writer until we know the vector schema (dim and quantizer type)
     let mut v2w_opt: Option<V2Writer> = None;
@@ -1668,10 +1673,10 @@ mod tests {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
 
-        let partial0 = index_dir.child("partial_0");
-        let partial1 = index_dir.child("partial_1");
-        let aux0 = partial0.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux1 = partial1.child(INDEX_AUXILIARY_FILE_NAME);
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
         let lengths0 = vec![2_u32, 1_u32];
         let lengths1 = vec![1_u32, 2_u32];
@@ -1764,7 +1769,7 @@ mod tests {
             "expected write_auxiliary_index progress callbacks"
         );
 
-        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
 
         // Use ScanScheduler to obtain a FileScheduler (required by V2Reader::try_open)
@@ -1823,6 +1828,7 @@ mod tests {
                 4,
                 lance_encoding::decoder::FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
         while let Some(batch) = stream.next().await {
             total_rows += batch.unwrap().num_rows();
@@ -1836,10 +1842,10 @@ mod tests {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid");
 
-        let partial0 = index_dir.child("partial_0");
-        let partial1 = index_dir.child("partial_1");
-        let aux0 = partial0.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux1 = partial1.child(INDEX_AUXILIARY_FILE_NAME);
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
         let lengths = vec![2_u32, 2_u32];
         let dim = 2_i32;
@@ -1885,10 +1891,10 @@ mod tests {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/float64_uuid");
 
-        let partial0 = index_dir.child("partial_0");
-        let partial1 = index_dir.child("partial_1");
-        let aux0 = partial0.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux1 = partial1.child(INDEX_AUXILIARY_FILE_NAME);
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
         let lengths = vec![2_u32, 2_u32];
         let dim = 3_i32;
@@ -1909,7 +1915,7 @@ mod tests {
         .await
         .unwrap();
 
-        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let sched = ScanScheduler::new(
             Arc::new(object_store.clone()),
             SchedulerConfig::max_bandwidth(&object_store),
@@ -2129,10 +2135,10 @@ mod tests {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq");
 
-        let partial0 = index_dir.child("partial_0");
-        let partial1 = index_dir.child("partial_1");
-        let aux0 = partial0.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux1 = partial1.child(INDEX_AUXILIARY_FILE_NAME);
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
         let lengths0 = vec![2_u32, 1_u32];
         let lengths1 = vec![1_u32, 2_u32];
@@ -2189,7 +2195,7 @@ mod tests {
         .unwrap();
 
         // 3) Unified auxiliary file exists.
-        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
 
         // Open merged auxiliary file.
@@ -2259,10 +2265,10 @@ mod tests {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq");
 
-        let partial0 = index_dir.child("partial_0");
-        let partial1 = index_dir.child("partial_1");
-        let aux0 = partial0.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux1 = partial1.child(INDEX_AUXILIARY_FILE_NAME);
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
         let lengths0 = vec![2_u32, 1_u32];
         let lengths1 = vec![1_u32, 2_u32];
@@ -2307,7 +2313,7 @@ mod tests {
         .await
         .unwrap();
 
-        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
 
         let sched = ScanScheduler::new(
@@ -2368,6 +2374,7 @@ mod tests {
                 4,
                 lance_encoding::decoder::FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
         while let Some(batch) = stream.next().await {
             total_rows += batch.unwrap().num_rows();
@@ -2381,10 +2388,10 @@ mod tests {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq_mismatch");
 
-        let partial0 = index_dir.child("partial_0");
-        let partial1 = index_dir.child("partial_1");
-        let aux0 = partial0.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux1 = partial1.child(INDEX_AUXILIARY_FILE_NAME);
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
         let lengths0 = vec![2_u32, 1_u32];
         let lengths1 = vec![1_u32, 2_u32];
@@ -2464,10 +2471,10 @@ mod tests {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_tie");
 
-        let partial_a = index_dir.child("partial_1_10");
-        let partial_b = index_dir.child("partial_1_10b");
-        let aux_a = partial_a.child(INDEX_AUXILIARY_FILE_NAME);
-        let aux_b = partial_b.child(INDEX_AUXILIARY_FILE_NAME);
+        let partial_a = index_dir.clone().join("partial_1_10");
+        let partial_b = index_dir.clone().join("partial_1_10b");
+        let aux_a = partial_a.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux_b = partial_b.clone().join(INDEX_AUXILIARY_FILE_NAME);
 
         // Equal-length shards to simulate the tie scenario where per-partition
         // row counts alone cannot disambiguate ordering.
@@ -2524,7 +2531,7 @@ mod tests {
         .await
         .unwrap();
 
-        let aux_out = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+        let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         assert!(object_store.exists(&aux_out).await.unwrap());
 
         // Open merged auxiliary file and verify that the per-partition write
@@ -2556,6 +2563,7 @@ mod tests {
                 4,
                 lance_encoding::decoder::FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         let mut row_ids = Vec::new();

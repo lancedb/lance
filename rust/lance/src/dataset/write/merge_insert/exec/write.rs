@@ -182,7 +182,7 @@ pub struct FullSchemaMergeInsertExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
@@ -200,12 +200,12 @@ impl FullSchemaMergeInsertExec {
         params: MergeInsertParams,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(empty_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         // Check if ON columns match the schema's unenforced primary key
         let field_ids: Vec<i32> = params
@@ -414,26 +414,52 @@ impl FullSchemaMergeInsertExec {
                 ))
             })?;
 
-        // Find all data columns to write (everything except special columns)
-        // The schema from DataFusion optimization may have collapsed duplicate columns
-        // from the logical join, leaving us with the merged data columns plus special columns
-        let total_fields = input_schema.fields().len();
+        // Emit data columns in dataset-schema order, keyed by name. This
+        // matters for partial-schema upserts, where `create_plan` adds
+        // synthetic unqualified columns (filled from the target side) at
+        // the end of the logical projection. Without name-based reordering
+        // they would land at the end of the write stream and mismatch the
+        // intended writer schema (which is `dataset.schema()`). Using name
+        // lookup is also a strictly-safer choice for the full-schema path:
+        // it turns an implicit positional assumption into an explicit
+        // name-based invariant.
+        let mut name_to_idx: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(input_schema.fields().len());
+        for (idx, field) in input_schema.fields().iter().enumerate() {
+            let name = field.name();
+            // Skip special columns: _rowaddr, _rowid, __action, and the
+            // source-presence sentinel.
+            if idx == rowaddr_idx
+                || idx == rowid_idx
+                || idx == action_idx
+                || name == ROW_ADDR
+                || name == ROW_ID
+                || name == MERGE_ACTION_COLUMN
+                || name == MERGE_SOURCE_SENTINEL
+            {
+                continue;
+            }
+            name_to_idx.insert(name.as_str(), idx);
+        }
 
-        // Select all columns that are data columns (not _rowaddr, __action, or the sentinel)
-        // These represent the final merged data values to write
-        let data_column_indices: Vec<usize> = (0..total_fields)
-            .filter(|&idx| {
-                let field = input_schema.field(idx);
-                let name = field.name();
-                // Skip special columns: _rowaddr, __action, and the source-presence sentinel
-                idx != rowaddr_idx
-                    && idx != action_idx
-                    && name != ROW_ADDR
-                    && name != ROW_ID
-                    && name != MERGE_ACTION_COLUMN
-                    && name != MERGE_SOURCE_SENTINEL
-            })
-            .collect();
+        let dataset_arrow_schema: arrow_schema::Schema = self.dataset.schema().into();
+        let dataset_fields = dataset_arrow_schema.fields();
+        let mut data_column_indices: Vec<usize> = Vec::with_capacity(dataset_fields.len());
+        let mut output_fields: Vec<Arc<arrow_schema::Field>> =
+            Vec::with_capacity(dataset_fields.len());
+        for dataset_field in dataset_fields {
+            let idx = *name_to_idx
+                .get(dataset_field.name().as_str())
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "Dataset field {:?} missing from merge insert input schema \
+                     — this indicates a logical plan pruning bug",
+                        dataset_field.name()
+                    ))
+                })?;
+            data_column_indices.push(idx);
+            output_fields.push(Arc::new(input_schema.field(idx).clone()));
+        }
 
         if data_column_indices.is_empty() {
             return Err(datafusion::error::DataFusionError::Internal(
@@ -441,14 +467,6 @@ impl FullSchemaMergeInsertExec {
             ));
         }
 
-        // Create output schema with only data columns
-        let output_fields: Vec<_> = data_column_indices
-            .iter()
-            .map(|&idx| {
-                let field = input_schema.field(idx);
-                Arc::new(field.clone())
-            })
-            .collect();
         let output_schema = Arc::new(Schema::new(output_fields));
 
         Ok((
@@ -792,7 +810,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -928,6 +946,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .collect(),
                 update_mode: Some(RewriteRows),
                 inserted_rows_filter: inserted_rows_filter.clone(),
+                updated_fragment_offsets: None,
             };
 
             // Step 5: Create and store the transaction

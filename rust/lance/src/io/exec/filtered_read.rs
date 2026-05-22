@@ -32,9 +32,6 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::{
-    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
-};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
@@ -43,8 +40,11 @@ use lance_datafusion::utils::{
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
+use lance_index::scalar::expression::{FilterPlan, IndexExprResult, index_expr_result_from_parts};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_select::{
+    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
+};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
@@ -57,6 +57,7 @@ use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
     BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
+    get_default_io_buffer_size_override,
 };
 
 use super::utils::IoMetrics;
@@ -100,7 +101,7 @@ impl EvaluatedIndex {
         }
         let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
         let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
-        let index_result = IndexExprResult::from_parts(row_addr_mask, match_type)?;
+        let index_result = index_expr_result_from_parts(row_addr_mask, match_type)?;
 
         let applicable_fragments = batch.column(2).as_binary::<i32>();
         let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
@@ -412,7 +413,12 @@ impl FilteredReadStream {
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
         let obj_store = dataset.object_store.clone();
-        let scheduler_config = if let Some(io_buffer_size_bytes) = options.io_buffer_size_bytes {
+        // Explicit options take precedence; otherwise fall back to the
+        // LANCE_DEFAULT_IO_BUFFER_SIZE env var if set; otherwise max_bandwidth.
+        let scheduler_config = if let Some(io_buffer_size_bytes) = options
+            .io_buffer_size_bytes
+            .or_else(get_default_io_buffer_size_override)
+        {
             SchedulerConfig::new(io_buffer_size_bytes)
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
@@ -651,7 +657,10 @@ impl FilteredReadStream {
     ) -> Vec<ScopedFragmentRead> {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
-                std::cmp::max(dataset.object_store().block_size() / 4, BATCH_SIZE_FALLBACK)
+                std::cmp::max(
+                    dataset.object_store.as_ref().block_size() / 4,
+                    BATCH_SIZE_FALLBACK,
+                )
             }) as u32
         });
         let projection = Arc::new(options.projection.clone());
@@ -1107,7 +1116,8 @@ impl FilteredReadStream {
             .read_ranges(
                 fragment_read_task.ranges.into(),
                 fragment_read_task.batch_size,
-            )?
+            )
+            .await?
             .map(move |batch_fut: ReadBatchFut| {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
@@ -1469,7 +1479,7 @@ impl FilteredReadOptions {
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
     options: FilteredReadOptions,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     // Precomputed internal plan
@@ -1568,12 +1578,12 @@ impl FilteredReadExec {
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema),
             Partitioning::RoundRobinBatch(num_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         let metrics = ExecutionPlanMetricsSet::new();
 
@@ -1857,7 +1867,7 @@ impl ExecutionPlan for FilteredReadExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -2052,6 +2062,10 @@ impl ExecutionPlan for FilteredReadExec {
             return None;
         }
         let limit = limit?;
+
+        if self.dataset.manifest.uses_stable_row_ids() {
+            return None;
+        }
 
         let mut updated_options = self.options.clone();
 

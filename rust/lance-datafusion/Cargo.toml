@@ -33,11 +33,8 @@ chrono.workspace = true
 log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
-snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# We only need this to pin the substrait version to 0.62.2 for now.
-substrait = {version = "=0.62.2", optional = true}
 
 [build-dependencies]
 prost-build.workspace = true
@@ -48,7 +45,7 @@ lance-datagen.workspace = true
 
 [features]
 geo = ["dep:lance-geo"]
-substrait = ["dep:datafusion-substrait", "dep:substrait"]
+substrait = ["dep:datafusion-substrait"]
 protoc = ["dep:protobuf-src"]
 
 [lints]

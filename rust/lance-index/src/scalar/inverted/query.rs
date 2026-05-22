@@ -8,7 +8,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtsSearchParams {
     pub limit: Option<usize>,
     pub wand_factor: f32,
