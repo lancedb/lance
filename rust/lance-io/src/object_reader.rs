@@ -365,9 +365,17 @@ impl Reader for SmallReader {
     }
 
     /// Object/File Size.
+    ///
+    /// Returns the actual size of the downloaded content rather than the
+    /// pre-supplied `known_size`. This avoids inconsistencies caused by
+    /// eventual consistency in object stores where the LIST-reported size
+    /// may differ from the actual GET response size.
     fn size(&self) -> BoxFuture<'_, OSResult<usize>> {
-        let size = self.inner.size;
-        Box::pin(async move { Ok(size) })
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let bytes = inner.wait().await?;
+            Ok(bytes.len())
+        })
     }
 
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
@@ -455,5 +463,95 @@ impl DeepSizeOf for SmallReader {
         }
 
         size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::Reader;
+    use object_store::{ObjectStoreExt, PutPayload, memory::InMemory};
+
+    /// Test that SmallReader::size() returns the actual downloaded content size
+    /// rather than the stale `known_size` passed during construction.
+    ///
+    /// This simulates the eventual consistency scenario where a LIST operation
+    /// reports a different file size than what the subsequent GET actually returns.
+    #[tokio::test]
+    async fn test_small_reader_size_returns_actual_size() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("test/manifest.bin");
+
+        // Write actual content (10 bytes)
+        let actual_content = b"0123456789";
+        store
+            .put(&path, PutPayload::from_static(actual_content))
+            .await
+            .unwrap();
+
+        // Create SmallReader with a stale known_size (20 bytes) that differs
+        // from the actual content size (10 bytes). This simulates the case where
+        // a LIST operation reported a stale size due to eventual consistency.
+        let stale_known_size = 20;
+        let reader = SmallReader::new(store.clone(), path.clone(), 3, stale_known_size);
+
+        // size() should return the actual downloaded size (10), not the stale known_size (20)
+        let reported_size = reader.size().await.unwrap();
+        assert_eq!(
+            reported_size,
+            actual_content.len(),
+            "size() should return actual content size, not stale known_size"
+        );
+    }
+
+    /// Test that SmallReader::get_range() works correctly with the actual content
+    /// size, even when known_size was wrong.
+    #[tokio::test]
+    async fn test_small_reader_get_range_with_stale_known_size() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("test/manifest2.bin");
+
+        let actual_content = b"hello world";
+        store
+            .put(&path, PutPayload::from_static(actual_content))
+            .await
+            .unwrap();
+
+        // known_size is larger than actual content (simulating stale LIST result)
+        let stale_known_size = 100;
+        let reader = SmallReader::new(store.clone(), path.clone(), 3, stale_known_size);
+
+        // First get the actual size
+        let actual_size = reader.size().await.unwrap();
+        assert_eq!(actual_size, actual_content.len());
+
+        // get_range with the actual size should succeed
+        let bytes = reader.get_range(0..actual_size).await.unwrap();
+        assert_eq!(bytes.as_ref(), actual_content);
+    }
+
+    /// Test that SmallReader::get_range() returns an error when the requested
+    /// range exceeds the actual content size.
+    #[tokio::test]
+    async fn test_small_reader_get_range_invalid_range_error() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("test/manifest3.bin");
+
+        let actual_content = b"short";
+        store
+            .put(&path, PutPayload::from_static(actual_content))
+            .await
+            .unwrap();
+
+        let stale_known_size = 50;
+        let reader = SmallReader::new(store.clone(), path.clone(), 3, stale_known_size);
+
+        // Requesting a range based on the stale known_size should fail
+        // because the actual content is only 5 bytes
+        let result = reader.get_range(0..stale_known_size).await;
+        assert!(
+            result.is_err(),
+            "get_range with stale size should fail when actual content is smaller"
+        );
     }
 }
