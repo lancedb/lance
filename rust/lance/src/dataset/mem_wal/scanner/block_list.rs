@@ -19,6 +19,8 @@ use arrow_array::RecordBatch;
 use futures::TryStreamExt;
 use lance_core::Result;
 
+use uuid::Uuid;
+
 use super::data_source::{LsmDataSource, LsmGeneration};
 use super::exec::{compute_pk_hash, resolve_pk_indices};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
@@ -26,54 +28,78 @@ use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::BatchStore;
 use crate::session::Session;
 
-/// Per-source `NEWER(G)`: each generation maps to the newer generations' sets
-/// (base table: all of them). Only superseded sources get an entry; the newest
-/// never does.
+/// Per-source blocked PK-hash sets, keyed by `(shard_id, generation)`. Each
+/// value is the membership sets of the generations newer than that source.
+pub type SourceBlockLists = HashMap<(Option<Uuid>, LsmGeneration), Vec<Arc<HashSet<u64>>>>;
+
+/// A shard's generations paired with their PK-hash membership, before sorting.
+type ShardGenSets = HashMap<Uuid, Vec<(LsmGeneration, Arc<HashSet<u64>>)>>;
+
+/// Per-source `NEWER(G)`, keyed by `(shard_id, generation)`. Generations are
+/// per-shard, so a source is superseded only by strictly-newer generations of
+/// the **same** shard — it never appears in its own blocked list. The base table
+/// is shardless (`None`, oldest) and superseded by every non-base generation.
+/// Only superseded sources get an entry; the newest of each shard never does.
 pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
-) -> Result<HashMap<LsmGeneration, Vec<Arc<HashSet<u64>>>>> {
-    // Hash each non-base source's membership. Base (oldest) is blocked by all.
-    let mut indexed: Vec<(LsmGeneration, Arc<HashSet<u64>>)> = Vec::new();
+) -> Result<SourceBlockLists> {
+    // Hash each non-base source's membership, grouped by shard (generations are
+    // per-shard, so supersession is within-shard only).
+    let mut by_shard: ShardGenSets = HashMap::new();
     let mut has_base = false;
     for source in sources {
         match source {
             LsmDataSource::BaseTable { .. } => has_base = true,
             LsmDataSource::ActiveMemTable {
                 batch_store,
+                shard_id,
                 generation,
                 ..
             } => {
                 let hashes = Arc::new(pk_hashes_from_batch_store(batch_store, pk_columns)?);
-                indexed.push((*generation, hashes));
+                by_shard
+                    .entry(*shard_id)
+                    .or_default()
+                    .push((*generation, hashes));
             }
             LsmDataSource::FlushedMemTable {
-                path, generation, ..
+                path,
+                shard_id,
+                generation,
+                ..
             } => {
                 // Cached by immutable path so repeated searches skip the PK scan.
                 let hashes = flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?;
-                indexed.push((*generation, hashes));
+                by_shard
+                    .entry(*shard_id)
+                    .or_default()
+                    .push((*generation, hashes));
             }
         }
     }
 
-    // Newest-first: a gen's blocked list is the sets accumulated before it.
-    indexed.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
-    let mut blocked: HashMap<LsmGeneration, Vec<Arc<HashSet<u64>>>> = HashMap::new();
-    let mut newer: Vec<Arc<HashSet<u64>>> = Vec::new();
-    for (generation, hashes) in &indexed {
-        if !newer.is_empty() {
-            blocked.insert(*generation, newer.clone());
-        }
-        if !hashes.is_empty() {
-            newer.push(hashes.clone());
+    let mut blocked: SourceBlockLists = HashMap::new();
+    // Base (shardless, oldest) is superseded by every non-base generation.
+    let mut base_blocked: Vec<Arc<HashSet<u64>>> = Vec::new();
+    for (shard, mut gens) in by_shard {
+        // Newest-first: a gen's blocked list is its own shard's newer gens.
+        gens.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
+        let mut newer: Vec<Arc<HashSet<u64>>> = Vec::new();
+        for (generation, hashes) in gens {
+            if !newer.is_empty() {
+                blocked.insert((Some(shard), generation), newer.clone());
+            }
+            if !hashes.is_empty() {
+                base_blocked.push(hashes.clone());
+                newer.push(hashes);
+            }
         }
     }
-    // The base table (oldest) is superseded by every non-base generation.
-    if has_base && !newer.is_empty() {
-        blocked.insert(LsmGeneration::BASE_TABLE, newer);
+    if has_base && !base_blocked.is_empty() {
+        blocked.insert((None, LsmGeneration::BASE_TABLE), base_blocked);
     }
     Ok(blocked)
 }
@@ -165,27 +191,37 @@ async fn flushed_pk_hashes(
                             Some(&build_cache),
                         )
                         .await?;
-                        let batches = scan_pk(&dataset, &build_pk).await?;
-                        pk_hashes_from_batches(&batches, &build_pk)
+                        scan_pk_hashes(&dataset, &build_pk).await
                     }),
                 )
                 .await
         }
         None => {
             let dataset = open_flushed_dataset(path, session, None).await?;
-            let batches = scan_pk(&dataset, pk_columns).await?;
-            Ok(Arc::new(pk_hashes_from_batches(&batches, pk_columns)?))
+            Ok(Arc::new(scan_pk_hashes(&dataset, pk_columns).await?))
         }
     }
 }
 
-/// Scan a dataset's PK columns, collecting the result batches.
-async fn scan_pk(dataset: &Dataset, pk_columns: &[String]) -> Result<Vec<RecordBatch>> {
+/// Scan a dataset's PK columns and fold them into a membership set, one batch
+/// resident at a time (no full PK-column buffer).
+async fn scan_pk_hashes(dataset: &Dataset, pk_columns: &[String]) -> Result<HashSet<u64>> {
     let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
     let mut scanner = dataset.scan();
     scanner.project(&pk_refs)?;
-    let stream = scanner.try_into_stream().await?;
-    stream.try_collect::<Vec<_>>().await
+    let mut stream = scanner.try_into_stream().await?;
+    let mut hashes = HashSet::new();
+    while let Some(batch) = stream.try_next().await? {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pk_indices = resolve_pk_indices(&batch, pk_columns)
+            .map_err(|e| lance_core::Error::invalid_input(e.to_string()))?;
+        for row in 0..batch.num_rows() {
+            hashes.insert(compute_pk_hash(&batch, &pk_indices, row));
+        }
+    }
+    Ok(hashes)
 }
 
 #[cfg(test)]
@@ -310,9 +346,9 @@ mod tests {
         let g2 = LsmGeneration::memtable(2);
         // The newer active write supersedes the frozen copy: gen 1 is blocked on
         // pk=1, so its KNN drops pk=1.
-        assert!(blocks(&blocked[&g1], 1));
+        assert!(blocks(&blocked[&(Some(shard), g1)], 1));
         // The active (newest) generation is superseded by nothing — no entry.
-        assert!(!blocked.contains_key(&g2));
+        assert!(!blocked.contains_key(&(Some(shard), g2)));
     }
 
     #[tokio::test]
@@ -363,9 +399,62 @@ mod tests {
         // Base is blocked by every newer gen: pk=1 (re-written in gen 1) is
         // blocked, pk=3 (base-only) is not. End-to-end drop: vector_search specs.
         let base_blocked = blocked
-            .get(&LsmGeneration::BASE_TABLE)
+            .get(&(None, LsmGeneration::BASE_TABLE))
             .expect("base has a blocked set");
         assert!(blocks(base_blocked, 1));
         assert!(!blocks(base_blocked, 3));
+    }
+
+    #[tokio::test]
+    async fn block_lists_are_keyed_per_shard() {
+        // Regression: generations are per-shard, so a source must only be blocked
+        // by newer generations of its OWN shard. A generation-only key would
+        // cross-block same-generation sources from different shards.
+        use crate::dataset::mem_wal::scanner::data_source::{LsmDataSource, LsmGeneration};
+        use crate::dataset::mem_wal::write::IndexStore;
+        use uuid::Uuid;
+
+        let mk = |shard: Uuid, ids: &[i32], generation: u64| {
+            let store = BatchStore::with_capacity(8);
+            store.append(id_batch(ids)).unwrap();
+            LsmDataSource::ActiveMemTable {
+                batch_store: Arc::new(store),
+                index_store: Arc::new(IndexStore::new()),
+                schema: id_batch(&[1]).schema(),
+                shard_id: shard,
+                generation: LsmGeneration::memtable(generation),
+            }
+        };
+
+        // Two shards, each: frozen gen 1 (stale) + active gen 2 (re-write).
+        // Shard A keys pk=1; shard B keys pk=2 (disjoint partitions).
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let sources = vec![
+            mk(a, &[1], 1),
+            mk(a, &[1], 2),
+            mk(b, &[2], 1),
+            mk(b, &[2], 2),
+        ];
+
+        let blocked = Box::pin(compute_source_block_lists(
+            &sources,
+            &["id".to_string()],
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let g1 = LsmGeneration::memtable(1);
+        let g2 = LsmGeneration::memtable(2);
+        // Each shard's gen 1 is blocked by its OWN gen 2 only.
+        assert!(blocks(&blocked[&(Some(a), g1)], 1));
+        assert!(!blocks(&blocked[&(Some(a), g1)], 2));
+        assert!(blocks(&blocked[&(Some(b), g1)], 2));
+        assert!(!blocks(&blocked[&(Some(b), g1)], 1));
+        // The newest generation of each shard is superseded by nothing.
+        assert!(!blocked.contains_key(&(Some(a), g2)));
+        assert!(!blocked.contains_key(&(Some(b), g2)));
     }
 }

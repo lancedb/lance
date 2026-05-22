@@ -233,8 +233,9 @@ impl LsmVectorSearchPlanner {
             let generation = source.generation();
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             // Over-fetch when something supersedes this source, so the post-filter
-            // still leaves k live candidates.
-            let blocked = block_lists.get(&generation);
+            // still leaves k live candidates. Keyed per shard — generations are
+            // per-shard, so a source is only blocked by its own shard's newer gens.
+            let blocked = block_lists.get(&(source.shard_id(), generation));
             let fetch_k = if blocked.is_some() {
                 ((k as f64) * STALE_OVERFETCH_FACTOR).ceil() as usize
             } else {
@@ -1647,6 +1648,20 @@ mod tests {
              stale base-table copy (distance ~0) was served because fresh \
              pk=1 fell out of the active arm's top-k and never deduped it; \
              got {:?}",
+            rows
+        );
+        // Positive check: with the stale copy suppressed, the nearest *live*
+        // neighbor is pk=2 — the top-1 result, not an empty or dropped-everything
+        // result.
+        assert_eq!(
+            rows.len(),
+            1,
+            "k=1 must return exactly one row, got {:?}",
+            rows
+        );
+        assert_eq!(
+            rows[0].0, 2,
+            "expected nearest live neighbor pk=2, got {:?}",
             rows
         );
     }
