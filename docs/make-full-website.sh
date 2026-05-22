@@ -88,6 +88,25 @@ copy_file_if_exists() {
     return 1
 }
 
+copy_duckdb_docs() {
+    local source_dir="$1"
+    local target_dir="$2"
+
+    if [ ! -d "$source_dir" ]; then
+        return 1
+    fi
+
+    rm -rf "$target_dir"
+    mkdir -p "$target_dir"
+    cp "$source_dir/.pages" "$target_dir/.pages"
+    cp "$source_dir/index.md" "$target_dir/index.md"
+    cp "$source_dir/sql.md" "$target_dir/sql.md"
+    cp "$source_dir/rest.md" "$target_dir/rest.md"
+    cp "$source_dir/cloud.md" "$target_dir/cloud.md"
+
+    return 0
+}
+
 resolve_repo_dir() {
     local repo_path="$1"
 
@@ -207,10 +226,10 @@ while IFS= read -r line; do
     integration_entries+=("$line")
 done < <(sed -n '2,$p' "$docs_src/integrations/.pages")
 
-if copy_docs_dir "$duckdb_repo/docs/src" "$docs_src/integrations/duckdb"; then
+if copy_duckdb_docs "$duckdb_repo/docs" "$docs_src/integrations/duckdb"; then
     integration_entries+=("  - DuckDB: duckdb")
 else
-    warn_missing_repo "Lance DuckDB docs" "$duckdb_repo/docs/src"
+    warn_missing_repo "Lance DuckDB docs" "$duckdb_repo/docs"
 fi
 
 if copy_docs_dir "$huggingface_repo/docs/src" "$docs_src/integrations/huggingface"; then
