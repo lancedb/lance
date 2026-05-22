@@ -2341,10 +2341,7 @@ impl Dataset {
         log::info!("Creating index: type={}", index_type);
         let params: Box<dyn IndexParams> = match index_type.as_str() {
             "BTREE" => {
-                let btree_params = match range_id {
-                    Some(rid) => Some(format!("{{\"range_id\": {}}}", rid)),
-                    None => None,
-                };
+                let btree_params = range_id.map(|rid| format!("{{\"range_id\": {}}}", rid));
                 Box::new(ScalarIndexParams {
                     index_type: "btree".to_string(),
                     params: btree_params,
