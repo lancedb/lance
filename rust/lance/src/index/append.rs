@@ -657,6 +657,7 @@ mod tests {
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::compact_files;
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
+    use crate::index::create::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
@@ -1288,5 +1289,298 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_after_append_preserves_data() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from_iter_values(0..100))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert!(
+            dataset
+                .unindexed_fragments("value_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "all fragments should be indexed after initial build"
+        );
+
+        let count_before: usize = dataset
+            .scan()
+            .filter("value >= 40 AND value < 60")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count_before, 20);
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from_iter_values(
+                100..150,
+            ))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], schema.clone());
+        let mut dataset = dataset;
+        dataset.append(reader, None).await.unwrap();
+
+        assert!(
+            !dataset
+                .unindexed_fragments("value_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "new fragments should be unindexed after append"
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert!(
+            dataset
+                .unindexed_fragments("value_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "all fragments should be indexed after optimize"
+        );
+
+        let count_old: usize = dataset
+            .scan()
+            .filter("value >= 40 AND value < 60")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count_old, 20, "old data should be preserved after optimize");
+
+        let count_new: usize = dataset
+            .scan()
+            .filter("value >= 120 AND value < 140")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count_new, 20, "new data should be indexed after optimize");
+
+        let count_all: usize = dataset
+            .scan()
+            .filter("value >= 0 AND value < 150")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            count_all, 150,
+            "all data should be queryable after optimize"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_index_update_preserves_range_partition_structure() {
+        use lance_index::scalar::BuiltinIndexType;
+        use lance_index::scalar::btree::BTreeParameters;
+        use lance_table::format::list_index_files_with_sizes;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from_iter_values(0..50))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 25,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        let frag_0: Vec<u32> = vec![fragments[0].id() as u32];
+        let frag_1: Vec<u32> = vec![fragments[1].id() as u32];
+        let all_frag_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
+        let shared_uuid = Uuid::new_v4().to_string();
+
+        let btree_params_0 = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(
+            &serde_json::to_value(BTreeParameters {
+                zone_size: None,
+                range_id: Some(0),
+            })
+            .unwrap(),
+        );
+        let index_meta_0 =
+            CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &btree_params_0)
+                .name("value_idx".to_string())
+                .fragments(frag_0)
+                .index_uuid(shared_uuid.clone())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        let btree_params_1 = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(
+            &serde_json::to_value(BTreeParameters {
+                zone_size: None,
+                range_id: Some(1),
+            })
+            .unwrap(),
+        );
+        let _index_meta_1 =
+            CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &btree_params_1)
+                .name("value_idx".to_string())
+                .fragments(frag_1)
+                .index_uuid(shared_uuid.clone())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::BTree,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+
+        let mut committed_meta = index_meta_0;
+        committed_meta.fragment_bitmap = Some(all_frag_ids.iter().copied().collect());
+        committed_meta.files = Some(
+            list_index_files_with_sizes(
+                dataset.object_store.as_ref(),
+                &dataset.indices_dir().join(shared_uuid.as_str()),
+            )
+            .await
+            .unwrap(),
+        );
+        committed_meta.dataset_version = dataset.manifest.version;
+
+        let transaction = crate::dataset::transaction::TransactionBuilder::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![committed_meta],
+                removed_indices: vec![],
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let indices = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+
+        let index_uuid_str = indices[0].uuid.to_string();
+        let index_dir = dataset.indices_dir().join(index_uuid_str.as_str());
+        let files_before = list_index_files_with_sizes(dataset.object_store.as_ref(), &index_dir)
+            .await
+            .unwrap();
+        let has_part_files_before = files_before.iter().any(|f| f.path.contains("part_"));
+        assert!(
+            has_part_files_before,
+            "range-partitioned BTree should have part_* files before optimize, found: {:?}",
+            files_before
+        );
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from_iter_values(50..100))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], schema.clone());
+        let mut dataset = dataset;
+        dataset.append(reader, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let indices = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let index_uuid_str = indices[0].uuid.to_string();
+        let index_dir = dataset.indices_dir().join(index_uuid_str.as_str());
+        let files_after = list_index_files_with_sizes(dataset.object_store.as_ref(), &index_dir)
+            .await
+            .unwrap();
+        let has_part_files_after = files_after.iter().any(|f| f.path.contains("part_"));
+        assert!(
+            has_part_files_after,
+            "range-partitioned BTree should preserve range structure after optimize, found: {:?}",
+            files_after
+        );
+
+        let count_all: usize = dataset
+            .scan()
+            .filter("value >= 0 AND value < 100")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            count_all, 100,
+            "data should still be correct after optimize even though range structure is lost"
+        );
     }
 }

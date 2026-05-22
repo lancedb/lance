@@ -1897,12 +1897,63 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = self
             .clone()
             .combine_old_new(new_data, self.batch_size, old_data_filter)
             .await?;
-        train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
+
+        let Some(ranges_to_files) = &self.ranges_to_files else {
+            train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
+            return Ok(CreatedIndex {
+                index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                    .unwrap(),
+                index_version: BTREE_INDEX_VERSION,
+                files: Some(dest_store.list_files_with_sizes().await?),
+            });
+        };
+
+        let num_partitions = ranges_to_files.iter().count();
+
+        let collected = collect_sorted_batches(merged_data_source).await?;
+        if collected.is_empty() {
+            return Err(Error::internal(
+                "no data to train range-partitioned BTree index".to_string(),
+            ));
+        }
+
+        let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
+        let rows_per_partition = total_rows.div_ceil(num_partitions);
+
+        let mut row_offset = 0usize;
+        for part_idx in 0..num_partitions {
+            let range_id = part_idx as u32;
+            let start = row_offset;
+            let end = if part_idx == num_partitions - 1 {
+                total_rows
+            } else {
+                std::cmp::min(row_offset + rows_per_partition, total_rows)
+            };
+            row_offset = end;
+
+            let part_batches = slice_batches(&collected, start, end)?;
+            if part_batches.is_empty() {
+                continue;
+            }
+            let part_stream = batches_to_stream(part_batches);
+            train_btree_index(
+                part_stream,
+                dest_store,
+                self.batch_size,
+                None,
+                Some(range_id),
+            )
+            .await?;
+        }
+
+        let partition_ids: Vec<u64> = (0..num_partitions as u32)
+            .map(|range_id| (range_id as u64) << 32)
+            .collect();
+        merge_range_partition_lookups_in_place(dest_store, &partition_ids, self.batch_size).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
@@ -1923,6 +1974,106 @@ impl ScalarIndex for BTreeIndex {
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
+}
+
+async fn collect_sorted_batches(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
+    stream.try_collect::<Vec<_>>().await.map_err(Into::into)
+}
+
+fn slice_batches(batches: &[RecordBatch], start: usize, end: usize) -> Result<Vec<RecordBatch>> {
+    if start >= end {
+        return Ok(vec![]);
+    }
+    let mut result = Vec::new();
+    let mut offset = 0usize;
+    for batch in batches {
+        let batch_len = batch.num_rows();
+        let batch_start = offset;
+        let batch_end = offset + batch_len;
+        if batch_end <= start || batch_start >= end {
+            offset += batch_len;
+            continue;
+        }
+        let slice_start = start.saturating_sub(batch_start);
+        let slice_end = std::cmp::min(end - batch_start, batch_len);
+        result.push(batch.slice(slice_start, slice_end - slice_start));
+        offset += batch_len;
+    }
+    Ok(result)
+}
+
+fn batches_to_stream(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+    let schema = batches[0].schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(batches.into_iter().map(Ok)),
+    ))
+}
+
+async fn merge_range_partition_lookups_in_place(
+    store: &dyn IndexStore,
+    partition_ids: &[u64],
+    batch_size: u64,
+) -> Result<()> {
+    let value_type = {
+        let first_lookup = store
+            .open_index_file(&part_lookup_file_path(partition_ids[0]))
+            .await?;
+        first_lookup
+            .schema()
+            .fields
+            .first()
+            .unwrap()
+            .data_type()
+            .clone()
+    };
+
+    let lookup_schema = Arc::new(Schema::new(vec![
+        Field::new("min", value_type.clone(), true),
+        Field::new("max", value_type.clone(), true),
+        Field::new("null_count", DataType::UInt32, false),
+        Field::new("page_idx", DataType::UInt32, false),
+    ]));
+
+    let mut metadata = HashMap::new();
+    metadata.insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
+    metadata.insert(RANGE_PARTITIONED_META_KEY.to_string(), "true".to_string());
+
+    let mut lookup_file = store
+        .new_index_file(BTREE_LOOKUP_NAME, lookup_schema.clone())
+        .await?;
+
+    let mut pages_per_file: Vec<(u64, u32)> = Vec::with_capacity(partition_ids.len());
+    let mut num_pages_written = 0u32;
+
+    for &partition_id in partition_ids {
+        let lookup_name = part_lookup_file_path(partition_id);
+        let lookup_reader = store.open_index_file(&lookup_name).await?;
+        let num_rows = lookup_reader.num_rows();
+        let reader_stream = IndexReaderStream::new(lookup_reader.clone(), batch_size).await;
+        let mut stream = reader_stream.buffered(1).boxed();
+        while let Some(batch) = stream.next().await {
+            let original_batch = batch?;
+            let modified_batch = add_offset_to_page_idx(&original_batch, num_pages_written)?;
+            lookup_file.write_record_batch(modified_batch).await?;
+        }
+        pages_per_file.push((partition_id, num_rows as u32));
+        num_pages_written += num_rows as u32;
+    }
+
+    metadata.insert(
+        PAGE_NUM_PER_RANGE_PARTITION_META_KEY.to_string(),
+        serde_json::to_string(&pages_per_file)?,
+    );
+
+    lookup_file.finish_with_metadata(metadata).await?;
+
+    for &partition_id in partition_ids {
+        let lookup_name = part_lookup_file_path(partition_id);
+        store.delete_index_file(&lookup_name).await.ok();
+    }
+
+    Ok(())
 }
 
 struct BatchStats {
