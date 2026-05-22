@@ -561,6 +561,24 @@ impl KMeansAlgo<u8> for KModeAlgo {
     }
 }
 
+/// Cluster id assignment for each vector in a batch.
+pub type KMeansMembership = Vec<Option<u32>>;
+
+/// Distance from each vector to its assigned centroid.
+pub type KMeansDistances = Vec<Option<f32>>;
+
+/// Maximum assignment distance per centroid.
+pub type KMeansClusterRadii = Vec<f32>;
+
+/// Sum of assignment distances per centroid.
+pub type KMeansClusterLosses = Vec<f64>;
+
+/// Batch assignment results with per-centroid radii and losses.
+pub type KMeansMembershipAndLoss = (KMeansMembership, KMeansClusterRadii, KMeansClusterLosses);
+
+/// Batch assignment results with per-vector distances.
+pub type KMeansMembershipAndDistances = (KMeansMembership, KMeansDistances);
+
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
 pub struct KMeans {
@@ -640,7 +658,7 @@ impl KMeans {
     pub fn compute_membership_and_loss(
         &self,
         data: &FixedSizeListArray,
-    ) -> arrow::error::Result<(Vec<Option<u32>>, Vec<f32>, Vec<f64>)> {
+    ) -> arrow::error::Result<KMeansMembershipAndLoss> {
         let (membership, distances) = self.compute_membership_and_distances(data)?;
         let k = self.centroids.len() / self.dimension;
         let mut cluster_radius: Vec<f32> = vec![0.0_f32; k];
@@ -659,7 +677,7 @@ impl KMeans {
     pub fn compute_membership_and_distances(
         &self,
         data: &FixedSizeListArray,
-    ) -> arrow::error::Result<(Vec<Option<u32>>, Vec<Option<f32>>)> {
+    ) -> arrow::error::Result<KMeansMembershipAndDistances> {
         if data.value_length() as usize != self.dimension {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "KMeans: data dimension {} does not match centroid dimension {}",
