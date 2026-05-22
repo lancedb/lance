@@ -2554,10 +2554,7 @@ impl Dataset {
                 self.ds.sample_partition_boundaries(column, num_partitions),
             )?
             .infer_error()?;
-        Ok(boundaries
-            .iter()
-            .map(|v| v.to_string())
-            .collect())
+        Ok(boundaries.iter().map(|v| v.to_string()).collect())
     }
 
     fn commit_existing_index_segments(
