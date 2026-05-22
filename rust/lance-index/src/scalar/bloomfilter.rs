@@ -440,7 +440,6 @@ impl ScalarIndex for BloomFilterIndex {
         ))
     }
 
-
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,

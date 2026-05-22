@@ -479,7 +479,6 @@ impl ScalarIndex for NGramIndex {
         }
     }
 
-
     fn can_remap(&self) -> bool {
         true
     }
