@@ -3,13 +3,14 @@
 
 //! Per-source block-list construction for LSM vector search.
 //!
-//! A generation's membership is its set of PK hashes ([`compute_pk_hash`]). This
-//! builds each source's *blocked* set — `NEWER(G)`, the union of every newer
-//! generation's membership (base table: the union of all of them). The KNN drops
-//! candidates whose PK is in the set (see [`super::exec::PkHashFilterExec`]).
+//! A generation's membership is an `Arc<HashSet<u64>>` of PK hashes
+//! ([`compute_pk_hash`]), built once (immutable gens cached). Each source gets a
+//! `Vec<Arc<HashSet<u64>>>` of the newer generations' sets (`NEWER(G)`; base: all
+//! of them) — referenced, never merged. The KNN drops candidates whose PK is in
+//! any (see [`super::exec::PkHashFilterExec`]).
 //!
-//! Cross-generation only: within-gen duplicates share a hash and are collapsed
-//! downstream by the global dedup's `(generation, freshness)` tiebreaker.
+//! Cross-generation only: within-gen dups share a hash and fall to the global
+//! dedup's `(generation, freshness)` tiebreaker.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,18 +26,16 @@ use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::BatchStore;
 use crate::session::Session;
 
-/// Per-source blocked PK-hash set: each generation maps to `NEWER(G)`, the base
-/// table to the union of all generations. Only superseded generations get an
-/// entry (a present entry means "this source needs filtering"); the newest never
-/// does.
+/// Per-source `NEWER(G)`: each generation maps to the newer generations' sets
+/// (base table: all of them). Only superseded sources get an entry; the newest
+/// never does.
 pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
-) -> Result<HashMap<LsmGeneration, Arc<HashSet<u64>>>> {
-    // Hash each non-base source's membership. Base is the oldest source, so it
-    // supersedes nothing; its blocked set is just the union of all of them.
+) -> Result<HashMap<LsmGeneration, Vec<Arc<HashSet<u64>>>>> {
+    // Hash each non-base source's membership. Base (oldest) is blocked by all.
     let mut indexed: Vec<(LsmGeneration, Arc<HashSet<u64>>)> = Vec::new();
     let mut has_base = false;
     for source in sources {
@@ -60,36 +59,23 @@ pub async fn compute_source_block_lists(
         }
     }
 
-    // Newest first so each older gen is blocked against `NEWER(G)`.
+    // Newest-first: a gen's blocked list is the sets accumulated before it.
     indexed.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
-    let gens_newest_first: Vec<&HashSet<u64>> =
-        indexed.iter().map(|(_, hashes)| hashes.as_ref()).collect();
-    let (per_gen_blocked, full_union) = compute_blocked_sets(&gens_newest_first);
-
-    let mut blocked: HashMap<LsmGeneration, Arc<HashSet<u64>>> = HashMap::new();
-    for ((generation, _), set) in indexed.iter().zip(per_gen_blocked) {
-        if !set.is_empty() {
-            blocked.insert(*generation, Arc::new(set));
+    let mut blocked: HashMap<LsmGeneration, Vec<Arc<HashSet<u64>>>> = HashMap::new();
+    let mut newer: Vec<Arc<HashSet<u64>>> = Vec::new();
+    for (generation, hashes) in &indexed {
+        if !newer.is_empty() {
+            blocked.insert(*generation, newer.clone());
+        }
+        if !hashes.is_empty() {
+            newer.push(hashes.clone());
         }
     }
     // The base table (oldest) is superseded by every non-base generation.
-    if has_base && !full_union.is_empty() {
-        blocked.insert(LsmGeneration::BASE_TABLE, Arc::new(full_union));
+    if has_base && !newer.is_empty() {
+        blocked.insert(LsmGeneration::BASE_TABLE, newer);
     }
     Ok(blocked)
-}
-
-/// `NEWER(G)` for each generation (aligned with `gens_newest_first`; newest gets
-/// an empty set), plus the union of all of them — the base table's blocked set.
-fn compute_blocked_sets(gens_newest_first: &[&HashSet<u64>]) -> (Vec<HashSet<u64>>, HashSet<u64>) {
-    let mut newer: HashSet<u64> = HashSet::new();
-    let mut per_gen = Vec::with_capacity(gens_newest_first.len());
-    for hashes in gens_newest_first {
-        // NEWER(G): everything folded in so far (newest-first).
-        per_gen.push(newer.clone());
-        newer.extend(hashes.iter().copied());
-    }
-    (per_gen, newer)
 }
 
 /// Hash the PK membership of an in-memory memtable (active or frozen) from its
@@ -193,6 +179,11 @@ mod tests {
         compute_pk_hash(&batch, &pk_indices, 0)
     }
 
+    /// Whether `id`'s PK hash is blocked by any of a source's newer-gen sets.
+    fn blocks(sets: &[Arc<HashSet<u64>>], id: i32) -> bool {
+        sets.iter().any(|s| s.contains(&hash_id(id)))
+    }
+
     #[test]
     fn pk_hashes_collapse_within_gen_duplicates() {
         // Two rows share pk=1 (a within-gen duplicate); pk=2 is unique.
@@ -217,22 +208,6 @@ mod tests {
 
         let hashes = pk_hashes_from_batch_store(&store, &["id".to_string()]).unwrap();
         assert_eq!(hashes.len(), 3); // distinct pks: 1, 2, 3
-    }
-
-    #[test]
-    fn compute_blocked_sets_accumulates_newer_generations() {
-        // Newest gen: pk 1, 2. Older gen: pk 1, 3.
-        let gen_new = HashSet::from([1u64, 2]);
-        let gen_old = HashSet::from([1u64, 3]);
-
-        let (per_gen, full_union) = compute_blocked_sets(&[&gen_new, &gen_old]);
-
-        // The newest generation is superseded by nothing.
-        assert!(per_gen[0].is_empty());
-        // The older generation is superseded by the newer one's membership.
-        assert_eq!(per_gen[1], HashSet::from([1, 2]));
-        // The full union (base's blocked set) spans both generations.
-        assert_eq!(full_union, HashSet::from([1, 2, 3]));
     }
 
     #[tokio::test]
@@ -271,9 +246,9 @@ mod tests {
 
         let g1 = LsmGeneration::memtable(1);
         let g2 = LsmGeneration::memtable(2);
-        // The newer active write supersedes the frozen copy: gen 1's blocked set
-        // contains pk=1's hash, so its KNN drops pk=1.
-        assert!(blocked[&g1].contains(&hash_id(1)));
+        // The newer active write supersedes the frozen copy: gen 1 is blocked on
+        // pk=1, so its KNN drops pk=1.
+        assert!(blocks(&blocked[&g1], 1));
         // The active (newest) generation is superseded by nothing — no entry.
         assert!(!blocked.contains_key(&g2));
     }
@@ -323,12 +298,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Base's blocked set = union of newer gens: pk=1 (re-written in gen 1) is
+        // Base is blocked by every newer gen: pk=1 (re-written in gen 1) is
         // blocked, pk=3 (base-only) is not. End-to-end drop: vector_search specs.
         let base_blocked = blocked
             .get(&LsmGeneration::BASE_TABLE)
             .expect("base has a blocked set");
-        assert!(base_blocked.contains(&hash_id(1)));
-        assert!(!base_blocked.contains(&hash_id(3)));
+        assert!(blocks(base_blocked, 1));
+        assert!(!blocks(base_blocked, 3));
     }
 }
