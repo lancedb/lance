@@ -219,6 +219,11 @@ impl Visit for EventToMap {
     }
 }
 
+fn trace_event_log_target(target: &str) -> String {
+    let target = target.strip_prefix("lance::").unwrap_or(target);
+    format!("lance::events::{target}")
+}
+
 #[derive(Clone)]
 pub struct LoggingPassthroughRef(Arc<RwLock<Option<LoggingPassthroughState>>>);
 
@@ -248,7 +253,14 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
 
         let mut fields = EventToStr::default();
         event.record(&mut fields);
-        log::log!(target: "lance::events", state.level, "target=\"{}\" {}", event.metadata().target(), fields.str);
+        let log_target = trace_event_log_target(event.metadata().target());
+        log::log!(
+            target: &log_target,
+            state.level,
+            "target=\"{}\" {}",
+            event.metadata().target(),
+            fields.str
+        );
 
         if let Some(callback_sender) = state.callback_sender.as_ref() {
             let mut args = EventToMap::default();

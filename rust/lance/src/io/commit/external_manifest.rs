@@ -15,8 +15,7 @@ mod test {
     };
     use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
+    use object_store::{ObjectStoreExt, local::LocalFileSystem, path::Path};
     use tokio::sync::Mutex;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -268,6 +267,15 @@ mod test {
                         .to_string_lossy()
                         .contains(".manifest#")
                 })
+                // The version hint file is expected to be present.
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    !entry
+                        .file_name()
+                        .as_os_str()
+                        .to_string_lossy()
+                        .starts_with("latest_version_hint")
+                })
                 .collect::<Vec<_>>();
             assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
         }
@@ -308,8 +316,9 @@ mod test {
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
         // Move version 6 to a temporary location, put that in the store.
         let base_path = Path::parse(ds_uri).unwrap();
-        let version_six_staging_location =
-            base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
+        let version_six_staging_location = base_path
+            .clone()
+            .join(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
             .rename(
                 &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
@@ -372,6 +381,15 @@ mod test {
                     .as_os_str()
                     .to_string_lossy()
                     .ends_with(".manifest")
+            })
+            // The version hint file is expected to be present.
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                !entry
+                    .file_name()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with("latest_version_hint")
             })
             .collect::<Vec<_>>();
         assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);

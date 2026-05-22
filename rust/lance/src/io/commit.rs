@@ -26,10 +26,10 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
+use lance_select::RowAddrTreeMap;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
     WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
@@ -50,6 +50,7 @@ use crate::dataset::{
 };
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::vector::details::infer_missing_vector_details;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -60,6 +61,8 @@ use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
+#[cfg(test)]
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -79,7 +82,10 @@ pub(crate) async fn read_transaction_file(
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
@@ -99,7 +105,10 @@ async fn cleanup_transaction_file(
     if transaction_file.is_empty() {
         return;
     }
-    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
     if let Err(e) = object_store.delete(&path).await {
         log::warn!(
             "Failed to clean up orphaned transaction file '{}': {}",
@@ -116,11 +125,14 @@ pub(crate) async fn write_transaction_file(
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
-    object_store.inner.put(&path, buf.into()).await?;
+    object_store.put(&path, &buf).await?;
 
     Ok(file_name)
 }
@@ -581,7 +593,7 @@ pub(crate) async fn migrate_fragments(
             let mut data_files = fragment.files.clone();
 
             // For each of the data files in the fragment, we need to get the file size
-            let object_store = dataset.object_store();
+            let object_store = dataset.object_store.as_ref();
             let get_sizes = data_files
                 .iter()
                 .map(|file| {
@@ -590,7 +602,7 @@ pub(crate) async fn migrate_fragments(
                     } else {
                         Either::Right(async {
                             object_store
-                                .size(&dataset.base.child("data").child(file.path.clone()))
+                                .size(&dataset.base.clone().join("data").join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
                                         Error::internal(format!("File {} has size 0", file.path))
@@ -660,6 +672,7 @@ fn must_recalculate_fragment_bitmap(
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 /// Indices might also be missing `files` (file sizes), so this function will collect them.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
+    infer_missing_vector_details(dataset, indices).await;
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
         Err(BadFragmentBitmapError { bad_indices }) => {
@@ -698,8 +711,9 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             let result = async {
                 let index_dir = dataset
                     .indice_files_dir(index)?
-                    .child(index.uuid.to_string());
-                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+                    .join(index.uuid.to_string());
+                let object_store = dataset.object_store_for_index(index).await?;
+                list_index_files_with_sizes(&object_store, &index_dir).await
             }
             .await;
             match result {
@@ -908,7 +922,7 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    // Note: object_store has been configured with WriteParams, but dataset.object_store()
+    // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;

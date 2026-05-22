@@ -236,11 +236,13 @@ impl JsonQueryParser {
                 ScalarIndexExpr::Query(ScalarIndexSearch {
                     column,
                     index_name,
+                    index_type,
                     query,
                     needs_recheck,
                 }) => ScalarIndexExpr::Query(ScalarIndexSearch {
                     column,
                     index_name,
+                    index_type,
                     query: Arc::new(JsonQuery::new(query, self.path.clone())),
                     needs_recheck,
                 }),

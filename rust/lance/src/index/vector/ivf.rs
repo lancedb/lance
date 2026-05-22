@@ -17,7 +17,13 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
-    index::{INDEX_FILE_NAME, pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions},
+    index::{
+        INDEX_FILE_NAME,
+        api::{IndexSegment, IndexSegmentPlan},
+        pb,
+        prefilter::PreFilter,
+        vector::ivf::io::write_pq_partitions,
+    },
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use arrow::array::ArrayData;
@@ -45,6 +51,7 @@ use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
+    utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
 use lance_file::{
@@ -105,7 +112,11 @@ use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::mpsc;
 use tracing::instrument;
 use uuid::Uuid;
@@ -400,11 +411,11 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store();
+    let object_store = dataset.object_store.as_ref();
     let index_file = dataset
         .indices_dir()
-        .child(new_uuid.to_string())
-        .child(INDEX_FILE_NAME);
+        .join(new_uuid.to_string())
+        .join(INDEX_FILE_NAME);
     let writer = object_store.create(&index_file).await?;
 
     let first_idx = existing_indices[0]
@@ -433,8 +444,8 @@ pub(crate) async fn optimize_vector_indices(
     {
         let aux_file = dataset
             .indices_dir()
-            .child(new_uuid.to_string())
-            .child(INDEX_AUXILIARY_FILE_NAME);
+            .join(new_uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME);
         let aux_writer = object_store.create(&aux_file).await?;
         optimize_ivf_hnsw_indices(
             Arc::new(dataset),
@@ -475,7 +486,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let existing_indices = existing_indices.to_vec();
 
     let new_uuid = Uuid::new_v4();
-    let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+    let index_dir = dataset.indices_dir().join(new_uuid.to_string());
     let ivf_model = existing_indices[0].ivf_model();
     let quantizer = existing_indices[0].quantizer();
     let distance_type = existing_indices[0].metric_type();
@@ -507,8 +518,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             } else {
@@ -525,8 +536,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             }
@@ -546,8 +557,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -566,8 +577,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -586,8 +597,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -605,8 +616,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -626,8 +637,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             } else {
@@ -644,8 +655,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             }
@@ -665,8 +676,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -685,8 +696,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -955,9 +966,50 @@ pub struct IvfIndexStatistics {
     num_partitions: usize,
     sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStatistics>,
-    centroids: Vec<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    centroids: Option<Vec<Vec<f32>>>,
     loss: Option<f64>,
     index_file_version: IndexFileVersion,
+}
+
+/// Environment variable controlling whether vector index statistics include
+/// the centroid vectors. When unset, centroids are still included for
+/// backward compatibility, but a one-time warning is logged. Set to a truthy
+/// value (e.g. `1`, `true`) to keep the current behavior without the warning,
+/// or any other value (e.g. `0`, `false`) to omit centroids from stats.
+pub const LANCE_INCLUDE_VECTOR_CENTROIDS_ENV: &str = "LANCE_INCLUDE_VECTOR_CENTROIDS";
+
+/// Read the centroids for inclusion in index stats, honoring
+/// `LANCE_INCLUDE_VECTOR_CENTROIDS`.
+///
+/// - If the env var is set to a truthy value (per `parse_env_as_bool`),
+///   returns the converted centroids.
+/// - If the env var is set to any other value, returns `Ok(None)` without
+///   reading the centroids.
+/// - If unset, returns the converted centroids and logs a one-time
+///   deprecation warning that the default will change in a future release.
+pub(crate) fn maybe_centroids_for_stats(
+    centroids: &FixedSizeListArray,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+
+    if std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).is_err() {
+        WARN_ONCE.call_once(|| {
+            warn!(
+                "Vector index statistics currently include centroids, which can use \
+                 significant memory for large indexes. In a future release, centroids \
+                 will be excluded from statistics by default. Set {}=true to preserve \
+                 the current behavior (and silence this warning), or {}=false to opt \
+                 in to the new behavior now.",
+                LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, LANCE_INCLUDE_VECTOR_CENTROIDS_ENV
+            );
+        });
+    }
+    if !parse_env_as_bool(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, true) {
+        return Ok(None);
+    }
+    Ok(Some(centroids_to_vectors(centroids)?))
 }
 
 fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>> {
@@ -1050,7 +1102,7 @@ impl Index for IVFIndex {
             })
             .collect::<Vec<_>>();
 
-        let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
+        let centroid_vecs = maybe_centroids_for_stats(self.ivf.centroids.as_ref().unwrap())?;
 
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type: self.index_type().to_string(),
@@ -1561,7 +1613,7 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     write_ivf_pq_file(
-        dataset.object_store(),
+        dataset.object_store.as_ref(),
         dataset.indices_dir(),
         column,
         index_name,
@@ -1691,7 +1743,7 @@ pub(crate) async fn remap_index_file_v3(
     column: String,
 ) -> Result<()> {
     let dataset = dataset.clone();
-    let index_dir = dataset.indices_dir().child(new_uuid);
+    let index_dir = dataset.indices_dir().join(new_uuid);
     let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
     match index.sub_index_type() {
         (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
@@ -1791,9 +1843,9 @@ pub(crate) async fn remap_index_file(
     column: String,
     transforms: Vec<pb::Transform>,
 ) -> Result<()> {
-    let object_store = dataset.object_store();
-    let old_path = dataset.indices_dir().child(old_uuid).child(INDEX_FILE_NAME);
-    let new_path = dataset.indices_dir().child(new_uuid).child(INDEX_FILE_NAME);
+    let object_store = dataset.object_store.as_ref();
+    let old_path = dataset.indices_dir().join(old_uuid).join(INDEX_FILE_NAME);
+    let new_path = dataset.indices_dir().join(new_uuid).join(INDEX_FILE_NAME);
 
     let reader: Arc<dyn Reader> = object_store.open(&old_path).await?.into();
     let mut writer = object_store.create(&new_path).await?;
@@ -1860,7 +1912,7 @@ async fn write_ivf_pq_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let path = index_dir.child(uuid).child(INDEX_FILE_NAME);
+    let path = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
     let start = std::time::Instant::now();
@@ -1911,11 +1963,11 @@ pub async fn write_ivf_pq_file_from_existing_index(
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
-    let obj_store = dataset.object_store();
+    let obj_store = dataset.object_store.as_ref();
     let path = dataset
         .indices_dir()
-        .child(index_id.to_string())
-        .child("index.idx");
+        .join(index_id.to_string())
+        .join("index.idx");
     let mut writer = obj_store.create(&path).await?;
     write_pq_partitions(writer.as_mut(), &mut ivf, Some(streams), None).await?;
 
@@ -1953,8 +2005,8 @@ async fn write_ivf_hnsw_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let object_store = dataset.object_store();
-    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
+    let object_store = dataset.object_store.as_ref();
+    let path = dataset.indices_dir().join(uuid).join(INDEX_FILE_NAME);
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
@@ -1975,8 +2027,8 @@ async fn write_ivf_hnsw_file(
 
     let aux_path = dataset
         .indices_dir()
-        .child(uuid)
-        .child(INDEX_AUXILIARY_FILE_NAME);
+        .join(uuid)
+        .join(INDEX_AUXILIARY_FILE_NAME);
     let aux_writer = object_store.create(&aux_path).await?;
     let schema = Schema::new(vec![
         ROW_ID_FIELD.clone(),
@@ -2066,6 +2118,128 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
+pub(crate) async fn plan_segments(
+    segments: &[TableIndexMetadata],
+    requested_index_type: Option<IndexType>,
+    target_segment_bytes: Option<u64>,
+) -> Result<Vec<IndexSegmentPlan>> {
+    if let Some(index_type) = requested_index_type
+        && !matches!(
+            index_type,
+            IndexType::IvfFlat
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfRq
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq
+                | IndexType::Vector
+        )
+    {
+        return Err(Error::invalid_input(format!(
+            "Unsupported distributed vector segment build type: {}",
+            index_type
+        )));
+    }
+
+    if let Some(0) = target_segment_bytes {
+        return Err(Error::invalid_input(
+            "target_segment_bytes must be greater than zero".to_string(),
+        ));
+    }
+
+    if segments.is_empty() {
+        return Err(Error::index("No segment metadata was provided".to_string()));
+    }
+
+    let mut sorted_segments = segments.to_vec();
+    sorted_segments.sort_by_key(|index| index.uuid);
+    let mut expected_segment_ids = HashSet::with_capacity(sorted_segments.len());
+    for segment in &sorted_segments {
+        if !expected_segment_ids.insert(segment.uuid) {
+            return Err(Error::index(format!(
+                "Distributed vector segment '{}' was provided more than once",
+                segment.uuid
+            )));
+        }
+    }
+
+    let mut covered_fragments = RoaringBitmap::new();
+    for segment in &sorted_segments {
+        let fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        if covered_fragments.intersection_len(fragment_bitmap) > 0 {
+            return Err(Error::index(
+                "Distributed vector shards have overlapping fragment coverage".to_string(),
+            ));
+        }
+        covered_fragments |= fragment_bitmap.clone();
+    }
+
+    if target_segment_bytes.is_none() {
+        return sorted_segments
+            .into_iter()
+            .map(|segment| build_segment_plan(vec![segment], requested_index_type))
+            .collect();
+    }
+
+    let target_segment_bytes = target_segment_bytes.unwrap();
+    let mut plans = Vec::new();
+    let mut current_group = Vec::new();
+    let mut current_bytes = 0_u64;
+
+    for segment in sorted_segments {
+        let source_bytes = estimate_source_index_bytes(&segment);
+        if !current_group.is_empty()
+            && current_bytes.saturating_add(source_bytes) > target_segment_bytes
+        {
+            plans.push(build_segment_plan(
+                std::mem::take(&mut current_group),
+                requested_index_type,
+            )?);
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(source_bytes);
+        current_group.push(segment);
+    }
+
+    if !current_group.is_empty() {
+        plans.push(build_segment_plan(current_group, requested_index_type)?);
+    }
+
+    Ok(plans)
+}
+
+pub(crate) async fn build_segment(
+    object_store: &ObjectStore,
+    indices_dir: &Path,
+    segment_plan: &IndexSegmentPlan,
+) -> Result<IndexSegment> {
+    let built_segment = segment_plan.segment().clone();
+    let segments = segment_plan.segments();
+
+    if segments.len() == 1 && segments[0].uuid == built_segment.uuid() {
+        return Ok(built_segment);
+    }
+
+    let final_dir = indices_dir.clone().join(built_segment.uuid().to_string());
+    merge_segments_to_dir(
+        object_store,
+        indices_dir,
+        &final_dir,
+        segment_plan.segments(),
+        segment_plan.requested_index_type(),
+        lance_index::progress::noop_progress(),
+    )
+    .await?;
+
+    Ok(built_segment)
+}
+
 /// Merge one caller-defined group of source segments into a single segment.
 pub(crate) async fn merge_segments(
     object_store: &ObjectStore,
@@ -2110,14 +2284,22 @@ pub(crate) async fn merge_segments_with_progress(
 
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
-    let final_dir = indices_dir.child(segment_uuid.to_string());
-    merge_segments_to_dir(object_store, indices_dir, &final_dir, &segments, progress).await?;
+    let final_dir = indices_dir.clone().join(segment_uuid.to_string());
+    merge_segments_to_dir(
+        object_store,
+        indices_dir,
+        &final_dir,
+        &segments,
+        None,
+        progress,
+    )
+    .await?;
     let files = list_index_files_with_sizes(object_store, &final_dir).await?;
 
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(crate::index::vector_index_details())),
+        index_details: Some(Arc::new(crate::index::vector_index_details_default())),
         index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
@@ -2137,6 +2319,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
+    _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
     reset_final_segment_dir(object_store, final_dir).await?;
@@ -2150,16 +2333,18 @@ async fn merge_segments_to_dir(
         .iter()
         .map(|segment| {
             indices_dir
-                .child(segment.uuid.to_string())
-                .child(INDEX_AUXILIARY_FILE_NAME)
+                .clone()
+                .join(segment.uuid.to_string())
+                .join(INDEX_AUXILIARY_FILE_NAME)
         })
         .collect::<Vec<_>>();
     let source_index_paths = segments
         .iter()
         .map(|segment| {
             indices_dir
-                .child(segment.uuid.to_string())
-                .child(INDEX_FILE_NAME)
+                .clone()
+                .join(segment.uuid.to_string())
+                .join(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
 
@@ -2182,6 +2367,56 @@ async fn merge_segments_to_dir(
     Ok(())
 }
 
+fn build_segment_plan(
+    group: Vec<TableIndexMetadata>,
+    requested_index_type: Option<IndexType>,
+) -> Result<IndexSegmentPlan> {
+    debug_assert!(!group.is_empty());
+    let first = &group[0];
+    let mut fragment_bitmap = RoaringBitmap::new();
+    let mut estimated_bytes = 0_u64;
+    let mut segments = Vec::with_capacity(group.len());
+
+    for segment in &group {
+        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "Segment '{}' is missing fragment coverage",
+                segment.uuid
+            ))
+        })?;
+        fragment_bitmap |= source_fragment_bitmap.clone();
+        estimated_bytes = estimated_bytes.saturating_add(estimate_source_index_bytes(segment));
+        segments.push(segment.clone());
+    }
+
+    let segment_uuid = if group.len() == 1 {
+        first.uuid
+    } else {
+        Uuid::new_v4()
+    };
+    let index_version = match requested_index_type {
+        Some(index_type) => index_type.version(),
+        None => infer_source_index_version(&group)?,
+    };
+
+    // Legacy source segments may not carry index_details. Fall back to an empty
+    // placeholder; `needs_vector_details_inference` will pick this up on the
+    // next manifest load and populate the real details from the index files.
+    let index_details = match first.index_details.as_ref() {
+        Some(d) => d.clone(),
+        None => Arc::new(crate::index::vector::details::vector_index_details_default()),
+    };
+
+    let segment = IndexSegment::new(segment_uuid, fragment_bitmap, index_details, index_version);
+
+    Ok(IndexSegmentPlan::new(
+        segment,
+        segments,
+        estimated_bytes,
+        requested_index_type,
+    ))
+}
+
 fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
     debug_assert!(!group.is_empty());
     let first = group[0].index_version;
@@ -2191,6 +2426,14 @@ fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
         ));
     }
     Ok(first)
+}
+
+fn estimate_source_index_bytes(index_metadata: &TableIndexMetadata) -> u64 {
+    index_metadata
+        .files
+        .as_ref()
+        .map(|files| files.iter().map(|file| file.size_bytes).sum())
+        .unwrap_or(0)
 }
 
 /// Best-effort reset of one target directory before rewriting it.
@@ -2210,7 +2453,7 @@ async fn write_root_vector_index_from_auxiliary(
     centroid_source_index_paths: &[Path],
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<()> {
-    let aux_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
         SchedulerConfig::max_bandwidth(object_store),
@@ -2301,7 +2544,7 @@ async fn write_root_vector_index_from_auxiliary(
         };
 
     // Write root index.idx via V2 writer so downstream opens through v2 path.
-    let index_path = index_dir.child(INDEX_FILE_NAME);
+    let index_path = index_dir.clone().join(INDEX_FILE_NAME);
     let obj_writer = object_store.create(&index_path).await?;
     progress
         .stage_start("write_root_index", Some(1), "files")
@@ -4036,11 +4279,98 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::IndexFileVersion;
-    use crate::index::vector_index_details;
+    use crate::index::vector_index_details_default;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    // Verifies LANCE_INCLUDE_VECTOR_CENTROIDS env var is honored by
+    // maybe_centroids_for_stats. The env var is process-global, so this test
+    // is serialized against any other test that touches the same key.
+    #[test]
+    #[serial_test::serial(LANCE_INCLUDE_VECTOR_CENTROIDS)]
+    fn test_maybe_centroids_for_stats_env_var() {
+        let centroids = Float32Array::from(vec![1.0_f32, 2.0, 3.0, 4.0]);
+        let centroids = FixedSizeListArray::try_new_from_values(centroids, 2).unwrap();
+        let expected = Some(vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+
+        // Save the original value so we can restore it afterwards.
+        let original = std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).ok();
+
+        // Unset → centroids included (with one-time warning).
+        unsafe {
+            std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV);
+        }
+        assert_eq!(maybe_centroids_for_stats(&centroids).unwrap(), expected);
+
+        // Truthy values → centroids included.
+        for truthy in ["1", "true", "TRUE", "on", "yes", "y"] {
+            unsafe {
+                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, truthy);
+            }
+            assert_eq!(
+                maybe_centroids_for_stats(&centroids).unwrap(),
+                expected,
+                "expected centroids to be included for {truthy:?}",
+            );
+        }
+
+        // Non-truthy values → centroids omitted.
+        for falsy in ["0", "false", "FALSE", "no", "off"] {
+            unsafe {
+                std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, falsy);
+            }
+            assert_eq!(
+                maybe_centroids_for_stats(&centroids).unwrap(),
+                None,
+                "expected centroids to be omitted for {falsy:?}",
+            );
+        }
+
+        // Restore original value.
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, v),
+                None => std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV),
+            }
+        }
+    }
+
+    // Verifies that when centroids are omitted via the env var, the
+    // serialized stats JSON does not contain the `centroids` field at all
+    // (instead of an explicit null), since downstream code distinguishes
+    // missing from null.
+    #[test]
+    #[serial_test::serial(LANCE_INCLUDE_VECTOR_CENTROIDS)]
+    fn test_stats_centroids_omitted_when_disabled() {
+        let original = std::env::var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV).ok();
+
+        unsafe {
+            std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, "false");
+        }
+        let stats = IvfIndexStatistics {
+            index_type: "IVF_PQ".to_string(),
+            uuid: "uuid".to_string(),
+            uri: "uri".to_string(),
+            metric_type: "l2".to_string(),
+            num_partitions: 0,
+            sub_index: serde_json::Value::Null,
+            partitions: vec![],
+            centroids: None,
+            loss: None,
+            index_file_version: IndexFileVersion::V3,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(json.get("centroids").is_none());
+
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV, v),
+                None => std::env::remove_var(LANCE_INCLUDE_VECTOR_CENTROIDS_ENV),
+            }
+        }
+    }
 
     /// This goal of this function is to generate data that behaves in a very deterministic way so that
     /// we can evaluate the correctness of an IVF_PQ implementation.  Currently it is restricted to the
@@ -4221,6 +4551,7 @@ mod tests {
                     refine_factor: None,
                     metric_type: Some(MetricType::L2),
                     use_index: true,
+                    query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                     dist_q_c: 0.0,
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();
@@ -4421,7 +4752,7 @@ mod tests {
             fields: vec![field.id],
             name: INDEX_NAME.to_string(),
             fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
@@ -4460,7 +4791,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
@@ -4520,7 +4851,7 @@ mod tests {
             fields: vec![field.id],
             name: format!("{}_remapped", INDEX_NAME),
             fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
@@ -5733,11 +6064,11 @@ mod tests {
             .unwrap();
 
         // Reset IO stats after index creation
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all partitions into cache
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -5754,7 +6085,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -5764,7 +6095,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -5808,11 +6139,11 @@ mod tests {
             .clone();
 
         // Reset IO stats after migration and sampling.
-        dataset.object_store().io_stats_incremental();
+        dataset.object_store.as_ref().io_stats_incremental();
 
         // Prewarm should perform IO to load all index deltas into cache.
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -5828,7 +6159,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -5838,7 +6169,7 @@ mod tests {
 
         // Second prewarm should not need IO (already cached).
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store().io_stats_incremental();
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 

@@ -293,53 +293,30 @@ where
     })
 }
 
-// Quantize the distance table to u8, map distance `d` to `(d-qmin) * 255 / (qmax-qmin)`
+// Quantize the distance table into a caller-owned buffer.
 #[inline]
-fn quantize_dist_table(dist_table: &[f32]) -> (f32, f32, Vec<u8>) {
+fn quantize_dist_table_into(dist_table: &[f32], quantized_dist_table: &mut Vec<u8>) -> (f32, f32) {
     let (qmin, qmax) = dist_table
         .iter()
         .cloned()
         .minmax_by(|a, b| a.total_cmp(b))
         .into_option()
         .unwrap();
+    quantized_dist_table.clear();
+    quantized_dist_table.resize(dist_table.len(), 0);
     // this happens if the query is all zeros
     if qmin == qmax {
-        return (qmin, qmax, vec![0; dist_table.len()]);
+        return (qmin, qmax);
     }
     let factor = 255.0 / (qmax - qmin);
-    let quantized_dist_table = dist_table
-        .iter()
-        .map(|&d| ((d - qmin) * factor).round() as u8)
-        .collect();
-
-    (qmin, qmax, quantized_dist_table)
-}
-
-#[inline]
-fn compute_rq_distance_flat(
-    dist_table: &[f32],
-    codes: &[u8],
-    offset: usize,
-    length: usize,
-    dists: &mut [f32],
-) {
-    let d = dist_table.len() / 4;
-    let code_len = d / u8::BITS as usize;
-    let codes = &codes[offset * code_len..(offset + length) * code_len];
-    let dists = &mut dists[offset..offset + length];
-
-    for (sub_vec_idx, codes) in codes.chunks_exact(length).enumerate() {
-        let current_dist_table = &dist_table
-            [sub_vec_idx * 2 * SEGMENT_NUM_CODES..(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES];
-        let next_dist_table = &dist_table
-            [(sub_vec_idx * 2 + 1) * SEGMENT_NUM_CODES..(sub_vec_idx * 2 + 2) * SEGMENT_NUM_CODES];
-
-        codes.iter().zip(dists.iter_mut()).for_each(|(code, dist)| {
-            let current_code = (code & 0x0F) as usize;
-            let next_code = (code >> 4) as usize;
-            *dist += current_dist_table[current_code] + next_dist_table[next_code];
+    quantized_dist_table
+        .iter_mut()
+        .zip(dist_table.iter())
+        .for_each(|(quantized, &d)| {
+            *quantized = ((d - qmin) * factor).round() as u8;
         });
-    }
+
+    (qmin, qmax)
 }
 
 impl DistCalculator for RabitDistCalculator<'_> {
@@ -358,34 +335,48 @@ impl DistCalculator for RabitDistCalculator<'_> {
 
     #[inline(always)]
     fn distance_all(&self, _: usize) -> Vec<f32> {
+        let mut dists = Vec::new();
+        let mut quantized_dists = Vec::new();
+        let mut quantized_dists_table = Vec::new();
+        self.distance_all_with_scratch(
+            0,
+            &mut dists,
+            &mut quantized_dists,
+            &mut quantized_dists_table,
+        );
+        dists
+    }
+
+    #[inline(always)]
+    fn distance_all_with_scratch(
+        &self,
+        _: usize,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+    ) {
         let code_len = self.dim * (self.num_bits as usize) / u8::BITS as usize;
         let n = self.codes.len() / code_len;
         if n == 0 {
-            return Vec::new();
+            dists.clear();
+            quantized_dists.clear();
+            return;
         }
 
-        let mut dists = vec![0.0; n];
-
-        let (qmin, qmax, quantized_dists_table) = quantize_dist_table(&self.dist_table);
-        let mut quantized_dists = vec![0; n];
+        dists.clear();
+        dists.resize(n, 0.0);
+        let (qmin, qmax) = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
+        quantized_dists.clear();
+        quantized_dists.resize(n, 0);
 
         let remainder = n % BATCH_SIZE;
         simd::dist_table::sum_4bit_dist_table(
             n - remainder,
             code_len,
             self.codes,
-            &quantized_dists_table,
-            &mut quantized_dists,
+            quantized_dists_table,
+            quantized_dists,
         );
-        if remainder > 0 {
-            compute_rq_distance_flat(
-                &self.dist_table,
-                self.codes,
-                n - remainder,
-                remainder,
-                &mut dists,
-            );
-        }
 
         let range = (qmax - qmin) / 255.0;
         let num_tables = quantized_dists_table.len() / 16;
@@ -393,19 +384,28 @@ impl DistCalculator for RabitDistCalculator<'_> {
         dists
             .iter_mut()
             .take(n - remainder)
-            .zip(quantized_dists.into_iter().take(n - remainder))
+            .zip(quantized_dists.iter().take(n - remainder))
             .for_each(|(dist, q_dist)| {
-                *dist = (q_dist as f32) * range + sum_min;
+                *dist = (*q_dist as f32) * range + sum_min;
             });
 
         dists
-            .into_iter()
+            .iter_mut()
             .enumerate()
-            .map(|(id, dist)| {
-                let dist_vq_qr = (2.0 * dist - self.sum_q) / self.sqrt_d;
-                dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
-            })
-            .collect()
+            .take(n - remainder)
+            .for_each(|(id, dist)| {
+                let dist_vq_qr = (2.0 * *dist - self.sum_q) / self.sqrt_d;
+                *dist =
+                    dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor;
+            });
+
+        dists
+            .iter_mut()
+            .enumerate()
+            .skip(n - remainder)
+            .for_each(|(id, dist)| {
+                *dist = self.distance(id as u32);
+            });
     }
 }
 

@@ -299,6 +299,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 };
                 Ok(Self(op))
             }

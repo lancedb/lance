@@ -449,7 +449,7 @@ impl IvfShuffler {
         data: impl Stream<Item = Result<RecordBatch>>,
     ) -> Result<()> {
         let object_store = ObjectStore::local();
-        let path = self.output_dir.child(UNSORTED_BUFFER);
+        let path = self.output_dir.clone().join(UNSORTED_BUFFER);
         let writer = object_store.create(&path).await?;
 
         let mut data = Box::pin(data.peekable());
@@ -504,7 +504,7 @@ impl IvfShuffler {
         let mut total_batches = vec![];
         for buffer in &self.unsorted_buffers {
             let object_store = ObjectStore::local();
-            let path = self.output_dir.child(buffer.as_str());
+            let path = self.output_dir.clone().join(buffer.as_str());
 
             if self.is_legacy {
                 let reader =
@@ -548,7 +548,7 @@ impl IvfShuffler {
         } in inputs
         {
             let file_name = &self.unsorted_buffers[file_idx];
-            let path = self.output_dir.child(file_name.as_str());
+            let path = self.output_dir.clone().join(file_name.as_str());
 
             if self.is_legacy {
                 let reader =
@@ -593,6 +593,7 @@ impl IvfShuffler {
                         16,
                         FilterExpression::no_filter(),
                     )
+                    .await
                     .unwrap();
 
                 while let Some(batch) = stream.next().await {
@@ -630,7 +631,7 @@ impl IvfShuffler {
         {
             let object_store = ObjectStore::local();
             let file_name = &self.unsorted_buffers[file_idx];
-            let path = self.output_dir.child(file_name.as_str());
+            let path = self.output_dir.clone().join(file_name.as_str());
             let mut _reader_handle = None;
 
             let mut stream = if self.is_legacy {
@@ -667,7 +668,8 @@ impl IvfShuffler {
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
-                    )?
+                    )
+                    .await?
                     .boxed()
             };
 
@@ -770,7 +772,7 @@ impl IvfShuffler {
                     // finally, write the shuffled data to disk
                     let object_store = ObjectStore::local();
                     let output_file = format!("{}_{}.lance", this.shuffle_output_root_filename, i);
-                    let path = this.output_dir.child(output_file.clone());
+                    let path = this.output_dir.clone().join(output_file.clone());
                     let writer = object_store.create(&path).await?;
 
                     info!(
@@ -825,7 +827,7 @@ impl IvfShuffler {
 
         for file in files {
             let object_store = Arc::new(ObjectStore::local());
-            let path = basedir.child(file);
+            let path = basedir.clone().join(file);
             let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
             let scan_scheduler = ScanScheduler::new(object_store, scheduler_config);
             let file_scheduler = scan_scheduler
@@ -845,7 +847,8 @@ impl IvfShuffler {
                     /*batch_size=*/ 1,
                     /*batch_readahead=*/ 32,
                     FilterExpression::no_filter(),
-                )?
+                )
+                .await?
                 .and_then(|batch| {
                     let list_array = batch
                         .column(0)

@@ -176,6 +176,26 @@ public abstract class FullTextQuery {
     }
 
     @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof MatchQuery)) return false;
+      MatchQuery other = (MatchQuery) o;
+      return Float.compare(boost, other.boost) == 0
+          && maxExpansions == other.maxExpansions
+          && prefixLength == other.prefixLength
+          && operator == other.operator
+          && Objects.equals(queryText, other.queryText)
+          && Objects.equals(column, other.column)
+          && Objects.equals(fuzziness, other.fuzziness);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(
+          queryText, column, boost, fuzziness, maxExpansions, operator, prefixLength);
+    }
+
+    @Override
     public String toString() {
       return MoreObjects.toStringHelper(this)
           .add("type", getType())
@@ -223,6 +243,21 @@ public abstract class FullTextQuery {
 
     public int getSlop() {
       return slop;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof PhraseQuery)) return false;
+      PhraseQuery other = (PhraseQuery) o;
+      return slop == other.slop
+          && Objects.equals(queryText, other.queryText)
+          && Objects.equals(column, other.column);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(queryText, column, slop);
     }
 
     @Override
@@ -275,6 +310,22 @@ public abstract class FullTextQuery {
 
     public Operator getOperator() {
       return operator;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof MultiMatchQuery)) return false;
+      MultiMatchQuery other = (MultiMatchQuery) o;
+      return operator == other.operator
+          && Objects.equals(queryText, other.queryText)
+          && Objects.equals(columns, other.columns)
+          && Objects.equals(boosts, other.boosts);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(queryText, columns, operator, boosts);
     }
 
     @Override

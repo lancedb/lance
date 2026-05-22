@@ -67,6 +67,23 @@ impl MemBM25Scorer {
     }
 }
 
+impl Scorer for MemBM25Scorer {
+    fn query_weight(&self, token: &str) -> f32 {
+        let token_docs = self.num_docs_containing_token(token);
+        if token_docs == 0 {
+            return 0.0;
+        }
+        idf(token_docs, self.num_docs)
+    }
+
+    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+        let freq = freq as f32;
+        let doc_tokens = doc_tokens as f32;
+        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length());
+        (K1 + 1.0) * freq / (freq + doc_norm)
+    }
+}
+
 pub struct IndexBM25Scorer<'a> {
     partitions: Vec<&'a InvertedPartition>,
     num_docs: usize,

@@ -31,6 +31,7 @@ public class Query {
   private final Optional<Integer> refineFactor;
   private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
+  private final int queryParallelism;
 
   private Query(Builder builder) {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
@@ -50,6 +51,7 @@ public class Query {
     this.refineFactor = builder.refineFactor;
     this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
+    this.queryParallelism = builder.queryParallelism;
   }
 
   public String getColumn() {
@@ -92,6 +94,10 @@ public class Query {
     return useIndex;
   }
 
+  public int getQueryParallelism() {
+    return queryParallelism;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -104,6 +110,7 @@ public class Query {
         .add("refineFactor", refineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
+        .add("queryParallelism", queryParallelism)
         .toString();
   }
 
@@ -117,6 +124,7 @@ public class Query {
     private Optional<Integer> refineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
+    private int queryParallelism = 0;
 
     /**
      * Sets the column to be searched.
@@ -242,6 +250,24 @@ public class Query {
      */
     public Builder setUseIndex(boolean useIndex) {
       this.useIndex = useIndex;
+      return this;
+    }
+
+    /**
+     * Sets vector partition search concurrency for each query.
+     *
+     * <p>The default is 0. Value 0 uses the automatic policy, which currently maps to the
+     * single-worker sequential path. Value -1 uses the CPU pool size. Value 1 uses the
+     * single-worker sequential path. Values greater than or equal to 2 use the partition-parallel
+     * path and are clamped to the CPU pool size.
+     *
+     * @param queryParallelism The partition search concurrency policy.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setQueryParallelism(int queryParallelism) {
+      Preconditions.checkArgument(
+          queryParallelism >= -1, "Query parallelism must be greater than or equal to -1");
+      this.queryParallelism = queryParallelism;
       return this;
     }
 

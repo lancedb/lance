@@ -274,7 +274,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
             RecordBatch::try_new(Arc::new(new_schema.clone()), data.columns().to_vec()).unwrap();
 
         let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(&new_schema).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -291,7 +291,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::default(),
+                    LanceFileVersion::V2_2,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();

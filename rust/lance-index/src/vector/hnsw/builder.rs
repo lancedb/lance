@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{Rng, rng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
@@ -44,6 +44,15 @@ use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
+/// Fixed seed for HNSW node-level assignment.
+///
+/// A constant seed makes graph construction reproducible (same data + params =>
+/// same graph), which keeps index builds deterministic and tests stable. Recall
+/// is statistically unaffected — the level distribution is identical, only the
+/// random draws become fixed. Shared by the offline ([`HNSWBuilder`]) and online
+/// ([`super::online::OnlineHnswBuilder`]) builders so both produce comparable graphs.
+pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
+
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
@@ -58,6 +67,16 @@ pub struct HnswBuildParams {
 
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
+}
+
+impl From<&HnswBuildParams> for crate::pb::HnswParameters {
+    fn from(params: &HnswBuildParams) -> Self {
+        Self {
+            max_connections: params.m as u32,
+            construction_ef: params.ef_construction as u32,
+            max_level: params.max_level as u32,
+        }
+    }
 }
 
 impl Default for HnswBuildParams {
@@ -173,6 +192,30 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
+    /// Construct an HNSW from its constituent parts. Used by the online
+    /// builder when finalizing.
+    pub(crate) fn from_parts(
+        params: HnswBuildParams,
+        nodes: Vec<GraphBuilderNode>,
+        level_count: Vec<usize>,
+        entry_point: u32,
+    ) -> Self {
+        let queue_size = get_num_compute_intensive_cpus().max(1) * 2;
+        let visited_generator_queue = Arc::new(ArrayQueue::new(queue_size));
+        for _ in 0..queue_size {
+            let _ = visited_generator_queue.push(VisitedGenerator::new(0));
+        }
+        Self {
+            inner: Arc::new(HnswCore {
+                params,
+                nodes: Arc::new(nodes),
+                level_count,
+                entry_point,
+                visited_generator_queue,
+            }),
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             inner: Arc::new(HnswCore {
@@ -217,7 +260,8 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
-        let mut ep = OrderedNode::new(0, dist_calc.distance(0).into());
+        let entry = self.inner.entry_point;
+        let mut ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
         let nodes = self.inner.nodes.as_ref();
         for level in (0..self.max_level()).rev() {
             let cur_level = ImmutableHnswLevelView::new(level, nodes);
@@ -450,7 +494,7 @@ impl HnswBuilder {
             if len > 0 {
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
-            let mut level_rng = rng();
+            let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
             for i in 1..len {
                 nodes.push(RwLock::new(GraphBuilderNode::new(
                     i as u32,

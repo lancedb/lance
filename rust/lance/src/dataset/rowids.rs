@@ -39,7 +39,7 @@ pub async fn load_row_id_sequence(
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move {
-                    let path = dataset_clone.base.child(file_slice.path.as_str());
+                    let path = dataset_clone.base.clone().join(file_slice.path.as_str());
                     let range = file_slice.offset as usize
                         ..(file_slice.offset as usize + file_slice.size as usize);
                     let data = dataset_clone
@@ -559,7 +559,7 @@ mod test {
         let expected: Vec<i32> = (0..60)
             .filter(|&i| i != 2 && i != 3 && i != 5 && i != 9)
             .collect();
-        assert_eq!(id_set, expected.iter().cloned().collect());
+        assert_eq!(id_set, expected.iter().cloned().collect::<HashSet<_>>());
 
         // get the row_id where i == 15
         let mut scan = dataset.scan();

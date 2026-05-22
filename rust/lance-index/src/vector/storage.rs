@@ -44,6 +44,18 @@ pub trait DistCalculator {
     // k_hint is a hint that can be used for optimization
     fn distance_all(&self, k_hint: usize) -> Vec<f32>;
 
+    // Write the distances of all rows into caller-owned scratch buffers.
+    fn distance_all_with_scratch(
+        &self,
+        k_hint: usize,
+        dists: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+    ) {
+        dists.clear();
+        dists.extend(self.distance_all(k_hint));
+    }
+
     fn prefetch(&self, _id: u32) {}
 }
 
@@ -309,7 +321,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     u32::MAX,
                     1,
                     FilterExpression::no_filter(),
-                )?
+                )
+                .await?
                 .try_collect::<Vec<_>>()
                 .await?;
             let schema = Arc::new(self.reader.schema().as_ref().into());

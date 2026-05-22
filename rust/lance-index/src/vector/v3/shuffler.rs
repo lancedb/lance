@@ -111,8 +111,14 @@ impl Shuffler for IvfShuffler {
         let schema = data.schema().without_column(PART_ID_COLUMN);
         let mut writers = stream::iter(0..num_partitions)
             .map(|partition_id| {
-                let part_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
-                let spill_path = self.output_dir.child(format!("ivf_{}.spill", partition_id));
+                let part_path = self
+                    .output_dir
+                    .clone()
+                    .join(format!("ivf_{}.lance", partition_id));
+                let spill_path = self
+                    .output_dir
+                    .clone()
+                    .join(format!("ivf_{}.spill", partition_id));
                 let object_store = self.object_store.clone();
                 let schema = schema.clone();
                 let format_version = self.format_version;
@@ -242,7 +248,10 @@ impl ShuffleReader for IvfShufflerReader {
             return Ok(None);
         }
 
-        let partition_path = self.output_dir.child(format!("ivf_{}.lance", partition_id));
+        let partition_path = self
+            .output_dir
+            .clone()
+            .join(format!("ivf_{}.lance", partition_id));
 
         let reader = FileReader::try_open(
             self.scheduler
@@ -255,14 +264,17 @@ impl ShuffleReader for IvfShufflerReader {
         )
         .await?;
         let schema: Schema = reader.schema().as_ref().into();
-        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
-            Arc::new(schema),
-            reader.read_stream(
+        let stream = reader
+            .read_stream(
                 lance_io::ReadBatchParams::RangeFull,
                 u32::MAX,
                 16,
                 FilterExpression::no_filter(),
-            )?,
+            )
+            .await?;
+        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
+            Arc::new(schema),
+            stream,
         ))))
     }
 
@@ -435,8 +447,8 @@ impl Shuffler for TwoFileShuffler {
         );
 
         // Create data file writer
-        let data_path = self.output_dir.child("shuffle_data.lance");
-        let spill_path = self.output_dir.child("shuffle_data.spill");
+        let data_path = self.output_dir.clone().join("shuffle_data.lance");
+        let spill_path = self.output_dir.clone().join("shuffle_data.spill");
         let writer = self.object_store.create(&data_path).await?;
         let mut file_writer = FileWriter::try_new(
             writer,
@@ -446,8 +458,8 @@ impl Shuffler for TwoFileShuffler {
         .with_page_metadata_spill(self.object_store.clone(), spill_path);
 
         // Create offsets file writer
-        let offsets_path = self.output_dir.child("shuffle_offsets.lance");
-        let spill_path = self.output_dir.child("shuffle_offsets.spill");
+        let offsets_path = self.output_dir.clone().join("shuffle_offsets.lance");
+        let spill_path = self.output_dir.clone().join("shuffle_offsets.spill");
         let writer = self.object_store.create(&offsets_path).await?;
         let mut offsets_writer = FileWriter::try_new(
             writer,
@@ -573,7 +585,7 @@ impl TwoFileShuffleReader {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
-        let data_path = output_dir.child("shuffle_data.lance");
+        let data_path = output_dir.clone().join("shuffle_data.lance");
         let file_reader = FileReader::try_open(
             scheduler
                 .open_file(&data_path, &CachedFileSize::unknown())
@@ -585,7 +597,7 @@ impl TwoFileShuffleReader {
         )
         .await?;
 
-        let offsets_path = output_dir.child("shuffle_offsets.lance");
+        let offsets_path = output_dir.clone().join("shuffle_offsets.lance");
         let offsets_reader = FileReader::try_open(
             scheduler
                 .open_file(&offsets_path, &CachedFileSize::unknown())
@@ -620,12 +632,15 @@ impl TwoFileShuffleReader {
         }
         let positions = UInt32Array::from(positions);
         let num_positions = positions.len() as u32;
-        let offsets_stream = self.offsets_reader.read_stream(
-            ReadBatchParams::Indices(positions),
-            num_positions,
-            1,
-            FilterExpression::no_filter(),
-        )?;
+        let offsets_stream = self
+            .offsets_reader
+            .read_stream(
+                ReadBatchParams::Indices(positions),
+                num_positions,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await?;
         let schema = offsets_stream.schema().clone();
         let offsets = offsets_stream.try_collect::<Vec<_>>().await?;
         let offsets = if offsets.is_empty() {
@@ -672,14 +687,18 @@ impl ShuffleReader for TwoFileShuffleReader {
         }
 
         let schema: Schema = self.file_reader.schema().as_ref().into();
-        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
-            Arc::new(schema),
-            self.file_reader.read_stream(
+        let stream = self
+            .file_reader
+            .read_stream(
                 ReadBatchParams::Ranges(ranges.into()),
                 u32::MAX,
                 16,
                 FilterExpression::no_filter(),
-            )?,
+            )
+            .await?;
+        Ok(Some(Box::new(RecordBatchStreamAdapter::new(
+            Arc::new(schema),
+            stream,
         ))))
     }
 

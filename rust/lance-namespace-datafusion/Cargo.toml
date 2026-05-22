@@ -19,10 +19,8 @@ lance-namespace.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-arrow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
-datafusion-sql.workspace = true
 lance-namespace-impls.workspace = true
 tempfile.workspace = true
 

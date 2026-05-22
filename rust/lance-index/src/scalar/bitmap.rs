@@ -3,7 +3,8 @@
 
 use std::{
     any::Any,
-    collections::{BTreeMap, HashMap},
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::Debug,
     ops::Bound,
     sync::Arc,
@@ -18,19 +19,22 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_core::utils::mask::RowSetOps;
+use lance_arrow::ipc::{
+    read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
+    write_len_prefixed_bytes,
+};
 use lance_core::{
     Error, ROW_ID, Result,
-    cache::{CacheKey, LanceCache, WeakLanceCache},
+    cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
-    utils::{
-        mask::{NullableRowAddrSet, RowAddrTreeMap},
-        tokio::get_num_compute_intensive_cpus,
-    },
+    utils::tokio::get_num_compute_intensive_cpus,
 };
+use lance_io::object_store::ObjectStore;
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
+use object_store::path::Path;
 use roaring::RoaringBitmap;
-use serde::Serialize;
-use tracing::instrument;
+use serde::{Deserialize, Serialize};
+use tracing::{instrument, warn};
 
 use super::{AnyQuery, IndexStore, ScalarIndex};
 use super::{
@@ -40,12 +44,13 @@ use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
     frag_reuse::FragReuseIndex,
+    progress::IndexBuildProgress,
     scalar::{
         CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME,
+            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
         },
     },
 };
@@ -53,10 +58,18 @@ use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
+const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
+const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
+const EXPLICIT_SHARD_ID_TAG: u64 = 0;
+const IMPLICIT_FRAGMENT_ID_TAG: u64 = 1;
 
 const MAX_BITMAP_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
 
 const MAX_ROWS_PER_CHUNK: usize = 2 * 1024;
+// Smaller than MAX_ROWS_PER_CHUNK to bound the per-cursor in-memory batch
+// footprint during a k-way merge (N cursors × chunk), while still amortising
+// I/O over a reasonable number of rows per read.
+const MERGE_ROWS_PER_CHUNK: usize = 512;
 
 const BITMAP_INDEX_VERSION: u32 = 0;
 
@@ -133,6 +146,151 @@ impl CacheKey for BitmapKey {
     fn type_name() -> &'static str {
         "Bitmap"
     }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<RowAddrTreeMap>())
+    }
+}
+
+/// The serializable state of a [`BitmapIndex`].
+///
+/// `BitmapIndex` holds non-serializable infrastructure (an `IndexStore`, a
+/// cache handle, a lazy reader, a fragment-reuse index). `BitmapIndexState`
+/// captures just the data needed to rebuild it: the value→file-offset map,
+/// the null bitmap, and the value type.
+#[derive(Debug, Clone)]
+pub struct BitmapIndexState {
+    /// Value-to-row-offset lookup, encoded as an Arrow `RecordBatch` so we can
+    /// reuse the existing IPC utilities for zero-copy round trips.
+    ///
+    /// Schema: `keys: <value_type>`, `offsets: UInt64`. Iteration order of
+    /// `index_map` is preserved on serialize and the `BTreeMap` resorts the
+    /// entries on deserialize, so the wire form does not need to be sorted.
+    lookup_batch: RecordBatch,
+    /// Already-remapped null bitmap (remapping is applied during load, so the
+    /// cached state matches the in-memory representation).
+    null_map: Arc<RowAddrTreeMap>,
+    /// Cached separately from the schema for the empty-index case where the
+    /// `lookup_batch` is empty but we still need to remember the column type.
+    value_type: DataType,
+}
+
+impl DeepSizeOf for BitmapIndexState {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.lookup_batch.get_array_memory_size() + self.null_map.deep_size_of_children(context)
+    }
+}
+
+impl BitmapIndexState {
+    pub(crate) fn from_index(index: &BitmapIndex) -> Result<Self> {
+        Ok(Self {
+            lookup_batch: build_lookup_batch(&index.index_map, &index.value_type)?,
+            null_map: index.null_map.clone(),
+            value_type: index.value_type.clone(),
+        })
+    }
+
+    pub(crate) fn into_bitmap_index(
+        self,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<BitmapIndex>> {
+        let index_map = parse_lookup_batch(&self.lookup_batch)?;
+        Ok(Arc::new(BitmapIndex::new(
+            index_map,
+            self.null_map,
+            self.value_type,
+            store,
+            WeakLanceCache::from(index_cache),
+            frag_reuse_index,
+        )))
+    }
+}
+
+fn build_lookup_batch(
+    index_map: &BTreeMap<OrderableScalarValue, usize>,
+    value_type: &DataType,
+) -> Result<RecordBatch> {
+    let keys = if index_map.is_empty() {
+        arrow_array::new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(index_map.keys().map(|k| k.0.clone()))?
+    };
+    let offsets = Arc::new(UInt64Array::from_iter_values(
+        index_map.values().map(|v| *v as u64),
+    ));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("keys", value_type.clone(), true),
+        Field::new("offsets", DataType::UInt64, false),
+    ]));
+    Ok(RecordBatch::try_new(schema, vec![keys, offsets])?)
+}
+
+fn parse_lookup_batch(batch: &RecordBatch) -> Result<BTreeMap<OrderableScalarValue, usize>> {
+    let keys = batch.column(0);
+    let offsets = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            Error::internal("BitmapIndexState: expected UInt64 offsets column".to_string())
+        })?;
+    let mut index_map = BTreeMap::new();
+    for idx in 0..batch.num_rows() {
+        let value = OrderableScalarValue(ScalarValue::try_from_array(keys, idx)?);
+        index_map.insert(value, offsets.value(idx) as usize);
+    }
+    Ok(index_map)
+}
+
+impl CacheCodecImpl for BitmapIndexState {
+    /// Wire format:
+    /// ```text
+    /// [u64 null_map_len][null_map bytes]
+    /// [arrow IPC stream: (keys: <value_type>, offsets: UInt64)]
+    /// ```
+    /// The value type is recovered from the IPC stream schema.
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        let mut null_bytes = Vec::with_capacity(self.null_map.serialized_size());
+        self.null_map.serialize_into(&mut null_bytes)?;
+        write_len_prefixed_bytes(writer, &null_bytes)?;
+        write_ipc_stream(&self.lookup_batch, writer)?;
+        Ok(())
+    }
+
+    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let null_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
+        let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let value_type = lookup_batch.schema().field(0).data_type().clone();
+        Ok(Self {
+            lookup_batch,
+            null_map,
+            value_type,
+        })
+    }
+}
+
+/// Cache key for a [`BitmapIndexState`]. The cache is already namespaced
+/// per-index by the caller, so a constant key suffices.
+struct BitmapIndexStateKey;
+
+impl CacheKey for BitmapIndexStateKey {
+    type ValueType = BitmapIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+
+    fn type_name() -> &'static str {
+        "BitmapIndexState"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<BitmapIndexState>())
+    }
 }
 
 impl BitmapIndex {
@@ -179,35 +337,24 @@ impl BitmapIndex {
 
         let mut index_map: BTreeMap<OrderableScalarValue, usize> = BTreeMap::new();
         let mut null_map = Arc::new(RowAddrTreeMap::default());
-        let mut value_type: Option<DataType> = None;
         let mut null_location: Option<usize> = None;
-        let mut row_offset = 0;
+        let value_type = page_lookup_file.schema().fields[0].data_type();
 
-        for start_row in (0..total_rows).step_by(MAX_ROWS_PER_CHUNK) {
-            let end_row = (start_row + MAX_ROWS_PER_CHUNK).min(total_rows);
-            let chunk = page_lookup_file
-                .read_range(start_row..end_row, Some(&["keys"]))
-                .await?;
-
-            if chunk.num_rows() == 0 {
-                continue;
-            }
-
-            if value_type.is_none() {
-                value_type = Some(chunk.schema().field(0).data_type().clone());
-            }
-
-            let dict_keys = chunk.column(0);
-
-            for idx in 0..chunk.num_rows() {
+        // Stream keys in bounded batches to avoid loading the entire keys
+        // column into memory at once.
+        let mut keys_stream = page_lookup_file
+            .read_range_stream(0..total_rows, Some(&["keys"]))
+            .await?;
+        let mut row_offset: usize = 0;
+        while let Some(keys_batch) = keys_stream.try_next().await? {
+            let dict_keys = keys_batch.column(0);
+            for idx in 0..keys_batch.num_rows() {
                 let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
-
                 if key.0.is_null() {
                     null_location = Some(row_offset);
                 } else {
                     index_map.insert(key, row_offset);
                 }
-
                 row_offset += 1;
             }
         }
@@ -233,12 +380,10 @@ impl BitmapIndex {
             null_map = Arc::new(bitmap);
         }
 
-        let final_value_type = value_type.expect_ok()?;
-
         Ok(Arc::new(Self::new(
             index_map,
             null_map,
-            final_value_type,
+            value_type,
             store,
             WeakLanceCache::from(index_cache),
             frag_reuse_index,
@@ -333,6 +478,37 @@ impl DeepSizeOf for BitmapIndex {
 #[derive(Serialize)]
 struct BitmapStatistics {
     num_bitmaps: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BitmapParameters {
+    /// Optional shard identifier for distributed bitmap builds spanning
+    /// multiple fragments.
+    pub shard_id: Option<u32>,
+}
+
+struct BitmapTrainingRequest {
+    parameters: BitmapParameters,
+    criteria: TrainingCriteria,
+}
+
+impl BitmapTrainingRequest {
+    fn new(parameters: BitmapParameters) -> Self {
+        Self {
+            parameters,
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        }
+    }
+}
+
+impl TrainingRequest for BitmapTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
 }
 
 #[async_trait]
@@ -606,7 +782,13 @@ impl ScalarIndex for BitmapIndex {
         dest_store: &dyn IndexStore,
         _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        BitmapIndexPlugin::streaming_build_and_write(new_data, Some(self), dest_store).await?;
+        BitmapIndexPlugin::streaming_build_and_write(
+            new_data,
+            Some(self),
+            dest_store,
+            BITMAP_LOOKUP_NAME,
+        )
+        .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -695,6 +877,289 @@ impl BitmapBatchWriter {
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
         self.file.finish_with_metadata(metadata).await?;
         Ok(())
+    }
+}
+
+fn bitmap_shard_file_name(partition_id: u64) -> String {
+    format!("{BITMAP_PART_LOOKUP_PREFIX}{partition_id}{BITMAP_PART_LOOKUP_SUFFIX}")
+}
+
+fn tagged_bitmap_partition_id(id: u32, tag: u64) -> u64 {
+    ((id as u64) << 32) | tag
+}
+
+fn bitmap_shard_partition_id(fragment_ids: &[u32], shard_id: Option<u32>) -> Result<u64> {
+    if fragment_ids.is_empty() {
+        return Err(Error::invalid_input(
+            "Bitmap shard build requires at least one fragment id".to_string(),
+        ));
+    }
+
+    if let Some(shard_id) = shard_id {
+        return Ok(tagged_bitmap_partition_id(shard_id, EXPLICIT_SHARD_ID_TAG));
+    }
+
+    let [fragment_id] = fragment_ids else {
+        return Err(Error::invalid_input(format!(
+            "Bitmap distributed build over multiple fragments requires an explicit shard_id. \
+             Received {} fragment ids: {:?}. Please assign mutually exclusive shard_id values \
+             to disjoint fragment groups.",
+            fragment_ids.len(),
+            fragment_ids
+        )));
+    };
+
+    Ok(tagged_bitmap_partition_id(
+        *fragment_id,
+        IMPLICIT_FRAGMENT_ID_TAG,
+    ))
+}
+
+fn extract_bitmap_shard_id(filename: &str) -> Result<u64> {
+    let partition_id = filename
+        .strip_prefix(BITMAP_PART_LOOKUP_PREFIX)
+        .and_then(|name| name.strip_suffix(BITMAP_PART_LOOKUP_SUFFIX))
+        .ok_or_else(|| {
+            Error::internal(format!("Invalid bitmap shard file name format: {filename}"))
+        })?;
+    partition_id.parse::<u64>().map_err(|_| {
+        Error::internal(format!(
+            "Failed to parse bitmap partition id from file name: {filename}"
+        ))
+    })
+}
+
+fn deserialize_bitmap(bitmap_bytes: &[u8], file_name: &str) -> Result<RowAddrTreeMap> {
+    RowAddrTreeMap::deserialize_from(bitmap_bytes).map_err(|error| {
+        Error::corrupt_file(
+            Path::from(file_name),
+            format!("Failed to deserialize bitmap bytes: {error}"),
+        )
+    })
+}
+
+async fn new_bitmap_batch_writer(
+    index_store: &dyn IndexStore,
+    file_name: &str,
+    value_type: &DataType,
+) -> Result<BitmapBatchWriter> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("keys", value_type.clone(), true),
+        Field::new("bitmaps", DataType::Binary, true),
+    ]));
+    let index_file = index_store.new_index_file(file_name, schema).await?;
+    Ok(BitmapBatchWriter::new(index_file))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BitmapHeapItem {
+    key: OrderableScalarValue,
+    shard_idx: usize,
+}
+
+impl Ord for BitmapHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key
+            .cmp(&other.key)
+            .then_with(|| self.shard_idx.cmp(&other.shard_idx))
+    }
+}
+
+impl PartialOrd for BitmapHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct BitmapShardCursor {
+    file_name: String,
+    reader: Arc<dyn IndexReader>,
+    total_rows: usize,
+    next_row_offset: usize,
+    batch: Option<RecordBatch>,
+    batch_row_idx: usize,
+}
+
+impl BitmapShardCursor {
+    async fn try_new(file_name: String, reader: Arc<dyn IndexReader>) -> Result<Option<Self>> {
+        let total_rows = reader.num_rows();
+        if total_rows == 0 {
+            return Ok(None);
+        }
+
+        let mut cursor = Self {
+            file_name,
+            reader,
+            total_rows,
+            next_row_offset: 0,
+            batch: None,
+            batch_row_idx: 0,
+        };
+        if cursor.advance().await? {
+            Ok(Some(cursor))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn peek_key(&self) -> Result<OrderableScalarValue> {
+        let batch = self.batch.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "Bitmap shard {} has no active batch",
+                self.file_name
+            ))
+        })?;
+        let key = ScalarValue::try_from_array(batch.column(0), self.batch_row_idx)?;
+        Ok(OrderableScalarValue(key))
+    }
+
+    fn take_current(&mut self) -> Result<(ScalarValue, RowAddrTreeMap)> {
+        let batch = self.batch.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "Bitmap shard {} has no active batch",
+                self.file_name
+            ))
+        })?;
+        let keys = batch.column(0);
+        let binary_bitmaps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                Error::corrupt_file(
+                    Path::from(self.file_name.as_str()),
+                    "Bitmap shard batch has non-binary bitmap column".to_string(),
+                )
+            })?;
+        let key = ScalarValue::try_from_array(keys, self.batch_row_idx)?;
+        let bitmap = deserialize_bitmap(binary_bitmaps.value(self.batch_row_idx), &self.file_name)?;
+        self.batch_row_idx += 1;
+        Ok((key, bitmap))
+    }
+
+    async fn advance(&mut self) -> Result<bool> {
+        loop {
+            if let Some(batch) = &self.batch
+                && self.batch_row_idx < batch.num_rows()
+            {
+                return Ok(true);
+            }
+
+            if self.next_row_offset >= self.total_rows {
+                self.batch = None;
+                return Ok(false);
+            }
+
+            let end_row = (self.next_row_offset + MERGE_ROWS_PER_CHUNK).min(self.total_rows);
+            let batch = self
+                .reader
+                .read_range(self.next_row_offset..end_row, None)
+                .await?;
+            self.next_row_offset = end_row;
+            self.batch = Some(batch);
+            self.batch_row_idx = 0;
+        }
+    }
+}
+
+async fn advance_cursor_and_push(
+    cursors: &mut [BitmapShardCursor],
+    heap: &mut BinaryHeap<Reverse<BitmapHeapItem>>,
+    shard_idx: usize,
+) -> Result<()> {
+    if cursors[shard_idx].advance().await? {
+        heap.push(Reverse(BitmapHeapItem {
+            key: cursors[shard_idx].peek_key()?,
+            shard_idx,
+        }));
+    }
+    Ok(())
+}
+
+async fn drain_same_key_bitmaps(
+    cursors: &mut [BitmapShardCursor],
+    heap: &mut BinaryHeap<Reverse<BitmapHeapItem>>,
+    item: BitmapHeapItem,
+) -> Result<(ScalarValue, RowAddrTreeMap)> {
+    let (key, mut merged_bitmap) = cursors[item.shard_idx].take_current()?;
+    let merged_key = OrderableScalarValue(key);
+    advance_cursor_and_push(cursors, heap, item.shard_idx).await?;
+
+    loop {
+        let Some(Reverse(next_item)) = heap.peek() else {
+            break;
+        };
+        if next_item.key != merged_key {
+            break;
+        }
+
+        let shard_idx = next_item.shard_idx;
+        let _ = heap.pop();
+        let (_, bitmap) = cursors[shard_idx].take_current()?;
+        merged_bitmap |= &bitmap;
+        advance_cursor_and_push(cursors, heap, shard_idx).await?;
+    }
+
+    Ok((merged_key.0, merged_bitmap))
+}
+
+async fn list_bitmap_shard_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    progress: &dyn IndexBuildProgress,
+) -> Result<Vec<String>> {
+    let mut shard_files = Vec::new();
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                let file_name = meta.location.filename().unwrap_or_default();
+                if file_name.starts_with(BITMAP_PART_LOOKUP_PREFIX)
+                    && file_name.ends_with(BITMAP_PART_LOOKUP_SUFFIX)
+                {
+                    shard_files.push(file_name.to_string());
+                    progress
+                        .stage_progress("scan_bitmap_shards", shard_files.len() as u64)
+                        .await?;
+                }
+            }
+            Err(err) => {
+                return Err(Error::io(format!(
+                    "Failed to list bitmap shard files in {}: {err}",
+                    index_dir
+                )));
+            }
+        }
+    }
+    let mut shard_files = shard_files
+        .into_iter()
+        .map(|file_name| extract_bitmap_shard_id(&file_name).map(|shard_id| (shard_id, file_name)))
+        .collect::<Result<Vec<_>>>()?;
+    shard_files.sort_unstable_by_key(|(shard_id, _)| *shard_id);
+    let shard_files = shard_files
+        .into_iter()
+        .map(|(_, file_name)| file_name)
+        .collect::<Vec<_>>();
+    if shard_files.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "No bitmap shard files found in index directory: {}; \
+             call build_index for each fragment before calling merge_index_metadata",
+            index_dir
+        )));
+    }
+    Ok(shard_files)
+}
+
+async fn cleanup_bitmap_shard_files(store: &dyn IndexStore, shard_files: &[String]) {
+    for file_name in shard_files {
+        if let Err(error) = store.delete_index_file(file_name).await {
+            warn!(
+                "Failed to delete bitmap shard file '{}': {}. \
+                 This does not affect the merged bitmap index, but the shard file \
+                 may need manual cleanup.",
+                file_name, error
+            );
+        }
     }
 }
 
@@ -834,7 +1299,24 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<()> {
-        Self::streaming_build_and_write(data, None, index_store).await
+        Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME).await
+    }
+
+    async fn train_bitmap_shard(
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        fragment_ids: &[u32],
+        shard_id: Option<u32>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+    ) -> Result<()> {
+        let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
+        let file_name = bitmap_shard_file_name(partition_id);
+        progress
+            .stage_start("build_bitmap_shard", None, "rows")
+            .await?;
+        Self::streaming_build_and_write(data, None, index_store, &file_name).await?;
+        progress.stage_complete("build_bitmap_shard").await?;
+        Ok(())
     }
 
     /// Builds and writes a bitmap index in a streaming fashion from value-sorted
@@ -848,18 +1330,12 @@ impl BitmapIndexPlugin {
         mut data_source: SendableRecordBatchStream,
         old_index: Option<&BitmapIndex>,
         index_store: &dyn IndexStore,
+        output_file_name: &str,
     ) -> Result<()> {
         let value_type = data_source.schema().field(0).data_type().clone();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("keys", value_type.clone(), true),
-            Field::new("bitmaps", DataType::Binary, true),
-        ]));
-
-        let index_file = index_store
-            .new_index_file(BITMAP_LOOKUP_NAME, schema)
-            .await?;
-        let mut writer = BitmapBatchWriter::new(index_file);
+        let mut writer =
+            new_bitmap_batch_writer(index_store, output_file_name, &value_type).await?;
 
         // Collect old index keys (already in memory as BTreeMap keys — this is
         // just a Vec of references, not a copy of the bitmaps themselves).
@@ -1020,6 +1496,99 @@ impl BitmapIndexPlugin {
             })
             .collect()
     }
+
+    /// Merge per-shard bitmap lookup files into a single bitmap index file.
+    ///
+    /// Each shard file is already sorted by key and can contain many distinct keys.
+    /// This method does not materialize an entire shard in memory. Instead, it keeps
+    /// one cursor per shard, where each cursor tracks the shard's current row within
+    /// a small in-memory batch. A min-heap stores the current key for each shard.
+    ///
+    /// The merge then proceeds as a streaming K-way merge:
+    /// - pop the smallest current key across all shards
+    /// - union the bitmap for that key with any other shards currently positioned on
+    ///   the same key
+    /// - advance only those shards that participated in the union and push their next
+    ///   keys back into the heap
+    ///
+    /// This keeps memory usage proportional to the number of shards plus the bitmaps
+    /// currently being merged, instead of the total number of keys across all shards.
+    async fn merge_shards(
+        store: &dyn IndexStore,
+        shard_files: &[String],
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<()> {
+        progress
+            .stage_start("merge_bitmap_shards", None, "bitmaps")
+            .await?;
+
+        let mut cursors = Vec::with_capacity(shard_files.len());
+        let mut heap = BinaryHeap::with_capacity(shard_files.len());
+        let mut value_type: Option<DataType> = None;
+
+        for file_name in shard_files {
+            let reader = store.open_index_file(file_name).await?;
+            let shard_value_type = reader.schema().fields[0].data_type().clone();
+            if let Some(existing_type) = &value_type {
+                if existing_type != &shard_value_type {
+                    return Err(Error::invalid_input(format!(
+                        "Bitmap shard {} has value type {:?}, expected {:?}",
+                        file_name, shard_value_type, existing_type
+                    )));
+                }
+            } else {
+                value_type = Some(shard_value_type);
+            }
+            if let Some(cursor) = BitmapShardCursor::try_new(file_name.clone(), reader).await? {
+                let key = cursor.peek_key()?;
+                let shard_idx = cursors.len();
+                cursors.push(cursor);
+                heap.push(Reverse(BitmapHeapItem { key, shard_idx }));
+            }
+        }
+
+        let value_type = value_type.ok_or_else(|| {
+            Error::invalid_input("Bitmap shard merge requires at least one shard file".to_string())
+        })?;
+        let mut writer = new_bitmap_batch_writer(store, BITMAP_LOOKUP_NAME, &value_type).await?;
+        let mut merged_keys = 0u64;
+
+        while let Some(Reverse(item)) = heap.pop() {
+            let (key, merged_bitmap) =
+                drain_same_key_bitmaps(&mut cursors, &mut heap, item).await?;
+            writer.emit(key, &merged_bitmap).await?;
+            merged_keys += 1;
+            progress
+                .stage_progress("merge_bitmap_shards", merged_keys)
+                .await?;
+        }
+
+        progress.stage_complete("merge_bitmap_shards").await?;
+        progress
+            .stage_start("write_bitmap_index", Some(1), "files")
+            .await?;
+        writer.finish().await?;
+        progress.stage_progress("write_bitmap_index", 1).await?;
+        progress.stage_complete("write_bitmap_index").await?;
+        Ok(())
+    }
+}
+
+pub async fn merge_index_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    store: Arc<dyn IndexStore>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<()> {
+    progress
+        .stage_start("scan_bitmap_shards", None, "files")
+        .await?;
+    let shard_files = list_bitmap_shard_files(object_store, index_dir, progress.as_ref()).await?;
+    progress.stage_complete("scan_bitmap_shards").await?;
+
+    BitmapIndexPlugin::merge_shards(store.as_ref(), &shard_files, progress).await?;
+    cleanup_bitmap_shard_files(store.as_ref(), &shard_files).await;
+    Ok(())
 }
 
 #[async_trait]
@@ -1030,7 +1599,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 
     fn new_training_request(
         &self,
-        _params: &str,
+        params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
@@ -1038,9 +1607,12 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
                 "A bitmap index can only be created on a non-nested field.".into(),
             ));
         }
-        Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
-        )))
+        let params = if params.is_empty() {
+            BitmapParameters::default()
+        } else {
+            serde_json::from_str::<BitmapParameters>(params)?
+        };
+        Ok(Box::new(BitmapTrainingRequest::new(params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -1056,24 +1628,47 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(index_name, false)))
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            false,
+        )))
     }
 
     async fn train_index(
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        _request: Box<dyn TrainingRequest>,
+        request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "Bitmap index does not support fragment training".into(),
+        let request = request
+            .as_any()
+            .downcast_ref::<BitmapTrainingRequest>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "BitmapIndexPlugin::train_index received a non-bitmap training request"
+                        .to_string(),
+                )
+            })?;
+        if let Some(fragment_ids) = fragment_ids.as_ref() {
+            Self::train_bitmap_shard(
+                data,
+                index_store,
+                fragment_ids,
+                request.parameters.shard_id,
+                progress,
+            )
+            .await?;
+        } else if request.parameters.shard_id.is_some() {
+            return Err(Error::invalid_input(
+                "Bitmap shard_id requires fragment_ids and is only supported for distributed shard builds"
+                    .to_string(),
             ));
+        } else {
+            Self::train_bitmap_index(data, index_store).await?;
         }
-
-        Self::train_bitmap_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
@@ -1091,6 +1686,34 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+    }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
+            return Ok(None);
+        };
+        let state = (*state).clone();
+        let index = state.into_bitmap_index(index_store, cache, frag_reuse_index)?;
+        Ok(Some(index as Arc<dyn ScalarIndex>))
+    }
+
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+        let bitmap = index
+            .as_any()
+            .downcast_ref::<BitmapIndex>()
+            .ok_or_else(|| {
+                Error::internal("BitmapIndexPlugin::put_in_cache called with a non-bitmap index")
+            })?;
+        let state = BitmapIndexState::from_index(bitmap)?;
+        cache
+            .insert_with_key(&BitmapIndexStateKey, Arc::new(state))
+            .await;
+        Ok(())
     }
 
     async fn load_statistics(
@@ -1135,10 +1758,45 @@ mod tests {
     }
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
-    use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
+    use lance_select::RowSetOps;
     use std::collections::HashMap;
+
+    fn assert_state_roundtrips(state: &BitmapIndexState) {
+        let mut buf = Vec::new();
+        state.serialize(&mut buf).unwrap();
+        let restored = BitmapIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        assert_eq!(restored.lookup_batch, state.lookup_batch);
+        assert_eq!(&*restored.null_map, &*state.null_map);
+        assert_eq!(restored.value_type, state.value_type);
+    }
+
+    #[test]
+    fn test_bitmap_index_state_codec_roundtrip() {
+        // Non-empty state with a few keys and a populated null map.
+        let mut index_map = BTreeMap::new();
+        index_map.insert(OrderableScalarValue(ScalarValue::Int32(Some(1))), 0);
+        index_map.insert(OrderableScalarValue(ScalarValue::Int32(Some(7))), 1);
+        index_map.insert(OrderableScalarValue(ScalarValue::Int32(Some(42))), 2);
+        let mut null_map = RowAddrTreeMap::new();
+        null_map.insert(RowAddress::new_from_parts(0, 3).into());
+        null_map.insert(RowAddress::new_from_parts(0, 5).into());
+        let state = BitmapIndexState {
+            lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
+            null_map: Arc::new(null_map),
+            value_type: DataType::Int32,
+        };
+        assert_state_roundtrips(&state);
+
+        // Empty state: no keys, empty null map. Schema still carries the type.
+        let empty_state = BitmapIndexState {
+            lookup_batch: build_lookup_batch(&BTreeMap::new(), &DataType::Utf8).unwrap(),
+            null_map: Arc::new(RowAddrTreeMap::new()),
+            value_type: DataType::Utf8,
+        };
+        assert_state_roundtrips(&empty_state);
+    }
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
@@ -1286,8 +1944,8 @@ mod tests {
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::LanceCache;
-        use lance_core::utils::mask::RowAddrTreeMap;
         use lance_io::object_store::ObjectStore;
+        use lance_select::RowAddrTreeMap;
         use std::collections::HashMap;
         use std::sync::Arc;
 

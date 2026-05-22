@@ -144,14 +144,24 @@ pub struct AwsCredentialVendor {
 impl AwsCredentialVendor {
     /// Create a new AWS credential vendor with the specified configuration.
     pub async fn new(config: AwsCredentialVendorConfig) -> Result<Self> {
-        let mut aws_config_loader = aws_config::defaults(BehaviorVersion::latest());
-
-        if let Some(ref region) = config.region {
-            aws_config_loader = aws_config_loader.region(aws_config::Region::new(region.clone()));
-        }
-
-        let aws_config = aws_config_loader.load().await;
-        let sts_client = StsClient::new(&aws_config);
+        // Load AWS config in a spawn_blocking context to avoid "Cannot drop a runtime"
+        // panic. aws_config::load() may internally create a nested tokio runtime for
+        // credential resolution (e.g., IMDS, SSO), which panics if dropped inside
+        // an existing async context.
+        let region = config.region.clone();
+        let sts_client = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let mut aws_config_loader = aws_config::defaults(BehaviorVersion::latest());
+                if let Some(region) = region {
+                    aws_config_loader = aws_config_loader.region(aws_config::Region::new(region));
+                }
+                let aws_config = aws_config_loader.load().await;
+                StsClient::new(&aws_config)
+            })
+        })
+        .await
+        .map_err(|e| lance_core::Error::io(format!("Failed to initialize AWS config: {:?}", e)))?;
 
         Ok(Self { config, sts_client })
     }

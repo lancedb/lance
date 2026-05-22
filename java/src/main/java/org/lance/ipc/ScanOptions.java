@@ -38,6 +38,7 @@ public class ScanOptions {
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
   private final Optional<ByteBuffer> substraitAggregate;
+  private final boolean collectStats;
 
   /**
    * Constructor for LanceScanOptions.
@@ -76,7 +77,8 @@ public class ScanOptions {
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      Optional<ByteBuffer> substraitAggregate) {
+      Optional<ByteBuffer> substraitAggregate,
+      boolean collectStats) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -96,6 +98,7 @@ public class ScanOptions {
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
     this.substraitAggregate = substraitAggregate;
+    this.collectStats = collectStats;
   }
 
   /**
@@ -237,6 +240,10 @@ public class ScanOptions {
     return substraitAggregate;
   }
 
+  public boolean isCollectStats() {
+    return collectStats;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -260,6 +267,7 @@ public class ScanOptions {
         .add(
             "substraitAggregate",
             substraitAggregate.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
+        .add("collectStats", collectStats)
         .toString();
   }
 
@@ -281,6 +289,7 @@ public class ScanOptions {
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
+    private boolean collectStats = false;
 
     public Builder() {}
 
@@ -306,6 +315,7 @@ public class ScanOptions {
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
       this.substraitAggregate = options.getSubstraitAggregate();
+      this.collectStats = options.isCollectStats();
     }
 
     /**
@@ -483,6 +493,20 @@ public class ScanOptions {
     }
 
     /**
+     * Enable or disable scan execution statistics collection.
+     *
+     * <p>When enabled, the native scanner will collect statistics (see {@link ScanStats}) for the
+     * scan and make them available via {@link LanceScanner#getStats()} after the scan stream is
+     * fully consumed and closed.
+     *
+     * <p>Default is false.
+     */
+    public Builder collectStats(boolean collectStats) {
+      this.collectStats = collectStats;
+      return this;
+    }
+
+    /**
      * Build the LanceScanOptions instance.
      *
      * @return LanceScanOptions instance with the specified parameters.
@@ -504,7 +528,8 @@ public class ScanOptions {
           batchReadahead,
           columnOrderings,
           useScalarIndex,
-          substraitAggregate);
+          substraitAggregate,
+          collectStats);
     }
   }
 }

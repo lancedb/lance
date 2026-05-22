@@ -278,6 +278,16 @@ impl HashJoiner {
             .await?;
         Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
     }
+
+    /// Returns `true` for each row where [collect_with_fallback] would take values from the
+    /// right-hand stream (hash hit); `false` where it falls back to the left batch row.
+    pub(super) fn matched_join_rows(&self, index_column: ArrayRef) -> Result<Vec<bool>> {
+        let rows = column_to_rows(index_column)?;
+        Ok(rows
+            .iter()
+            .map(|row| self.index_map.get(&row.owned()).is_some())
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +364,44 @@ mod tests {
         );
 
         assert_eq!(results.num_columns(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_matched_join_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..2)
+            .map(|v| {
+                let values = (v * 10..v * 10 + 10).collect::<Vec<_>>();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter(values.iter().copied())),
+                        Arc::new(StringArray::from_iter_values(
+                            values.iter().map(|val| format!("str_{}", val)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema,
+        ));
+        let joiner = HashJoiner::try_new(reader, "i").await.unwrap();
+
+        let index = Arc::new(Int32Array::from(vec![
+            Some(5),  // present in first RHS batch
+            Some(15), // present in second RHS batch
+            Some(99), // absent from RHS
+            None,     // null join key — no RHS entry
+        ]));
+        let matched = joiner.matched_join_rows(index).unwrap();
+        assert_eq!(matched, vec![true, true, false, false]);
     }
 
     #[tokio::test]

@@ -71,14 +71,17 @@ impl<T: Clone + std::fmt::Debug> WatchableOnceCellReader<T> {
 
     /// Wait for a value to be written.
     ///
-    /// Returns immediately if a value is already present.
-    pub async fn await_value(&mut self) -> T {
-        self.rx
-            .wait_for(|v| v.is_some())
-            .await
-            .expect("watch channel closed")
-            .clone()
-            .expect("no value found")
+    /// Returns immediately if a value is already present. Returns
+    /// `None` if the underlying watch channel was closed before a
+    /// value was published — typically because the producing task
+    /// died (panicked or returned `Err`). Earlier this case used to
+    /// panic with `expect("watch channel closed")`, which turned a
+    /// dead-flusher consequence into a worker panic and made the
+    /// merge_insert call fail with a `RustPanic` instead of a
+    /// recoverable error.
+    pub async fn await_value(&mut self) -> Option<T> {
+        self.rx.wait_for(|v| v.is_some()).await.ok()?;
+        self.rx.borrow().clone()
     }
 }
 
@@ -126,27 +129,32 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
     Some(bit_reverse_u64(reversed))
 }
 
+/// Path to the MemWAL root directory.
+///
+/// Returns: `{base_path}/_mem_wal/`
+pub fn mem_wal_path(base_path: &Path) -> Path {
+    base_path.clone().join("_mem_wal")
+}
+
 /// Base path for a shard within the MemWAL directory.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/`
 pub fn shard_base_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    base_path
-        .child("_mem_wal")
-        .child(shard_id.as_hyphenated().to_string())
+    mem_wal_path(base_path).join(shard_id.as_hyphenated().to_string())
 }
 
 /// Path to the WAL directory for a shard.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/wal/`
 pub fn shard_wal_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    shard_base_path(base_path, shard_id).child("wal")
+    shard_base_path(base_path, shard_id).join("wal")
 }
 
 /// Path to the manifest directory for a shard.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/manifest/`
 pub fn shard_manifest_path(base_path: &Path, shard_id: &Uuid) -> Path {
-    shard_base_path(base_path, shard_id).child("manifest")
+    shard_base_path(base_path, shard_id).join("manifest")
 }
 
 /// Path to a flushed MemTable directory.
@@ -158,7 +166,7 @@ pub fn flushed_memtable_path(
     random_hash: &str,
     generation: u64,
 ) -> Path {
-    shard_base_path(base_path, shard_id).child(format!("{}_gen_{}", random_hash, generation))
+    shard_base_path(base_path, shard_id).join(format!("{}_gen_{}", random_hash, generation))
 }
 
 /// Generate an 8-character random hex string for flushed MemTable directories.
@@ -241,6 +249,15 @@ mod tests {
     }
 
     #[test]
+    fn test_mem_wal_path() {
+        let base_path = Path::from("my/dataset");
+        assert_eq!(mem_wal_path(&base_path).as_ref(), "my/dataset/_mem_wal");
+
+        let empty_base = Path::from("");
+        assert_eq!(mem_wal_path(&empty_base).as_ref(), "_mem_wal");
+    }
+
+    #[test]
     fn test_shard_paths() {
         let base_path = Path::from("my/dataset");
         let shard_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
@@ -312,7 +329,7 @@ mod tests {
         cell.write(123);
 
         let result = handle.await.unwrap();
-        assert_eq!(result, 123);
+        assert_eq!(result, Some(123));
     }
 
     #[tokio::test]
@@ -328,7 +345,21 @@ mod tests {
 
         cell.write(456);
 
-        assert_eq!(h1.await.unwrap(), 456);
-        assert_eq!(h2.await.unwrap(), 456);
+        assert_eq!(h1.await.unwrap(), Some(456));
+        assert_eq!(h2.await.unwrap(), Some(456));
+    }
+
+    #[tokio::test]
+    async fn test_watchable_once_cell_returns_none_on_close() {
+        let cell: WatchableOnceCell<i32> = WatchableOnceCell::new();
+        let mut reader = cell.reader();
+
+        // Drop the cell (and thereby the sender) without ever writing.
+        // Earlier this caused `await_value` to panic with
+        // "watch channel closed"; now it returns None so callers can
+        // surface the dead-producer condition as a recoverable error.
+        let handle = tokio::spawn(async move { reader.await_value().await });
+        drop(cell);
+        assert_eq!(handle.await.unwrap(), None);
     }
 }

@@ -9,6 +9,7 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
 from lance.lance import Compaction
 from lance.optimize import RewriteResult
 from lance.vector import vec_to_table
@@ -323,6 +324,41 @@ def test_defer_index_remap(tmp_path: Path):
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_describe_indices_matches_list_indices_for_frag_reuse(tmp_path: Path):
+    """describe_indices() and list_indices() must agree on the index_type
+    string for every index, including the __lance_frag_reuse system index
+    that defer_index_remap produces.
+
+    list_indices() special-cases system indices via infer_system_index_type()
+    in python/src/dataset.rs. describe_indices() in
+    rust/lance/src/index.rs::IndexDescriptionImpl::try_new does not, so it
+    falls through to a plugin lookup that has no entry for
+    FragmentReuseIndexDetails and reports 'Unknown' instead.
+    """
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    dataset.delete("i < 500")
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
+    )
+
+    dataset = lance.dataset(base_dir)
+    described = {d.name: d.index_type for d in dataset.describe_indices()}
+    listed = {idx["name"]: idx["type"] for idx in dataset.list_indices()}
+
+    assert "__lance_frag_reuse" in listed, (
+        "test precondition: defer_index_remap should produce a frag-reuse index"
+    )
+    assert described == listed, (
+        "describe_indices and list_indices disagree on index_type:\n"
+        f"  describe_indices: {described}\n"
+        f"  list_indices:     {listed}"
+    )
+
+
 def test_dataset_distributed_optimize(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     data = pa.table({"a": range(800), "b": range(800)})
@@ -410,6 +446,77 @@ def test_migration_via_fragment_apis(tmp_path):
     ds2 = lance.dataset(tmp_path / "dataset2")
 
     assert ds2.data_storage_version == "2.0"
+
+
+def test_optimize_indices_second_call_is_noop(tmp_path: Path):
+    """A second optimize_indices call when nothing has changed since the first
+    must not write any new files to the dataset directory."""
+    base_dir = tmp_path / "dataset"
+
+    n = 1024
+    rng = np.random.default_rng(0)
+    vectors = rng.standard_normal((n, 8)).astype(np.float32)
+    table = pa.table(
+        {
+            "id": pa.array(range(n), type=pa.int64()),
+            "category": pa.array([f"cat{i % 4}" for i in range(n)]),
+            "tags": pa.array([[f"t{i % 3}", f"t{(i + 1) % 3}"] for i in range(n)]),
+            "doc": pa.array([f"hello world document {i}" for i in range(n)]),
+            "name": pa.array([f"name_{i:05d}" for i in range(n)]),
+            "value": pa.array(range(n), type=pa.int64()),
+            "bloom_val": pa.array(range(n), type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(vectors.reshape(-1), type=pa.float32()), 8
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    dataset.create_scalar_index("id", index_type="BTREE")
+    dataset.create_scalar_index("category", index_type="BITMAP")
+    dataset.create_scalar_index("tags", index_type="LABEL_LIST")
+    dataset.create_scalar_index("doc", index_type="INVERTED")
+    dataset.create_scalar_index("name", index_type="NGRAM")
+    dataset.create_scalar_index("value", index_type="ZONEMAP")
+    dataset.create_scalar_index("bloom_val", index_type="BLOOMFILTER")
+    # num_partitions=1 keeps this dataset balanced: the auto-rebalance check
+    # in merge_indices only finds join candidates when num_partitions > 1, and
+    # 1024 + 128 rows is well below the split threshold. Without this, the
+    # rebalance heuristic would keep finding work on the small partitions.
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=1, num_sub_vectors=2
+    )
+
+    extra_rows = 128
+    extra_vectors = rng.standard_normal((extra_rows, 8)).astype(np.float32)
+    extra = pa.table(
+        {
+            "id": pa.array(range(n, n + extra_rows), type=pa.int64()),
+            "category": pa.array([f"cat{i % 4}" for i in range(extra_rows)]),
+            "tags": pa.array([[f"t{i % 3}"] for i in range(extra_rows)]),
+            "doc": pa.array([f"goodbye world document {i}" for i in range(extra_rows)]),
+            "name": pa.array([f"add_{i:05d}" for i in range(extra_rows)]),
+            "value": pa.array(range(n, n + extra_rows), type=pa.int64()),
+            "bloom_val": pa.array(range(n, n + extra_rows), type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(extra_vectors.reshape(-1), type=pa.float32()), 8
+            ),
+        }
+    )
+    dataset = lance.write_dataset(extra, base_dir, mode="append")
+
+    # First optimize: should pull the new fragment into each index.
+    dataset.optimize.optimize_indices()
+
+    files_before = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
+
+    # Second optimize: nothing has changed, so this must be a no-op on disk.
+    dataset.optimize.optimize_indices()
+
+    files_after = {p.relative_to(base_dir) for p in base_dir.rglob("*") if p.is_file()}
+
+    new_files = files_after - files_before
+    assert not new_files, f"second optimize_indices created new files: {new_files}"
 
 
 def test_compaction_generates_rewrite_transaction(tmp_path: Path):

@@ -20,6 +20,7 @@ import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.ipc.ScanStats;
 
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -174,6 +175,43 @@ public class ScannerTest {
                     .filter("id < 20")
                     .build())) {
           assertEquals(20, scanner.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetScannerStats(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_stats").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(20).build())) {
+          assertTrue(scanner.getStats().isEmpty());
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              // Consume all batches.
+            }
+          }
+          assertTrue(scanner.getStats().isEmpty());
+        }
+
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(20).collectStats(true).build())) {
+          assertTrue(scanner.getStats().isEmpty());
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              // Consume all batches.
+            }
+          }
+
+          Optional<ScanStats> statsOpt = scanner.getStats();
+          assertTrue(statsOpt.isPresent());
+          ScanStats stats = statsOpt.get();
+          assertTrue(stats.getBytesRead() > 0 || !stats.getAllCounts().isEmpty());
         }
       }
     }

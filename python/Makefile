@@ -1,53 +1,74 @@
-ifeq ($(CI), true)
-    PYTEST_ARGS = -vvv -s --durations=30 -m "not recurring"
-else
-    PYTEST_ARGS = -vvv -s -m "not recurring"
+.DEFAULT_GOAL := help
+.PHONY: help install build test integtest doctest compattest format format-python lint lint-python lint-rust clean
+PYTHON ?=
+PYTEST_ARGS ?= -vvv -s -m "not recurring"
+KEEP_COMPOSE ?= 0
+COMPOSE_FILE ?= ../docker-compose.yml
+UV_SYNC = uv sync
+UV_RUN = uv run --frozen
+
+# Set PYTHON=3.12 to use a specific Python version with uv.
+ifneq ($(strip $(PYTHON)),)
+  UV_PYTHON_ARG = --python $(PYTHON)
+  UV_SYNC += $(UV_PYTHON_ARG)
+  UV_RUN += $(UV_PYTHON_ARG)
 endif
 
-test:
+ifeq ($(CI), true)
+  PYTEST_ARGS += --durations=30
+endif
+
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+install: ## Sync dependencies and set up local development tools
+	@if ! command -v uv > /dev/null 2>&1; then \
+		echo "uv not found. Install it from https://docs.astral.sh/uv/getting-started/installation/"; \
+		exit 1; \
+	fi
+	$(UV_SYNC)
+	uv tool run pre-commit install
+
+build: ## Build the local Rust extension with maturin
+	$(UV_RUN) maturin develop --uv
+
+test: ## Run Python tests except recurring tests
 	pytest $(PYTEST_ARGS) python/tests
-.PHONY: test
 
-integtest:
-	pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_namespace_integration.py
-.PHONY: integtest
+integtest: ## Start LocalStack and run integration tests
+	@if [ "$(KEEP_COMPOSE)" = "1" ]; then \
+		docker compose -f $(COMPOSE_FILE) up -d --wait && \
+		pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_namespace_integration.py; \
+	else \
+		trap 'docker compose -f $(COMPOSE_FILE) down -v --remove-orphans --timeout 0 >/dev/null 2>&1 || true' EXIT; \
+		docker compose -f $(COMPOSE_FILE) up -d --wait && \
+		pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_namespace_integration.py; \
+	fi
 
-doctest:
+doctest: ## Run Python doctests
 	pytest --doctest-modules $(PYTEST_ARGS) python/lance
-.PHONY: doctest
 
-compattest:
-	pytest --run-compat $(PYTEST_ARGS)  python/tests/compat
-.PHONY: compattest
+compattest: ## Run upgrade/downgrade compatibility tests
+	pytest --run-compat $(PYTEST_ARGS) python/tests/compat
 
-format: format-python
+format: format-python ## Auto-format Python and Rust
 	cargo fmt
-.PHONY: format
 
-build:
-	maturin develop
-.PHONY: build
-
-format-python:
+format-python: ## Auto-format Python (ruff)
 	ruff format python
 	ruff check --fix python
-.PHONY: format-python
 
-lint: lint-python lint-rust
-.PHONY: lint
+lint: lint-python lint-rust ## Check Python and Rust formatting/lints
 
-lint-python:
+lint-python: ## Check Python formatting, linting, and types
 	ruff format --check --diff python
 	ruff check python
 	pyright
-.PHONY: lint-python
 
-lint-rust:
+lint-rust: ## Check Rust formatting and clippy lints
 	cargo fmt -- --check
 	cargo clippy -- -D warnings
-.PHONY: lint-rust
 
-clean:
+clean: ## Remove build artifacts
 	cargo clean
 	rm -rf target
-.PHONY: clean

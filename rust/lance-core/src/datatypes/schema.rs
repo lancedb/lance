@@ -134,6 +134,20 @@ impl Schema {
         pk_fields
     }
 
+    /// The unenforced clustering key fields in the schema, ordered by position.
+    ///
+    /// Fields are ordered by their explicit position value (1-based).
+    pub fn unenforced_clustering_key(&self) -> Vec<&Field> {
+        let mut ck_fields: Vec<&Field> = self
+            .fields_pre_order()
+            .filter(|f| f.is_unenforced_clustering_key())
+            .collect();
+
+        ck_fields.sort_by_key(|f| f.unenforced_clustering_key_position.unwrap_or(0));
+
+        ck_fields
+    }
+
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
         compare_fields(&self.fields, &expected.fields, options)
             && (!options.compare_metadata || self.metadata == expected.metadata)
@@ -2809,5 +2823,89 @@ mod tests {
         assert!(paths.contains(&"id".to_string()));
         assert!(paths.contains(&"vector".to_string()));
         assert!(paths.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_schema_unenforced_clustering_key() {
+        use crate::datatypes::field::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        // No clustering key fields
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert!(schema.unenforced_clustering_key().is_empty());
+
+        // Single clustering key field
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "1".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Utf8, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let ck = schema.unenforced_clustering_key();
+        assert_eq!(ck.len(), 1);
+        assert_eq!(ck[0].name, "a");
+
+        // Clustering key fields can be nullable (unlike primary keys)
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "1".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(schema.unenforced_clustering_key().len(), 1);
+    }
+
+    #[test]
+    fn test_schema_unenforced_clustering_key_ordering() {
+        use crate::datatypes::field::LANCE_UNENFORCED_CLUSTERING_KEY_POSITION;
+
+        // Fields ordered by position regardless of schema column order
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Utf8, true).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "3".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("a", DataType::Int32, false).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "1".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("b", DataType::Int64, false).with_metadata(
+                vec![(
+                    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION.to_owned(),
+                    "2".to_owned(),
+                )]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            ),
+            ArrowField::new("d", DataType::Float64, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let ck = schema.unenforced_clustering_key();
+        assert_eq!(ck.len(), 3);
+        assert_eq!(ck[0].name, "a");
+        assert_eq!(ck[1].name, "b");
+        assert_eq!(ck[2].name, "c");
     }
 }

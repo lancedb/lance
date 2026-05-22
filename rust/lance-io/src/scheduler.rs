@@ -1011,7 +1011,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjFile;
     use rand::RngCore;
 
-    use object_store::{GetRange, ObjectStore as OSObjectStore, memory::InMemory};
+    use object_store::{GetRange, ObjectStore as OSObjectStore, ObjectStoreExt, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 

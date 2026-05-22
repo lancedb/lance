@@ -10,13 +10,10 @@ use crate::{
     dataset::transaction::{Operation, Transaction},
 };
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowSetOps;
-use lance_core::{
-    Error, Result,
-    utils::{deletion::DeletionVector, mask::RowAddrTreeMap},
-};
+use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use std::{
@@ -1364,7 +1361,7 @@ impl<'a> TransactionRebase<'a> {
                         .await
                         .map(|dv| (fragment_id, dv))
                     })
-                    .buffered(dataset.object_store().io_parallelism())
+                    .buffered(dataset.object_store.as_ref().io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 
@@ -1420,7 +1417,7 @@ impl<'a> TransactionRebase<'a> {
                         *fragment_id,
                         dataset.manifest.version,
                         &dv,
-                        dataset.object_store(),
+                        dataset.object_store.as_ref(),
                     )
                     .await?;
 
@@ -1815,6 +1812,7 @@ mod tests {
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
+            updated_fragment_offsets: None,
         };
         let transaction = Transaction::new_from_version(1, operation);
         let other_operations = [
@@ -1827,6 +1825,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             Operation::Delete {
                 deleted_fragment_ids: vec![3],
@@ -1842,6 +1841,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
         let other_transactions = other_operations.map(|op| Transaction::new_from_version(2, op));
@@ -1849,12 +1849,12 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store().io_stats_incremental(); // reset
+        dataset.object_store.as_ref().io_stats_incremental(); // reset
         for (other_version, other_transaction) in other_transactions.iter().enumerate() {
             rebase
                 .check_txn(other_transaction, other_version as u64)
                 .unwrap();
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 0);
             assert_io_eq!(io_stats, write_iops, 0);
         }
@@ -1868,7 +1868,7 @@ mod tests {
         let rebased_transaction = rebase.finish(&dataset).await.unwrap();
         assert_eq!(rebased_transaction, expected_transaction);
         // We didn't need to do any IO, so the stats should be 0.
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
     }
@@ -1884,7 +1884,7 @@ mod tests {
                 deletion_file,
                 // Reference deletion file should never enter this apply_deletion. So base path is fine.
                 &dataset.base,
-                dataset.object_store(),
+                dataset.object_store.as_ref(),
             )
             .await
             .unwrap()
@@ -1899,7 +1899,7 @@ mod tests {
             fragment.id,
             dataset.manifest.version,
             &current_deletions,
-            dataset.object_store(),
+            dataset.object_store.as_ref(),
         )
         .await
         .unwrap();
@@ -1944,6 +1944,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             Operation::Delete {
                 updated_fragments: vec![apply_deletion(&[1], &mut fragment, &dataset).await],
@@ -1959,6 +1960,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
         let transactions =
@@ -1973,12 +1975,12 @@ mod tests {
                     .await
                     .unwrap();
 
-            dataset.object_store().io_stats_incremental(); // reset
+            dataset.object_store.as_ref().io_stats_incremental(); // reset
             for (other_version, other_transaction) in previous_transactions.iter().enumerate() {
                 rebase
                     .check_txn(other_transaction, other_version as u64)
                     .unwrap();
-                let io_stats = dataset.object_store().io_stats_incremental();
+                let io_stats = dataset.object_store.as_ref().io_stats_incremental();
                 assert_io_eq!(io_stats, read_iops, 0);
                 assert_io_eq!(io_stats, write_iops, 0);
             }
@@ -1989,7 +1991,7 @@ mod tests {
             let rebased_transaction = rebase.finish(&dataset).await.unwrap();
             assert_eq!(rebased_transaction.read_version, dataset.manifest.version);
 
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             if expected_rewrite {
                 // Read the current deletion file, and write the new one.
                 assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
@@ -2014,7 +2016,7 @@ mod tests {
                 //     original_fragment.id,
                 //     original_fragment.deletion_file.as_ref().unwrap(),
                 // );
-                // assert!(!dataset.object_store().exists(&old_path).await.unwrap());
+                // assert!(!dataset.object_store.as_ref().exists(&old_path).await.unwrap());
                 // The new deletion file should exist.
                 let final_fragment = match &rebased_transaction.operation {
                     Operation::Update {
@@ -2032,7 +2034,14 @@ mod tests {
                     final_fragment.id,
                     final_fragment.deletion_file.as_ref().unwrap(),
                 );
-                assert!(dataset.object_store().exists(&new_path).await.unwrap());
+                assert!(
+                    dataset
+                        .object_store
+                        .as_ref()
+                        .exists(&new_path)
+                        .await
+                        .unwrap()
+                );
 
                 assert_io_eq!(io_stats, num_stages, 1);
             } else {
@@ -2081,6 +2090,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
             ),
             (
@@ -2094,6 +2104,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
             ),
             (
@@ -2138,12 +2149,12 @@ mod tests {
 
         let affected_rows = RowAddrTreeMap::from_iter([0]);
 
-        dataset.object_store().io_stats_incremental(); // reset
+        dataset.object_store.as_ref().io_stats_incremental(); // reset
         let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2168,7 +2179,7 @@ mod tests {
             vec![(0, true)],
         );
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
 
@@ -2178,7 +2189,7 @@ mod tests {
             Err(crate::Error::RetryableCommitConflict { .. })
         ));
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0, "deletion file should be cached");
         assert_io_eq!(io_stats, write_iops, 0, "failed before writing");
     }
@@ -2254,6 +2265,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
             create_update_config_for_test(
                 Some(HashMap::from_iter(vec![(
@@ -2460,6 +2472,7 @@ mod tests {
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
                 },
                 [
                     Compatible,    // append
@@ -2982,6 +2995,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
+                updated_fragment_offsets: None,
             },
         ];
 

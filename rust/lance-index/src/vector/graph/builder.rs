@@ -19,6 +19,20 @@ pub struct GraphBuilderNode {
 }
 
 impl GraphBuilderNode {
+    /// Construct a node from already-computed parts. Used by the online
+    /// builder to convert its mutable state into an immutable `HNSW`.
+    pub(crate) fn from_parts(
+        level_neighbors: Vec<Arc<Vec<u32>>>,
+        level_neighbors_ranked: Vec<Vec<OrderedNode>>,
+        bottom_neighbors: Arc<Vec<u32>>,
+    ) -> Self {
+        Self {
+            bottom_neighbors,
+            level_neighbors,
+            level_neighbors_ranked,
+        }
+    }
+
     pub(crate) fn new(_id: u32, max_level: usize) -> Self {
         let bottom_neighbors = Arc::new(Vec::new());
         let level_neighbors = (0..max_level).map(|_| Arc::new(Vec::new())).collect();

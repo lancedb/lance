@@ -16,7 +16,10 @@ package org.lance;
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableList;
 
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -70,10 +73,18 @@ public class Branch {
   private final long parentVersion;
   private final long createAt;
   private final int manifestSize;
+  private final Map<String, String> metadata;
 
   public Branch(
       String name, String parentBranch, long parentVersion, long createAt, int manifestSize) {
-    this(name, parentBranch, ImmutableList.of(), parentVersion, createAt, manifestSize);
+    this(
+        name,
+        parentBranch,
+        ImmutableList.of(),
+        parentVersion,
+        createAt,
+        manifestSize,
+        Collections.emptyMap());
   }
 
   public Branch(
@@ -82,13 +93,15 @@ public class Branch {
       List<BranchVersionMapping> branchIdentifier,
       long parentVersion,
       long createAt,
-      int manifestSize) {
+      int manifestSize,
+      Map<String, String> metadata) {
     this.name = name;
     this.parentBranch = Optional.ofNullable(parentBranch);
     this.branchIdentifier = ImmutableList.copyOf(Objects.requireNonNull(branchIdentifier));
     this.parentVersion = parentVersion;
     this.createAt = createAt;
     this.manifestSize = manifestSize;
+    this.metadata = Collections.unmodifiableMap(new HashMap<>(metadata));
   }
 
   public String getName() {
@@ -115,6 +128,10 @@ public class Branch {
     return manifestSize;
   }
 
+  public Map<String, String> getMetadata() {
+    return metadata;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -124,6 +141,7 @@ public class Branch {
         .add("parentVersion", parentVersion)
         .add("createAt", createAt)
         .add("manifestSize", manifestSize)
+        .add("metadata", metadata)
         .toString();
   }
 
@@ -137,12 +155,13 @@ public class Branch {
         && manifestSize == branch.manifestSize
         && Objects.equals(name, branch.name)
         && Objects.equals(parentBranch, branch.parentBranch)
-        && Objects.equals(branchIdentifier, branch.branchIdentifier);
+        && Objects.equals(branchIdentifier, branch.branchIdentifier)
+        && Objects.equals(metadata, branch.metadata);
   }
 
   @Override
   public int hashCode() {
     return Objects.hash(
-        name, parentBranch, branchIdentifier, parentVersion, createAt, manifestSize);
+        name, parentBranch, branchIdentifier, parentVersion, createAt, manifestSize, metadata);
   }
 }

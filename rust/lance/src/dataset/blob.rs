@@ -31,7 +31,7 @@ use super::take::TakeBuilder;
 use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
-use lance_core::datatypes::{BlobKind, BlobVersion};
+use lance_core::datatypes::{BlobKind, BlobVersion, parse_field_path};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result, utils::address::RowAddress};
 use lance_io::traits::{Reader, WriteExt, Writer};
@@ -1682,8 +1682,10 @@ pub async fn take_blobs_by_addresses(
 
 /// Validate that `column` exists and is a blob column, returning its field id.
 pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Result<u32> {
-    let projection = dataset.schema().project(&[column])?;
-    let blob_field = &projection.fields[0];
+    let schema = dataset.schema();
+    let blob_field = schema
+        .field(column)
+        .ok_or_else(|| Error::field_not_found(column, schema.field_paths()))?;
     if !blob_field.is_blob() {
         return Err(Error::invalid_input_source(
             format!("the column '{}' is not a blob column", column).into(),
@@ -1753,7 +1755,7 @@ async fn collect_blob_entries_for_selection(
         return Ok(Vec::new());
     }
 
-    let descriptions = description_and_addr.column(0).as_struct();
+    let descriptions = leaf_descriptor_struct(&description_and_addr, column)?;
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     match blob_version_from_descriptions(descriptions)? {
@@ -1762,6 +1764,24 @@ async fn collect_blob_entries_for_selection(
             collect_blob_entries_v2(dataset, blob_field_id, descriptions, row_addrs).await
         }
     }
+}
+
+/// Walk into the descriptor `RecordBatch` at `column` and return the leaf
+/// descriptor `StructArray`, descending through nested struct children for
+/// dotted paths.
+fn leaf_descriptor_struct<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StructArray> {
+    let path = parse_field_path(column)?;
+    let mut current = batch
+        .column_by_name(&path[0])
+        .expect("validate_blob_column ensured column exists")
+        .as_struct();
+    for segment in &path[1..] {
+        current = current
+            .column_by_name(segment)
+            .expect("validate_blob_column ensured all path segments exist")
+            .as_struct();
+    }
+    Ok(current)
 }
 
 fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVersion> {
@@ -1820,7 +1840,7 @@ fn collect_blob_entries_v1(
                     blob_field_id, frag_id, row_addr
                 ))
             })?;
-            let data_file_path = dataset.data_dir().child(data_file.path.as_str());
+            let data_file_path = dataset.data_dir().join(data_file.path.as_str());
             Ok(BlobEntry {
                 selection_index,
                 row_address: row_addr,
@@ -1946,7 +1966,7 @@ async fn collect_blob_entries_v2(
                     let object_store = if let Some(store) = store_cache.get(&base_id) {
                         store.clone()
                     } else {
-                        let store = dataset.object_store_for_base(base_id).await?;
+                        let store = dataset.object_store(Some(base_id)).await?;
                         store_cache.insert(base_id, store.clone());
                         store
                     };
@@ -2040,14 +2060,14 @@ async fn resolve_blob_read_location(
         .data_file_for_field(blob_field_id)
         .ok_or_else(|| Error::internal("Data file not found for blob field".to_string()))?;
     let data_file_dir = dataset.data_file_dir(data_file)?;
-    let data_file_path = data_file_dir.child(data_file.path.as_str());
+    let data_file_path = data_file_dir.clone().join(data_file.path.as_str());
     let data_file_key = data_file_key_from_path(data_file.path.as_str()).to_string();
 
     let object_store = if let Some(base_id) = data_file.base_id {
         if let Some(store) = store_cache.get(&base_id) {
             store.clone()
         } else {
-            let store = dataset.object_store_for_base(base_id).await?;
+            let store = dataset.object_store(Some(base_id)).await?;
             store_cache.insert(base_id, store.clone());
             store
         }
@@ -2100,8 +2120,9 @@ mod tests {
     use lance_io::stream::RecordBatchStream;
     use lance_table::format::BasePath;
     use object_store::{
-        Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-        ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+        Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+        MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        path::Path,
     };
     use tokio::sync::Notify;
     use url::Url;
@@ -2225,14 +2246,6 @@ mod tests {
 
     #[async_trait]
     impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
-        async fn put(
-            &self,
-            _location: &Path,
-            _bytes: PutPayload,
-        ) -> object_store::Result<PutResult> {
-            unimplemented!("put is not used by these tests")
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
@@ -2242,25 +2255,12 @@ mod tests {
             unimplemented!("put_opts is not used by these tests")
         }
 
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            unimplemented!("put_multipart is not used by these tests")
-        }
-
         async fn put_multipart_opts(
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
             unimplemented!("put_multipart_opts is not used by these tests")
-        }
-
-        async fn get(&self, _location: &Path) -> object_store::Result<GetResult> {
-            Err(object_store::Error::NotSupported {
-                source: "get is not used by these tests".into(),
-            })
         }
 
         async fn get_opts(
@@ -2286,8 +2286,11 @@ mod tests {
             })
         }
 
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-            unimplemented!("delete is not used by these tests")
+        fn delete_stream(
+            &self,
+            _locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            unimplemented!("delete_stream is not used by these tests")
         }
 
         fn list(
@@ -2304,12 +2307,13 @@ mod tests {
             unimplemented!("list_with_delimiter is not used by these tests")
         }
 
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy is not used by these tests")
-        }
-
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy_if_not_exists is not used by these tests")
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: CopyOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!("copy_opts is not used by these tests")
         }
     }
 
@@ -2355,6 +2359,14 @@ mod tests {
             self.requested_ranges.lock().unwrap().clone()
         }
 
+        fn requested_blob_ranges(&self) -> Vec<Range<u64>> {
+            let full_object = 0..self.data.len() as u64;
+            self.requested_ranges()
+                .into_iter()
+                .filter(|range| range != &full_object)
+                .collect()
+        }
+
         fn object_meta(&self, location: &Path) -> ObjectMeta {
             ObjectMeta {
                 location: location.clone(),
@@ -2374,14 +2386,6 @@ mod tests {
 
     #[async_trait]
     impl object_store::ObjectStore for RecordingRangeObjectStore {
-        async fn put(
-            &self,
-            _location: &Path,
-            _bytes: PutPayload,
-        ) -> object_store::Result<PutResult> {
-            unimplemented!("put is not used by these tests")
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
@@ -2391,23 +2395,12 @@ mod tests {
             unimplemented!("put_opts is not used by these tests")
         }
 
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            unimplemented!("put_multipart is not used by these tests")
-        }
-
         async fn put_multipart_opts(
             &self,
             _location: &Path,
             _opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
             unimplemented!("put_multipart_opts is not used by these tests")
-        }
-
-        async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
-            self.get_opts(location, GetOptions::default()).await
         }
 
         async fn get_opts(
@@ -2424,7 +2417,8 @@ mod tests {
                     });
                 }
             };
-            if let Some(gate) = &self.gate {
+            let is_full_object_probe = range.start == 0 && range.end == self.data.len() as u64;
+            if !is_full_object_probe && let Some(gate) = &self.gate {
                 gate.notified().await;
             }
             self.requested_ranges.lock().unwrap().push(range.clone());
@@ -2439,12 +2433,11 @@ mod tests {
             })
         }
 
-        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-            Ok(self.object_meta(location))
-        }
-
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-            unimplemented!("delete is not used by these tests")
+        fn delete_stream(
+            &self,
+            _locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            unimplemented!("delete_stream is not used by these tests")
         }
 
         fn list(
@@ -2461,12 +2454,13 @@ mod tests {
             unimplemented!("list_with_delimiter is not used by these tests")
         }
 
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy is not used by these tests")
-        }
-
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!("copy_if_not_exists is not used by these tests")
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: CopyOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!("copy_opts is not used by these tests")
         }
     }
 
@@ -2906,6 +2900,103 @@ mod tests {
         assert_eq!(blobs.len(), 2, "Mixed fragment blobs should have 2 items");
     }
 
+    /// Regression test: scanning the same blob column twice on a single
+    /// `Dataset` (and therefore a single cache scope) with different
+    /// `BlobHandling` values must not panic in the structural decoder.
+    ///
+    /// Background: `FieldDataCacheKey` previously keyed cached page data only
+    /// by `column_index`. A blob column has two valid decoder shapes — the
+    /// descriptor view (`Struct<position, size>`) used when scanning with
+    /// `BlobHandling::BlobsDescriptions`, and the bytes view (`LargeBinary`)
+    /// used when scanning with `BlobHandling::AllBinary`. Both views go through
+    /// the same `StructuralPrimitiveFieldScheduler` but instantiate different
+    /// page-level schedulers, which cache different concrete `CachedPageData`
+    /// types under the same column index. When the second view hit the cache
+    /// populated by the first, it downcast the wrong state type and panicked.
+    #[tokio::test]
+    async fn test_blob_cache_key_distinguishes_views() {
+        use crate::dataset::WriteParams;
+        use arrow_array::RecordBatchIterator;
+        use arrow_array::{LargeBinaryArray, UInt64Array};
+        use arrow_schema::{Field, Schema};
+        use lance_arrow::BLOB_META_KEY;
+        use lance_core::datatypes::BlobHandling;
+
+        let test_dir = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blobs", DataType::LargeBinary, true).with_metadata(blob_meta),
+            Field::new("idx", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"foo".as_slice()),
+                    Some(b"bar".as_slice()),
+                    Some(b"baz".as_slice()),
+                ])),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Open once and reuse the same Dataset (single Session, single cache)
+        // across both scans. Reopening would defeat the test.
+        let dataset = Arc::new(Dataset::open(test_dir.as_str()).await.unwrap());
+
+        // Pass 1: descriptor view (Struct<position, size>). Default for scan().
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::BlobsDescriptions);
+        let descriptors = scanner
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(descriptors.column(0).data_type().is_struct());
+
+        // Pass 2: bytes view (LargeBinary). Used by compact_files.
+        // Without the fix this used to panic in BlobPageScheduler::load
+        // when it downcast the cached BlobDescriptionPageScheduler state.
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let bytes = scanner
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(bytes.column(0).data_type(), &DataType::LargeBinary);
+        let blobs = bytes.column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+        assert_eq!(blobs.value(2), b"baz");
+
+        // Pass 3: back to descriptor view to verify both directions are safe.
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::BlobsDescriptions);
+        let descriptors = scanner
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(descriptors.column(0).data_type().is_struct());
+    }
+
     #[test]
     fn test_data_file_key_from_path() {
         assert_eq!(data_file_key_from_path("data/abc.lance"), "abc");
@@ -3002,7 +3093,7 @@ mod tests {
         assert_eq!(chunks[1].as_ref(), b"bc");
         assert_eq!(chunks[2].as_ref(), b"de");
         assert!(chunks[3].is_empty());
-        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
     }
 
     #[tokio::test]
@@ -3025,7 +3116,7 @@ mod tests {
         let (data1, data2) = tokio::join!(blob1.read(), blob2.read());
         assert_eq!(data1.unwrap().as_ref(), b"bcd");
         assert_eq!(data2.unwrap().as_ref(), b"efg");
-        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
     }
 
     #[tokio::test]
@@ -3060,7 +3151,7 @@ mod tests {
         assert_eq!(blobs[0].data.as_ref(), b"efg");
         assert_eq!(blobs[1].row_address, 11);
         assert_eq!(blobs[1].data.as_ref(), b"bcd");
-        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
     }
 
     #[tokio::test]
@@ -3631,7 +3722,7 @@ mod tests {
         .await
         .unwrap();
         let object_store = object_store.as_ref().clone();
-        let data_dir = base_path.child("data");
+        let data_dir = base_path.clone().join("data");
 
         let mut field = blob_field("blob", true);
         let mut metadata = field.metadata().clone();

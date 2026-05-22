@@ -8,7 +8,9 @@ scan, point lookup, vector search and full-text search.
 ![MemWAL Overview](../../images/mem_wal_overview.png)
 
 A Lance table is called a **base table** under the context of the MemWAL spec.
-It must have an [unenforced primary key](index.md#unenforced-primary-key) defined in the table schema.
+It may have an [unenforced primary key](index.md#unenforced-primary-key) defined in the table schema.
+Primary keys are required for primary-key lookups and last-write-wins upsert semantics,
+but append-only MemWAL tables may omit them.
 
 On top of the base table, the MemWAL spec defines a set of shards.
 Writers write to shards, and data in each shard is merged into the base table asynchronously.
@@ -22,7 +24,7 @@ Each shard has exactly one active writer at any time.
 Writers claim a shard and then write data to that shard.
 Data in each shard is expected to be merged into the base table asynchronously.
 
-Rows of the same primary key must be written to one and only one shard.
+For tables with a primary key, rows of the same primary key must be written to one and only one shard.
 If two shards contain rows with the same primary key, the following scenario can cause data corruption:
 
 1. Shard A receives a write with primary key `pk=1` at time T1
@@ -32,8 +34,10 @@ If two shards contain rows with the same primary key, the following scenario can
 5. The row from Shard A (older) now overwrites the row from Shard B (newer)
 
 This violates the expected "last write wins" semantics.
-By ensuring each primary key is assigned to exactly one shard via the shard spec,
+By ensuring each primary key is assigned to exactly one shard via the sharding spec,
 merge order between shards becomes irrelevant for correctness.
+Append-only tables without a primary key do not rely on last-write-wins conflict resolution
+and may shard by any deterministic append key or partitioning column.
 
 See [MemWAL Shard Architecture](#shard-architecture) for the complete shard architecture.
 
@@ -42,16 +46,17 @@ See [MemWAL Shard Architecture](#shard-architecture) for the complete shard arch
 A **MemWAL Index** is the centralized structure for all MemWAL metadata on top of a base table.
 A table has at most one MemWAL index. It stores:
 
-- **Configuration**: Shard specs defining how rows map to shards, and which indexes to maintain
+- **Configuration**: Sharding specs defining how rows map to shards, and which indexes to maintain
 - **Merge progress**: Last generation merged to base table for each shard
 - **Index catchup progress**: Which merged generation each base table index has been rebuilt to cover
-- **Shard snapshots**: Snapshot of all shard states for read optimization
+- **Shard snapshots**: Point-in-time snapshot of shard states for read optimization
 
 The index is the source of truth for **configuration**, **merge progress** and **index catchup progress**
 Writers and mergers read the MemWAL index to get these configurations before writing.
 
 Each [shard's manifest](#shard-manifest) is authoritative for its own state.
-Readers use **shard snapshots** is a read-only optimization to see a point-in-time view of all shards without the need to open each shard manifest.
+Readers may use **shard snapshots** as a read-only optimization to see a point-in-time view of shards without opening each shard manifest.
+Readers that need the latest shard set must discover shard directories in storage and read each shard's latest manifest.
 
 See [MemWAL Index Details](#memwal-index-details) for the complete structure.
 
@@ -136,7 +141,7 @@ Each WAL entry is stored within the WAL directory of the shard located at `_mem_
 
 WAL files use bit-reversed 64-bit binary naming to distribute files evenly across the directory keyspace.
 This optimizes S3 throughput by spreading sequential writes across S3's internal partitions, minimizing throttling.
-The filename is the bit-reversed binary representation of the entry ID with suffix `.lance`.
+The filename is the bit-reversed binary representation of the entry ID with suffix `.arrow`.
 For example, entry ID 5 (binary `000...101`) becomes `1010000000000000000000000000000000000000000000000000000000000000.arrow`.
 
 ### Flushed MemTable
@@ -150,7 +155,7 @@ However, since our MemTable is not sorted, we just use the term flushed MemTable
 
 #### Flushed MemTable Storage Layout
 
-The MemTable of generation `i` is flushed to `_mem_wal/{region_uuid}/{random_hex}_gen_{i}/` directory,
+The MemTable of generation `i` is flushed to `_mem_wal/{shard_id}/{random_hex}_gen_{i}/` directory,
 where `{random_hex}` is a random 8-character hex value generated at flush time.
 The random hex value is necessary to ensure if one MemTable flush attempt fails,
 The retry can use another directory.
@@ -161,8 +166,9 @@ The content within the generation directory follows the [Lance table storage lay
 Generation numbers determine merge order of flushed MemTable into base table:
 lower numbers represent older data and must be merged to the base table first to preserve correct upsert semantics.
 
-Within a single flushed MemTable, if there are multiple rows of the same primary key,
-the row that is last inserted wins.
+Within a single flushed MemTable for a primary-key table,
+if there are multiple rows of the same primary key, the row that is last inserted wins.
+Append-only tables without a primary key retain all inserted rows.
 
 ### Shard Manifest
 
@@ -173,6 +179,7 @@ Each shard has a manifest file. This is the source of truth for the state of a s
 The manifest contains:
 
 - **Fencing state**: `writer_epoch` as the latest writer fencing token, see [Writer Fencing](#writer-fencing) for more details.
+- **Shard assignment**: `shard_spec_id` and `shard_field_values` record how this shard maps to its sharding spec. `shard_field_values` is a map from shard field id to the raw Arrow scalar bytes of the computed value; the matching `ShardingField.result_type` in the `ShardingSpec` determines how to interpret each entry (e.g., 4 little-endian bytes for int32, raw UTF-8 bytes for utf8).
 - **WAL pointers**: `replay_after_wal_entry_position` (last entry position flushed to MemTable, 0-based), `wal_entry_position_last_seen` (last entry position seen at manifest update, 0-based)
 - **Generation trackers**: `current_generation` (next generation to flush), `flushed_generations` list of generation number and directory path pairs (e.g., generation 1 at `a1b2c3d4_gen_1`)
 
@@ -223,7 +230,7 @@ For example, version 5 becomes `101000000000000000000000000000000000000000000000
 
 ## MemWAL Index Details
 
-The MemWAL Index uses the [standard index storage](index/index.md#index-storage) at `_indices/{UUID}/`.
+The MemWAL Index uses the [standard index storage](../index/index.md#index-storage) at `_indices/{UUID}/`.
 
 The index stores its data in two parts:
 
@@ -234,7 +241,7 @@ The index stores its data in two parts:
 
 The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` protobuf message with the following key fields:
 
-- **Configuration fields** (`shard_specs`, `maintained_indexes`) are the source of truth for MemWAL configuration.
+- **Configuration fields** (`sharding_specs`, `maintained_indexes`) are the source of truth for MemWAL configuration.
   Writers read these fields to determine how to partition data and which indexes to maintain.
 - **Merge progress** (`merged_generations`) tracks the last generation merged to the base table for each shard.
   This field is updated atomically with merge-insert data commits, enabling conflict resolution when multiple mergers operate concurrently.
@@ -258,28 +265,37 @@ The `index_details` field in `IndexMetadata` contains a `MemWalIndexDetails` pro
 
 ### Shard Identifier
 
-Each shard has a unique identifier across all shards following UUID v4 standard.
-When a new shard is created, it is assigned a new identifier.
+Each shard has a unique UUID identifier within the table.
+When a new shard is created, implementations may assign either a random UUID or
+a deterministic UUID derived from the shard assignment when deterministic
+writer fencing is required.
 
-### Shard Spec
+### Shard Discovery
 
-A **Shard Spec** defines how all rows in a table are logically divided into different shards,
+The MemWAL index can store shard snapshots for read optimization, but those snapshots may lag the latest shard set.
+Implementations that need to discover the current shard set should list `_mem_wal/` shard directories and read each shard's latest [shard manifest](#shard-manifest).
+
+Each shard manifest records the shard UUID, sharding spec ID, and computed shard field values needed to map the shard back to a sharding spec assignment.
+
+### Sharding Spec
+
+A **Sharding Spec** defines how all rows in a table are logically divided into different shards,
 enabling automatic shard assignment and query-time shard pruning.
 
-Each shard spec has:
+Each sharding spec has:
 
 - **Spec ID**: A positive integer that uniquely identifies this spec within the MemWAL index. IDs are never reused.
-- **Shard fields**: An array of field definitions that determine how to compute shard values.
+- **Sharding fields**: An array of field definitions that determine how to compute shard values.
 
-Each shard is bound to a specific shard spec ID, recorded in its [manifest](#shard-manifest).
+Each shard is bound to a specific sharding spec ID, recorded in its [manifest](#shard-manifest).
 Shards without a spec ID (`spec_id = 0`) are manually-created shards not governed by any spec.
 
-A shard spec's field array consists of **shard field** definitions.
-Each shard field has the following properties:
+A sharding spec's field array consists of **sharding field** definitions.
+Each sharding field has the following properties:
 
 | Property      | Description                                                               |
 | ------------- | ------------------------------------------------------------------------- |
-| `field_id`    | Unique string identifier for this shard field                            |
+| `field_id`    | Unique string identifier for this sharding field                         |
 | `source_ids`  | Array of field IDs referencing source columns in the schema               |
 | `transform`   | A well-known shard expression, specify this or `expression`              |
 | `expression`  | A DataFusion SQL expression for custom logic, specify this or `transform` |
@@ -342,28 +358,25 @@ This file uses standard Lance format with the shard snapshot schema, enabling ef
 ### Shard Snapshot Arrow Schema
 
 Shard snapshots are stored as a Lance file with one row per shard.
-The schema has one column per `ShardManifest` field plus shard spec columns:
+The snapshot schema is optimized for shard discovery. Full mutable shard state
+remains in the authoritative shard manifest files.
 
-| Column                            | Type                                             | Description                                              |
-| --------------------------------- | ------------------------------------------------ | -------------------------------------------------------- |
-| `shard_id`                       | `fixed_size_binary(16)`                          | Shard UUID bytes                                        |
-| `version`                         | `uint64`                                         | Shard manifest version                                  |
-| `shard_spec_id`                  | `uint32`                                         | Shard spec ID (0 if manual)                             |
-| `writer_epoch`                    | `uint64`                                         | Writer fencing token                                     |
-| `replay_after_wal_entry_position` | `uint64`                                         | Last WAL entry position (0-based) flushed to MemTable    |
-| `wal_entry_position_last_seen`    | `uint64`                                         | Last WAL entry position (0-based) seen (hint)            |
-| `current_generation`              | `uint64`                                         | Next generation to flush                                 |
-| `flushed_generations`             | `list<struct<generation: uint64, path: string>>` | Flushed MemTable paths                                   |
-| `region_field_{field_id}`         | varies                                           | Shard field value (one column per field in shard spec) |
+| Column                   | Type          | Description                                                                                                |
+| ------------------------ | ------------- | ---------------------------------------------------------------------------------------------------------- |
+| `shard_id`               | `utf8`        | Shard UUID string                                                                                          |
+| `shard_spec_id`          | `uint32`      | Sharding spec ID (0 if manual)                                                                             |
+| `shard_field_{field_id}` | varies        | One column per sharding field defined in the sharding spec, typed to match the field's `ShardingField.result_type`. |
 
-For example, with a shard spec containing a field `user_bucket` of type `int32`:
+For example, with a sharding spec containing a field `user_bucket` of type `int32`:
 
 | Column                     | Type    | Description                  |
 | -------------------------- | ------- | ---------------------------- |
 | ...                        | ...     | (base columns above)         |
-| `region_field_user_bucket` | `int32` | Bucket value for this shard |
+| `shard_field_user_bucket`  | `int32` | Bucket value for this shard |
 
-This schema directly corresponds to the fields in the `ShardManifest` protobuf message plus the computed shard field values.
+This schema records the fields needed to map each shard back to its sharding spec
+assignment. Readers that need fencing epochs, WAL positions, or flushed
+generation state must read the latest shard manifests directly.
 
 ## Storage Layout
 
@@ -376,12 +389,12 @@ Here is a recap of the storage layout with all the files and concepts defined so
 │       └── index.lance                  # Serialized shard snapshots (Lance file)
 │
 └── _mem_wal/
-    └── {region_uuid}/                   # Shard directory (UUID v4)
+    └── {shard_id}/                   # Shard directory (UUID v4)
         ├── manifest/
         │   ├── {bit_reversed_version}.binpb     # Serialized shard manifest (bit-reversed naming)
         │   └── version_hint.json                # Version hint file
         ├── wal/
-        │   ├── {bit_reversed_entry_id}.lance    # WAL data files (bit-reversed naming)
+        │   ├── {bit_reversed_entry_id}.arrow    # WAL data files (bit-reversed naming)
         │   └── ...
         └── {random_hash}_gen_{i}/        # Flushed MemTable (generation i, random prefix)
             ├── _versions/
@@ -460,11 +473,19 @@ The garbage collector removes obsolete data from shard directories. Flushed MemT
 2. All maintained indexes have caught up (`generation <= min(index_catchup[I].caught_up_generation)`)
 3. No retained base table version references the generation for time travel
 
+!!!warning
+    Deleting WAL files weakens [writer fencing](#writer-fencing) and can lead to silent acknowledgement of lost writes.
+
+    Fencing detects a stalled writer when its `put-if-not-exists` for the next WAL entry collides with a newer writer's entry at the same position — only that collision triggers the epoch check. If GC has already removed the WAL file at that position, the stalled writer's PUT lands on empty space and succeeds against its old `writer_epoch`. The entry is acknowledged to the client, but the new manifest's `replay_after_wal_entry_position` has already advanced past it, so the data is never replayed.
+
+    Implementations that GC WAL files must compensate, for example by re-checking fence state after each successful WAL write, encoding the writer epoch into the WAL filename so positions are partitioned by epoch, or otherwise guaranteeing a stalled writer cannot land at a position that has been or will be GC'd.
+
 ## Reader Expectations
 
 ### LSM Tree Merging Read
 
-Readers **MUST** merge results from multiple data sources (base table, flushed MemTables, in-memory MemTables) by primary key to ensure correctness.
+For tables with a primary key, readers **MUST** merge results from multiple data sources
+(base table, flushed MemTables, in-memory MemTables) by primary key to ensure correctness.
 
 When the same primary key exists in multiple sources, the reader must keep only the newest version based on:
 
@@ -480,6 +501,10 @@ This deduplication is essential because:
 - A single write batch may contain multiple updates to the same primary key
 
 Without proper merging, queries would return duplicate or stale rows.
+
+Append-only tables without a primary key do not perform primary-key deduplication.
+Readers should include the relevant base table, flushed MemTables, and in-memory MemTables
+according to the requested consistency level; duplicate values are treated as distinct appended rows.
 
 ### Reader Consistency
 
@@ -511,23 +536,25 @@ Datasets come from:
 
 Each dataset is tagged with a generation number: 0 for the base table, and positive integers for MemTable generations.
 Within a shard, the generation number determines data freshness, with higher numbers representing newer data.
-Rows from different shards do not need deduplication since each primary key maps to exactly one shard.
+For primary-key tables, rows from different shards do not need deduplication
+since each primary key maps to exactly one shard.
+Append-only tables without a primary key do not require cross-shard primary-key deduplication.
 
 The planner also collects bloom filters from each generation for staleness detection during search queries.
 
 #### Shard Pruning
 
-Before executing queries, if shard spec is available,
-the planner evaluates filter predicates against shard specs to determine which shards may contain matching data.
+Before executing queries, if sharding spec is available,
+the planner evaluates filter predicates against sharding specs to determine which shards may contain matching data.
 This pruning step reduces the number of shards to scan.
 
 For each filter predicate:
 
-1. Extract predicates on columns used in shard specs
+1. Extract predicates on columns used in sharding specs
 2. Evaluate which shard values can satisfy the predicate
 3. Prune shards whose values cannot match
 
-For example, with a shard spec using `bucket(user_id, 10)` and a filter `user_id = 123`:
+For example, with a sharding spec using `bucket(user_id, 10)` and a filter `user_id = 123`:
 
 1. Compute `bucket(123, 10) = 3`
 2. Only scan shards with bucket value 3

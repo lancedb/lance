@@ -411,7 +411,7 @@ Combining full-text search with metadata filters can significantly reduce the se
 
 ### Further Reading
 
-For advanced usage instructions with different tokenizers and more technical details on the index training process, including information about the expected memory and disk usage, visit the [full-text index](../format/table/index/scalar/fts.md) specification.
+For advanced usage instructions with different tokenizers and more technical details on the index training process, including information about the expected memory and disk usage, visit the [full-text index](../format/index/scalar/fts.md) specification.
 
 ## Next Steps
 

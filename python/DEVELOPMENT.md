@@ -3,10 +3,10 @@
 For local development, prefer [uv](https://docs.astral.sh/uv/) to create and manage the Python environment:
 
 ```shell
-uv sync --extra tests --extra dev
+uv sync
 ```
 
-Add extras such as `benchmarks`, `torch`, or `geo` only when you need them. After the environment is initialized, either activate it or use `uv run ...` for commands.
+Add `--group benchmarks` for benchmarks, or `--extra torch` / `--extra geo` for those optional features. After the environment is initialized, either activate it or use `uv run ...` for commands.
 
 `uv sync` is not just downloading Python packages here. It also builds the local `pylance` Rust extension as part of the editable environment, so the first run, cache misses, or Rust dependency changes can make it noticeably slow. This is expected; let the build finish instead of interrupting it and switching to a different environment setup.
 
@@ -17,7 +17,7 @@ This project is built with [maturin](https://github.com/PyO3/maturin).
 It can be built in development mode with:
 
 ```shell
-uv run maturin develop
+uv run maturin develop --uv
 ```
 
 This builds the Rust native module in place. You will need to re-run this
@@ -104,8 +104,8 @@ benchmarks added there should run in less than 5 seconds.
 Before running benchmarks, you should build pylance in release mode:
 
 ```shell
-uv sync --extra tests --extra dev --extra benchmarks
-uv run maturin develop --profile release-with-debug --extras benchmarks --features datagen
+uv sync --group benchmarks
+uv run maturin develop --uv --profile release-with-debug --extras benchmarks --features datagen
 ```
 
 (You can also use `--release` or `--profile release`, but `--profile release-with-debug`
@@ -172,13 +172,13 @@ the benchmarks again with `--benchmark-compare`.
 ```shell
 CURRENT_BRANCH=$(git branch --show-current)
 git checkout main
-uv sync --extra tests --extra dev --extra benchmarks
-uv run maturin develop --profile release-with-debug --features datagen
+uv sync --group benchmarks
+uv run maturin develop --uv --profile release-with-debug --features datagen
 uv run pytest --benchmark-save=baseline python/benchmarks -m "not slow"
 COMPARE_ID=$(ls .benchmarks/*/ | tail -1 | cut -c1-4)
 git checkout $CURRENT_BRANCH
-uv sync --extra tests --extra dev --extra benchmarks
-uv run maturin develop --profile release-with-debug --features datagen
+uv sync --group benchmarks
+uv run maturin develop --uv --profile release-with-debug --features datagen
 uv run pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
 ```
 

@@ -33,6 +33,18 @@ from .lance import (
     bytes_read_counter,
     iops_counter,
 )
+from .mem_wal import (
+    ExecutionPlan,
+    LsmPointLookupPlanner,
+    LsmScanner,
+    LsmVectorSearchPlanner,
+    MergedGeneration,
+    ShardingField,
+    ShardingSpec,
+    ShardSnapshot,
+    ShardWriter,
+    evaluate_sharding_spec,
+)
 from .namespace import (
     DescribeTableRequest,
     LanceNamespace,
@@ -83,6 +95,16 @@ __all__ = [
     "write_dataset",
     "FFILanceTableProvider",
     "IndexProgress",
+    "ExecutionPlan",
+    "LsmPointLookupPlanner",
+    "LsmScanner",
+    "LsmVectorSearchPlanner",
+    "MergedGeneration",
+    "ShardSnapshot",
+    "ShardWriter",
+    "ShardingField",
+    "ShardingSpec",
+    "evaluate_sharding_spec",
 ]
 
 
