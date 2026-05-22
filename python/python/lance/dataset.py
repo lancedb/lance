@@ -3259,7 +3259,15 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["progress_callback"] = progress_callback
 
         self._ds.create_index(
-            [column], index_type, name, replace, train, None, range_partitions, None, kwargs
+            [column],
+            index_type,
+            name,
+            replace,
+            train,
+            None,
+            range_partitions,
+            None,
+            kwargs,
         )
 
     def _create_index_impl(
