@@ -29,7 +29,7 @@ use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
 use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
@@ -1914,16 +1914,25 @@ impl ScalarIndex for BTreeIndex {
 
         let num_partitions = ranges_to_files.iter().count();
 
-        let collected = collect_sorted_batches(merged_data_source).await?;
-        if collected.is_empty() {
+        let schema = merged_data_source.schema();
+        let mut stream = Box::pin(merged_data_source);
+
+        let mut total_rows = 0usize;
+        let mut all_batches: Vec<RecordBatch> = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            total_rows += batch.num_rows();
+            all_batches.push(batch);
+        }
+
+        if total_rows == 0 {
             return Err(Error::internal(
                 "no data to train range-partitioned BTree index".to_string(),
             ));
         }
 
-        let total_rows: usize = collected.iter().map(|b| b.num_rows()).sum();
         let rows_per_partition = total_rows.div_ceil(num_partitions);
 
+        let mut trained_partition_ids: Vec<u64> = Vec::new();
         let mut row_offset = 0usize;
         for part_idx in 0..num_partitions {
             let range_id = part_idx as u32;
@@ -1935,11 +1944,11 @@ impl ScalarIndex for BTreeIndex {
             };
             row_offset = end;
 
-            let part_batches = slice_batches(&collected, start, end)?;
+            let part_batches = slice_batches(&all_batches, start, end)?;
             if part_batches.is_empty() {
                 continue;
             }
-            let part_stream = batches_to_stream(part_batches);
+            let part_stream = batches_to_stream(part_batches, schema.clone());
             train_btree_index(
                 part_stream,
                 dest_store,
@@ -1948,12 +1957,17 @@ impl ScalarIndex for BTreeIndex {
                 Some(range_id),
             )
             .await?;
+            trained_partition_ids.push((range_id as u64) << 32);
         }
 
-        let partition_ids: Vec<u64> = (0..num_partitions as u32)
-            .map(|range_id| (range_id as u64) << 32)
-            .collect();
-        merge_range_partition_lookups_in_place(dest_store, &partition_ids, self.batch_size).await?;
+        if trained_partition_ids.len() > 1 {
+            merge_range_partition_lookups_in_place(
+                dest_store,
+                &trained_partition_ids,
+                self.batch_size,
+            )
+            .await?;
+        }
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
@@ -1974,10 +1988,6 @@ impl ScalarIndex for BTreeIndex {
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(&params))
     }
-}
-
-async fn collect_sorted_batches(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
-    stream.try_collect::<Vec<_>>().await.map_err(Into::into)
 }
 
 fn slice_batches(batches: &[RecordBatch], start: usize, end: usize) -> Result<Vec<RecordBatch>> {
@@ -2002,8 +2012,7 @@ fn slice_batches(batches: &[RecordBatch], start: usize, end: usize) -> Result<Ve
     Ok(result)
 }
 
-fn batches_to_stream(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
-    let schema = batches[0].schema();
+fn batches_to_stream(batches: Vec<RecordBatch>, schema: SchemaRef) -> SendableRecordBatchStream {
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
         futures::stream::iter(batches.into_iter().map(Ok)),
