@@ -258,15 +258,13 @@ mod tests {
         let cache = FlushedMemTableCache::new(8);
         let path = "memory://shard/gen_1";
         let first = cache
-            .get_or_build_pk_index(path, async {
-                Ok(GenPkIndex::from_hashed([(1u64, 0u64), (2, 1)]))
-            })
+            .get_or_build_pk_index(path, async { Ok(GenPkIndex::from_hashed([1u64, 2])) })
             .await
             .unwrap();
         let second = cache
             .get_or_build_pk_index(path, async {
                 // Different contents; must be ignored because the path is cached.
-                Ok(GenPkIndex::from_hashed([(9u64, 0u64)]))
+                Ok(GenPkIndex::from_hashed([9u64]))
             })
             .await
             .unwrap();

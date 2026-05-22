@@ -36,16 +36,16 @@ use super::projection::{
 };
 use crate::session::Session;
 
-/// Per-source over-fetch multiplier for the block-list post-filter. A source
-/// that may contain superseded rows fetches `ceil(k * factor)` candidates so
-/// that dropping the blocked ones still leaves `k` live rows for the
-/// cross-source merge.
+/// Per-source over-fetch multiplier for the staleness post-filter. A source that
+/// may contain superseded rows fetches `ceil(k * factor)` candidates so that
+/// dropping the blocked ones (`PkHashFilterExec`) still leaves `k` live rows for
+/// the cross-source merge.
 ///
 /// TODO(perf/correctness): over-fetch does not *guarantee* `k` live results when
 /// a source has more than `factor` superseded rows near the query. Push the
-/// block-list into the per-source KNN as a true prefilter (the index keeps
+/// filter into the per-source KNN as a true prefilter (the index keeps
 /// traversing until `k` rows pass), then drop both the over-fetch and the
-/// post-filter `BlockListFilterExec`.
+/// post-filter.
 const STALE_OVERFETCH_FACTOR: f64 = 2.5;
 
 /// Plans vector search queries over LSM data.
@@ -209,11 +209,12 @@ impl LsmVectorSearchPlanner {
             return self.empty_plan(projection);
         }
 
-        // Per-source block-lists: the `_rowid`s superseded by a newer generation.
-        // A present entry means that source must drop those rows before the union
-        // (and over-fetch to backfill the holes). See [`super::block_list`].
-        // `Box::pin` keeps this sizeable sub-future off `plan_search`'s own future
-        // (avoids `clippy::large_futures` at every call site).
+        // Per-source blocked PK-hash sets: for each generation, the PK hashes that
+        // a newer generation supersedes (`NEWER(G)`; for base, the union of all
+        // generations). A present entry means that source must drop candidates
+        // whose PK is in the set before the union, and over-fetch to backfill the
+        // holes. See [`super::block_list`]. `Box::pin` keeps this sizeable
+        // sub-future off `plan_search`'s own future (avoids `clippy::large_futures`).
         let block_lists = Box::pin(super::block_list::compute_source_block_lists(
             &sources,
             &self.pk_columns,
@@ -238,10 +239,10 @@ impl LsmVectorSearchPlanner {
         for source in &sources {
             let generation = source.generation();
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            // When this source has superseded rows, over-fetch so the block-list
-            // post-filter still leaves k live candidates for the merge.
-            let block_mask = block_lists.get(&generation);
-            let fetch_k = if block_mask.is_some() {
+            // When a newer generation supersedes this source's rows, over-fetch so
+            // the PK-hash post-filter still leaves k live candidates for the merge.
+            let blocked = block_lists.get(&generation);
+            let fetch_k = if blocked.is_some() {
                 ((k as f64) * STALE_OVERFETCH_FACTOR).ceil() as usize
             } else {
                 k
@@ -255,14 +256,18 @@ impl LsmVectorSearchPlanner {
                 refine_factor,
             ))
             .await?;
-            // Drop rows superseded by a newer generation (matched by `_rowid`)
-            // before tagging/union, so a stale row never reaches the merge — this
-            // is what closes the top-k stale-read gap the global dedup can't.
-            let knn = match block_mask {
-                Some(mask) => Arc::new(super::exec::BlockListFilterExec::new(
+            // Drop rows whose PK was superseded by a newer generation before
+            // tagging/union, so a stale row never reaches the merge — this closes
+            // the top-k stale-read gap the global dedup can't. Same hash-membership
+            // test for every source; within-generation duplicates (same PK, same
+            // gen — not in the blocked set) are left to the global dedup's
+            // freshness tiebreaker.
+            let knn = match blocked {
+                Some(set) => Arc::new(super::exec::PkHashFilterExec::new(
                     knn,
-                    mask.clone(),
-                    lance_core::ROW_ID,
+                    self.pk_columns.clone(),
+                    set.clone(),
+                    k,
                 )) as Arc<dyn ExecutionPlan>,
                 None => knn,
             };
@@ -378,15 +383,8 @@ impl LsmVectorSearchPlanner {
             merged_sorted
         };
 
-        // When a block-list was applied, a result shorter than k signals an
-        // under-fetch (the over-fetch could not backfill the dropped rows). Only
-        // wrap then, so a genuinely small unfiltered result does not warn.
-        let result = if block_lists.is_empty() {
-            result
-        } else {
-            Arc::new(super::exec::UnderfillFilterWarnExec::new(result, k)) as Arc<dyn ExecutionPlan>
-        };
-
+        // Under-fetch is detected per-source inside `PkHashFilterExec` (the
+        // over-fetch is a per-source property), so there is no top-level warn.
         Ok(result)
     }
 
