@@ -3,17 +3,13 @@
 
 //! Per-source block-list construction for LSM vector search.
 //!
-//! Given the LSM data sources for a query, this module builds each generation's
-//! [`GenPkIndex`] (its set of PK hashes) and, from those, the per-source blocked
-//! PK-hash set: `NEWER(G)`, the union of every newer generation's membership.
-//! A source's vector search drops any candidate whose primary key hashes into
-//! its set (see [`super::exec::PkHashFilterExec`]), suppressing rows superseded
-//! by a newer generation. The base table (oldest) is blocked by the union of
-//! every generation's membership.
+//! A generation's membership is its set of PK hashes ([`compute_pk_hash`]). This
+//! builds each source's *blocked* set — `NEWER(G)`, the union of every newer
+//! generation's membership (base table: the union of all of them). The KNN drops
+//! candidates whose PK is in the set (see [`super::exec::PkHashFilterExec`]).
 //!
-//! Within-generation duplicates are not handled here (see
-//! [`super::gen_pk_index`]); the global dedup's `(generation, freshness)`
-//! tiebreaker collapses those over the merged stream.
+//! Cross-generation only: within-gen duplicates share a hash and are collapsed
+//! downstream by the global dedup's `(generation, freshness)` tiebreaker.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,44 +19,25 @@ use futures::TryStreamExt;
 use lance_core::Result;
 
 use super::data_source::{LsmDataSource, LsmGeneration};
+use super::exec::{compute_pk_hash, resolve_pk_indices};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
-use super::gen_pk_index::{GenPkIndex, compute_blocked_sets};
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::BatchStore;
 use crate::session::Session;
 
-/// Build a [`GenPkIndex`] (PK-hash membership) for an in-memory memtable (active
-/// or frozen) from its committed `BatchStore` rows.
-pub fn pk_index_from_batch_store(store: &BatchStore, pk_columns: &[String]) -> Result<GenPkIndex> {
-    let mut batches: Vec<RecordBatch> = Vec::with_capacity(store.len());
-    for i in 0..store.len() {
-        if let Some(stored) = store.get(i) {
-            batches.push(stored.data.clone());
-        }
-    }
-    GenPkIndex::from_batches(&batches, pk_columns)
-}
-
-/// Compute the blocked PK-hash set for every LSM source in `sources`.
-///
-/// Each entry maps a generation to the set of PK hashes that supersede it:
-/// `NEWER(G)` for a flushed / in-memory generation, and the union of every
-/// generation's membership for the base table (which is older than all of them).
-/// A source's KNN drops any candidate whose primary key hashes into its set.
-///
-/// Only generations that something supersedes get an entry, so the caller can
-/// treat a present entry as "this source needs filtering" and skip the cost
-/// otherwise. The newest generation never has an entry.
+/// Per-source blocked PK-hash set: each generation maps to `NEWER(G)`, the base
+/// table to the union of all generations. Only superseded generations get an
+/// entry (a present entry means "this source needs filtering"); the newest never
+/// does.
 pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
 ) -> Result<HashMap<LsmGeneration, Arc<HashSet<u64>>>> {
-    // Build a PK-hash membership index for every non-base source. The base table
-    // carries no index: it is the oldest source, so it never supersedes anything
-    // and its own blocked set is just the union of all newer generations.
-    let mut indexed: Vec<(LsmGeneration, Arc<GenPkIndex>)> = Vec::new();
+    // Hash each non-base source's membership. Base is the oldest source, so it
+    // supersedes nothing; its blocked set is just the union of all of them.
+    let mut indexed: Vec<(LsmGeneration, Arc<HashSet<u64>>)> = Vec::new();
     let mut has_base = false;
     for source in sources {
         match source {
@@ -70,24 +47,23 @@ pub async fn compute_source_block_lists(
                 generation,
                 ..
             } => {
-                let index = Arc::new(pk_index_from_batch_store(batch_store, pk_columns)?);
-                indexed.push((*generation, index));
+                let hashes = Arc::new(pk_hashes_from_batch_store(batch_store, pk_columns)?);
+                indexed.push((*generation, hashes));
             }
             LsmDataSource::FlushedMemTable {
                 path, generation, ..
             } => {
                 // Cached by immutable path so repeated searches skip the PK scan.
-                let index = flushed_pk_index(path, pk_columns, session, flushed_cache).await?;
-                indexed.push((*generation, index));
+                let hashes = flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?;
+                indexed.push((*generation, hashes));
             }
         }
     }
 
-    // Newest generation first so each older generation is blocked against the
-    // union of every newer generation's membership (`NEWER(G)`).
+    // Newest first so each older gen is blocked against `NEWER(G)`.
     indexed.sort_by_key(|(generation, _)| std::cmp::Reverse(*generation));
-    let gens_newest_first: Vec<&GenPkIndex> =
-        indexed.iter().map(|(_, index)| index.as_ref()).collect();
+    let gens_newest_first: Vec<&HashSet<u64>> =
+        indexed.iter().map(|(_, hashes)| hashes.as_ref()).collect();
     let (per_gen_blocked, full_union) = compute_blocked_sets(&gens_newest_first);
 
     let mut blocked: HashMap<LsmGeneration, Arc<HashSet<u64>>> = HashMap::new();
@@ -103,17 +79,59 @@ pub async fn compute_source_block_lists(
     Ok(blocked)
 }
 
-/// Build (or fetch the cached) [`GenPkIndex`] for one flushed generation.
-///
-/// With a cache, the index is built once per immutable path (single-flight) and
-/// reused across queries; without one, it is built cold each call. The build
-/// opens the flushed dataset and scans its PK columns.
-async fn flushed_pk_index(
+/// `NEWER(G)` for each generation (aligned with `gens_newest_first`; newest gets
+/// an empty set), plus the union of all of them — the base table's blocked set.
+fn compute_blocked_sets(gens_newest_first: &[&HashSet<u64>]) -> (Vec<HashSet<u64>>, HashSet<u64>) {
+    let mut newer: HashSet<u64> = HashSet::new();
+    let mut per_gen = Vec::with_capacity(gens_newest_first.len());
+    for hashes in gens_newest_first {
+        // NEWER(G): everything folded in so far (newest-first).
+        per_gen.push(newer.clone());
+        newer.extend(hashes.iter().copied());
+    }
+    (per_gen, newer)
+}
+
+/// Hash the PK membership of an in-memory memtable (active or frozen) from its
+/// committed `BatchStore` rows.
+pub fn pk_hashes_from_batch_store(
+    store: &BatchStore,
+    pk_columns: &[String],
+) -> Result<HashSet<u64>> {
+    let mut batches: Vec<RecordBatch> = Vec::with_capacity(store.len());
+    for i in 0..store.len() {
+        if let Some(stored) = store.get(i) {
+            batches.push(stored.data.clone());
+        }
+    }
+    pk_hashes_from_batches(&batches, pk_columns)
+}
+
+/// Hash every row's primary key across `batches` into a membership set.
+fn pk_hashes_from_batches(batches: &[RecordBatch], pk_columns: &[String]) -> Result<HashSet<u64>> {
+    let mut pk_hashes = HashSet::new();
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pk_indices = resolve_pk_indices(batch, pk_columns)
+            .map_err(|e| lance_core::Error::invalid_input(e.to_string()))?;
+        for row_idx in 0..batch.num_rows() {
+            pk_hashes.insert(compute_pk_hash(batch, &pk_indices, row_idx));
+        }
+    }
+    Ok(pk_hashes)
+}
+
+/// Build (or fetch the cached) PK-hash membership for one flushed generation.
+/// Cached by immutable path (single-flight); the build scans the flushed
+/// dataset's PK columns.
+async fn flushed_pk_hashes(
     path: &str,
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
-) -> Result<Arc<GenPkIndex>> {
+) -> Result<Arc<HashSet<u64>>> {
     match flushed_cache {
         Some(cache) => {
             let build_cache = cache.clone();
@@ -121,7 +139,7 @@ async fn flushed_pk_index(
             let build_session = session.cloned();
             let build_pk = pk_columns.to_vec();
             cache
-                .get_or_build_pk_index(
+                .get_or_build_pk_hashes(
                     path,
                     // `Box::pin` keeps this build future off the caller's future
                     // (avoids `clippy::large_futures`).
@@ -133,7 +151,7 @@ async fn flushed_pk_index(
                         )
                         .await?;
                         let batches = scan_pk(&dataset, &build_pk).await?;
-                        GenPkIndex::from_batches(&batches, &build_pk)
+                        pk_hashes_from_batches(&batches, &build_pk)
                     }),
                 )
                 .await
@@ -141,7 +159,7 @@ async fn flushed_pk_index(
         None => {
             let dataset = open_flushed_dataset(path, session, None).await?;
             let batches = scan_pk(&dataset, pk_columns).await?;
-            Ok(Arc::new(GenPkIndex::from_batches(&batches, pk_columns)?))
+            Ok(Arc::new(pk_hashes_from_batches(&batches, pk_columns)?))
         }
     }
 }
@@ -170,14 +188,26 @@ mod tests {
     /// Hash a single Int32 `id` PK the way the planner does, so a test can probe
     /// a returned blocked set by value.
     fn hash_id(id: i32) -> u64 {
-        use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, resolve_pk_indices};
         let batch = id_batch(&[id]);
         let pk_indices = resolve_pk_indices(&batch, &["id".to_string()]).unwrap();
         compute_pk_hash(&batch, &pk_indices, 0)
     }
 
     #[test]
-    fn batch_store_index_collapses_within_gen_dups() {
+    fn pk_hashes_collapse_within_gen_duplicates() {
+        // Two rows share pk=1 (a within-gen duplicate); pk=2 is unique.
+        let hashes = pk_hashes_from_batches(&[id_batch(&[1, 2, 1])], &["id".to_string()]).unwrap();
+        assert_eq!(hashes.len(), 2); // distinct pks: 1, 2
+    }
+
+    #[test]
+    fn empty_batches_yield_empty_membership() {
+        let hashes = pk_hashes_from_batches(&[id_batch(&[])], &["id".to_string()]).unwrap();
+        assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn batch_store_membership_collapses_within_gen_dups() {
         let store = BatchStore::with_capacity(8);
         // Two single-row batches, both pk=1 (a within-gen update).
         store.append(id_batch(&[1])).unwrap();
@@ -185,8 +215,24 @@ mod tests {
         // A two-row batch: pk=2, pk=3.
         store.append(id_batch(&[2, 3])).unwrap();
 
-        let index = pk_index_from_batch_store(&store, &["id".to_string()]).unwrap();
-        assert_eq!(index.len(), 3); // distinct pks: 1, 2, 3
+        let hashes = pk_hashes_from_batch_store(&store, &["id".to_string()]).unwrap();
+        assert_eq!(hashes.len(), 3); // distinct pks: 1, 2, 3
+    }
+
+    #[test]
+    fn compute_blocked_sets_accumulates_newer_generations() {
+        // Newest gen: pk 1, 2. Older gen: pk 1, 3.
+        let gen_new = HashSet::from([1u64, 2]);
+        let gen_old = HashSet::from([1u64, 3]);
+
+        let (per_gen, full_union) = compute_blocked_sets(&[&gen_new, &gen_old]);
+
+        // The newest generation is superseded by nothing.
+        assert!(per_gen[0].is_empty());
+        // The older generation is superseded by the newer one's membership.
+        assert_eq!(per_gen[1], HashSet::from([1, 2]));
+        // The full union (base's blocked set) spans both generations.
+        assert_eq!(full_union, HashSet::from([1, 2, 3]));
     }
 
     #[tokio::test]
@@ -277,10 +323,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Base's blocked set is the union of all newer generations. pk=1 was
-        // re-written in gen 1, so its hash is blocked (the stale base copy gets
-        // dropped); pk=3 exists only in base, so its hash is absent (kept). The
-        // end-to-end drop is covered by the vector_search base specs.
+        // Base's blocked set = union of newer gens: pk=1 (re-written in gen 1) is
+        // blocked, pk=3 (base-only) is not. End-to-end drop: vector_search specs.
         let base_blocked = blocked
             .get(&LsmGeneration::BASE_TABLE)
             .expect("base has a blocked set");

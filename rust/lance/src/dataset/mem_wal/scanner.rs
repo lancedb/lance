@@ -37,10 +37,6 @@ mod collector;
 mod data_source;
 pub mod exec;
 mod flushed_cache;
-// Retains general-purpose constructors/accessors (`from_hashed`, `len`,
-// `is_empty`) used by unit tests; the block-list path uses the rest.
-#[allow(dead_code)]
-mod gen_pk_index;
 mod planner;
 mod point_lookup;
 mod projection;

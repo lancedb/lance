@@ -36,16 +36,12 @@ use super::projection::{
 };
 use crate::session::Session;
 
-/// Per-source over-fetch multiplier for the staleness post-filter. A source that
-/// may contain superseded rows fetches `ceil(k * factor)` candidates so that
-/// dropping the blocked ones (`PkHashFilterExec`) still leaves `k` live rows for
-/// the cross-source merge.
+/// Over-fetch multiplier for the staleness post-filter: a source that may hold
+/// superseded rows fetches `ceil(k * factor)` so `k` live rows survive the drop.
 ///
-/// TODO(perf/correctness): over-fetch does not *guarantee* `k` live results when
-/// a source has more than `factor` superseded rows near the query. Push the
-/// filter into the per-source KNN as a true prefilter (the index keeps
-/// traversing until `k` rows pass), then drop both the over-fetch and the
-/// post-filter.
+/// TODO(perf/correctness): this doesn't *guarantee* `k` live rows when a source
+/// has more than `factor` superseded rows near the query. A true KNN prefilter
+/// (traverse until `k` pass) would drop both the over-fetch and the post-filter.
 const STALE_OVERFETCH_FACTOR: f64 = 2.5;
 
 /// Plans vector search queries over LSM data.
@@ -209,12 +205,9 @@ impl LsmVectorSearchPlanner {
             return self.empty_plan(projection);
         }
 
-        // Per-source blocked PK-hash sets: for each generation, the PK hashes that
-        // a newer generation supersedes (`NEWER(G)`; for base, the union of all
-        // generations). A present entry means that source must drop candidates
-        // whose PK is in the set before the union, and over-fetch to backfill the
-        // holes. See [`super::block_list`]. `Box::pin` keeps this sizeable
-        // sub-future off `plan_search`'s own future (avoids `clippy::large_futures`).
+        // Per-source blocked PK-hash sets (`NEWER(G)`; base = union of all gens).
+        // A present entry → that source over-fetches and drops blocked candidates
+        // before the union. `Box::pin` avoids `clippy::large_futures`.
         let block_lists = Box::pin(super::block_list::compute_source_block_lists(
             &sources,
             &self.pk_columns,
@@ -239,8 +232,8 @@ impl LsmVectorSearchPlanner {
         for source in &sources {
             let generation = source.generation();
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            // When a newer generation supersedes this source's rows, over-fetch so
-            // the PK-hash post-filter still leaves k live candidates for the merge.
+            // Over-fetch when something supersedes this source, so the post-filter
+            // still leaves k live candidates.
             let blocked = block_lists.get(&generation);
             let fetch_k = if blocked.is_some() {
                 ((k as f64) * STALE_OVERFETCH_FACTOR).ceil() as usize
@@ -256,12 +249,9 @@ impl LsmVectorSearchPlanner {
                 refine_factor,
             ))
             .await?;
-            // Drop rows whose PK was superseded by a newer generation before
-            // tagging/union, so a stale row never reaches the merge — this closes
-            // the top-k stale-read gap the global dedup can't. Same hash-membership
-            // test for every source; within-generation duplicates (same PK, same
-            // gen — not in the blocked set) are left to the global dedup's
-            // freshness tiebreaker.
+            // Drop superseded rows before the union — closes the top-k stale-read
+            // gap the global dedup can't. Within-gen dups (not in the blocked set)
+            // are left to the dedup's freshness tiebreaker.
             let knn = match blocked {
                 Some(set) => Arc::new(super::exec::PkHashFilterExec::new(
                     knn,
@@ -383,8 +373,7 @@ impl LsmVectorSearchPlanner {
             merged_sorted
         };
 
-        // Under-fetch is detected per-source inside `PkHashFilterExec` (the
-        // over-fetch is a per-source property), so there is no top-level warn.
+        // Under-fetch is warned per-source inside `PkHashFilterExec`.
         Ok(result)
     }
 

@@ -3,27 +3,19 @@
 
 //! Drop superseded rows from a per-source KNN result by primary-key hash.
 //!
-//! `PkHashFilterExec` removes every input row whose primary-key hash is in
-//! `blocked` — for a generation `G`, the union of every newer generation's PK
-//! hashes (`NEWER(G)`); for the base table, the union of all generations (see
-//! [`super::super::block_list`]). It hashes only the rows the source's KNN
-//! actually returns, so there is no separate full scan to find superseded rows.
+//! Drops every row whose PK hash ([`super::compute_pk_hash`]) is in `blocked` —
+//! `NEWER(G)` for a generation, the union of all generations for the base table
+//! (see [`super::super::block_list`]). Only the KNN's output is hashed, so there
+//! is no separate scan for superseded rows.
 //!
-//! It blocks only *cross-generation* supersession: a PK in `NEWER(G)` means
-//! every copy of it in `G` is stale, so dropping by hash (no address needed) is
-//! exact. *Within-generation* duplicates (the same PK twice in one generation)
-//! share a hash and are *not* in the blocked set; they are collapsed downstream
-//! by the global dedup's `(generation, freshness)` tiebreaker. The hash is
-//! [`super::compute_pk_hash`] — the same one the dedup nodes use.
+//! Only *cross-generation* supersession is blocked: a PK in `NEWER(G)` makes
+//! every copy stale, so dropping by hash needs no row address. *Within-gen*
+//! duplicates share a hash and aren't in `blocked`; the global dedup's
+//! `(generation, freshness)` tiebreaker collapses those.
 //!
-//! # Under-fetch warning
-//!
-//! Because this is a post-filter, the per-source KNN over-fetches
-//! (`STALE_OVERFETCH_FACTOR`) so enough live rows survive the drop. When the
-//! source still produced at least `k` candidates yet fewer than `k` survived,
-//! the over-fetch was too small — the filter logs a warning at end of stream.
-//! This is a per-source signal (the over-fetch is per-source), so it can fire
-//! even when the merged top-k ends up full because another source backfilled.
+//! It post-filters an over-fetched KNN (`STALE_OVERFETCH_FACTOR`), so it warns
+//! when a source produced >= k candidates but < k survived — the over-fetch was
+//! too small. Per-source, so it can fire even when the merged top-k is full.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -201,17 +193,14 @@ impl Stream for PkHashFilterStream {
                 }
             }
             Poll::Ready(None) => {
-                // The source produced >= k candidates but the post-filter left
-                // fewer: the over-fetch did not cover the superseded rows here.
+                // >= k candidates in, < k out: the over-fetch missed superseded rows.
                 if !self.warned && self.input_seen >= self.k && self.kept < self.k {
                     warn!(
                         k = self.k,
                         fetched = self.input_seen,
                         kept = self.kept,
-                        "LSM vector-search source dropped enough superseded rows that fewer than \
-                         k live candidates survived the PK-hash post-filter; the per-source \
-                         over-fetch (STALE_OVERFETCH_FACTOR) was too small. Raise the factor or \
-                         move the block-list into the KNN as a true prefilter."
+                        "LSM vector search: < k live rows survived the PK-hash post-filter; \
+                         raise STALE_OVERFETCH_FACTOR or use a true KNN prefilter."
                     );
                     self.warned = true;
                 }

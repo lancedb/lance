@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 
-use super::gen_pk_index::GenPkIndex;
 use crate::dataset::{Dataset, DatasetBuilder};
 use crate::session::Session;
 
@@ -44,10 +43,10 @@ pub struct FlushedMemTableCache {
     // `try_get_with`, so concurrent first-queries on a just-flushed
     // generation open the dataset exactly once.
     inner: moka::future::Cache<String, Arc<Dataset>>,
-    // Per-generation PK index for the vector-search block-list, keyed by the
-    // same immutable flushed path. Built lazily on the first query that needs
+    // Per-generation set of PK hashes for the vector-search block-list, keyed by
+    // the same immutable flushed path. Built lazily on the first query that needs
     // it (single-flight) so repeated searches skip re-scanning the PK column.
-    pk_indices: moka::future::Cache<String, Arc<GenPkIndex>>,
+    pk_hashes: moka::future::Cache<String, Arc<HashSet<u64>>>,
 }
 
 impl FlushedMemTableCache {
@@ -64,7 +63,7 @@ impl FlushedMemTableCache {
                 // into at build time.
                 .support_invalidation_closures()
                 .build(),
-            pk_indices: moka::future::Cache::builder()
+            pk_hashes: moka::future::Cache::builder()
                 .max_capacity(max_entries)
                 .support_invalidation_closures()
                 .build(),
@@ -97,16 +96,16 @@ impl FlushedMemTableCache {
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
     }
 
-    /// Get the cached `GenPkIndex` for `path`, building it (exactly once) on a
-    /// miss via `build`. The flushed path is immutable, so a cached index is
+    /// Get the cached set of PK hashes for `path`, building it (exactly once) on
+    /// a miss via `build`. The flushed path is immutable, so a cached set is
     /// never stale; concurrent first-queries share one build via `moka`'s
     /// single-flight `try_get_with`.
-    pub async fn get_or_build_pk_index(
+    pub async fn get_or_build_pk_hashes(
         &self,
         path: &str,
-        build: impl std::future::Future<Output = Result<GenPkIndex>>,
-    ) -> Result<Arc<GenPkIndex>> {
-        self.pk_indices
+        build: impl std::future::Future<Output = Result<HashSet<u64>>>,
+    ) -> Result<Arc<HashSet<u64>>> {
+        self.pk_hashes
             .try_get_with(path.to_string(), async move { build.await.map(Arc::new) })
             .await
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
@@ -128,7 +127,7 @@ impl FlushedMemTableCache {
             .invalidate_entries_if(move |path, _| !live.contains(path));
         let live = live_paths.clone();
         let _ = self
-            .pk_indices
+            .pk_hashes
             .invalidate_entries_if(move |path, _| !live.contains(path));
     }
 }
@@ -252,30 +251,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pk_index_cached_reuses_first_build() {
-        // The PK index is keyed by the immutable flushed path: a hit returns the
-        // first-built index and never runs the second build closure.
+    async fn pk_hashes_cached_reuses_first_build() {
+        // The PK-hash set is keyed by the immutable flushed path: a hit returns
+        // the first-built set and never runs the second build closure.
         let cache = FlushedMemTableCache::new(8);
         let path = "memory://shard/gen_1";
         let first = cache
-            .get_or_build_pk_index(path, async { Ok(GenPkIndex::from_hashed([1u64, 2])) })
+            .get_or_build_pk_hashes(path, async { Ok(HashSet::from([1u64, 2])) })
             .await
             .unwrap();
         let second = cache
-            .get_or_build_pk_index(path, async {
+            .get_or_build_pk_hashes(path, async {
                 // Different contents; must be ignored because the path is cached.
-                Ok(GenPkIndex::from_hashed([9u64]))
+                Ok(HashSet::from([9u64]))
             })
             .await
             .unwrap();
         assert!(
             Arc::ptr_eq(&first, &second),
-            "a PK-index cache hit must reuse the first-built index"
+            "a PK-hash cache hit must reuse the first-built set"
         );
         assert_eq!(
             second.len(),
             2,
-            "cached index keeps the first build's contents"
+            "cached set keeps the first build's contents"
         );
     }
 
