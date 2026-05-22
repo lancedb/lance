@@ -93,12 +93,20 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param nprobes number of IVF partitions to probe
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
-   * @param refineFactor when positive, the base-table arm over-fetches {@code k * refineFactor}
-   *     candidates and re-ranks them with exact distances. Pass {@code 0} or negative to disable.
+   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances
+   *     (refine factor 1). Useful when the base table uses an approximate index (IVF-PQ).
+   * @param overfetchFactor when positive, each source fetches {@code ceil(k * overfetchFactor)}
+   *     candidates to mitigate stale reads from LSM dedup. Pass {@code 0} or negative to disable.
+   *     When active, base-table refine is also enabled automatically.
    * @return an executable plan
    */
   public ExecutionPlan planSearch(
-      Float4Vector query, int k, int nprobes, List<String> columns, int refineFactor) {
+      Float4Vector query,
+      int k,
+      int nprobes,
+      List<String> columns,
+      boolean refineBaseTable,
+      double overfetchFactor) {
     Preconditions.checkNotNull(query, "query must not be null");
     Preconditions.checkArgument(k > 0, "k must be positive, got %s", k);
     Preconditions.checkArgument(nprobes > 0, "nprobes must be positive, got %s", nprobes);
@@ -115,7 +123,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
                 k,
                 nprobes,
                 Optional.ofNullable(columns),
-                refineFactor);
+                refineBaseTable,
+                overfetchFactor);
         plan.allocator = allocator;
         return plan;
       }
@@ -123,7 +132,23 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
   }
 
   /**
-   * Plan a KNN vector search without refine.
+   * Plan a KNN vector search without overfetch.
+   *
+   * @param query a flat float32 vector of length {@code vectorDim}
+   * @param k number of nearest neighbours to return
+   * @param nprobes number of IVF partitions to probe
+   * @param columns columns to project; pass {@code null} to return all columns plus {@code
+   *     _distance}
+   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances.
+   * @return an executable plan
+   */
+  public ExecutionPlan planSearch(
+      Float4Vector query, int k, int nprobes, List<String> columns, boolean refineBaseTable) {
+    return planSearch(query, k, nprobes, columns, refineBaseTable, 0);
+  }
+
+  /**
+   * Plan a KNN vector search without refine or overfetch.
    *
    * @param query a flat float32 vector of length {@code vectorDim}
    * @param k number of nearest neighbours to return
@@ -133,12 +158,12 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @return an executable plan
    */
   public ExecutionPlan planSearch(Float4Vector query, int k, int nprobes, List<String> columns) {
-    return planSearch(query, k, nprobes, columns, 0);
+    return planSearch(query, k, nprobes, columns, false, 0);
   }
 
   /** Plan a KNN vector search with default {@code nprobes} of 20. */
   public ExecutionPlan planSearch(Float4Vector query, int k) {
-    return planSearch(query, k, 20, null, 0);
+    return planSearch(query, k, 20, null, false, 0);
   }
 
   private native ExecutionPlan nativePlanSearch(
@@ -147,7 +172,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
       int k,
       int nprobes,
       Optional<List<String>> columns,
-      int refineFactor);
+      boolean refineBaseTable,
+      double overfetchFactor);
 
   /**
    * Close the planner and release native resources. If the planner is already closed, invoking this

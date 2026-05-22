@@ -172,11 +172,19 @@ impl LsmVectorSearchPlanner {
     /// * `k` - Number of nearest neighbors to return
     /// * `nprobes` - Number of IVF partitions to search (for IVF-based indexes)
     /// * `projection` - Columns to include in output (None = all columns)
-    /// * `refine_factor` - When set, the base-table arm of the KNN plan fetches
-    ///   `k * refine_factor` candidates and re-ranks them with exact distances.
-    ///   Useful when the base table uses an approximate index (IVF-PQ) so that
-    ///   cross-source distance comparison is exact. Memtable arms use exact
-    ///   HNSW search and do not need refine.
+    /// * `refine_base_table` - When true, the base-table arm re-ranks its
+    ///   candidates with exact distances (refine factor 1). Useful when the
+    ///   base table uses an approximate index (IVF-PQ) so that cross-source
+    ///   distance comparison is exact. Memtable arms use exact HNSW search
+    ///   and never need refine.
+    /// * `overfetch_factor` - When set, each source fetches `ceil(k * factor)`
+    ///   candidates instead of `k`. After cross-source global PK dedup, the
+    ///   final top-k is taken from the larger candidate pool. This mitigates
+    ///   stale reads: when a PK's fresh version falls out of its source's
+    ///   top-k, the extra candidates increase the chance that the global dedup
+    ///   still sees it and can suppress the stale copy. For the base table,
+    ///   overfetching also enables refine so that approximate index distances
+    ///   are re-ranked to exact before the cross-source merge.
     ///
     /// # Returns
     ///
@@ -189,7 +197,8 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
-        refine_factor: Option<u32>,
+        refine_base_table: bool,
+        overfetch_factor: Option<f64>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
 
@@ -209,12 +218,29 @@ impl LsmVectorSearchPlanner {
         let internal_schema =
             canonical_internal_schema(projection, &self.base_schema, &self.pk_columns, true);
 
+        let fetch_k = match overfetch_factor {
+            Some(factor) => ((k as f64) * factor).ceil() as usize,
+            None => k,
+        };
+
+        // Refine the base table when explicitly requested or when overfetching
+        // (overfetch widens the candidate pool so approximate distances must be
+        // re-ranked to exact before the cross-source merge).
+        let refine_base = refine_base_table || overfetch_factor.is_some();
+
         let mut knn_plans = Vec::new();
         for source in &sources {
             let generation = source.generation();
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let knn = self
-                .build_knn_plan(source, query_vector, k, nprobes, projection, refine_factor)
+                .build_knn_plan(
+                    source,
+                    query_vector,
+                    fetch_k,
+                    nprobes,
+                    projection,
+                    is_base && refine_base,
+                )
                 .await?;
             // Tag rows with `(_memtable_gen, _freshness)`. Polarity differs
             // per source — see [`LsmSourceTagExec`] / [`FreshnessPolarity`]:
@@ -339,7 +365,7 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
-        refine_factor: Option<u32>,
+        refine: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -360,10 +386,10 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_metric(self.distance_type);
                 // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
-                // Re-rank base candidates with exact distances when set, so
-                // they're directly comparable to MemTable distances in the merge.
-                if let Some(factor) = refine_factor {
-                    scanner.refine(factor);
+                // Re-rank base candidates with exact distances so they're
+                // directly comparable to memtable distances in the merge.
+                if refine {
+                    scanner.refine(1);
                 }
                 scanner.create_plan().await
             }
@@ -532,7 +558,7 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 10, 8, None, None).await;
+        let plan = planner.plan_search(&query, 10, 8, None, false, None).await;
 
         // Plan construction must succeed. Execution against empty data is a
         // separate concern handled by integration tests.
@@ -620,7 +646,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, None)
+            .plan_search(&query, 3, 1, None, false, None)
             .await
             .expect("planner should produce a plan");
 
@@ -741,7 +767,7 @@ mod tests {
         let query = create_query_vector();
         let projection = vec!["vector".to_string()];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, None)
             .await
             .expect("planner should produce a plan");
 
@@ -823,7 +849,7 @@ mod tests {
             "_rowid".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, None)
             .await
             .expect(
                 "planner must accept `_distance`/`_rowid` in projection without breaking the plan",
@@ -934,7 +960,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, None)
+            .plan_search(&query, 3, 1, None, false, None)
             .await
             .expect("planner should produce a plan");
 
@@ -1076,7 +1102,10 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, None)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -1196,7 +1225,7 @@ mod tests {
             "vector".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, None)
             .await
             .expect("planner should produce a plan");
 
@@ -1272,7 +1301,7 @@ mod tests {
         ];
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, Some(&projection), None)
+            .plan_search(&query, 5, 1, Some(&projection), false, None)
             .await
             .expect("empty plan must accept system columns in projection");
 
@@ -1317,7 +1346,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 8, None, None)
+            .plan_search(&query, 10, 8, None, false, None)
             .await
             .expect("planner should produce a plan without a base table");
 
@@ -1444,7 +1473,10 @@ mod tests {
         // the older row's vector is far from the query but still a graph
         // node. After dedup we should see pk=1 exactly once.
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, None)
+            .await
+            .unwrap();
 
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
