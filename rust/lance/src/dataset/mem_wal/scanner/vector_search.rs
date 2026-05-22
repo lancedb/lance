@@ -36,14 +36,6 @@ use super::projection::{
 };
 use crate::session::Session;
 
-/// Over-fetch multiplier for the staleness post-filter: a source that may hold
-/// superseded rows fetches `ceil(k * factor)` so `k` live rows survive the drop.
-///
-/// TODO(perf/correctness): this doesn't *guarantee* `k` live rows when a source
-/// has more than `factor` superseded rows near the query. A true KNN prefilter
-/// (traverse until `k` pass) would drop both the over-fetch and the post-filter.
-const STALE_OVERFETCH_FACTOR: f64 = 2.5;
-
 /// Plans vector search queries over LSM data.
 ///
 /// Each source independently runs KNN, then results are unioned and run
@@ -180,16 +172,36 @@ impl LsmVectorSearchPlanner {
     /// * `k` - Number of nearest neighbors to return
     /// * `nprobes` - Number of IVF partitions to search (for IVF-based indexes)
     /// * `projection` - Columns to include in output (None = all columns)
-    /// * `refine_factor` - When set, the base-table arm of the KNN plan fetches
-    ///   `k * refine_factor` candidates and re-ranks them with exact distances.
-    ///   Useful when the base table uses an approximate index (IVF-PQ) so that
-    ///   cross-source distance comparison is exact. Memtable arms use exact
-    ///   HNSW search and do not need refine.
+    /// * `refine_base_table` - When true, the base-table arm re-ranks its
+    ///   candidates with exact distances (refine factor 1). Useful when the base
+    ///   table uses an approximate index (IVF-PQ) so cross-source distance
+    ///   comparison is exact. Memtable arms use exact HNSW search and never need
+    ///   refine. Auto-enabled whenever stale filtering is on (see below).
+    /// * `overfetch_factor` - A single knob that controls **both** whether stale
+    ///   rows are filtered and how aggressively sources over-fetch to backfill
+    ///   the rows that filtering drops:
+    ///
+    ///   - `factor < 1.0` (e.g. `0.0`): **stale filtering off.** The per-source
+    ///     block-list / [`super::exec::PkHashFilterExec`] is not built or applied,
+    ///     so rows superseded by a newer generation can surface. The global PK
+    ///     dedup still runs, so it still suppresses stale copies in the cases
+    ///     where both the stale and the fresh row reach it.
+    ///   - `factor == 1.0`: **stale filtering on, no over-fetch.** Each source
+    ///     that has superseded rows fetches exactly `k` candidates, drops the
+    ///     stale ones, and may therefore return fewer than `k` live rows.
+    ///   - `factor > 1.0`: **stale filtering on, with over-fetch.** Such a source
+    ///     fetches `ceil(k * factor)` candidates so that dropping the stale ones
+    ///     still leaves `k` live rows for the merge.
+    ///
+    ///   There is intentionally no separate on/off flag: over-fetch is only ever
+    ///   meaningful while filtering, so the factor encodes both. A true KNN
+    ///   prefilter would remove the need for over-fetch entirely.
     ///
     /// # Returns
     ///
     /// An execution plan that returns the top-K nearest neighbors across all
-    /// LSM levels, with stale results filtered out.
+    /// LSM levels, with stale results filtered out (unless `overfetch_factor`
+    /// disables filtering).
     #[instrument(name = "lsm_vector_search", level = "info", skip_all, fields(k, nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
     pub async fn plan_search(
         &self,
@@ -197,7 +209,8 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
-        refine_factor: Option<u32>,
+        refine_base_table: bool,
+        overfetch_factor: f64,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
 
@@ -205,16 +218,26 @@ impl LsmVectorSearchPlanner {
             return self.empty_plan(projection);
         }
 
+        // `overfetch_factor` is the single stale-filtering knob: a factor `>= 1.0`
+        // turns the per-source block-list / `PkHashFilterExec` on (and sets the
+        // over-fetch multiple); `< 1.0` turns it off entirely. See the doc above.
+        let filter_stale = overfetch_factor >= 1.0;
+
         // Per-source blocked PK-hash sets (`NEWER(G)`; base = union of all gens).
         // A present entry → that source over-fetches and drops blocked candidates
-        // before the union. `Box::pin` avoids `clippy::large_futures`.
-        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
-            &sources,
-            &self.pk_columns,
-            self.session.as_ref(),
-            self.flushed_cache.as_ref(),
-        ))
-        .await?;
+        // before the union. `Box::pin` avoids `clippy::large_futures`. Skipped
+        // entirely when stale filtering is disabled (no block-list, no filter).
+        let block_lists = if filter_stale {
+            Box::pin(super::block_list::compute_source_block_lists(
+                &sources,
+                &self.pk_columns,
+                self.session.as_ref(),
+                self.flushed_cache.as_ref(),
+            ))
+            .await?
+        } else {
+            Default::default()
+        };
 
         let canonical_schema = canonical_output_schema(
             projection,
@@ -228,16 +251,24 @@ impl LsmVectorSearchPlanner {
         let internal_schema =
             canonical_internal_schema(projection, &self.base_schema, &self.pk_columns, true);
 
+        // Refine the base table when explicitly requested, or whenever stale
+        // filtering runs (it over-fetches the base's approximate-index candidates,
+        // so distances must be re-ranked to exact before the cross-source merge).
+        let refine_base = refine_base_table || filter_stale;
+
         let mut knn_plans = Vec::new();
         for source in &sources {
             let generation = source.generation();
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            // Over-fetch when something supersedes this source, so the post-filter
-            // still leaves k live candidates. Keyed per shard — generations are
-            // per-shard, so a source is only blocked by its own shard's newer gens.
+            // A blocked source fetches `ceil(k * overfetch_factor)` candidates so
+            // the post-filter still leaves k live ones (factor >= 1.0 ⇒ >= k).
+            // `block_lists` is non-empty only when filtering is on, so a present
+            // entry already implies `overfetch_factor >= 1.0`. Keyed per shard —
+            // generations are per-shard, so a source is only blocked by its own
+            // shard's newer generations.
             let blocked = block_lists.get(&(source.shard_id(), generation));
             let fetch_k = if blocked.is_some() {
-                ((k as f64) * STALE_OVERFETCH_FACTOR).ceil() as usize
+                ((k as f64) * overfetch_factor).ceil() as usize
             } else {
                 k
             };
@@ -247,7 +278,7 @@ impl LsmVectorSearchPlanner {
                 fetch_k,
                 nprobes,
                 projection,
-                refine_factor,
+                is_base && refine_base,
             ))
             .await?;
             // Drop superseded rows before the union — closes the top-k stale-read
@@ -386,7 +417,7 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
-        refine_factor: Option<u32>,
+        refine: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -407,10 +438,10 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_metric(self.distance_type);
                 // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
-                // Re-rank base candidates with exact distances when set, so
-                // they're directly comparable to MemTable distances in the merge.
-                if let Some(factor) = refine_factor {
-                    scanner.refine(factor);
+                // Re-rank base candidates with exact distances so they're
+                // directly comparable to memtable distances in the merge.
+                if refine {
+                    scanner.refine(1);
                 }
                 scanner.create_plan().await
             }
@@ -579,7 +610,7 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 10, 8, None, None).await;
+        let plan = planner.plan_search(&query, 10, 8, None, false, 1.0).await;
 
         // Plan construction must succeed. Execution against empty data is a
         // separate concern handled by integration tests.
@@ -667,7 +698,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, None)
+            .plan_search(&query, 3, 1, None, false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -788,7 +819,7 @@ mod tests {
         let query = create_query_vector();
         let projection = vec!["vector".to_string()];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -870,7 +901,7 @@ mod tests {
             "_rowid".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
             .await
             .expect(
                 "planner must accept `_distance`/`_rowid` in projection without breaking the plan",
@@ -981,7 +1012,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, None)
+            .plan_search(&query, 3, 1, None, false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -1123,7 +1154,10 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, 1.0)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -1243,7 +1277,7 @@ mod tests {
             "vector".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -1319,7 +1353,7 @@ mod tests {
         ];
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, Some(&projection), None)
+            .plan_search(&query, 5, 1, Some(&projection), false, 1.0)
             .await
             .expect("empty plan must accept system columns in projection");
 
@@ -1364,7 +1398,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 8, None, None)
+            .plan_search(&query, 10, 8, None, false, 1.0)
             .await
             .expect("planner should produce a plan without a base table");
 
@@ -1491,7 +1525,10 @@ mod tests {
         // the older row's vector is far from the query but still a graph
         // node. After dedup we should see pk=1 exactly once.
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, 1.0)
+            .await
+            .unwrap();
 
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
@@ -1616,7 +1653,10 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 1, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 1, 1, None, false, 1.0)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -1663,6 +1703,29 @@ mod tests {
             rows[0].0, 2,
             "expected nearest live neighbor pk=2, got {:?}",
             rows
+        );
+
+        // Toggle off: with filter_stale=false the block-list is skipped, so the
+        // superseded base copy of pk=1 (distance ~0) is no longer suppressed.
+        // Fresh pk=1 never reaches the global dedup (evicted from the active
+        // top-k), so the stale copy resurfaces and wins top-1.
+        let unfiltered = planner
+            .plan_search(&query, 1, 1, None, false, 0.0)
+            .await
+            .unwrap();
+        let unfiltered_rows = {
+            let stream = unfiltered
+                .execute(0, SessionContext::new().task_ctx())
+                .unwrap();
+            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            collect_id_dist(&batches)
+        };
+        assert!(
+            unfiltered_rows
+                .iter()
+                .any(|&(id, d)| id == 1 && d.abs() < 1e-3),
+            "filter_stale=false must surface the stale pk=1 (distance ~0); got {:?}",
+            unfiltered_rows
         );
     }
 
@@ -1782,7 +1845,11 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 3, 1, None, None).await.unwrap();
+        // Over-fetch (2.5x) so the post-filter can backfill the all-stale top-k.
+        let plan = planner
+            .plan_search(&query, 3, 1, None, false, 2.5)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -1857,7 +1924,10 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 1, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 1, 1, None, false, 1.0)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -1978,7 +2048,10 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 1, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 1, 1, None, false, 1.0)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -2087,7 +2160,10 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, 1.0)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();

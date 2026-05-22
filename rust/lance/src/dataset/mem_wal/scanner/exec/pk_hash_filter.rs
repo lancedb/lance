@@ -10,8 +10,8 @@
 //! Cross-generation only: within-gen duplicates share a hash, so the global
 //! dedup's `(generation, freshness)` tiebreaker collapses those instead.
 //!
-//! Post-filters an over-fetched KNN (`STALE_OVERFETCH_FACTOR`); warns when a
-//! source had >= k candidates but < k survived (over-fetch too small).
+//! Post-filters an over-fetched KNN (the planner's `overfetch_factor`); warns
+//! when a source had >= k candidates but < k survived (over-fetch too small).
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -198,7 +198,7 @@ impl Stream for PkHashFilterStream {
                         fetched = self.input_seen,
                         kept = self.kept,
                         "LSM vector search: < k live rows survived the PK-hash post-filter; \
-                         raise STALE_OVERFETCH_FACTOR or use a true KNN prefilter."
+                         raise the over-fetch factor or use a true KNN prefilter."
                     );
                     self.warned = true;
                 }

@@ -1006,7 +1006,7 @@ fn bench_vector_search(c: &mut Criterion) {
                         DistanceType::L2,
                     );
                     let plan = planner
-                        .plan_search(&query, k, nprobes, None, None)
+                        .plan_search(&query, k, nprobes, None, false, 1.0)
                         .await
                         .unwrap();
                     let session_ctx = SessionContext::new();
