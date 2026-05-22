@@ -663,36 +663,13 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         .unwrap_or(0);
     println!("manifest: {num_flushed} flushed generations");
 
-    // Build an FTS index on each flushed generation. Flushed memtables are
-    // written without one (the maintained index lives only in the active
-    // memtable), so without this both scoring modes would flat-scan the
-    // generations per query — an O(rows·queries) artifact that swamps the
-    // scoring-mode signal this bench measures. Indexing the generations
-    // models the realistic post-flush multi-segment FTS state (discussion
-    // #6789) and lets both Local and Rescore use the fast indexed path.
-    // (The index-less flat path itself is covered by unit tests.)
-    if let Some(ref m) = manifest {
-        let idx_start = Instant::now();
-        for fg in &m.flushed_generations {
-            let gen_uri = format!("{}/_mem_wal/{}/{}", args.uri, shard_id, fg.path);
-            let mut gen_ds = Dataset::open(&gen_uri).await?;
-            gen_ds
-                .create_index(
-                    &[TEXT_COL],
-                    IndexType::Inverted,
-                    Some(FTS_INDEX_NAME.to_string()),
-                    &InvertedIndexParams::default(),
-                    true,
-                )
-                .await?;
-        }
-        if num_flushed > 0 {
-            println!(
-                "indexed {num_flushed} flushed generations in {:.1}s",
-                idx_start.elapsed().as_secs_f64()
-            );
-        }
-    }
+    // Flushed generations carry the same maintained secondary indexes as
+    // the active memtable: the flush handler builds them during flush
+    // (lance #6901), so each generation already has the FTS index and
+    // both scoring modes use the fast indexed path. No manual indexing
+    // step is needed here. (The index-less flat fallback in the rescore
+    // planner is still exercised by unit tests for the no-maintained-index
+    // case.)
 
     let collector = LsmDataSourceCollector::new(dataset.clone(), vec![shard_snapshot])
         .with_in_memory_memtables(shard_id, in_memory_refs);
