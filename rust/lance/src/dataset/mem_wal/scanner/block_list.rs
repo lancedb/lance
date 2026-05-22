@@ -78,6 +78,35 @@ pub async fn compute_source_block_lists(
     Ok(blocked)
 }
 
+/// The fresh-tier block-list: one membership set per generation that shadows the
+/// base table — active + frozen memtables (hashed now) and flushed generations
+/// (from the cache). Same `Vec<Arc<HashSet<u64>>>` shape the vector-search filter
+/// consumes; a base/external reader can drop any row whose PK is in one of them.
+/// The base source, if present, is skipped (it is what gets shadowed).
+pub async fn fresh_tier_block_list(
+    sources: &[LsmDataSource],
+    pk_columns: &[String],
+    session: Option<&Arc<Session>>,
+    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+) -> Result<Vec<Arc<HashSet<u64>>>> {
+    let mut sets = Vec::new();
+    for source in sources {
+        let set = match source {
+            LsmDataSource::BaseTable { .. } => continue,
+            LsmDataSource::ActiveMemTable { batch_store, .. } => {
+                Arc::new(pk_hashes_from_batch_store(batch_store, pk_columns)?)
+            }
+            LsmDataSource::FlushedMemTable { path, .. } => {
+                flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?
+            }
+        };
+        if !set.is_empty() {
+            sets.push(set);
+        }
+    }
+    Ok(sets)
+}
+
 /// Hash the PK membership of an in-memory memtable (active or frozen) from its
 /// committed `BatchStore` rows.
 pub fn pk_hashes_from_batch_store(
@@ -208,6 +237,39 @@ mod tests {
 
         let hashes = pk_hashes_from_batch_store(&store, &["id".to_string()]).unwrap();
         assert_eq!(hashes.len(), 3); // distinct pks: 1, 2, 3
+    }
+
+    #[tokio::test]
+    async fn fresh_tier_block_list_one_set_per_in_memory_gen() {
+        use crate::dataset::mem_wal::scanner::data_source::{LsmDataSource, LsmGeneration};
+        use crate::dataset::mem_wal::write::IndexStore;
+        use uuid::Uuid;
+
+        let shard = Uuid::new_v4();
+        let mk = |ids: &[i32], generation: u64| {
+            let store = BatchStore::with_capacity(8);
+            store.append(id_batch(ids)).unwrap();
+            LsmDataSource::ActiveMemTable {
+                batch_store: Arc::new(store),
+                index_store: Arc::new(IndexStore::new()),
+                schema: id_batch(&[1]).schema(),
+                shard_id: shard,
+                generation: LsmGeneration::memtable(generation),
+            }
+        };
+        // Active gen 2: pk=1,2. Frozen gen 1: pk=3.
+        let sources = vec![mk(&[1, 2], 2), mk(&[3], 1)];
+
+        let sets = fresh_tier_block_list(&sources, &["id".to_string()], None, None)
+            .await
+            .unwrap();
+
+        // One set per generation; together they cover pk=1,2,3 (not 4).
+        assert_eq!(sets.len(), 2);
+        for id in [1, 2, 3] {
+            assert!(blocks(&sets, id));
+        }
+        assert!(!blocks(&sets, 4));
     }
 
     #[tokio::test]
