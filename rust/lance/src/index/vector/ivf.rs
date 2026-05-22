@@ -2808,7 +2808,7 @@ impl<'a> FixedIvfTrainingSampler<'a> {
         Ok(Some(Self {
             dataset,
             column,
-            vector_type: vector_field.data_type().clone(),
+            vector_type: vector_field.data_type(),
             projection: Arc::new(dataset.schema().project(&[column])?),
             byte_width: vector_field
                 .data_type()
@@ -2843,24 +2843,31 @@ impl<'a> FixedIvfTrainingSampler<'a> {
     }
 }
 
-fn train_ivf_kmeans_step<T: ArrowPrimitiveType>(
-    centroids: Option<Arc<FixedSizeListArray>>,
-    data: &PrimitiveArray<T>,
+type KMeansProgressCallback = Arc<dyn Fn(u32, u32) + Send + Sync>;
+
+struct KMeansStepOptions {
     dimension: usize,
     metric_type: MetricType,
     num_partitions: usize,
     sample_rate: usize,
     max_iters: usize,
-    on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
+    on_progress: KMeansProgressCallback,
+}
+
+fn train_ivf_kmeans_step<T: ArrowPrimitiveType>(
+    centroids: Option<Arc<FixedSizeListArray>>,
+    data: &PrimitiveArray<T>,
+    options: &KMeansStepOptions,
 ) -> Result<KMeans>
 where
     <T as ArrowPrimitiveType>::Native: Dot + L2 + Normalize,
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let has_centroids = centroids.is_some();
-    let mut kmeans_params = KMeansParams::new(centroids, max_iters as u32, 1, metric_type)
-        .with_balance_factor(1.0)
-        .with_on_progress(on_progress);
+    let mut kmeans_params =
+        KMeansParams::new(centroids, options.max_iters as u32, 1, options.metric_type)
+            .with_balance_factor(1.0)
+            .with_on_progress(options.on_progress.clone());
     if has_centroids {
         // Incremental refinement already has the full centroid set.  The
         // hierarchical trainer bootstraps a smaller tree and is only suitable
@@ -2870,9 +2877,9 @@ where
     lance_index::vector::kmeans::train_kmeans::<T>(
         data,
         kmeans_params,
-        dimension,
-        num_partitions,
-        sample_rate,
+        options.dimension,
+        options.num_partitions,
+        options.sample_rate,
     )
 }
 
@@ -2887,36 +2894,29 @@ fn train_ivf_kmeans_step_arrow_array(
 ) -> Result<(KMeans, f64)> {
     let dimension = data.value_length() as usize;
     let values = data.values();
+    let step_options = KMeansStepOptions {
+        dimension,
+        metric_type,
+        num_partitions,
+        sample_rate,
+        max_iters,
+        on_progress,
+    };
     let kmeans = match (values.data_type(), metric_type) {
         (DataType::Float16, _) => train_ivf_kmeans_step::<Float16Type>(
             centroids,
             values.as_primitive::<Float16Type>(),
-            dimension,
-            metric_type,
-            num_partitions,
-            sample_rate,
-            max_iters,
-            on_progress,
+            &step_options,
         )?,
         (DataType::Float32, _) => train_ivf_kmeans_step::<Float32Type>(
             centroids,
             values.as_primitive::<Float32Type>(),
-            dimension,
-            metric_type,
-            num_partitions,
-            sample_rate,
-            max_iters,
-            on_progress,
+            &step_options,
         )?,
         (DataType::Float64, _) => train_ivf_kmeans_step::<Float64Type>(
             centroids,
             values.as_primitive::<Float64Type>(),
-            dimension,
-            metric_type,
-            num_partitions,
-            sample_rate,
-            max_iters,
-            on_progress,
+            &step_options,
         )?,
         (DataType::Int8, DistanceType::L2)
         | (DataType::Int8, DistanceType::Dot)
@@ -2925,12 +2925,7 @@ fn train_ivf_kmeans_step_arrow_array(
             let kmeans = train_ivf_kmeans_step::<Float32Type>(
                 centroids,
                 data.values().as_primitive::<Float32Type>(),
-                dimension,
-                metric_type,
-                num_partitions,
-                sample_rate,
-                max_iters,
-                on_progress,
+                &step_options,
             )?;
             let loss = kmeans.compute_loss(&data)?;
             return Ok((kmeans, loss));
@@ -2938,12 +2933,7 @@ fn train_ivf_kmeans_step_arrow_array(
         (DataType::UInt8, DistanceType::Hamming) => train_ivf_kmeans_step::<UInt8Type>(
             centroids,
             values.as_primitive::<UInt8Type>(),
-            dimension,
-            metric_type,
-            num_partitions,
-            sample_rate,
-            max_iters,
-            on_progress,
+            &step_options,
         )?,
         _ => Err(Error::index(format!(
             "KMeans: can not train data type {} with distance type: {}",
@@ -2962,20 +2952,24 @@ fn compute_ivf_kmeans_loss(kmeans: &KMeans, data: &FixedSizeListArray) -> Result
     Ok(kmeans.compute_loss(data)?)
 }
 
-async fn compute_streaming_ivf_loss(
-    dataset: &Dataset,
-    column: &str,
+struct StreamingIvfSamples<'a> {
+    dataset: &'a Dataset,
+    column: &'a str,
     metric_type: MetricType,
     total_sample_rate: usize,
     streaming_sample_rate: usize,
     num_partitions: usize,
+    fragment_ids: Option<&'a [u32]>,
+}
+
+async fn compute_streaming_ivf_loss(
+    samples: &StreamingIvfSamples<'_>,
     centroids: &FixedSizeListArray,
-    fragment_ids: Option<&[u32]>,
 ) -> Result<f64> {
-    let loss_metric_type = if metric_type == MetricType::Cosine {
+    let loss_metric_type = if samples.metric_type == MetricType::Cosine {
         MetricType::L2
     } else {
-        metric_type
+        samples.metric_type
     };
     let kmeans = KMeans::with_centroids(
         centroids.values().clone(),
@@ -2983,14 +2977,19 @@ async fn compute_streaming_ivf_loss(
         loss_metric_type,
         f64::MAX,
     );
-    let mut remaining_sample_rate = total_sample_rate;
+    let mut remaining_sample_rate = samples.total_sample_rate;
     let mut loss = 0.0;
     while remaining_sample_rate > 0 {
-        let step_sample_rate = remaining_sample_rate.min(streaming_sample_rate);
-        let step_sample_size = num_partitions * step_sample_rate;
-        let (training_data, _) =
-            sample_ivf_training_chunk(dataset, column, step_sample_size, metric_type, fragment_ids)
-                .await?;
+        let step_sample_rate = remaining_sample_rate.min(samples.streaming_sample_rate);
+        let step_sample_size = samples.num_partitions * step_sample_rate;
+        let (training_data, _) = sample_ivf_training_chunk(
+            samples.dataset,
+            samples.column,
+            step_sample_size,
+            samples.metric_type,
+            samples.fragment_ids,
+        )
+        .await?;
         loss += compute_ivf_kmeans_loss(&kmeans, &training_data)?;
         remaining_sample_rate -= step_sample_rate;
     }
@@ -3228,7 +3227,7 @@ impl WeightedCoreset {
         self.losses.push(loss);
     }
 
-    fn append(&mut self, other: WeightedCoreset) {
+    fn append(&mut self, other: Self) {
         self.values.extend(other.values);
         self.weights.extend(other.weights);
         self.losses.extend(other.losses);
@@ -3731,7 +3730,7 @@ fn train_weighted_hierarchical_f32_kmeans(
         let cluster_k = if cluster.indices.len() <= 16 {
             2.min(remaining_k).min(cluster.indices.len())
         } else {
-            (cluster.indices.len() / 16).min(remaining_k).min(16).max(2)
+            (cluster.indices.len() / 16).min(remaining_k).clamp(2, 16)
         };
         let (sub_data, sub_weights, sub_losses) = weighted_subset(
             data_values,
@@ -4024,14 +4023,16 @@ async fn train_streaming_coreset_ivf_model(
         .await?
     } else {
         compute_streaming_ivf_loss(
-            dataset,
-            column,
-            metric_type,
-            total_sample_rate,
-            streaming_sample_rate,
-            num_partitions,
+            &StreamingIvfSamples {
+                dataset,
+                column,
+                metric_type,
+                total_sample_rate,
+                streaming_sample_rate,
+                num_partitions,
+                fragment_ids,
+            },
             &centroids,
-            fragment_ids,
         )
         .await?
     };
@@ -4149,14 +4150,16 @@ async fn train_streaming_ivf_model(
 
     let centroids = centroids.ok_or_else(|| Error::index("No IVF centroids trained"))?;
     let loss = compute_streaming_ivf_loss(
-        dataset,
-        column,
-        metric_type,
-        total_sample_rate,
-        streaming_sample_rate,
-        num_partitions,
+        &StreamingIvfSamples {
+            dataset,
+            column,
+            metric_type,
+            total_sample_rate,
+            streaming_sample_rate,
+            num_partitions,
+            fragment_ids,
+        },
         &centroids,
-        fragment_ids,
     )
     .await?;
     Ok(IvfModel::new((*centroids).clone(), Some(loss)))
