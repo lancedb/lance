@@ -25,6 +25,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
+import org.lance.index.scalar.ZonemapStatsCodec;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -1489,11 +1490,16 @@ public class Dataset implements Closeable {
         columnName != null && !columnName.isEmpty(), "columnName cannot be null or empty");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeGetZonemapStats(columnName);
+      byte[] ipcBytes = nativeGetZonemapStatsIpc(columnName);
+      try {
+        return ZonemapStatsCodec.decode(ipcBytes, allocator);
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to decode zonemap stats IPC", e);
+      }
     }
   }
 
-  private native List<ZoneStats> nativeGetZonemapStats(String columnName);
+  private native byte[] nativeGetZonemapStatsIpc(String columnName);
 
   /**
    * Get the table config of the dataset.
