@@ -3259,7 +3259,7 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["progress_callback"] = progress_callback
 
         self._ds.create_index(
-            [column], index_type, name, replace, train, None, range_partitions, kwargs
+            [column], index_type, name, replace, train, None, range_partitions, None, kwargs
         )
 
     def _create_index_impl(
@@ -3623,6 +3623,7 @@ class LanceDataset(pa.dataset.Dataset):
             train,
             storage_options,
             range_partitions,
+            None,
             kwargs,
         )
         timers["final_create_index:end"] = time.time()
