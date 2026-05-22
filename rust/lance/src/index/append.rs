@@ -1580,7 +1580,200 @@ mod tests {
             .num_rows();
         assert_eq!(
             count_all, 100,
-            "data should still be correct after optimize even though range structure is lost"
+            "all data should be queryable after optimize"
+        );
+
+        let count_range: usize = dataset
+            .scan()
+            .filter("value >= 10 AND value < 20")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            count_range, 10,
+            "range query should return correct results using the index"
+        );
+
+        let count_point: usize = dataset
+            .scan()
+            .filter("value = 75")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            count_point, 1,
+            "point query should return correct result using the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_btree_range_partition_with_three_partitions() {
+        use lance_index::scalar::BuiltinIndexType;
+        use lance_index::scalar::btree::BTreeParameters;
+        use lance_table::format::list_index_files_with_sizes;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from_iter_values(0..90))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 30,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3, "should have 3 fragments");
+        let frag_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
+        let shared_uuid = Uuid::new_v4().to_string();
+
+        let mut index_metas = Vec::new();
+        for (range_id, &frag_id) in frag_ids.iter().enumerate() {
+            let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree).with_params(
+                &serde_json::to_value(BTreeParameters {
+                    zone_size: None,
+                    range_id: Some(range_id as u32),
+                })
+                .unwrap(),
+            );
+            let meta =
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &btree_params)
+                    .name("value_idx".to_string())
+                    .fragments(vec![frag_id])
+                    .index_uuid(shared_uuid.clone())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            index_metas.push(meta);
+        }
+
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::BTree,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+
+        let mut committed_meta = index_metas.into_iter().next().unwrap();
+        committed_meta.fragment_bitmap = Some(frag_ids.iter().copied().collect());
+        committed_meta.files = Some(
+            list_index_files_with_sizes(
+                dataset.object_store.as_ref(),
+                &dataset.indices_dir().join(shared_uuid.as_str()),
+            )
+            .await
+            .unwrap(),
+        );
+        committed_meta.dataset_version = dataset.manifest.version;
+
+        let transaction = crate::dataset::transaction::TransactionBuilder::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![committed_meta],
+                removed_indices: vec![],
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::Int32Array::from_iter_values(90..150))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], schema.clone());
+        let mut dataset = dataset;
+        dataset.append(reader, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        let indices = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let index_uuid_str = indices[0].uuid.to_string();
+        let index_dir = dataset.indices_dir().join(index_uuid_str.as_str());
+        let files = list_index_files_with_sizes(dataset.object_store.as_ref(), &index_dir)
+            .await
+            .unwrap();
+        let has_part_files = files.iter().any(|f| f.path.contains("part_"));
+        assert!(
+            has_part_files,
+            "range-partitioned BTree should preserve range structure after optimize, found: {:?}",
+            files
+        );
+
+        assert!(
+            dataset
+                .unindexed_fragments("value_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "all fragments should be indexed after optimize"
+        );
+
+        let count_all: usize = dataset
+            .scan()
+            .filter("value >= 0 AND value < 150")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count_all, 150, "all data should be queryable");
+
+        let count_range: usize = dataset
+            .scan()
+            .filter("value >= 45 AND value < 55")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            count_range, 10,
+            "range query across partition boundary should return correct results"
+        );
+
+        let count_point: usize = dataset
+            .scan()
+            .filter("value = 120")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            count_point, 1,
+            "point query on appended data should return correct result"
         );
     }
 }
