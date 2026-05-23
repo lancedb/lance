@@ -1100,15 +1100,17 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::UpdateConfig {
             schema_metadata_updates,
             field_metadata_updates,
+            fragment_metadata_updates,
             ..
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
-                Operation::Overwrite { .. } => {
-                    // Updates to schema metadata or field metadata conflict with any kind
-                    // of overwrite.
+                Operation::Overwrite { .. } | Operation::Restore { .. } => {
+                    // Updates to schema, field, or fragment metadata conflict with
+                    // Overwrite/Restore since they replace all fragments and schema.
                     if schema_metadata_updates.is_some()
                         || !field_metadata_updates.is_empty()
+                        || !fragment_metadata_updates.is_empty()
                         || self
                             .transaction
                             .operation
@@ -1134,16 +1136,39 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
+                Operation::Delete {
+                    deleted_fragment_ids,
+                    ..
+                } => {
+                    if fragment_metadata_updates
+                        .keys()
+                        .any(|id| deleted_fragment_ids.contains(id))
+                    {
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::Update {
+                    removed_fragment_ids,
+                    ..
+                } => {
+                    if fragment_metadata_updates
+                        .keys()
+                        .any(|id| removed_fragment_ids.contains(id))
+                    {
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
-                | Operation::Delete { .. }
                 | Operation::CreateIndex { .. }
                 | Operation::Rewrite { .. }
                 | Operation::DataReplacement { .. }
                 | Operation::Merge { .. }
-                | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
-                | Operation::Update { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),

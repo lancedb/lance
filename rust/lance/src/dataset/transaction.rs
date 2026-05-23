@@ -3223,7 +3223,8 @@ impl TryFrom<pb::Transaction> for Transaction {
                 let has_new_fields = update_config.config_updates.is_some()
                     || update_config.table_metadata_updates.is_some()
                     || update_config.schema_metadata_updates.is_some()
-                    || !update_config.field_metadata_updates.is_empty();
+                    || !update_config.field_metadata_updates.is_empty()
+                    || !update_config.fragment_metadata_updates.is_empty();
 
                 // Check if old-style fields are present
                 let has_old_fields = !update_config.upsert_values.is_empty()

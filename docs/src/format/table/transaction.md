@@ -426,8 +426,11 @@ Modifies table configuration, table metadata, schema metadata, field metadata, o
 An UpdateConfig operation only modifies metadata and tends to be compatible with other operations. Here
 are the operations that conflict with UpdateConfig:
 
-- Overwrite
+- Overwrite (if the UpdateConfig modifies schema, field, or fragment metadata)
+- Restore (if the UpdateConfig modifies schema, field, or fragment metadata)
 - UpdateConfig (only if the two operations modify the same config or the same fragment/field/schema metadata)
+- Delete (only if the UpdateConfig modifies metadata on a fragment that was deleted)
+- Update (only if the UpdateConfig modifies metadata on a fragment that was removed)
 
 ### DataReplacement
 
