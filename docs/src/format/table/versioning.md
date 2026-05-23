@@ -28,7 +28,9 @@ they should return an "unsupported" error on any read or write operation.
 | 4        | `FLAG_USE_V2_FORMAT_DEPRECATED` | No              | No              | Files are written with the new v2 format. This flag is deprecated and no longer used.                       |
 | 8        | `FLAG_TABLE_CONFIG`             | No              | Yes             | Table config is present in the manifest.                                                                    |
 | 16       | `FLAG_BASE_PATHS`               | Yes             | Yes             | Dataset uses multiple base paths (for shallow clones or multi-base datasets).                               |
+| 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | No              | Inline transaction in manifest; no separate transaction file written.                                       |
+| 64       | `FLAG_FRAGMENT_METADATA`        | No              | Yes             | Fragments may contain free-form key-value metadata.                                                         |
 
 </div>
 
-Flags with bit values 32 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
+Flags with bit values 128 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.

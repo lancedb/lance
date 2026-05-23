@@ -20,8 +20,10 @@ pub const FLAG_TABLE_CONFIG: u64 = 8;
 pub const FLAG_BASE_PATHS: u64 = 16;
 /// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
 pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
+/// Fragments may contain free-form key-value metadata
+pub const FLAG_FRAGMENT_METADATA: u64 = 64;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 64;
+pub const FLAG_UNKNOWN: u64 = 128;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -74,6 +76,15 @@ pub fn apply_feature_flags(
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
+
+    let has_fragment_metadata = manifest
+        .fragments
+        .iter()
+        .any(|frag| !frag.metadata.is_empty());
+    if has_fragment_metadata {
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_METADATA;
+    }
+
     Ok(())
 }
 
@@ -103,6 +114,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_FRAGMENT_METADATA));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -120,12 +132,14 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_FRAGMENT_METADATA));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
                 | super::FLAG_BASE_PATHS
+                | super::FLAG_FRAGMENT_METADATA
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
     }
@@ -180,5 +194,46 @@ mod tests {
             multi_base_manifest.writer_feature_flags & FLAG_BASE_PATHS,
             0
         );
+    }
+
+    #[test]
+    fn test_fragment_metadata_feature_flag() {
+        use crate::format::{DataStorageFormat, Fragment, Manifest};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // No fragment metadata → no flag
+        let mut manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.writer_feature_flags & FLAG_FRAGMENT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_FRAGMENT_METADATA, 0);
+
+        // With fragment metadata → writer flag only
+        let mut frag = Fragment::new(0);
+        frag.metadata
+            .insert("created_at".into(), "2026-05-22".into());
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![frag]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_FRAGMENT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_FRAGMENT_METADATA, 0);
     }
 }
