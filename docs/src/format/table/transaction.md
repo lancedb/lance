@@ -410,7 +410,7 @@ are rebaseable conflicts with Update:
 
 ### UpdateConfig
 
-Modifies table configuration, table metadata, schema metadata, or field metadata without changing data.
+Modifies table configuration, table metadata, schema metadata, field metadata, or fragment metadata without changing data.
 
 <details>
 <summary>UpdateConfig protobuf message</summary>
@@ -423,11 +423,11 @@ Modifies table configuration, table metadata, schema metadata, or field metadata
 
 #### UpdateConfig Compatibility
 
-An UpdateConfig operation only modifies table config and tends to be compatible with other operations. Here
+An UpdateConfig operation only modifies metadata and tends to be compatible with other operations. Here
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
-- UpdateConfig (only if the two operations modify the same config)
+- UpdateConfig (only if the two operations modify the same config or the same fragment/field/schema metadata)
 
 ### DataReplacement
 

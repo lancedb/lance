@@ -72,6 +72,7 @@ fn make_uniform_pb_fragments(n: u64, num_fields: usize) -> Vec<pb::DataFragment>
                     version_bytes.clone(),
                 ),
             ),
+            metadata: Default::default(),
         })
         .collect()
 }
@@ -148,6 +149,7 @@ fn make_diverse_pb_fragments(
                         version_payloads[version_idx].clone(),
                     ),
                 ),
+                metadata: Default::default(),
             }
         })
         .collect()

@@ -380,6 +380,7 @@ impl DataFileFieldInterner {
             physical_rows,
             last_updated_at_version_meta,
             created_at_version_meta,
+            metadata: p.metadata,
         })
     }
 }
@@ -503,6 +504,10 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Free-form key-value metadata for the fragment.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
 }
 
 impl Fragment {
@@ -515,6 +520,7 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -554,6 +560,7 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -680,6 +687,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            metadata: p.metadata,
         })
     }
 }
@@ -721,6 +729,7 @@ impl From<&Fragment> for pb::DataFragment {
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             last_updated_at_version_sequence,
             created_at_version_sequence,
+            metadata: f.metadata.clone(),
         }
     }
 }
@@ -784,6 +793,43 @@ mod tests {
         let proto = pb::DataFragment::from(&fragment);
         let fragment2 = Fragment::try_from(proto).unwrap();
         assert_eq!(fragment, fragment2);
+    }
+
+    #[test]
+    fn test_roundtrip_fragment_with_metadata() {
+        let mut fragment = Fragment::new(1);
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
+        fragment.add_file_legacy("data.lance", &Schema::try_from(&schema).unwrap());
+        fragment
+            .metadata
+            .insert("created_at".into(), "2026-05-22T00:00:00Z".into());
+        fragment
+            .metadata
+            .insert("process_id".into(), "pid-42".into());
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert_eq!(proto.metadata.len(), 2);
+        assert_eq!(
+            proto.metadata.get("created_at").unwrap(),
+            "2026-05-22T00:00:00Z"
+        );
+
+        let fragment2 = Fragment::try_from(proto).unwrap();
+        assert_eq!(fragment, fragment2);
+    }
+
+    #[test]
+    fn test_roundtrip_fragment_empty_metadata() {
+        let mut fragment = Fragment::new(2);
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
+        fragment.add_file_legacy("data.lance", &Schema::try_from(&schema).unwrap());
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert!(proto.metadata.is_empty());
+
+        let fragment2 = Fragment::try_from(proto).unwrap();
+        assert_eq!(fragment, fragment2);
+        assert!(fragment2.metadata.is_empty());
     }
 
     #[test]

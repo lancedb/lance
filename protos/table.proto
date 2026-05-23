@@ -346,6 +346,10 @@ message DataFragment {
   // deletion tombstones. To compute the current number of rows, subtract
   // `deletion_file.num_deleted_rows` from this value.
   uint64 physical_rows = 4;
+
+  // Free-form key-value metadata for the fragment.
+  // Intended for lightweight metadata such as creation time, process ID, etc.
+  map<string, string> metadata = 11;
 }
 
 message DataFile {

@@ -287,12 +287,13 @@ message Transaction {
   }
   
   // An operation that updates the table config, table metadata, schema metadata,
-  // or field metadata.
+  // field metadata, or fragment metadata.
   message UpdateConfig {
     UpdateMap config_updates = 6;
     UpdateMap table_metadata_updates = 7;
     UpdateMap schema_metadata_updates = 8;
     map<int32, UpdateMap> field_metadata_updates = 9;
+    map<uint64, UpdateMap> fragment_metadata_updates = 10;
 
     // Deprecated -------------------------------
     map<string, string> upsert_values = 1;

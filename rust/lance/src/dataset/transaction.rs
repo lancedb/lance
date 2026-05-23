@@ -431,6 +431,7 @@ pub enum Operation {
         table_metadata_updates: Option<UpdateMap>,
         schema_metadata_updates: Option<UpdateMap>,
         field_metadata_updates: HashMap<i32, UpdateMap>,
+        fragment_metadata_updates: HashMap<u64, UpdateMap>,
     },
     /// Update merged generations in MemWAL index.
     /// This is used during merge-insert to atomically record which
@@ -669,18 +670,21 @@ impl PartialEq for Operation {
                     table_metadata_updates: a_table_metadata,
                     schema_metadata_updates: a_schema,
                     field_metadata_updates: a_field,
+                    fragment_metadata_updates: a_frag,
                 },
                 Self::UpdateConfig {
                     config_updates: b_config,
                     table_metadata_updates: b_table_metadata,
                     schema_metadata_updates: b_schema,
                     field_metadata_updates: b_field,
+                    fragment_metadata_updates: b_frag,
                 },
             ) => {
                 a_config == b_config
                     && a_table_metadata == b_table_metadata
                     && a_schema == b_schema
                     && a_field == b_field
+                    && a_frag == b_frag
             }
             (
                 Self::DataReplacement { replacements: a },
@@ -1442,12 +1446,14 @@ impl Operation {
                     table_metadata_updates,
                     schema_metadata_updates,
                     field_metadata_updates,
+                    fragment_metadata_updates,
                     ..
                 },
                 Self::UpdateConfig {
                     table_metadata_updates: other_table_metadata,
                     schema_metadata_updates: other_schema_metadata,
                     field_metadata_updates: other_field_metadata,
+                    fragment_metadata_updates: other_fragment_metadata,
                     ..
                 },
             ) => {
@@ -1463,6 +1469,13 @@ impl Operation {
                 if !field_metadata_updates.is_empty() && !other_field_metadata.is_empty() {
                     for field in field_metadata_updates.keys() {
                         if other_field_metadata.contains_key(field) {
+                            return true;
+                        }
+                    }
+                }
+                if !fragment_metadata_updates.is_empty() && !other_fragment_metadata.is_empty() {
+                    for frag_id in fragment_metadata_updates.keys() {
+                        if other_fragment_metadata.contains_key(frag_id) {
                             return true;
                         }
                     }
@@ -2386,6 +2399,7 @@ impl Transaction {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                fragment_metadata_updates,
             } => {
                 if let Some(config_updates) = config_updates {
                     let mut config = manifest.config.clone();
@@ -2506,6 +2520,22 @@ impl Transaction {
                     return Err(Error::invalid_input(
                         "the unenforced clustering key is a reserved key and cannot be set to an invalid value",
                     ));
+                }
+                if !fragment_metadata_updates.is_empty() {
+                    let fragments = Arc::make_mut(&mut manifest.fragments);
+                    for (frag_id, frag_metadata_update) in fragment_metadata_updates {
+                        let fragment =
+                            fragments
+                                .iter_mut()
+                                .find(|f| f.id == *frag_id)
+                                .ok_or_else(|| {
+                                    Error::invalid_input(format!(
+                                        "Fragment with id {} does not exist",
+                                        frag_id
+                                    ))
+                                })?;
+                        apply_update_map(&mut fragment.metadata, frag_metadata_update);
+                    }
                 }
             }
             _ => {}
@@ -3245,6 +3275,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                         table_metadata_updates: None,
                         schema_metadata_updates,
                         field_metadata_updates,
+                        fragment_metadata_updates: HashMap::new(),
                     }
                 } else {
                     // Use new-style fields directly (convert from protobuf)
@@ -3263,6 +3294,13 @@ impl TryFrom<pb::Transaction> for Transaction {
                             .iter()
                             .map(|(field_id, pb_update_map)| {
                                 (*field_id, UpdateMap::from(pb_update_map))
+                            })
+                            .collect(),
+                        fragment_metadata_updates: update_config
+                            .fragment_metadata_updates
+                            .iter()
+                            .map(|(frag_id, pb_update_map)| {
+                                (*frag_id, UpdateMap::from(pb_update_map))
                             })
                             .collect(),
                     }
@@ -3529,6 +3567,7 @@ impl From<&Transaction> for pb::Transaction {
                 table_metadata_updates,
                 schema_metadata_updates,
                 field_metadata_updates,
+                fragment_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
                 config_updates: config_updates
                     .as_ref()
@@ -3543,6 +3582,12 @@ impl From<&Transaction> for pb::Transaction {
                     .iter()
                     .map(|(field_id, update_map)| {
                         (*field_id, pb::transaction::UpdateMap::from(update_map))
+                    })
+                    .collect(),
+                fragment_metadata_updates: fragment_metadata_updates
+                    .iter()
+                    .map(|(frag_id, update_map)| {
+                        (*frag_id, pb::transaction::UpdateMap::from(update_map))
                     })
                     .collect(),
                 // Leave old fields empty - we only write new-style fields
@@ -4151,6 +4196,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         }];
         let mut next_row_id = 0;
 
@@ -4183,6 +4229,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         }];
         let mut next_row_id = 100;
 
@@ -4215,6 +4262,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         }];
         let mut next_row_id = 100;
 
@@ -4250,6 +4298,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         }];
         let mut next_row_id = 100;
 
@@ -4278,6 +4327,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                metadata: HashMap::new(),
             },
             Fragment {
                 id: 2,
@@ -4287,6 +4337,7 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                metadata: HashMap::new(),
             },
         ];
         let mut next_row_id = 1000;
@@ -4331,6 +4382,7 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         }];
         let mut next_row_id = 0;
 
@@ -4840,6 +4892,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![fragment.clone()]);
@@ -5108,6 +5161,7 @@ mod tests {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let operation = Operation::Overwrite {
@@ -5200,6 +5254,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let mut manifest = Manifest::new(
@@ -5272,6 +5327,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(meta_v1.clone()),
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let mut manifest = Manifest::new(
@@ -5291,6 +5347,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: Some(meta_v1),
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let tx = Transaction::new(
@@ -5340,6 +5397,7 @@ mod tests {
             physical_rows: Some(5),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = Manifest::new(
@@ -5404,6 +5462,7 @@ mod tests {
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let mut manifest = Manifest::new(
@@ -5426,6 +5485,7 @@ mod tests {
             physical_rows: Some(4),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let tx = Transaction::new(
@@ -5490,6 +5550,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let new_seq = RowIdSequence::from([100u64, 102].as_slice());
@@ -5501,6 +5562,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5545,6 +5607,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                metadata: HashMap::new(),
             },
             Fragment {
                 id: 2,
@@ -5556,6 +5619,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                metadata: HashMap::new(),
             },
         ]);
 
@@ -5569,6 +5633,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let (result, _) = update_txn(vec![new_fragment])
@@ -5612,6 +5677,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         // New fragment has row 10 (UPDATE branch) and row 999 (INSERT branch)
@@ -5624,6 +5690,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         // update_txn uses read_version 4 → new_version is 5
@@ -5670,6 +5737,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let new_seq = RowIdSequence::from([10u64, 500, 11, 501].as_slice());
@@ -5681,6 +5749,7 @@ mod tests {
             physical_rows: Some(4),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         // update_txn uses read_version 4 → new_version is 5
@@ -5714,6 +5783,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let new_seq = RowIdSequence::from([50u64].as_slice());
@@ -5725,6 +5795,7 @@ mod tests {
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5753,6 +5824,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let new_fragment = Fragment {
@@ -5763,6 +5835,7 @@ mod tests {
             physical_rows: Some(3),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5795,6 +5868,7 @@ mod tests {
                 vec![0xFFu8; 8].as_slice(),
             ))),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let new_seq = RowIdSequence::from([10u64].as_slice());
@@ -5806,6 +5880,7 @@ mod tests {
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -5849,6 +5924,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         // Fragment outside range – IDs [1000, 1001], created_at = 99 (must never appear)
@@ -5869,6 +5945,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         // New fragment rewrites both rows from the in-range fragment
@@ -5881,6 +5958,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![in_range_frag, out_of_range_frag]);
@@ -5919,6 +5997,7 @@ mod tests {
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         // New fragment takes the boundary IDs: 10 (min) and 12 (max)
@@ -5931,6 +6010,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing]);
@@ -5981,6 +6061,7 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         // New fragment rewrites all 100 rows preserving their stable IDs.
@@ -5993,6 +6074,7 @@ mod tests {
             physical_rows: Some(100),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![src_frag]);
@@ -6042,6 +6124,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                metadata: HashMap::new(),
             },
             Fragment {
                 id: 2,
@@ -6053,6 +6136,7 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                metadata: HashMap::new(),
             },
         ]);
 
@@ -6066,6 +6150,7 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            metadata: HashMap::new(),
         };
 
         let (result, _) = update_txn(vec![new_frag])
@@ -6113,6 +6198,7 @@ mod tests {
             }),
             schema_metadata_updates: None,
             field_metadata_updates: HashMap::new(),
+            fragment_metadata_updates: HashMap::new(),
         }
     }
 
@@ -6126,5 +6212,41 @@ mod tests {
         assert!(left.modifies_same_metadata(&same_key));
         assert!(!left.modifies_same_metadata(&different_key));
         assert!(left.modifies_same_metadata(&replace));
+    }
+
+    fn fragment_metadata_update(frag_id: u64, entries: Vec<(&str, Option<&str>)>) -> Operation {
+        let mut fragment_metadata_updates = HashMap::new();
+        fragment_metadata_updates.insert(
+            frag_id,
+            UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace: false,
+            },
+        );
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+            fragment_metadata_updates,
+        }
+    }
+
+    #[test]
+    fn test_fragment_metadata_conflicts_on_same_fragment() {
+        let left = fragment_metadata_update(1, vec![("key", Some("a"))]);
+        let same_frag = fragment_metadata_update(1, vec![("other", Some("b"))]);
+        let different_frag = fragment_metadata_update(2, vec![("key", Some("c"))]);
+
+        assert!(left.modifies_same_metadata(&same_frag));
+        assert!(!left.modifies_same_metadata(&different_frag));
+    }
+
+    #[test]
+    fn test_fragment_metadata_no_conflict_with_table_metadata() {
+        let frag_update = fragment_metadata_update(1, vec![("key", Some("a"))]);
+        let table_update = table_metadata_update(vec![("key", Some("b"))], false);
+
+        assert!(!frag_update.modifies_same_metadata(&table_update));
     }
 }
