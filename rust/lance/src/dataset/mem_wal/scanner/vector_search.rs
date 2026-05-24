@@ -28,7 +28,10 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{FreshnessPolarity, LsmGlobalPkDedupExec, LsmSourceTagExec};
+use super::exec::{
+    DedupDirection, FreshnessPolarity, LsmGlobalPkDedupExec, LsmSourceTagExec,
+    WithinSourceDedupExec,
+};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_internal_schema, canonical_output_schema,
@@ -258,14 +261,14 @@ impl LsmVectorSearchPlanner {
         for source in &sources {
             let generation = source.generation();
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            // A blocked source fetches `ceil(k * overfetch_factor)` candidates so
-            // the post-filter still leaves k live ones (factor >= 1.0 ⇒ >= k).
-            // `block_lists` is non-empty only when filtering is on, so a present
-            // entry already implies `overfetch_factor >= 1.0`. Keyed per shard —
-            // generations are per-shard, so a source is only blocked by its own
-            // shard's newer generations.
+            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+            // Over-fetch a blocked source (the post-filter drops superseded
+            // candidates) or the active source (its within-source dedup collapses
+            // duplicate-PK HNSW nodes). Factor >= 1.0 ⇒ >= k live candidates
+            // survive. Keyed per shard — generations are per-shard, so a source
+            // is only blocked by its own shard's newer generations.
             let blocked = block_lists.get(&(source.shard_id(), generation));
-            let fetch_k = if blocked.is_some() {
+            let fetch_k = if blocked.is_some() || is_active {
                 ((k as f64) * overfetch_factor).ceil() as usize
             } else {
                 k
@@ -279,17 +282,32 @@ impl LsmVectorSearchPlanner {
                 is_base && refine_base,
             ))
             .await?;
-            // Drop superseded rows before the union — closes the top-k stale-read
-            // gap the global dedup can't. Within-gen dups (not in the blocked set)
-            // are left to the dedup's freshness tiebreaker.
-            let knn = match blocked {
-                Some(set) => Arc::new(super::exec::PkHashFilterExec::new(
+            // Make each source independently newest-per-PK before the union:
+            //  * active: the append-only HNSW returns one node per inserted
+            //    version, so collapse duplicate-PK rows to the newest insert
+            //    (KeepMaxRowAddr on `_rowid`), then re-sort by distance (the
+            //    dedup emits unordered) and cap at k. This is probabilistic: a
+            //    fresh version evicted from the over-fetched top-k still leaks.
+            //  * flushed/base: drop cross-generation superseded rows via the
+            //    block-list (the flushed deletion vector handles within-gen).
+            let knn = if is_active {
+                let deduped: Arc<dyn ExecutionPlan> = Arc::new(WithinSourceDedupExec::new(
                     knn,
                     self.pk_columns.clone(),
-                    set.clone(),
-                    k,
-                )) as Arc<dyn ExecutionPlan>,
-                None => knn,
+                    lance_core::ROW_ID,
+                    DedupDirection::KeepMaxRowAddr,
+                ));
+                sort_by_distance(deduped, k)?
+            } else {
+                match blocked {
+                    Some(set) => Arc::new(super::exec::PkHashFilterExec::new(
+                        knn,
+                        self.pk_columns.clone(),
+                        set.clone(),
+                        k,
+                    )) as Arc<dyn ExecutionPlan>,
+                    None => knn,
+                }
             };
             // Tag rows with `(_memtable_gen, _freshness)`. Every source is now
             // written in insert order (larger `_rowid` = newer): the active
@@ -494,6 +512,29 @@ impl LsmVectorSearchPlanner {
         let schema = canonical_output_schema(projection, &self.base_schema, &self.pk_columns, true);
         Ok(Arc::new(EmptyExec::new(schema)))
     }
+}
+
+/// Sort a single-partition plan by `_distance` ascending and cap at `k`.
+///
+/// Used to re-order the active arm after its within-source dedup (which emits
+/// rows unordered) so the cross-source distance merge sees a sorted stream.
+fn sort_by_distance(plan: Arc<dyn ExecutionPlan>, k: usize) -> Result<Arc<dyn ExecutionPlan>> {
+    let idx = plan.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
+        lance_core::Error::invalid_input(format!(
+            "Column '{}' not found in schema",
+            DISTANCE_COLUMN
+        ))
+    })?;
+    let sort_expr = vec![PhysicalSortExpr {
+        expr: Arc::new(Column::new(DISTANCE_COLUMN, idx)),
+        options: SortOptions {
+            descending: false,
+            nulls_first: false,
+        },
+    }];
+    let ordering = LexOrdering::new(sort_expr)
+        .ok_or_else(|| lance_core::Error::internal("Failed to create LexOrdering".to_string()))?;
+    Ok(Arc::new(SortExec::new(ordering, plan).with_fetch(Some(k))))
 }
 
 /// Convert a (typically single-row) FixedSizeList query into the array shape
@@ -1523,6 +1564,18 @@ mod tests {
             .plan_search(&query, 5, 1, None, false, 1.0)
             .await
             .unwrap();
+
+        // The active arm collapses duplicate-PK HNSW nodes itself, so it no
+        // longer depends on the cross-source dedup for within-source dedup.
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_str.contains("WithinSourceDedupExec"),
+            "active vector arm must self-dedup, got:\n{}",
+            plan_str
+        );
 
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
