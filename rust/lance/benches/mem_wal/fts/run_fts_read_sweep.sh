@@ -28,7 +28,9 @@
 #   QUERIES         queries per config (default 200)
 #   WITH_BASELINE   "1" to also build the merged-index accuracy baseline
 #                   and report local-vs-merged Jaccard (default off)
-#   BACKENDS        space-separated subset of "nvme s3" (default both)
+#   BACKENDS        space-separated subset of "nvme s3 s3express" (default all)
+#   S3EXPRESS_PREFIX  s3:// directory-bucket prefix (must be in instance AZ)
+#   BASELINE_BACKEND  only build the merged accuracy baseline on this backend
 #   CONFIG_TIMEOUT  per-config seconds (default 5400)
 
 set -uo pipefail
@@ -40,6 +42,10 @@ cd "$REPO_ROOT"
 RUN_ID="${1:-$(date -u +%Y%m%dT%H%M%SZ)}"
 NVME_PREFIX="${NVME_PREFIX:-${TMPDIR:-/tmp}/lsm-fts-nvme}"
 S3_PREFIX="${S3_PREFIX:-s3://jack-devland-build/lsm-fts}"
+# S3 Express One Zone directory bucket (must be in the instance's AZ to get
+# the latency benefit). Auto-detected as S3 Express by lance via the
+# `--x-s3` suffix.
+S3EXPRESS_PREFIX="${S3EXPRESS_PREFIX:-s3://jack-lancedb-devland--use1-az4--x-s3/lsm-fts}"
 CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/lance-fineweb-cache}"
 BASE_ROWS_LIST="${BASE_ROWS_LIST:-100000 1000000}"
 K_LIST="${K_LIST:-10 100}"
@@ -47,7 +53,10 @@ MAX_MEMTABLE_ROWS="${MAX_MEMTABLE_ROWS:-100000}"
 GENS_LIST="${GENS_LIST:-1 2 5}"
 QUERIES="${QUERIES:-200}"
 WITH_BASELINE="${WITH_BASELINE:-}"
-BACKENDS="${BACKENDS:-nvme s3}"
+# Accuracy (merged baseline) is storage-independent, so only build it on
+# this backend to avoid redundant rebuilds across the storage tiers.
+BASELINE_BACKEND="${BASELINE_BACKEND:-nvme}"
+BACKENDS="${BACKENDS:-nvme s3 s3express}"
 CONFIG_TIMEOUT="${CONFIG_TIMEOUT:-5400}"
 
 LOCAL_DIR="$REPO_ROOT/target/lsm-fts-read-results/${RUN_ID}"
@@ -67,9 +76,10 @@ echo ""
 
 backend_prefix() {
     case "$1" in
-        nvme) echo "$NVME_PREFIX/$RUN_ID" ;;
-        s3)   echo "$S3_PREFIX/$RUN_ID" ;;
-        *)    echo "ERROR unknown backend $1" >&2; exit 1 ;;
+        nvme)      echo "$NVME_PREFIX/$RUN_ID" ;;
+        s3)        echo "$S3_PREFIX/$RUN_ID" ;;
+        s3express) echo "$S3EXPRESS_PREFIX/$RUN_ID" ;;
+        *)         echo "ERROR unknown backend $1" >&2; exit 1 ;;
     esac
 }
 
@@ -116,8 +126,12 @@ for backend in $BACKENDS; do
                     echo ">>> $name (already done, skipping)"
                     continue
                 fi
+                # Accuracy is storage-independent → only build the merged
+                # baseline on BASELINE_BACKEND to avoid redundant rebuilds.
                 baseline_flag=()
-                [ -n "$WITH_BASELINE" ] && baseline_flag=(--with-baseline)
+                if [ -n "$WITH_BASELINE" ] && [ "$backend" = "$BASELINE_BACKEND" ]; then
+                    baseline_flag=(--with-baseline)
+                fi
                 run_phase "$name" \
                     --phase search --uri "$uri" \
                     --base-rows "$base_rows" \
