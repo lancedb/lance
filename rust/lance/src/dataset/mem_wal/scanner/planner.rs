@@ -18,7 +18,9 @@ use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
+use super::exec::{
+    DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkHashFilterExec, ROW_ADDRESS_COLUMN,
+};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
@@ -128,8 +130,20 @@ impl LsmScanPlanner {
             return self.empty_plan(projection, with_memtable_gen, keep_row_address);
         }
 
+        // Cross-generation block-list (`NEWER(G)` per source; base = union of all
+        // gens). A present entry drops, before the union, any row whose PK lives
+        // in a newer generation — the sole cross-generation mechanism once the
+        // sorted dedup is removed. `Box::pin` avoids `clippy::large_futures`.
+        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
+            &sources,
+            &self.pk_columns,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        ))
+        .await?;
+
         // 2. Build scan plan for each source with local sorting
-        // Order of operations: scan -> local sort -> (optional) tag with generation
+        // Order of operations: scan -> block-list filter -> local sort -> (optional) tag
         //
         // IMPORTANT: Sources are collected in generation order (base=0, then memtables 1,2,3...)
         // We reverse this to get _memtable_gen DESC order for the merge tiebreaker.
@@ -139,6 +153,20 @@ impl LsmScanPlanner {
         for source in sources {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
             let scan = self.build_source_scan(&source, projection, filter).await?;
+
+            // Drop cross-generation stale rows (PKs superseded by a newer gen)
+            // before the merge. Within-gen duplicates are handled per source
+            // (active fused dedup / flushed deletion vector). `k = 0`: there is
+            // no top-k, so the under-fetch warning never fires.
+            let scan = match block_lists.get(&(source.shard_id(), source.generation())) {
+                Some(set) => Arc::new(PkHashFilterExec::new(
+                    scan,
+                    self.pk_columns.clone(),
+                    set.clone(),
+                    0,
+                )) as Arc<dyn ExecutionPlan>,
+                None => scan,
+            };
 
             // Sort locally by (pk ASC, _rowaddr DESC)
             let local_sort_exprs = self.build_local_sort_exprs(&scan)?;
@@ -760,6 +788,65 @@ mod integration_tests {
         assert_eq!(results.get(&6), Some(&"active_6".to_string()));
         // id=7: only in active
         assert_eq!(results.get(&7), Some(&"active_7".to_string()));
+    }
+
+    /// Phase 4: the filtered-read plan applies the cross-generation block-list
+    /// (older generations whose PKs are superseded by a newer one are filtered),
+    /// while results stay newest-per-PK.
+    #[tokio::test]
+    async fn test_lsm_scan_filtered_read_applies_block_list() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        // base/gen1/gen2 all hold PKs superseded by a newer generation, so each
+        // is wrapped in a `PkHashFilterExec`; the newest (active) arm is not.
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_str.contains("PkHashFilterExec"),
+            "filtered-read plan must apply the cross-gen block-list, got:\n{}",
+            plan_str
+        );
+
+        // Results stay correct (newest-per-PK across generations).
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(results.len(), 7);
+        assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"active_5".to_string()));
+        assert_eq!(results.get(&6), Some(&"active_6".to_string()));
     }
 
     /// Regression for the concurrent-read-vs-flush hole: a sealed

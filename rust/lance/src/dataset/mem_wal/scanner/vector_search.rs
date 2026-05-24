@@ -218,26 +218,23 @@ impl LsmVectorSearchPlanner {
             return self.empty_plan(projection);
         }
 
-        // `overfetch_factor` is the single stale-filtering knob: a factor `>= 1.0`
-        // turns the per-source block-list / `PkHashFilterExec` on (and sets the
-        // over-fetch multiple); `< 1.0` turns it off entirely. See the doc above.
-        let filter_stale = overfetch_factor >= 1.0;
+        // The cross-generation block-list is **unconditional** (load-bearing:
+        // the sole cross-generation mechanism once the global dedup is removed).
+        // `overfetch_factor` is now only the over-fetch multiple; clamp it to
+        // `>= 1.0` so a blocked source still yields k live candidates after the
+        // post-filter.
+        let overfetch_factor = overfetch_factor.max(1.0);
 
         // Per-source blocked PK-hash sets (`NEWER(G)`; base = union of all gens).
         // A present entry → that source over-fetches and drops blocked candidates
-        // before the union. `Box::pin` avoids `clippy::large_futures`. Skipped
-        // entirely when stale filtering is disabled (no block-list, no filter).
-        let block_lists = if filter_stale {
-            Box::pin(super::block_list::compute_source_block_lists(
-                &sources,
-                &self.pk_columns,
-                self.session.as_ref(),
-                self.flushed_cache.as_ref(),
-            ))
-            .await?
-        } else {
-            Default::default()
-        };
+        // before the union. `Box::pin` avoids `clippy::large_futures`.
+        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
+            &sources,
+            &self.pk_columns,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        ))
+        .await?;
 
         let canonical_schema = canonical_output_schema(
             projection,
@@ -251,10 +248,11 @@ impl LsmVectorSearchPlanner {
         let internal_schema =
             canonical_internal_schema(projection, &self.base_schema, &self.pk_columns, true);
 
-        // Refine the base table when explicitly requested, or whenever stale
-        // filtering runs (it over-fetches the base's approximate-index candidates,
-        // so distances must be re-ranked to exact before the cross-source merge).
-        let refine_base = refine_base_table || filter_stale;
+        // Refine the base table when explicitly requested, or whenever the base
+        // is blocked (it then over-fetches its approximate-index candidates, so
+        // distances must be re-ranked to exact before the cross-source merge).
+        // `block_lists` is non-empty exactly when a newer generation exists.
+        let refine_base = refine_base_table || !block_lists.is_empty();
 
         let mut knn_plans = Vec::new();
         for source in &sources {
@@ -1701,27 +1699,27 @@ mod tests {
             rows
         );
 
-        // Toggle off: with filter_stale=false the block-list is skipped, so the
-        // superseded base copy of pk=1 (distance ~0) is no longer suppressed.
-        // Fresh pk=1 never reaches the global dedup (evicted from the active
-        // top-k), so the stale copy resurfaces and wins top-1.
-        let unfiltered = planner
+        // The block-list is now unconditional: a sub-1.0 overfetch_factor is
+        // clamped to 1.0 and the stale base copy of pk=1 stays suppressed (the
+        // factor only tunes the over-fetch multiple, it cannot disable filtering).
+        let still_filtered = planner
             .plan_search(&query, 1, 1, None, false, 0.0)
             .await
             .unwrap();
-        let unfiltered_rows = {
-            let stream = unfiltered
+        let still_filtered_rows = {
+            let stream = still_filtered
                 .execute(0, SessionContext::new().task_ctx())
                 .unwrap();
             let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
             collect_id_dist(&batches)
         };
         assert!(
-            unfiltered_rows
+            still_filtered_rows
                 .iter()
-                .any(|&(id, d)| id == 1 && d.abs() < 1e-3),
-            "filter_stale=false must surface the stale pk=1 (distance ~0); got {:?}",
-            unfiltered_rows
+                .all(|&(id, d)| !(id == 1 && d.abs() < 1e-3)),
+            "block-list is unconditional: stale pk=1 must stay suppressed even \
+             with overfetch_factor < 1.0; got {:?}",
+            still_filtered_rows
         );
     }
 
