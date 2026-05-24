@@ -405,12 +405,14 @@ impl LsmScanPlanner {
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.with_row_address();
 
-                // Apply filter - enables BTree index optimization for MemTable
+                // The filter is applied *inside* the fused dedup scan (after
+                // newest-per-PK dedup), not pushed into the raw scan — otherwise
+                // a PK whose newest version fails the filter leaks an older one.
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
 
-                scanner.create_plan().await
+                scanner.create_dedup_plan(&self.pk_columns).await
             }
         }
     }
@@ -490,7 +492,7 @@ mod integration_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use uuid::Uuid;
@@ -636,14 +638,14 @@ mod integration_tests {
         // - DeduplicateExec at top (with_memtable_gen=false means no MemtableGenTagExec)
         // - SortPreservingMergeExec merging by pk only (enables stream index tiebreaker)
         // - UnionExec combining 4 sorted streams
-        // - Each stream: SortExec -> MemTableScanExec or LanceRead
+        // - Each stream: SortExec -> MemTableDedupScanExec (active) or LanceRead
         assert_plan_node_equals(
             plan,
             "DeduplicateExec: pk=[id], with_memtable_gen=false, keep_addr=false, input_sorted=true
   SortPreservingMergeExec: [id@0 ASC NULLS LAST]
     UnionExec
       SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+        MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
       SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
         LanceRead:...gen_2...
       SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
@@ -674,7 +676,7 @@ mod integration_tests {
         // - SortPreservingMergeExec merging by pk only
         // - UnionExec combining 4 streams
         // - Each stream: MemtableGenTagExec -> SortExec -> data source
-        //   - gen3 (active): MemtableGenTagExec: gen=gen3 -> MemTableScanExec
+        //   - gen3 (active): MemtableGenTagExec: gen=gen3 -> MemTableDedupScanExec
         //   - gen2 (flushed): MemtableGenTagExec: gen=gen2 -> LanceRead
         //   - gen1 (flushed): MemtableGenTagExec: gen=gen1 -> LanceRead
         //   - base: MemtableGenTagExec: gen=base -> LanceRead
@@ -685,7 +687,7 @@ mod integration_tests {
     UnionExec
       MemtableGenTagExec: gen=gen3
         SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+          MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
       MemtableGenTagExec: gen=gen2
         SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
           LanceRead:...gen_2...
@@ -1040,7 +1042,7 @@ mod integration_tests {
     UnionExec
       ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
         SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+          MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
       ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
         SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
           LanceRead:...gen_2...
@@ -1108,7 +1110,7 @@ mod integration_tests {
       MemtableGenTagExec: gen=gen3
         ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
           SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-            MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+            MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
       MemtableGenTagExec: gen=gen2
         ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
           SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
@@ -1251,10 +1253,17 @@ mod integration_tests {
         );
         assert!(plan_str.contains("UnionExec"), "Should have UnionExec");
 
-        // 2. Verify BTree index optimization for active memtable
+        // 2. The active arm uses the fused dedup scan: it deduplicates to
+        //    newest-per-PK *before* applying the predicate, so it deliberately
+        //    forgoes the in-memory BTree skip (the dedup must see every
+        //    version). See MemTableDedupScanExec.
         assert!(
-            plan_str.contains("BTreeIndexExec: predicate=Eq"),
-            "Active memtable should use BTreeIndexExec instead of MemTableScanExec"
+            plan_str.contains("MemTableDedupScanExec"),
+            "Active memtable should use the fused dedup scan"
+        );
+        assert!(
+            !plan_str.contains("BTreeIndexExec"),
+            "Active filtered read no longer uses the BTree skip"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets
@@ -1359,6 +1368,96 @@ mod integration_tests {
         assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
     }
 
+    /// End-to-end regression for the active within-generation phantom: a PK
+    /// inserted then updated in one memtable so its newest version fails the
+    /// predicate must NOT leak the older version that still passes.
+    #[tokio::test]
+    async fn test_lsm_scan_active_within_gen_phantom_suppressed() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+
+        // Base has an unrelated matching row, to prove real matches survive.
+        let base_uri = format!("{}/base", base_path);
+        let base_dataset = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[1], "base")]).await,
+        );
+
+        let shard_id = Uuid::new_v4();
+        let shard_snapshot = ShardSnapshot::new(shard_id).with_current_generation(1);
+
+        // Active memtable: id=10 inserted ("keep") then updated to NULL within
+        // the same generation; id=20 ("active_20") is a control that matches.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let active_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 10])),
+                Arc::new(StringArray::from(vec![
+                    Some("keep"),
+                    Some("active_20"),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        batch_store.append(active_batch).unwrap();
+
+        let in_memory = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store,
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation: 1,
+            },
+            frozen: vec![],
+        };
+
+        let scanner = LsmScanner::new(base_dataset, vec![shard_snapshot], vec!["id".to_string()])
+            .filter("name IS NOT NULL")
+            .unwrap()
+            .with_in_memory_memtables(shard_id, in_memory);
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, Option<String>> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let name = (!names.is_null(i)).then(|| names.value(i).to_string());
+                results.insert(ids.value(i), name);
+            }
+        }
+
+        // id=10's newest version is NULL, so it must be absent. Pre-fix the
+        // predicate dropped the NULL before dedup and the stale "keep" leaked.
+        assert!(
+            !results.contains_key(&10),
+            "id=10 newest is NULL; stale 'keep' must not leak under name IS NOT NULL, got {:?}",
+            results
+        );
+        assert_eq!(results.get(&1), Some(&Some("base_1".to_string())));
+        assert_eq!(results.get(&20), Some(&Some("active_20".to_string())));
+        assert_eq!(results.len(), 2);
+    }
+
     #[tokio::test]
     async fn test_lsm_scan_without_base_table() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
@@ -1393,7 +1492,7 @@ mod integration_tests {
             plan_str
         );
         assert!(
-            plan_str.contains("MemTableScanExec"),
+            plan_str.contains("MemTableDedupScanExec"),
             "Plan must scan the active memtable, got: {}",
             plan_str
         );

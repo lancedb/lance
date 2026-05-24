@@ -10,11 +10,13 @@
 //! - `FtsIndexExec` - Full-text search
 
 mod btree;
+mod dedup_scan;
 mod fts;
 mod scan;
 mod vector;
 
 pub use btree::BTreeIndexExec;
+pub use dedup_scan::MemTableDedupScanExec;
 pub use fts::FtsIndexExec;
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;

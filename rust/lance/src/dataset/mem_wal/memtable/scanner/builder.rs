@@ -17,7 +17,10 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;
 
-use super::exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};
+use super::exec::{
+    BTreeIndexExec, FtsIndexExec, MemTableDedupScanExec, MemTableScanExec, VectorIndexExec,
+};
+use crate::dataset::mem_wal::scanner::exec::validate_pk_types;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Vector search query parameters.
@@ -780,6 +783,58 @@ impl MemTableScanner {
         }
 
         Ok(plan)
+    }
+
+    /// Plan a newest-per-PK scan that fuses within-source dedup with the filter.
+    ///
+    /// Used by the LSM filtered-read planner for the active-memtable arm: it
+    /// reverse-scans the memtable and keeps only the newest version of each PK
+    /// *before* applying the predicate, so a PK whose newest version fails the
+    /// predicate cannot leak an older version that passes. See
+    /// [`MemTableDedupScanExec`]. Unlike [`Self::plan_full_scan`] this never uses
+    /// the BTree skip (dedup must see every version) and never pushes a limit
+    /// into the scan (the LSM applies it above the cross-source merge).
+    pub async fn create_dedup_plan(&self, pk_columns: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
+        validate_pk_types(&self.schema, pk_columns)?;
+
+        let pk_indices = pk_columns
+            .iter()
+            .map(|name| {
+                self.schema
+                    .column_with_name(name)
+                    .map(|(idx, _)| idx)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Primary key column '{}' not found in schema",
+                            name
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<usize>>>()?;
+
+        let projection_indices = self.compute_projection_indices()?;
+
+        // optimize_expr() must run before create_physical_expr() for type coercion.
+        let (filter_predicate, filter_expr) = if let Some(ref filter) = self.filter {
+            let planner = Planner::new(self.schema.clone());
+            let optimized = planner.optimize_expr(filter.clone())?;
+            let predicate = planner.create_physical_expr(&optimized)?;
+            (Some(predicate), Some(optimized))
+        } else {
+            (None, None)
+        };
+
+        Ok(Arc::new(MemTableDedupScanExec::new(
+            self.batch_store.clone(),
+            self.max_visible_batch_position,
+            projection_indices,
+            self.output_schema(),
+            pk_indices,
+            self.with_row_id,
+            self.with_row_address,
+            filter_predicate,
+            filter_expr,
+        )))
     }
 
     /// Plan a BTree index query.

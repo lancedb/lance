@@ -219,6 +219,18 @@ pub fn compute_pk_hash_from_scalars(values: &[datafusion::common::ScalarValue]) 
             datafusion::common::ScalarValue::Null => {
                 true.hash(&mut hasher); // is_null = true
             }
+            datafusion::common::ScalarValue::Int8(v) => {
+                false.hash(&mut hasher);
+                if let Some(val) = v {
+                    val.hash(&mut hasher);
+                }
+            }
+            datafusion::common::ScalarValue::Int16(v) => {
+                false.hash(&mut hasher);
+                if let Some(val) = v {
+                    val.hash(&mut hasher);
+                }
+            }
             datafusion::common::ScalarValue::Int32(v) => {
                 false.hash(&mut hasher);
                 if let Some(val) = v {
@@ -231,6 +243,18 @@ pub fn compute_pk_hash_from_scalars(values: &[datafusion::common::ScalarValue]) 
                     val.hash(&mut hasher);
                 }
             }
+            datafusion::common::ScalarValue::UInt8(v) => {
+                false.hash(&mut hasher);
+                if let Some(val) = v {
+                    val.hash(&mut hasher);
+                }
+            }
+            datafusion::common::ScalarValue::UInt16(v) => {
+                false.hash(&mut hasher);
+                if let Some(val) = v {
+                    val.hash(&mut hasher);
+                }
+            }
             datafusion::common::ScalarValue::UInt32(v) => {
                 false.hash(&mut hasher);
                 if let Some(val) = v {
@@ -238,6 +262,12 @@ pub fn compute_pk_hash_from_scalars(values: &[datafusion::common::ScalarValue]) 
                 }
             }
             datafusion::common::ScalarValue::UInt64(v) => {
+                false.hash(&mut hasher);
+                if let Some(val) = v {
+                    val.hash(&mut hasher);
+                }
+            }
+            datafusion::common::ScalarValue::Boolean(v) => {
                 false.hash(&mut hasher);
                 if let Some(val) = v {
                     val.hash(&mut hasher);
