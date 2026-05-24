@@ -24,7 +24,7 @@
 #   BASE_ROWS_LIST  space-separated base sizes (default "100000 1000000")
 #   K_LIST          space-separated top-k values (default "10 100")
 #   MAX_MEMTABLE_ROWS  active/flushed memtable cap (default 100000)
-#   FLUSHED_GENERATIONS number of flushed gens (default 2)
+#   GENS_LIST       space-separated flushed-generation counts (default "1 2 5")
 #   QUERIES         queries per config (default 200)
 #   WITH_BASELINE   "1" to also build the merged-index accuracy baseline
 #                   and report local-vs-merged Jaccard (default off)
@@ -44,7 +44,7 @@ CACHE_DIR="${CACHE_DIR:-${TMPDIR:-/tmp}/lance-fineweb-cache}"
 BASE_ROWS_LIST="${BASE_ROWS_LIST:-100000 1000000}"
 K_LIST="${K_LIST:-10 100}"
 MAX_MEMTABLE_ROWS="${MAX_MEMTABLE_ROWS:-100000}"
-FLUSHED_GENERATIONS="${FLUSHED_GENERATIONS:-2}"
+GENS_LIST="${GENS_LIST:-1 2 5}"
 QUERIES="${QUERIES:-200}"
 WITH_BASELINE="${WITH_BASELINE:-}"
 BACKENDS="${BACKENDS:-nvme s3}"
@@ -100,34 +100,37 @@ for backend in $BACKENDS; do
         esac
         uri="$prefix/base_${btag}"
 
-        # prepare once per (backend, base_rows)
+        # prepare once per (backend, base_rows); reused across gens/k since
+        # each search ingests into its own fresh shard under _mem_wal.
         run_phase "prepare_${backend}_${btag}" \
             --phase prepare --uri "$uri" \
             --base-rows "$base_rows" --batch-rows 1000 \
             --cache-dir "$CACHE_DIR" || continue
 
-        # search for each k
-        for k in $K_LIST; do
-            name="search_${backend}_${btag}_k${k}"
-            out="$LOCAL_DIR/${name}.json"
-            if [ -f "$out" ]; then
-                echo ">>> $name (already done, skipping)"
-                continue
-            fi
-            baseline_flag=()
-            [ -n "$WITH_BASELINE" ] && baseline_flag=(--with-baseline)
-            run_phase "$name" \
-                --phase search --uri "$uri" \
-                --base-rows "$base_rows" \
-                --max-memtable-rows "$MAX_MEMTABLE_ROWS" \
-                --flushed-generations "$FLUSHED_GENERATIONS" \
-                --batch-rows 1000 \
-                --queries "$QUERIES" --k "$k" \
-                "${baseline_flag[@]}" \
-                --cache-dir "$CACHE_DIR" \
-                --output "$out"
-            # mirror result to s3 for durability regardless of backend
-            [ -f "$out" ] && aws s3 cp "$out" "$S3_PREFIX/$RUN_ID/results/${name}.json" >/dev/null 2>&1
+        # search for each (flushed-generations, k)
+        for gens in $GENS_LIST; do
+            for k in $K_LIST; do
+                name="search_${backend}_${btag}_g${gens}_k${k}"
+                out="$LOCAL_DIR/${name}.json"
+                if [ -f "$out" ]; then
+                    echo ">>> $name (already done, skipping)"
+                    continue
+                fi
+                baseline_flag=()
+                [ -n "$WITH_BASELINE" ] && baseline_flag=(--with-baseline)
+                run_phase "$name" \
+                    --phase search --uri "$uri" \
+                    --base-rows "$base_rows" \
+                    --max-memtable-rows "$MAX_MEMTABLE_ROWS" \
+                    --flushed-generations "$gens" \
+                    --batch-rows 1000 \
+                    --queries "$QUERIES" --k "$k" \
+                    "${baseline_flag[@]}" \
+                    --cache-dir "$CACHE_DIR" \
+                    --output "$out"
+                # mirror result to s3 for durability regardless of backend
+                [ -f "$out" ] && aws s3 cp "$out" "$S3_PREFIX/$RUN_ID/results/${name}.json" >/dev/null 2>&1
+            done
         done
     done
 done
