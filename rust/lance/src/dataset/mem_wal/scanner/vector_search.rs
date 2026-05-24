@@ -61,7 +61,7 @@ use crate::session::Session;
 ///                     KNNExec: active memtable, k=k
 ///               ProjectionExec (canonical internal schema)
 ///                 ProjectionExec (null_columns _rowid)
-///                   LsmSourceTagExec: gen=N, polarity=ReverseWrite        (flushed)
+///                   LsmSourceTagExec: gen=N, polarity=InsertOrder         (flushed)
 ///                     KNNExec: flushed gen N, k=k (fast_search)
 ///               … one per flushed gen …
 ///               ProjectionExec (canonical internal schema)
@@ -293,17 +293,13 @@ impl LsmVectorSearchPlanner {
                 )) as Arc<dyn ExecutionPlan>,
                 None => knn,
             };
-            // Tag rows with `(_memtable_gen, _freshness)`. Polarity differs
-            // per source — see [`LsmSourceTagExec`] / [`FreshnessPolarity`]:
-            //   * active memtable:  insert order, larger `_rowid` = newer
-            //   * flushed memtable: reverse-written, smaller `_rowid` = newer
-            //   * base table:       no duplicates expected; polarity moot
-            let polarity = match source {
-                LsmDataSource::FlushedMemTable { .. } => FreshnessPolarity::ReverseWrite,
-                LsmDataSource::ActiveMemTable { .. } | LsmDataSource::BaseTable { .. } => {
-                    FreshnessPolarity::InsertOrder
-                }
-            };
+            // Tag rows with `(_memtable_gen, _freshness)`. Every source is now
+            // written in insert order (larger `_rowid` = newer): the active
+            // memtable is an append log, and flushed generations are
+            // forward-written with a deletion vector. The within-generation
+            // deletion vector means a flushed source yields one row per PK, so
+            // freshness only matters across generations (resolved by gen).
+            let polarity = FreshnessPolarity::InsertOrder;
             let tagged: Arc<dyn ExecutionPlan> = Arc::new(LsmSourceTagExec::new(
                 knn,
                 generation,

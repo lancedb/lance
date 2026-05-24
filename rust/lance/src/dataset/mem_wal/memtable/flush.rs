@@ -3,7 +3,7 @@
 
 //! MemTable flush to persistent storage.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -39,21 +39,22 @@ pub struct FlushResult {
     pub covered_wal_entry_position: u64,
 }
 
-/// Build the within-generation deletion vector for reverse-written flush data.
+/// Build the within-generation deletion vector for forward-written flush data.
 ///
-/// `batches` are in on-disk (reverse-write) order, so the newest version of
-/// each primary key is at the smallest offset: the first occurrence of a PK
-/// hash is kept and every later occurrence is marked deleted. Keys are hashed
+/// `batches` are in on-disk (insert) order, so the newest version of each
+/// primary key is at the largest offset: the last occurrence of a PK hash is
+/// kept and every earlier occurrence is marked deleted. Keys are hashed
 /// (collisions accepted, consistent with the read path).
 fn compute_dedup_deletions(batches: &[RecordBatch], pk_indices: &[usize]) -> RoaringBitmap {
     let mut deleted = RoaringBitmap::new();
-    let mut seen: HashSet<u64> = HashSet::new();
+    let mut latest: HashMap<u64, u32> = HashMap::new();
     let mut offset: u32 = 0;
     for batch in batches {
         for row in 0..batch.num_rows() {
             let pk_hash = compute_pk_hash(batch, pk_indices, row);
-            if !seen.insert(pk_hash) {
-                deleted.insert(offset);
+            if let Some(previous) = latest.insert(pk_hash, offset) {
+                // An earlier (older) occurrence of this PK is now superseded.
+                deleted.insert(previous);
             }
             offset += 1;
         }
@@ -185,11 +186,13 @@ impl MemTableFlusher {
         })
     }
 
-    /// Write data file with batches in reverse order (newest first).
+    /// Write the data file in insert (forward) order.
     ///
-    /// Returns the total number of rows written (needed for reversing row
-    /// positions in indexes) and the within-generation deletion vector marking
-    /// every older duplicate of each primary key (see [`compute_dedup_deletions`]).
+    /// Returns the total number of rows written and the within-generation
+    /// deletion vector marking every older duplicate of each primary key (see
+    /// [`compute_dedup_deletions`]). Forward order keeps the data file, the
+    /// incrementally-built indexes, and the deletion-vector offsets in one
+    /// position space (newest = largest offset) with no remap.
     #[instrument(name = "mt_write_data_file", level = "debug", skip_all, fields(path = %path))]
     async fn write_data_file(
         &self,
@@ -204,17 +207,17 @@ impl MemTableFlusher {
             return Ok((0, RoaringBitmap::new()));
         }
 
-        // Scan batches in reverse order (newest first) so that the flushed
-        // data is ordered from newest to oldest. This enables more efficient
-        // K-way merge during LSM scan.
-        let (batches, total_rows) = memtable.scan_batches_reversed().await?;
+        // Write in insert (forward) order: the newest version of each PK lands
+        // at the largest offset, matching the insert-order index positions 1:1.
+        let batches = memtable.scan_batches().await?;
         if batches.is_empty() {
             return Ok((0, RoaringBitmap::new()));
         }
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
         // Build the within-generation deletion vector before the batches are
-        // moved into the writer. Under reverse-write the newest version of each
-        // PK is at the smallest offset, so the first occurrence is kept.
+        // moved into the writer. Under forward-write the newest version of each
+        // PK is at the largest offset, so the last occurrence is kept.
         let pk_columns: Vec<String> = memtable
             .lance_schema()
             .unenforced_primary_key()
@@ -370,7 +373,7 @@ impl MemTableFlusher {
         let mut all_indexes: Vec<IndexMetadata> = Vec::new();
 
         let btree_indexes = self
-            .create_indexes(&mut dataset, index_configs, memtable.indexes(), total_rows)
+            .create_indexes(&mut dataset, index_configs, memtable.indexes())
             .await?;
         if !btree_indexes.is_empty() {
             info!(
@@ -387,7 +390,7 @@ impl MemTableFlusher {
                     && let Some(mem_index) = registry.get_hnsw(&hnsw_config.name)
                 {
                     let mut index_meta = self
-                        .create_hnsw_index(&gen_path, hnsw_config, mem_index, total_rows)
+                        .create_hnsw_index(&gen_path, hnsw_config, mem_index)
                         .await?;
 
                     let schema = dataset.schema();
@@ -469,7 +472,6 @@ impl MemTableFlusher {
         dataset: &mut Dataset,
         index_configs: &[MemIndexConfig],
         mem_indexes: Option<&super::super::index::IndexStore>,
-        total_rows: usize,
     ) -> Result<Vec<IndexMetadata>> {
         use arrow_array::RecordBatchIterator;
 
@@ -503,10 +505,9 @@ impl MemTableFlusher {
             if let Some(registry) = mem_indexes
                 && let Some(btree_index) = registry.get_btree(&btree_cfg.name)
             {
-                // Use reversed training batches since the flushed data is in reverse order.
-                // Row positions need to be mapped: reversed_pos = total_rows - original_pos - 1
-                let training_batches =
-                    btree_index.to_training_batches_reversed(8192, total_rows)?;
+                // Forward-written data: index row positions line up 1:1 with
+                // the data file, no remap needed.
+                let training_batches = btree_index.to_training_batches(8192)?;
                 if !training_batches.is_empty() {
                     let schema = training_batches[0].schema();
                     let reader =
@@ -567,8 +568,7 @@ impl MemTableFlusher {
 
             let partition_id = uuid::Uuid::new_v4().as_u64_pair().0;
 
-            let mut inner_builder =
-                fts_index.to_index_builder_reversed(partition_id, total_rows)?;
+            let mut inner_builder = fts_index.to_index_builder(partition_id, total_rows)?;
 
             let index_uuid = uuid::Uuid::new_v4();
             let index_dir = gen_path
@@ -677,13 +677,11 @@ impl MemTableFlusher {
     /// * `gen_path` - Path to the flushed generation folder
     /// * `config` - HNSW index configuration
     /// * `mem_index` - In-memory HNSW index (snapshotted, not consumed)
-    /// * `total_rows` - Total number of rows in the flushed data (for row position reversal)
     async fn create_hnsw_index(
         &self,
         gen_path: &Path,
         config: &super::super::index::HnswIndexConfig,
         mem_index: &super::super::index::HnswMemIndex,
-        total_rows: usize,
     ) -> Result<IndexMetadata> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::Float32Type;
@@ -721,8 +719,9 @@ impl MemTableFlusher {
                 "HnswMemIndex has no inserted vectors; nothing to flush",
             ));
         }
-        let Some((hnsw, flat_storage_batch)) = mem_index.to_lance_hnsw(Some(total_rows as u64))?
-        else {
+        // Forward-written data: HNSW row ids line up 1:1 with the data file, so
+        // no position reversal (pass `None`).
+        let Some((hnsw, flat_storage_batch)) = mem_index.to_lance_hnsw(None)? else {
             return Err(Error::invalid_input(
                 "HnswMemIndex is empty; nothing to flush",
             ));
