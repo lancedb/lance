@@ -15,6 +15,9 @@ use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use lance_core::{Error, Result};
 
+/// Column name for a row address (the in-source row offset).
+pub const ROW_ADDRESS_COLUMN: &str = "_rowaddr";
+
 /// Resolve the column index of each primary-key column in `batch`.
 pub fn resolve_pk_indices(batch: &RecordBatch, pk_columns: &[String]) -> DFResult<Vec<usize>> {
     pk_columns

@@ -1035,10 +1035,7 @@ mod tests {
 
         let out_schema = batches[0].schema();
         assert!(out_schema.field_with_name(DISTANCE_COLUMN).is_ok());
-        for internal in [
-            super::super::exec::MEMTABLE_GEN_COLUMN,
-            super::super::exec::FRESHNESS_COLUMN,
-        ] {
+        for internal in [super::super::exec::MEMTABLE_GEN_COLUMN, "_freshness"] {
             assert!(
                 out_schema.field_with_name(internal).is_err(),
                 "`{}` leaked into output: {:?}",
