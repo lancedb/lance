@@ -300,6 +300,27 @@ impl LsmScanner {
             .await
     }
 
+    /// Build a local-scoring FTS plan spanning base + flushed + active sources.
+    ///
+    /// Routes through [`super::LsmFtsSearchPlanner`]. Output schema is
+    /// `projection ∪ pk_columns + _score`; per-source local BM25 `_score`
+    /// is merged DESC and capped at `k`. `column` must be FTS-indexed on
+    /// the queried sources.
+    pub async fn full_text_search(
+        &self,
+        column: &str,
+        query: lance_index::scalar::FullTextSearchQuery,
+        k: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let collector = self.build_collector();
+        let base_schema = self.schema();
+        let planner =
+            super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        planner
+            .plan_search(column, query, k, self.projection.as_deref())
+            .await
+    }
+
     /// Execute the scan and return a stream of record batches.
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
