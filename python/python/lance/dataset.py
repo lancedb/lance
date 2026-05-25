@@ -1172,8 +1172,9 @@ class LanceDataset(pa.dataset.Dataset):
             - query: str
                 The query string to search for.
         fast_search:  bool, default False
-            If True, then the search will only be performed on the indexed data, which
-            yields faster search time.
+            If True, then vector search, full text search, and scalar-indexed
+            filters will only search indexed fragments, which yields faster
+            search time but may skip recently appended unindexed data.
         scan_stats_callback: Callable[[ScanStatistics], None], default None
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
@@ -1417,6 +1418,8 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool, optional, default True
             Use stats pushdown during filters.
         fast_search: bool, optional, default False
+            Only search indexed fragments for vector, full text, and scalar-indexed
+            filter queries. This may skip recently appended unindexed data.
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents contains "hello" or "world".
@@ -6015,10 +6018,10 @@ class ScannerBuilder:
         return self
 
     def fast_search(self, flag: bool) -> ScannerBuilder:
-        """Enable fast search, which only perform search on the indexed data.
+        """Enable fast search, which only performs search on indexed fragments.
 
-        Users can use `Table::optimize()` or `create_index()` to include the new data
-        into index, thus make new data searchable.
+        Users can use `Table::optimize()` or `create_index()` to include new data
+        in an index, thus making new data searchable.
         """
         self._fast_search = flag
         return self

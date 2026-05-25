@@ -4426,6 +4426,22 @@ def test_use_scalar_index(tmp_path: Path):
     ).explain_plan(True)
 
 
+def test_fast_search_scalar_index_skips_unindexed_fragments(tmp_path: Path):
+    table = pa.table({"filter": range(100)})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=100)
+    dataset.create_scalar_index("filter", "BTREE")
+    dataset = lance.write_dataset(
+        pa.table({"filter": range(100, 110)}), tmp_path, mode="append"
+    )
+
+    normal = dataset.to_table(filter="filter >= 95")
+    fast = dataset.to_table(filter="filter >= 95", fast_search=True)
+
+    assert normal.num_rows == 15
+    assert fast.num_rows == 5
+    assert sorted(fast.column("filter").to_pylist()) == list(range(95, 100))
+
+
 EXPECTED_DEFAULT_STORAGE_VERSION = stable_version()
 EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
 EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])

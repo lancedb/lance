@@ -580,6 +580,7 @@ impl FilteredReadStream {
                 &mut to_take,
                 &mut fragments_to_read,
                 &mut scan_push_down_fragments_to_read,
+                options.only_indexed_fragments,
             );
 
             if to_take == 0 {
@@ -706,6 +707,7 @@ impl FilteredReadStream {
         to_take: &mut u64,
         fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
         scan_push_down_fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
+        only_indexed_fragments: bool,
     ) {
         let fragment_id = fragment.id() as u32;
 
@@ -738,10 +740,13 @@ impl FilteredReadStream {
                     }
                 }
             } else {
-                // Fragment not indexed - add full fragment to unindexed_ranges
-                fragments_to_read.insert(fragment_id, to_read);
+                // Fragment not indexed.  Normally we add the full fragment to keep
+                // results complete.  Fast search intentionally accepts staleness.
+                if !only_indexed_fragments {
+                    fragments_to_read.insert(fragment_id, to_read);
+                }
             }
-        } else {
+        } else if !only_indexed_fragments {
             // No index at all - add full fragment to unindexed_ranges
             fragments_to_read.insert(fragment_id, to_read);
         }
@@ -1279,6 +1284,8 @@ pub struct FilteredReadOptions {
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
+    /// If true, skip fragments that are not covered by the scalar index result.
+    pub only_indexed_fragments: bool,
 }
 
 impl FilteredReadOptions {
@@ -1307,6 +1314,7 @@ impl FilteredReadOptions {
             refine_filter: None,
             full_filter: None,
             io_buffer_size_bytes: None,
+            only_indexed_fragments: false,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1457,6 +1465,12 @@ impl FilteredReadOptions {
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
     pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
         self.io_buffer_size_bytes = Some(io_buffer_size);
+        self
+    }
+
+    /// Only read fragments covered by a scalar index result.
+    pub fn with_only_indexed_fragments(mut self) -> Self {
+        self.only_indexed_fragments = true;
         self
     }
 }

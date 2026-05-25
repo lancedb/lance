@@ -245,6 +245,7 @@ pub(crate) struct ScannerOptions<'a> {
     pub batch_readahead: jint,
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
+    pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
 }
 
@@ -361,6 +362,10 @@ pub(crate) fn build_scanner_with_options<'a>(
         Ok(())
     })?;
 
+    if options.fast_search == JNI_TRUE {
+        scanner.fast_search();
+    }
+
     scanner.batch_readahead(options.batch_readahead as usize);
 
     env.get_optional(&options.column_orderings, |env, java_obj| {
@@ -413,6 +418,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     batch_readahead: jint,             // int
     column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,        // boolean
+    fast_search: jboolean,             // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
     collect_stats: jboolean,           // boolean
 ) -> JObject<'local> {
@@ -436,6 +442,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             batch_readahead,
             column_orderings,
             use_scalar_index,
+            fast_search,
             substrait_aggregate_obj,
             collect_stats,
         )
@@ -461,6 +468,7 @@ fn inner_create_scanner<'local>(
     batch_readahead: jint,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
+    fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     collect_stats: jboolean,
 ) -> Result<JObject<'local>> {
@@ -485,6 +493,7 @@ fn inner_create_scanner<'local>(
         batch_readahead,
         column_orderings,
         use_scalar_index,
+        fast_search,
         substrait_aggregate_obj,
     };
 

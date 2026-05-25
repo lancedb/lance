@@ -2777,6 +2777,10 @@ impl Scanner {
             read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
         }
 
+        if self.fast_search && filter_plan.has_index_query() {
+            read_options = read_options.with_only_indexed_fragments();
+        }
+
         let index_input = filter_plan.index_query.clone().map(|index_query| {
             Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
                 as Arc<dyn ExecutionPlan>
@@ -4551,12 +4555,13 @@ impl Scanner {
                 .partition_frags_by_coverage(index_query, fragments.clone())
                 .await?;
 
-            if missing_frags.is_empty() {
+            if missing_frags.is_empty() || self.fast_search {
                 log::trace!("prefilter entirely satisfied by exact index search");
                 // We can only avoid materializing the index for a prefilter if:
                 // 1. The search is indexed
                 // 2. The index search is an exact search with no recheck or refine
-                // 3. The indices cover at least the same fragments as the vector index
+                // 3. The indices cover at least the same fragments as the vector index,
+                //    unless fast_search allows skipping uncovered fragments.
                 return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
                     ScalarIndexExec::new(self.dataset.clone(), index_query.clone()),
                 )));
@@ -9744,6 +9749,153 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(normal_rows, 10);
         assert_eq!(fast_rows, 0);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fast_search_scalar_index_skips_unindexed_fragments(
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
+    ) {
+        let mut dataset = TestVectorDataset::new(data_storage_version, false)
+            .await
+            .unwrap();
+        dataset.make_scalar_index().await.unwrap();
+        dataset.append_new_data().await.unwrap();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.filter("i >= 395").unwrap().project(&["i"]).unwrap();
+        let normal_batch = scanner.try_into_batch().await.unwrap();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner
+            .filter("i >= 395")
+            .unwrap()
+            .fast_search()
+            .project(&["i"])
+            .unwrap();
+        let fast_batch = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(normal_batch.num_rows(), 15);
+        assert_eq!(fast_batch.num_rows(), 5);
+    }
+
+    fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..end)),
+                Arc::new(Int32Array::from_iter_values(start..end)),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn make_scalar_filter_test_dataset(
+        data_storage_version: LanceFileVersion,
+    ) -> (TempStrDir, SchemaRef, Dataset) {
+        let tmp_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+        let batch = make_scalar_filter_test_batch(schema.clone(), 0, 100);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            &tmp_dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        (tmp_dir, schema, dataset)
+    }
+
+    async fn append_scalar_filter_test_data(
+        dataset: &mut Dataset,
+        schema: SchemaRef,
+        start: i32,
+        end: i32,
+    ) {
+        let batch = make_scalar_filter_test_batch(schema.clone(), start, end);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        dataset.append(reader, None).await.unwrap();
+    }
+
+    async fn create_scalar_index(dataset: &mut Dataset, column: &str) {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn scan_count(dataset: &Dataset, filter: &str, fast_search: bool) -> usize {
+        let mut scanner = dataset.scan();
+        scanner
+            .filter(filter)
+            .unwrap()
+            .project(&["a", "b"])
+            .unwrap();
+        if fast_search {
+            scanner.fast_search();
+        }
+        scanner.try_into_batch().await.unwrap().num_rows()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fast_search_scalar_index_filter_coverage_cases(
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
+    ) {
+        let (_tmp_dir, schema, mut dataset) =
+            make_scalar_filter_test_dataset(data_storage_version).await;
+        create_scalar_index(&mut dataset, "a").await;
+        append_scalar_filter_test_data(&mut dataset, schema, 100, 110).await;
+
+        // a is indexed and b is not. The indexed side finds candidates in covered
+        // fragments and b is applied as a refine filter.
+        assert_eq!(scan_count(&dataset, "a >= 95 AND b >= 95", false).await, 15);
+        assert_eq!(scan_count(&dataset, "a >= 95 AND b >= 95", true).await, 5);
+
+        // OR cannot safely skip unindexed fragments: a row in an unindexed fragment
+        // may satisfy `b >= 105` even if `a` is not indexed there. Skipping it would
+        // silently drop valid results, so fast_search has no effect on OR queries where
+        // any branch lacks a scalar index.
+        assert_eq!(scan_count(&dataset, "a >= 105 OR b >= 105", false).await, 5);
+        assert_eq!(scan_count(&dataset, "a >= 105 OR b >= 105", true).await, 5);
+
+        // A single-column indexed filter skips the appended fragment in fast mode.
+        assert_eq!(scan_count(&dataset, "a >= 95", false).await, 15);
+        assert_eq!(scan_count(&dataset, "a >= 95", true).await, 5);
+
+        let (_tmp_dir, schema, mut dataset) =
+            make_scalar_filter_test_dataset(data_storage_version).await;
+        create_scalar_index(&mut dataset, "a").await;
+        append_scalar_filter_test_data(&mut dataset, schema, 100, 110).await;
+        create_scalar_index(&mut dataset, "b").await;
+
+        // a and b are both indexed, but a only covers the original fragment while b
+        // covers both fragments. Fast search only reads the shared indexed coverage.
+        assert_eq!(scan_count(&dataset, "a >= 95 AND b >= 95", false).await, 15);
+        assert_eq!(scan_count(&dataset, "a >= 95 AND b >= 95", true).await, 5);
+
+        let (_tmp_dir, schema, mut dataset) =
+            make_scalar_filter_test_dataset(data_storage_version).await;
+        append_scalar_filter_test_data(&mut dataset, schema, 100, 110).await;
+
+        // With no scalar index query, fast_search must not enable indexed-fragment
+        // pruning. This guards against treating any ordinary filter as indexed.
+        assert_eq!(scan_count(&dataset, "a >= 95", false).await, 15);
+        assert_eq!(scan_count(&dataset, "a >= 95", true).await, 15);
     }
 
     #[rstest]
