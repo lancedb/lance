@@ -1260,7 +1260,7 @@ mod tests {
     // Creates a dataset with three fragments holding 100, 200, and 150 rows.
     async fn make_three_fragment_dataset() -> Dataset {
         use arrow_array::{RecordBatch, RecordBatchIterator};
-        use arrow_schema::{Schema as ArrowSchema};
+        use arrow_schema::Schema as ArrowSchema;
 
         let schema = Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
             "x",
@@ -1269,8 +1269,7 @@ mod tests {
         )]));
 
         let make_batch = |n: usize| -> RecordBatch {
-            let arr: ArrayRef =
-                Arc::new(Float32Array::from_iter_values((0..n).map(|i| i as f32)));
+            let arr: ArrayRef = Arc::new(Float32Array::from_iter_values((0..n).map(|i| i as f32)));
             RecordBatch::try_new(schema.clone(), vec![arr]).unwrap()
         };
 
@@ -1312,9 +1311,7 @@ mod tests {
             .map(|f| f.id() as u32)
             .collect();
         // Skip the middle fragment (200 rows); expect 100 + 150 = 250.
-        let result = count_rows(&dataset, Some(&[ids[0], ids[2]]))
-            .await
-            .unwrap();
+        let result = count_rows(&dataset, Some(&[ids[0], ids[2]])).await.unwrap();
         assert_eq!(result, 250);
     }
 
@@ -1327,9 +1324,7 @@ mod tests {
             .map(|f| f.id() as u32)
             .collect();
         // Pass the same two fragments in reverse (unsorted) order; result must match.
-        let result = count_rows(&dataset, Some(&[ids[2], ids[0]]))
-            .await
-            .unwrap();
+        let result = count_rows(&dataset, Some(&[ids[2], ids[0]])).await.unwrap();
         assert_eq!(result, 250);
     }
 }
