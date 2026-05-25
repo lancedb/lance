@@ -966,18 +966,15 @@ pub(crate) async fn commit_transaction(
     let mut current_transaction_file = String::new();
 
     while backoff.attempt() < num_attempts {
-        // Skip rebase on first attempt (optimistic), only rebase on conflict
-        // or when the operation semantics require the latest state.
-        let needs_rebase = !strict_overwrite
-            && (backoff.attempt() > 0
-                || matches!(
-                    &transaction.operation,
-                    Operation::UpdateConfig { .. }
-                        | Operation::Overwrite {
-                            config_upsert_values: Some(_),
-                            ..
-                        }
-                ));
+        // We optimistically skip rebase on the first attempt. If there is no
+        // conflicting commit, this saves the I/O cost of loading and checking
+        // new transactions. Benchmarks show this is faster in all cases: the
+        // cost of a failed commit attempt is typically lower than the rebase
+        // I/O overhead (loading new transactions + TransactionRebase), so the
+        // fast path wins and the slow path is no worse. On conflict, we rebase
+        // before retrying to resolve the conflict and improve the chance of
+        // success on the next attempt.
+        let needs_rebase = backoff.attempt() > 0;
 
         if needs_rebase {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
