@@ -46,6 +46,7 @@ public final class LanceArrowReaders {
   private static final class DiagnosticArrowReader extends ArrowReader {
     private final ArrowReader delegate;
     private final String source;
+    private Schema schema;
 
     private DiagnosticArrowReader(BufferAllocator allocator, ArrowReader delegate, String source) {
       super(allocator);
@@ -55,7 +56,9 @@ public final class LanceArrowReaders {
 
     @Override
     public VectorSchemaRoot getVectorSchemaRoot() throws IOException {
-      return delegate.getVectorSchemaRoot();
+      VectorSchemaRoot root = delegate.getVectorSchemaRoot();
+      schema = root.getSchema();
+      return root;
     }
 
     @Override
@@ -76,11 +79,17 @@ public final class LanceArrowReaders {
     @Override
     public boolean loadNextBatch() throws IOException {
       try {
-        return delegate.loadNextBatch();
+        boolean loaded = delegate.loadNextBatch();
+        if (loaded) {
+          schema = delegate.getVectorSchemaRoot().getSchema();
+        }
+        return loaded;
       } catch (IllegalArgumentException e) {
         throw new IllegalArgumentException(loadFailureMessage(source, e), e);
       } catch (IOException e) {
         throw new IOException(loadFailureMessage(source, e), e);
+      } catch (RuntimeException e) {
+        throw new RuntimeException(loadFailureMessage(source, e), e);
       }
     }
 
@@ -91,6 +100,8 @@ public final class LanceArrowReaders {
 
     @Override
     public void close() throws IOException {
+      // This reader is a pass-through diagnostics wrapper. It never initializes
+      // ArrowReader's private root, so closing the delegate is the only owner cleanup needed.
       delegate.close();
     }
 
@@ -101,12 +112,15 @@ public final class LanceArrowReaders {
 
     @Override
     protected void closeReadSource() throws IOException {
-      delegate.close();
+      delegate.close(false);
     }
 
     @Override
     protected Schema readSchema() throws IOException {
-      return delegate.getVectorSchemaRoot().getSchema();
+      if (schema == null) {
+        throw new IOException("Diagnostic Arrow reader does not own a schema");
+      }
+      return schema;
     }
   }
 
