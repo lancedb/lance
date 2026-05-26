@@ -1034,23 +1034,17 @@ pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    // Use the dataset's config rather than the committed manifest's config.
-    // Under optimistic commit, the manifest may inherit stale config from an
-    // outdated snapshot via Manifest::new_from_previous. The dataset reflects
-    // the on-disk state at commit time, so its config is authoritative.
-    let policy = build_cleanup_policy_from_dataset_config(dataset, manifest.version).await?;
+    // Under optimistic commit, the committed manifest may inherit stale config
+    // from an outdated snapshot via Manifest::new_from_previous. The caller
+    // passes the original dataset (before checkout to read_version), so
+    // dataset.manifest.config reflects the on-disk state as the user last saw
+    // it. We use this as the authoritative config for cleanup decisions.
+    let policy = build_cleanup_policy_from_config(dataset, &dataset.manifest.config, manifest.version).await?;
     if let Some(policy) = policy {
         Ok(Some(dataset.cleanup_with_policy(policy).await?))
     } else {
         Ok(None)
     }
-}
-
-async fn build_cleanup_policy_from_dataset_config(
-    dataset: &Dataset,
-    version: u64,
-) -> Result<Option<CleanupPolicy>> {
-    build_cleanup_policy_from_config(dataset, &dataset.manifest.config, version).await
 }
 
 /// This is trigger when a parent branch is cleaning and `clean_referenced_branches` is set as true

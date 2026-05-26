@@ -1089,10 +1089,12 @@ pub(crate) async fn commit_transaction(
                 }
 
                 if !commit_config.skip_auto_cleanup {
-                    // Note: We're using the old dataset here (before the new manifest is committed).
-                    // This means cleanup runs based on the previous version's state, which may affect
-                    // which versions are available for cleanup.
-                    match auto_cleanup_hook(&dataset, &manifest).await {
+                    // Note: We pass the original dataset (the one the user opened, before any
+                    // checkout to read_version) so that auto_cleanup_hook can use its config
+                    // as the authoritative source. Under optimistic commit, the committed manifest
+                    // may inherit stale config from an outdated snapshot via new_from_previous.
+                    // The original dataset reflects the on-disk state as the user last saw it.
+                    match auto_cleanup_hook(&original_dataset, &manifest).await {
                         Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
                         Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
                         _ => {}
