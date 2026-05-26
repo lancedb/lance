@@ -115,6 +115,7 @@ use serde_json::json;
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
+    ops::Range,
     sync::Arc,
 };
 use tokio::sync::mpsc;
@@ -2680,25 +2681,131 @@ async fn sample_ivf_training_chunk(
     Ok((filter_finite_training_data(training_data)?, mt))
 }
 
-fn generate_fixed_training_indices(num_rows: usize, sample_size: usize) -> Vec<u64> {
+#[derive(Debug, Clone)]
+struct FixedIvfTrainingRanges {
+    ranges: Vec<Range<u64>>,
+    num_rows: usize,
+}
+
+impl FixedIvfTrainingRanges {
+    fn new(ranges: Vec<Range<u64>>) -> Self {
+        let num_rows = ranges.iter().map(range_len).sum();
+        Self { ranges, num_rows }
+    }
+
+    fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    fn chunk(&self, row_offset: usize, row_count: usize) -> Vec<Range<u64>> {
+        if row_count == 0 || row_offset >= self.num_rows {
+            return Vec::new();
+        }
+
+        let mut remaining_skip = row_offset;
+        let mut remaining_take = row_count.min(self.num_rows - row_offset);
+        let mut chunk = Vec::new();
+        for range in &self.ranges {
+            let range_len = range_len(range);
+            if remaining_skip >= range_len {
+                remaining_skip -= range_len;
+                continue;
+            }
+
+            let start = range.start + remaining_skip as u64;
+            let available = range_len - remaining_skip;
+            let take = available.min(remaining_take);
+            chunk.push(start..start + take as u64);
+            remaining_take -= take;
+            remaining_skip = 0;
+            if remaining_take == 0 {
+                break;
+            }
+        }
+        chunk
+    }
+}
+
+fn range_len(range: &Range<u64>) -> usize {
+    (range.end - range.start) as usize
+}
+
+fn generate_fixed_training_ranges(
+    num_rows: usize,
+    sample_size: usize,
+    block_size: usize,
+    byte_width: usize,
+) -> FixedIvfTrainingRanges {
+    let sample_size = num_rows.min(sample_size);
+    if sample_size == 0 {
+        return FixedIvfTrainingRanges::new(Vec::new());
+    }
+    if sample_size >= num_rows {
+        return FixedIvfTrainingRanges::new(vec![0..num_rows as u64]);
+    }
+
+    let rows_per_range = 1.max(block_size / byte_width);
+    let num_bins = num_rows.div_ceil(rows_per_range);
     let mut rng = SmallRng::seed_from_u64(0x1a6c_e5eed);
-    let mut indices = if sample_size * 2 < num_rows {
-        let mut set = std::collections::HashSet::with_capacity(sample_size);
-        while set.len() < sample_size {
-            set.insert(rng.random_range(0..num_rows as u64));
+
+    let bins = if sample_size * 5 >= num_rows {
+        let mut bins = (0..num_bins).collect::<Vec<_>>();
+        for i in 0..num_bins {
+            let j = rng.random_range(i..num_bins);
+            bins.swap(i, j);
         }
-        set.into_iter().collect::<Vec<_>>()
+        bins
     } else {
-        let mut all = (0..num_rows as u64).collect::<Vec<_>>();
-        for i in 0..sample_size {
-            let j = rng.random_range(i..all.len());
-            all.swap(i, j);
+        let mut bins = Vec::with_capacity(sample_size.div_ceil(rows_per_range).saturating_add(1));
+        let mut seen = HashSet::with_capacity(bins.capacity());
+        while bins.len() * rows_per_range < sample_size {
+            let bin = rng.random_range(0..num_bins);
+            if seen.insert(bin) {
+                bins.push(bin);
+            }
         }
-        all.truncate(sample_size);
-        all
+        bins
     };
-    indices.sort_unstable();
-    indices
+
+    let mut remaining = sample_size;
+    let mut ranges = Vec::new();
+    for bin in bins {
+        if remaining == 0 {
+            break;
+        }
+        let bin_start = bin * rows_per_range;
+        let bin_end = ((bin + 1) * rows_per_range).min(num_rows);
+        let bin_len = bin_end - bin_start;
+        if bin_len == 0 {
+            continue;
+        }
+
+        let take = bin_len.min(remaining);
+        let offset = if take < bin_len {
+            rng.random_range(0..=bin_len - take)
+        } else {
+            0
+        };
+        let start = bin_start + offset;
+        ranges.push(start as u64..(start + take) as u64);
+        remaining -= take;
+    }
+
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.is_empty() {
+            continue;
+        }
+        if let Some(last) = merged.last_mut()
+            && last.end >= range.start
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    FixedIvfTrainingRanges::new(merged)
 }
 
 fn default_streaming_coreset_rate(total_sample_rate: usize, streaming_sample_rate: usize) -> usize {
@@ -2817,17 +2924,22 @@ impl<'a> FixedIvfTrainingSampler<'a> {
         }))
     }
 
-    async fn sample(
+    async fn sample_ranges(
         &self,
-        indices: &[u64],
+        ranges: &[Range<u64>],
         metric_type: MetricType,
     ) -> Result<(FixedSizeListArray, MetricType)> {
-        let mut values_buf = MutableBuffer::with_capacity(indices.len() * self.byte_width);
+        let rows = ranges.iter().map(range_len).sum::<usize>();
+        let mut values_buf = MutableBuffer::with_capacity(rows * self.byte_width);
         let mut total_rows = 0;
 
-        const TAKE_CHUNK_SIZE: usize = 8192;
-        for chunk in indices.chunks(TAKE_CHUNK_SIZE) {
-            let batch = self.dataset.take(chunk, self.projection.clone()).await?;
+        let range_stream = stream::iter(ranges.to_vec().into_iter().map(Ok));
+        let mut batch_stream = self.dataset.take_scan(
+            Box::pin(range_stream),
+            self.projection.clone(),
+            self.dataset.object_store.as_ref().io_parallelism(),
+        );
+        while let Some(batch) = batch_stream.try_next().await? {
             let array = get_top_level_vector_column(&batch, self.column)?;
             append_fsl_values(&mut values_buf, &mut total_rows, &array, self.byte_width)?;
         }
@@ -3008,7 +3120,7 @@ async fn refine_streaming_f32_kmeans_with_sampler(
     sampler: &FixedIvfTrainingSampler<'_>,
     metric_type: MetricType,
     streaming_sample_size: usize,
-    indices: &[u64],
+    sample_ranges: &FixedIvfTrainingRanges,
     initial_centroids: &FixedSizeListArray,
     passes: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
@@ -3019,8 +3131,11 @@ async fn refine_streaming_f32_kmeans_with_sampler(
         let mut cluster_sums = vec![0.0_f32; centroids.len() * dimension];
         let mut cluster_weights = vec![0.0_f64; centroids.len()];
         let mut loss = 0.0;
-        for chunk in indices.chunks(streaming_sample_size.max(1)) {
-            let (training_data, mt) = sampler.sample(chunk, metric_type).await?;
+        let mut row_offset = 0;
+        while row_offset < sample_ranges.num_rows() {
+            let ranges = sample_ranges.chunk(row_offset, streaming_sample_size.max(1));
+            row_offset += ranges.iter().map(range_len).sum::<usize>();
+            let (training_data, mt) = sampler.sample_ranges(&ranges, metric_type).await?;
             let training_data = if training_data.value_type() == DataType::Float32 {
                 training_data
             } else {
@@ -3756,10 +3871,15 @@ async fn train_streaming_coreset_ivf_model(
     } else {
         None
     };
-    let fixed_sample_indices = if fixed_sampler.is_some() {
+    let fixed_sample_ranges = if let Some(sampler) = &fixed_sampler {
         let num_rows = dataset.count_rows(None).await?;
         let sample_size = num_rows.min(num_partitions * total_sample_rate);
-        Some(generate_fixed_training_indices(num_rows, sample_size))
+        Some(generate_fixed_training_ranges(
+            num_rows,
+            sample_size,
+            dataset.object_store.as_ref().block_size(),
+            sampler.byte_width,
+        ))
     } else {
         None
     };
@@ -3807,13 +3927,12 @@ async fn train_streaming_coreset_ivf_model(
             step, step_sample_rate, step_sample_size
         );
 
-        let (training_data, mt) = if let (Some(indices), Some(sampler)) =
-            (&fixed_sample_indices, &fixed_sampler)
+        let (training_data, mt) = if let (Some(sample_ranges), Some(sampler)) =
+            (&fixed_sample_ranges, &fixed_sampler)
         {
-            let chunk_end = (sample_offset + step_sample_size).min(indices.len());
-            let chunk = &indices[sample_offset..chunk_end];
-            sample_offset = chunk_end;
-            sampler.sample(chunk, metric_type).await?
+            let ranges = sample_ranges.chunk(sample_offset, step_sample_size);
+            sample_offset += ranges.iter().map(range_len).sum::<usize>();
+            sampler.sample_ranges(&ranges, metric_type).await?
         } else {
             sample_ivf_training_chunk(dataset, column, step_sample_size, metric_type, fragment_ids)
                 .await?
@@ -3893,33 +4012,33 @@ async fn train_streaming_coreset_ivf_model(
             "Running {} streaming raw-vector refinement pass(es)",
             params.streaming_refine_passes
         );
-        centroids = if let (Some(indices), Some(sampler)) = (&fixed_sample_indices, &fixed_sampler)
-        {
-            refine_streaming_f32_kmeans_with_sampler(
-                sampler,
-                metric_type,
-                num_partitions * streaming_sample_rate,
-                indices,
-                &centroids,
-                params.streaming_refine_passes,
-                on_progress.clone(),
-            )
-            .await?
-        } else {
-            refine_streaming_f32_kmeans_with_resampling(
-                dataset,
-                column,
-                metric_type,
-                total_sample_rate,
-                streaming_sample_rate,
-                num_partitions,
-                &centroids,
-                fragment_ids,
-                params.streaming_refine_passes,
-                on_progress.clone(),
-            )
-            .await?
-        };
+        centroids =
+            if let (Some(sample_ranges), Some(sampler)) = (&fixed_sample_ranges, &fixed_sampler) {
+                refine_streaming_f32_kmeans_with_sampler(
+                    sampler,
+                    metric_type,
+                    num_partitions * streaming_sample_rate,
+                    sample_ranges,
+                    &centroids,
+                    params.streaming_refine_passes,
+                    on_progress.clone(),
+                )
+                .await?
+            } else {
+                refine_streaming_f32_kmeans_with_resampling(
+                    dataset,
+                    column,
+                    metric_type,
+                    total_sample_rate,
+                    streaming_sample_rate,
+                    num_partitions,
+                    &centroids,
+                    fragment_ids,
+                    params.streaming_refine_passes,
+                    on_progress.clone(),
+                )
+                .await?
+            };
     }
 
     drop(progress_tx);
@@ -5282,6 +5401,35 @@ mod tests {
                 .await
                 .is_finite()
         );
+    }
+
+    #[test]
+    fn test_fixed_training_ranges_are_sorted_and_bounded() {
+        let ranges = generate_fixed_training_ranges(10_000, 1_234, 1_024, 16);
+        assert_eq!(ranges.num_rows(), 1_234);
+        assert!(ranges.ranges.iter().all(|range| {
+            range.start < range.end && range.end <= 10_000 && range_len(range) <= 1_234
+        }));
+        assert!(
+            ranges
+                .ranges
+                .windows(2)
+                .all(|pair| pair[0].end < pair[1].start)
+        );
+
+        let all_rows = generate_fixed_training_ranges(128, 256, 1_024, 16);
+        assert_eq!(all_rows.ranges, vec![0..128]);
+        assert_eq!(all_rows.num_rows(), 128);
+    }
+
+    #[test]
+    fn test_fixed_training_ranges_chunk_splits_ranges() {
+        let ranges = FixedIvfTrainingRanges::new(vec![10..20, 30..45]);
+        assert_eq!(ranges.num_rows(), 25);
+        assert_eq!(ranges.chunk(0, 5), vec![10..15]);
+        assert_eq!(ranges.chunk(5, 12), vec![15..20, 30..37]);
+        assert_eq!(ranges.chunk(20, 10), vec![40..45]);
+        assert!(ranges.chunk(25, 10).is_empty());
     }
 
     #[test]
