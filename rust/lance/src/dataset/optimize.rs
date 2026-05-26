@@ -745,6 +745,10 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                                     .map(|sz| sz.get() as usize)
                                     .sum::<usize>();
                             if self.exceeds_budget(running_fragments, running_bytes) {
+                                bin.fragments.pop();
+                                bin.pos_range.end -= 1;
+                                bin.candidacy.pop();
+                                bin.row_counts.pop();
                                 candidate_bins.push(current_bin.take().unwrap());
                                 break;
                             }
