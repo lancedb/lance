@@ -59,7 +59,7 @@ pub const ZONEMAP_FILENAME: &str = "zonemap.lance";
 /// `zonemap.lance` by [`merge_index_files`].
 pub const ZONEMAP_PART_FILE_PREFIX: &str = "part_";
 pub const ZONEMAP_PART_FILE_SUFFIX: &str = "_zonemap.lance";
-const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
+pub const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
@@ -974,15 +974,12 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
                 )
             })?;
         let file_name = match fragment_ids.as_deref() {
-            // Distributed build: each worker writes a per-worker file. We use the
-            // smallest fragment id in the worker's assignment to name the file.
-            // ZoneTrainer already partitions zones strictly by fragment_id, so
-            // worker files never share zones across the same fragment_id and the
-            // final merge step is a pure concatenation.
-            Some(ids) if !ids.is_empty() => {
-                let worker_id = ids.iter().copied().min().expect("non-empty fragment_ids");
-                zonemap_part_file_name(worker_id)
-            }
+            // Distributed build: each worker writes a per-worker file named
+            // after all its assigned fragment IDs (sorted, dash-separated).
+            // Encoding every fragment ID in the filename makes collisions
+            // impossible by construction, even if the orchestrator
+            // accidentally assigns overlapping fragments to two workers.
+            Some(ids) if !ids.is_empty() => zonemap_part_file_name(ids),
             _ => ZONEMAP_FILENAME.to_string(),
         };
         Self::train_zonemap_index_to(data, index_store, Some(request.params), &file_name).await?;
@@ -1005,8 +1002,15 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     }
 }
 
-fn zonemap_part_file_name(worker_id: u32) -> String {
-    format!("{ZONEMAP_PART_FILE_PREFIX}{worker_id}{ZONEMAP_PART_FILE_SUFFIX}")
+fn zonemap_part_file_name(fragment_ids: &[u32]) -> String {
+    let mut sorted = fragment_ids.to_vec();
+    sorted.sort();
+    let id_str = sorted
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("{ZONEMAP_PART_FILE_PREFIX}{id_str}{ZONEMAP_PART_FILE_SUFFIX}")
 }
 
 fn is_missing_zonemap_error(err: &Error) -> bool {
@@ -1070,13 +1074,14 @@ async fn list_zonemap_part_files(
             index_dir
         )));
     }
-    // Stable order (by worker id) so the merged output is deterministic.
-    // Sort numerically by the worker_id embedded in the filename, not
-    // lexicographically, so that part_10_* comes after part_2_*.
+    // Stable order so the merged output is deterministic.
+    // Sort numerically by the first fragment ID embedded in the filename,
+    // not lexicographically, so that part_10_* comes after part_2_*.
     part_files.sort_by_key(|name| {
         name.strip_prefix(ZONEMAP_PART_FILE_PREFIX)
             .and_then(|s| s.strip_suffix(ZONEMAP_PART_FILE_SUFFIX))
-            .and_then(|id| id.parse::<u32>().ok())
+            .and_then(|id| id.split('-').next())
+            .and_then(|first| first.parse::<u32>().ok())
             .unwrap_or(u32::MAX)
     });
     Ok(part_files)
@@ -1084,10 +1089,12 @@ async fn list_zonemap_part_files(
 
 /// Merge per-worker zonemap part files into a single `zonemap.lance`.
 ///
-/// Each worker writes a `part_<worker_id>_zonemap.lance` containing zones for
-/// its assigned fragments. Because zones are independent and never span
-/// fragments, the merge is a pure concatenation of record batches with no
-/// sorting, deduplication, or rewrite of zone payloads.
+/// Each worker writes a `part_<fragment_ids>_zonemap.lance` (where
+/// `<fragment_ids>` is the sorted, dash-separated list of assigned fragment
+/// IDs) containing zones for its assigned fragments. Because zones are
+/// independent and never span fragments, the merge is a pure concatenation
+/// of record batches with no sorting, deduplication, or rewrite of zone
+/// payloads.
 pub async fn merge_index_files(
     object_store: &ObjectStore,
     index_dir: &Path,
@@ -1111,15 +1118,21 @@ pub async fn merge_index_files(
         )
         .await?;
 
-    // Read the first part to recover the arrow schema (including the
-    // ZONEMAP_SIZE_META_KEY metadata) for the merged output. Subsequent parts
-    // are appended in order.
+    // Read the first part to recover the arrow schema for the merged output.
+    // The RecordBatch schema does not carry file-level metadata (such as
+    // ZONEMAP_SIZE_META_KEY), so we must copy it from the IndexReader schema
+    // into the batch schema before creating the merged file.
     let first_reader = store.open_index_file(&part_files[0]).await?;
     let first_num_rows = first_reader.num_rows();
     let first_batch = first_reader.read_range(0..first_num_rows, None).await?;
-    let merged_schema = first_batch.schema();
+    let mut merged_schema = first_batch.schema().as_ref().clone();
+    if let Some(rows_per_zone) = first_reader.schema().metadata.get(ZONEMAP_SIZE_META_KEY) {
+        merged_schema
+            .metadata
+            .insert(ZONEMAP_SIZE_META_KEY.to_string(), rows_per_zone.clone());
+    }
     let mut writer = store
-        .new_index_file(ZONEMAP_FILENAME, merged_schema)
+        .new_index_file(ZONEMAP_FILENAME, Arc::new(merged_schema))
         .await?;
     if first_num_rows > 0 {
         writer.write_record_batch(first_batch).await?;

@@ -1645,7 +1645,7 @@ mod tests {
             "committed zonemap index should only reference merged files"
         );
 
-        // Open the merged zonemap and exercise pruning. Range [150, 250] only
+        // Open the merged zonemap and exercise pruning. Range [110, 210]
         // overlaps fragment 1 (100..115) and fragment 2 (200..215), so the
         // returned mask should be a strict subset of the dataset.
         let scalar_index =
@@ -1657,8 +1657,8 @@ mod tests {
         let result = scalar_index
             .search(
                 &SargableQuery::Range(
-                    Bound::Included(ScalarValue::Int32(Some(150))),
-                    Bound::Included(ScalarValue::Int32(Some(250))),
+                    Bound::Included(ScalarValue::Int32(Some(110))),
+                    Bound::Included(ScalarValue::Int32(Some(210))),
                 ),
                 &NoOpMetricsCollector,
             )
@@ -1670,16 +1670,132 @@ mod tests {
                 let kept = mask.len().unwrap_or(total_rows);
                 assert!(
                     kept < total_rows,
-                    "zonemap should prune at least one zone for the [150, 250] range, \
+                    "zonemap should prune at least one zone for the [110, 210] range, \
                      got kept={kept} total={total_rows}"
                 );
                 assert!(
                     kept > 0,
-                    "zonemap should keep the zones overlapping [150, 250]"
+                    "zonemap should keep the zones overlapping [110, 210]"
                 );
             }
             SearchResult::AtLeast(_) => panic!("zonemap unexpectedly produced AtLeast result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_distributed_build_zonemap_custom_rows_per_zone() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = (0..4)
+            .map(
+                |fragment_id| -> std::result::Result<_, arrow_schema::ArrowError> {
+                    let base = fragment_id * 100;
+                    let values: Vec<i32> = (0..16).map(|i| base + i).collect();
+                    Ok(RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(values))],
+                    )
+                    .unwrap())
+                },
+            )
+            .collect::<Vec<_>>();
+        let reader = RecordBatchIterator::new(batches.into_iter(), schema);
+
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 16,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let custom_rows_per_zone = 4u64;
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+            .with_params(&lance_index::scalar::zonemap::ZoneMapIndexBuilderParams::new(
+                custom_rows_per_zone,
+            ));
+        let fragments = dataset.get_fragments();
+        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
+        let shared_uuid = Uuid::new_v4().to_string();
+        let mut shard_metadata = None;
+
+        for &fragment_id in &fragment_ids {
+            let index_metadata =
+                CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::ZoneMap, &params)
+                    .name("distributed_zonemap_custom".to_string())
+                    .fragments(vec![fragment_id])
+                    .index_uuid(shared_uuid.clone())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            if shard_metadata.is_none() {
+                shard_metadata = Some(index_metadata);
+            }
+        }
+
+        dataset
+            .merge_index_metadata(
+                &shared_uuid,
+                IndexType::ZoneMap,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+
+        let mut committed_index_metadata = shard_metadata.unwrap();
+        committed_index_metadata.fragment_bitmap = Some(fragment_ids.iter().copied().collect());
+        committed_index_metadata.files = Some(
+            list_index_files_with_sizes(
+                dataset.object_store.as_ref(),
+                &dataset.indices_dir().clone().join(shared_uuid.clone()),
+            )
+            .await
+            .unwrap(),
+        );
+        committed_index_metadata.dataset_version = dataset.manifest.version;
+
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![committed_index_metadata],
+                removed_indices: vec![],
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&dataset_uri).await.unwrap();
+        let indices = dataset
+            .load_indices_by_name("distributed_zonemap_custom")
+            .await
+            .unwrap();
+        let index = &indices[0];
+
+        let scalar_index =
+            crate::index::scalar::open_scalar_index(&dataset, "id", index, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+
+        let stats = scalar_index.statistics().unwrap();
+        let loaded_rows_per_zone = stats["rows_per_zone"].as_u64().unwrap();
+        assert_eq!(
+            loaded_rows_per_zone, custom_rows_per_zone,
+            "merged zonemap should preserve custom rows_per_zone metadata"
+        );
     }
 
     #[tokio::test]
