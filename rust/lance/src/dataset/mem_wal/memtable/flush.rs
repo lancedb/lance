@@ -29,7 +29,7 @@ use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
 use crate::Dataset;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
-use crate::dataset::mem_wal::scanner::exec::compute_pk_hash;
+use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
 
 #[derive(Debug, Clone)]
@@ -89,7 +89,6 @@ impl MemTableFlusher {
 
     /// Construct a full URI for a path within the base dataset.
     fn path_to_uri(&self, path: &Path) -> String {
-        // Remove base_path prefix from path to get relative path
         let path_str = path.as_ref();
         let base_str = self.base_path.as_ref();
 
@@ -99,7 +98,6 @@ impl MemTableFlusher {
             path_str
         };
 
-        // Combine base_uri with relative path
         let base = self.base_uri.trim_end_matches('/');
         if relative.is_empty() {
             base.to_string()
@@ -207,17 +205,13 @@ impl MemTableFlusher {
             return Ok((0, RoaringBitmap::new()));
         }
 
-        // Write in insert (forward) order: the newest version of each PK lands
-        // at the largest offset, matching the insert-order index positions 1:1.
         let batches = memtable.scan_batches().await?;
         if batches.is_empty() {
             return Ok((0, RoaringBitmap::new()));
         }
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        // Build the within-generation deletion vector before the batches are
-        // moved into the writer. Under forward-write the newest version of each
-        // PK is at the largest offset, so the last occurrence is kept.
+        // Build the deletion vector before `batches` is moved into the writer.
         let pk_columns: Vec<String> = memtable
             .lance_schema()
             .unenforced_primary_key()
@@ -228,6 +222,10 @@ impl MemTableFlusher {
             RoaringBitmap::new()
         } else {
             let schema = batches[0].schema();
+            // Match the read-path contract (create_dedup_plan): unsupported PK
+            // types must error here rather than hit compute_pk_hash's
+            // debug-format fallback, which can collapse distinct keys.
+            validate_pk_types(schema.as_ref(), &pk_columns)?;
             let pk_indices = pk_columns
                 .iter()
                 .map(|c| {
@@ -1170,6 +1168,142 @@ mod tests {
         assert_eq!(rows.get(&1), Some(&"a2".to_string()));
         assert_eq!(rows.get(&2), Some(&"b".to_string()));
         assert_eq!(rows.get(&3), Some(&"c2".to_string()));
+    }
+
+    /// Covers `finalize_generation` writing both a deletion vector *and*
+    /// indexes into the same manifest — the deletion-only and index-only
+    /// paths are exercised by sibling tests.
+    #[tokio::test]
+    async fn test_flush_with_indexes_and_dedup_deletion_vector() {
+        use super::super::super::index::{BTreeIndexConfig, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use futures::TryStreamExt;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        // BTree on the non-PK `name` column so the index sees the dedup set.
+        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "name_btree".to_string(),
+            field_id: 1,
+            column: "name".to_string(),
+        })];
+
+        let schema = create_pk_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let registry = IndexStore::from_configs(&index_configs, 100_000, 1_000).unwrap();
+        memtable.set_indexes(registry);
+
+        // Duplicate PKs in append order: id=1 a->a2, id=2 b, id=3 c->c2.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 1, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "a2", "c2"])),
+            ],
+        )
+        .unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            shard_id,
+            manifest_store.clone(),
+        );
+        let result = flusher
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
+            .await
+            .unwrap();
+        assert_eq!(result.rows_flushed, 5, "all physical rows are written");
+
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri.trim_end_matches('/'),
+            shard_id,
+            result.generation.path
+        );
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            1,
+            "flushed dataset must be a single-version dataset"
+        );
+
+        // Index half of the combined manifest.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "name_btree");
+
+        // Deletion-vector half: scan returns newest-per-PK.
+        let batches: Vec<RecordBatch> = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = std::collections::HashMap::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = b
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(
+            rows.len(),
+            3,
+            "deletion vector should leave newest-per-PK, got {:?}",
+            rows
+        );
+        assert_eq!(rows.get(&1), Some(&"a2".to_string()));
+        assert_eq!(rows.get(&2), Some(&"b".to_string()));
+        assert_eq!(rows.get(&3), Some(&"c2".to_string()));
+
+        // The BTree on `name` must not surface a stale value: a hit for the
+        // pre-update "a" would mean the indexed path ignored the deletion
+        // vector.
+        let stale_hits = dataset
+            .scan()
+            .filter("name = 'a'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_hits.num_rows(),
+            0,
+            "older name 'a' for id=1 must be filtered out by the deletion vector"
+        );
+        let fresh_hits = dataset
+            .scan()
+            .filter("name = 'a2'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(fresh_hits.num_rows(), 1);
     }
 
     #[tokio::test]

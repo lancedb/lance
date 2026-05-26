@@ -1,36 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! MemTableDedupScanExec - reverse-iterating, newest-per-PK scan that fuses
-//! within-source deduplication with the scalar predicate in a single pass.
+//! MemTableDedupScanExec — newest-per-PK scan over the active memtable that
+//! fuses within-source dedup with the scalar predicate in a single pass.
 //!
-//! The active memtable is an append log: an update of a primary key is just a
-//! later append with the same key, so a PK can have several versions. A correct
-//! fresh-tier read must keep only the newest version of each PK. The plain
-//! [`super::MemTableScanExec`] pushes the filter into the scan, which removes a
-//! PK's newest version *before* any dedup can pick it — so an older version that
-//! still satisfies the predicate leaks through (a stale "phantom" row).
+//! The active memtable is an append log, so a PK update is a later append
+//! with the same key. [`super::MemTableScanExec`] pushes the filter into the
+//! scan, which removes a PK's newest row *before* dedup runs — an older row
+//! that still satisfies the predicate then leaks through (a "phantom").
 //!
-//! This exec fixes that for the active arm by deduplicating *before* the
-//! predicate:
-//!
-//! 1. iterate visible batches newest-first (reverse batch order, rows reversed
-//!    within each batch — the same order the flush uses),
-//! 2. for each row compute its PK hash and mark it seen; the first time a PK is
-//!    seen is its newest version (keep), every later occurrence is older (drop),
-//! 3. emit a row only when it is the newest occurrence **and** satisfies the
-//!    predicate.
-//!
-//! The seen-set is updated from the newest occurrence **independent of the
-//! predicate**: a newest row that fails the predicate must still suppress its
-//! older versions, otherwise the phantom returns.
+//! This exec walks rows newest-first (batches reversed, rows iterated
+//! back-to-front), seeds a seen-set from the *newest* occurrence of every PK
+//! regardless of the predicate (so older versions stay suppressed even when
+//! the newest row fails the filter), and records the keep/drop verdict into a
+//! forward-aligned mask. A single `filter_record_batch` over the original
+//! batch then emits the survivors with no per-column reverse copy.
 
 use std::any::Any;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -49,9 +40,8 @@ use futures::stream::{self, StreamExt};
 use crate::dataset::mem_wal::scanner::exec::compute_pk_hash;
 use crate::dataset::mem_wal::write::BatchStore;
 
-/// ExecutionPlan node that scans the active memtable newest-first and emits the
-/// newest-per-PK rows that satisfy the (optional) predicate. See the module doc
-/// for the correctness rationale.
+/// Scans the active memtable newest-first and emits the newest-per-PK rows
+/// that satisfy the (optional) predicate. See the module doc.
 pub struct MemTableDedupScanExec {
     batch_store: Arc<BatchStore>,
     max_visible_batch_position: usize,
@@ -118,30 +108,6 @@ impl MemTableDedupScanExec {
             filter_predicate,
             filter_expr,
         }
-    }
-
-    /// Reverse the rows of `batch` (newest-first) and return the reversed batch
-    /// alongside the original row offsets of those rows.
-    ///
-    /// `row_offset` is the offset of the batch's first row. After reversal the
-    /// row at reversed position `j` is original row `n - 1 - j`, so its address
-    /// is `row_offset + (n - 1 - j)`.
-    fn reverse_rows(
-        batch: &RecordBatch,
-        row_offset: u64,
-    ) -> DataFusionResult<(RecordBatch, Vec<u64>)> {
-        use arrow::compute::kernels::take::take;
-
-        let n = batch.num_rows();
-        let indices = UInt32Array::from_iter_values((0..n as u32).rev());
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|col| take(col.as_ref(), &indices, None))
-            .collect::<Result<Vec<_>, _>>()?;
-        let reversed = RecordBatch::try_new(batch.schema(), columns)?;
-        let offsets = (0..n).map(|j| row_offset + (n - 1 - j) as u64).collect();
-        Ok((reversed, offsets))
     }
 }
 
@@ -218,7 +184,8 @@ impl ExecutionPlan for MemTableDedupScanExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        // Visible batches in append (forward) order; reverse for newest-first.
+        // Newest-first iteration: reverse batches here, rows are walked
+        // back-to-front below.
         let mut batches = self
             .batch_store
             .visible_batches_with_offsets(self.max_visible_batch_position);
@@ -237,17 +204,16 @@ impl ExecutionPlan for MemTableDedupScanExec {
         let mut out: Vec<DataFusionResult<RecordBatch>> = Vec::with_capacity(batches.len());
 
         for (batch, row_offset) in batches {
-            if batch.num_rows() == 0 {
+            let n = batch.num_rows();
+            if n == 0 {
                 continue;
             }
 
-            let (reversed, offsets) = Self::reverse_rows(&batch, row_offset)?;
-            let n = reversed.num_rows();
-
-            // Predicate mask over the reversed rows (null counts as no-match).
+            // Predicate mask over the original (forward) rows; null counts as
+            // no-match.
             let filter_array = match &filter_predicate {
                 Some(predicate) => {
-                    let value = predicate.evaluate(&reversed)?;
+                    let value = predicate.evaluate(&batch)?;
                     let array = value.into_array(n)?;
                     let Some(boolean) = array.as_any().downcast_ref::<BooleanArray>() else {
                         return Err(datafusion::error::DataFusionError::Internal(
@@ -259,22 +225,23 @@ impl ExecutionPlan for MemTableDedupScanExec {
                 None => None,
             };
 
-            // Emit a row iff it is the newest occurrence of its PK AND passes
-            // the predicate. `seen` is updated from the newest occurrence
-            // regardless of the predicate, so older versions stay suppressed.
-            let mut emit = Vec::with_capacity(n);
-            for j in 0..n {
-                let pk_hash = compute_pk_hash(&reversed, &pk_indices, j);
+            // Walk newest-first; first insertion into `seen` is the newest
+            // occurrence (keep), later ones are older (drop). `seen` is
+            // updated even when the newest row fails the predicate so its
+            // older versions stay suppressed (no phantom).
+            let mut emit_forward = vec![false; n];
+            for j in (0..n).rev() {
+                let pk_hash = compute_pk_hash(&batch, &pk_indices, j);
                 let is_newest = seen.insert(pk_hash);
                 let passes = match &filter_array {
                     Some(mask) => mask.is_valid(j) && mask.value(j),
                     None => true,
                 };
-                emit.push(is_newest && passes);
+                emit_forward[j] = is_newest && passes;
             }
-            let emit_mask = BooleanArray::from(emit);
+            let emit_mask = BooleanArray::from(emit_forward);
 
-            let emitted = arrow_select::filter::filter_record_batch(&reversed, &emit_mask)?;
+            let emitted = arrow_select::filter::filter_record_batch(&batch, &emit_mask)?;
             if emitted.num_rows() == 0 {
                 continue;
             }
@@ -282,7 +249,7 @@ impl ExecutionPlan for MemTableDedupScanExec {
             let filtered_offsets: Vec<u64> = if need_row_offsets {
                 (0..n)
                     .filter(|&j| emit_mask.value(j))
-                    .map(|j| offsets[j])
+                    .map(|j| row_offset + j as u64)
                     .collect()
             } else {
                 vec![]
