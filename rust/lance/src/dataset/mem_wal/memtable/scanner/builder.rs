@@ -786,10 +786,10 @@ impl MemTableScanner {
         Ok(plan)
     }
 
-    /// Plan a newest-per-PK active-arm scan via [`MemTableDedupScanExec`] —
+    /// Plan a newest-per-PK active-arm scan via `MemTableDedupScanExec` —
     /// dedup runs before the predicate so a PK whose newest version fails the
     /// filter cannot leak an older version that passes. Unlike
-    /// [`Self::plan_full_scan`], this never takes the BTree skip (dedup needs
+    /// `plan_full_scan`, this never takes the BTree skip (dedup needs
     /// every version) and never pushes a limit (the LSM caps results above
     /// the cross-source merge).
     pub async fn create_dedup_plan(&self, pk_columns: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
