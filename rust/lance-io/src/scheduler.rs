@@ -397,6 +397,7 @@ impl IoTask {
     async fn run(self) {
         let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
+        let io_start = Instant::now();
         let bytes = if self.to_read.start == self.to_read.end {
             Ok(Bytes::new())
         } else {
@@ -412,7 +413,18 @@ impl IoTask {
                 .await
                 .map_err(Error::from)
         };
-        // Emit per-file I/O trace event only when tracing is enabled
+        let duration_us = io_start.elapsed().as_micros() as u64;
+        // Physical IO event consumed by `QueryProfileLayer` for distribution
+        // stats (bytes / duration / throughput per file type). Emitted at
+        // INFO so it's not stripped by debug-level filters.
+        tracing::info!(
+            target: lance_core::utils::tracing::TRACE_IO_PHYSICAL,
+            file_path = file_path,
+            bytes = num_bytes,
+            duration_us = duration_us,
+        );
+        // Legacy trace-level event retained for any consumers that already
+        // listen to it (e.g. low-level debugging).
         tracing::trace!(
             file = file_path,
             bytes_read = num_bytes,
@@ -755,9 +767,24 @@ impl ScanScheduler {
             .map(|task| {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
+                let task_bytes = task.end.saturating_sub(task.start);
+                let task_start_off = task.start;
+                let task_end_off = task.end;
                 let run_fn = Box::new(move || {
+                    let file_path = reader.path().as_ref().to_string();
+                    let io_start = Instant::now();
                     reader
-                        .get_range(task.start as usize..task.end as usize)
+                        .get_range(task_start_off as usize..task_end_off as usize)
+                        .map(move |result| {
+                            let duration_us = io_start.elapsed().as_micros() as u64;
+                            tracing::info!(
+                                target: lance_core::utils::tracing::TRACE_IO_PHYSICAL,
+                                file_path = file_path.as_str(),
+                                bytes = task_bytes,
+                                duration_us = duration_us,
+                            );
+                            result
+                        })
                         .map_err(Error::from)
                         .boxed()
                 });

@@ -1502,7 +1502,7 @@ impl ScalarIndexExpr {
         }
     }
 
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(name = "phase.index_search.scalar", skip_all)]
     pub async fn evaluate(
         &self,
         index_loader: &dyn ScalarIndexLoader,

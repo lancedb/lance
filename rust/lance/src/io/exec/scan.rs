@@ -25,7 +25,7 @@ use futures::{FutureExt, TryFutureExt, stream};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
-use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
+use lance_core::utils::tracing::{FutureTracingExt, PHASE_LOAD_DATA_LANCE_SCAN, StreamTracingExt};
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -701,7 +701,7 @@ impl ExecutionPlan for LanceScanExec {
         .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            lance_stream,
+            lance_stream.stream_in_span(tracing::info_span!(PHASE_LOAD_DATA_LANCE_SCAN)),
         )))
     }
 

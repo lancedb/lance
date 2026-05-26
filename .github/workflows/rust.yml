@@ -194,6 +194,15 @@ jobs:
       - name: Set up Rust
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - name: Install pinned toolchain (if any)
+        # The repo's rust-toolchain.toml may pin a channel that differs from
+        # the runner default. On brew-managed rust these overrides can trigger
+        # a buggy rustup-init path; installing explicitly avoids that.
+        run: |
+          PINNED=$(grep channel rust-toolchain.toml 2>/dev/null | cut -d\" -f2 || echo "")
+          if [ -n "$PINNED" ] && [ "$PINNED" != "stable" ]; then
+            rustup toolchain install "$PINNED" --no-self-update
+          fi
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Build tests
         run: |

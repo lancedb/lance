@@ -29,11 +29,11 @@ use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::{
     tokio::{get_num_compute_intensive_cpus, spawn_in_current_span},
-    tracing::{FutureTracingExt, StreamTracingExt},
+    tracing::{FutureTracingExt, PHASE_LOAD_DATA_TAKE, StreamTracingExt},
 };
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use tracing::error;
+use tracing::{error, info_span};
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
@@ -638,7 +638,10 @@ impl ExecutionPlan for TakeExec {
             take_stream.apply(input_stream)
         });
         let output_schema = self.output_schema.clone();
-        let stream = lazy_take_stream.flatten().boxed_stream_in_current_span();
+        let stream = lazy_take_stream
+            .flatten()
+            .boxed_stream_in_current_span()
+            .stream_in_span(info_span!(PHASE_LOAD_DATA_TAKE));
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
             stream,

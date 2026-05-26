@@ -54,7 +54,9 @@ use lance_core::datatypes::{
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+use lance_core::utils::profile::{TRACE_QUERY_DONE, drain_pending_summaries};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::QUERY_PROFILE_ROOT;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::aggregate::Aggregate;
 use lance_datafusion::exec::{
@@ -77,7 +79,7 @@ use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
-use tracing::{Span, info_span, instrument};
+use tracing::{Instrument, Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
@@ -1952,18 +1954,24 @@ impl Scanner {
     #[instrument(skip_all)]
     pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         // Future intentionally boxed here to avoid large futures on the stack
+        let span = info_span!(QUERY_PROFILE_ROOT);
+        let stream_span = span.clone();
         async move {
             let plan = self.create_plan().await?;
 
-            Ok(DatasetRecordBatchStream::new(execute_plan(
-                plan,
-                LanceExecutionOptions {
-                    batch_size: self.batch_size,
-                    execution_stats_callback: self.scan_stats_callback.clone(),
-                    ..Default::default()
-                },
-            )?))
+            Ok(DatasetRecordBatchStream::new_with_span(
+                execute_plan(
+                    plan,
+                    LanceExecutionOptions {
+                        batch_size: self.batch_size,
+                        execution_stats_callback: self.scan_stats_callback.clone(),
+                        ..Default::default()
+                    },
+                )?,
+                stream_span,
+            ))
         }
+        .instrument(span)
         .boxed()
     }
 
@@ -1971,14 +1979,25 @@ impl Scanner {
         &self,
         mut options: LanceExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
-        let plan = self.create_plan().await?;
+        let span = info_span!(QUERY_PROFILE_ROOT);
+        let stream_span = span.clone();
+        let stream = async move {
+            let plan = self.create_plan().await?;
 
-        // Use the scan stats callback if the user didn't set an execution stats callback
-        if options.execution_stats_callback.is_none() {
-            options.execution_stats_callback = self.scan_stats_callback.clone();
+            // Use the scan stats callback if the user didn't set an execution stats callback
+            if options.execution_stats_callback.is_none() {
+                options.execution_stats_callback = self.scan_stats_callback.clone();
+            }
+
+            execute_plan(plan, options)
         }
-
-        execute_plan(plan, options)
+        .instrument(span)
+        .await?;
+        Ok(Box::pin(SpannedRecordBatchStream {
+            inner: stream,
+            span: stream_span.clone(),
+            _done_guard: QueryDoneGuard { span: stream_span },
+        }))
     }
 
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
@@ -2423,7 +2442,7 @@ impl Scanner {
     /// 3. Sort
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(name = "phase.plan", skip_all)]
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
@@ -4151,8 +4170,7 @@ impl Scanner {
 
     /// Here we consume all input (as unindexed) and rerank according to BM25 scores
     ///
-    /// If there is an index on the column then we still use the index to determine the
-    /// tokenizer and inform the BM25 scoring (e.g. avg doc length, token frequency, etc.)
+    #[instrument(name = "phase.postprocess", skip_all)]
     async fn fts_rerank(
         &self,
         input: Arc<dyn ExecutionPlan>,
@@ -4665,10 +4683,22 @@ pub struct DatasetRecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
     span: Span,
+    /// Drops after `exec_node` so the query-done event fires once the inner
+    /// stream is fully torn down. Some background tasks may still hold span
+    /// clones that prevent the `query` span itself from closing, so this
+    /// guard is what triggers the profile summary.
+    _done_guard: QueryDoneGuard,
 }
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
+        Self::new_with_span(exec_node, info_span!(QUERY_PROFILE_ROOT))
+    }
+
+    /// Construct a stream that polls under a caller-supplied span. Used by
+    /// the scanner so the same `query` span covers plan creation and stream
+    /// consumption — letting `QueryProfileLayer` aggregate both phases.
+    pub fn new_with_span(exec_node: SendableRecordBatchStream, span: Span) -> Self {
         let schema = exec_node.schema();
         let adapter = SchemaAdapter::new(schema.clone());
         let exec_node = if SchemaAdapter::requires_logical_conversion(&schema) {
@@ -4677,8 +4707,12 @@ impl DatasetRecordBatchStream {
             exec_node
         };
 
-        let span = info_span!("DatasetRecordBatchStream");
-        Self { exec_node, span }
+        let _done_guard = QueryDoneGuard { span: span.clone() };
+        Self {
+            exec_node,
+            span,
+            _done_guard,
+        }
     }
 }
 
@@ -4704,6 +4738,56 @@ impl Stream for DatasetRecordBatchStream {
 impl From<DatasetRecordBatchStream> for SendableRecordBatchStream {
     fn from(stream: DatasetRecordBatchStream) -> Self {
         stream.exec_node
+    }
+}
+
+/// Fires a `lance::query_done` event when dropped, instructing
+/// [`QueryProfileLayer`] to flush its summary for the surrounding `query`
+/// span. The guard is held inside scanner-produced streams so the event fires
+/// when the user drops the stream — even when background tasks still hold
+/// span clones that prevent the span itself from closing.
+struct QueryDoneGuard {
+    span: Span,
+}
+
+impl Drop for QueryDoneGuard {
+    fn drop(&mut self) {
+        let _g = self.span.enter();
+        // Tells QueryProfileLayer to snapshot this query's state into a
+        // thread-local buffer (it cannot emit a tracing event from within
+        // its own `on_event` callback — those are dropped silently).
+        tracing::info!(target: TRACE_QUERY_DONE, "");
+        drop(_g);
+        // Now that we're outside the layer's callback, drain and emit.
+        drain_pending_summaries();
+    }
+}
+
+/// Wraps a [`SendableRecordBatchStream`] so that polls happen under a
+/// caller-supplied span. Used by [`Scanner::try_into_dfstream`] to keep the
+/// query root span alive for the entire stream lifetime so that
+/// [`QueryProfileLayer`] sees execution-time spans/events as descendants.
+#[pin_project::pin_project]
+struct SpannedRecordBatchStream {
+    #[pin]
+    inner: SendableRecordBatchStream,
+    span: Span,
+    _done_guard: QueryDoneGuard,
+}
+
+impl datafusion::physical_plan::RecordBatchStream for SpannedRecordBatchStream {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+}
+
+impl Stream for SpannedRecordBatchStream {
+    type Item = datafusion::error::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        let _guard = this.span.enter();
+        this.inner.poll_next(cx)
     }
 }
 

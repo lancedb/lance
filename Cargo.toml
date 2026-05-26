@@ -203,6 +203,7 @@ tower = "0.5"
 tower-http = "0.5"
 tracing = "0.1"
 tracing-mock = { version = "=0.1.0-beta.3" }
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 url = "2.5.7"
 uuid = { version = "1.2", features = ["v4", "serde"] }
 wiremock = "0.6"

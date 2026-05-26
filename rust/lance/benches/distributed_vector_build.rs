@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// `CreateIndexBuilder::execute_uncommitted` is a deeply nested async future;
+// the per-query profile spans push the trait-resolution query depth past the
+// default 128 limit during this bench's monomorphization.
+#![recursion_limit = "256"]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

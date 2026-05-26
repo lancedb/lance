@@ -157,8 +157,48 @@ pub const IO_TYPE_OPEN_FRAG_REUSE: &str = "open_frag_reuse_index";
 pub const IO_TYPE_OPEN_MEM_WAL: &str = "open_mem_wal_index";
 pub const IO_TYPE_LOAD_VECTOR_PART: &str = "load_vector_part";
 pub const IO_TYPE_LOAD_SCALAR_PART: &str = "load_scalar_part";
+pub const IO_TYPE_LOAD_DATA_FILE: &str = "load_data_file";
+pub const IO_TYPE_LOAD_MANIFEST: &str = "load_manifest";
+pub const IO_TYPE_LOAD_DELETION: &str = "load_deletion";
 pub const TRACE_EXECUTION: &str = "lance::execution";
 pub const EXECUTION_PLAN_RUN: &str = "plan_run";
+
+/// Target for the per-query aggregated profile event emitted by
+/// [`crate::utils::profile::QueryProfileLayer`] when a `query` root span closes.
+pub const TRACE_QUERY_PROFILE: &str = "lance::query_profile";
+/// Name of the root span the profile layer aggregates under. Created at the
+/// scanner stream entry points.
+pub const QUERY_PROFILE_ROOT: &str = "query";
+
+/// Names of the high-level phase spans recognized by the profile layer.
+/// Spans with any other name are ignored by the aggregator.
+///
+/// Sub-phase spans use the form `phase.<kind>.<subkind>` and roll up into the
+/// corresponding `phase.<kind>` total — both are reported in the summary
+/// event.
+pub const PHASE_PLAN: &str = "phase.plan";
+pub const PHASE_OPEN_INDEX: &str = "phase.open_index";
+pub const PHASE_OPEN_INDEX_SCALAR: &str = "phase.open_index.scalar";
+pub const PHASE_OPEN_INDEX_VECTOR: &str = "phase.open_index.vector";
+pub const PHASE_OPEN_INDEX_FRAG_REUSE: &str = "phase.open_index.frag_reuse";
+pub const PHASE_OPEN_INDEX_MEM_WAL: &str = "phase.open_index.mem_wal";
+pub const PHASE_INDEX_SEARCH: &str = "phase.index_search";
+pub const PHASE_INDEX_SEARCH_SCALAR: &str = "phase.index_search.scalar";
+pub const PHASE_INDEX_SEARCH_FTS: &str = "phase.index_search.fts";
+pub const PHASE_INDEX_SEARCH_ANN: &str = "phase.index_search.ann";
+pub const PHASE_LOAD_DATA: &str = "phase.load_data";
+pub const PHASE_LOAD_DATA_FILTERED_READ: &str = "phase.load_data.filtered_read";
+pub const PHASE_LOAD_DATA_LANCE_SCAN: &str = "phase.load_data.lance_scan";
+pub const PHASE_LOAD_DATA_TAKE: &str = "phase.load_data.take";
+pub const PHASE_POSTPROCESS: &str = "phase.postprocess";
+
+/// Per-physical-IO event target. Emitted by the `lance-io` scheduler from
+/// each `reader.get_range` completion with `bytes` and `duration_us` fields.
+/// Consumed by [`crate::utils::profile::QueryProfileLayer`] to build IO
+/// distribution stats (count / total / min / p50 / p95 / max for bytes,
+/// duration, and throughput) per file type.
+pub const TRACE_IO_PHYSICAL: &str = "lance::io_physical";
+
 pub const TRACE_DATASET_EVENTS: &str = "lance::dataset_events";
 pub const DATASET_WRITING_EVENT: &str = "writing";
 pub const DATASET_COMMITTED_EVENT: &str = "committed";

@@ -22,6 +22,7 @@ fn create_datafusion_context() -> SessionContext {
 
 mod inverted;
 mod primitives;
+mod profile;
 mod tracing;
 mod vectors;
 

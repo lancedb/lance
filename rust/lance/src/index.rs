@@ -1696,7 +1696,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
     }
 
-    #[instrument(level = "debug", skip_all)]
+    #[instrument(name = "phase.open_index.scalar", skip_all)]
     async fn open_scalar_index(
         &self,
         column: &str,
@@ -1725,6 +1725,7 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(index)
     }
 
+    #[instrument(name = "phase.open_index.vector", skip_all)]
     async fn open_vector_index(
         &self,
         column: &str,
@@ -2045,6 +2046,7 @@ impl DatasetIndexInternalExt for Dataset {
         LogicalVectorIndex::try_new(name.to_string(), column.to_string(), segments)
     }
 
+    #[instrument(name = "phase.open_index.frag_reuse", skip_all)]
     async fn open_frag_reuse_index(
         &self,
         metrics: &dyn MetricsCollector,
@@ -2075,6 +2077,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
     }
 
+    #[instrument(name = "phase.open_index.mem_wal", skip_all)]
     async fn open_mem_wal_index(
         &self,
         metrics: &dyn MetricsCollector,
