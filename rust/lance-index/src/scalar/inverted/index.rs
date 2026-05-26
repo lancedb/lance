@@ -633,7 +633,9 @@ impl InvertedIndex {
         let scorer: &dyn Scorer = if let Some(base_scorer) = base_scorer {
             base_scorer
         } else {
-            local_scorer = self.bm25_base_scorer(tokens.as_ref(), params.as_ref()).await?;
+            local_scorer = self
+                .bm25_base_scorer(tokens.as_ref(), params.as_ref())
+                .await?;
             &local_scorer
         };
 
