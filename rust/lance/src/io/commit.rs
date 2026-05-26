@@ -679,6 +679,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             bad_indices.into_iter().map(|(name, _)| name).collect()
         }
     };
+    let disk_indices = dataset.load_indices().await?;
     for index in indices.iter_mut() {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
@@ -686,14 +687,23 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::internal(format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0])))?;
-            let idx = dataset
-                .open_generic_index(
-                    &idx_field.name,
-                    &index.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
-                .await?;
-            index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
+            if disk_indices.iter().any(|i| i.uuid == index.uuid) {
+                let idx = dataset
+                    .open_generic_index(
+                        &idx_field.name,
+                        &index.uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+                index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
+            } else {
+                log::debug!(
+                    "Skipping fragment_bitmap recalculation for index {} (uuid: {}) because it does not exist on disk. \
+                     This likely means the index was remapped during this commit and the uuid was changed.",
+                    index.name,
+                    index.uuid
+                );
+            }
         }
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
