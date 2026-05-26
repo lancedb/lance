@@ -1721,9 +1721,9 @@ mod tests {
 
         let custom_rows_per_zone = 4u64;
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
-            .with_params(&lance_index::scalar::zonemap::ZoneMapIndexBuilderParams::new(
-                custom_rows_per_zone,
-            ));
+            .with_params(
+                &lance_index::scalar::zonemap::ZoneMapIndexBuilderParams::new(custom_rows_per_zone),
+            );
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
         let shared_uuid = Uuid::new_v4().to_string();
