@@ -1061,6 +1061,46 @@ pub(crate) async fn commit_transaction(
 
         match result {
             Ok(manifest_location) => {
+                // When auto_cleanup has previously deleted older manifest files,
+                // a commit based on a stale read_version can succeed at writing a
+                // manifest whose version is lower than the actual latest (because
+                // rename_if_not_exists sees the slot as empty). This creates an
+                // "orphan" version that is unreachable from the latest lineage.
+                // Subsequent commits on the correct lineage won't see the orphan's
+                // config changes (e.g. disabling auto_cleanup), and cleanup may
+                // delete the orphan version, losing those changes.
+                //
+                // Detect this by checking whether the committed version is behind
+                // the true latest. Only do this check when auto_cleanup may have
+                // been active (indicated by the original dataset's config
+                // containing auto_cleanup keys), since that is the only scenario
+                // where cleanup could have freed a version slot. This avoids the
+                // I/O cost on commits that don't involve auto_cleanup.
+                let may_have_cleanup = original_dataset
+                    .manifest
+                    .config
+                    .contains_key("lance.auto_cleanup.interval");
+                if may_have_cleanup
+                    && backoff.attempt() == 0
+                    && let Ok(latest) = commit_handler
+                        .resolve_latest_location(&dataset.base, object_store)
+                        .await
+                    && latest.version > manifest.version
+                {
+                    let path =
+                        manifest_naming_scheme.manifest_path(&dataset.base, manifest.version);
+                    let _ = object_store.delete(&path).await;
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.base,
+                        &current_transaction_file,
+                    )
+                    .await;
+                    backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                    tokio::time::sleep(backoff.next_backoff()).await;
+                    continue;
+                }
+
                 // Cache both the transaction file and manifest
                 let tx_key = crate::session::caches::TransactionKey {
                     version: target_version,
@@ -1089,11 +1129,6 @@ pub(crate) async fn commit_transaction(
                 }
 
                 if !commit_config.skip_auto_cleanup {
-                    // Note: We pass the original dataset (the one the user opened, before any
-                    // checkout to read_version) so that auto_cleanup_hook can use its config
-                    // as the authoritative source. Under optimistic commit, the committed manifest
-                    // may inherit stale config from an outdated snapshot via new_from_previous.
-                    // The original dataset reflects the on-disk state as the user last saw it.
                     match auto_cleanup_hook(&original_dataset, &manifest).await {
                         Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
                         Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),

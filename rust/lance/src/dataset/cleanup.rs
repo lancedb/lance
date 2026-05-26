@@ -1034,13 +1034,32 @@ pub async fn auto_cleanup_hook(
     dataset: &Dataset,
     manifest: &Manifest,
 ) -> Result<Option<RemovalStats>> {
-    // Under optimistic commit, the committed manifest may inherit stale config
-    // from an outdated snapshot via Manifest::new_from_previous. The caller
-    // passes the original dataset (before checkout to read_version), so
-    // dataset.manifest.config reflects the on-disk state as the user last saw
-    // it. We use this as the authoritative config for cleanup decisions.
-    let policy = build_cleanup_policy_from_config(dataset, &dataset.manifest.config, manifest.version).await?;
+    let policy =
+        build_cleanup_policy_from_config(dataset, &manifest.config, manifest.version).await?;
     if let Some(policy) = policy {
+        // When auto_cleanup has previously deleted older manifest files,
+        // a concurrent commit based on a stale read_version can succeed at
+        // writing a manifest whose version is lower than the actual latest
+        // (because rename_if_not_exists sees the slot as empty). Running
+        // cleanup in that state would delete the just-committed orphan
+        // version and any other versions between it and the true latest,
+        // losing config changes such as disabling auto_cleanup. Detect
+        // this by checking whether the committed version is behind the
+        // true latest; if so, skip cleanup — the next commit on the
+        // correct lineage will re-trigger the hook.
+        if let Ok(latest) = dataset
+            .commit_handler
+            .resolve_latest_location(&dataset.base, &dataset.object_store)
+            .await
+            && latest.version > manifest.version
+        {
+            log::warn!(
+                "Skipping auto_cleanup: committed version {} is behind latest version {}.",
+                manifest.version,
+                latest.version,
+            );
+            return Ok(None);
+        }
         Ok(Some(dataset.cleanup_with_policy(policy).await?))
     } else {
         Ok(None)
