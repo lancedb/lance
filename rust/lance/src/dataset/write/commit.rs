@@ -221,6 +221,7 @@ impl<'a> CommitBuilder<'a> {
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
             WriteDestination::Uri(uri) => {
+                // Check if it already exists.
                 let mut builder = DatasetBuilder::from_uri(uri)
                     .with_read_params(ReadParams {
                         store_options: self.store_params.clone(),
