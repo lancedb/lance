@@ -1371,7 +1371,12 @@ impl Dataset {
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
-                DataType::UInt8 => {
+                DataType::UInt8
+                    if !matches!(
+                        q.data_type(),
+                        DataType::List(_) | DataType::FixedSizeList(_, _)
+                    ) =>
+                {
                     let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
                         PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
                     })?;
