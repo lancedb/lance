@@ -21,6 +21,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
+use lance_core::utils::tracing::FutureTracingExt;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 
@@ -201,6 +202,7 @@ async fn do_take_rows(
                 )
                 .await
         }
+        .future_in_current_span()
     }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());

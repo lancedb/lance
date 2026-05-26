@@ -14,6 +14,7 @@ use futures::{FutureExt, future::BoxFuture};
 
 use lance_core::{
     Error, Result, cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt,
+    utils::tracing::FutureTracingExt,
 };
 
 use crate::{
@@ -60,7 +61,7 @@ impl BlobDescriptionPageScheduler {
                     as Box<dyn StructuralPageDecoder>,
             )
         }
-        .boxed()
+        .boxed_in_current_span()
     }
 }
 
@@ -266,7 +267,7 @@ impl BlobPageScheduler {
             Ok(Box::new(BlobPageDecoder::new(loaded_blobs, def_meaning))
                 as Box<dyn StructuralPageDecoder>)
         }
-        .boxed();
+        .boxed_in_current_span();
         Ok(PageLoadTask {
             decoder_fut,
             num_rows,

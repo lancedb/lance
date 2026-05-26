@@ -17,7 +17,7 @@ use futures::{
     future::{BoxFuture, Shared},
     stream::{self, StreamExt},
 };
-use lance_core::{Error, Result, error::CloneableError};
+use lance_core::{Error, Result, error::CloneableError, utils::tracing::FutureTracingExt};
 use object_store::ObjectStoreExt;
 use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
@@ -307,7 +307,7 @@ impl SmallReader {
     ) -> Self {
         let path_ref = path.clone();
         let state = SmallReaderState::Loading(
-            Box::pin(async move {
+            async move {
                 let object_reader =
                     CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
                         .map_err(CloneableError)?;
@@ -315,8 +315,8 @@ impl SmallReader {
                     .get_all()
                     .await
                     .map_err(|err| CloneableError(Error::from(err)))
-            })
-            .boxed()
+            }
+            .boxed_in_current_span()
             .shared(),
         );
         Self {

@@ -30,7 +30,7 @@ permissions:
 jobs:
   build:
     # Needs additional disk space for the full build.
-    runs-on: ubuntu-24.04-8x
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write

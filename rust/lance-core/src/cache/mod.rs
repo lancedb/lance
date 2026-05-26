@@ -61,7 +61,7 @@ use std::sync::{
 
 use futures::{Future, FutureExt};
 
-use crate::Result;
+use crate::{Result, utils::tracing::FutureTracingExt};
 
 pub use deepsize::{Context, DeepSizeOf};
 
@@ -338,12 +338,15 @@ impl LanceCache {
     {
         let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
 
-        let typed_loader = Box::pin(async move {
-            let value = loader().await?;
-            let arc = Arc::new(value);
-            let size = cache_entry_size(&*arc);
-            Ok((arc as CacheEntry, size))
-        });
+        let typed_loader = Box::pin(
+            async move {
+                let value = loader().await?;
+                let arc = Arc::new(value);
+                let size = cache_entry_size(&*arc);
+                Ok((arc as CacheEntry, size))
+            }
+            .future_in_current_span(),
+        );
 
         let (entry, was_cached) = self
             .cache
@@ -468,12 +471,15 @@ impl WeakLanceCache {
     {
         if let Some(cache) = self.inner.upgrade() {
             let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-            let typed_loader = Box::pin(async move {
-                let value = loader().await?;
-                let arc = Arc::new(value);
-                let size = cache_entry_size(&*arc);
-                Ok((arc as CacheEntry, size))
-            });
+            let typed_loader = Box::pin(
+                async move {
+                    let value = loader().await?;
+                    let arc = Arc::new(value);
+                    let size = cache_entry_size(&*arc);
+                    Ok((arc as CacheEntry, size))
+                }
+                .future_in_current_span(),
+            );
             let (entry, was_cached) = cache.get_or_insert(&key, typed_loader, K::codec()).await?;
             if was_cached {
                 self.hits.fetch_add(1, Ordering::Relaxed);

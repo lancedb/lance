@@ -30,7 +30,10 @@ use crate::{
 
 use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
-use lance_core::Result;
+use lance_core::{
+    Result,
+    utils::{tokio::spawn_in_current_span, tracing::FutureTracingExt},
+};
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -168,7 +171,7 @@ impl PageScheduler for BinaryPageScheduler {
         let null_adjustment = self.null_adjustment;
         let offsets_type = self.offsets_type.clone();
 
-        tokio::spawn(async move {
+        spawn_in_current_span(async move {
             // For the following data:
             // "abcd", "hello", "abcd", "apple", "hello", "abcd"
             //   4,        9,     13,      18,      23,     27
@@ -251,7 +254,7 @@ impl PageScheduler for BinaryPageScheduler {
                 }) as Box<dyn PrimitivePageDecoder>)
             }
         })
-        .boxed()
+        .boxed_in_current_span()
     }
 }
 

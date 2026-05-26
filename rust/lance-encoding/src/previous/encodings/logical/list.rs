@@ -16,7 +16,11 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, future::BoxFuture};
-use lance_core::{Error, Result, cache::LanceCache, utils::parse::str_is_truthy};
+use lance_core::{
+    Error, Result,
+    cache::LanceCache,
+    utils::{parse::str_is_truthy, tokio::spawn_in_current_span},
+};
 use log::trace;
 use tokio::task::JoinHandle;
 
@@ -481,7 +485,7 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         let cache = context.cache().clone();
 
         // Immediately spawn the indirect scheduling
-        let indirect_fut = tokio::spawn(indirect_schedule_task(
+        let indirect_fut = spawn_in_current_span(indirect_schedule_task(
             next_offsets_decoder,
             list_reqs,
             null_offset_adjustment,

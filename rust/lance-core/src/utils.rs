@@ -13,6 +13,7 @@ pub mod futures;
 pub mod hash;
 pub mod parse;
 pub mod path;
+pub mod profile;
 pub mod tempfile;
 pub mod testing;
 pub mod tokio;

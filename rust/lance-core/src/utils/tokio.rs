@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::{Future, FutureExt};
 use tokio::runtime::{Builder, Runtime};
-use tracing::Span;
+use tracing::{Instrument, Span};
 
 /// We cache the call to num_cpus::get() because:
 ///
@@ -119,9 +119,29 @@ pub fn spawn_cpu<
     // Propagate the current span into the task
     let span = Span::current();
     global_cpu_runtime().spawn_blocking(move || {
-        let _span_guard = span.enter();
-        let result = func();
+        let result = {
+            let _span_guard = span.enter();
+            func()
+        };
+        // Exit the span BEFORE sending the result so the caller never
+        // observes the span as "still active" after receiving the value.
         let _ = send.send(result);
     });
     recv.map(|res| res.unwrap())
+}
+
+pub fn spawn_in_current_span<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_in_span(future, Span::current())
+}
+
+pub fn spawn_in_span<F>(future: F, span: Span) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(future.instrument(span))
 }

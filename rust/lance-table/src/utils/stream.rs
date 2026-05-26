@@ -5,31 +5,24 @@ use std::sync::Arc;
 
 use arrow_array::{BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array};
 use arrow_buffer::NullBuffer;
-use futures::{
-    FutureExt, Stream, StreamExt,
-    future::BoxFuture,
-    stream::{BoxStream, FuturesOrdered},
-};
+use futures::{FutureExt, Stream, StreamExt, stream::FuturesOrdered};
 use lance_arrow::RecordBatchExt;
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD, Result,
-    utils::{address::RowAddress, deletion::DeletionVector},
+    utils::{
+        address::RowAddress,
+        deletion::DeletionVector,
+        tracing::{FutureTracingExt, StreamTracingExt},
+    },
+};
+pub use lance_file::reader::{
+    ReadBatchFut, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
 };
 use lance_io::ReadBatchParams;
-use tracing::instrument;
+use tracing::{Span, instrument};
 
 use crate::rowids::RowIdSequence;
-
-pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
-/// A task, emitted by a file reader, that will produce a batch (of the
-/// given size)
-pub struct ReadBatchTask {
-    pub task: ReadBatchFut,
-    pub num_rows: u32,
-}
-pub type ReadBatchTaskStream = BoxStream<'static, ReadBatchTask>;
-pub type ReadBatchFutStream = BoxStream<'static, ReadBatchFut>;
 
 struct MergeStream {
     streams: Vec<ReadBatchTaskStream>,
@@ -48,11 +41,10 @@ impl MergeStream {
                 batch = batch.merge(&next)?;
             }
             Ok(batch)
-        }
-        .boxed();
+        };
         let num_rows = self.next_num_rows;
         self.next_num_rows = 0;
-        ReadBatchTask { task, num_rows }
+        ReadBatchTask::from_future(task, num_rows)
     }
 }
 
@@ -110,7 +102,7 @@ pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
         next_num_rows: 0,
         index: 0,
     }
-    .boxed()
+    .boxed_stream_in_current_span()
 }
 
 /// Apply a mask to the batch, where rows are "deleted" by the _rowid column null.
@@ -398,10 +390,12 @@ pub fn wrap_with_row_id_and_delete(
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
     let config = Arc::new(config);
+    let stream_span = Span::current();
     let mut offset = 0;
     stream
         .map(move |batch_task| {
             let config = config.clone();
+            let stream_span = stream_span.clone();
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
             offset += num_rows;
@@ -410,9 +404,9 @@ pub fn wrap_with_row_id_and_delete(
                 .map(move |batch| {
                     apply_row_id_and_deletes(batch?, this_offset, fragment_id, config.as_ref())
                 })
-                .boxed()
+                .boxed_in_span(stream_span)
         })
-        .boxed()
+        .boxed_stream_in_current_span()
 }
 
 #[cfg(test)]

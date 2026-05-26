@@ -19,8 +19,7 @@ use lance_encoding::{
     EncodingsIo,
     decoder::{
         ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
-        ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
-        schedule_and_decode_blocking,
+        RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
     version::LanceFileVersion,
@@ -33,6 +32,7 @@ use lance_core::{
     Error, Result,
     cache::LanceCache,
     datatypes::{Field, Schema},
+    utils::tracing::StreamTracingExt,
 };
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
@@ -47,6 +47,10 @@ use crate::{
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
     io::LanceEncodingsIo,
     writer::PAGE_BUFFER_ALIGNMENT,
+};
+
+pub use lance_encoding::decoder::{
+    ReadBatchFut, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
 };
 
 /// Default chunk size for reading large pages (8MiB)
@@ -1256,7 +1260,7 @@ impl FileReader {
         let batch_stream = tasks_stream
             .map(|task| task.task)
             .buffered(batch_readahead as usize)
-            .boxed();
+            .boxed_stream_in_current_span();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             arrow_schema,
             batch_stream,

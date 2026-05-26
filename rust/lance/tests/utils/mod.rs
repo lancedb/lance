@@ -149,6 +149,18 @@ impl DatasetTestCases {
     }
 }
 
+pub async fn build_multi_fragment_dataset(original: RecordBatch) -> Dataset {
+    let inverted_index_params = HashMap::new();
+    build_dataset(
+        original,
+        Fragmentation::MultiFragment,
+        DeletionState::NoDeletions,
+        &[],
+        &inverted_index_params,
+    )
+    .await
+}
+
 /// Create an in-memory dataset with the given state and data.
 ///
 /// The data in dataset will exactly match the `original` batch. (Extra rows are

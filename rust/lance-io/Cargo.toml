@@ -59,6 +59,7 @@ mockall.workspace = true
 rstest.workspace = true
 mock_instant.workspace = true
 tracing-mock = { workspace = true }
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true

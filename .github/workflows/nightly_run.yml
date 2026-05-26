@@ -24,7 +24,7 @@ jobs:
 
   jumbo-tests:
     # jumbo tests need more resources
-    runs-on: ubuntu-24.04-8x
+    runs-on: ubuntu-24.04
     if: github.repository == 'lancedb/lance'
     timeout-minutes: 60
     permissions:

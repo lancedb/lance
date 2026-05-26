@@ -4,6 +4,7 @@
 //! Utilities for working with datafusion execution plans
 
 use std::{
+    any::Any,
     collections::HashMap,
     fmt::{self, Formatter},
     sync::{Arc, Mutex, OnceLock},
@@ -36,9 +37,10 @@ use datafusion::{
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
+use datafusion_common_runtime::{JoinSetTracer, set_join_set_tracer};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, future::BoxFuture, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
@@ -48,7 +50,7 @@ use lance_core::{
     },
 };
 use log::{debug, info, warn};
-use tracing::Span;
+use tracing::{Instrument, Span};
 
 use crate::udf::register_functions;
 use crate::{
@@ -58,6 +60,37 @@ use crate::{
         MetricsExt, PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
+
+static DATAFUSION_JOIN_SET_TRACER: LanceJoinSetTracer = LanceJoinSetTracer;
+static DATAFUSION_JOIN_SET_TRACER_INIT: OnceLock<()> = OnceLock::new();
+
+struct LanceJoinSetTracer;
+
+impl JoinSetTracer for LanceJoinSetTracer {
+    fn trace_future(
+        &self,
+        fut: BoxFuture<'static, Box<dyn Any + Send>>,
+    ) -> BoxFuture<'static, Box<dyn Any + Send>> {
+        fut.instrument(Span::current()).boxed()
+    }
+
+    fn trace_block(
+        &self,
+        f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+    ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
+        let span = Span::current();
+        Box::new(move || {
+            let _guard = span.enter();
+            f()
+        })
+    }
+}
+
+fn ensure_datafusion_task_tracing() {
+    DATAFUSION_JOIN_SET_TRACER_INIT.get_or_init(|| {
+        let _ = set_join_set_tracer(&DATAFUSION_JOIN_SET_TRACER);
+    });
+}
 
 /// An source execution node created from an existing stream
 ///
@@ -597,6 +630,8 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
+    ensure_datafusion_task_tracing();
+
     if !options.skip_logging {
         debug!(
             "Executing plan:\n{}",
@@ -604,12 +639,19 @@ pub fn execute_plan(
         );
     }
 
+    // Keep the entire execution plan stream under the caller's current span.
+    // Without this wrapper, lazy plan nodes like FilteredReadExec only build
+    // their inner streams on first poll, after execute_with_options() has
+    // already returned to the caller. In multi-threaded runtimes that means
+    // downstream spawn_in_current_span()/boxed_in_current_span() sites can
+    // observe <none> and emit detached spans.
+    let traced_plan = Arc::new(TracedExec::new(plan.clone(), Span::current()));
     let session_ctx = get_session_context(&options);
 
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
-    assert_eq!(plan.properties().partitioning.partition_count(), 1);
-    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+    assert_eq!(traced_plan.properties().partitioning.partition_count(), 1);
+    let stream = traced_plan.execute(0, get_task_context(&session_ctx, &options))?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
@@ -624,6 +666,8 @@ pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<String> {
+    ensure_datafusion_task_tracing();
+
     // This is needed as AnalyzeExec launches a thread task per
     // partition, and we want these to be connected to the parent span
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
@@ -1207,5 +1251,68 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_join_set_tracer_trace_future() {
+        let tracer = LanceJoinSetTracer;
+        let fut: BoxFuture<'static, Box<dyn Any + Send>> =
+            (async { Box::new(42i32) as Box<dyn Any + Send> }).boxed();
+        let traced_fut = tracer.trace_future(fut);
+        let result = traced_fut.await;
+        assert_eq!(*result.downcast::<i32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_join_set_tracer_trace_block() {
+        let tracer = LanceJoinSetTracer;
+        let f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> =
+            Box::new(|| Box::new(42i32) as Box<dyn Any + Send>);
+        let traced_f = tracer.trace_block(f);
+        let result = traced_f();
+        assert_eq!(*result.downcast::<i32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_traced_exec_display_and_debug() {
+        let schema = Arc::new(ArrowSchema::empty());
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(schema)));
+        let traced = TracedExec::new(input, Span::current());
+
+        // Debug
+        assert_eq!(format!("{:?}", traced), "TracedExec");
+
+        // DisplayAs (all variants should produce "TracedExec")
+        struct Wrapper<'a>(&'a TracedExec, DisplayFormatType);
+        impl<'a> std::fmt::Display for Wrapper<'a> {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                self.0.fmt_as(self.1, f)
+            }
+        }
+        assert_eq!(
+            format!("{}", Wrapper(&traced, DisplayFormatType::Default)),
+            "TracedExec"
+        );
+        assert_eq!(
+            format!("{}", Wrapper(&traced, DisplayFormatType::Verbose)),
+            "TracedExec"
+        );
+    }
+
+    #[test]
+    fn test_traced_exec_with_new_children() {
+        let schema = Arc::new(ArrowSchema::empty());
+        let input1: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
+            RecordBatch::new_empty(schema.clone()),
+        ));
+        let input2: Arc<dyn ExecutionPlan> =
+            Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(schema)));
+
+        let traced = Arc::new(TracedExec::new(input1, Span::current()));
+        let new_traced = traced.with_new_children(vec![input2]).unwrap();
+
+        assert_eq!(new_traced.name(), "TracedExec");
+        assert_eq!(new_traced.children().len(), 1);
     }
 }

@@ -93,6 +93,7 @@ async fn open_fts_segments(
     .await
 }
 
+#[instrument(name = "phase.index_search.fts", skip_all)]
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
     tokens: Arc<Tokens>,

@@ -26,7 +26,8 @@ use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
+use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
@@ -51,6 +52,7 @@ use lance_table::utils::stream::{
     wrap_with_row_id_and_delete,
 };
 use roaring::RoaringBitmap;
+use tracing::Span;
 
 use self::write::FragmentCreateBuilder;
 
@@ -168,7 +170,7 @@ fn ranges_to_tasks(
             let num_rows = range.end - range.start;
             let reader = reader.clone();
             let projection = projection.clone();
-            let task = tokio::task::spawn(async move {
+            let task = spawn_in_current_span(async move {
                 previous_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
@@ -177,14 +179,10 @@ fn ranges_to_tasks(
                 )
                 .await
             })
-            .map(|task_out| task_out.unwrap())
-            .boxed();
-            ReadBatchTask {
-                task,
-                num_rows: num_rows as u32,
-            }
+            .map(|task_out| task_out.unwrap());
+            ReadBatchTask::from_future(task, num_rows as u32)
         })
-        .boxed()
+        .boxed_stream_in_current_span()
 }
 
 #[derive(Clone, Debug)]
@@ -285,7 +283,7 @@ impl GenericFileReader for V1Reader {
                 num_rows,
             })
             .boxed();
-            Ok(futures::stream::once(task).boxed())
+            Ok(futures::stream::once(task).boxed_stream_in_current_span())
         }
         .boxed()
     }
@@ -367,6 +365,7 @@ mod v2_adapter {
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
+                let task_span = Span::current();
                 Ok(self
                     .reader
                     .read_tasks(
@@ -376,11 +375,14 @@ mod v2_adapter {
                         FilterExpression::no_filter(),
                     )
                     .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
+                    .map(move |v2_task| {
+                        ReadBatchTask::from_future_in_span(
+                            v2_task.task.map_err(Error::from),
+                            v2_task.num_rows,
+                            task_span.clone(),
+                        )
                     })
-                    .boxed())
+                    .boxed_stream_in_current_span())
             }
             .boxed()
         }
@@ -397,6 +399,7 @@ mod v2_adapter {
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
+                let task_span = Span::current();
                 Ok(self
                     .reader
                     .read_tasks(
@@ -406,11 +409,14 @@ mod v2_adapter {
                         FilterExpression::no_filter(),
                     )
                     .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
+                    .map(move |v2_task| {
+                        ReadBatchTask::from_future_in_span(
+                            v2_task.task.map_err(Error::from),
+                            v2_task.num_rows,
+                            task_span.clone(),
+                        )
                     })
-                    .boxed())
+                    .boxed_stream_in_current_span())
             }
             .boxed()
         }
@@ -426,6 +432,7 @@ mod v2_adapter {
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
+                let task_span = Span::current();
                 Ok(self
                     .reader
                     .read_tasks(
@@ -435,11 +442,14 @@ mod v2_adapter {
                         FilterExpression::no_filter(),
                     )
                     .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
+                    .map(move |v2_task| {
+                        ReadBatchTask::from_future_in_span(
+                            v2_task.task.map_err(Error::from),
+                            v2_task.num_rows,
+                            task_span.clone(),
+                        )
                     })
-                    .boxed())
+                    .boxed_stream_in_current_span())
             }
             .boxed()
         }
@@ -470,6 +480,7 @@ mod v2_adapter {
                     self.reader.clone()
                 };
 
+                let task_span = Span::current();
                 Ok(reader
                     .read_tasks(
                         ReadBatchParams::Indices(indices),
@@ -478,11 +489,14 @@ mod v2_adapter {
                         FilterExpression::no_filter(),
                     )
                     .await?
-                    .map(|v2_task| ReadBatchTask {
-                        task: v2_task.task.map_err(Error::from).boxed(),
-                        num_rows: v2_task.num_rows,
+                    .map(move |v2_task| {
+                        ReadBatchTask::from_future_in_span(
+                            v2_task.task.map_err(Error::from),
+                            v2_task.num_rows,
+                            task_span.clone(),
+                        )
                     })
-                    .boxed())
+                    .boxed_stream_in_current_span())
             }
             .boxed()
         }
@@ -585,14 +599,12 @@ impl GenericFileReader for NullReader {
             let num_rows = remaining_rows.min(batch_size as u64) as usize;
             remaining_rows -= num_rows as u64;
             let batch = Self::batch(projection.clone(), num_rows);
-            let task = ReadBatchTask {
-                task: futures::future::ready(Ok(batch)).boxed(),
-                num_rows: num_rows as u32,
-            };
+            let task =
+                ReadBatchTask::from_future(futures::future::ready(Ok(batch)), num_rows as u32);
             Some(task)
         });
 
-        async move { Ok(futures::stream::iter(task_iter).boxed()) }.boxed()
+        async move { Ok(futures::stream::iter(task_iter).boxed_stream_in_current_span()) }.boxed()
     }
 
     fn read_all_tasks(
@@ -2403,6 +2415,7 @@ impl FragmentReader {
     where
         F: Fn(&'a dyn GenericFileReader) -> BoxFuture<'a, Result<ReadBatchTaskStream>>,
     {
+        let stream_span = Span::current();
         let total_num_rows = self.num_physical_rows as u32;
         // Note that the fragment length might be considerably smaller if there are deleted rows.
         // E.g. if a fragment has 100 rows but rows 0..10 are deleted we still need to make
@@ -2425,17 +2438,20 @@ impl FragmentReader {
         // we can delete this path once we migrate away from any support of v1.
         let merged = if self.num_system_cols() == self.output_schema.fields.len() {
             let selected_rows = params.to_offsets_total(total_num_rows).len();
+            let task_span = stream_span.clone();
+            let stream_box_span = stream_span.clone();
             let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
                     let num_rows = (batch_size as usize).min(selected_rows - offset);
                     let batch = RecordBatch::from(StructArray::new_empty_fields(num_rows, None));
-                    ReadBatchTask {
-                        task: std::future::ready(Ok(batch)).boxed(),
-                        num_rows: num_rows as u32,
-                    }
+                    ReadBatchTask::from_future_in_span(
+                        std::future::ready(Ok(batch)),
+                        num_rows as u32,
+                        task_span.clone(),
+                    )
                 });
-            stream::iter(tasks).boxed()
+            stream::iter(tasks).boxed_stream_in_span(stream_box_span)
         } else {
             // Read each data file, these reads should produce streams of equal sized
             // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
@@ -2477,20 +2493,22 @@ impl FragmentReader {
             total_num_rows,
         };
         let output_schema = Arc::new(self.output_schema.clone());
+        let final_stream_span = stream_span.clone();
         Ok(
             wrap_with_row_id_and_delete(merged, self.fragment_id as u32, config)
                 // Finally, reorder the columns to match the order specified in the projection
                 .map(move |batch_fut| {
                     let output_schema = output_schema.clone();
+                    let future_span = final_stream_span.clone();
                     batch_fut
                         .map(move |batch| {
                             batch?
                                 .project_by_schema(&output_schema)
                                 .map_err(Error::from)
                         })
-                        .boxed()
+                        .boxed_in_span(future_span)
                 })
-                .boxed(),
+                .boxed_stream_in_span(stream_span),
         )
     }
 
@@ -2590,6 +2608,7 @@ impl FragmentReader {
         ranges: Arc<[Range<u64>]>,
         batch_size: u32,
     ) -> Result<ReadBatchFutStream> {
+        let stream_span = Span::current();
         let total_num_rows = self.num_physical_rows as u32;
         let mut num_requested_rows = 0;
         // Note that row ranges at this point are physical and not logical.
@@ -2604,18 +2623,21 @@ impl FragmentReader {
         }
 
         let merged_stream = if self.num_system_cols() == self.output_schema.fields.len() {
+            let task_span = stream_span.clone();
+            let stream_box_span = stream_span.clone();
             let tasks = (0..num_requested_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
                     let num_rows = (batch_size as u64).min(num_requested_rows - offset);
                     let batch =
                         RecordBatch::from(StructArray::new_empty_fields(num_rows as usize, None));
-                    ReadBatchTask {
-                        task: std::future::ready(Ok(batch)).boxed(),
-                        num_rows: num_rows as u32,
-                    }
+                    ReadBatchTask::from_future_in_span(
+                        std::future::ready(Ok(batch)),
+                        num_rows as u32,
+                        task_span.clone(),
+                    )
                 });
-            stream::iter(tasks).boxed()
+            stream::iter(tasks).boxed_stream_in_span(stream_box_span)
         } else {
             // Read each data file, these reads should produce streams of equal sized
             // tasks.  In other words, if we get 3 tasks of 20 rows and then a task
@@ -2647,20 +2669,22 @@ impl FragmentReader {
             total_num_rows,
         };
         let output_schema = Arc::new(self.output_schema.clone());
+        let final_stream_span = stream_span.clone();
         Ok(
             wrap_with_row_id_and_delete(merged_stream, self.fragment_id as u32, config)
                 // Finally, reorder the columns to match the order specified in the projection
                 .map(move |batch_fut| {
                     let output_schema = output_schema.clone();
+                    let future_span = final_stream_span.clone();
                     batch_fut
                         .map(move |batch| {
                             batch?
                                 .project_by_schema(&output_schema)
                                 .map_err(Error::from)
                         })
-                        .boxed()
+                        .boxed_in_span(future_span)
                 })
-                .boxed(),
+                .boxed_stream_in_span(stream_span),
         )
     }
 

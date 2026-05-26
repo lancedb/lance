@@ -27,7 +27,8 @@ use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
+use lance_core::utils::tracing::FutureTracingExt;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_file::reader::FileReaderOptions;
 use lance_io::ReadBatchParams;
@@ -207,18 +208,21 @@ impl ExecutionPlan for LancePushdownScanExec {
             }
         });
 
-        let batch_stream = fragment_stream.map(|(exec, fragment)| async move {
-            let frag_scanner = FragmentScanner::open(
-                fragment,
-                exec.dataset,
-                exec.projection,
-                exec.predicate_projection,
-                exec.predicate,
-                exec.config.clone(),
-            )
-            .await?;
+        let batch_stream = fragment_stream.map(|(exec, fragment)| {
+            async move {
+                let frag_scanner = FragmentScanner::open(
+                    fragment,
+                    exec.dataset,
+                    exec.projection,
+                    exec.predicate_projection,
+                    exec.predicate,
+                    exec.config.clone(),
+                )
+                .await?;
 
-            frag_scanner.scan().await
+                frag_scanner.scan().await
+            }
+            .future_in_current_span()
         });
 
         let batch_stream = batch_stream
@@ -344,12 +348,14 @@ impl FragmentScanner {
             })
             .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
-                    .map(|res| match res {
-                        Ok(Ok(batch)) => Ok(batch),
-                        Ok(Err(err)) => Err(err),
-                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
-                    })
+                spawn_in_current_span(
+                    async move { scanner_ref.read_batch(batch_id, predicate).await },
+                )
+                .map(|res| match res {
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
+                })
             });
 
         let stream = if ordered_output {

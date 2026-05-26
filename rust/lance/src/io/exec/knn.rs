@@ -39,6 +39,7 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::tracing::{PHASE_INDEX_SEARCH_ANN, StreamTracingExt};
 use lance_core::{
     ROW_ID_FIELD,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
@@ -58,6 +59,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
+use tracing::info_span;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -936,10 +938,10 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     .add_duration(timer.elapsed());
             });
         let schema = self.schema();
-        Ok(
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
-                as SendableRecordBatchStream,
-        )
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream.boxed_stream_in_span(info_span!(PHASE_INDEX_SEARCH_ANN)),
+        )) as SendableRecordBatchStream)
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -1617,7 +1619,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         .add_duration(timer.elapsed());
                     metrics_clone.baseline_metrics.done();
                 })
-                .boxed(),
+                .boxed_stream_in_span(info_span!(PHASE_INDEX_SEARCH_ANN)),
         )))
     }
 
