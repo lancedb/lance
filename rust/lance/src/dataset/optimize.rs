@@ -733,6 +733,22 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                         bin.pos_range.end += 1;
                         bin.candidacy.push(candidacy);
                         bin.row_counts.push(metrics.num_rows());
+                        if has_budget && !bin.is_noop() {
+                            let running_fragments =
+                                effective_candidate_fragments + bin.fragments.len();
+                            let running_bytes = effective_candidate_bytes
+                                + bin
+                                    .fragments
+                                    .iter()
+                                    .flat_map(|f| f.files.iter())
+                                    .filter_map(|f| f.file_size_bytes.get())
+                                    .map(|sz| sz.get() as usize)
+                                    .sum::<usize>();
+                            if self.exceeds_budget(running_fragments, running_bytes) {
+                                candidate_bins.push(current_bin.take().unwrap());
+                                break;
+                            }
+                        }
                     } else {
                         if let Some(completed_bin) = current_bin.take() {
                             if !completed_bin.is_noop() {
@@ -5025,212 +5041,5 @@ mod tests {
             total_frags, 50,
             "without budget, all fragments should be planned"
         );
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn benchmark_compaction_plan_many_fragments() {
-        use lance_datagen::generator::array;
-        use std::time::Instant;
-
-        let fragment_counts: Vec<u32> = vec![100, 500, 1_000, 5_000, 10_000];
-        let rows_per_fragment: u32 = 100;
-
-        info!(
-            "{:<12} {:<12} {:<12} {:<12} {:<20}",
-            "num_frags", "plan_time_ms", "num_tasks", "total_frags_in_plan", "plan_json_size_bytes"
-        );
-        info!("{}", "-".repeat(68));
-
-        for frag_count in fragment_counts {
-            let dataset = lance_datagen::BatchGeneratorBuilder::new()
-                .col("key", array::cycle::<Int32Type>((0..100).collect()))
-                .into_ram_dataset(
-                    FragmentCount::from(frag_count),
-                    FragmentRowCount::from(rows_per_fragment),
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(
-                dataset.get_fragments().len(),
-                frag_count as usize,
-                "expected {} fragments",
-                frag_count
-            );
-
-            let options = CompactionOptions {
-                target_rows_per_fragment: 1_000_000,
-                materialize_deletions: true,
-                materialize_deletions_threshold: 0.1,
-                ..Default::default()
-            };
-
-            let start = Instant::now();
-            let plan = plan_compaction(&dataset, &options).await.unwrap();
-            let plan_time = start.elapsed();
-
-            let num_tasks = plan.num_tasks();
-            let total_frags_in_plan: usize = plan.tasks.iter().map(|t| t.fragments.len()).sum();
-
-            let plan_json_size = serde_json::to_string(&plan).unwrap().len();
-
-            info!(
-                "{:<12} {:<12} {:<12} {:<12} {:<20}",
-                frag_count,
-                plan_time.as_millis(),
-                num_tasks,
-                total_frags_in_plan,
-                plan_json_size,
-            );
-
-            drop(plan);
-            drop(dataset);
-        }
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn benchmark_compaction_plan_with_max_source_fragments() {
-        use lance_datagen::generator::array;
-        use std::time::Instant;
-
-        let frag_count: u32 = 10_000;
-        let rows_per_fragment: u32 = 100;
-
-        let dataset = lance_datagen::BatchGeneratorBuilder::new()
-            .col("key", array::cycle::<Int32Type>((0..100).collect()))
-            .into_ram_dataset(
-                FragmentCount::from(frag_count),
-                FragmentRowCount::from(rows_per_fragment),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(dataset.get_fragments().len(), frag_count as usize);
-
-        info!(
-            "{:<25} {:<12} {:<12} {:<12} {:<20}",
-            "max_source_fragments",
-            "plan_time_ms",
-            "num_tasks",
-            "total_frags_in_plan",
-            "plan_json_size_bytes"
-        );
-        info!("{}", "-".repeat(81));
-
-        for max_frags in [None, Some(100), Some(500), Some(1_000)] {
-            let options = CompactionOptions {
-                target_rows_per_fragment: 1_000_000,
-                materialize_deletions: true,
-                materialize_deletions_threshold: 0.1,
-                max_source_fragments: max_frags,
-                ..Default::default()
-            };
-
-            let start = Instant::now();
-            let plan = plan_compaction(&dataset, &options).await.unwrap();
-            let plan_time = start.elapsed();
-
-            let num_tasks = plan.num_tasks();
-            let total_frags_in_plan: usize = plan.tasks.iter().map(|t| t.fragments.len()).sum();
-            let plan_json_size = serde_json::to_string(&plan).unwrap().len();
-
-            let max_label = match max_frags {
-                Some(v) => v.to_string(),
-                None => "None (unlimited)".to_string(),
-            };
-
-            info!(
-                "{:<25} {:<12} {:<12} {:<12} {:<20}",
-                max_label,
-                plan_time.as_millis(),
-                num_tasks,
-                total_frags_in_plan,
-                plan_json_size,
-            );
-
-            drop(plan);
-        }
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn benchmark_compaction_plan_with_deletions() {
-        use lance_datagen::generator::array;
-        use std::time::Instant;
-
-        let frag_count: u32 = 10_000;
-        let rows_per_fragment: u32 = 100;
-
-        let test_dir = TempStrDir::default();
-        let test_uri = &test_dir;
-
-        let dataset = lance_datagen::BatchGeneratorBuilder::new()
-            .col("key", array::cycle::<Int32Type>((0..100).collect()))
-            .into_dataset(
-                test_uri,
-                FragmentCount::from(frag_count),
-                FragmentRowCount::from(rows_per_fragment),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(dataset.get_fragments().len(), frag_count as usize);
-
-        let mut dataset = dataset;
-        dataset.delete("key < 10").await.unwrap();
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
-
-        info!(
-            "Dataset: {} fragments, {} total rows after deletions",
-            dataset.get_fragments().len(),
-            dataset.count_rows(None).await.unwrap()
-        );
-
-        info!(
-            "{:<25} {:<12} {:<12} {:<12} {:<20}",
-            "max_source_fragments",
-            "plan_time_ms",
-            "num_tasks",
-            "total_frags_in_plan",
-            "plan_json_size_bytes"
-        );
-        info!("{}", "-".repeat(81));
-
-        for max_frags in [None, Some(100), Some(500), Some(1_000)] {
-            let options = CompactionOptions {
-                target_rows_per_fragment: 1_000_000,
-                materialize_deletions: true,
-                materialize_deletions_threshold: 0.1,
-                max_source_fragments: max_frags,
-                ..Default::default()
-            };
-
-            let start = Instant::now();
-            let plan = plan_compaction(&dataset, &options).await.unwrap();
-            let plan_time = start.elapsed();
-
-            let num_tasks = plan.num_tasks();
-            let total_frags_in_plan: usize = plan.tasks.iter().map(|t| t.fragments.len()).sum();
-            let plan_json_size = serde_json::to_string(&plan).unwrap().len();
-
-            let max_label = match max_frags {
-                Some(v) => v.to_string(),
-                None => "None (unlimited)".to_string(),
-            };
-
-            info!(
-                "{:<25} {:<12} {:<12} {:<12} {:<20}",
-                max_label,
-                plan_time.as_millis(),
-                num_tasks,
-                total_frags_in_plan,
-                plan_json_size,
-            );
-
-            drop(plan);
-        }
     }
 }
