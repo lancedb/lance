@@ -2945,83 +2945,6 @@ fn train_ivf_kmeans_step_arrow_array(
     Ok((kmeans, loss))
 }
 
-fn compute_ivf_kmeans_loss(kmeans: &KMeans, data: &FixedSizeListArray) -> Result<f64> {
-    if data.value_type() == DataType::Int8 && kmeans.centroids.data_type() == &DataType::Float32 {
-        return Ok(kmeans.compute_loss(&data.convert_to_floating_point()?)?);
-    }
-    Ok(kmeans.compute_loss(data)?)
-}
-
-struct StreamingIvfSamples<'a> {
-    dataset: &'a Dataset,
-    column: &'a str,
-    metric_type: MetricType,
-    total_sample_rate: usize,
-    streaming_sample_rate: usize,
-    num_partitions: usize,
-    fragment_ids: Option<&'a [u32]>,
-}
-
-async fn compute_streaming_ivf_loss(
-    samples: &StreamingIvfSamples<'_>,
-    centroids: &FixedSizeListArray,
-) -> Result<f64> {
-    let loss_metric_type = if samples.metric_type == MetricType::Cosine {
-        MetricType::L2
-    } else {
-        samples.metric_type
-    };
-    let kmeans = KMeans::with_centroids(
-        centroids.values().clone(),
-        centroids.value_length() as usize,
-        loss_metric_type,
-        f64::MAX,
-    );
-    let mut remaining_sample_rate = samples.total_sample_rate;
-    let mut loss = 0.0;
-    while remaining_sample_rate > 0 {
-        let step_sample_rate = remaining_sample_rate.min(samples.streaming_sample_rate);
-        let step_sample_size = samples.num_partitions * step_sample_rate;
-        let (training_data, _) = sample_ivf_training_chunk(
-            samples.dataset,
-            samples.column,
-            step_sample_size,
-            samples.metric_type,
-            samples.fragment_ids,
-        )
-        .await?;
-        loss += compute_ivf_kmeans_loss(&kmeans, &training_data)?;
-        remaining_sample_rate -= step_sample_rate;
-    }
-    Ok(loss)
-}
-
-async fn compute_fixed_streaming_ivf_loss_with_sampler(
-    sampler: &FixedIvfTrainingSampler<'_>,
-    metric_type: MetricType,
-    streaming_sample_size: usize,
-    indices: &[u64],
-    centroids: &FixedSizeListArray,
-) -> Result<f64> {
-    let loss_metric_type = if metric_type == MetricType::Cosine {
-        MetricType::L2
-    } else {
-        metric_type
-    };
-    let kmeans = KMeans::with_centroids(
-        centroids.values().clone(),
-        centroids.value_length() as usize,
-        loss_metric_type,
-        f64::MAX,
-    );
-    let mut loss = 0.0;
-    for chunk in indices.chunks(streaming_sample_size.max(1)) {
-        let (training_data, _) = sampler.sample(chunk, metric_type).await?;
-        loss += compute_ivf_kmeans_loss(&kmeans, &training_data)?;
-    }
-    Ok(loss)
-}
-
 fn accumulate_refine_assignments(
     data: &FixedSizeListArray,
     centroids: &FixedSizeListArray,
@@ -4012,31 +3935,7 @@ async fn train_streaming_coreset_ivf_model(
         coreset.len()
     );
 
-    let loss = if let (Some(indices), Some(sampler)) = (&fixed_sample_indices, &fixed_sampler) {
-        compute_fixed_streaming_ivf_loss_with_sampler(
-            sampler,
-            metric_type,
-            num_partitions * streaming_sample_rate,
-            indices,
-            &centroids,
-        )
-        .await?
-    } else {
-        compute_streaming_ivf_loss(
-            &StreamingIvfSamples {
-                dataset,
-                column,
-                metric_type,
-                total_sample_rate,
-                streaming_sample_rate,
-                num_partitions,
-                fragment_ids,
-            },
-            &centroids,
-        )
-        .await?
-    };
-    Ok(IvfModel::new(centroids, Some(loss)))
+    Ok(IvfModel::new(centroids, None))
 }
 
 async fn train_streaming_ivf_model(
@@ -4149,20 +4048,7 @@ async fn train_streaming_ivf_model(
     );
 
     let centroids = centroids.ok_or_else(|| Error::index("No IVF centroids trained"))?;
-    let loss = compute_streaming_ivf_loss(
-        &StreamingIvfSamples {
-            dataset,
-            column,
-            metric_type,
-            total_sample_rate,
-            streaming_sample_rate,
-            num_partitions,
-            fragment_ids,
-        },
-        &centroids,
-    )
-    .await?;
-    Ok(IvfModel::new((*centroids).clone(), Some(loss)))
+    Ok(IvfModel::new((*centroids).clone(), None))
 }
 
 /// Train IVF partitions using kmeans.
@@ -4287,6 +4173,27 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    async fn compute_test_ivf_loss(dataset: &Dataset, column: &str, ivf: &IvfModel) -> f64 {
+        let centroids = ivf
+            .centroids_array()
+            .expect("test IVF model should include centroids");
+        let mut scanner = dataset.scan();
+        scanner.project(&[column]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let data = batch
+            .column_by_name(column)
+            .expect("test vector column should exist")
+            .as_fixed_size_list()
+            .clone();
+        let kmeans = KMeans::with_centroids(
+            centroids.values().clone(),
+            centroids.value_length() as usize,
+            DistanceType::L2,
+            f64::MAX,
+        );
+        kmeans.compute_loss(&data).unwrap()
+    }
 
     // Verifies LANCE_INCLUDE_VECTOR_CENTROIDS env var is honored by
     // maybe_centroids_for_stats. The env var is process-global, so this test
@@ -5332,7 +5239,12 @@ mod tests {
 
         assert_eq!(ivf_model.num_partitions(), 8);
         assert_eq!(ivf_model.dimension(), 32);
-        assert!(ivf_model.loss().is_some_and(|loss| loss.is_finite()));
+        assert!(ivf_model.loss().is_none());
+        assert!(
+            compute_test_ivf_loss(&dataset, "vector", &ivf_model)
+                .await
+                .is_finite()
+        );
     }
 
     #[tokio::test]
@@ -5364,7 +5276,12 @@ mod tests {
 
         assert_eq!(ivf_model.num_partitions(), 320);
         assert_eq!(ivf_model.dimension(), 8);
-        assert!(ivf_model.loss().is_some_and(|loss| loss.is_finite()));
+        assert!(ivf_model.loss().is_none());
+        assert!(
+            compute_test_ivf_loss(&dataset, "vector", &ivf_model)
+                .await
+                .is_finite()
+        );
     }
 
     #[test]
