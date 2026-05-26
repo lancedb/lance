@@ -79,17 +79,14 @@ impl LsmScanPlanner {
     ///
     /// # Query plan
     ///
-    /// Each source is independently newest-per-PK — the active memtable via the
-    /// fused [`MemTableDedupScanExec`](super::super::memtable::scanner) reverse
-    /// dedup, flushed generations via their within-generation deletion vector —
-    /// and the cross-generation block-list ([`PkHashFilterExec`]) drops any PK
-    /// superseded by a newer generation. So each PK survives in exactly one
-    /// source and a plain `UnionExec` holds at most one row per PK: no
-    /// cross-source dedup, local sort, or merge ordering is needed.
-    ///
-    /// `_memtable_gen` (via [`MemtableGenTagExec`]) and `_rowaddr` are produced
-    /// only when the caller opts in (`with_memtable_gen` / `keep_row_address`);
-    /// they are output columns, not used for dedup.
+    /// Each source is independently newest-per-PK (active via the fused
+    /// [`MemTableDedupScanExec`](super::super::memtable::scanner), flushed via
+    /// its within-generation deletion vector) and a cross-generation block-list
+    /// ([`PkHashFilterExec`]) drops any PK superseded by a newer generation.
+    /// Each PK therefore survives in exactly one source, so a plain
+    /// `UnionExec` carries at most one row per PK — no cross-source dedup,
+    /// sort, or merge needed. `_memtable_gen` / `_rowaddr` are output-only and
+    /// only produced when the caller opts in.
     #[instrument(name = "lsm_plan_scan", level = "debug", skip_all, fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
@@ -117,10 +114,9 @@ impl LsmScanPlanner {
             return self.empty_plan(projection, with_memtable_gen, keep_row_address);
         }
 
-        // Cross-generation block-list (`NEWER(G)` per source; base = union of all
-        // gens). A present entry drops, before the union, any row whose PK lives
-        // in a newer generation — the sole cross-generation mechanism once the
-        // sorted dedup is removed. `Box::pin` avoids `clippy::large_futures`.
+        // Cross-generation block-list keyed by source: a hit drops any row
+        // whose PK lives in a newer generation, applied before the union.
+        // `Box::pin` keeps the future off `clippy::large_futures`.
         let block_lists = Box::pin(super::block_list::compute_source_block_lists(
             &sources,
             &self.pk_columns,
@@ -129,16 +125,9 @@ impl LsmScanPlanner {
         ))
         .await?;
 
-        // 2. Build a scan per source: scan -> block-list filter -> (optional)
-        // NULL `_rowaddr` for non-base -> (optional) `_memtable_gen` tag.
-        //
-        // Each PK survives in exactly one source (the block-list drops it from
-        // older generations) and every source is within-generation clean (active
-        // fused dedup / flushed deletion vector), so a plain union holds at most
-        // one row per PK — no cross-source dedup, local sort, or merge ordering
-        // is needed. Sources are reversed only so the union lists the newest
-        // generation first (a stable output order; correctness no longer relies
-        // on it).
+        // Reverse so the union lists the newest generation first. This is
+        // cosmetic — correctness comes from the per-source dedup and the
+        // cross-gen block-list, not from output ordering.
         let sources: Vec<_> = sources.into_iter().rev().collect();
 
         let mut source_plans = Vec::new();
@@ -177,9 +166,8 @@ impl LsmScanPlanner {
             source_plans.push(plan);
         }
 
-        // 3. Union the clean per-source scans (no dedup/sort/merge needed), then
-        // coalesce into a single partition — UnionExec produces one partition per
-        // arm and downstream consumers read only partition 0.
+        // Union, then coalesce into a single partition (UnionExec emits one
+        // per arm; downstream consumers only read partition 0).
         let mut plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
             source_plans.remove(0)
         } else {
@@ -188,10 +176,8 @@ impl LsmScanPlanner {
             Arc::new(CoalescePartitionsExec::new(union))
         };
 
-        // 5. Project to the canonical output schema. Every source scan produces
-        // `_rowaddr` internally; this drops it unless the caller requested it,
-        // and surfaces `_rowaddr` / `_memtable_gen` at the requested positions.
-        // (The removed cross-source dedup used to perform this strip.)
+        // Project to the canonical output schema, dropping `_rowaddr` /
+        // `_memtable_gen` unless the caller opted in.
         plan = project_to_canonical(
             plan,
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
@@ -297,9 +283,9 @@ impl LsmScanPlanner {
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.with_row_address();
 
-                // The filter is applied *inside* the fused dedup scan (after
-                // newest-per-PK dedup), not pushed into the raw scan — otherwise
-                // a PK whose newest version fails the filter leaks an older one.
+                // The dedup scan applies the filter post-dedup; pushing it
+                // into the raw scan would resurrect older versions of PKs
+                // whose newest version fails the predicate.
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
@@ -526,8 +512,8 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify the collapsed plan (gen DESC order: active -> gen2 -> gen1 -> base):
-        // - plain UnionExec at top (no cross-source dedup / sort / merge)
+        // Verify the plan (gen DESC order: active -> gen2 -> gen1 -> base):
+        // - plain UnionExec at top
         // - active arm: MemTableDedupScanExec (newest gen, not block-listed)
         // - older arms: PkHashFilterExec (cross-gen block-list) -> LanceRead
         assert_plan_node_equals(
@@ -561,8 +547,8 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify the collapsed plan with `_memtable_gen` tags (gen DESC order):
-        // - plain UnionExec at top (no cross-source dedup / sort / merge)
+        // Verify the plan with `_memtable_gen` tags (gen DESC order):
+        // - plain UnionExec at top
         // - each arm: MemtableGenTagExec -> (PkHashFilterExec ->) data source
         //   - gen3 (active): MemtableGenTagExec -> MemTableDedupScanExec
         //   - gen2/gen1/base: MemtableGenTagExec -> PkHashFilterExec -> LanceRead
@@ -647,9 +633,9 @@ mod integration_tests {
         assert_eq!(results.get(&7), Some(&"active_7".to_string()));
     }
 
-    /// Phase 4: the filtered-read plan applies the cross-generation block-list
-    /// (older generations whose PKs are superseded by a newer one are filtered),
-    /// while results stay newest-per-PK.
+    /// The filtered-read plan applies the cross-generation block-list (older
+    /// generations whose PKs are superseded by a newer one are filtered), while
+    /// results stay newest-per-PK.
     #[tokio::test]
     async fn test_lsm_scan_filtered_read_applies_block_list() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
@@ -1188,7 +1174,7 @@ mod integration_tests {
         );
         assert!(
             !plan_str.contains("DeduplicateExec"),
-            "the cross-source sorted dedup is removed"
+            "filtered read must not use a cross-source DeduplicateExec"
         );
 
         // 2. The active arm uses the fused dedup scan: it deduplicates to
