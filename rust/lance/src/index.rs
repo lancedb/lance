@@ -706,6 +706,18 @@ impl IndexDescriptionImpl {
     }
 }
 
+fn index_segment_in_fragments(segment: &IndexMetadata, fragment_ids: &HashSet<u32>) -> bool {
+    segment
+        .fragment_bitmap
+        .as_ref()
+        .map(|bitmap| {
+            bitmap
+                .iter()
+                .all(|fragment_id| fragment_ids.contains(&fragment_id))
+        })
+        .unwrap_or(false)
+}
+
 impl IndexDescription for IndexDescriptionImpl {
     fn name(&self) -> &str {
         &self.name
@@ -928,6 +940,52 @@ impl DatasetIndexExt for Dataset {
         } else {
             indices.iter().collect::<Vec<_>>()
         };
+        indices.sort_by_key(|idx| &idx.name);
+
+        let grouped: Vec<Vec<IndexMetadata>> = indices
+            .into_iter()
+            .chunk_by(|idx| idx.name.clone())
+            .into_iter()
+            .map(|(_, segments)| segments.cloned().collect::<Vec<_>>())
+            .collect();
+
+        let mut results = Vec::with_capacity(grouped.len());
+        for segments in grouped {
+            let desc = IndexDescriptionImpl::try_new(segments, self).await?;
+            results.push(Arc::new(desc) as Arc<dyn IndexDescription>);
+        }
+        Ok(results)
+    }
+
+    async fn describe_indices_for_fragments(
+        &self,
+        index_names: Option<&[&str]>,
+        fragment_ids: &[u32],
+    ) -> Result<Vec<Arc<dyn IndexDescription>>> {
+        if fragment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested_fragments = fragment_ids.iter().copied().collect::<HashSet<_>>();
+        let index_names = index_names.map(|names| names.iter().copied().collect::<HashSet<_>>());
+        let indices = self.load_indices().await?;
+        let mut indices = indices
+            .iter()
+            .filter(|idx| {
+                if idx.index_details.is_none() {
+                    log::warn!("The method describe_indices_for_fragments does not support indexes without index details.  Please retrain the index {}", idx.name);
+                    return false;
+                }
+
+                if let Some(index_names) = &index_names
+                    && !index_names.contains(idx.name.as_str())
+                {
+                    return false;
+                }
+
+                index_segment_in_fragments(idx, &requested_fragments)
+            })
+            .collect::<Vec<_>>();
         indices.sort_by_key(|idx| &idx.name);
 
         let grouped: Vec<Vec<IndexMetadata>> = indices
@@ -2484,6 +2542,43 @@ mod tests {
                 size_bytes: payload.len() as u64,
             }]),
         }
+    }
+
+    fn index_segment_metadata(
+        dataset: &Dataset,
+        index_name: &str,
+        field_id: i32,
+        uuid: Uuid,
+        fragment_bitmap: impl IntoIterator<Item = u32>,
+        size_bytes: u64,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid,
+            name: index_name.to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
+            index_details: Some(Arc::new(
+                prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap(),
+            )),
+            index_version: IndexType::BTree.version(),
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(vec![lance_table::format::IndexFile {
+                path: "test-index".to_string(),
+                size_bytes,
+            }]),
+        }
+    }
+
+    async fn cache_index_metadata(dataset: &Dataset, indices: Vec<IndexMetadata>) {
+        let metadata_key = IndexMetadataKey {
+            version: dataset.version().version,
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&metadata_key, Arc::new(indices))
+            .await;
     }
 
     fn segment_from_metadata(metadata: &IndexMetadata) -> IndexSegment {
@@ -6367,6 +6462,134 @@ mod tests {
                 .all(|idx| idx.files.as_ref().is_some_and(|files| !files.is_empty())),
             "committed segment metadata should capture on-disk file info"
         );
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_for_fragments_returns_subset_segments() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(30), BatchCount::from(3));
+
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("id").unwrap().id;
+        let segment_a =
+            index_segment_metadata(&dataset, "id_idx", field_id, Uuid::new_v4(), [0_u32], 9);
+        let wide_segment = index_segment_metadata(
+            &dataset,
+            "id_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32, 2_u32],
+            16,
+        );
+
+        cache_index_metadata(&dataset, vec![segment_a.clone(), wide_segment.clone()]).await;
+
+        let batch_a = dataset
+            .describe_indices_for_fragments(Some(&["id_idx"]), &[0])
+            .await
+            .unwrap();
+        let batch_b = dataset
+            .describe_indices_for_fragments(Some(&["id_idx"]), &[1])
+            .await
+            .unwrap();
+
+        let uuids_a = batch_a[0]
+            .segments()
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(uuids_a, HashSet::from([segment_a.uuid]));
+        assert!(
+            batch_b.is_empty(),
+            "wide segments should not be reported for partial fragment batches"
+        );
+        assert!(!uuids_a.contains(&wide_segment.uuid));
+
+        let wide_batch = dataset
+            .describe_indices_for_fragments(Some(&["id_idx"]), &[1, 2])
+            .await
+            .unwrap();
+        let wide_uuids = wide_batch[0]
+            .segments()
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(wide_uuids, HashSet::from([wide_segment.uuid]));
+
+        let full_batch = dataset
+            .describe_indices_for_fragments(Some(&["id_idx"]), &[0, 1, 2])
+            .await
+            .unwrap();
+        let full_uuids = full_batch[0]
+            .segments()
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            full_uuids,
+            HashSet::from([segment_a.uuid, wide_segment.uuid])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_for_fragments_filters_index_names() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let field_id = dataset.schema().field("id").unwrap().id;
+        let keep =
+            index_segment_metadata(&dataset, "keep_idx", field_id, Uuid::new_v4(), [0_u32], 4);
+        let skip =
+            index_segment_metadata(&dataset, "skip_idx", field_id, Uuid::new_v4(), [0_u32], 4);
+
+        cache_index_metadata(&dataset, vec![keep.clone(), skip]).await;
+
+        let descriptions = dataset
+            .describe_indices_for_fragments(Some(&["keep_idx"]), &[0])
+            .await
+            .unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].name(), "keep_idx");
+        assert_eq!(descriptions[0].segments()[0].uuid, keep.uuid);
+
+        let descriptions = dataset
+            .describe_indices_for_fragments(Some(&["missing_idx"]), &[0])
+            .await
+            .unwrap();
+        assert!(descriptions.is_empty());
     }
 
     #[tokio::test]

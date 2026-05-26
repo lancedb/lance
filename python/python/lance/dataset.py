@@ -977,6 +977,23 @@ class LanceDataset(pa.dataset.Dataset):
         """Returns index information for all indices in the dataset."""
         return self._ds.describe_indices()
 
+    def describe_indices_for_fragments(
+        self,
+        *,
+        index_names: Optional[List[str]] = None,
+        fragment_ids: List[int],
+    ) -> List[IndexDescription]:
+        """Returns index information for segments fully covered by fragments.
+
+        Only index segments whose fragment ids are all contained in ``fragment_ids``
+        are returned.  This makes results from disjoint fragment batches safe to
+        concatenate without double-counting segment row counts or file sizes.
+        """
+        return self._ds.describe_indices_for_fragments(
+            index_names=index_names,
+            fragment_ids=fragment_ids,
+        )
+
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
             "LanceDataset.index_statistics() is deprecated, "

@@ -3223,6 +3223,32 @@ impl Dataset {
             .collect())
     }
 
+    #[pyo3(signature=(*, index_names=None, fragment_ids))]
+    fn describe_indices_for_fragments(
+        &self,
+        py: Python<'_>,
+        index_names: Option<Vec<String>>,
+        fragment_ids: Vec<u32>,
+    ) -> PyResult<Vec<PyIndexDescription>> {
+        let new_self = self.ds.as_ref().clone();
+        let index_name_refs = index_names
+            .as_ref()
+            .map(|names| names.iter().map(String::as_str).collect::<Vec<_>>());
+        let indices = rt()
+            .block_on(
+                Some(py),
+                new_self.describe_indices_for_fragments(
+                    index_name_refs.as_deref(),
+                    fragment_ids.as_slice(),
+                ),
+            )?
+            .infer_error()?;
+        Ok(indices
+            .into_iter()
+            .map(|desc| PyIndexDescription::new(desc.as_ref(), self.ds.as_ref()))
+            .collect())
+    }
+
     /// Create a delta builder to explore changes between dataset versions.
     #[pyo3(signature=())]
     fn delta(&self) -> PyResult<DatasetDeltaBuilder> {

@@ -287,6 +287,17 @@ pub trait DatasetIndexExt {
         criteria: Option<lance_index::IndexCriteria<'b>>,
     ) -> Result<Vec<Arc<dyn lance_index::IndexDescription>>>;
 
+    /// Describes indices whose segments are fully covered by the provided fragments.
+    ///
+    /// A segment is returned only when all of its fragment ids are contained in
+    /// `fragment_ids`. This makes results from disjoint fragment batches safe to
+    /// concatenate without duplicating segment-level row counts or file sizes.
+    async fn describe_indices_for_fragments(
+        &self,
+        index_names: Option<&[&str]>,
+        fragment_ids: &[u32],
+    ) -> Result<Vec<Arc<dyn lance_index::IndexDescription>>>;
+
     /// Loads a specific scalar index using the provided criteria.
     async fn load_scalar_index<'a, 'b>(
         &'a self,
