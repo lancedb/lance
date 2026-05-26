@@ -976,6 +976,54 @@ def test_fts_stats(dataset):
     assert "num_workers" not in params
 
 
+def test_fts_optimize_num_indices_to_merge(tmp_path):
+    def append_rows(rows):
+        return lance.write_dataset(pa.table(rows), tmp_path, mode="append")
+
+    def num_indices(ds):
+        return ds.stats.index_stats("text_idx")["num_indices"]
+
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": [0, 1],
+                "text": ["alpha base phrase", "beta base phrase"],
+            }
+        ),
+        tmp_path,
+    )
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=True)
+    assert num_indices(ds) == 1
+
+    ds = append_rows({"id": [2], "text": ["gamma delta phrase"]})
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    assert num_indices(ds) == 2
+
+    ds = append_rows({"id": [3], "text": ["epsilon zeta phrase"]})
+    ds.optimize.optimize_indices(num_indices_to_merge=1)
+    assert num_indices(ds) == 2
+    assert ds.to_table(full_text_query="epsilon")["id"].to_pylist() == [3]
+
+    ds = append_rows({"id": [4], "text": ["eta theta phrase"]})
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    assert num_indices(ds) == 3
+
+    ds.optimize.optimize_indices(num_indices_to_merge=2)
+    assert num_indices(ds) == 2
+    assert ds.to_table(full_text_query=PhraseQuery("eta theta", "text"))[
+        "id"
+    ].to_pylist() == [4]
+
+    ds = append_rows({"id": [5], "text": ["iota kappa phrase"]})
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    assert num_indices(ds) == 3
+
+    ds.optimize.optimize_indices(num_indices_to_merge=10)
+    assert num_indices(ds) == 1
+    assert ds.to_table(full_text_query="alpha")["id"].to_pylist() == [0]
+    assert ds.to_table(full_text_query="iota")["id"].to_pylist() == [5]
+
+
 def test_fts_score(tmp_path):
     # the number of tokens matters for scoring,
     # make a table that all docs have the same number of tokens

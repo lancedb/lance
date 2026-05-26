@@ -156,13 +156,18 @@ pub struct ShardManifest {
     /// Computed shard field values as raw Arrow scalar bytes, keyed by field id.
     /// The byte encoding follows Arrow's little-endian convention: int32 is 4 LE
     /// bytes, utf8 is raw UTF-8 bytes, etc. The result_type in the corresponding
-    /// ShardField from the ShardSpec determines how to interpret each value.
+    /// ShardingField from the ShardingSpec determines how to interpret each value.
     pub shard_field_values: HashMap<String, Vec<u8>>,
     pub writer_epoch: u64,
-    /// The most recent WAL entry position (0-based) flushed to a MemTable.
-    /// Recovery replays from `replay_after_wal_entry_position + 1`.
+    /// The most recent WAL entry position flushed to a MemTable.
+    /// Recovery replays from `replay_after_wal_entry_position + 1`. The
+    /// default value 0 means "no flush has ever stamped this shard" — WAL
+    /// positions themselves are 1-based, so 0 is never a valid covered
+    /// position.
     pub replay_after_wal_entry_position: u64,
-    /// The most recent WAL entry position (0-based) when manifest was updated.
+    /// The most recent WAL entry position observed at manifest write time.
+    /// Default 0 means "no entry has been written yet"; WAL positions are
+    /// 1-based.
     pub wal_entry_position_last_seen: u64,
     pub current_generation: u64,
     pub flushed_generations: Vec<FlushedGeneration>,
@@ -230,9 +235,9 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
     }
 }
 
-/// Shard field definition.
+/// Sharding field definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct ShardField {
+pub struct ShardingField {
     pub field_id: String,
     pub source_ids: Vec<i32>,
     pub transform: Option<String>,
@@ -241,8 +246,8 @@ pub struct ShardField {
     pub parameters: HashMap<String, String>,
 }
 
-impl From<&ShardField> for pb::ShardField {
-    fn from(rf: &ShardField) -> Self {
+impl From<&ShardingField> for pb::ShardingField {
+    fn from(rf: &ShardingField) -> Self {
         Self {
             field_id: rf.field_id.clone(),
             source_ids: rf.source_ids.clone(),
@@ -254,8 +259,8 @@ impl From<&ShardField> for pb::ShardField {
     }
 }
 
-impl From<pb::ShardField> for ShardField {
-    fn from(rf: pb::ShardField) -> Self {
+impl From<pb::ShardingField> for ShardingField {
+    fn from(rf: pb::ShardingField) -> Self {
         Self {
             field_id: rf.field_id,
             source_ids: rf.source_ids,
@@ -267,15 +272,15 @@ impl From<pb::ShardField> for ShardField {
     }
 }
 
-/// Shard spec definition.
+/// Sharding spec definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct ShardSpec {
+pub struct ShardingSpec {
     pub spec_id: u32,
-    pub fields: Vec<ShardField>,
+    pub fields: Vec<ShardingField>,
 }
 
-impl From<&ShardSpec> for pb::ShardSpec {
-    fn from(rs: &ShardSpec) -> Self {
+impl From<&ShardingSpec> for pb::ShardingSpec {
+    fn from(rs: &ShardingSpec) -> Self {
         Self {
             spec_id: rs.spec_id,
             fields: rs.fields.iter().map(|f| f.into()).collect(),
@@ -283,11 +288,11 @@ impl From<&ShardSpec> for pb::ShardSpec {
     }
 }
 
-impl From<pb::ShardSpec> for ShardSpec {
-    fn from(rs: pb::ShardSpec) -> Self {
+impl From<pb::ShardingSpec> for ShardingSpec {
+    fn from(rs: pb::ShardingSpec) -> Self {
         Self {
             spec_id: rs.spec_id,
-            fields: rs.fields.into_iter().map(ShardField::from).collect(),
+            fields: rs.fields.into_iter().map(ShardingField::from).collect(),
         }
     }
 }
@@ -298,10 +303,17 @@ pub struct MemWalIndexDetails {
     pub snapshot_ts_millis: i64,
     pub num_shards: u32,
     pub inline_snapshots: Option<Vec<u8>>,
-    pub shard_specs: Vec<ShardSpec>,
+    pub sharding_specs: Vec<ShardingSpec>,
     pub maintained_indexes: Vec<String>,
     pub merged_generations: Vec<MergedGeneration>,
     pub index_catchup: Vec<IndexCatchupProgress>,
+    /// Default `ShardWriter` configuration values for this MemWAL index.
+    ///
+    /// Persisted so every writer — across processes and restarts — starts
+    /// from the same default writer configuration. These are defaults only;
+    /// an individual writer may still override any value at runtime in its
+    /// own (non-persisted) `ShardWriterConfig`.
+    pub writer_config_defaults: HashMap<String, String>,
 }
 
 impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
@@ -310,7 +322,7 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
             snapshot_ts_millis: details.snapshot_ts_millis,
             num_shards: details.num_shards,
             inline_snapshots: details.inline_snapshots.clone(),
-            shard_specs: details.shard_specs.iter().map(|rs| rs.into()).collect(),
+            sharding_specs: details.sharding_specs.iter().map(|rs| rs.into()).collect(),
             maintained_indexes: details.maintained_indexes.clone(),
             merged_generations: details
                 .merged_generations
@@ -318,6 +330,7 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
                 .map(|mg| mg.into())
                 .collect(),
             index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
+            writer_config_defaults: details.writer_config_defaults.clone(),
         }
     }
 }
@@ -330,10 +343,10 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
             snapshot_ts_millis: details.snapshot_ts_millis,
             num_shards: details.num_shards,
             inline_snapshots: details.inline_snapshots,
-            shard_specs: details
-                .shard_specs
+            sharding_specs: details
+                .sharding_specs
                 .into_iter()
-                .map(ShardSpec::from)
+                .map(ShardingSpec::from)
                 .collect(),
             maintained_indexes: details.maintained_indexes,
             merged_generations: details
@@ -346,6 +359,7 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .into_iter()
                 .map(IndexCatchupProgress::try_from)
                 .collect::<lance_core::Result<_>>()?,
+            writer_config_defaults: details.writer_config_defaults,
         })
     }
 }
@@ -419,7 +433,7 @@ impl Index for MemWalIndex {
         let stats = MemWalStatistics {
             num_shards: self.details.num_shards,
             num_merged_generations: self.details.merged_generations.len(),
-            num_shard_specs: self.details.shard_specs.len(),
+            num_shard_specs: self.details.sharding_specs.len(),
             num_maintained_indexes: self.details.maintained_indexes.len(),
             num_index_catchup_entries: self.details.index_catchup.len(),
         };

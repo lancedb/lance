@@ -140,6 +140,10 @@ public class Query {
     /**
      * Sets the vector to be searched.
      *
+     * <p>This API accepts a single query vector. The array length must match the target vector
+     * column dimension. Batch nearest-neighbor search with multiple query vectors requires a
+     * list-shaped query input and is not available through this {@code float[]} entry point.
+     *
      * @param key The search vector.
      * @return The Builder instance for method chaining.
      */

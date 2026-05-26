@@ -17,9 +17,9 @@ use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_encoding::version::LanceFileVersion;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
-use lance_table::format::pb::VectorIndexDetails;
 use serde::{Deserialize, Serialize};
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions};

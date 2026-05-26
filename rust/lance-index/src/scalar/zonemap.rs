@@ -967,17 +967,16 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::{StreamExt, TryStreamExt, stream};
-    use lance_core::utils::mask::NullableRowAddrSet;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{
         ROW_ADDR,
         cache::{LanceCache, WeakLanceCache},
-        utils::mask::RowAddrTreeMap,
     };
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
+    use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
 
     use crate::scalar::{
         SargableQuery, ScalarIndex, SearchResult,

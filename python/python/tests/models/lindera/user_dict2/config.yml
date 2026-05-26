@@ -1,7 +1,4 @@
 segmenter:
   mode: "normal"
-  dictionary:
-    path: "./python/tests/models/lindera/ipadic/main"
-  user_dictionary:
-    path: "./python/tests/models/lindera/user_dict2/userdic.bin"
-    kind: "ipadic"
+  dictionary: "./python/tests/models/lindera/ipadic/main"
+  user_dictionary: "./python/tests/models/lindera/user_dict2/userdic.bin"

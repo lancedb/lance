@@ -23,7 +23,7 @@ use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
-pub use scorer::MemBM25Scorer;
+pub use scorer::{MemBM25Scorer, Scorer};
 pub use tokenizer::*;
 
 use crate::scalar::inverted::query::{FtsSearchParams, Tokens};

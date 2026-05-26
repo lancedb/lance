@@ -144,7 +144,7 @@ jobs:
              - Run "cargo clippy --workspace --tests --benches -- -D warnings" to check for issues
              - Run ONLY the specific failing tests to confirm they pass now:
                - For Rust test failures: Run the specific test with "cargo test -p <crate> <test_name>"
-               - For Python test failures: Build with "cd python && maturin develop" then run "pytest <specific_test_file>::<test_name>"
+               - For Python test failures: Build with "cd python && make build" then run "uv run pytest <specific_test_file>::<test_name>"
                - For Java test failures: Run "cd java && mvn test -Dtest=<TestClass>#<testMethod>"
                - Do NOT run the full test suite - only run the tests that were failing
 

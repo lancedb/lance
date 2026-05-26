@@ -16,7 +16,7 @@ use crate::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
         },
-        vector_index_details,
+        vector_index_details, vector_index_details_default,
     },
 };
 use futures::future::{BoxFuture, try_join_all};
@@ -386,7 +386,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details(vec_params),
                     index_version,
                     files: Some(files),
                 }
@@ -425,7 +425,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
                     files: Some(files),
                 }
@@ -760,7 +760,7 @@ mod tests {
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
-    use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+    use lance_index::scalar::{FullTextSearchQuery, inverted::tokenizer::InvertedIndexParams};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -1373,8 +1373,8 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_build_bitmap() {
         use datafusion::common::ScalarValue;
-        use lance_core::utils::mask::RowSetOps;
         use lance_index::scalar::{SargableQuery, SearchResult, bitmap::BITMAP_LOOKUP_NAME};
+        use lance_select::RowSetOps;
 
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -1855,6 +1855,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_existing_index_segments_supports_fts_segments() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let batches = RecordBatchIterator::new(
+            vec![
+                Ok(create_text_batch(0, 10)),
+                Ok(create_text_batch(10, 20)),
+                Ok(create_text_batch(20, 30)),
+            ],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 5,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = InvertedIndexParams::default();
+        let mut input_segments = Vec::new();
+        let mut expected_fragments = roaring::RoaringBitmap::new();
+        for fragment in dataset.get_fragments() {
+            expected_fragments.insert(fragment.id() as u32);
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
+                    .name("text_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            input_segments.push(segment);
+        }
+
+        let merged = dataset
+            .merge_existing_index_segments(input_segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .expect("merged FTS segment should have fragment coverage"),
+            &expected_fragments
+        );
+        assert!(
+            merged
+                .index_details
+                .as_ref()
+                .expect("merged FTS segment should have index details")
+                .type_url
+                .ends_with("InvertedIndexDetails")
+        );
+
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![merged])
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("document".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 20);
+    }
+
+    #[tokio::test]
     async fn test_index_segment_builder_rejects_duplicate_segment_uuids() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -2027,7 +2106,7 @@ mod tests {
                 vec![IndexSegment::new(
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
-                    Arc::new(vector_index_details()),
+                    Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
                 )],
             )

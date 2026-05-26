@@ -30,6 +30,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
+use lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE;
 #[cfg(test)]
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -383,17 +384,25 @@ impl OperationThrottle {
         let outcome = match result {
             Ok(_) => RequestOutcome::Success,
             Err(err) if is_throttle_error(err) => {
-                debug!("Throttle error detected in stream");
+                debug!(
+                    target: TRACE_OBJECT_STORE_THROTTLE,
+                    error = %err,
+                    "Throttle error detected in stream"
+                );
                 RequestOutcome::Throttled
             }
             Err(_) => RequestOutcome::Success,
         };
         let prev_rate = self.controller.current_rate();
         let new_rate = self.controller.record_outcome(outcome);
-        if new_rate < prev_rate {
+        if new_rate < prev_rate
+            && let Err(err) = result.as_ref()
+        {
             warn!(
+                target: TRACE_OBJECT_STORE_THROTTLE,
                 previous_rate = format!("{prev_rate:.1}"),
                 new_rate = format!("{new_rate:.1}"),
+                error = %err,
                 "AIMD throttle: rate reduced due to throttle errors"
             );
         }
@@ -416,17 +425,25 @@ impl OperationThrottle {
             let outcome = match &result {
                 Ok(_) => RequestOutcome::Success,
                 Err(err) if is_throttle_error(err) => {
-                    debug!("Throttle error detected");
+                    debug!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        error = %err,
+                        "Throttle error detected"
+                    );
                     RequestOutcome::Throttled
                 }
                 Err(_) => RequestOutcome::Success, // Non-throttle errors don't indicate capacity problems
             };
             let prev_rate = self.controller.current_rate();
             let new_rate = self.controller.record_outcome(outcome);
-            if new_rate < prev_rate {
+            if new_rate < prev_rate
+                && let Err(err) = result.as_ref()
+            {
                 warn!(
+                    target: TRACE_OBJECT_STORE_THROTTLE,
                     previous_rate = format!("{prev_rate:.1}"),
                     new_rate = format!("{new_rate:.1}"),
+                    error = %err,
                     "AIMD throttle: rate reduced due to throttle errors"
                 );
             }
@@ -437,9 +454,11 @@ impl OperationThrottle {
                     let backoff_ms =
                         rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
                         attempt = attempt + 1,
                         max_retries = self.max_retries,
                         backoff_ms,
+                        error = %err,
                         "Retrying after throttle error"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -722,6 +741,8 @@ mod tests {
     use rstest::rstest;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    const THROTTLE_ERROR_RESPONSE: &str = "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s - Server returned non-2xx status code: 503: x-ms-request-id: azure-request-id";
 
     fn make_generic_error(msg: &str) -> object_store::Error {
         object_store::Error::Generic {
@@ -1130,8 +1151,7 @@ mod tests {
         fn throttle_error() -> object_store::Error {
             object_store::Error::Generic {
                 store: "RateLimitingMock",
-                source: "request failed, after 10 retries, max_retries: 10, retry_timeout: 180s"
-                    .into(),
+                source: THROTTLE_ERROR_RESPONSE.into(),
             }
         }
     }
@@ -1375,8 +1395,7 @@ mod tests {
             if should_error {
                 Err(object_store::Error::Generic {
                     store: "RetryTestMock",
-                    source: "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s"
-                        .into(),
+                    source: THROTTLE_ERROR_RESPONSE.into(),
                 })
             } else {
                 self.inner.get_opts(location, options).await
@@ -1448,7 +1467,13 @@ mod tests {
 
         let result = throttled.get(&path).await;
         assert!(result.is_err(), "Expected error after max retries");
-        assert!(is_throttle_error(&result.unwrap_err()));
+        let err = result.unwrap_err();
+        assert!(is_throttle_error(&err));
+
+        let lance_error = lance_core::Error::from(err);
+        let error_message = lance_error.to_string();
+        assert!(error_message.contains("x-ms-request-id"));
+        assert!(error_message.contains("azure-request-id"));
 
         // Should have called get 4 times: initial attempt + 3 retries
         assert_eq!(mock.get_call_count.load(Ordering::Relaxed), 4);

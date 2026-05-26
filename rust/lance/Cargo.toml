@@ -15,7 +15,11 @@ categories.workspace = true
 features = []
 no-default-features = true
 
+[package.metadata.cargo-machete]
+ignored = ["tracing-chrome"]
+
 [dependencies]
+arc-swap = { workspace = true }
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
@@ -25,9 +29,9 @@ lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-namespace = { workspace = true }
+lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
-lance-geo = { workspace = true, optional = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -39,10 +43,12 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 async-recursion.workspace = true
 async-trait.workspace = true
+bitpacking = { workspace = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
@@ -50,6 +56,7 @@ deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true
+moka.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
 aws-credential-types.optional = true
@@ -60,6 +67,7 @@ roaring.workspace = true
 tokio.workspace = true
 url.workspace = true
 rand.workspace = true
+rayon.workspace = true
 futures.workspace = true
 uuid.workspace = true
 arrow.workspace = true
@@ -70,12 +78,10 @@ datafusion-physical-expr.workspace = true
 datafusion-physical-plan.workspace = true
 datafusion-expr.workspace = true
 either.workspace = true
-lapack = { version = "0.19.0", optional = true }
 snafu = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-moka.workspace = true
 permutation = { version = "0.4.0" }
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 tracing.workspace = true
@@ -102,8 +108,6 @@ libc = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
 approx.workspace = true
-rand_distr.workspace = true
-dirs = "5.0.0"
 all_asserts = "2.3.1"
 mock_instant.workspace = true
 lance-testing = { workspace = true }
@@ -116,7 +120,6 @@ tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
-paste = "1.0"
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
@@ -148,7 +151,7 @@ azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
 tencent = ["lance-io/tencent"]
 huggingface = ["lance-io/huggingface"]
-geo = ["dep:lance-geo", "lance-geo/geo", "lance-datafusion/geo", "lance-index/geo"]
+geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
 
@@ -202,30 +205,65 @@ harness = false
 
 [[bench]]
 name = "mem_wal_write"
+path = "benches/mem_wal/write/mem_wal_write.rs"
 harness = false
 
 [[bench]]
 name = "memtable_read"
+path = "benches/mem_wal/read/memtable_read.rs"
 harness = false
 
 [[bench]]
-name = "mem_wal_read"
+name = "mem_wal_point_lookup_bench"
+path = "benches/mem_wal/point_lookup/mem_wal_point_lookup_bench.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_vector_bench"
+path = "benches/mem_wal/vector/mem_wal_vector_bench.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_replay"
-harness = false
-
-[[bench]]
-name = "mem_wal_vector"
+path = "benches/mem_wal/write/mem_wal_replay.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_index_micro"
+path = "benches/mem_wal/vector/mem_wal_index_micro.rs"
 harness = false
 
 [[bench]]
 name = "mem_wal_recall_hnsw"
+path = "benches/mem_wal/vector/hnsw/mem_wal_recall_hnsw.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_hnsw_bench"
+path = "benches/mem_wal/vector/hnsw/mem_wal_hnsw_bench.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_shard_writer_backpressure"
+path = "benches/mem_wal/write/mem_wal_shard_writer_backpressure.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_fineweb_fts"
+path = "benches/mem_wal/fts/mem_wal_fineweb_fts.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_fts_bench"
+path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
+harness = false
+
+[[bench]]
+name = "manifest_commit"
+harness = false
+
+[[bench]]
+name = "concurrent_append"
 harness = false
 
 [lints]

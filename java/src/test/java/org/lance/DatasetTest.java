@@ -528,7 +528,12 @@ public class DatasetTest {
         assertEquals(1, dataset1.version());
         Path manifestPath = datasetPath.resolve("_versions");
         try (Stream<Path> fileStream = Files.list(manifestPath)) {
-          assertEquals(1, fileStream.count());
+          // Ignore the version hint file, which is not a manifest.
+          assertEquals(
+              1,
+              fileStream
+                  .filter(p -> !p.getFileName().toString().startsWith("latest_version_hint"))
+                  .count());
           ByteBuffer manifestBuffer = readManifest(manifestPath.resolve("1.manifest"));
           try (Dataset dataset2 = testDataset.write(1, 5)) {
             assertEquals(2, dataset2.version());
@@ -900,6 +905,56 @@ public class DatasetTest {
             }
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void testTakeRows(@TempDir Path tempDir) throws IOException, ClosedChannelException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        // For a single-fragment dataset, physical row IDs match row offsets
+        List<Long> rowIds = Arrays.asList(1L, 4L);
+        List<String> columns = Arrays.asList("id", "name");
+        try (ArrowReader reader = dataset2.takeRows(rowIds, columns)) {
+          while (reader.loadNextBatch()) {
+            VectorSchemaRoot result = reader.getVectorSchemaRoot();
+            assertNotNull(result);
+            assertEquals(rowIds.size(), result.getRowCount());
+
+            for (int i = 0; i < rowIds.size(); i++) {
+              assertEquals(rowIds.get(i).intValue(), result.getVector("id").getObject(i));
+              assertNotNull(result.getVector("name").getObject(i));
+            }
+          }
+        }
+
+        // Verify input order is preserved: reversed input yields reversed output
+        List<Long> reversed = Arrays.asList(4L, 1L);
+        try (ArrowReader reader = dataset2.takeRows(reversed, columns)) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertEquals(4, result.getVector("id").getObject(0));
+          assertEquals(1, result.getVector("id").getObject(1));
+        }
+
+        // Empty row IDs should be rejected
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              dataset2.takeRows(Collections.emptyList(), columns);
+            });
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              dataset2.takeRows(null, columns);
+            });
       }
     }
   }

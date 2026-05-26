@@ -189,9 +189,10 @@ impl MemIndexConfig {
 /// Indexes are keyed by index name. Each index stores its field_id for
 /// stable column-to-index resolution (column name → field_id → index).
 ///
-/// The store maintains a global `max_indexed_batch_position` watermark that
-/// tracks which batches have been indexed. All indexes are updated atomically,
-/// so queries should only see data up to this watermark for consistent results.
+/// The store also carries the MemTable's `max_visible_batch_position`
+/// watermark — the highest batch position that is durable in the WAL and
+/// therefore safe for scanners to read. Scanners snapshot this at plan
+/// construction time so every plan keys on a stable MVCC cursor.
 pub struct IndexStore {
     /// BTree indexes keyed by index name.
     btree_indexes: HashMap<String, BTreeMemIndex>,
@@ -199,9 +200,10 @@ pub struct IndexStore {
     hnsw_indexes: HashMap<String, HnswMemIndex>,
     /// FTS indexes keyed by index name.
     fts_indexes: HashMap<String, FtsMemIndex>,
-    /// Maximum batch position that has been indexed across all indexes.
-    /// Updated atomically after all indexes have processed a batch.
-    max_indexed_batch_position: AtomicUsize,
+    /// Maximum batch position that is durable in the WAL and therefore
+    /// visible to scanners. Advanced unconditionally after a WAL append
+    /// succeeds; not gated on whether any indexes are configured.
+    max_visible_batch_position: AtomicUsize,
 }
 
 impl Default for IndexStore {
@@ -210,7 +212,7 @@ impl Default for IndexStore {
             btree_indexes: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
-            max_indexed_batch_position: AtomicUsize::new(0),
+            max_visible_batch_position: AtomicUsize::new(0),
         }
     }
 }
@@ -228,8 +230,8 @@ impl std::fmt::Debug for IndexStore {
             )
             .field("fts_indexes", &self.fts_indexes.keys().collect::<Vec<_>>())
             .field(
-                "max_indexed_batch_position",
-                &self.max_indexed_batch_position.load(Ordering::Acquire),
+                "max_visible_batch_position",
+                &self.max_visible_batch_position.load(Ordering::Acquire),
             )
             .finish()
     }
@@ -383,19 +385,22 @@ impl IndexStore {
 
         // Update global watermark after all indexes have been updated
         if let Some(bp) = batch_position {
-            self.update_max_indexed_batch_position(bp);
+            self.advance_max_visible_batch_position(bp);
         }
 
         Ok(())
     }
 
-    /// Update the maximum indexed batch position.
+    /// Advance the visibility watermark to at least `batch_pos`.
     ///
-    /// Only updates if the new value is greater than the current value.
-    fn update_max_indexed_batch_position(&self, batch_pos: usize) {
-        let mut current = self.max_indexed_batch_position.load(Ordering::Acquire);
+    /// The watermark only ever moves forward (idempotent max). Public so the
+    /// WAL flush handler can advance it after a successful WAL append, which
+    /// is the authoritative durability signal regardless of whether any
+    /// indexes are configured.
+    pub fn advance_max_visible_batch_position(&self, batch_pos: usize) {
+        let mut current = self.max_visible_batch_position.load(Ordering::Acquire);
         while batch_pos > current {
-            match self.max_indexed_batch_position.compare_exchange_weak(
+            match self.max_visible_batch_position.compare_exchange_weak(
                 current,
                 batch_pos,
                 Ordering::Release,
@@ -435,7 +440,7 @@ impl IndexStore {
 
         // Update global watermark to the max batch position
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
-        self.update_max_indexed_batch_position(max_bp);
+        self.advance_max_visible_batch_position(max_bp);
 
         Ok(())
     }
@@ -547,7 +552,7 @@ impl IndexStore {
 
             // Update global watermark to the max batch position
             let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
-            self.update_max_indexed_batch_position(max_bp);
+            self.advance_max_visible_batch_position(max_bp);
 
             Ok(duration_map)
         })
@@ -626,15 +631,15 @@ impl IndexStore {
         self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
     }
 
-    /// Get the global maximum indexed batch position.
+    /// Get the visibility watermark (max batch position safe to read).
     ///
-    /// Returns the batch position up to which all data has been indexed.
-    /// Queries should use `min(max_visible_batch_position, max_indexed_batch_position)`
-    /// as their effective visibility to ensure consistent results.
+    /// Returns the highest batch position whose data is durable in the WAL
+    /// and therefore visible to scanners. Scanners snapshot this at plan
+    /// construction time so every plan runs against a stable cursor.
     ///
-    /// Returns 0 if no data has been indexed yet.
-    pub fn max_indexed_batch_position(&self) -> usize {
-        self.max_indexed_batch_position.load(Ordering::Acquire)
+    /// Returns 0 before any WAL flush has advanced the watermark.
+    pub fn max_visible_batch_position(&self) -> usize {
+        self.max_visible_batch_position.load(Ordering::Acquire)
     }
 }
 
@@ -745,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_store_max_indexed_batch_position() {
+    fn test_index_store_max_visible_batch_position() {
         let schema = create_test_schema();
         let mut registry = IndexStore::new();
 
@@ -754,7 +759,7 @@ mod tests {
         registry.add_fts("desc_idx".to_string(), 2, "description".to_string());
 
         // Initial watermark should be 0 (no data indexed yet)
-        assert_eq!(registry.max_indexed_batch_position(), 0);
+        assert_eq!(registry.max_visible_batch_position(), 0);
 
         // Insert with batch position tracking
         let batch = create_test_batch(&schema, 0);
@@ -763,7 +768,7 @@ mod tests {
             .unwrap();
 
         // Now watermark should be 5
-        assert_eq!(registry.max_indexed_batch_position(), 5);
+        assert_eq!(registry.max_visible_batch_position(), 5);
 
         // Insert with higher batch position
         registry
@@ -771,11 +776,11 @@ mod tests {
             .unwrap();
 
         // Watermark should advance to 10
-        assert_eq!(registry.max_indexed_batch_position(), 10);
+        assert_eq!(registry.max_visible_batch_position(), 10);
 
         // Insert without batch position shouldn't change watermark
         registry.insert(&batch, 6).unwrap();
-        assert_eq!(registry.max_indexed_batch_position(), 10);
+        assert_eq!(registry.max_visible_batch_position(), 10);
     }
 
     #[test]

@@ -33,6 +33,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
@@ -41,10 +42,10 @@ use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
-use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use roaring::RoaringBitmap;
 use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
@@ -68,11 +69,12 @@ use super::{
 };
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
+use crate::progress::IndexBuildProgress;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
-    ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
+    OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
 use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -455,6 +457,63 @@ impl InvertedIndex {
     /// fragments and prune them at search time (merge-on-read).
     pub fn deleted_fragments(&self) -> &RoaringBitmap {
         &self.deleted_fragments
+    }
+
+    pub async fn merge_segments(
+        segments: &[Arc<Self>],
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let Some(first) = segments.first() else {
+            return Err(Error::invalid_input(
+                "cannot merge inverted index without at least one source segment".to_string(),
+            ));
+        };
+
+        for segment in segments.iter().skip(1) {
+            if segment.params != first.params {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different parameters".to_string(),
+                ));
+            }
+            if segment.token_set_format != first.token_set_format {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different token set formats"
+                        .to_string(),
+                ));
+            }
+            if segment.format_version() != first.format_version() {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different format versions"
+                        .to_string(),
+                ));
+            }
+            if segment.posting_tail_codec() != first.posting_tail_codec() {
+                return Err(Error::index(
+                    "cannot merge inverted index segments with different posting tail codecs"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
+        builder = builder
+            .with_token_set_format(first.token_set_format)
+            .with_format_version(first.format_version())
+            .with_posting_tail_codec(first.posting_tail_codec());
+        builder
+            .update_from_segments(new_data, dest_store, segments, old_data_filter)
+            .await?;
+
+        let details = pbold::InvertedIndexDetails::try_from(&first.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: first.index_version(),
+            files: Some(dest_store.list_files_with_sizes().await?),
+        })
     }
 
     pub fn bm25_base_scorer(&self, query_tokens: &Tokens) -> MemBM25Scorer {
@@ -1146,7 +1205,7 @@ impl InvertedPartition {
             self.token_set_format,
             self.inverted_list.posting_tail_codec(),
         );
-        builder.tokens = self.tokens;
+        builder.tokens = self.tokens.into_mutable();
         builder.docs = self.docs;
 
         builder
@@ -1448,6 +1507,33 @@ impl TokenSet {
         self.next_id += 1;
         self.total_length += token.len();
         next_id
+    }
+
+    pub(crate) fn into_mutable(self) -> Self {
+        let Self {
+            tokens,
+            next_id,
+            total_length,
+        } = self;
+        match tokens {
+            TokenMap::HashMap(_) => Self {
+                tokens,
+                next_id,
+                total_length,
+            },
+            TokenMap::Fst(map) => {
+                let mut mutable = HashMap::new();
+                let mut stream = map.stream();
+                while let Some((token, token_id)) = stream.next() {
+                    mutable.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+                Self {
+                    tokens: TokenMap::HashMap(mutable),
+                    next_id,
+                    total_length,
+                }
+            }
+        }
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
@@ -3846,11 +3932,13 @@ impl DocSet {
         let len = self.len();
         let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
         let num_tokens = std::mem::replace(&mut self.num_tokens, Vec::with_capacity(len));
+        self.total_tokens = 0;
         for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
             match mapping.get(&row_id) {
                 Some(Some(new_row_id)) => {
                     self.row_ids.push(*new_row_id);
                     self.num_tokens.push(num_token);
+                    self.total_tokens += num_token as u64;
                 }
                 Some(None) => {
                     removed.push(doc_id as u32);
@@ -3858,6 +3946,7 @@ impl DocSet {
                 None => {
                     self.row_ids.push(row_id);
                     self.num_tokens.push(num_token);
+                    self.total_tokens += num_token as u64;
                 }
             }
         }
@@ -3974,6 +4063,7 @@ async fn tokenize_and_count(
     tokenizer: Box<dyn LanceTokenizer>,
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
+    elapsed_compute: Option<Time>,
 ) -> DataFusionResult<RecordBatch> {
     let output_schema = Arc::new(Schema::new(vec![
         ROW_ID_FIELD.clone(),
@@ -3998,7 +4088,12 @@ async fn tokenize_and_count(
             let query_tokens = query_tokens.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
+            let elapsed_compute = elapsed_compute.clone();
             spawn_cpu(move || {
+                // Time the per-batch CPU work so callers can attribute it to
+                // `elapsed_compute` on a metric handle (the spawn_cpu worker
+                // thread is invisible to the caller's poll timer otherwise).
+                let start = std::time::Instant::now();
                 let batch = batch?;
                 let mut all_token_counts = UInt64Builder::with_capacity(batch.num_rows());
                 let mut query_token_counts = FixedSizeListBuilder::with_capacity(
@@ -4052,6 +4147,9 @@ async fn tokenize_and_count(
                     tracing::warn!("Flat full text search is accumulating a large number of bytes.  Consider using an FTS index instead.");
                 }
 
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
                 DataFusionResult::Ok(result_batch)
             })
         })
@@ -4181,6 +4279,10 @@ fn flat_bm25_score(
     Ok(batch)
 }
 
+#[deprecated(
+    note = "use `flat_bm25_search_stream_with_metrics` to record CPU compute \
+            time on a metric handle; pass `None` for the old behavior"
+)]
 pub async fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
@@ -4188,6 +4290,32 @@ pub async fn flat_bm25_search_stream(
     tokenizer: Box<dyn LanceTokenizer>,
     base_scorer: Option<MemBM25Scorer>,
     target_batch_size: usize,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    flat_bm25_search_stream_with_metrics(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        base_scorer,
+        target_batch_size,
+        None,
+    )
+    .await
+}
+
+/// Same as [`flat_bm25_search_stream`] but accepts an optional `Time` handle
+/// that, if provided, will receive the CPU time spent in (a) per-batch
+/// tokenization on the `spawn_cpu` worker threads and (b) the synchronous
+/// scoring phase. This lets a calling `ExecutionPlan` report accurate
+/// `elapsed_compute` without double-counting upstream poll time.
+pub async fn flat_bm25_search_stream_with_metrics(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
+    target_batch_size: usize,
+    elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
@@ -4213,12 +4341,23 @@ pub async fn flat_bm25_search_stream(
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
     // and we are tokenizing with a whitespace tokenizer, we need to know that there are 3 tokens
     // and the token book appears once.
-    let counted_input =
-        tokenize_and_count(chunked, tokenizer, query_tokens.clone(), doc_col_idx).await?;
+    let counted_input = tokenize_and_count(
+        chunked,
+        tokenizer,
+        query_tokens.clone(),
+        doc_col_idx,
+        elapsed_compute.clone(),
+    )
+    .await?;
 
-    // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize)
+    // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
+    // Synchronous and single-threaded, so we time it from this thread.
+    let scoring_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(scoring_start.elapsed());
+    }
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -4250,7 +4389,9 @@ mod tests {
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
     use crate::scalar::ScalarIndex;
-    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder, inverted_list_schema};
+    use crate::scalar::inverted::builder::{
+        InnerBuilder, InvertedIndexBuilder, PositionRecorder, inverted_list_schema,
+    };
     use crate::scalar::inverted::encoding::{
         compress_positions, compress_posting_list_with_tail_codec,
         decompress_posting_list_with_tail_codec, encode_position_stream_block_into,
@@ -4265,6 +4406,57 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    async fn write_single_partition_index(
+        store: Arc<LanceIndexStore>,
+        params: InvertedIndexParams,
+        token_set_format: TokenSetFormat,
+        token: &str,
+        row_id: u64,
+    ) -> Result<Arc<InvertedIndex>> {
+        let mut partition = InnerBuilder::new_with_format_version(
+            0,
+            false,
+            token_set_format,
+            InvertedListFormatVersion::V1,
+        );
+        partition.tokens.add(token.to_owned());
+        let mut posting_list =
+            PostingListBuilder::new_with_posting_tail_codec(false, PostingTailCodec::Fixed32);
+        posting_list.add(0, PositionRecorder::Count(1));
+        partition.posting_lists.push(posting_list);
+        partition.docs.append(row_id, 1);
+        partition.write(store.as_ref()).await?;
+
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0_u64]).unwrap(),
+            ),
+            ("params".to_owned(), serde_json::to_string(&params).unwrap()),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                token_set_format.to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await?;
+        writer.finish_with_metadata(metadata).await?;
+
+        InvertedIndex::load(store, None, &LanceCache::no_cache()).await
+    }
+
+    fn empty_doc_stream() -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(Vec::<datafusion::error::Result<RecordBatch>>::new()),
+        ))
+    }
 
     #[tokio::test]
     async fn test_posting_builder_remap() {
@@ -5431,6 +5623,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let index = write_single_partition_index(
+            src_store,
+            InvertedIndexParams::default(),
+            TokenSetFormat::Arrow,
+            "hello",
+            100,
+        )
+        .await?;
+        let created = InvertedIndex::merge_segments(
+            &[index],
+            empty_doc_stream(),
+            dest_store.as_ref(),
+            None,
+            crate::progress::noop_progress(),
+        )
+        .await?;
+
+        assert_eq!(created.index_version, 0);
+        let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
+
+        let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+        let (row_ids, _) = merged
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
+            .await?;
+        assert_eq!(row_ids, vec![100]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()> {
+        let src_dir_1 = TempObjDir::default();
+        let src_dir_2 = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store_1 = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir_1.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let src_store_2 = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir_2.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let params = InvertedIndexParams::default().memory_limit_mb(0);
+        let first = write_single_partition_index(
+            src_store_1,
+            params.clone(),
+            TokenSetFormat::default(),
+            "alpha",
+            100,
+        )
+        .await?;
+        let second = write_single_partition_index(
+            src_store_2,
+            params,
+            TokenSetFormat::default(),
+            "beta",
+            200,
+        )
+        .await?;
+
+        let mut builder =
+            InvertedIndexBuilder::new(InvertedIndexParams::default().memory_limit_mb(0))
+                .with_token_set_format(TokenSetFormat::default());
+        builder
+            .update_from_segments(
+                empty_doc_stream(),
+                dest_store.as_ref(),
+                &[first, second],
+                None,
+            )
+            .await?;
+
+        let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(merged.partitions.len(), 2);
+        let mut partition_ids = merged
+            .partitions
+            .iter()
+            .map(|partition| partition.id())
+            .collect::<Vec<_>>();
+        partition_ids.sort_unstable();
+        assert_eq!(partition_ids, vec![0, 1]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
         // An index created before the deleted_fragments feature was added
         // will have a metadata file with num_rows=0 (no record batch data).
@@ -5477,6 +5781,65 @@ mod tests {
         assert!(
             index.deleted_fragments().is_empty(),
             "index without deleted_fragments column should have empty bitmap"
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_search_stream_with_metrics_records_elapsed_compute() {
+        use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
+        use arrow_array::{StringArray, UInt64Array};
+        use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
+
+        // Tiny stream of one batch containing the query term in two rows.
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    "the quick brown fox",
+                    "lazy dog sleeps",
+                    "the brown fox jumps over",
+                    "completely unrelated text",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+
+        let elapsed_compute = Time::default();
+        let result_stream = flat_bm25_search_stream_with_metrics(
+            input,
+            "text".to_string(),
+            "fox".to_string(),
+            tokenizer,
+            None,
+            100,
+            Some(elapsed_compute.clone()),
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        assert!(!batches.is_empty(), "expected at least one scored batch");
+
+        // Both phase 1 (tokenize_and_count's spawn_cpu) and phase 2 (sync
+        // scoring) call `add_duration` on the metric; verify the handle
+        // was actually populated.
+        assert!(
+            elapsed_compute.value() > 0,
+            "elapsed_compute should have been populated; got 0"
         );
     }
 }

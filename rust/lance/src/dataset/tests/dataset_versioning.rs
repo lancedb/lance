@@ -34,6 +34,8 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         .read_dir()
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        // Ignore the version hint file, which is not a manifest.
+        .filter(|name| !name.starts_with("latest_version_hint"))
         .collect::<Vec<_>>();
     assert!(
         entries_names

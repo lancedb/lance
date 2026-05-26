@@ -286,18 +286,21 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     // MemWAL classes
     m.add_class::<mem_wal::PyMergedGeneration>()?;
-    m.add_class::<mem_wal::PyRegionSnapshot>()?;
-    m.add_class::<mem_wal::PyRegionWriter>()?;
+    m.add_class::<mem_wal::PyShardSnapshot>()?;
+    m.add_class::<mem_wal::PyShardWriter>()?;
     m.add_class::<mem_wal::PyLsmScanner>()?;
     m.add_class::<mem_wal::PyExecutionPlan>()?;
     m.add_class::<mem_wal::PyLsmPointLookupPlanner>()?;
     m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
+    m.add_wrapped(wrap_pyfunction!(mem_wal::py_evaluate_sharding_spec))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
+    m.add_wrapped(wrap_pyfunction!(schema::parse_field_path))?;
+    m.add_wrapped(wrap_pyfunction!(schema::format_field_path))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;

@@ -31,7 +31,7 @@ use super::take::TakeBuilder;
 use super::write::ExternalBlobMode;
 use super::{Dataset, ProjectionRequest};
 use arrow_array::StructArray;
-use lance_core::datatypes::{BlobKind, BlobVersion};
+use lance_core::datatypes::{BlobKind, BlobVersion, parse_field_path};
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result, utils::address::RowAddress};
 use lance_io::traits::{Reader, WriteExt, Writer};
@@ -1682,8 +1682,10 @@ pub async fn take_blobs_by_addresses(
 
 /// Validate that `column` exists and is a blob column, returning its field id.
 pub(super) fn validate_blob_column(dataset: &Arc<Dataset>, column: &str) -> Result<u32> {
-    let projection = dataset.schema().project(&[column])?;
-    let blob_field = &projection.fields[0];
+    let schema = dataset.schema();
+    let blob_field = schema
+        .field(column)
+        .ok_or_else(|| Error::field_not_found(column, schema.field_paths()))?;
     if !blob_field.is_blob() {
         return Err(Error::invalid_input_source(
             format!("the column '{}' is not a blob column", column).into(),
@@ -1753,7 +1755,7 @@ async fn collect_blob_entries_for_selection(
         return Ok(Vec::new());
     }
 
-    let descriptions = description_and_addr.column(0).as_struct();
+    let descriptions = leaf_descriptor_struct(&description_and_addr, column)?;
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     match blob_version_from_descriptions(descriptions)? {
@@ -1762,6 +1764,24 @@ async fn collect_blob_entries_for_selection(
             collect_blob_entries_v2(dataset, blob_field_id, descriptions, row_addrs).await
         }
     }
+}
+
+/// Walk into the descriptor `RecordBatch` at `column` and return the leaf
+/// descriptor `StructArray`, descending through nested struct children for
+/// dotted paths.
+fn leaf_descriptor_struct<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StructArray> {
+    let path = parse_field_path(column)?;
+    let mut current = batch
+        .column_by_name(&path[0])
+        .expect("validate_blob_column ensured column exists")
+        .as_struct();
+    for segment in &path[1..] {
+        current = current
+            .column_by_name(segment)
+            .expect("validate_blob_column ensured all path segments exist")
+            .as_struct();
+    }
+    Ok(current)
 }
 
 fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVersion> {
@@ -2878,6 +2898,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blobs.len(), 2, "Mixed fragment blobs should have 2 items");
+    }
+
+    /// Regression test: scanning the same blob column twice on a single
+    /// `Dataset` (and therefore a single cache scope) with different
+    /// `BlobHandling` values must not panic in the structural decoder.
+    ///
+    /// Background: `FieldDataCacheKey` previously keyed cached page data only
+    /// by `column_index`. A blob column has two valid decoder shapes — the
+    /// descriptor view (`Struct<position, size>`) used when scanning with
+    /// `BlobHandling::BlobsDescriptions`, and the bytes view (`LargeBinary`)
+    /// used when scanning with `BlobHandling::AllBinary`. Both views go through
+    /// the same `StructuralPrimitiveFieldScheduler` but instantiate different
+    /// page-level schedulers, which cache different concrete `CachedPageData`
+    /// types under the same column index. When the second view hit the cache
+    /// populated by the first, it downcast the wrong state type and panicked.
+    #[tokio::test]
+    async fn test_blob_cache_key_distinguishes_views() {
+        use crate::dataset::WriteParams;
+        use arrow_array::RecordBatchIterator;
+        use arrow_array::{LargeBinaryArray, UInt64Array};
+        use arrow_schema::{Field, Schema};
+        use lance_arrow::BLOB_META_KEY;
+        use lance_core::datatypes::BlobHandling;
+
+        let test_dir = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blobs", DataType::LargeBinary, true).with_metadata(blob_meta),
+            Field::new("idx", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"foo".as_slice()),
+                    Some(b"bar".as_slice()),
+                    Some(b"baz".as_slice()),
+                ])),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Open once and reuse the same Dataset (single Session, single cache)
+        // across both scans. Reopening would defeat the test.
+        let dataset = Arc::new(Dataset::open(test_dir.as_str()).await.unwrap());
+
+        // Pass 1: descriptor view (Struct<position, size>). Default for scan().
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::BlobsDescriptions);
+        let descriptors = scanner
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(descriptors.column(0).data_type().is_struct());
+
+        // Pass 2: bytes view (LargeBinary). Used by compact_files.
+        // Without the fix this used to panic in BlobPageScheduler::load
+        // when it downcast the cached BlobDescriptionPageScheduler state.
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let bytes = scanner
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(bytes.column(0).data_type(), &DataType::LargeBinary);
+        let blobs = bytes.column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+        assert_eq!(blobs.value(2), b"baz");
+
+        // Pass 3: back to descriptor view to verify both directions are safe.
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::BlobsDescriptions);
+        let descriptors = scanner
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(descriptors.column(0).data_type().is_struct());
     }
 
     #[test]

@@ -1497,6 +1497,7 @@ fn inner_commit_to_uri<'local>(
         6 * 1024 * 1024,
         1024 * 1024,
         initial_storage_options,
+        HashMap::new(),
         None,
         storage_options_provider,
         None,

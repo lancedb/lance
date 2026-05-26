@@ -20,10 +20,10 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use lance_core::datatypes::{BlobHandling, Projection};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
 use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
+use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 
 use crate::Dataset;
@@ -487,8 +487,8 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
-    use lance_core::utils::mask::RowAddrTreeMap;
     use lance_datagen::{array, gen_batch};
+    use lance_select::RowAddrTreeMap;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::collections::HashSet;

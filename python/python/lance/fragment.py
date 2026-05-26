@@ -655,6 +655,7 @@ class LanceFragment(pa.dataset.Fragment):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        batch_size: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
         blob_mode: str = "lazy",
@@ -664,7 +665,8 @@ class LanceFragment(pa.dataset.Fragment):
         """Read this fragment into a :py:class:`pandas.DataFrame`.
 
         Parameters are the same as :meth:`to_table`, except pandas export uses
-        ``blob_mode`` instead of Arrow-facing ``blob_handling``.
+        ``blob_mode`` instead of Arrow-facing ``blob_handling`` and accepts
+        ``batch_size`` for scan batching.
 
         Parameters
         ----------
@@ -674,6 +676,8 @@ class LanceFragment(pa.dataset.Fragment):
             - ``"lazy"``: return :class:`lance.BlobFile` objects
             - ``"bytes"``: return Python ``bytes``
             - ``"descriptions"``: preserve ``to_table().to_pandas()`` behavior
+        batch_size: int, optional
+            The maximum number of rows per scan batch.
         **kwargs
             Forwarded to :meth:`pyarrow.Table.to_pandas` for non-blob columns.
         """
@@ -682,6 +686,7 @@ class LanceFragment(pa.dataset.Fragment):
             filter=filter,
             limit=limit,
             offset=offset,
+            batch_size=batch_size,
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             order_by=order_by,
@@ -1006,6 +1011,7 @@ if TYPE_CHECKING:
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> Transaction: ...
@@ -1028,6 +1034,7 @@ if TYPE_CHECKING:
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
@@ -1050,6 +1057,7 @@ def write_fragments(
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
@@ -1127,6 +1135,13 @@ def write_fragments(
 
         **Only valid in CREATE mode**. Will raise an error if used with
         APPEND/OVERWRITE modes.
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by exact base path URI.
+        Each value is a dict of storage options for that base. These settings
+        are not persisted to the manifest. When a base has no explicit entry,
+        top-level ``storage_options`` is used as a fallback. If ``dataset_uri``
+        is a LanceDataset and this is omitted, the dataset's base store params
+        are inherited.
     namespace_client : optional, LanceNamespace
         A namespace client for automatic credential refresh. When provided with
         `table_id`, a storage options provider will be created automatically to
@@ -1168,6 +1183,10 @@ def write_fragments(
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
     elif isinstance(dataset_uri, LanceDataset):
+        if base_store_params is None:
+            base_store_params = dataset_uri._base_store_params
+        if storage_options is None:
+            storage_options = dataset_uri._storage_options
         dataset_uri = dataset_uri._ds
     elif not isinstance(dataset_uri, str):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
@@ -1199,6 +1218,7 @@ def write_fragments(
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
         initial_bases=initial_bases,
+        base_store_params=base_store_params,
     )
 
 

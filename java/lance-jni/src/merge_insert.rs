@@ -3,6 +3,7 @@
 
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
+use crate::traits::import_vec_to_rust;
 use crate::traits::{FromJString, IntoJava};
 use crate::{Error, JNIEnvExt, RT};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
@@ -14,8 +15,10 @@ use lance::dataset::{
     MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
+use lance_index::mem_wal::MergedGeneration;
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
@@ -48,6 +51,7 @@ fn inner_merge_insert<'local>(
     let conflict_retries = extract_conflict_retries(env, &jparam)?;
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
+    let marked_generations = extract_marked_generations(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -65,6 +69,7 @@ fn inner_merge_insert<'local>(
             .conflict_retries(conflict_retries)
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
+            .mark_generations_as_merged(marked_generations)
             .try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
@@ -227,6 +232,26 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
         .call_method(jparam, "skipAutoCleanup", "()Z", &[])?
         .z()?;
     Ok(skip_auto_cleanup)
+}
+
+fn extract_marked_generations<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<Vec<MergedGeneration>> {
+    let list = env
+        .call_method(jparam, "markedGenerations", "()Ljava/util/List;", &[])?
+        .l()?;
+    import_vec_to_rust(env, &list, |env, obj| {
+        let shard_id: JString = env
+            .call_method(&obj, "shardId", "()Ljava/lang/String;", &[])?
+            .l()?
+            .into();
+        let shard_id = shard_id.extract(env)?;
+        let generation = env.call_method(&obj, "generation", "()J", &[])?.j()? as u64;
+        let uuid = Uuid::parse_str(&shard_id)
+            .map_err(|e| Error::input_error(format!("Invalid shard_id UUID: {}", e)))?;
+        Ok(MergedGeneration::new(uuid, generation))
+    })
 }
 
 const MERGE_STATS_CLASS: &str = "org/lance/merge/MergeInsertStats";

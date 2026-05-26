@@ -20,6 +20,7 @@ import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.ipc.ScanStats;
 
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -174,6 +175,43 @@ public class ScannerTest {
                     .filter("id < 20")
                     .build())) {
           assertEquals(20, scanner.countRows());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetScannerStats(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_stats").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(20).build())) {
+          assertTrue(scanner.getStats().isEmpty());
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              // Consume all batches.
+            }
+          }
+          assertTrue(scanner.getStats().isEmpty());
+        }
+
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(20).collectStats(true).build())) {
+          assertTrue(scanner.getStats().isEmpty());
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              // Consume all batches.
+            }
+          }
+
+          Optional<ScanStats> statsOpt = scanner.getStats();
+          assertTrue(statsOpt.isPresent());
+          ScanStats stats = statsOpt.get();
+          assertTrue(stats.getBytesRead() > 0 || !stats.getAllCounts().isEmpty());
         }
       }
     }
@@ -618,6 +656,43 @@ public class ScannerTest {
             resultsWithIndex,
             resultsWithoutIndex,
             "Results should be identical with or without scalar index");
+      }
+    }
+  }
+
+  @Test
+  void testFastSearchSkipsUnindexedFragments(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_fast_search_scalar_index").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 100)) {
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        IndexOptions options =
+            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                .withIndexName("id_btree_index")
+                .replace(true)
+                .build();
+        dataset.createIndex(options);
+
+        FragmentMetadata metadata = testDataset.createNewFragment(10);
+        FragmentOperation.Append appendOp =
+            new FragmentOperation.Append(Collections.singletonList(metadata));
+        try (Dataset appended =
+            Dataset.commit(allocator, datasetPath, appendOp, Optional.of(dataset.version()))) {
+          try (LanceScanner scanner =
+              appended.newScan(new ScanOptions.Builder().filter("id < 5").build())) {
+            assertEquals(10, scanner.countRows());
+          }
+
+          try (LanceScanner scanner =
+              appended.newScan(
+                  new ScanOptions.Builder().filter("id < 5").fastSearch(true).build())) {
+            assertEquals(5, scanner.countRows());
+          }
+        }
       }
     }
   }

@@ -124,6 +124,14 @@ impl RestAdapter {
             )
             .route("/v1/table/:id/refresh", post(refresh_materialized_view))
             .route(
+                "/v1/materialized_view/:id/refresh",
+                post(refresh_materialized_view),
+            )
+            .route(
+                "/v1/materialized_view/:id/create",
+                post(create_materialized_view),
+            )
+            .route(
                 "/v1/table/:id/schema_metadata/update",
                 post(update_table_schema_metadata),
             )
@@ -1113,6 +1121,22 @@ async fn refresh_materialized_view(
 
     match backend.refresh_materialized_view(request).await {
         Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn create_materialized_view(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateMaterializedViewRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.create_materialized_view(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
 }

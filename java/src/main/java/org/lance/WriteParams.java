@@ -38,6 +38,7 @@ public class WriteParams {
   private final Optional<String> dataStorageVersion;
   private final Optional<Boolean> enableV2ManifestPaths;
   private Map<String, String> storageOptions = new HashMap<>();
+  private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private final Optional<List<BasePath>> initialBases;
   private final Optional<List<String>> targetBases;
   private final Optional<Boolean> allowExternalBlobOutsideBases;
@@ -52,6 +53,7 @@ public class WriteParams {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
@@ -64,6 +66,7 @@ public class WriteParams {
     this.dataStorageVersion = dataStorageVersion;
     this.enableV2ManifestPaths = enableV2ManifestPaths;
     this.storageOptions = storageOptions;
+    this.baseStoreParams = baseStoreParams;
     this.initialBases = initialBases;
     this.targetBases = targetBases;
     this.allowExternalBlobOutsideBases = allowExternalBlobOutsideBases;
@@ -105,6 +108,10 @@ public class WriteParams {
 
   public Map<String, String> getStorageOptions() {
     return storageOptions;
+  }
+
+  public Map<String, Map<String, String>> getBaseStoreParams() {
+    return baseStoreParams;
   }
 
   public Optional<List<BasePath>> getInitialBases() {
@@ -159,6 +166,7 @@ public class WriteParams {
     private Optional<String> dataStorageVersion = Optional.empty();
     private Optional<Boolean> enableV2ManifestPaths;
     private Map<String, String> storageOptions = new HashMap<>();
+    private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
     private Optional<List<BasePath>> initialBases = Optional.empty();
     private Optional<List<String>> targetBases = Optional.empty();
     private Optional<Boolean> allowExternalBlobOutsideBases = Optional.empty();
@@ -191,6 +199,22 @@ public class WriteParams {
 
     public Builder withStorageOptions(Map<String, String> storageOptions) {
       this.storageOptions = storageOptions;
+      return this;
+    }
+
+    /**
+     * Set runtime-only object store parameters for registered base paths.
+     *
+     * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+     * Each value is the storage options map used as-is for that base. These params are not
+     * persisted in the manifest. If a base has no explicit entry, {@link #withStorageOptions(Map)}
+     * remains the fallback.
+     *
+     * @param baseStoreParams object store parameters keyed by base path URI
+     * @return this builder
+     */
+    public Builder withBaseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+      this.baseStoreParams = baseStoreParams;
       return this;
     }
 
@@ -252,6 +276,7 @@ public class WriteParams {
           dataStorageVersion,
           enableV2ManifestPaths,
           storageOptions,
+          baseStoreParams,
           initialBases,
           targetBases,
           allowExternalBlobOutsideBases,

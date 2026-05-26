@@ -94,7 +94,7 @@ impl std::fmt::Debug for BatchDurableWatcher {
 /// A single WAL entry representing a batch of batches.
 #[derive(Debug, Clone)]
 pub struct WalEntry {
-    /// WAL entry position (0-based, sequential).
+    /// WAL entry position (1-based, sequential — see `FIRST_WAL_ENTRY_POSITION`).
     pub position: u64,
     /// Writer epoch at the time of write.
     pub writer_epoch: u64,
@@ -664,7 +664,12 @@ impl WalEntryData {
 // Generic WAL Appender and Tailer
 // ============================================================================
 
-const FIRST_WAL_ENTRY_POSITION: u64 = 0;
+/// First valid WAL entry position. Positions are 1-based so that a
+/// `ShardManifest::replay_after_wal_entry_position` of 0 unambiguously means
+/// "no flush has ever stamped the cursor" — replay then starts at position 1
+/// without needing to consult `flushed_generations`, which an external
+/// compactor may legitimately drain back to empty.
+const FIRST_WAL_ENTRY_POSITION: u64 = 1;
 const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;
 const APPEND_CONFLICT_REFRESH_INTERVAL: usize = 16;
 const MAX_CURSOR_PROBE: u64 = 4096;
@@ -1308,6 +1313,16 @@ mod tests {
         }
     }
 
+    fn batch_store_source_with_indexes(
+        batch_store: &Arc<BatchStore>,
+        indexes: &Arc<IndexStore>,
+    ) -> WalFlushSource {
+        WalFlushSource::BatchStore {
+            batch_store: batch_store.clone(),
+            indexes: Some(indexes.clone()),
+        }
+    }
+
     #[tokio::test]
     async fn test_wal_flusher_track_batch() {
         let (store, base_path, _temp_dir) = create_local_store().await;
@@ -1379,8 +1394,9 @@ mod tests {
         let source = batch_store_source(&batch_store);
         let result = buffer.flush(&source, batch_store.len()).await.unwrap();
         let entry = result.entry.unwrap();
-        // First entry from a freshly-discovered position is 0 (atomic-create
-        // path discovers the tip via list and starts at FIRST_WAL_ENTRY_POSITION).
+        // First entry from a freshly-discovered position lands at
+        // FIRST_WAL_ENTRY_POSITION (atomic-create path discovers the tip
+        // via list).
         assert_eq!(entry.position, FIRST_WAL_ENTRY_POSITION);
         assert_eq!(entry.writer_epoch, 1);
         assert_eq!(entry.num_batches, 2);
@@ -1392,6 +1408,63 @@ mod tests {
         watcher2.wait().await.unwrap();
         assert!(watcher1.is_durable());
         assert!(watcher2.is_durable());
+    }
+
+    // Regression test for the visibility-cursor bug: with an empty IndexStore
+    // (the common case for WAL-managed tables that mirror an index-less base
+    // dataset), a WAL flush must still advance `max_visible_batch_position` so
+    // scanners can see every batch up to the durable position — not just
+    // batch 0. Before the fix, the cursor stayed at 0 for the lifetime of the
+    // memtable and scanners returned only the first row.
+    #[tokio::test]
+    async fn test_wal_flush_advances_visibility_with_empty_indexes() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        for _ in 0..3 {
+            batch_store.append(create_test_batch(&schema, 5)).unwrap();
+        }
+
+        // Empty registry, mimicking a memtable with `index_configs = []`.
+        let indexes = Arc::new(IndexStore::new());
+        assert_eq!(indexes.max_visible_batch_position(), 0);
+
+        let source = batch_store_source_with_indexes(&batch_store, &indexes);
+        flusher.flush(&source, batch_store.len()).await.unwrap();
+
+        // Cursor must advance to the highest flushed batch position (2),
+        // making all three batches visible to scanners.
+        assert_eq!(indexes.max_visible_batch_position(), 2);
+        assert_eq!(batch_store.max_flushed_batch_position(), Some(2));
+    }
+
+    // Regression guard for the indexed path: with at least one BTree index
+    // configured, the cursor advance still fires (this was already working
+    // before the fix — keeping the test to lock in the behavior).
+    #[tokio::test]
+    async fn test_wal_flush_advances_visibility_with_btree_index() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        for _ in 0..3 {
+            batch_store.append(create_test_batch(&schema, 5)).unwrap();
+        }
+
+        let mut idx = IndexStore::new();
+        idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let indexes = Arc::new(idx);
+
+        let source = batch_store_source_with_indexes(&batch_store, &indexes);
+        flusher.flush(&source, batch_store.len()).await.unwrap();
+
+        assert_eq!(indexes.max_visible_batch_position(), 2);
+        assert_eq!(batch_store.max_flushed_batch_position(), Some(2));
     }
 
     #[tokio::test]
@@ -1562,6 +1635,7 @@ mod tests {
         assert!(hint >= 1, "cursor hint never updated, last={hint}");
 
         // next_position must still resolve to one past the last appended entry.
-        assert_eq!(tailer.next_position().await.unwrap(), 3);
+        // Three entries from a fresh shard land at 1, 2, 3, so next is 4.
+        assert_eq!(tailer.next_position().await.unwrap(), 4);
     }
 }
