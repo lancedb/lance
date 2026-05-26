@@ -790,8 +790,8 @@ impl MemTableScanner {
     /// Used by the LSM filtered-read planner for the active-memtable arm: it
     /// reverse-scans the memtable and keeps only the newest version of each PK
     /// *before* applying the predicate, so a PK whose newest version fails the
-    /// predicate cannot leak an older version that passes. See
-    /// [`MemTableDedupScanExec`]. Unlike [`Self::plan_full_scan`] this never uses
+    /// predicate cannot leak an older version that passes (the work happens in
+    /// the `MemTableDedupScanExec` node). Unlike `plan_full_scan` this never uses
     /// the BTree skip (dedup must see every version) and never pushes a limit
     /// into the scan (the LSM applies it above the cross-source merge).
     pub async fn create_dedup_plan(&self, pk_columns: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
