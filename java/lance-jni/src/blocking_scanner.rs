@@ -318,7 +318,9 @@ pub(crate) fn build_scanner_with_options<'a>(
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Float32Array::from(key_array);
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        let _ = scanner.nearest(&column, &key, k);
+        scanner
+            .nearest(&column, &key, k)
+            .map_err(|err| Error::input_error(err.to_string()))?;
 
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
