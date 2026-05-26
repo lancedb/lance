@@ -18,7 +18,8 @@ use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;
 
 use super::exec::{
-    BTreeIndexExec, FtsIndexExec, MemTableDedupScanExec, MemTableScanExec, VectorIndexExec,
+    BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
+    MemTableScanExec, VectorIndexExec,
 };
 use crate::dataset::mem_wal::scanner::exec::validate_pk_types;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -864,26 +865,39 @@ impl MemTableScanner {
 
     /// Plan a vector similarity search.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
-    /// queries only see indexed data. Falls back to full scan if no index exists.
+    /// Always emits a plan whose output schema includes `_distance`: dispatches
+    /// to [`VectorIndexExec`] when an HNSW exists for the column, otherwise to
+    /// [`MemTableBruteForceVectorExec`]. The brute-force arm exists because the
+    /// active memtable is the LSM's unindexed-rows path — when the HNSW config
+    /// hasn't reached this writer yet (cold-start, or rows written between an
+    /// index commit and the next memtable rotation), KNN must still produce
+    /// correct, distance-bearing results so the LSM-level merge stays sound.
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_vector_index(&query.column) {
-            return self.plan_full_scan().await;
-        }
-
         let max_visible = self.max_visible_batch_position;
         let projection_indices = self.compute_projection_indices()?;
+        let base_schema = self.base_output_schema();
 
-        let index_exec = VectorIndexExec::new(
-            self.batch_store.clone(),
-            self.indexes.clone(),
-            query.clone(),
-            max_visible,
-            projection_indices,
-            self.base_output_schema(),
-            self.with_row_id,
-        )?;
-        self.apply_post_index_ops(Arc::new(index_exec)).await
+        let exec: Arc<dyn ExecutionPlan> = if self.has_vector_index(&query.column) {
+            Arc::new(VectorIndexExec::new(
+                self.batch_store.clone(),
+                self.indexes.clone(),
+                query.clone(),
+                max_visible,
+                projection_indices,
+                base_schema,
+                self.with_row_id,
+            )?)
+        } else {
+            Arc::new(MemTableBruteForceVectorExec::new(
+                self.batch_store.clone(),
+                query.clone(),
+                max_visible,
+                projection_indices,
+                base_schema,
+                self.with_row_id,
+            )?)
+        };
+        self.apply_post_index_ops(exec).await
     }
 
     /// Plan a full-text search.
@@ -1503,5 +1517,46 @@ mod tests {
             assert_eq!(row_ids.value(i), i as u64);
             assert_eq!(row_addrs.value(i), i as u64);
         }
+    }
+
+    /// Regression: vector search against a column with no HNSW must still
+    /// emit a plan whose output schema contains `_distance`. The earlier
+    /// behaviour fell back to `plan_full_scan` (no `_distance`), which broke
+    /// the LSM caller's `sort_by_distance` chain. Now the planner dispatches
+    /// to `MemTableBruteForceVectorExec` instead — see
+    /// [`super::super::exec::MemTableBruteForceVectorExec`].
+    #[tokio::test]
+    async fn test_plan_vector_search_without_hnsw_produces_distance_schema() {
+        use std::sync::Arc;
+
+        const DISTANCE_COLUMN: &str = "_distance";
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let indexes = Arc::new(IndexStore::new()); // intentionally no HNSW
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
+        let query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(vec![0.0_f32, 0.0_f32]));
+        scanner.nearest("vector", query, 5);
+
+        let plan = scanner
+            .create_plan()
+            .await
+            .expect("planner must produce a plan when no HNSW exists");
+        let out_schema = plan.schema();
+        assert!(
+            out_schema.field_with_name(DISTANCE_COLUMN).is_ok(),
+            "plan output schema missing `{DISTANCE_COLUMN}` — got {:?}",
+            out_schema
+        );
     }
 }
