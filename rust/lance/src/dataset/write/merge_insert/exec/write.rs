@@ -740,7 +740,7 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                         format!("UpdateIf({})", condition)
                     }
                     crate::dataset::WhenMatched::UpdateIfExpr(expr) => {
-                        format!("UpdateIfExpr({})", expr)
+                        format!("UpdateIf({})", expr.human_display())
                     }
                     crate::dataset::WhenMatched::Fail => "Fail".to_string(),
                     crate::dataset::WhenMatched::Delete => "Delete".to_string(),
