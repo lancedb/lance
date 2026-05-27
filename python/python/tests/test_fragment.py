@@ -835,3 +835,33 @@ def test_fragment_delete_rows(tmp_path: Path):
         frag.delete_rows([100])
     with pytest.raises(ValueError, match="out of range"):
         frag.delete_rows([0, 50, 1000])
+
+
+def test_fragment_take_with_json_column(tmp_path):
+    """Test that FileFragment.take returns JSON columns in Arrow JSON format."""
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array(range(10), type=pa.int64()),
+            "meta": pa.array(
+                [f'{{"val":{i}}}' for i in range(10)],
+                type=json_type,
+            ),
+        }
+    )
+    dataset_uri = tmp_path / "test_frag_take_json"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    fragment = dataset.get_fragment(0)
+    result = fragment.take([1, 4, 7])
+
+    # Should return arrow.json type (Utf8), not lance.json (LargeBinary)
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":1}'
+    assert metas[1] == '{"val":4}'
+    assert metas[2] == '{"val":7}'

@@ -964,6 +964,49 @@ def test_take_with_projection(tmp_path: Path):
     assert table3 == table2
 
 
+def test_take_with_json_column(tmp_path: Path):
+    """Test that take/take_rows return JSON columns in Arrow JSON format (Utf8).
+
+    Previously, take would return lance.json (LargeBinary) instead of
+    arrow.json (Utf8), which is the user-facing format.
+    """
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array(range(10), type=pa.int64()),
+            "meta": pa.array(
+                [f'{{"val":{i}}}' for i in range(10)],
+                type=json_type,
+            ),
+        }
+    )
+    base_dir = tmp_path / "test_take_json"
+    lance.write_dataset(data, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    # Dataset.take should return arrow.json type
+    result = dataset.take([2, 5, 8])
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":2}'
+    assert metas[1] == '{"val":5}'
+    assert metas[2] == '{"val":8}'
+
+    # Dataset._take_rows should also return arrow.json type
+    result = dataset._take_rows([0, 3, 9])
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":0}'
+    assert metas[1] == '{"val":3}'
+    assert metas[2] == '{"val":9}'
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
