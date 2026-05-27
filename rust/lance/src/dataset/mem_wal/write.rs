@@ -4444,6 +4444,89 @@ mod shard_writer_tests {
         assert!(!defaults.contains_key("shard_spec_id"));
     }
 
+    /// A maintained index can be split across multiple physical segments once a
+    /// delta is appended over previously uncovered fragments (the distributed
+    /// indexer / `optimize_indices(append)` flow). `mem_wal_writer` must resolve
+    /// such an index by name without tripping the singular loader's "multiple
+    /// indices of the same name" error — it only reads the shared type/params,
+    /// which every segment carries identically.
+    #[tokio::test]
+    async fn test_mem_wal_writer_with_multi_segment_index() {
+        use lance_index::optimize::OptimizeOptions;
+
+        let vector_dim = 32;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_multi_segment_index_{}", Uuid::new_v4());
+
+        // Initial fragment + an IVF vector index covering it.
+        let initial = create_test_batch(&schema, 0, 256, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .expect("Failed to create vector index");
+
+        // Append a second fragment and index it as a *delta* (no merge), so the
+        // index ends up with two physical segments sharing the name "vector_idx".
+        let appended = create_test_batch(&schema, 256, 256, vector_dim);
+        let append_batches = RecordBatchIterator::new([Ok(appended)], schema.clone());
+        dataset
+            .append(append_batches, None)
+            .await
+            .expect("Failed to append fragment");
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .expect("Failed to append index delta");
+
+        // Precondition: the index is genuinely multi-segment, so the singular
+        // `load_index_by_name` would error here.
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "expected two physical segments for the maintained index"
+        );
+
+        dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["vector_idx"])
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        // The regression: loading the multi-segment maintained index must succeed.
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id).with_durable_write(false),
+            )
+            .await
+            .expect("mem_wal_writer must accept a multi-segment maintained index");
+
+        // And the resulting writer is functional.
+        writer
+            .put(vec![create_test_batch(&schema, 200, 10, vector_dim)])
+            .await
+            .unwrap();
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
+        writer.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_initialize_mem_wal_bucket_sharding() {
         let vector_dim = 128;

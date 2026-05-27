@@ -206,60 +206,44 @@ impl datafusion::physical_plan::RecordBatchStream for EmptyStream {
 
 /// Compute hash for a primary key value.
 ///
-/// This function should be consistent with the hash function used when
-/// inserting keys into the bloom filter.
+/// Must stay byte-for-byte consistent with [`super::compute_pk_hash`]: for each
+/// scalar, hash `is_null` first, then hash the inner value only when not-null.
+/// This includes the typed Option(None) branches — they represent a NULL of a
+/// known type and must hash the same as a row-side NULL of the same column.
 pub fn compute_pk_hash_from_scalars(values: &[datafusion::common::ScalarValue]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
 
+    fn hash_opt<T: Hash>(hasher: &mut DefaultHasher, v: &Option<T>) {
+        v.is_none().hash(hasher);
+        if let Some(val) = v {
+            val.hash(hasher);
+        }
+    }
+
     for value in values {
         match value {
             datafusion::common::ScalarValue::Null => {
                 true.hash(&mut hasher); // is_null = true
             }
-            datafusion::common::ScalarValue::Int32(v) => {
-                false.hash(&mut hasher);
-                if let Some(val) = v {
-                    val.hash(&mut hasher);
-                }
-            }
-            datafusion::common::ScalarValue::Int64(v) => {
-                false.hash(&mut hasher);
-                if let Some(val) = v {
-                    val.hash(&mut hasher);
-                }
-            }
-            datafusion::common::ScalarValue::UInt32(v) => {
-                false.hash(&mut hasher);
-                if let Some(val) = v {
-                    val.hash(&mut hasher);
-                }
-            }
-            datafusion::common::ScalarValue::UInt64(v) => {
-                false.hash(&mut hasher);
-                if let Some(val) = v {
-                    val.hash(&mut hasher);
-                }
-            }
+            datafusion::common::ScalarValue::Int8(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::Int16(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::Int32(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::Int64(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::UInt8(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::UInt16(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::UInt32(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::UInt64(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::Boolean(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::Utf8(v)
-            | datafusion::common::ScalarValue::LargeUtf8(v) => {
-                false.hash(&mut hasher);
-                if let Some(val) = v {
-                    val.hash(&mut hasher);
-                }
-            }
+            | datafusion::common::ScalarValue::LargeUtf8(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::Binary(v)
-            | datafusion::common::ScalarValue::LargeBinary(v) => {
-                false.hash(&mut hasher);
-                if let Some(val) = v {
-                    val.hash(&mut hasher);
-                }
-            }
-            // Add more types as needed
+            | datafusion::common::ScalarValue::LargeBinary(v) => hash_opt(&mut hasher, v),
+            // Unsupported types: validated out at the scanner boundary, but
+            // distinguish by value rather than collapse if reached.
             _ => {
-                // For unsupported types, just hash the debug representation
                 false.hash(&mut hasher);
                 format!("{:?}", value).hash(&mut hasher);
             }
