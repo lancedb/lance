@@ -3319,8 +3319,12 @@ impl WeightedCoreset {
         self.losses.extend(other.losses);
     }
 
-    fn to_fsl(&self, dimension: usize) -> Result<FixedSizeListArray> {
-        f32_fsl_from_values(self.values.clone(), dimension)
+    fn into_fsl_parts(self, dimension: usize) -> Result<(FixedSizeListArray, Vec<f64>, Vec<f64>)> {
+        Ok((
+            f32_fsl_from_values(self.values, dimension)?,
+            self.weights,
+            self.losses,
+        ))
     }
 
     fn reduce_to_budget(&mut self, dimension: usize, budget: usize) {
@@ -3755,23 +3759,32 @@ fn weighted_subset(
 }
 
 fn train_weighted_hierarchical_f32_kmeans(
-    coreset: &WeightedCoreset,
+    data: &FixedSizeListArray,
+    weights: &[f64],
+    losses: &[f64],
     dimension: usize,
     target_k: usize,
     metric_type: MetricType,
     max_iters: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
 ) -> Result<FixedSizeListArray> {
-    if coreset.len() == 0 {
+    if data.len() == 0 {
         return Err(Error::index("empty weighted coreset"));
     }
+    if weights.len() != data.len() || losses.len() != data.len() {
+        return Err(Error::invalid_input(format!(
+            "weighted hierarchical kmeans input lengths do not match: data={}, weights={}, losses={}",
+            data.len(),
+            weights.len(),
+            losses.len()
+        )));
+    }
 
-    let data = coreset.to_fsl(dimension)?;
     let initial_k = 16_usize.min(target_k).min(data.len()).max(1);
     let initial = train_weighted_f32_kmeans(
-        &data,
-        &coreset.weights,
-        &coreset.losses,
+        data,
+        weights,
+        losses,
         initial_k,
         metric_type,
         max_iters,
@@ -3818,13 +3831,8 @@ fn train_weighted_hierarchical_f32_kmeans(
         } else {
             (cluster.indices.len() / 16).min(remaining_k).clamp(2, 16)
         };
-        let (sub_data, sub_weights, sub_losses) = weighted_subset(
-            data_values,
-            &coreset.weights,
-            &coreset.losses,
-            &cluster.indices,
-            dimension,
-        )?;
+        let (sub_data, sub_weights, sub_losses) =
+            weighted_subset(data_values, weights, losses, &cluster.indices, dimension)?;
         let split = train_weighted_f32_kmeans(
             &sub_data,
             &sub_weights,
@@ -4036,21 +4044,24 @@ async fn train_streaming_coreset_ivf_model(
         remaining_sample_rate -= step_sample_rate;
     }
 
+    let coreset_len = coreset.len();
+    let (coreset_data, coreset_weights, coreset_losses) = coreset.into_fsl_parts(dimension)?;
     let mut centroids = train_weighted_hierarchical_f32_kmeans(
-        &coreset,
+        &coreset_data,
+        &coreset_weights,
+        &coreset_losses,
         dimension,
         num_partitions,
         DistanceType::L2,
         params.max_iters,
         on_progress.clone(),
     )?;
-    let coreset_data = coreset.to_fsl(dimension)?;
     let refine_iters = 3;
     if refine_iters > 0 {
         let refined = refine_weighted_f32_kmeans(
             &coreset_data,
-            &coreset.weights,
-            &coreset.losses,
+            &coreset_weights,
+            &coreset_losses,
             &centroids,
             DistanceType::L2,
             refine_iters,
@@ -4100,9 +4111,7 @@ async fn train_streaming_coreset_ivf_model(
 
     info!(
         "Streaming coreset IVF sampled {} vectors total; max in-memory training vectors per step: {}; coreset vectors: {}",
-        total_training_vectors,
-        max_training_vectors,
-        coreset.len()
+        total_training_vectors, max_training_vectors, coreset_len
     );
 
     Ok(IvfModel::new(centroids, None))
