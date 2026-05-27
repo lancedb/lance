@@ -707,7 +707,7 @@ impl IndexDescriptionImpl {
                 }
             }
         }
-        tracing::trace!(
+        tracing::debug!(
             index_name = name.as_str(),
             index_type = index_type.as_str(),
             segment_count = segments.len(),
