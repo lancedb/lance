@@ -664,7 +664,6 @@ impl IndexDescriptionImpl {
         }
 
         let details = IndexDetails(index_details.clone());
-        let mut rows_indexed = 0;
 
         let index_type = if details.is_vector() {
             derive_vector_index_type(index_details)
@@ -682,18 +681,42 @@ impl IndexDescriptionImpl {
                 .unwrap_or_else(|_| "Unknown".to_string())
         };
 
+        let mut fragment_rows = HashMap::with_capacity(dataset.manifest.fragments.len());
+        for fragment in dataset.iter_fragments() {
+            fragment_rows.insert(
+                fragment.id as u32,
+                fragment_logical_rows_from_metadata(fragment)?,
+            );
+        }
+        let mut rows_indexed = 0;
+        let mut indexed_fragment_refs = 0u64;
+        let mut missing_fragment_refs = 0u64;
+
         for shard in &segments {
             let fragment_bitmap = shard
             .fragment_bitmap
             .as_ref()
             .ok_or_else(|| Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()))?;
 
-            for fragment in dataset.get_fragments() {
-                if fragment_bitmap.contains(fragment.id() as u32) {
-                    rows_indexed += fragment.fast_logical_rows()? as u64;
+            indexed_fragment_refs += fragment_bitmap.len();
+            for fragment_id in fragment_bitmap.iter() {
+                if let Some(fragment_rows) = fragment_rows.get(&fragment_id) {
+                    rows_indexed += *fragment_rows;
+                } else {
+                    missing_fragment_refs += 1;
                 }
             }
         }
+        tracing::trace!(
+            index_name = name.as_str(),
+            index_type = index_type.as_str(),
+            segment_count = segments.len(),
+            dataset_fragment_count = fragment_rows.len(),
+            indexed_fragment_refs,
+            missing_fragment_refs,
+            rows_indexed,
+            "described index row coverage from fragment metadata"
+        );
 
         Ok(Self {
             name,
@@ -704,6 +727,15 @@ impl IndexDescriptionImpl {
             rows_indexed,
         })
     }
+}
+
+fn fragment_logical_rows_from_metadata(fragment: &Fragment) -> Result<u64> {
+    fragment.num_rows().map(|rows| rows as u64).ok_or_else(|| {
+        Error::internal(format!(
+            "Index description requires physical row count and deletion count in fragment metadata. Fragment id: {}",
+            fragment.id
+        ))
+    })
 }
 
 impl IndexDescription for IndexDescriptionImpl {
@@ -6884,6 +6916,7 @@ mod tests {
 
         let desc = &descriptions[0];
         assert_eq!(desc.name(), "test_idx");
+        assert_eq!(desc.rows_indexed(), 4);
 
         // Verify total_size_bytes is available
         let total_size = desc.total_size_bytes();
