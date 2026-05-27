@@ -3046,7 +3046,7 @@ where
     )
 }
 
-fn train_ivf_kmeans_step_arrow_array(
+fn train_ivf_kmeans_step_arrow_array_no_loss(
     centroids: Option<Arc<FixedSizeListArray>>,
     data: &FixedSizeListArray,
     metric_type: MetricType,
@@ -3054,7 +3054,7 @@ fn train_ivf_kmeans_step_arrow_array(
     sample_rate: usize,
     max_iters: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
-) -> Result<(KMeans, f64)> {
+) -> Result<KMeans> {
     let dimension = data.value_length() as usize;
     let values = data.values();
     let step_options = KMeansStepOptions {
@@ -3085,13 +3085,11 @@ fn train_ivf_kmeans_step_arrow_array(
         | (DataType::Int8, DistanceType::Dot)
         | (DataType::Int8, DistanceType::Cosine) => {
             let data = data.convert_to_floating_point()?;
-            let kmeans = train_ivf_kmeans_step::<Float32Type>(
+            train_ivf_kmeans_step::<Float32Type>(
                 centroids,
                 data.values().as_primitive::<Float32Type>(),
                 &step_options,
-            )?;
-            let loss = kmeans.compute_loss(&data)?;
-            return Ok((kmeans, loss));
+            )?
         }
         (DataType::UInt8, DistanceType::Hamming) => train_ivf_kmeans_step::<UInt8Type>(
             centroids,
@@ -3104,8 +3102,7 @@ fn train_ivf_kmeans_step_arrow_array(
             metric_type
         )))?,
     };
-    let loss = kmeans.compute_loss(data)?;
-    Ok((kmeans, loss))
+    Ok(kmeans)
 }
 
 fn accumulate_refine_assignments(
@@ -3659,7 +3656,7 @@ fn append_local_coreset(
 ) -> Result<()> {
     let dimension = data.value_length() as usize;
     let sample_rate = data.len().div_ceil(local_k).max(1);
-    let (kmeans, _) = train_ivf_kmeans_step_arrow_array(
+    let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
         None,
         data,
         metric_type,
@@ -4191,7 +4188,7 @@ async fn train_streaming_ivf_model(
             );
         }
 
-        let (kmeans, _step_loss) = train_ivf_kmeans_step_arrow_array(
+        let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
             centroids.clone(),
             &training_data,
             mt,
