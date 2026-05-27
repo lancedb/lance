@@ -651,9 +651,13 @@ def test_lance_mem_pool_env_var(tmp_path):
 
 
 @pytest.mark.parametrize("with_position", [True, False])
-def test_full_text_search(dataset, with_position):
+@pytest.mark.parametrize("base_tokenizer", ["simple", "icu"])
+def test_full_text_search(dataset, with_position, base_tokenizer):
     dataset.create_scalar_index(
-        "doc", index_type="INVERTED", with_position=with_position
+        "doc",
+        index_type="INVERTED",
+        with_position=with_position,
+        base_tokenizer=base_tokenizer,
     )
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py()
@@ -840,7 +844,8 @@ def test_ngram_fts(tmp_path):
     )
 
 
-def test_fts_fts(tmp_path):
+@pytest.mark.parametrize("base_tokenizer", ["simple", "icu"])
+def test_fts_fts(tmp_path, base_tokenizer):
     # Tests creating two FTS indices with the same name but different parameters
     dataset = lance.write_dataset(
         pa.table(
@@ -855,7 +860,11 @@ def test_fts_fts(tmp_path):
         tmp_path,
     )
     dataset.create_scalar_index(
-        "text", "INVERTED", with_position=True, remove_stop_words=False
+        "text",
+        "INVERTED",
+        with_position=True,
+        remove_stop_words=False,
+        base_tokenizer=base_tokenizer,
     )
 
     results = dataset.to_table(full_text_query='"was a puppy"', prefilter=True)
@@ -865,7 +874,11 @@ def test_fts_fts(tmp_path):
     assert results.num_rows == 3
 
     dataset.create_scalar_index(
-        "text", "INVERTED", name="no_pos_idx", with_position=False
+        "text",
+        "INVERTED",
+        name="no_pos_idx",
+        with_position=False,
+        base_tokenizer=base_tokenizer,
     )
 
     # There is no way to currently specify which index to use.  Instead
@@ -1024,7 +1037,8 @@ def test_fts_optimize_num_indices_to_merge(tmp_path):
     assert ds.to_table(full_text_query="iota")["id"].to_pylist() == [5]
 
 
-def test_fts_score(tmp_path):
+@pytest.mark.parametrize("base_tokenizer", ["simple", "icu"])
+def test_fts_score(tmp_path, base_tokenizer):
     # the number of tokens matters for scoring,
     # make a table that all docs have the same number of tokens
     data = pa.table(
@@ -1034,7 +1048,7 @@ def test_fts_score(tmp_path):
         }
     )
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer=base_tokenizer)
 
     results = ds.to_table(full_text_query="lance search text")
     assert results.num_rows == 3
@@ -1046,7 +1060,7 @@ def test_fts_score(tmp_path):
         "text",
         "lance search text",
         tmp_path,
-        index_params={"with_position": False},
+        index_params={"with_position": False, "base_tokenizer": base_tokenizer},
     )
 
 
