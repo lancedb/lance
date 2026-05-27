@@ -2730,6 +2730,41 @@ fn range_len(range: &Range<u64>) -> usize {
     (range.end - range.start) as usize
 }
 
+const DEFAULT_STREAMING_IVF_TAKE_RANGE_ROWS: usize = 8192;
+const DEFAULT_STREAMING_IVF_PREFETCH_DEPTH: usize = 1;
+const STREAMING_IVF_PREFETCH_DEPTH_ENV: &str = "LANCE_STREAMING_IVF_PREFETCH_DEPTH";
+const STREAMING_IVF_TAKE_RANGE_ROWS_ENV: &str = "LANCE_STREAMING_IVF_TAKE_RANGE_ROWS";
+
+fn streaming_ivf_prefetch_depth() -> usize {
+    std::env::var(STREAMING_IVF_PREFETCH_DEPTH_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|depth| *depth > 0)
+        .unwrap_or(DEFAULT_STREAMING_IVF_PREFETCH_DEPTH)
+}
+
+fn streaming_ivf_take_range_rows() -> usize {
+    std::env::var(STREAMING_IVF_TAKE_RANGE_ROWS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+        .unwrap_or(DEFAULT_STREAMING_IVF_TAKE_RANGE_ROWS)
+}
+
+fn split_ranges_by_row_count(ranges: &[Range<u64>], max_rows: usize) -> Vec<Range<u64>> {
+    let max_rows = max_rows.max(1) as u64;
+    let mut split = Vec::new();
+    for range in ranges {
+        let mut start = range.start;
+        while start < range.end {
+            let end = (start + max_rows).min(range.end);
+            split.push(start..end);
+            start = end;
+        }
+    }
+    split
+}
+
 fn generate_fixed_training_ranges(
     num_rows: usize,
     sample_size: usize,
@@ -2933,11 +2968,13 @@ impl<'a> FixedIvfTrainingSampler<'a> {
         let mut values_buf = MutableBuffer::with_capacity(rows * self.byte_width);
         let mut total_rows = 0;
 
-        let range_stream = stream::iter(ranges.to_vec().into_iter().map(Ok));
+        let read_ranges = split_ranges_by_row_count(ranges, streaming_ivf_take_range_rows());
+        let range_stream = stream::iter(read_ranges.into_iter().map(Ok));
+        let batch_readahead = streaming_ivf_prefetch_depth();
         let mut batch_stream = self.dataset.take_scan(
             Box::pin(range_stream),
             self.projection.clone(),
-            self.dataset.object_store.as_ref().io_parallelism(),
+            batch_readahead,
         );
         while let Some(batch) = batch_stream.try_next().await? {
             let array = get_top_level_vector_column(&batch, self.column)?;
@@ -5430,6 +5467,19 @@ mod tests {
         assert_eq!(ranges.chunk(5, 12), vec![15..20, 30..37]);
         assert_eq!(ranges.chunk(20, 10), vec![40..45]);
         assert!(ranges.chunk(25, 10).is_empty());
+    }
+
+    #[test]
+    fn test_split_ranges_by_row_count() {
+        assert_eq!(
+            split_ranges_by_row_count(&[10..25, 30..33], 8),
+            vec![10..18, 18..25, 30..33]
+        );
+        assert_eq!(
+            split_ranges_by_row_count(&[5..8], 0),
+            vec![5..6, 6..7, 7..8]
+        );
+        assert!(split_ranges_by_row_count(&[], 8).is_empty());
     }
 
     #[test]
