@@ -2732,8 +2732,10 @@ fn range_len(range: &Range<u64>) -> usize {
 
 const DEFAULT_STREAMING_IVF_TAKE_RANGE_ROWS: usize = 8192;
 const DEFAULT_STREAMING_IVF_PREFETCH_DEPTH: usize = 1;
+const DEFAULT_STREAMING_IVF_PROGRESS_INTERVAL: u64 = 64;
 const STREAMING_IVF_PREFETCH_DEPTH_ENV: &str = "LANCE_STREAMING_IVF_PREFETCH_DEPTH";
 const STREAMING_IVF_TAKE_RANGE_ROWS_ENV: &str = "LANCE_STREAMING_IVF_TAKE_RANGE_ROWS";
+const STREAMING_IVF_PROGRESS_INTERVAL_ENV: &str = "LANCE_STREAMING_IVF_PROGRESS_INTERVAL";
 
 fn streaming_ivf_prefetch_depth() -> usize {
     std::env::var(STREAMING_IVF_PREFETCH_DEPTH_ENV)
@@ -2749,6 +2751,18 @@ fn streaming_ivf_take_range_rows() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|rows| *rows > 0)
         .unwrap_or(DEFAULT_STREAMING_IVF_TAKE_RANGE_ROWS)
+}
+
+fn streaming_ivf_progress_interval() -> u64 {
+    std::env::var(STREAMING_IVF_PROGRESS_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|interval| *interval > 0)
+        .unwrap_or(DEFAULT_STREAMING_IVF_PROGRESS_INTERVAL)
+}
+
+fn should_report_streaming_ivf_progress(total: u64, interval: u64) -> bool {
+    total == 1 || total % interval.max(1) == 0
 }
 
 fn split_ranges_by_row_count(ranges: &[Range<u64>], max_rows: usize) -> Vec<Range<u64>> {
@@ -3937,9 +3951,12 @@ async fn train_streaming_coreset_ivf_model(
     let on_progress: Arc<dyn Fn(u32, u32) + Send + Sync> = {
         let progress_tx = progress_tx.clone();
         let cumulative_iters = std::sync::atomic::AtomicU64::new(0);
+        let progress_interval = streaming_ivf_progress_interval();
         Arc::new(move |_iter: u32, _max_iters: u32| {
             let total = cumulative_iters.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let _ = progress_tx.send(total);
+            if should_report_streaming_ivf_progress(total, progress_interval) {
+                let _ = progress_tx.send(total);
+            }
         })
     };
 
@@ -5480,6 +5497,15 @@ mod tests {
             vec![5..6, 6..7, 7..8]
         );
         assert!(split_ranges_by_row_count(&[], 8).is_empty());
+    }
+
+    #[test]
+    fn test_streaming_ivf_progress_throttle() {
+        assert!(should_report_streaming_ivf_progress(1, 64));
+        assert!(!should_report_streaming_ivf_progress(63, 64));
+        assert!(should_report_streaming_ivf_progress(64, 64));
+        assert!(should_report_streaming_ivf_progress(128, 64));
+        assert!(should_report_streaming_ivf_progress(2, 0));
     }
 
     #[test]
