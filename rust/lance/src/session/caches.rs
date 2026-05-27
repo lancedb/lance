@@ -122,12 +122,19 @@ impl CacheKey for DeletionFileKey<'_> {
 #[derive(Debug)]
 pub struct RowAddrMaskKey {
     pub version: u64,
+    /// `Some(hash)` when the mask is restricted to a fragment subset; `None`
+    /// when it covers all fragments in the dataset. Two consumers that ask
+    /// for different subsets must not poison each other's cache entry.
+    pub restrict_hash: Option<u64>,
 }
 
 impl CacheKey for RowAddrMaskKey {
     type ValueType = RowAddrMask;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_addr_mask/{}", self.version))
+        match self.restrict_hash {
+            None => Cow::Owned(format!("row_addr_mask/{}", self.version)),
+            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+        }
     }
     fn type_name() -> &'static str {
         "RowAddrMask"
