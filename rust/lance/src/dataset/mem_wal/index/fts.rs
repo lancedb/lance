@@ -9,7 +9,7 @@
 //! - **One writer** (`insert` / `insert_with_batch_position`) at a time per
 //!   index. Callers are responsible for that invariant; this is consistent
 //!   with `IndexStore`'s usage from `ShardWriter`.
-//! - **Many readers** (`search*`, `expand_fuzzy`, `to_index_builder_reversed`)
+//! - **Many readers** (`search*`, `expand_fuzzy`, `to_index_builder`)
 //!   in parallel with the writer. Reads are lock-free aside from a brief
 //!   tokenizer-pool checkout.
 //! - **Per-batch monotonic visibility**: a reader either sees every row of
@@ -41,7 +41,7 @@
 //! # On-disk format
 //!
 //! At flush time we hand off to `lance_index::scalar::inverted::builder::InnerBuilder`
-//! via `to_index_builder_reversed`, which merges every partition and the tail
+//! via `to_index_builder`, which merges every partition and the tail
 //! into one builder. The on-disk format is unchanged from Lance's existing
 //! inverted index.
 
@@ -1396,11 +1396,9 @@ impl FtsMemIndex {
     /// Export the in-memory FTS index to an `InnerBuilder` ready to be
     /// written to disk.
     ///
-    /// `total_rows` is the total number of rows in the MemTable being
-    /// flushed; row positions are reversed (`reversed = total_rows - pos -
-    /// 1`) to match the LSM-friendly newest-first flush order used by the
-    /// rest of MemWAL.
-    pub fn to_index_builder_reversed(
+    /// Doc row positions are kept in insert order to match the forward-written
+    /// flush data file 1:1. `total_rows` is used only to validate positions.
+    pub fn to_index_builder(
         &self,
         partition_id: u64,
         total_rows: usize,
@@ -1434,9 +1432,9 @@ impl FtsMemIndex {
             ));
         }
 
-        // Step 2: assign doc_ids in ascending reversed-position order, so the
-        // on-disk layout matches MemWAL's newest-first flush convention.
-        let mut entries: Vec<(u64, u64, u32)> = Vec::with_capacity(all_docs.len());
+        // Step 2: assign doc_ids in ascending insert-position order, so the
+        // stored row positions line up 1:1 with the forward-written data file.
+        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(all_docs.len());
         for (original, num_tokens) in &all_docs {
             if *original >= total_rows_u64 {
                 return Err(Error::io(format!(
@@ -1444,13 +1442,13 @@ impl FtsMemIndex {
                     original, total_rows
                 )));
             }
-            entries.push((total_rows_u64 - original - 1, *original, *num_tokens));
+            entries.push((*original, *num_tokens));
         }
-        entries.sort_by_key(|(rev, _, _)| *rev);
+        entries.sort_by_key(|(original, _)| *original);
         let mut docs = DocSet::default();
         let mut original_to_doc_id: HashMap<u64, u32> = HashMap::with_capacity(entries.len());
-        for (rev, original, num_tokens) in &entries {
-            let doc_id = docs.append(*rev, *num_tokens);
+        for (original, num_tokens) in &entries {
+            let doc_id = docs.append(*original, *num_tokens);
             original_to_doc_id.insert(*original, doc_id);
         }
 
@@ -3712,14 +3710,14 @@ mod tests {
     }
 
     #[test]
-    fn test_to_index_builder_reversed_smoke() {
+    fn test_to_index_builder_smoke() {
         // Ensure flush works on a minimal input.
         let schema = create_test_schema();
         let index = FtsMemIndex::new(1, "description".to_string());
         let batch = create_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
 
-        let builder = index.to_index_builder_reversed(42, 3).unwrap();
+        let builder = index.to_index_builder(42, 3).unwrap();
         // The builder can be consumed by callers; we just check it built.
         assert!(builder.id() > 0 || builder.id() == 42);
     }
@@ -3879,7 +3877,7 @@ mod tests {
         assert_eq!(st.partitions.len(), 1);
         assert_eq!(st.tail.visible_count(), 1);
 
-        let builder = index.to_index_builder_reversed(7, 300).unwrap();
+        let builder = index.to_index_builder(7, 300).unwrap();
         assert_eq!(builder.id(), 7);
         // A non-empty builder proves the partition and the tail both reached
         // the flush; end-to-end flush correctness is covered by the MemTable
