@@ -218,7 +218,7 @@ pub struct CompactionOptions {
     /// purposes. If the first task alone exceeds this limit, no tasks are
     /// returned.
     /// Defaults to `None` (no limit).
-    pub max_compaction_bytes: Option<usize>,
+    pub max_compaction_bytes: Option<u64>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -619,7 +619,7 @@ impl DefaultCompactionPlanner {
         Self { options }
     }
 
-    fn exceeds_budget(&self, candidate_fragments: usize, candidate_bytes: usize) -> bool {
+    fn exceeds_budget(&self, candidate_fragments: usize, candidate_bytes: u64) -> bool {
         if let Some(max_frags) = self.options.max_source_fragments
             && candidate_fragments > max_frags
         {
@@ -637,12 +637,12 @@ impl DefaultCompactionPlanner {
         &self,
         completed_bin: CandidateBin,
         effective_candidate_fragments: &mut usize,
-        effective_candidate_bytes: &mut usize,
+        effective_candidate_bytes: &mut u64,
         candidate_bins: &mut Vec<CandidateBin>,
     ) -> bool {
         if !completed_bin.is_noop() {
             *effective_candidate_fragments += completed_bin.fragments.len();
-            *effective_candidate_bytes += completed_bin.total_bytes();
+            *effective_candidate_bytes += completed_bin.known_bytes;
         }
         candidate_bins.push(completed_bin);
         self.exceeds_budget(*effective_candidate_fragments, *effective_candidate_bytes)
@@ -650,16 +650,16 @@ impl DefaultCompactionPlanner {
 
     fn apply_budget_limits(&self, tasks: Vec<TaskData>) -> Vec<TaskData> {
         let mut total_frags = 0usize;
-        let mut total_bytes = 0usize;
+        let mut total_bytes = 0u64;
         let mut result = Vec::new();
         for task in tasks {
             let task_frags = task.fragments.len();
-            let task_bytes: usize = task
+            let task_bytes: u64 = task
                 .fragments
                 .iter()
                 .flat_map(|f| f.files.iter())
                 .filter_map(|f| f.file_size_bytes.get())
-                .map(|sz| sz.get() as usize)
+                .map(|sz| sz.get())
                 .sum();
             if let Some(max_frags) = self.options.max_source_fragments
                 && total_frags + task_frags > max_frags
@@ -710,7 +710,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let mut candidate_bins: Vec<CandidateBin> = Vec::new();
         let mut current_bin: Option<CandidateBin> = None;
         let mut effective_candidate_fragments: usize = 0;
-        let mut effective_candidate_bytes: usize = 0;
+        let mut effective_candidate_bytes: u64 = 0;
         let mut i = 0;
 
         let has_budget = self.options.max_source_fragments.is_some()
@@ -734,26 +734,24 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             match (candidacy, &mut current_bin) {
                 (None, None) => {}
                 (Some(candidacy), None) => {
+                    let known_bytes = CandidateBin::fragment_known_bytes(&fragment);
                     current_bin = Some(CandidateBin {
                         fragments: vec![fragment],
                         pos_range: i..(i + 1),
                         candidacy: vec![candidacy],
                         row_counts: vec![metrics.num_rows()],
                         indices,
+                        known_bytes,
                     });
                 }
                 (Some(candidacy), Some(bin)) => {
                     if bin.indices == indices {
-                        let new_fragment_bytes: usize = fragment
-                            .files
-                            .iter()
-                            .filter_map(|f| f.file_size_bytes.get())
-                            .map(|sz| sz.get() as usize)
-                            .sum();
+                        let new_fragment_bytes = CandidateBin::fragment_known_bytes(&fragment);
                         bin.fragments.push(fragment);
                         bin.pos_range.end += 1;
                         bin.candidacy.push(candidacy);
                         bin.row_counts.push(metrics.num_rows());
+                        bin.known_bytes += new_fragment_bytes;
                         if has_budget && !bin.is_noop() {
                             let running_fragments =
                                 effective_candidate_fragments + bin.fragments.len();
@@ -763,6 +761,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                                 bin.pos_range.end -= 1;
                                 bin.candidacy.pop();
                                 bin.row_counts.pop();
+                                bin.known_bytes -= new_fragment_bytes;
                                 candidate_bins.push(current_bin.take().unwrap());
                                 break;
                             }
@@ -778,12 +777,14 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                         {
                             break;
                         }
+                        let known_bytes = CandidateBin::fragment_known_bytes(&fragment);
                         current_bin = Some(CandidateBin {
                             fragments: vec![fragment],
                             pos_range: i..(i + 1),
                             candidacy: vec![candidacy],
                             row_counts: vec![metrics.num_rows()],
                             indices,
+                            known_bytes,
                         });
                     }
                 }
@@ -1085,10 +1086,19 @@ struct CandidateBin {
     pub candidacy: Vec<CompactionCandidacy>,
     pub row_counts: Vec<usize>,
     pub indices: Vec<usize>,
+    pub known_bytes: u64,
 }
 
 impl CandidateBin {
-    /// Return true if compacting these fragments wouldn't do anything.
+    fn fragment_known_bytes(fragment: &Fragment) -> u64 {
+        fragment
+            .files
+            .iter()
+            .filter_map(|f| f.file_size_bytes.get())
+            .map(|sz| sz.get())
+            .sum()
+    }
+
     fn is_noop(&self) -> bool {
         if self.fragments.is_empty() {
             return true;
@@ -1100,16 +1110,6 @@ impl CandidateBin {
         }
     }
 
-    fn total_bytes(&self) -> usize {
-        self.fragments
-            .iter()
-            .flat_map(|f| f.files.iter())
-            .filter_map(|f| f.file_size_bytes.get())
-            .map(|sz| sz.get() as usize)
-            .sum()
-    }
-
-    /// Split into one or more bins with at least `min_num_rows` in them.
     fn split_for_size(mut self, min_num_rows: usize) -> Vec<Self> {
         let mut bins = Vec::new();
 
@@ -1121,20 +1121,17 @@ impl CandidateBin {
                 bin_len += 1;
             }
 
-            // If there's enough remaining to make another worthwhile bin, then
-            // push what we have as a bin.
             if self.row_counts[bin_len..].iter().sum::<usize>() >= min_num_rows {
                 bins.push(Self {
                     fragments: self.fragments.drain(0..bin_len).collect(),
                     pos_range: self.pos_range.start..(self.pos_range.start + bin_len),
                     candidacy: self.candidacy.drain(0..bin_len).collect(),
                     row_counts: self.row_counts.drain(0..bin_len).collect(),
-                    // By the time we are splitting for size we are done considering indices
                     indices: Vec::new(),
+                    known_bytes: 0,
                 });
                 self.pos_range.start += bin_len;
             } else {
-                // Otherwise, just push the remaining fragments into the last bin
                 bins.push(self);
                 break;
             }
@@ -1786,6 +1783,7 @@ mod tests {
             candidacy: vec![],
             row_counts: vec![],
             indices: vec![],
+            known_bytes: 0,
         };
         assert!(empty_bin.is_noop());
 
@@ -1804,6 +1802,7 @@ mod tests {
             candidacy: vec![CompactionCandidacy::CompactWithNeighbors],
             row_counts: vec![100],
             indices: vec![],
+            known_bytes: 0,
         };
         assert!(single_bin.is_noop());
 
@@ -1813,6 +1812,7 @@ mod tests {
             candidacy: vec![CompactionCandidacy::CompactItself],
             row_counts: vec![100],
             indices: vec![],
+            known_bytes: 0,
         };
         // Not a no-op because it's CompactItself
         assert!(!single_bin.is_noop());
@@ -1823,8 +1823,7 @@ mod tests {
             candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 8).collect(),
             row_counts: vec![100, 400, 200, 200, 400, 300, 300, 100],
             indices: vec![],
-            // Will group into: [[100, 400], [200, 200, 400], [300, 300, 100]]
-            // with size = 500
+            known_bytes: 0,
         };
         assert!(!big_bin.is_noop());
         let split = big_bin.split_for_size(500);
@@ -4992,19 +4991,31 @@ mod tests {
         let unlimited_plan = plan_compaction(
             &dataset,
             &CompactionOptions {
-                target_rows_per_fragment: 1_000_000,
+                target_rows_per_fragment: 250,
                 ..Default::default()
             },
         )
         .await
         .unwrap();
         let unlimited_frags: usize = unlimited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
+        assert!(
+            unlimited_frags > 0,
+            "need at least some candidate fragments"
+        );
+
+        let first_task_bytes: u64 = unlimited_plan.tasks[0]
+            .fragments
+            .iter()
+            .flat_map(|f| f.files.iter())
+            .filter_map(|f| f.file_size_bytes.get())
+            .map(|sz| sz.get())
+            .sum();
 
         let limited_plan = plan_compaction(
             &dataset,
             &CompactionOptions {
-                target_rows_per_fragment: 1_000_000,
-                max_compaction_bytes: Some(1),
+                target_rows_per_fragment: 250,
+                max_compaction_bytes: Some(first_task_bytes),
                 ..Default::default()
             },
         )
@@ -5012,6 +5023,10 @@ mod tests {
         .unwrap();
         let limited_frags: usize = limited_plan.tasks.iter().map(|t| t.fragments.len()).sum();
 
+        assert!(
+            limited_frags > 0,
+            "expected at least 1 candidate fragment, got 0"
+        );
         assert!(
             limited_frags < unlimited_frags,
             "limited plan should have fewer fragments than unlimited ({} vs {})",
