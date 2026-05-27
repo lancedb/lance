@@ -91,8 +91,10 @@ geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-sch
 protoc = ["dep:protobuf-src"]
 jieba-rs = ["tokenizer-jieba"]
 lindera = ["tokenizer-lindera"]
+icu = ["tokenizer-icu"]
 tokenizer-lindera = ["lance-tokenizer/tokenizer-lindera"]
 tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
+tokenizer-icu = ["lance-tokenizer/tokenizer-icu"]
 
 [build-dependencies]
 prost-build.workspace = true

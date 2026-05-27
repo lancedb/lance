@@ -22,6 +22,8 @@ use crate::pbold;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
+#[cfg(feature = "tokenizer-icu")]
+use lance_tokenizer::IcuTokenizer;
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
     AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
@@ -41,6 +43,7 @@ pub struct InvertedIndexParams {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    /// - `icu`: ICU dictionary-based word segmentation
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
@@ -195,6 +198,7 @@ impl InvertedIndexParams {
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
     /// - `ngram`: N-Gram tokenizer
+    /// - `icu`: ICU dictionary-based word segmentation
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
@@ -385,6 +389,8 @@ impl InvertedIndexParams {
             "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
             "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
             "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
+            #[cfg(feature = "tokenizer-icu")]
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
@@ -437,6 +443,8 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::InvertedIndexParams;
+    #[cfg(feature = "tokenizer-icu")]
+    use lance_tokenizer::TokenStream;
 
     #[test]
     fn test_build_only_fields_are_not_serialized() {
@@ -484,5 +492,20 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
+    }
+
+    #[cfg(feature = "tokenizer-icu")]
+    #[test]
+    fn test_build_icu_tokenizer() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer("icu".to_string())
+            .stem(false)
+            .remove_stop_words(false)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_doc("Hello, こんにちは世界!");
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| tokens.push(token.text.clone()));
+        assert_eq!(tokens, vec!["hello", "こんにちは", "世界"]);
     }
 }

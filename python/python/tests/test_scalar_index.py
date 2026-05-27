@@ -1665,6 +1665,22 @@ def test_jieba_tokenizer(tmp_path):
     assert results["_rowid"].to_pylist() == [0]
 
 
+def test_icu_tokenizer(tmp_path):
+    data = pa.table(
+        {
+            "text": ["Hello, こんにちは世界!", "Hello, こんにちは!"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer="icu")
+    results = ds.to_table(
+        full_text_query="世界",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):
     set_language_model_path()
     data = pa.table(

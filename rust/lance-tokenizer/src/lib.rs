@@ -4,6 +4,8 @@
 mod alphanum_only;
 mod analyzer;
 mod ascii_folding_filter;
+#[cfg(feature = "tokenizer-icu")]
+mod icu;
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
 mod lower_caser;
@@ -22,6 +24,8 @@ mod lindera;
 pub use alphanum_only::AlphaNumOnlyFilter;
 pub use analyzer::{TextAnalyzer, TextAnalyzerBuilder};
 pub use ascii_folding_filter::AsciiFoldingFilter;
+#[cfg(feature = "tokenizer-icu")]
+pub use icu::IcuTokenizer;
 #[cfg(feature = "tokenizer-jieba")]
 pub use jieba::JiebaTokenizer;
 #[cfg(feature = "tokenizer-lindera")]

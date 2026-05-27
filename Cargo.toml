@@ -151,6 +151,7 @@ geo-types = "0.7.16"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
+icu_segmenter = { version = "2.2", default-features = false, features = ["compiled_data"] }
 io-uring = "0.7"
 itertools = "0.13"
 jieba-rs = { version = "0.10.0", default-features = false }
