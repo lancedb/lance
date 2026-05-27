@@ -23,17 +23,14 @@ use lance_arrow::ipc::{
     read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
     write_len_prefixed_bytes,
 };
-use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
-    utils::{
-        mask::{NullableRowAddrSet, RowAddrTreeMap},
-        tokio::get_num_compute_intensive_cpus,
-    },
+    utils::tokio::get_num_compute_intensive_cpus,
 };
 use lance_io::object_store::ObjectStore;
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -1761,9 +1758,9 @@ mod tests {
     }
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
-    use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
+    use lance_select::RowSetOps;
     use std::collections::HashMap;
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
@@ -1947,8 +1944,8 @@ mod tests {
         use arrow_schema::DataType;
         use datafusion_common::ScalarValue;
         use lance_core::cache::LanceCache;
-        use lance_core::utils::mask::RowAddrTreeMap;
         use lance_io::object_store::ObjectStore;
+        use lance_select::RowAddrTreeMap;
         use std::collections::HashMap;
         use std::sync::Arc;
 

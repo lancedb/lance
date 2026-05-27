@@ -338,6 +338,32 @@ impl LsmScanner {
         Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
     }
 
+    /// Test which `pks` have been (re)written in the WAL fresh tier — the active
+    /// and frozen memtables and flushed generations this scanner spans — i.e.
+    /// are shadowed above the base table. `pks` is a batch whose columns include
+    /// the primary-key columns; the returned `Vec<bool>` is aligned with its
+    /// rows. Hashing matches the scanner's internal dedup, so the caller never
+    /// hashes PKs itself. Flushed membership comes from the injected
+    /// [`FlushedMemTableCache`] when one is set.
+    pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
+        let sources = self.build_collector().collect()?;
+        let sets = super::block_list::fresh_tier_block_list(
+            &sources,
+            &self.pk_columns,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        )
+        .await?;
+        let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
+        Ok((0..pks.num_rows())
+            .map(|row| {
+                let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
+                sets.iter().any(|set| set.contains(&hash))
+            })
+            .collect())
+    }
+
     /// Build the data source collector.
     fn build_collector(&self) -> LsmDataSourceCollector {
         let mut collector = match &self.base {
@@ -434,5 +460,51 @@ mod tests {
         };
 
         assert_eq!(memtable_ref.generation, 10);
+    }
+
+    #[tokio::test]
+    async fn contains_pks_reports_fresh_tier_membership() {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_batch = |ids: &[i32]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids.to_vec()))],
+            )
+            .unwrap()
+        };
+        let mk = |ids: &[i32], generation: u64| {
+            let store = BatchStore::with_capacity(8);
+            store.append(id_batch(ids)).unwrap();
+            InMemoryMemTableRef {
+                batch_store: Arc::new(store),
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation,
+            }
+        };
+
+        // Fresh-tier only: active gen 2 (pk=1,2) + frozen gen 1 (pk=3).
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            shard,
+            InMemoryMemTables {
+                active: mk(&[1, 2], 2),
+                frozen: vec![mk(&[3], 1)],
+            },
+        );
+
+        // pk=1 (active), pk=4 (absent), pk=3 (frozen).
+        let result = scanner.contains_pks(&id_batch(&[1, 4, 3])).await.unwrap();
+        assert_eq!(result, vec![true, false, true]);
     }
 }

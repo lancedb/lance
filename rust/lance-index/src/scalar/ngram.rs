@@ -38,9 +38,9 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, utils::mask::RowAddrTreeMap};
-use lance_core::{ROW_ID, Result};
+use lance_core::{Error, ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
+use lance_select::RowAddrTreeMap;
 use lance_tokenizer::{
     AlphaNumOnlyFilter, AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, TextAnalyzer,
 };
@@ -1334,13 +1334,10 @@ mod tests {
     use datafusion_common::DataFusionError;
     use futures::{TryStreamExt, stream};
     use itertools::Itertools;
-    use lance_core::{
-        ROW_ID,
-        cache::LanceCache,
-        utils::{mask::RowAddrTreeMap, tempfile::TempDir},
-    };
+    use lance_core::{ROW_ID, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
+    use lance_select::RowAddrTreeMap;
     use lance_tokenizer::TextAnalyzer;
 
     use crate::scalar::{

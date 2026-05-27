@@ -18,7 +18,7 @@ use lance_arrow::ipc::{read_ipc_stream_single_at, read_len_prefixed_bytes_at, wr
 use lance_core::Result;
 use lance_core::cache::CacheCodecImpl;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 

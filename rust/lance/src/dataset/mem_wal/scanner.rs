@@ -31,6 +31,7 @@
 //! let stream = scanner.try_into_stream().await?;
 //! ```
 
+mod block_list;
 mod builder;
 mod collector;
 mod data_source;

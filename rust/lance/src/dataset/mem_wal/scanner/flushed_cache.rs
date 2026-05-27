@@ -43,6 +43,10 @@ pub struct FlushedMemTableCache {
     // `try_get_with`, so concurrent first-queries on a just-flushed
     // generation open the dataset exactly once.
     inner: moka::future::Cache<String, Arc<Dataset>>,
+    // Per-generation set of PK hashes for the vector-search block-list, keyed by
+    // the same immutable flushed path. Built lazily on the first query that needs
+    // it (single-flight) so repeated searches skip re-scanning the PK column.
+    pk_hashes: moka::future::Cache<String, Arc<HashSet<u64>>>,
 }
 
 impl FlushedMemTableCache {
@@ -57,6 +61,10 @@ impl FlushedMemTableCache {
                 // Required for `retain_paths`: moka silently ignores
                 // `invalidate_entries_if` unless closure support is opted
                 // into at build time.
+                .support_invalidation_closures()
+                .build(),
+            pk_hashes: moka::future::Cache::builder()
+                .max_capacity(max_entries)
                 .support_invalidation_closures()
                 .build(),
         }
@@ -88,6 +96,21 @@ impl FlushedMemTableCache {
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
     }
 
+    /// Get the cached set of PK hashes for `path`, building it (exactly once) on
+    /// a miss via `build`. The flushed path is immutable, so a cached set is
+    /// never stale; concurrent first-queries share one build via `moka`'s
+    /// single-flight `try_get_with`.
+    pub async fn get_or_build_pk_hashes(
+        &self,
+        path: &str,
+        build: impl std::future::Future<Output = Result<HashSet<u64>>>,
+    ) -> Result<Arc<HashSet<u64>>> {
+        self.pk_hashes
+            .try_get_with(path.to_string(), async move { build.await.map(Arc::new) })
+            .await
+            .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
+    }
+
     /// Drop cached entries whose path is not in `live_paths`.
     ///
     /// Called by the consumer after compaction retires generations. Purely a
@@ -101,6 +124,10 @@ impl FlushedMemTableCache {
         // would just defer reclamation — never a correctness issue.
         let _ = self
             .inner
+            .invalidate_entries_if(move |path, _| !live.contains(path));
+        let live = live_paths.clone();
+        let _ = self
+            .pk_hashes
             .invalidate_entries_if(move |path, _| !live.contains(path));
     }
 }
@@ -221,6 +248,34 @@ mod tests {
         }
         cache.inner.run_pending_tasks().await;
         assert_eq!(cache.inner.entry_count(), 1, "exactly one entry cached");
+    }
+
+    #[tokio::test]
+    async fn pk_hashes_cached_reuses_first_build() {
+        // The PK-hash set is keyed by the immutable flushed path: a hit returns
+        // the first-built set and never runs the second build closure.
+        let cache = FlushedMemTableCache::new(8);
+        let path = "memory://shard/gen_1";
+        let first = cache
+            .get_or_build_pk_hashes(path, async { Ok(HashSet::from([1u64, 2])) })
+            .await
+            .unwrap();
+        let second = cache
+            .get_or_build_pk_hashes(path, async {
+                // Different contents; must be ignored because the path is cached.
+                Ok(HashSet::from([9u64]))
+            })
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a PK-hash cache hit must reuse the first-built set"
+        );
+        assert_eq!(
+            second.len(),
+            2,
+            "cached set keeps the first build's contents"
+        );
     }
 
     #[tokio::test]

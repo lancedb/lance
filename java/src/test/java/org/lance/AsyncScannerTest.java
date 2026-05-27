@@ -13,6 +13,10 @@
  */
 package org.lance;
 
+import org.lance.index.IndexOptions;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.AsyncScanner;
 import org.lance.ipc.ScanOptions;
 
@@ -28,7 +32,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -127,6 +133,56 @@ public class AsyncScannerTest {
         }
       }
     }
+  }
+
+  @Test
+  void testFastSearchSkipsUnindexedFragments(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_fast_search_scalar_index").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      try (Dataset dataset = testDataset.write(1, 100)) {
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        IndexOptions indexOptions =
+            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                .withIndexName("id_btree_index")
+                .replace(true)
+                .build();
+        dataset.createIndex(indexOptions);
+
+        FragmentMetadata metadata = testDataset.createNewFragment(10);
+        FragmentOperation.Append appendOp =
+            new FragmentOperation.Append(Collections.singletonList(metadata));
+        try (Dataset appended =
+            Dataset.commit(allocator, datasetPath, appendOp, Optional.of(dataset.version()))) {
+          ScanOptions normalOptions = new ScanOptions.Builder().filter("id < 5").build();
+          try (AsyncScanner scanner = AsyncScanner.create(appended, normalOptions, allocator)) {
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS);
+            assertEquals(10, countRows(reader));
+            reader.close();
+          }
+
+          ScanOptions fastOptions =
+              new ScanOptions.Builder().filter("id < 5").fastSearch(true).build();
+          try (AsyncScanner scanner = AsyncScanner.create(appended, fastOptions, allocator)) {
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS);
+            assertEquals(5, countRows(reader));
+            reader.close();
+          }
+        }
+      }
+    }
+  }
+
+  private static int countRows(ArrowReader reader) throws Exception {
+    int rowCount = 0;
+    while (reader.loadNextBatch()) {
+      rowCount += reader.getVectorSchemaRoot().getRowCount();
+    }
+    return rowCount;
   }
 
   /**

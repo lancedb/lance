@@ -6,8 +6,8 @@
 # vector and FTS numbers are directly comparable.
 #
 # Usage:
-#   INDEX_TYPE=fts    rust/lance/benches/mem_wal/run_shard_writer_backpressure.sh [run_id]
-#   INDEX_TYPE=vector rust/lance/benches/mem_wal/run_shard_writer_backpressure.sh [run_id]
+#   INDEX_TYPE=fts    rust/lance/benches/mem_wal/write/run_shard_writer_backpressure.sh [run_id]
+#   INDEX_TYPE=vector rust/lance/benches/mem_wal/write/run_shard_writer_backpressure.sh [run_id]
 #
 # Finds the max sustainable async-indexed throughput: the highest paced
 # target where puts never block (slow>=1s == 0) and the WAL flush queue

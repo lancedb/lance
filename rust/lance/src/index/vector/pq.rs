@@ -645,10 +645,10 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
 
     use crate::index::vector::ivf::build_ivf_model;
-    use lance_core::utils::mask::RowAddrMask;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::DEFAULT_QUERY_PARALLELISM;
     use lance_index::vector::ivf::IvfBuildParams;
+    use lance_select::RowAddrMask;
     use lance_testing::datagen::{
         generate_random_array_with_range, generate_random_array_with_seed,
     };
