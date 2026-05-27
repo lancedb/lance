@@ -981,7 +981,6 @@ mod tests {
             .unwrap()
             .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
-            .nprobes(2)
             .refine(1)
             .try_into_batch()
             .await
