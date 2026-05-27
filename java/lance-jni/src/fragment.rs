@@ -360,6 +360,8 @@ fn create_fragment<'a>(
         let c_schema_ptr = schema_addr as *mut FFI_ArrowSchema;
         let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
         let arrow_schema = ArrowSchema::try_from(&c_schema)?;
+        // Schema::try_from restores Lance field IDs from the LANCE_FIELD_ID_KEY
+        // metadata inserted by LanceSchema.asArrowSchemaWithFieldIds().
         schema = Schema::try_from(&arrow_schema)?;
         builder = builder.schema(&schema);
     }

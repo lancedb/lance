@@ -19,6 +19,7 @@ import org.lance.ipc.ScanOptions;
 import org.lance.operation.Merge;
 import org.lance.operation.Project;
 import org.lance.operation.Update;
+import org.lance.schema.LanceField;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
@@ -40,6 +41,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -121,6 +123,11 @@ public class FragmentTest {
 
           assertEquals(1, fragments.size());
           assertEquals(1, fragments.get(0).getPhysicalRows());
+          assertArrayEquals(
+              evolvedDataset.getLanceSchema().fields().stream()
+                  .mapToInt(LanceField::getId)
+                  .toArray(),
+              fragments.get(0).getFiles().get(0).getFields());
 
           FragmentOperation.Append appendOp = new FragmentOperation.Append(fragments);
           try (Dataset appendedDataset =
