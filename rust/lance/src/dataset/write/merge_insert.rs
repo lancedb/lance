@@ -2091,25 +2091,15 @@ impl Merger {
             None
         };
         let match_filter_expr = match &params.when_matched {
-            WhenMatched::UpdateIf(expr_str) => {
+            WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
                 let combined_schema = Arc::new(combined_schema(&schema));
                 let planner = Planner::new(combined_schema.clone());
-                let expr = planner.parse_filter(expr_str)?;
+                let expr = match &params.when_matched {
+                    WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
+                    WhenMatched::UpdateIfExpr(expr) => expr.clone(),
+                    _ => unreachable!(),
+                };
                 let expr = planner.optimize_expr(expr)?;
-                let match_expr = planner.create_physical_expr(&expr)?;
-                let data_type = match_expr.data_type(combined_schema.as_ref())?;
-                if data_type != DataType::Boolean {
-                    return Err(Error::invalid_input(format!(
-                        "Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}",
-                        expr, data_type
-                    )));
-                }
-                Some(match_expr)
-            }
-            WhenMatched::UpdateIfExpr(expr) => {
-                let combined_schema = Arc::new(combined_schema(&schema));
-                let planner = Planner::new(combined_schema.clone());
-                let expr = planner.optimize_expr(expr.clone())?;
                 let match_expr = planner.create_physical_expr(&expr)?;
                 let data_type = match_expr.data_type(combined_schema.as_ref())?;
                 if data_type != DataType::Boolean {
