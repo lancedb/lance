@@ -47,7 +47,7 @@ pub struct InvertedIndexParams {
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
-    /// `simple` is recommended for most cases and the default value
+    /// `icu` is recommended for most cases and is the default when the ICU tokenizer feature is enabled
     pub(crate) base_tokenizer: String,
 
     /// language for stemming and stop words
@@ -154,7 +154,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                 .base_tokenizer
                 .as_ref()
                 .cloned()
-                .unwrap_or(defaults.base_tokenizer),
+                .unwrap_or_else(|| "simple".to_string()),
             language: serde_json::from_str(details.language.as_str())?,
             with_position: details.with_position,
             max_token_length: details.max_token_length.map(|l| l as usize),
@@ -186,7 +186,15 @@ fn default_max_ngram_length() -> u32 {
 
 impl Default for InvertedIndexParams {
     fn default() -> Self {
-        Self::new("simple".to_owned(), Language::English)
+        Self::new(default_base_tokenizer().to_owned(), Language::English)
+    }
+}
+
+fn default_base_tokenizer() -> &'static str {
+    if cfg!(feature = "tokenizer-icu") {
+        "icu"
+    } else {
+        "simple"
     }
 }
 
@@ -194,11 +202,11 @@ impl InvertedIndexParams {
     /// Create a new `InvertedIndexParams` with the given base tokenizer and language.
     ///
     /// The `base_tokenizer` can be one of the following:
-    /// - `simple`: splits tokens on whitespace and punctuation, default
+    /// - `icu`: ICU dictionary-based word segmentation, default when enabled
+    /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
     /// - `ngram`: N-Gram tokenizer
-    /// - `icu`: ICU dictionary-based word segmentation
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
@@ -446,6 +454,29 @@ mod tests {
     #[cfg(feature = "tokenizer-icu")]
     use lance_tokenizer::TokenStream;
 
+    #[cfg(not(feature = "tokenizer-icu"))]
+    #[test]
+    fn test_default_uses_simple_without_icu_feature() {
+        assert_eq!(InvertedIndexParams::default().base_tokenizer, "simple");
+    }
+
+    #[cfg(feature = "tokenizer-icu")]
+    #[test]
+    fn test_default_uses_icu_tokenizer() {
+        assert_eq!(InvertedIndexParams::default().base_tokenizer, "icu");
+    }
+
+    #[test]
+    fn test_missing_details_base_tokenizer_uses_legacy_simple_default() {
+        let mut details =
+            crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        details.base_tokenizer = None;
+
+        let params = InvertedIndexParams::try_from(&details).unwrap();
+
+        assert_eq!(params.base_tokenizer, "simple");
+    }
+
     #[test]
     fn test_build_only_fields_are_not_serialized() {
         let params = InvertedIndexParams::default()
@@ -498,7 +529,6 @@ mod tests {
     #[test]
     fn test_build_icu_tokenizer() {
         let mut tokenizer = InvertedIndexParams::default()
-            .base_tokenizer("icu".to_string())
             .stem(false)
             .remove_stop_words(false)
             .build()

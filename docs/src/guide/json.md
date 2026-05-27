@@ -292,7 +292,7 @@ on a single path, create an `INVERTED` index on the JSON column.
 dataset.create_scalar_index(
     "data",
     index_type="INVERTED",
-    base_tokenizer="simple",
+    base_tokenizer="icu",
     lower_case=True,
     stem=True,
     remove_stop_words=True,

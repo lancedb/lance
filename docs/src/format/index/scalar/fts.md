@@ -56,7 +56,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 
 | Field               | Type    | Default   | Description                                                    |
 |---------------------|---------|-----------|----------------------------------------------------------------|
-| `base_tokenizer`    | String  | "simple"  | Base tokenizer type (see Tokenizers section)                   |
+| `base_tokenizer`    | String  | "icu"     | Base tokenizer type (see Tokenizers section)                   |
 | `language`          | String  | "English" | Language for stemming and stop words                           |
 | `with_position`     | Boolean | false     | Store term positions for phrase queries (increases index size) |
 | `max_token_length`  | UInt32? | None      | Maximum token length (tokens longer than this are removed)     |
@@ -76,17 +76,17 @@ The full text search index supports multiple tokenizer types for different text 
 
 | Tokenizer      | Description                                                               | Use Case               |
 |----------------|---------------------------------------------------------------------------|------------------------|
-| **simple**     | Splits on whitespace and punctuation, removes non-alphanumeric characters | General text (default) |
+| **icu**        | ICU dictionary-based Unicode word segmentation                            | Mixed-language text (default) |
+| **simple**     | Splits on whitespace and punctuation, removes non-alphanumeric characters | General ASCII-oriented text |
 | **whitespace** | Splits only on whitespace characters                                      | Preserve punctuation   |
 | **raw**        | No tokenization, treats entire text as single token                       | Exact matching         |
 | **ngram**      | Breaks text into overlapping character sequences                          | Substring/fuzzy search |
-| **icu**        | ICU dictionary-based Unicode word segmentation                            | Mixed-language text    |
 | **jieba/***    | Chinese text tokenizer with word segmentation                             | Chinese text           |
 | **lindera/***  | Japanese text tokenizer with morphological analysis                       | Japanese text          |
 
 #### ICU Tokenizer (Mixed-language text)
 
-The ICU tokenizer uses Unicode word boundary rules and dictionary-based segmentation for complex scripts. It is useful for mixed-language text where the default `simple` tokenizer would keep an unspaced CJK span as one large token.
+The ICU tokenizer uses Unicode word boundary rules and dictionary-based segmentation for complex scripts. It is the default tokenizer because it handles mixed-language text where the `simple` tokenizer would keep an unspaced CJK span as one large token.
 
 - **Models**: Uses compiled ICU4X segmenter data bundled with Lance
 - **Usage**: Specify as `icu`
