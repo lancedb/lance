@@ -318,15 +318,12 @@ impl DeferredDocSet {
         if let Some(arr) = self.row_ids_col.get() {
             return Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect());
         }
-        // Targeted per-doc reads -- the deferred path's whole point.
-        // Lance v2 coalesces nearby reads at the page level.
-        let mut row_ids = Vec::with_capacity(doc_ids.len());
-        for &d in doc_ids {
-            let d = d as usize;
-            let batch = self.reader.read_range(d..d + 1, Some(&[ROW_ID])).await?;
-            let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
-            row_ids.push(arr.value(0));
-        }
-        Ok(row_ids)
+        let ranges: Vec<std::ops::Range<usize>> = doc_ids
+            .iter()
+            .map(|&d| d as usize..d as usize + 1)
+            .collect();
+        let batch = self.reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
+        let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
+        Ok((0..arr.len()).map(|i| arr.value(i)).collect())
     }
 }

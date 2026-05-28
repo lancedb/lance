@@ -221,6 +221,23 @@ pub trait IndexReader: Send + Sync {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
+    /// Read multiple ranges and concatenate into a single batch.
+    /// Default impl runs `read_range`s in parallel via `try_join_all`.
+    async fn read_ranges(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        if ranges.is_empty() {
+            return self.read_range(0..0, projection).await;
+        }
+        let futures = ranges
+            .iter()
+            .map(|r| self.read_range(r.clone(), projection));
+        let batches = futures::future::try_join_all(futures).await?;
+        let schema = batches[0].schema();
+        Ok(arrow_select::concat::concat_batches(&schema, &batches)?)
+    }
     /// Read a range of rows as a stream of record batches.
     ///
     /// This allows the caller to process rows incrementally without loading the
