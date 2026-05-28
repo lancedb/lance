@@ -732,7 +732,7 @@ impl IndexDescriptionImpl {
 fn fragment_logical_rows_from_metadata(fragment: &Fragment) -> Result<u64> {
     fragment.num_rows().map(|rows| rows as u64).ok_or_else(|| {
         Error::internal(format!(
-            "Index description requires physical row count and deletion count in fragment metadata. Fragment id: {}",
+            "Index description requires physical row count and deletion count in fragment metadata. To add this, make a write to this dataset using this library version. Fragment id: {}",
             fragment.id
         ))
     })
