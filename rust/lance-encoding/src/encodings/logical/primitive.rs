@@ -3835,16 +3835,17 @@ impl PrimitiveStructuralEncoder {
 
     /// Checks if the rep/def levels are too sparse for miniblock encoding.
     ///
-    /// Miniblock chunks are limited to ~32KiB total. Data can use up to ~16KiB,
-    /// leaving ~16KiB for both rep and def buffers combined. Each chunk has at most
-    /// MAX_MINIBLOCK_VALUES (4096) data values, but when data has many empty/null
-    /// lists, the number of rep/def levels can far exceed the number of data values
-    /// (each empty list adds a level entry with no corresponding data value).
+    /// [`Self::serialize_miniblocks`] writes each chunk's rep and def buffer
+    /// with a `u16` length field, capping each at `u16::MAX` (~64KiB). Empty
+    /// or null lists add level entries with no matching value, so a chunk's
+    /// rep/def buffer can blow past that limit even when its data buffer is
+    /// small.
     ///
-    /// We estimate the compressed bits per level by computing the max value in each
-    /// buffer and taking ceil(log2(max_val + 1)) — the minimum bits needed to
-    /// bitpack each level. We then calculate the maximum number of levels that fit
-    /// in 16KiB and compare against the actual levels-to-values ratio.
+    /// We bound the worst-case level count for any chunk of
+    /// `MAX_MINIBLOCK_VALUES` visible values via
+    /// [`Self::worst_levels_in_value_window`], then estimate each buffer's
+    /// compressed size at 2× ideal bitpacking (1-byte/level floor for
+    /// compressor framing) and compare against the u16 cap less a 4KiB margin.
     fn repdef_too_sparse_for_miniblock(
         repdef: &crate::repdef::SerializedRepDefs,
         num_values: u64,
@@ -3852,45 +3853,100 @@ impl PrimitiveStructuralEncoder {
         if num_values == 0 {
             return false;
         }
-        let num_levels = repdef
-            .repetition_levels
-            .as_ref()
-            .map(|r| r.len() as u64)
-            .max(repdef.definition_levels.as_ref().map(|d| d.len() as u64))
-            .unwrap_or(0);
-        if num_levels == 0 {
+
+        let rep = repdef.repetition_levels.as_deref();
+        let def = repdef.definition_levels.as_deref();
+        if rep.is_none() && def.is_none() {
             return false;
         }
 
-        // Compute bits needed per level for each buffer (ceil of log2(max+1))
-        let bits_per_rep = repdef
-            .repetition_levels
-            .as_ref()
-            .and_then(|r| r.iter().max().copied())
-            .map(|max_val| u16::BITS - max_val.leading_zeros())
-            .unwrap_or(0) as u64;
-        let bits_per_def = repdef
-            .definition_levels
-            .as_ref()
-            .and_then(|d| d.iter().max().copied())
-            .map(|max_val| u16::BITS - max_val.leading_zeros())
-            .unwrap_or(0) as u64;
-
-        let bits_per_level = bits_per_rep + bits_per_def;
-        if bits_per_level == 0 {
+        let num_levels = rep.map(|r| r.len()).max(def.map(|d| d.len())).unwrap_or(0);
+        // No specials => levels are 1:1 with values: at most 8KiB per buffer
+        // (4096 levels × 2 raw u16 bytes), well below the u16 cap.
+        if (num_levels as u64) <= num_values {
             return false;
         }
 
-        // 16KiB budget for rep+def combined (half the ~32KiB chunk limit)
-        const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
-        let max_levels_per_chunk = REPDEF_BUDGET_BITS / bits_per_level;
+        let window_values = (*miniblock::MAX_MINIBLOCK_VALUES as usize).min(num_values as usize);
+        let worst_levels_per_chunk =
+            Self::worst_levels_in_value_window(def, repdef.max_visible_level, window_values);
 
-        // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
-        // ratio tells us how many levels a chunk of that size would need.
-        let levels_per_chunk =
-            (num_levels as f64 / num_values as f64) * *miniblock::MAX_MINIBLOCK_VALUES as f64;
+        // 4KiB margin under the u16 cap covers compressor framing / RLE headers
+        // so `serialize_miniblocks`'s safety net only fires on pathological inputs.
+        const PER_BUFFER_BUDGET_BYTES: u64 = u16::MAX as u64 - 4 * 1024;
 
-        levels_per_chunk > max_levels_per_chunk as f64
+        let overflows = |levels: &[u16]| -> bool {
+            let max_val = levels.iter().max().copied().unwrap_or(0);
+            let ideal_bits = (u16::BITS - max_val.leading_zeros()).max(1) as u64;
+            // 2× pessimism vs ideal bitpacking, 1-byte/level floor for framing.
+            let pessimistic_bits_per_level = (ideal_bits * 2).max(8);
+            let est_bytes =
+                (worst_levels_per_chunk as u64 * pessimistic_bits_per_level).div_ceil(8);
+            est_bytes > PER_BUFFER_BUDGET_BYTES
+        };
+
+        rep.is_some_and(overflows) || def.is_some_and(overflows)
+    }
+
+    /// Maximum levels any single mini-block chunk could span to cover
+    /// `window_values` consecutive visible positions.
+    ///
+    /// A visible position has `def <= max_visible_level`, matching how
+    /// [`crate::repdef::RepDefSlicer::slice_next`] advances. Specials (empty /
+    /// null lists) take a level slot but no value and get absorbed by whichever
+    /// chunk straddles them.
+    ///
+    /// Commits each full chunk lazily - only when the next visible appears -
+    /// so interstitial specials land in the new chunk, mirroring `slice_next`.
+    /// Anything left over after the loop is the final chunk (`slice_rest`),
+    /// which sweeps up trailing specials.
+    ///
+    /// Returns `window_values` when there are no def levels or no list nesting
+    /// (levels are 1:1 with values).
+    fn worst_levels_in_value_window(
+        def_levels: Option<&[u16]>,
+        max_visible_level: Option<u16>,
+        window_values: usize,
+    ) -> usize {
+        let (Some(def_levels), Some(max_visible_level)) = (def_levels, max_visible_level) else {
+            return window_values;
+        };
+        if window_values == 0 {
+            return def_levels.len();
+        }
+
+        let mut max_chunk_levels = 0usize;
+        let mut chunk_start_level = 0usize;
+        let mut visible_in_chunk = 0usize;
+        let mut pending_chunk_end: Option<usize> = None;
+
+        for (level_idx, &d) in def_levels.iter().enumerate() {
+            if d > max_visible_level {
+                continue;
+            }
+            if let Some(end) = pending_chunk_end.take() {
+                let chunk_levels = end + 1 - chunk_start_level;
+                if chunk_levels > max_chunk_levels {
+                    max_chunk_levels = chunk_levels;
+                }
+                chunk_start_level = end + 1;
+            }
+            visible_in_chunk += 1;
+            if visible_in_chunk == window_values {
+                pending_chunk_end = Some(level_idx);
+                visible_in_chunk = 0;
+            }
+        }
+        // Final chunk via `slice_rest`: absorbs trailing specials and any
+        // uncommitted full chunk.
+        if chunk_start_level < def_levels.len() {
+            let chunk_levels = def_levels.len() - chunk_start_level;
+            if chunk_levels > max_chunk_levels {
+                max_chunk_levels = chunk_levels;
+            }
+        }
+
+        max_chunk_levels
     }
 
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
@@ -7545,5 +7601,174 @@ mod tests {
 
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    mod repdef_too_sparse_for_miniblock {
+        use super::*;
+        use crate::encodings::logical::primitive::miniblock;
+        use crate::repdef::{DefinitionInterpretation, SerializedRepDefs};
+
+        fn make_repdef(
+            rep: Option<Vec<u16>>,
+            def: Option<Vec<u16>>,
+            max_visible_level: Option<u16>,
+        ) -> SerializedRepDefs {
+            SerializedRepDefs {
+                repetition_levels: rep.map(Arc::from),
+                definition_levels: def.map(Arc::from),
+                def_meaning: vec![DefinitionInterpretation::EmptyableList],
+                max_visible_level,
+            }
+        }
+
+        #[test]
+        fn worst_levels_returns_window_when_no_def_levels() {
+            assert_eq!(
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(None, None, 100),
+                100
+            );
+            assert_eq!(
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(None, Some(0), 100),
+                100
+            );
+            let def: &[u16] = &[0; 100];
+            assert_eq!(
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(Some(def), None, 100),
+                100
+            );
+        }
+
+        #[test]
+        fn worst_levels_handles_dense_columns() {
+            let def: Vec<u16> = vec![0; 10_000];
+            let worst =
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(Some(&def), Some(0), 4096);
+            assert_eq!(worst, 4096);
+        }
+
+        #[test]
+        fn worst_levels_handles_uniform_sparsity() {
+            // 9 specials + 1 visible, repeated: a 100-visible chunk = 1000 levels.
+            let mut def = Vec::with_capacity(1000);
+            for _ in 0..100 {
+                def.extend(std::iter::repeat_n(1u16, 9));
+                def.push(0u16);
+            }
+            let worst =
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(Some(&def), Some(0), 100);
+            assert_eq!(worst, 1000);
+        }
+
+        #[test]
+        fn worst_levels_includes_leading_specials_in_first_chunk() {
+            // 500 leading specials before any visible belong to chunk 0.
+            let mut def: Vec<u16> = std::iter::repeat_n(1u16, 500).collect();
+            def.extend(std::iter::repeat_n(0u16, 100));
+            let worst =
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(Some(&def), Some(0), 100);
+            assert_eq!(worst, 600);
+        }
+
+        #[test]
+        fn worst_levels_includes_trailing_specials_in_last_chunk() {
+            // Trailing specials end up in the final chunk via `slice_rest`,
+            // even when the previous chunk was full.
+            let mut def: Vec<u16> = std::iter::repeat_n(0u16, 100).collect();
+            def.extend(std::iter::repeat_n(1u16, 500));
+            let worst =
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(Some(&def), Some(0), 100);
+            assert_eq!(worst, 600);
+        }
+
+        #[test]
+        fn worst_levels_handles_clustered_specials_between_chunks() {
+            // 100 visible, 800 specials, 100 visible: chunk 1 spans 900 levels.
+            let mut def: Vec<u16> = std::iter::repeat_n(0u16, 100).collect();
+            def.extend(std::iter::repeat_n(1u16, 800));
+            def.extend(std::iter::repeat_n(0u16, 100));
+            let worst =
+                PrimitiveStructuralEncoder::worst_levels_in_value_window(Some(&def), Some(0), 100);
+            assert_eq!(worst, 900);
+        }
+
+        #[test]
+        fn returns_false_for_zero_values() {
+            let repdef = make_repdef(None, None, None);
+            assert!(!PrimitiveStructuralEncoder::repdef_too_sparse_for_miniblock(&repdef, 0));
+        }
+
+        #[test]
+        fn returns_false_when_no_rep_or_def() {
+            let repdef = make_repdef(None, None, None);
+            assert!(!PrimitiveStructuralEncoder::repdef_too_sparse_for_miniblock(&repdef, 1000));
+        }
+
+        #[test]
+        fn returns_false_for_dense_repdef() {
+            let def: Vec<u16> = vec![0; 10_000];
+            let rep: Vec<u16> = vec![0; 10_000];
+            let repdef = make_repdef(Some(rep), Some(def), Some(0));
+            assert!(!PrimitiveStructuralEncoder::repdef_too_sparse_for_miniblock(&repdef, 10_000));
+        }
+
+        /// Regression test for issue #6681: pages whose specials cluster into
+        /// a single chunk used to slip past the old page-average check.
+        #[test]
+        fn returns_true_for_clustered_specials_with_low_page_ratio() {
+            let chunk_size = *miniblock::MAX_MINIBLOCK_VALUES as usize;
+            let num_dense_chunks = 100;
+            let num_leading_specials = 80_000;
+            let total_visible = chunk_size * (1 + num_dense_chunks);
+
+            let mut def: Vec<u16> = std::iter::repeat_n(1u16, num_leading_specials).collect();
+            def.extend(std::iter::repeat_n(0u16, total_visible));
+            let rep: Vec<u16> = std::iter::repeat_n(0u16, def.len()).collect();
+
+            let repdef = make_repdef(Some(rep), Some(def), Some(0));
+            assert!(PrimitiveStructuralEncoder::repdef_too_sparse_for_miniblock(
+                &repdef,
+                total_visible as u64,
+            ));
+        }
+
+        #[test]
+        fn returns_false_for_mildly_sparse_columns() {
+            // 1 visible per 4 levels → chunk spans 4096 × 4 = 16_384 levels,
+            // well under the u16 cap even with 2× pessimism.
+            let num_visible = 20_000;
+            let stride = 4;
+            let mut def = Vec::with_capacity(num_visible * stride);
+            for _ in 0..num_visible {
+                def.extend(std::iter::repeat_n(1u16, stride - 1));
+                def.push(0u16);
+            }
+            let rep: Vec<u16> = std::iter::repeat_n(0u16, def.len()).collect();
+            let repdef = make_repdef(Some(rep), Some(def), Some(0));
+            assert!(
+                !PrimitiveStructuralEncoder::repdef_too_sparse_for_miniblock(
+                    &repdef,
+                    num_visible as u64,
+                )
+            );
+        }
+
+        #[test]
+        fn returns_true_for_extremely_sparse_columns() {
+            // 1 visible per 200 levels → chunk spans ~819_200 levels, far past
+            // any plausible u16-sized buffer.
+            let num_visible = 10_000;
+            let stride = 200;
+            let mut def = Vec::with_capacity(num_visible * stride);
+            for _ in 0..num_visible {
+                def.extend(std::iter::repeat_n(1u16, stride - 1));
+                def.push(0u16);
+            }
+            let rep: Vec<u16> = std::iter::repeat_n(0u16, def.len()).collect();
+            let repdef = make_repdef(Some(rep), Some(def), Some(0));
+            assert!(PrimitiveStructuralEncoder::repdef_too_sparse_for_miniblock(
+                &repdef,
+                num_visible as u64,
+            ));
+        }
     }
 }
