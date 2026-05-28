@@ -37,8 +37,8 @@ use lance_namespace::models::{
     DescribeTableResponse, DescribeTableVersionResponse, DropNamespaceRequest,
     DropNamespaceResponse, DropTableRequest, DropTableResponse, ListNamespacesRequest,
     ListNamespacesResponse, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
-    NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse, TableExistsRequest,
-    TableVersion,
+    NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse, RenameTableRequest,
+    RenameTableResponse, TableExistsRequest, TableVersion,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use object_store::{Error as ObjectStoreError, path::Path};
@@ -387,6 +387,38 @@ fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option
             })
         }
     }
+}
+
+/// Recursively copy every object under `source_dir` to the corresponding path under
+/// `destination_dir`, preserving the relative layout of each file.
+pub(crate) async fn copy_dir_all(
+    object_store: &ObjectStore,
+    source_dir: &Path,
+    destination_dir: &Path,
+) -> Result<()> {
+    let mut entries = object_store.list(Some(source_dir.clone()));
+    while let Some(meta) = entries.try_next().await? {
+        let source_file = meta.location;
+        let Some(relative_parts) = source_file.prefix_match(source_dir) else {
+            continue;
+        };
+        let mut destination_file = destination_dir.clone();
+        for part in relative_parts {
+            destination_file = destination_file.join(part);
+        }
+        object_store
+            .copy(&source_file, &destination_file)
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to copy {} to {}: {:?}",
+                        source_file, destination_file, e
+                    ),
+                })
+            })?;
+    }
+    Ok(())
 }
 
 impl ManifestNamespace {
@@ -2398,6 +2430,115 @@ impl LanceNamespace for ManifestNamespace {
             }
             .into()),
         }
+    }
+
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
+        })?;
+
+        if table_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        if request.new_table_name.trim().is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "new_table_name cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        let (source_namespace, _) = Self::split_object_id(table_id);
+        let source_object_id = Self::str_object_id(table_id);
+
+        let source_info = self
+            .query_manifest_for_table(&source_object_id)
+            .boxed()
+            .await?
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::TableNotFound {
+                    message: Self::format_table_id(table_id),
+                })
+            })?;
+
+        // Default to the source namespace when no destination namespace is provided.
+        let destination_namespace = match request.new_namespace_id.as_ref() {
+            Some(namespace) => namespace.clone(),
+            None => source_namespace,
+        };
+        if !destination_namespace.is_empty() {
+            self.validate_namespace_levels_exist(&destination_namespace)
+                .boxed()
+                .await?;
+        }
+
+        let destination_object_id =
+            Self::build_object_id(&destination_namespace, &request.new_table_name);
+        if self
+            .manifest_contains_object(&destination_object_id)
+            .boxed()
+            .await?
+        {
+            return Err(NamespaceError::TableAlreadyExists {
+                message: request.new_table_name.clone(),
+            }
+            .into());
+        }
+
+        // Choose the destination directory the same way create_table does so the
+        // physical layout stays consistent with how tables are otherwise created.
+        let destination_dir_name = if destination_namespace.is_empty() && self.dir_listing_enabled {
+            format!("{}.lance", request.new_table_name)
+        } else {
+            Self::generate_dir_name(&destination_object_id)
+        };
+
+        let source_dir = self.base_path.clone().join(source_info.location.as_str());
+        let destination_dir = self.base_path.clone().join(destination_dir_name.as_str());
+        copy_dir_all(&self.object_store, &source_dir, &destination_dir)
+            .boxed()
+            .await?;
+
+        // Register the renamed table before dropping the old entry so the table stays
+        // reachable under at least one name if a later step fails.
+        let metadata = Self::serialize_metadata(
+            source_info.metadata.as_ref(),
+            "table",
+            &destination_object_id,
+        )?;
+        self.insert_into_manifest_with_metadata(
+            vec![ManifestEntry {
+                object_id: destination_object_id,
+                object_type: ObjectType::Table,
+                location: Some(destination_dir_name),
+                metadata,
+            }],
+            None,
+        )
+        .boxed()
+        .await?;
+        self.delete_from_manifest(&source_object_id).boxed().await?;
+
+        // Remove the original directory now that the rename has been committed.
+        self.object_store
+            .remove_dir_all(source_dir)
+            .boxed()
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to remove source table directory after rename: {:?}",
+                        e
+                    ),
+                })
+            })?;
+
+        Ok(RenameTableResponse::new())
     }
 
     async fn list_namespaces(
