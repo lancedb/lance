@@ -31,6 +31,7 @@ use futures::{
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
+use rayon::prelude::*;
 use lance_core::{Error, Result};
 use log::trace;
 
@@ -369,29 +370,10 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             });
         }
 
-        // Parallel column decoding for wide tables (4+ columns).
-        // When a struct has many child columns, each column's page decoding is
-        // independent CPU work.  Spreading it across threads improves scan
-        // throughput for wide analytical tables.
-        const PARALLEL_DECODE_MIN_CHILDREN: usize = 4;
-
-        let arrays = if children.len() >= PARALLEL_DECODE_MIN_CHILDREN {
-            std::thread::scope(|s| {
-                let handles: Vec<_> = children
-                    .into_iter()
-                    .map(|task| s.spawn(move || task.decode()))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap())
-                    .collect::<Result<Vec<_>>>()
-            })?
-        } else {
-            children
-                .into_iter()
-                .map(|task| task.decode())
-                .collect::<Result<Vec<_>>>()?
-        };
+        let arrays = children
+            .into_par_iter()
+            .map(|task| task.decode())
+            .collect::<Result<Vec<_>>>()?;
         let mut child_arrays = Vec::with_capacity(arrays.len());
         let mut data_size = 0u64;
         let mut arrays_iter = arrays.into_iter();
