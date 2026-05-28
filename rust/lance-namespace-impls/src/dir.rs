@@ -48,13 +48,14 @@ use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
-    AnalyzeTableQueryPlanRequest, BatchDeleteTableVersionsRequest,
-    BatchDeleteTableVersionsResponse, BranchContents as ModelBranchContents, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableBranchRequest,
-    CreateTableBranchResponse, CreateTableIndexRequest, CreateTableIndexResponse,
-    CreateTableRequest, CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
-    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse,
+    BranchContents as ModelBranchContents, CountTableRowsRequest, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
     DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
     DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
@@ -3762,6 +3763,165 @@ impl LanceNamespace for DirectoryNamespace {
         let (version, transaction) = self.find_transaction(&dataset, &id).await?;
 
         Ok(Self::transaction_response(version, &transaction))
+    }
+
+    async fn alter_transaction(
+        &self,
+        request: AlterTransactionRequest,
+    ) -> Result<AlterTransactionResponse> {
+        self.record_op("alter_transaction");
+
+        // Parse the request ID: must include table id and transaction identifier
+        let mut request_id = request.id.ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Transaction id must include table id and transaction identifier"
+                    .to_string(),
+            })
+        })?;
+        if request_id.len() < 2 {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Transaction request id must include table id and transaction identifier, got {:?}",
+                    request_id
+                ),
+            }
+            .into());
+        }
+
+        let txn_id = request_id.pop().expect("request_id len checked above");
+        let table_id = Some(request_id);
+        let table_uri = self.resolve_table_location(&table_id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "alter_transaction")
+            .await?;
+        let (version, transaction) = self.find_transaction(&dataset, &txn_id).await?;
+
+        // Collect current transaction properties
+        let mut properties = transaction
+            .transaction_properties
+            .as_ref()
+            .map(|props| (**props).clone())
+            .unwrap_or_default();
+        properties.insert("uuid".to_string(), transaction.uuid.clone());
+        properties.insert("version".to_string(), version.to_string());
+        properties.insert(
+            "read_version".to_string(),
+            transaction.read_version.to_string(),
+        );
+        properties.insert(
+            "operation".to_string(),
+            Self::transaction_operation_name(&transaction),
+        );
+        if let Some(tag) = &transaction.tag {
+            properties.insert("tag".to_string(), tag.clone());
+        }
+
+        // Process each action in the request
+        let mut final_status = "SUCCEEDED".to_string();
+        for action in &request.actions {
+            if let Some(ref set_status) = action.set_status_action
+                && let Some(ref status) = set_status.status
+            {
+                // Validate the status value (case-insensitive)
+                let normalized = status.to_lowercase().replace('_', "");
+                match normalized.as_str() {
+                    "queued" | "running" | "succeeded" | "failed" | "canceled" => {
+                        final_status = status.clone();
+                    }
+                    _ => {
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!(
+                                "Invalid transaction status '{}'. Valid values are: Queued, Running, Succeeded, Failed, Canceled",
+                                status
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            if let Some(ref set_property) = action.set_property_action
+                && let (Some(key), Some(value)) = (&set_property.key, &set_property.value)
+            {
+                let mode = set_property
+                    .mode
+                    .as_deref()
+                    .unwrap_or("Overwrite")
+                    .to_lowercase();
+                match mode.as_str() {
+                    "overwrite" => {
+                        properties.insert(key.clone(), value.clone());
+                    }
+                    "fail" => {
+                        if properties.contains_key(key) {
+                            return Err(NamespaceError::ConcurrentModification {
+                                message: format!(
+                                    "Property '{}' already exists and mode is 'Fail'",
+                                    key
+                                ),
+                            }
+                            .into());
+                        }
+                        properties.insert(key.clone(), value.clone());
+                    }
+                    "skip" => {
+                        if !properties.contains_key(key) {
+                            properties.insert(key.clone(), value.clone());
+                        }
+                    }
+                    _ => {
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!(
+                                "Invalid set_property mode '{}'. Valid values are: Overwrite, Fail, Skip",
+                                mode
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            if let Some(ref unset_property) = action.unset_property_action
+                && let Some(ref key) = unset_property.key
+            {
+                let mode = unset_property
+                    .mode
+                    .as_deref()
+                    .unwrap_or("Skip")
+                    .to_lowercase();
+                match mode.as_str() {
+                    "skip" => {
+                        properties.remove(key);
+                    }
+                    "fail" => {
+                        if !properties.contains_key(key) {
+                            return Err(NamespaceError::InvalidInput {
+                                message: format!(
+                                    "Property '{}' does not exist and mode is 'Fail'",
+                                    key
+                                ),
+                            }
+                            .into());
+                        }
+                        properties.remove(key);
+                    }
+                    _ => {
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!(
+                                "Invalid unset_property mode '{}'. Valid values are: Skip, Fail",
+                                mode
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+
+        Ok(AlterTransactionResponse {
+            status: final_status,
+            properties: Some(properties),
+        })
     }
 
     async fn create_table_scalar_index(
@@ -12967,5 +13127,254 @@ mod tests {
             .await
             .expect("reopen branch failed");
         assert_eq!(scan_id_column(&reopened).await, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_set_status() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+            DescribeTransactionRequest,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        if let Some(txn_id) = transaction_id {
+            // First verify the transaction exists
+            let describe_resp = namespace
+                .describe_transaction(DescribeTransactionRequest {
+                    id: Some(vec!["users".to_string(), txn_id.clone()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(describe_resp.status, "SUCCEEDED");
+
+            // Alter the transaction status
+            let response = namespace
+                .alter_transaction(AlterTransactionRequest {
+                    id: Some(vec!["users".to_string(), txn_id.clone()]),
+                    actions: vec![AlterTransactionAction {
+                        set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                            status: Some("Canceled".to_string()),
+                        })),
+                        set_property_action: None,
+                        unset_property_action: None,
+                    }],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.status, "Canceled");
+            assert!(response.properties.is_some());
+            let props = response.properties.unwrap();
+            assert_eq!(props.get("uuid"), Some(&txn_id));
+            assert_eq!(props.get("operation"), Some(&"CreateIndex".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_set_property() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        if let Some(txn_id) = transaction_id {
+            let response = namespace
+                .alter_transaction(AlterTransactionRequest {
+                    id: Some(vec!["users".to_string(), txn_id.clone()]),
+                    actions: vec![AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                            key: Some("custom_key".to_string()),
+                            value: Some("custom_value".to_string()),
+                            mode: None,
+                        })),
+                        unset_property_action: None,
+                    }],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.status, "SUCCEEDED");
+            let props = response.properties.unwrap();
+            assert_eq!(props.get("custom_key"), Some(&"custom_value".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_set_property_fail_mode() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        if let Some(txn_id) = transaction_id {
+            // Try to set a property that already exists (uuid) with Fail mode
+            let result = namespace
+                .alter_transaction(AlterTransactionRequest {
+                    id: Some(vec!["users".to_string(), txn_id.clone()]),
+                    actions: vec![AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                            key: Some("uuid".to_string()),
+                            value: Some("new_value".to_string()),
+                            mode: Some("Fail".to_string()),
+                        })),
+                        unset_property_action: None,
+                    }],
+                    ..Default::default()
+                })
+                .await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_unset_property() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+            AlterTransactionUnsetProperty,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        if let Some(txn_id) = transaction_id {
+            // First set a custom property, then unset it
+            let response = namespace
+                .alter_transaction(AlterTransactionRequest {
+                    id: Some(vec!["users".to_string(), txn_id.clone()]),
+                    actions: vec![
+                        AlterTransactionAction {
+                            set_status_action: None,
+                            set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                                key: Some("temp_key".to_string()),
+                                value: Some("temp_value".to_string()),
+                                mode: None,
+                            })),
+                            unset_property_action: None,
+                        },
+                        AlterTransactionAction {
+                            set_status_action: None,
+                            set_property_action: None,
+                            unset_property_action: Some(Box::new(AlterTransactionUnsetProperty {
+                                key: Some("temp_key".to_string()),
+                                mode: None,
+                            })),
+                        },
+                    ],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.status, "SUCCEEDED");
+            let props = response.properties.unwrap();
+            assert!(!props.contains_key("temp_key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_invalid_status() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        if let Some(txn_id) = transaction_id {
+            let result = namespace
+                .alter_transaction(AlterTransactionRequest {
+                    id: Some(vec!["users".to_string(), txn_id.clone()]),
+                    actions: vec![AlterTransactionAction {
+                        set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                            status: Some("InvalidStatus".to_string()),
+                        })),
+                        set_property_action: None,
+                        unset_property_action: None,
+                    }],
+                    ..Default::default()
+                })
+                .await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_not_found() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // Try to alter a non-existent transaction
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), "non_existent_txn".to_string()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_missing_id() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Try with missing id
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: None,
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+
+        // Try with insufficient id parts
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
     }
 }
