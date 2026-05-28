@@ -7,7 +7,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
-use arrow::array::AsArray;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::runtime::SpawnedTask;
@@ -39,11 +38,9 @@ use lance_datafusion::utils::{
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult, index_expr_result_from_parts};
+use lance_index::scalar::expression::{FilterPlan, IndexExprResult, deserialize_index_expr_result};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_select::{
-    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
-};
+use lance_select::{RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
@@ -80,30 +77,7 @@ impl EvaluatedIndex {
     }
 
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
-        if batch.num_rows() != 2 {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Expected a batch with exactly 2 rows but there are {} rows",
-                    batch.num_rows()
-                )
-                .into(),
-            ));
-        }
-        if batch.num_columns() != 3 {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Expected a batch with exactly two columns but there are {} columns",
-                    batch.num_columns()
-                )
-                .into(),
-            ));
-        }
-        let lower = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
-        let upper = RowAddrMask::from_arrow(batch.column(1).as_binary())?;
-        let index_result = index_expr_result_from_parts(lower, upper);
-
-        let applicable_fragments = batch.column(2).as_binary::<i32>();
-        let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
+        let (index_result, applicable_fragments) = deserialize_index_expr_result(batch)?;
 
         Ok(Self {
             index_result,
