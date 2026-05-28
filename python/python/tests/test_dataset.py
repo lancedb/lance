@@ -2443,6 +2443,86 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert dataset.to_table().sort_by("a") == expected
 
 
+def test_merge_insert_full_fragment_rewrite_json_e2e(tmp_path: Path):
+    """End-to-end test: merge_insert with JSON columns where ALL rows are updated.
+
+    This exercises the "all rows updated" fast path in handle_fragment which
+    bypasses the Updater and writes directly. Without proper JSON conversion,
+    Utf8 data (i32 offsets) is written with a LargeBinary schema (i64 offsets),
+    causing a decoder panic on subsequent reads:
+        "the offset of the new Buffer cannot exceed the existing Length:
+         slice offset=0 Length=N selfLen=N/2"
+
+    Conditions to trigger the fast path:
+    1. Subschema update (not all columns provided)
+    2. ALL rows in a fragment are matched/updated
+    3. data_storage_version = 2.2
+    """
+    import json
+
+    json_type = pa.json_()
+
+    # Create dataset with v2.2 storage format
+    initial_data = pa.table(
+        {
+            "unique_id": pa.array([f"id_{i}" for i in range(5)], type=pa.utf8()),
+            "coarse": pa.array(
+                [f'{{"original":{i}}}' for i in range(5)],
+                type=json_type,
+            ),
+            "score": pa.array(range(5), type=pa.int64()),
+        }
+    )
+    dataset = lance.write_dataset(
+        initial_data,
+        tmp_path / "e2e_json_rewrite",
+        data_storage_version="2.2",
+    )
+    assert dataset.count_rows() == 5
+    assert len(dataset.get_fragments()) == 1
+
+    # Subschema merge_insert: only provide [unique_id, coarse], update ALL rows
+    # This triggers: subschema → v1 path → all rows matched → fast path
+    update_data = pa.table(
+        {
+            "unique_id": pa.array([f"id_{i}" for i in range(5)], type=pa.utf8()),
+            "coarse": pa.array(
+                [f'{{"updated":true,"id":{i}}}' for i in range(5)],
+                type=json_type,
+            ),
+        }
+    )
+    dataset.merge_insert("unique_id").when_matched_update_all().execute(update_data)
+
+    # Critical: read back should NOT panic
+    result = dataset.to_table().sort_by("unique_id")
+    assert result.num_rows == 5
+
+    # Verify score column (not in update) is preserved
+    scores = result.column("score").to_pylist()
+    assert scores == [0, 1, 2, 3, 4]
+
+    # Verify JSON column was updated correctly
+    coarse_values = result.column("coarse").to_pylist()
+    for i, val in enumerate(coarse_values):
+        parsed = json.loads(val) if isinstance(val, str) else val
+        assert parsed.get("updated") is True, (
+            f"Row {i} should have updated coarse, got {val}"
+        )
+
+    # Verify take also works (different read path)
+    take_result = dataset.take([0, 2, 4])
+    assert take_result.num_rows == 3
+    take_coarse = take_result.column("coarse").to_pylist()
+    for val in take_coarse:
+        parsed = json.loads(val) if isinstance(val, str) else val
+        assert parsed.get("updated") is True
+
+    # Verify sample also works
+    sample_result = dataset.sample(3)
+    assert sample_result.num_rows == 3
+
+
 def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):
     base_dir = tmp_path / "merge_insert_pk_default"
 
