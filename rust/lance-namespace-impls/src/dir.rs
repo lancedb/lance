@@ -9850,7 +9850,7 @@ mod tests {
     /// (1 create + N-1 appends) and returns the namespace plus the table id.
     async fn create_tagged_test_table(
         versions: u32,
-    ) -> (DirectoryNamespace, TempStdDir, Vec<String>) {
+    ) -> (Arc<DirectoryNamespace>, TempStdDir, Vec<String>) {
         use arrow::array::{Int32Array, RecordBatchIterator};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
@@ -9861,11 +9861,12 @@ mod tests {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
 
-        let namespace = DirectoryNamespaceBuilder::new(temp_path)
-            .build()
-            .await
-            .unwrap();
-
+        let namespace = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .build()
+                .await
+                .unwrap(),
+        );
         let table_id = vec!["tag_table".to_string()];
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "id",
@@ -9883,17 +9884,9 @@ mod tests {
             ..Default::default()
         };
 
-        // Wrap namespace in Arc only for write_into_namespace; the original is returned to the caller.
-        let namespace_arc: Arc<dyn LanceNamespace> = Arc::new(
-            DirectoryNamespaceBuilder::new(temp_path)
-                .build()
-                .await
-                .unwrap(),
-        );
-
         let mut dataset = Dataset::write_into_namespace(
             batches,
-            namespace_arc.clone(),
+            namespace.clone() as Arc<dyn LanceNamespace>,
             table_id.clone(),
             Some(write_params),
         )
@@ -10087,9 +10080,10 @@ mod tests {
         let mut req = CreateTableTagRequest::new("v1".to_string(), 1);
         req.id = Some(vec!["does_not_exist".to_string()]);
         let err = namespace.create_table_tag(req).await.unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("Table"),
-            "expected table-not-found error, got: {}",
+            msg.contains("Table") && msg.to_lowercase().contains("not found"),
+            "expected TableNotFound error, got: {}",
             err
         );
     }
