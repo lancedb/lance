@@ -31,8 +31,8 @@ use futures::{
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
-use rayon::prelude::*;
 use lance_core::{Error, Result};
+use rayon::prelude::*;
 use log::trace;
 
 #[derive(Debug)]
@@ -355,12 +355,12 @@ struct RepDefStructDecodeTask {
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        // Extract fields from self to avoid partial-move issues when
-        // children are consumed in the parallel decode path below.
-        let child_fields = self.child_fields;
-        let is_root = self.is_root;
-        let num_rows = self.num_rows;
-        let children = self.children;
+        let Self {
+            children,
+            child_fields,
+            is_root,
+            num_rows,
+        } = *self;
 
         if children.is_empty() {
             return Ok(DecodedArray {
@@ -370,26 +370,27 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             });
         }
 
-        let arrays = children
+        let arrays: Vec<_> = children
             .into_par_iter()
             .map(|task| task.decode())
-            .collect::<Result<Vec<_>>>()?;
-        let mut child_arrays = Vec::with_capacity(arrays.len());
-        let mut data_size = 0u64;
-        let mut arrays_iter = arrays.into_iter();
-        let first_array = arrays_iter.next().unwrap();
-        let length = first_array.array.len();
+            .collect::<Result<_>>()?;
+
+        let mut iter = arrays.into_iter();
+        let first = iter.next().unwrap();
+        let length = first.array.len();
+        let mut repdef = first.repdef;
+        let mut data_size = first.data_size;
 
         // The repdef should be identical across all children at this point
-        let mut repdef = first_array.repdef;
-        data_size += first_array.data_size;
-        child_arrays.push(first_array.array);
-
-        for array in arrays_iter {
-            debug_assert_eq!(length, array.array.len());
-            data_size += array.data_size;
-            child_arrays.push(array.array);
-        }
+        let child_arrays: Vec<_> = std::iter::once(first.array)
+            .chain(
+                iter.inspect(|a| {
+                    debug_assert_eq!(a.array.len(), length);
+                    data_size += a.data_size;
+                })
+                .map(|a| a.array),
+            )
+            .collect();
 
         let validity = if is_root {
             None
@@ -850,10 +851,7 @@ mod tests {
         .await;
     }
 
-    /// Verify parallel column decode produces correct results for wide structs.
-    ///
-    /// This test ensures the `std::thread::scope` parallelization path (triggered
-    /// when a struct has 4+ columns) yields identical results to what sequential
+    /// Test that parallel decode produces the same results as sequential
     /// decode would produce.
     #[test_log::test(tokio::test)]
     async fn test_wide_struct_parallel_decode() {
