@@ -28,6 +28,7 @@ use futures::stream::repeat_with;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::LanceCache;
+use lance_core::utils::futures::StreamOnDropExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -354,10 +355,7 @@ pub async fn shuffle_dataset(
         .into_iter()
         .map(|stream| {
             let guard = temp_dir_guard.clone();
-            stream.map(move |item| {
-                let _keep_alive = &guard;
-                item
-            })
+            stream.on_drop(move || drop(guard))
         })
         .collect::<Vec<_>>();
 
