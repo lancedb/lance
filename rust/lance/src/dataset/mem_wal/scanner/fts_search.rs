@@ -22,9 +22,13 @@
 //! benchmark in this PR shows it carries a real latency penalty, so the
 //! local path lands first and the global option is optimized separately.
 //!
-//! Staleness: per-source results are returned as-is. The same primary
-//! key may appear from multiple sources if it was updated across
-//! generations; the caller deduplicates downstream if needed.
+//! Staleness: within a flushed generation, the deletion vector written
+//! at flush time (see #6929) already masks rows superseded by a newer
+//! generation, so per-source results are clean within each tier. The
+//! same primary key can still appear across tiers (active vs flushed)
+//! when an updated row sits in the active memtable while the older
+//! copy lives in a flushed generation; cross-tier deduplication is
+//! left to the caller in local mode.
 //!
 //! Everything here is contained in the `mem_wal` module — it reuses the
 //! existing per-source FTS read paths (`scanner.full_text_search` for
@@ -47,8 +51,10 @@ use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+use crate::session::Session;
 
 /// `_score` column name in FTS results — kept aligned with
 /// `lance_index::scalar::inverted::SCORE_COL` so this module doesn't
@@ -60,6 +66,10 @@ pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
     pk_columns: Vec<String>,
     base_schema: SchemaRef,
+    /// Session threaded into flushed-generation opens (shared caches).
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmFtsSearchPlanner {
@@ -73,7 +83,23 @@ impl LsmFtsSearchPlanner {
             collector,
             pk_columns,
             base_schema,
+            session: None,
+            flushed_cache: None,
         }
+    }
+
+    /// Thread a session into flushed-generation opens so the first open
+    /// populates the shared index / file-metadata caches.
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// searches against the same generation a pure `Arc::clone`.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
+        self
     }
 
     /// Build the FTS execution plan (local scoring).
@@ -183,9 +209,9 @@ impl LsmFtsSearchPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = crate::dataset::DatasetBuilder::from_uri(path)
-                    .load()
-                    .await?;
+                let dataset =
+                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await?;
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;

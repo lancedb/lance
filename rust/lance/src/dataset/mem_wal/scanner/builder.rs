@@ -314,8 +314,14 @@ impl LsmScanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
-        let planner =
+        let mut planner =
             super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        if let Some(session) = &self.session {
+            planner = planner.with_session(session.clone());
+        }
+        if let Some(cache) = &self.flushed_cache {
+            planner = planner.with_flushed_cache(cache.clone());
+        }
         planner
             .plan_search(column, query, k, self.projection.as_deref())
             .await
