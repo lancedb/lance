@@ -2041,8 +2041,9 @@ public class Dataset implements Closeable {
    * {@code _rowaddr}, and {@code _rowoffset}, allowing rows to be targeted by stable row id (e.g.
    * {@code "_rowid IN (1, 2, 3)"}).
    *
-   * <p>It is important that after update the current dataset is changed and should be closed. The
-   * new committed dataset is contained in the {@link UpdateResult}.
+   * <p>This call does not mutate the current {@code Dataset} instance: it still references the
+   * pre-update version. Callers should close this {@code Dataset} and switch to {@link
+   * UpdateResult#getDataset()}, which holds the newly committed version.
    *
    * @param params update parameters
    * @return UpdateResult containing the new committed Dataset and the number of rows updated.

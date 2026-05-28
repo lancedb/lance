@@ -31,6 +31,12 @@ import java.util.Optional;
  * <p>The {@code where} clause accepts the dataset columns as well as the system columns {@code
  * _rowid}, {@code _rowaddr}, and {@code _rowoffset}, which is useful for targeting specific rows by
  * stable row id.
+ *
+ * <p><strong>Important:</strong> {@code _rowid} is only a <em>stable</em> identifier when the
+ * dataset was created with {@code WriteParams.Builder().withEnableStableRowIds(true)}. Without
+ * stable row ids, {@code _rowid} is a positional id that can shift across compaction, deletion, or
+ * re-insertion. Targeting rows by an unstable {@code _rowid} in {@link #withWhere(String)} can
+ * silently update the wrong rows.
  */
 public class UpdateParams {
   // Defaults are kept in sync with the Rust core defaults declared on
@@ -55,6 +61,10 @@ public class UpdateParams {
    *
    * <p>The predicate is evaluated against the dataset schema augmented with the system columns
    * {@code _rowid}, {@code _rowaddr}, and {@code _rowoffset}.
+   *
+   * <p>When matching rows by {@code _rowid}, the dataset must have been created with stable row ids
+   * enabled (see the class-level Javadoc); otherwise the predicate may silently target the wrong
+   * rows.
    *
    * @param whereClause SQL predicate, e.g. {@code "id = 1"} or {@code "_rowid IN (1, 2, 3)"}.
    * @return This UpdateParams instance.

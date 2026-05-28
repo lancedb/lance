@@ -25,10 +25,16 @@ import com.google.common.base.MoreObjects;
 public final class UpdateResult {
   private final Dataset dataset;
   private final long numRowsUpdated;
+  // Snapshot the dataset identity at construction time so toString() stays safe to call after the
+  // caller has closed the dataset (closed datasets reject native uri()/version() calls).
+  private final String datasetUri;
+  private final long datasetVersion;
 
   public UpdateResult(Dataset dataset, long numRowsUpdated) {
     this.dataset = dataset;
     this.numRowsUpdated = numRowsUpdated;
+    this.datasetUri = dataset.uri();
+    this.datasetVersion = dataset.version();
   }
 
   /** Returns the new dataset reflecting the committed update. */
@@ -43,11 +49,10 @@ public final class UpdateResult {
 
   @Override
   public String toString() {
-    // Avoid dumping the full Dataset (which includes native handles, schema, manifest, etc.).
-    // A lightweight identifier (uri + version) is enough for diagnostics.
+    // Use the snapshot taken at construction time; the caller may have already closed `dataset`.
     return MoreObjects.toStringHelper(this)
-        .add("datasetUri", dataset.uri())
-        .add("datasetVersion", dataset.version())
+        .add("datasetUri", datasetUri)
+        .add("datasetVersion", datasetVersion)
         .add("numRowsUpdated", numRowsUpdated)
         .toString();
   }

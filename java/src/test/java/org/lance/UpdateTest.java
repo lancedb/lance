@@ -178,6 +178,32 @@ public class UpdateTest {
         IllegalArgumentException.class, () -> new UpdateParams(Collections.emptyMap()));
   }
 
+  @Test
+  public void testUpdateRejectsNegativeRetryParameters() {
+    UpdateParams params = new UpdateParams(ImmutableMap.of("name", "'x'"));
+    Assertions.assertThrows(IllegalArgumentException.class, () -> params.withConflictRetries(-1));
+    Assertions.assertThrows(IllegalArgumentException.class, () -> params.withRetryTimeoutMs(-1));
+  }
+
+  @Test
+  public void testUpdatePropagatesInvalidWhereClause() {
+    // Unknown column should surface as an exception from the Rust core, not a silent no-op.
+    Assertions.assertThrows(
+        Exception.class,
+        () ->
+            dataset.update(
+                new UpdateParams(ImmutableMap.of("name", "'x'"))
+                    .withWhere("nonexistent_column = 1")));
+  }
+
+  @Test
+  public void testUpdatePropagatesInvalidUpdateExpression() {
+    // Malformed SQL expression should surface as an exception, not a silent no-op.
+    Assertions.assertThrows(
+        Exception.class,
+        () -> dataset.update(new UpdateParams(ImmutableMap.of("name", "this is not sql"))));
+  }
+
   /**
    * Returns a 2-element list: index 0 contains the {@code _rowid} values, index 1 contains the
    * {@code id} values. Both arrays are sized to {@link #ROW_COUNT}.
