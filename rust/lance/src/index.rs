@@ -7010,10 +7010,7 @@ mod tests {
 
         let reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
-            .col(
-                "vector",
-                array::rand_vec::<Float32Type>(8.into()),
-            )
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
             .into_reader_rows(RowCount::from(10), BatchCount::from(2));
 
         let mut dataset = Dataset::write(
