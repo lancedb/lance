@@ -1469,7 +1469,7 @@ def test_fts_deleted_rows_with_stable_row_ids(tmp_path):
     # Regression test: stable-row-id prefiltering must not leak deleted rows.
     data = pa.table(
         {
-            "text": [f"dup_{i}" for i in range(200)],
+            "text": ["dup"] * 200,
             "category": [["A", "B", "C", "D", "E"][i % 5] for i in range(200)],
         }
     )
