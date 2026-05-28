@@ -354,20 +354,45 @@ struct RepDefStructDecodeTask {
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        if self.children.is_empty() {
+        // Extract fields from self to avoid partial-move issues when
+        // children are consumed in the parallel decode path below.
+        let child_fields = self.child_fields;
+        let is_root = self.is_root;
+        let num_rows = self.num_rows;
+        let children = self.children;
+
+        if children.is_empty() {
             return Ok(DecodedArray {
-                array: Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
+                array: Arc::new(StructArray::new_empty_fields(num_rows as usize, None)),
                 repdef: CompositeRepDefUnraveler::new(vec![]),
                 data_size: 0,
             });
         }
 
-        let arrays = self
-            .children
-            .into_iter()
-            .map(|task| task.decode())
-            .collect::<Result<Vec<_>>>()?;
-        let mut children = Vec::with_capacity(arrays.len());
+        // Parallel column decoding for wide tables (4+ columns).
+        // When a struct has many child columns, each column's page decoding is
+        // independent CPU work.  Spreading it across threads improves scan
+        // throughput for wide analytical tables.
+        const PARALLEL_DECODE_MIN_CHILDREN: usize = 4;
+
+        let arrays = if children.len() >= PARALLEL_DECODE_MIN_CHILDREN {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = children
+                    .into_iter()
+                    .map(|task| s.spawn(move || task.decode()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Result<Vec<_>>>()
+            })?
+        } else {
+            children
+                .into_iter()
+                .map(|task| task.decode())
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut child_arrays = Vec::with_capacity(arrays.len());
         let mut data_size = 0u64;
         let mut arrays_iter = arrays.into_iter();
         let first_array = arrays_iter.next().unwrap();
@@ -376,21 +401,21 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         // The repdef should be identical across all children at this point
         let mut repdef = first_array.repdef;
         data_size += first_array.data_size;
-        children.push(first_array.array);
+        child_arrays.push(first_array.array);
 
         for array in arrays_iter {
             debug_assert_eq!(length, array.array.len());
             data_size += array.data_size;
-            children.push(array.array);
+            child_arrays.push(array.array);
         }
 
-        let validity = if self.is_root {
+        let validity = if is_root {
             None
         } else {
             repdef.unravel_validity(length)
         };
 
-        let array = StructArray::try_new(self.child_fields, children, validity)
+        let array = StructArray::try_new(child_fields, child_arrays, validity)
             .map_err(|e| Error::invalid_input_source(e.to_string().into()))?;
         Ok(DecodedArray {
             array: Arc::new(array),
@@ -841,6 +866,26 @@ mod tests {
             HashMap::new(),
         )
         .await;
+    }
+
+    /// Verify parallel column decode produces correct results for wide structs.
+    ///
+    /// This test ensures the `std::thread::scope` parallelization path (triggered
+    /// when a struct has 4+ columns) yields identical results to what sequential
+    /// decode would produce.
+    #[test_log::test(tokio::test)]
+    async fn test_wide_struct_parallel_decode() {
+        // Wide struct with 6 primitive columns to trigger parallel path
+        let data_type = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("c", DataType::Float32, true),
+            Field::new("d", DataType::Float64, true),
+            Field::new("e", DataType::Utf8, true),
+            Field::new("f", DataType::Int16, true),
+        ]));
+        let field = Field::new("row", data_type, false);
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
