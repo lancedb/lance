@@ -244,6 +244,11 @@ impl IndexDetails {
         self.0.type_url.ends_with("InvertedIndexDetails")
     }
 
+    /// Returns true if the index is a suffix array index (for infini-gram queries)
+    pub fn supports_suffix_array(&self) -> bool {
+        self.0.type_url.ends_with("SuffixArrayIndexDetails")
+    }
+
     /// Returns the plugin for the index
     pub fn get_plugin(&self) -> Result<&dyn ScalarIndexPlugin> {
         SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(self.0.as_ref())
@@ -524,23 +529,40 @@ pub fn index_matches_criteria(
             ).into()));
         }
 
+        // An index without details cannot satisfy type-specific criteria
+        // (FTS, suffix array, etc.) — only concrete index details can prove
+        // the index is of the required type.
+        if criteria.must_support_fts || criteria.must_support_suffix_array || criteria.must_support_exact_equality {
+            return Ok(false);
+        }
+
         // If we don't have details then allow it for backwards compatibility
         return Ok(true);
     };
 
-    // Only apply scalar-specific checks to scalar indices
-    if !index_details.is_vector() {
-        if criteria.must_support_fts && !index_details.supports_fts() {
+    // Vector indices cannot satisfy scalar-specific criteria
+    if index_details.is_vector() {
+        if criteria.must_support_fts || criteria.must_support_suffix_array || criteria.must_support_exact_equality {
             return Ok(false);
         }
+        return Ok(true);
+    }
 
-        // We should not use FTS / NGram indices for exact equality queries
-        // (i.e. merge insert with a join on the indexed column)
-        if criteria.must_support_exact_equality {
-            let plugin = index_details.get_plugin()?;
-            if !plugin.provides_exact_answer() {
-                return Ok(false);
-            }
+    // Scalar-specific checks
+    if criteria.must_support_fts && !index_details.supports_fts() {
+        return Ok(false);
+    }
+
+    if criteria.must_support_suffix_array && !index_details.supports_suffix_array() {
+        return Ok(false);
+    }
+
+    // We should not use FTS / NGram indices for exact equality queries
+    // (i.e. merge insert with a join on the indexed column)
+    if criteria.must_support_exact_equality {
+        let plugin = index_details.get_plugin()?;
+        if !plugin.provides_exact_answer() {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -673,12 +695,7 @@ mod tests {
     fn test_index_matches_criteria_vector_index() {
         let index1 = make_index_metadata("vector_index", 1, Some(IndexType::Vector));
 
-        let criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
-            has_name: None,
-        };
+        let criteria = IndexCriteria::default();
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
         let schema = lance_core::datatypes::Schema {
@@ -699,12 +716,7 @@ mod tests {
         let inverted_index = make_index_metadata("inverted_index", 1, Some(IndexType::Inverted));
         let ngram_index = make_index_metadata("ngram_index", 1, Some(IndexType::NGram));
 
-        let criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
-            has_name: None,
-        };
+        let criteria = IndexCriteria::default();
 
         let field = Field::new_arrow("mycol", DataType::Int32, true).unwrap();
         let schema = lance_core::datatypes::Schema {
@@ -721,10 +733,8 @@ mod tests {
 
         // test for_column
         let mut criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
             for_column: Some("mycol"),
-            has_name: None,
+            ..Default::default()
         };
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
@@ -737,10 +747,8 @@ mod tests {
 
         // test has_name
         let mut criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
             has_name: Some("btree_index"),
+            ..Default::default()
         };
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
@@ -759,10 +767,8 @@ mod tests {
 
         // test supports_exact_equality
         let mut criteria = IndexCriteria {
-            must_support_fts: false,
             must_support_exact_equality: true,
-            for_column: None,
-            has_name: None,
+            ..Default::default()
         };
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
@@ -779,12 +785,7 @@ mod tests {
         assert!(!result);
 
         // test multiple indices
-        let mut criteria = IndexCriteria {
-            must_support_fts: false,
-            must_support_exact_equality: false,
-            for_column: None,
-            has_name: None,
-        };
+        let mut criteria = IndexCriteria::default();
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
         assert!(result);
@@ -2087,5 +2088,190 @@ mod tests {
             count_banana_rows, 0,
             "Should have 0 rows with value='banana' after deletion"
         );
+    }
+
+    #[test]
+    fn test_suffix_array_criteria_rejects_vector_index() {
+        // A vector index (with details) must NOT match suffix array criteria.
+        // This is the bug that caused flores_hard queries to pick up a SONAR
+        // embedding vector index instead of the SA index.
+        let vector_index = make_index_metadata("sonar_emb_idx", 1, Some(IndexType::Vector));
+
+        let field = Field::new_arrow("source_text_sonar2omni_emb", DataType::Float32, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default().supports_suffix_array();
+        let result =
+            index_matches_criteria(&vector_index, &criteria, &[&field], false, &schema).unwrap();
+        assert!(!result, "Vector index must NOT match suffix array criteria");
+    }
+
+    #[test]
+    fn test_suffix_array_criteria_rejects_index_without_details() {
+        // An index without details (older Lance version) must NOT match
+        // suffix array criteria — we can't verify it's actually an SA index.
+        let no_details_index = make_index_metadata("old_index", 1, None);
+
+        let field = Field::new_arrow("source_text", DataType::Utf8, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default().supports_suffix_array();
+        let result =
+            index_matches_criteria(&no_details_index, &criteria, &[&field], false, &schema)
+                .unwrap();
+        assert!(
+            !result,
+            "Index without details must NOT match suffix array criteria"
+        );
+    }
+
+    #[test]
+    fn test_suffix_array_criteria_rejects_btree_index() {
+        // A BTree scalar index must NOT match suffix array criteria.
+        let btree_index = make_index_metadata("btree_idx", 1, Some(IndexType::BTree));
+
+        let field = Field::new_arrow("source_text", DataType::Utf8, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default().supports_suffix_array();
+        let result =
+            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        assert!(
+            !result,
+            "BTree index must NOT match suffix array criteria"
+        );
+    }
+
+    #[test]
+    fn test_suffix_array_criteria_rejects_inverted_index() {
+        // An inverted (FTS) index must NOT match suffix array criteria.
+        let inverted_index = make_index_metadata("fts_idx", 1, Some(IndexType::Inverted));
+
+        let field = Field::new_arrow("source_text", DataType::Utf8, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default().supports_suffix_array();
+        let result =
+            index_matches_criteria(&inverted_index, &criteria, &[&field], false, &schema).unwrap();
+        assert!(
+            !result,
+            "Inverted index must NOT match suffix array criteria"
+        );
+    }
+
+    #[test]
+    fn test_fts_criteria_rejects_vector_index() {
+        // Vector index must NOT match FTS criteria either.
+        let vector_index = make_index_metadata("vec_idx", 1, Some(IndexType::Vector));
+
+        let field = Field::new_arrow("embeddings", DataType::Float32, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default();
+        let mut criteria = criteria;
+        criteria.must_support_fts = true;
+        let result =
+            index_matches_criteria(&vector_index, &criteria, &[&field], false, &schema).unwrap();
+        assert!(!result, "Vector index must NOT match FTS criteria");
+    }
+
+    #[test]
+    fn test_fts_criteria_rejects_index_without_details() {
+        // An index without details must NOT match FTS criteria.
+        let no_details_index = make_index_metadata("old_index", 1, None);
+
+        let field = Field::new_arrow("text_col", DataType::Utf8, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default();
+        let mut criteria = criteria;
+        criteria.must_support_fts = true;
+        let result =
+            index_matches_criteria(&no_details_index, &criteria, &[&field], false, &schema)
+                .unwrap();
+        assert!(
+            !result,
+            "Index without details must NOT match FTS criteria"
+        );
+    }
+
+    #[test]
+    fn test_exact_equality_criteria_rejects_index_without_details() {
+        // An index without details must NOT match exact equality criteria.
+        let no_details_index = make_index_metadata("old_index", 1, None);
+
+        let field = Field::new_arrow("id_col", DataType::Int32, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default();
+        let mut criteria = criteria;
+        criteria.must_support_exact_equality = true;
+        let result =
+            index_matches_criteria(&no_details_index, &criteria, &[&field], false, &schema)
+                .unwrap();
+        assert!(
+            !result,
+            "Index without details must NOT match exact equality criteria"
+        );
+    }
+
+    #[test]
+    fn test_default_criteria_still_matches_index_without_details() {
+        // Backwards compatibility: an index without details SHOULD match
+        // default criteria (no type-specific requirements).
+        let no_details_index = make_index_metadata("old_index", 1, None);
+
+        let field = Field::new_arrow("some_col", DataType::Utf8, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default();
+        let result =
+            index_matches_criteria(&no_details_index, &criteria, &[&field], false, &schema)
+                .unwrap();
+        assert!(
+            result,
+            "Index without details should match default criteria for backwards compatibility"
+        );
+    }
+
+    #[test]
+    fn test_default_criteria_still_matches_vector_index() {
+        // Vector indices should still match default criteria (no type requirements).
+        let vector_index = make_index_metadata("vec_idx", 1, Some(IndexType::Vector));
+
+        let field = Field::new_arrow("embeddings", DataType::Float32, true).unwrap();
+        let schema = lance_core::datatypes::Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+
+        let criteria = IndexCriteria::default();
+        let result =
+            index_matches_criteria(&vector_index, &criteria, &[&field], false, &schema).unwrap();
+        assert!(result, "Vector index should match default criteria");
     }
 }

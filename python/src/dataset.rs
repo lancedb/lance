@@ -75,7 +75,7 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
+    scalar::{FullTextSearchQuery, InfgramSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
         ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
@@ -83,6 +83,7 @@ use lance_index::{
 };
 use lance_index::{
     infer_system_index_type, metrics::NoOpMetricsCollector, scalar::inverted::query::Occur,
+    scalar::suffix_array::SuffixArrayQuery,
 };
 use lance_io::object_store::{
     LanceNamespaceStorageOptionsProvider, ObjectStoreParams, StorageOptionsAccessor,
@@ -1012,6 +1013,292 @@ impl Dataset {
             })
     }
 
+    /// Count occurrences of a byte pattern in a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// query : bytes
+    ///     Byte pattern to count.
+    ///
+    /// Returns
+    /// -------
+    /// int
+    ///     Number of occurrences.
+    fn suffix_array_count(&self, index_name: String, query: Vec<u8>) -> PyResult<u64> {
+        rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+            let sa_query = SuffixArrayQuery::Count { query_bytes: query };
+            let result = index.search(&sa_query, &NoOpMetricsCollector).await?;
+            match result {
+                lance_index::scalar::SearchResult::Exact(row_set) => {
+                    // Count is encoded as a synthetic row address
+                    let count: u64 = row_set
+                        .true_rows()
+                        .row_addrs()
+                        .map(|addrs| addrs.map(u64::from).sum())
+                        .unwrap_or(0);
+                    Ok(count)
+                }
+                _ => Ok(0),
+            }
+        })?
+        .map_err(|err| PyIOError::new_err(format!("Suffix array count failed: {}", err)))
+    }
+
+    /// Search for positions of a byte pattern in a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// query : bytes
+    ///     Byte pattern to search for.
+    /// max_results : int, optional
+    ///     Maximum number of positions to return. Default 100.
+    ///
+    /// Returns
+    /// -------
+    /// list[int]
+    ///     Byte positions within the corpus where the pattern occurs.
+    fn suffix_array_search(
+        &self,
+        index_name: String,
+        query: Vec<u8>,
+        max_results: Option<usize>,
+    ) -> PyResult<Vec<u64>> {
+        let max_results = max_results.unwrap_or(100);
+        rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+            let sa_query = SuffixArrayQuery::Search {
+                query_bytes: query,
+                max_results,
+            };
+            let result = index.search(&sa_query, &NoOpMetricsCollector).await?;
+            match result {
+                lance_index::scalar::SearchResult::Exact(row_set) => {
+                    let positions: Vec<u64> = row_set
+                        .true_rows()
+                        .row_addrs()
+                        .map(|addrs| addrs.map(u64::from).collect())
+                        .unwrap_or_default();
+                    Ok(positions)
+                }
+                _ => Ok(vec![]),
+            }
+        })?
+        .map_err(|err| PyIOError::new_err(format!("Suffix array search failed: {}", err)))
+    }
+
+    /// Compute conditional probability P(continuation | prompt) using a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// prompt : bytes
+    ///     The conditioning context.
+    /// continuation : bytes
+    ///     The continuation to compute probability for.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Dictionary with keys: "prompt_cnt", "cont_cnt", "prob".
+    fn suffix_array_prob(
+        &self,
+        index_name: String,
+        prompt: Vec<u8>,
+        continuation: Vec<u8>,
+    ) -> PyResult<(u64, u64, f64)> {
+        let result = rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+
+            let sa_index = index
+                .as_any()
+                .downcast_ref::<lance_index::scalar::suffix_array::SuffixArrayIndex>()
+                .ok_or_else(|| {
+                    lance::Error::invalid_input("Index is not a SuffixArrayIndex")
+                })?;
+
+            sa_index.compute_prob(&prompt, &continuation).await
+        })?
+        .map_err(|err: lance::Error| PyIOError::new_err(format!("Suffix array prob failed: {}", err)))?;
+
+        Ok((result.prompt_cnt, result.cont_cnt, result.prob))
+    }
+
+    /// Compute next-byte distribution after a prompt using a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// prompt : bytes
+    ///     The conditioning context.
+    /// max_support : int, optional
+    ///     Maximum entries to scan; uses approximate mode if exceeded.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Dictionary with keys: "prompt_cnt", "approximate", "distribution"
+    ///     where distribution is a list of dicts with "byte", "count", "prob".
+    fn suffix_array_ntd(
+        &self,
+        index_name: String,
+        prompt: Vec<u8>,
+        max_support: Option<u64>,
+    ) -> PyResult<(u64, bool, Vec<(u8, u64, f64)>)> {
+        let result = rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+
+            let sa_index = index
+                .as_any()
+                .downcast_ref::<lance_index::scalar::suffix_array::SuffixArrayIndex>()
+                .ok_or_else(|| {
+                    lance::Error::invalid_input("Index is not a SuffixArrayIndex")
+                })?;
+
+            sa_index.compute_ntd(&prompt, max_support).await
+        })?
+        .map_err(|err: lance::Error| PyIOError::new_err(format!("Suffix array ntd failed: {}", err)))?;
+
+        let distribution: Vec<(u8, u64, f64)> = result
+            .distribution
+            .iter()
+            .map(|e| (e.byte_value, e.count, e.prob))
+            .collect();
+        Ok((result.prompt_cnt, result.approximate, distribution))
+    }
+
+    /// Compute infinity-gram probability with backoff using a suffix array index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the suffix array index.
+    /// prompt : bytes
+    ///     The conditioning context.
+    /// continuation : bytes
+    ///     The continuation to compute probability for.
+    ///
+    /// Returns
+    /// -------
+    /// dict
+    ///     Dictionary with keys: "prompt_cnt", "cont_cnt", "prob",
+    ///     "effective_suffix_len".
+    fn suffix_array_infgram_prob(
+        &self,
+        index_name: String,
+        prompt: Vec<u8>,
+        continuation: Vec<u8>,
+    ) -> PyResult<(u64, u64, f64, usize)> {
+        let result = rt().block_on(None, async {
+            let metadatas = self.ds.load_indices_by_name(&index_name).await?;
+            if metadatas.is_empty() {
+                return Err(lance::Error::index_not_found(format!(
+                    "name={}",
+                    index_name
+                )));
+            }
+            let field_id = metadatas[0].fields[0];
+            let field_path = self.ds.schema().field_path(field_id)?;
+            let index = self
+                .ds
+                .open_scalar_index(
+                    &field_path,
+                    &metadatas[0].uuid.to_string(),
+                    &NoOpMetricsCollector,
+                )
+                .await?;
+
+            let sa_index = index
+                .as_any()
+                .downcast_ref::<lance_index::scalar::suffix_array::SuffixArrayIndex>()
+                .ok_or_else(|| {
+                    lance::Error::invalid_input("Index is not a SuffixArrayIndex")
+                })?;
+
+            sa_index.compute_infgram_prob(&prompt, &continuation).await
+        })?
+        .map_err(|err: lance::Error| {
+            PyIOError::new_err(format!("Suffix array infgram_prob failed: {}", err))
+        })?;
+
+        Ok((
+            result.prob_result.prompt_cnt,
+            result.prob_result.cont_cnt,
+            result.prob_result.prob,
+            result.effective_suffix_len,
+        ))
+    }
+
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
         let manifest_bytes = self.ds.manifest().serialized();
         PyBytes::new(py, &manifest_bytes).into()
@@ -1106,7 +1393,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, infgram_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1130,6 +1417,7 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
         full_text_query: Option<&Bound<'_, PyAny>>,
+        infgram_query: Option<&Bound<'_, PyAny>>,
         late_materialization: Option<Bound<PyAny>>,
         blob_handling: Option<Bound<PyAny>>,
         use_scalar_index: Option<bool>,
@@ -1247,6 +1535,134 @@ impl Dataset {
 
             scanner
                 .full_text_search(fts_query)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(infgram_query) = infgram_query {
+            let infgram = if let Ok(query_str) = infgram_query.extract::<String>() {
+                // Simple string query: infgram_query="fox"
+                // May contain AND/OR operators — parsed by Rust at execution time
+                InfgramSearchQuery::new(query_str)
+            } else if let Ok(dict) = infgram_query.cast::<PyDict>() {
+                // ---- Occur-based boolean: {"must": [...], "should": [...], "must_not": [...]} ----
+                if dict.get_item("must")?.is_some()
+                    || dict.get_item("should")?.is_some()
+                    || dict.get_item("must_not")?.is_some()
+                {
+                    // Helper: extract pattern strings from a list of {"pattern": "..."} dicts
+                    let extract_patterns = |key: &str| -> PyResult<Vec<String>> {
+                        match dict.get_item(key)? {
+                            Some(val) if !val.is_none() => {
+                                let list = val.downcast::<pyo3::types::PyList>()
+                                    .map_err(|_| PyValueError::new_err(
+                                        format!("infgram_query['{}'] must be a list", key)
+                                    ))?;
+                                let mut patterns = Vec::with_capacity(list.len());
+                                for item in list.iter() {
+                                    if let Ok(s) = item.extract::<String>() {
+                                        patterns.push(s);
+                                    } else if let Ok(d) = item.downcast::<PyDict>() {
+                                        if let Some(p) = d.get_item("pattern")? {
+                                            patterns.push(p.extract::<String>()?);
+                                        }
+                                    }
+                                }
+                                Ok(patterns)
+                            }
+                            _ => Ok(vec![]),
+                        }
+                    };
+                    let must = extract_patterns("must")?;
+                    let should = extract_patterns("should")?;
+                    let must_not = extract_patterns("must_not")?;
+                    let mut q = InfgramSearchQuery::new_boolean_occur(must, should, must_not);
+                    if let Some(col) = dict.get_item("column")? {
+                        if !col.is_none() {
+                            q = q.with_column(col.extract::<String>()?);
+                        }
+                    }
+                    if let Some(lim) = dict.get_item("limit")? {
+                        if !lim.is_none() {
+                            q = q.with_limit(Some(lim.extract::<usize>()?));
+                        }
+                    }
+                    q
+                }
+                // ---- Legacy CNF clauses: {"clauses": [["A", "B"], ["C"]]} ----
+                else if let Some(clauses_val) = dict.get_item("clauses")? {
+                    if !clauses_val.is_none() {
+                        let clauses: Vec<Vec<String>> = clauses_val.extract()?;
+                        let mut q = InfgramSearchQuery::new_boolean(clauses);
+                        if let Some(col) = dict.get_item("column")? {
+                            if !col.is_none() {
+                                q = q.with_column(col.extract::<String>()?);
+                            }
+                        }
+                        if let Some(lim) = dict.get_item("limit")? {
+                            if !lim.is_none() {
+                                q = q.with_limit(Some(lim.extract::<usize>()?));
+                            }
+                        }
+                        q
+                    } else {
+                        // clauses is None, fall through to query-based path
+                        let query_val = dict
+                            .get_item("query")?
+                            .ok_or_else(|| PyKeyError::new_err(
+                                "infgram_query must contain 'query' or 'clauses' key"
+                            ))?;
+                        let mut q = if let Ok(tokens) = query_val.extract::<Vec<i64>>() {
+                            InfgramSearchQuery::new_tokens(tokens)
+                        } else {
+                            InfgramSearchQuery::new(query_val.to_string())
+                        };
+                        if let Some(col) = dict.get_item("column")? {
+                            if !col.is_none() {
+                                q = q.with_column(col.extract::<String>()?);
+                            }
+                        }
+                        if let Some(lim) = dict.get_item("limit")? {
+                            if !lim.is_none() {
+                                q = q.with_limit(Some(lim.extract::<usize>()?));
+                            }
+                        }
+                        q
+                    }
+                } else {
+                    // No clauses key — use query-based path
+                    let query_val = dict
+                        .get_item("query")?
+                        .ok_or_else(|| PyKeyError::new_err(
+                            "infgram_query must contain 'query' or 'clauses' key"
+                        ))?;
+
+                    // Check if query is a list of ints (token IDs) or a string
+                    let mut q = if let Ok(tokens) = query_val.extract::<Vec<i64>>() {
+                        InfgramSearchQuery::new_tokens(tokens)
+                    } else {
+                        InfgramSearchQuery::new(query_val.to_string())
+                    };
+
+                    if let Some(col) = dict.get_item("column")? {
+                        if !col.is_none() {
+                            q = q.with_column(col.extract::<String>()?);
+                        }
+                    }
+                    if let Some(lim) = dict.get_item("limit")? {
+                        if !lim.is_none() {
+                            q = q.with_limit(Some(lim.extract::<usize>()?));
+                        }
+                    }
+                    q
+                }
+            } else {
+                return Err(PyValueError::new_err(
+                    "infgram_query must be a string, InfgramQuery, or dict with 'query' \
+                     (str or list[int]), 'clauses' (list[list[str]]), or \
+                     'must'/'should'/'must_not' (list[str/dict]); optional 'column', 'limit'",
+                ));
+            };
+            scanner
+                .infgram_search(infgram)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
@@ -2297,6 +2713,7 @@ impl Dataset {
             "BLOOMFILTER" => IndexType::BloomFilter,
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
+            "SUFFIX_ARRAY" => IndexType::SuffixArray,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
@@ -2337,6 +2754,38 @@ impl Dataset {
                 index_type: "rtree".to_string(),
                 params: None,
             }),
+            "SUFFIX_ARRAY" => {
+                let mut sa_params = serde_json::Map::new();
+                if let Some(kwargs) = kwargs {
+                    if let Some(ci) = kwargs.get_item("case_insensitive")? {
+                        if ci.extract::<bool>()? {
+                            sa_params.insert(
+                                "case_insensitive".to_string(),
+                                serde_json::Value::Bool(true),
+                            );
+                        }
+                    }
+                    if let Some(sep) = kwargs.get_item("separator_token_id")? {
+                        if !sep.is_none() {
+                            sa_params.insert(
+                                "separator_token_id".to_string(),
+                                serde_json::Value::Number(
+                                    serde_json::Number::from(sep.extract::<u32>()?)
+                                ),
+                            );
+                        }
+                    }
+                }
+                let params_json = if sa_params.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(sa_params).to_string())
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "suffixarray".to_string(),
+                    params: params_json,
+                })
+            },
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
                     return Err(PyValueError::new_err(

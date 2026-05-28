@@ -243,3 +243,113 @@ class BooleanQuery(FullTextQuery):
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.BOOLEAN
+
+
+# ---------------------------------------------------------------------------
+# Infini-gram (suffix array) query classes
+# ---------------------------------------------------------------------------
+
+
+class InfgramQuery:
+    """Single-pattern infini-gram (suffix array) query.
+
+    Parameters
+    ----------
+    pattern : str
+        The text pattern to search for as a substring.
+    column : str, optional
+        The column to search in. If None, searches the first
+        suffix-array-indexed column.
+
+    Examples
+    --------
+    >>> from lance.query import InfgramQuery, Occur
+    >>> q = InfgramQuery("transformer")
+    >>> q = InfgramQuery("transformer") & InfgramQuery("attention")
+    >>> q = InfgramQuery("cat") | InfgramQuery("kitten")
+    """
+
+    def __init__(self, pattern: str, *, column: Optional[str] = None):
+        self.pattern = pattern
+        self.column = column
+
+    def __and__(self, other: "InfgramQuery") -> "InfgramBooleanQuery":
+        if isinstance(other, InfgramBooleanQuery):
+            return InfgramBooleanQuery(
+                [(Occur.MUST, self)] + other.queries
+            )
+        return InfgramBooleanQuery([(Occur.MUST, self), (Occur.MUST, other)])
+
+    def __or__(self, other: "InfgramQuery") -> "InfgramBooleanQuery":
+        if isinstance(other, InfgramBooleanQuery):
+            return InfgramBooleanQuery(
+                [(Occur.SHOULD, self)] + other.queries
+            )
+        return InfgramBooleanQuery(
+            [(Occur.SHOULD, self), (Occur.SHOULD, other)]
+        )
+
+    def _to_dict(self) -> dict:
+        """Serialize for the PyO3 layer."""
+        return {"pattern": self.pattern, "column": self.column}
+
+
+class InfgramBooleanQuery(InfgramQuery):
+    """Boolean composition of infini-gram queries using Occur semantics.
+
+    Mirrors :class:`BooleanQuery` for full-text search.
+
+    Parameters
+    ----------
+    queries : list[tuple[Occur, InfgramQuery]]
+        The list of queries with their occurrence requirements.
+
+    Examples
+    --------
+    >>> from lance.query import InfgramQuery, InfgramBooleanQuery, Occur
+    >>> q = InfgramBooleanQuery([
+    ...     (Occur.MUST, InfgramQuery("transformer")),
+    ...     (Occur.MUST, InfgramQuery("attention")),
+    ...     (Occur.MUST_NOT, InfgramQuery("survey")),
+    ... ])
+    """
+
+    def __init__(self, queries: list[tuple[Occur, "InfgramQuery"]]):
+        self.queries = queries
+        # Inherit column from first sub-query that has one
+        col = None
+        for _, q in queries:
+            if getattr(q, "column", None) is not None:
+                col = q.column
+                break
+        super().__init__("", column=col)
+
+    def __and__(self, other: "InfgramQuery") -> "InfgramBooleanQuery":
+        if isinstance(other, InfgramBooleanQuery):
+            return InfgramBooleanQuery(self.queries + other.queries)
+        return InfgramBooleanQuery(self.queries + [(Occur.MUST, other)])
+
+    def __or__(self, other: "InfgramQuery") -> "InfgramBooleanQuery":
+        if isinstance(other, InfgramBooleanQuery):
+            return InfgramBooleanQuery(self.queries + other.queries)
+        return InfgramBooleanQuery(self.queries + [(Occur.SHOULD, other)])
+
+    def _to_dict(self) -> dict:
+        """Serialize to ``{must, should, must_not}`` for the PyO3 layer."""
+        must: list[dict] = []
+        should: list[dict] = []
+        must_not: list[dict] = []
+        for occur, q in self.queries:
+            serialized = q._to_dict()
+            if occur == Occur.MUST:
+                must.append(serialized)
+            elif occur == Occur.SHOULD:
+                should.append(serialized)
+            elif occur == Occur.MUST_NOT:
+                must_not.append(serialized)
+        return {
+            "must": must,
+            "should": should,
+            "must_not": must_not,
+            "column": self.column,
+        }

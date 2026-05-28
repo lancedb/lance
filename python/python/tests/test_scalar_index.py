@@ -4875,3 +4875,74 @@ def test_vector_filter_fts_search(tmp_path):
     )
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+def test_suffix_array_index(tmp_path: Path):
+    """Test create suffix array index and query it."""
+    texts = [
+        "the quick brown fox jumps over the lazy dog",
+        "the cat sat on the mat",
+        "a quick brown dog outpaces a quick brown fox",
+    ]
+    tbl = pa.Table.from_arrays(
+        [pa.array(texts)],
+        names=["text"],
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("text", index_type="SUFFIX_ARRAY", name="sa_idx")
+
+    indices = dataset.describe_indices()
+    assert len(indices) == 1
+    assert indices[0].index_type == "SuffixArray"
+
+    # Count occurrences of "the" across all documents
+    count = dataset.suffix_array_count("sa_idx", "the")
+    # "the quick brown fox" (1), "the lazy dog" (1),
+    # "the cat" (1), "the mat" (1) = 4 total
+    assert count == 4, f"Expected 4 occurrences of 'the', got {count}"
+
+    # Count something that doesn't exist
+    count = dataset.suffix_array_count("sa_idx", "xyz")
+    assert count == 0, f"Expected 0 occurrences of 'xyz', got {count}"
+
+    # Count with bytes input
+    count = dataset.suffix_array_count("sa_idx", b"fox")
+    assert count == 2, f"Expected 2 occurrences of 'fox', got {count}"
+
+    # Search for positions of "quick"
+    positions = dataset.suffix_array_search("sa_idx", "quick", max_results=10)
+    assert len(positions) == 3, (
+        f"Expected 3 positions for 'quick', got {len(positions)}"
+    )
+
+    # Search with max_results limit
+    positions = dataset.suffix_array_search("sa_idx", "quick", max_results=1)
+    assert len(positions) == 1, (
+        f"Expected 1 position for 'quick' with max_results=1, got {len(positions)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "field_type",
+    [pa.string(), pa.large_string(), pa.binary(), pa.large_binary()],
+    ids=["string", "large_string", "binary", "large_binary"],
+)
+def test_suffix_array_index_field_types(tmp_path: Path, field_type):
+    """Test suffix array index with different column types."""
+    if pa.types.is_string(field_type) or pa.types.is_large_string(field_type):
+        data = pa.array(["hello world", "world hello"], type=field_type)
+    else:
+        data = pa.array([b"hello world", b"world hello"], type=field_type)
+    tbl = pa.Table.from_arrays([data], names=["col"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset", mode="overwrite")
+    dataset.create_scalar_index("col", index_type="SUFFIX_ARRAY", name="sa_idx")
+    count = dataset.suffix_array_count("sa_idx", b"hello")
+    assert count == 2
+
+
+def test_suffix_array_index_rejects_invalid_type(tmp_path: Path):
+    """Test that suffix array index rejects non-string/binary columns."""
+    tbl = pa.Table.from_arrays([pa.array([1, 2, 3])], names=["nums"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    with pytest.raises(TypeError, match="SUFFIX_ARRAY"):
+        dataset.create_scalar_index("nums", index_type="SUFFIX_ARRAY")

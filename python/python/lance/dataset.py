@@ -985,6 +985,103 @@ class LanceDataset(pa.dataset.Dataset):
         )
         return json.loads(self._ds.index_statistics(index_name))
 
+    def _suffix_array_info(
+        self,
+        index_name: str,
+        query: Union[str, bytes],
+        *,
+        operation: str = "count",
+        continuation: Optional[Union[str, bytes]] = None,
+        max_results: Optional[int] = None,
+        max_support: Optional[int] = None,
+    ) -> dict:
+        """Low-level suffix array index query.
+
+        Unified private interface for all suffix array operations.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the SUFFIX_ARRAY index to query.
+        query : str or bytes
+            The query pattern or prompt. Strings are encoded as UTF-8.
+        operation : str
+            One of: "count", "search", "prob", "ntd", "infgram_prob".
+        continuation : str or bytes, optional
+            Required for "prob" and "infgram_prob" operations.
+        max_results : int, optional
+            For "search" operation: max positions to return.
+        max_support : int, optional
+            For "ntd" operation: max entries to scan before approximate mode.
+
+        Returns
+        -------
+        dict
+            Result dictionary whose contents depend on the operation:
+            - ``count``: {"count": int}
+            - ``search``: {"positions": list[int]}
+            - ``prob``: {"prompt_cnt": int, "cont_cnt": int, "prob": float}
+            - ``ntd``: {"prompt_cnt": int, "approximate": bool,
+              "distribution": list[dict]}
+            - ``infgram_prob``: {"prompt_cnt": int, "cont_cnt": int,
+              "prob": float, "effective_suffix_len": int}
+        """
+        if isinstance(query, str):
+            query = query.encode("utf-8")
+
+        if operation == "count":
+            n = self._ds.suffix_array_count(index_name, query)
+            return {"count": n}
+        elif operation == "search":
+            positions = self._ds.suffix_array_search(
+                index_name, query, max_results
+            )
+            return {"positions": positions}
+        elif operation == "prob":
+            if continuation is None:
+                raise ValueError("continuation is required for 'prob' operation")
+            if isinstance(continuation, str):
+                continuation = continuation.encode("utf-8")
+            prompt_cnt, cont_cnt, prob = self._ds.suffix_array_prob(
+                index_name, query, continuation
+            )
+            return {"prompt_cnt": prompt_cnt, "cont_cnt": cont_cnt, "prob": prob}
+        elif operation == "ntd":
+            prompt_cnt, approximate, dist_tuples = self._ds.suffix_array_ntd(
+                index_name, query, max_support
+            )
+            distribution = [
+                {"byte": b, "count": c, "prob": p} for b, c, p in dist_tuples
+            ]
+            return {
+                "prompt_cnt": prompt_cnt,
+                "approximate": approximate,
+                "distribution": distribution,
+            }
+        elif operation == "infgram_prob":
+            if continuation is None:
+                raise ValueError(
+                    "continuation is required for 'infgram_prob' operation"
+                )
+            if isinstance(continuation, str):
+                continuation = continuation.encode("utf-8")
+            prompt_cnt, cont_cnt, prob, suffix_len = (
+                self._ds.suffix_array_infgram_prob(
+                    index_name, query, continuation
+                )
+            )
+            return {
+                "prompt_cnt": prompt_cnt,
+                "cont_cnt": cont_cnt,
+                "prob": prob,
+                "effective_suffix_len": suffix_len,
+            }
+        else:
+            raise ValueError(
+                f"Unknown operation '{operation}'. "
+                f"Must be one of: count, search, prob, ntd, infgram_prob"
+            )
+
     @property
     def has_index(self):
         return len(self.describe_indices()) > 0
@@ -1010,6 +1107,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        infgram_query: Optional[Union[str, dict]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -1298,6 +1396,15 @@ class LanceDataset(pa.dataset.Dataset):
                 builder = builder.full_text_search(full_text_query)
             elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
+        if infgram_query is not None:
+            from .query import InfgramQuery
+
+            if isinstance(infgram_query, InfgramQuery):
+                builder = builder.infgram_search(infgram_query)
+            elif isinstance(infgram_query, str):
+                builder = builder.infgram_search(infgram_query)
+            elif isinstance(infgram_query, dict):
+                builder = builder.infgram_search(**infgram_query)
         if nearest is not None:
             builder = builder.nearest(**nearest)
         return builder.to_scanner()
@@ -2965,6 +3072,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
+            Literal["SUFFIX_ARRAY"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3054,7 +3162,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"SUFFIX_ARRAY"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3130,6 +3238,10 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+        case_insensitive: bool, default False
+            This is for the ``SUFFIX_ARRAY`` index. If True, all text will be
+            lowercased at build time and queries will be lowercased before
+            searching. This enables case-insensitive substring matching.
 
         Examples
         --------
@@ -3191,12 +3303,13 @@ class LanceDataset(pa.dataset.Dataset):
                 "FTS",
                 "BLOOMFILTER",
                 "RTREE",
+                "SUFFIX_ARRAY",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
+                        '"INVERTED", "BLOOMFILTER", "RTREE", or "SUFFIX_ARRAY" are '
+                        f"supported for scalar columns.  Received {index_type}",
                     )
                 )
 
@@ -3228,6 +3341,29 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type == "SUFFIX_ARRAY":
+                if (
+                    not pa.types.is_string(field_type)
+                    and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
+                    and not (
+                        (pa.types.is_list(field_type) or pa.types.is_large_list(field_type))
+                        and field_type.value_type
+                        in (
+                            pa.int16(),
+                            pa.uint16(),
+                            pa.int32(),
+                            pa.uint32(),
+                            pa.int64(),
+                            pa.uint64(),
+                        )
+                    )
+                ):
+                    raise TypeError(
+                        f"SUFFIX_ARRAY index column {column} must be string, binary,"
+                        f" or list<int16/int32/int64>, but got {field_type}"
+                    )
             elif index_type in ["INVERTED", "FTS"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
@@ -5705,6 +5841,7 @@ class ScannerBuilder:
         self._use_stats = True
         self._fast_search = False
         self._full_text_query = None
+        self._infgram_query = None
         self._use_scalar_index = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
@@ -6085,6 +6222,73 @@ class ScannerBuilder:
             }
         return self
 
+    def infgram_search(
+        self,
+        query=None,
+        column: Optional[str] = None,
+        limit: Optional[int] = None,
+        clauses: Optional[List[List[str]]] = None,
+    ) -> ScannerBuilder:
+        """
+        Filter rows by infini-gram (suffix array) search.
+
+        Returns rows containing the given pattern, with ``_count`` and
+        ``_positions`` columns. Must create a suffix array index on the
+        target column before searching.
+
+        Parameters
+        ----------
+        query : str or InfgramQuery or InfgramBooleanQuery, optional
+            The text pattern to search for. Can be a plain string, an
+            :class:`~lance.query.InfgramQuery`, or an
+            :class:`~lance.query.InfgramBooleanQuery` built with
+            ``Occur.MUST / SHOULD / MUST_NOT``.
+            May contain AND/OR operators when passed as a string
+            (e.g. ``'"hello" AND "world"'``). Either ``query`` or
+            ``clauses`` must be provided.
+        column : str, optional
+            The column to search in. If None, searches the first
+            suffix-array-indexed column.
+        limit : int, optional
+            Maximum number of matching rows to return.
+        clauses : list of list of str, optional
+            Boolean query in CNF form. Each inner list is an OR group;
+            the outer list is AND of groups. For example,
+            ``[["cat", "kitten"], ["dog"]]`` means
+            ``("cat" OR "kitten") AND "dog"``.
+            Mutually exclusive with ``query``.
+        """
+        from .query import InfgramBooleanQuery, InfgramQuery
+
+        if isinstance(query, InfgramBooleanQuery):
+            d = query._to_dict()
+            if column is not None:
+                d["column"] = column
+            d["limit"] = limit
+            self._infgram_query = d
+            return self
+        elif isinstance(query, InfgramQuery):
+            self._infgram_query = {
+                "query": query.pattern,
+                "column": column or query.column,
+                "limit": limit,
+            }
+            return self
+
+        if clauses is not None:
+            self._infgram_query = {
+                "clauses": clauses,
+                "column": column,
+                "limit": limit,
+            }
+        else:
+            self._infgram_query = {
+                "query": query,
+                "column": column,
+                "limit": limit,
+            }
+        return self
+
     def scan_stats_callback(
         self, callback: Callable[[ScanStatistics], None]
     ) -> ScannerBuilder:
@@ -6167,6 +6371,7 @@ class ScannerBuilder:
             self._substrait_filter,
             self._fast_search,
             self._full_text_query,
+            self._infgram_query,
             self._late_materialization,
             self._blob_handling,
             self._use_scalar_index,

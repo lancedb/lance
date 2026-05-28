@@ -11,7 +11,8 @@ use crate::{
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
         inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
+        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, suffix_array::SuffixArrayIndexPlugin,
+        zonemap::ZoneMapIndexPlugin,
     },
 };
 
@@ -68,6 +69,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
+        registry.add_plugin::<pb::SuffixArrayIndexDetails, SuffixArrayIndexPlugin>();
 
         let registry = Arc::new(registry);
         for plugin in registry.plugins.values() {

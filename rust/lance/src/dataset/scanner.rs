@@ -65,6 +65,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::InfgramSearchQuery;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::expression::{
     INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt, serialize_index_expr_result,
@@ -741,6 +742,9 @@ pub struct Scanner {
     /// Optional full text search query
     full_text_query: Option<FullTextSearchQuery>,
 
+    /// Optional infini-gram (suffix array) search query
+    infgram_query: Option<InfgramSearchQuery>,
+
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
 
@@ -1021,6 +1025,7 @@ impl Scanner {
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
             full_text_query: None,
+            infgram_query: None,
             batch_size: None,
             batch_size_bytes: None,
             batch_readahead: get_num_compute_intensive_cpus(),
@@ -1269,6 +1274,20 @@ impl Scanner {
         }
 
         self.full_text_query = Some(query);
+        Ok(self)
+    }
+
+    /// Set an infini-gram search query.
+    ///
+    /// The scanner will search the suffix array index for rows containing
+    /// the given pattern and return those rows with a `_count` column.
+    pub fn infgram_search(&mut self, query: InfgramSearchQuery) -> Result<&mut Self> {
+        if let Some(ref col) = query.column {
+            if self.dataset.schema().field(col).is_none() {
+                return Err(Error::invalid_input(format!("Column {} not found", col)));
+            }
+        }
+        self.infgram_query = Some(query);
         Ok(self)
     }
 
@@ -1908,6 +1927,14 @@ impl Scanner {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
         }
 
+        if self.infgram_query.is_some() {
+            extra_columns.push(ArrowField::new(
+                crate::io::exec::infgram::COUNT_COL,
+                DataType::Float32,
+                true,
+            ));
+        }
+
         schema.merge(&ArrowSchema::new(extra_columns))
     }
 
@@ -1960,6 +1987,18 @@ impl Scanner {
                 }
                 let score_expr = expressions::col(SCORE_COL, current_schema)?;
                 output_expr.push((score_expr, SCORE_COL.to_string()));
+            }
+            if self.infgram_query.is_some() {
+                let count_col = crate::io::exec::infgram::COUNT_COL;
+                if output_expr.iter().all(|(_, name)| name != count_col) {
+                    let count_expr = expressions::col(count_col, current_schema)?;
+                    output_expr.push((count_expr, count_col.to_string()));
+                }
+                let positions_col = crate::io::exec::infgram::POSITIONS_COL;
+                if output_expr.iter().all(|(_, name)| name != positions_col) {
+                    let positions_expr = expressions::col(positions_col, current_schema)?;
+                    output_expr.push((positions_expr, positions_col.to_string()));
+                }
             }
         }
 
@@ -2512,11 +2551,14 @@ impl Scanner {
         let mut filter_plan = self.create_filter_plan(use_scalar_index).await?;
 
         let mut use_limit_node = true;
-        // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
-        let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
-            (Some(_), None) => self.vector_search_source(&mut filter_plan).await?,
-            (None, Some(query)) => self.fts_search_source(&mut filter_plan, query).await?,
-            (None, None) => {
+        // Source: either a (K|A)NN search, full text search, infgram search, or a (full|indexed) scan
+        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() && self.full_text_query.is_none() && self.infgram_query.is_none() {
+            self.vector_search_source(&mut filter_plan).await?
+        } else if self.nearest.is_none() && self.full_text_query.is_some() && self.infgram_query.is_none() {
+            self.fts_search_source(&mut filter_plan, self.full_text_query.as_ref().unwrap()).await?
+        } else if self.nearest.is_none() && self.full_text_query.is_none() && self.infgram_query.is_some() {
+            self.infgram_search_source(&mut filter_plan).await?
+        } else if self.nearest.is_none() && self.full_text_query.is_none() && self.infgram_query.is_none() {
                 if self.projection_plan.has_output_cols()
                     && self.projection_plan.physical_projection.is_empty()
                 {
@@ -2558,12 +2600,10 @@ impl Scanner {
                     }
                     planned_read.plan
                 }
-            }
-            _ => {
-                return Err(Error::invalid_input_source(
-                    "Cannot have both nearest and full text search".into(),
-                ));
-            }
+        } else {
+            return Err(Error::invalid_input_source(
+                "Cannot combine multiple search types (nearest, full_text_query, infgram_query)".into(),
+            ));
         };
 
         // Load columns needed for filter and ordering
@@ -3032,6 +3072,54 @@ impl Scanner {
             filter_plan.make_refine_only();
             self.fts(&ExprFilterPlan::default(), query).await
         }
+    }
+
+    /// Create an execution plan source from an infgram (suffix array) search.
+    ///
+    /// Follows the same pattern as `fts_search_source`: the SA index is
+    /// loaded, the query pattern is searched, matching row IDs are
+    /// returned, and remaining columns are materialized via Take.
+    async fn infgram_search_source(
+        &self,
+        filter_plan: &mut FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        log::trace!("source is an infgram search");
+        if self.include_deleted_rows {
+            return Err(Error::invalid_input_source(
+                "Cannot include deleted rows in an infgram search".into(),
+            ));
+        }
+
+        let query = self.infgram_query.as_ref().unwrap();
+
+        // Apply limit from scanner if query doesn't have its own.
+        // When a filter is present the limit must be applied *after* filtering
+        // (the downstream LimitExec handles it), so we leave the SA search
+        // unlimited to avoid discarding rows that would pass the filter.
+        let has_filter = self.filter.expr_filter.is_some();
+        let mut query = query.clone();
+        if query.limit.is_none() && !has_filter {
+            let search_limit = match (self.limit, self.offset) {
+                (Some(limit), Some(offset)) => Some((limit + offset) as usize),
+                (Some(limit), None) => Some(limit as usize),
+                (None, Some(_)) => None,
+                (None, None) => None,
+            };
+            query = query.with_limit(search_limit);
+        }
+
+        // The SA index does not support inline prefiltering (unlike FTS which
+        // can intersect with a scalar-index bitmap).  Always apply the filter
+        // as a refine (postfilter) step so it is never silently dropped.
+        filter_plan.make_refine_only();
+
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            crate::io::exec::infgram::InfgramSearchExec::new(
+                self.dataset.clone(),
+                query,
+            ),
+        );
+        Ok(plan)
     }
 
     async fn vector_search_source(

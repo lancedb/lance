@@ -99,6 +99,7 @@ tokenizer-icu = ["lance-tokenizer/tokenizer-icu"]
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
+cc = "1.0.83"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
