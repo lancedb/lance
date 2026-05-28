@@ -56,7 +56,9 @@ class IndicesBuilder:
         """
         self.dataset = dataset
         self.column = self._normalize_column(column)
-        self.dimension = self.dataset.schema.field(self.column[0]).type.list_size
+        self.dimension = self._vector_dimension(
+            self.dataset.schema.field(self.column[0]).type
+        )
 
     def train_ivf(
         self,
@@ -578,27 +580,47 @@ class IndicesBuilder:
             if c not in self.dataset.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.dataset.schema.field(c)
-            if not (
-                pa.types.is_fixed_size_list(field.type)
-                or (
-                    isinstance(field.type, pa.FixedShapeTensorType)
-                    and len(field.type.shape) == 1
-                )
-            ):
+            value_type = self._vector_value_type(field.type)
+            if value_type is None:
                 raise TypeError(
                     f"Vector column {c} must be FixedSizeListArray "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
             if not (
-                pa.types.is_floating(field.type.value_type)
-                or pa.types.is_unsigned_integer(field.type.value_type)
+                pa.types.is_floating(value_type)
+                or pa.types.is_unsigned_integer(value_type)
             ):
                 raise TypeError(
                     f"Vector column {c} must have floating or unsigned integer "
-                    f"value type, got {field.type.value_type}"
+                    f"value type, got {value_type}"
                 )
 
         return column
+
+    def _vector_dimension(self, data_type):
+        if pa.types.is_fixed_size_list(data_type):
+            return data_type.list_size
+        if pa.types.is_list(data_type) and pa.types.is_fixed_size_list(
+            data_type.value_type
+        ):
+            return data_type.value_type.list_size
+        if isinstance(data_type, pa.FixedShapeTensorType) and len(data_type.shape) == 1:
+            return data_type.shape[0]
+        raise TypeError(
+            "Vector column must be FixedSizeListArray "
+            f"1-dimensional FixedShapeTensorArray, got {data_type}"
+        )
+
+    def _vector_value_type(self, data_type):
+        if pa.types.is_fixed_size_list(data_type):
+            return data_type.value_type
+        if pa.types.is_list(data_type) and pa.types.is_fixed_size_list(
+            data_type.value_type
+        ):
+            return data_type.value_type.value_type
+        if isinstance(data_type, pa.FixedShapeTensorType) and len(data_type.shape) == 1:
+            return data_type.value_type
+        return None
 
 
 @dataclass

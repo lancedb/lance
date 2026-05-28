@@ -4337,11 +4337,18 @@ fn prepare_vector_index_params(
                 ));
             }
 
+            let centroid_type = match column_type {
+                DataType::List(field) if matches!(field.data_type(), DataType::FixedSizeList(_, _)) => {
+                    field.data_type()
+                }
+                _ => column_type,
+            };
+
             // It's important that the centroids are the same data type
             // as the vectors that will be indexed.
             let mut centroids: Arc<dyn Array> = batch.column(0).clone();
-            if centroids.data_type() != column_type {
-                centroids = cast_with_options(centroids.as_ref(), column_type, &Default::default())
+            if centroids.data_type() != centroid_type {
+                centroids = cast_with_options(centroids.as_ref(), centroid_type, &Default::default())
                     .map_err(|e| {
                         PyValueError::new_err(format!(
                             "Failed to cast centroids to column type: {}",

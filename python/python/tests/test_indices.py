@@ -218,6 +218,66 @@ def test_ivf_centroids_fragment_ids(tmpdir):
     assert np.allclose(second_centroid, 10.0, atol=1e-4)
 
 
+def test_ivf_centroids_multivector_fragment_ids(tmpdir):
+    dimension = 4
+    vector_type = pa.list_(pa.list_(pa.float32(), dimension))
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("embeddings", vector_type),
+        ]
+    )
+    table = pa.Table.from_pylist(
+        [
+            {"id": 1, "embeddings": [[0.1, 0.2, 0.3, 0.4], [0.2, 0.3, 0.4, 0.5]]},
+            {"id": 2, "embeddings": [[0.8, 0.7, 0.6, 0.5]]},
+            {"id": 3, "embeddings": [[0.3, 0.2, 0.1, 0.0], [0.9, 0.8, 0.7, 0.6]]},
+            {"id": 4, "embeddings": [[0.4, 0.1, 0.2, 0.3]]},
+        ],
+        schema=schema,
+    )
+    ds = lance.write_dataset(
+        table,
+        pathlib.Path(tmpdir) / "multivector_fragment_ivf",
+        max_rows_per_file=2,
+    )
+
+    builder = IndicesBuilder(ds, "embeddings")
+    assert builder.dimension == dimension
+
+    centroids = pa.FixedSizeListArray.from_arrays(
+        pa.array(
+            [
+                0.1,
+                0.2,
+                0.3,
+                0.4,
+                0.8,
+                0.7,
+                0.6,
+                0.5,
+            ],
+            type=pa.float32(),
+        ),
+        dimension,
+    )
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+
+    index = ds.create_index_uncommitted(
+        "embeddings",
+        index_type="IVF_HNSW_SQ",
+        metric="cosine",
+        num_partitions=2,
+        fragment_ids=fragment_ids,
+        index_uuid="00000000-0000-4000-8000-000000000001",
+        ivf_centroids=centroids,
+    )
+
+    assert index.uuid == "00000000-0000-4000-8000-000000000001"
+    assert index.fragment_ids == set(fragment_ids)
+    assert index.name == "embeddings_idx"
+
+
 def test_pq_fragment_ids(rand_dataset):
     fragment_id = rand_dataset.get_fragments()[0].fragment_id
     ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
