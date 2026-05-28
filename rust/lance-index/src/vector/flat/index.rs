@@ -23,7 +23,7 @@ use crate::{
         DIST_COL, Query,
         graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
-        storage::{DistCalculator, VectorStore},
+        storage::{DistCalculator, QueryResidual, QueryScratch, VectorStore},
         v3::subindex::IvfSubIndex,
     },
 };
@@ -128,15 +128,50 @@ impl IvfSubIndex for FlatIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        let mut scratch = QueryScratch::new();
+        self.search_with_scratch(
+            query,
+            k,
+            params,
+            storage,
+            prefilter,
+            metrics,
+            None,
+            &mut scratch,
+        )
+    }
+
+    fn search_with_scratch(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
+    ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = storage.dist_calculator_with_scratch(
+            query,
+            params.dist_q_c,
+            residual,
+            &mut scratch.query_f32,
+        );
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
 
         match prefilter.is_empty() {
             true => {
-                let dists = dist_calc.distance_all(k);
+                dist_calc.distance_all_with_scratch(
+                    k,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                );
+                let dists = scratch.distances.iter().copied();
 
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
@@ -210,9 +245,7 @@ impl IvfSubIndex for FlatIndex {
         res: &mut BinaryHeap<OrderedNode<u64>>,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
-        let mut distance_scratch = Vec::new();
-        let mut u16_scratch = Vec::new();
-        let mut u8_scratch = Vec::new();
+        let mut scratch = QueryScratch::new();
         self.accumulate_topk_with_scratch(
             query,
             k,
@@ -220,9 +253,8 @@ impl IvfSubIndex for FlatIndex {
             storage,
             prefilter,
             res,
-            &mut distance_scratch,
-            &mut u16_scratch,
-            &mut u8_scratch,
+            None,
+            &mut scratch,
             metrics,
         )
     }
@@ -235,21 +267,30 @@ impl IvfSubIndex for FlatIndex {
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
-        distance_scratch: &mut Vec<f32>,
-        u16_scratch: &mut Vec<u16>,
-        u8_scratch: &mut Vec<u8>,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = storage.dist_calculator_with_scratch(
+            query,
+            params.dist_q_c,
+            residual,
+            &mut scratch.query_f32,
+        );
         let mut max_dist = res.peek().map(|node| node.dist);
         metrics.record_comparisons(storage.len());
 
         match prefilter.is_empty() {
             true => {
-                dist_calc.distance_all_with_scratch(k, distance_scratch, u16_scratch, u8_scratch);
-                let dists = distance_scratch.iter().copied();
+                dist_calc.distance_all_with_scratch(
+                    k,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                );
+                let dists = scratch.distances.iter().copied();
 
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();

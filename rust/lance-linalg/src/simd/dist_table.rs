@@ -81,6 +81,9 @@ pub fn sum_4bit_dist_table_scalar(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
+    let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
+    dists[..num_full_vectors].fill(0);
+
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
         for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
             let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
@@ -301,6 +304,23 @@ mod tests {
 
         // so the distance is 2 * (dist_table[0x6] + dist_table[0xb + 16]) = 2*(7 + 12) = 38
         assert_eq!(dists[1], 38);
+    }
+
+    #[test]
+    fn test_sum_4bit_dist_table_overwrites_output() {
+        let n = BATCH_SIZE;
+        let code_len = 16;
+        let codes = vec![0x12; n * code_len];
+        let dist_table = vec![1u8; BATCH_SIZE * code_len];
+
+        let mut expected = vec![u16::MAX; n];
+        sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
+
+        let mut actual = vec![u16::MAX; n];
+        sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
+
+        assert_eq!(actual, expected);
+        assert!(actual.iter().all(|dist| *dist != u16::MAX));
     }
 
     /// Test that the SIMD path (NEON on ARM, AVX2 on x86) produces identical
