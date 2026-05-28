@@ -253,6 +253,67 @@ impl IndexReader for current_reader::FileReader {
         .await
     }
 
+    async fn read_ranges(
+        &self,
+        ranges: Vec<std::ops::Range<usize>>,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ranges.iter().any(|range| range.is_empty()) {
+            let mut batches = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                batches.push(self.read_range(range, projection).await?);
+            }
+            return Ok(batches);
+        }
+
+        let projection = if let Some(projection) = projection {
+            ReaderProjection::from_column_names(
+                self.metadata().version(),
+                self.schema(),
+                projection,
+            )?
+        } else {
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+        };
+        let schema = Arc::new(projection.schema.as_ref().into());
+        let ranges_u64 = ranges
+            .iter()
+            .map(|range| range.start as u64..range.end as u64)
+            .collect::<Vec<_>>();
+        let batches = self
+            .read_stream_projected(
+                ReadBatchParams::Ranges(ranges_u64.into()),
+                u32::MAX,
+                u32::MAX,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let combined = arrow::compute::concat_batches(&schema, batches.iter())?;
+        let expected_rows: usize = ranges.iter().map(|range| range.end - range.start).sum();
+        if combined.num_rows() != expected_rows {
+            return Err(Error::internal(format!(
+                "Expected {} rows from scalar index read_ranges, got {}",
+                expected_rows,
+                combined.num_rows()
+            )));
+        }
+
+        let mut offset = 0;
+        let mut split_batches = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let len = range.end - range.start;
+            split_batches.push(combined.slice(offset, len));
+            offset += len;
+        }
+        Ok(split_batches)
+    }
+
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self, batch_size: u64) -> u32 {
@@ -304,10 +365,9 @@ impl IndexStore for LanceIndexStore {
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.clone().join(name);
         // Use cached file size if available, otherwise unknown (requires HEAD call)
-        let cached_size = self
-            .file_sizes
-            .get(name)
-            .map(|&size| CachedFileSize::new(size))
+        let known_file_size = self.file_sizes.get(name).copied();
+        let cached_size = known_file_size
+            .map(CachedFileSize::new)
             .unwrap_or_else(CachedFileSize::unknown);
         let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
         match current_reader::FileReader::try_open(

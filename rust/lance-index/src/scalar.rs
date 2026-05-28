@@ -227,6 +227,27 @@ pub trait IndexReader: Send + Sync {
             futures::stream::once(async move { Ok(batch) }),
         )))
     }
+    /// Read multiple row ranges without changing the caller's logical range order.
+    ///
+    /// Each range is a half-open row interval (`start..end`) in this index
+    /// file. Ranges are expected to be sorted by `start` and must be
+    /// non-overlapping; adjacent ranges are allowed. The returned batches must
+    /// align one-to-one with the input ranges and preserve the input order.
+    ///
+    /// The default implementation preserves semantics by reading each range
+    /// independently. FileReader-backed readers override this to submit
+    /// coalesced storage reads without changing the logical output.
+    async fn read_ranges(
+        &self,
+        ranges: Vec<std::ops::Range<usize>>,
+        projection: Option<&[&str]>,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut batches = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            batches.push(self.read_range(range, projection).await?);
+        }
+        Ok(batches)
+    }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;
     /// Return the number of rows in the file

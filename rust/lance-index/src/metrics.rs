@@ -3,6 +3,29 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Per-search execution metrics for BTree page-data reads.
+///
+/// BTreePageReadPlan describes the shape of selected candidate pages.
+/// This struct records search execution outcomes: cache behavior,
+/// coalesced storage reads, storage materialization, and elapsed time.
+#[derive(Debug, Clone, Default)]
+pub struct BTreeSearchMetrics {
+    /// Number of BTree leaf pages selected by page lookup before cache checks.
+    pub candidate_pages: usize,
+    /// Number of page materialization lookups satisfied from cache.
+    pub cache_hits: usize,
+    /// Number of unique page materialization lookups that missed cache.
+    pub cache_misses: usize,
+    /// Number of batched page-data read calls used for cache misses.
+    pub coalesced_batches: usize,
+    /// Number of row ranges submitted through batched page-data reads.
+    pub coalesced_row_ranges: usize,
+    /// Number of BTree pages materialized from storage.
+    pub pages_read_from_storage: usize,
+    /// End-to-end BTree search elapsed time in milliseconds.
+    pub search_elapsed_ms: u64,
+}
+
 /// A trait used by the index to report metrics
 ///
 /// Callers can implement this trait to collect metrics
@@ -43,6 +66,9 @@ pub trait MetricsCollector: Send + Sync {
     ///
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
+
+    /// Record aggregate BTree scalar-index search metrics.
+    fn record_btree_search(&self, _metrics: &BTreeSearchMetrics) {}
 }
 
 /// A no-op metrics collector that does nothing

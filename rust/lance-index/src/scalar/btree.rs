@@ -6,8 +6,12 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     fmt::{Debug, Display},
-    ops::Bound,
-    sync::Arc,
+    ops::{Bound, Range},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+    time::Instant,
 };
 
 use super::{
@@ -25,7 +29,10 @@ use crate::{
         registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
     },
 };
-use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
+use crate::{
+    metrics::{BTreeSearchMetrics, NoOpMetricsCollector},
+    scalar::registry::TrainingCriteria,
+};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
 use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
@@ -72,6 +79,10 @@ mod flat;
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
+// Keep coalesced page-data reads bounded so broad range predicates do not submit
+// unbounded row-range requests to the file scheduler.
+const DEFAULT_BTREE_MAX_COALESCED_PAGES_PER_BATCH: usize = 64;
+const DEFAULT_BTREE_MAX_COALESCED_RANGES_PER_BATCH: usize = 64;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
 const DEFAULT_RANGE_PARTITIONED: bool = false;
 const RANGE_PARTITIONED_META_KEY: &str = "range_partitioned";
@@ -632,6 +643,174 @@ impl BTreeLookup {
     }
 }
 
+/// Describes the shape of BTree page candidates before page_data reads.
+///
+/// This is observational metadata only. It must not affect page selection
+/// or search semantics. Actual coalesced storage reads are reported by
+/// coalesced-read and search summary metrics.
+#[derive(Debug, Clone)]
+struct BTreePageReadPlan {
+    /// Number of logical BTree leaf pages selected by page lookup.
+    candidate_pages: usize,
+    /// Number of physical page_data files containing the selected pages.
+    physical_files: usize,
+    /// Number of contiguous local-page runs within physical page_data files.
+    page_runs: usize,
+    /// Smallest selected global BTree page id, useful for detecting broad scans.
+    min_page_id: Option<u32>,
+    /// Largest selected global BTree page id, useful for detecting broad scans.
+    max_page_id: Option<u32>,
+}
+
+fn btree_page_read_plan(
+    pages: &[Matches],
+    ranges_to_files: Option<&RangeInclusiveMap<u32, (String, u32)>>,
+) -> Result<BTreePageReadPlan> {
+    let candidate_pages = pages.len();
+    let mut min_page_id = None;
+    let mut max_page_id = None;
+    let mut pages_by_file: HashMap<String, Vec<u32>> = HashMap::with_capacity(candidate_pages);
+
+    for matches in pages {
+        let page_id = matches.page_id();
+        min_page_id = Some(min_page_id.map_or(page_id, |min: u32| min.min(page_id)));
+        max_page_id = Some(max_page_id.map_or(page_id, |max: u32| max.max(page_id)));
+
+        let (file_name, local_page_id) = resolve_btree_page_file(page_id, ranges_to_files)?;
+        pages_by_file
+            .entry(file_name)
+            .or_default()
+            .push(local_page_id);
+    }
+
+    let mut page_runs = 0;
+    for local_pages in pages_by_file.values_mut() {
+        local_pages.sort_unstable();
+        local_pages.dedup();
+
+        let mut previous_page = None;
+        for local_page in local_pages {
+            let starts_new_run = previous_page.and_then(|previous: u32| previous.checked_add(1))
+                != Some(*local_page);
+            if starts_new_run {
+                page_runs += 1;
+            }
+            previous_page = Some(*local_page);
+        }
+    }
+
+    Ok(BTreePageReadPlan {
+        candidate_pages,
+        physical_files: pages_by_file.len(),
+        page_runs,
+        min_page_id,
+        max_page_id,
+    })
+}
+
+/// Resolves a global BTree page id into a page_data file and local page id.
+fn resolve_btree_page_file(
+    page_id: u32,
+    ranges_to_files: Option<&RangeInclusiveMap<u32, (String, u32)>>,
+) -> Result<(String, u32)> {
+    if let Some(ranges_to_files) = ranges_to_files {
+        let (file_name, offset) = ranges_to_files.get(&page_id).ok_or_else(|| {
+            Error::internal(format!(
+                "Unexpected page index, index {} is out of range.",
+                page_id
+            ))
+        })?;
+        Ok((file_name.clone(), page_id - *offset))
+    } else {
+        Ok((BTREE_PAGES_NAME.to_string(), page_id))
+    }
+}
+
+/// Returns the row interval for one local page, clipping only the final page.
+fn btree_page_row_range(
+    local_page_id: u32,
+    batch_size: u64,
+    num_rows: usize,
+) -> Result<Range<usize>> {
+    let start = u64::from(local_page_id)
+        .checked_mul(batch_size)
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "BTree local page {} overflows row offset for batch size {}",
+                local_page_id, batch_size
+            ))
+        })?;
+    let end = start.checked_add(batch_size).ok_or_else(|| {
+        Error::internal(format!(
+            "BTree local page {} overflows row end for batch size {}",
+            local_page_id, batch_size
+        ))
+    })?;
+    let num_rows = u64::try_from(num_rows).map_err(|_| {
+        Error::internal("BTree page-data row count does not fit in u64".to_string())
+    })?;
+    if start >= num_rows {
+        return Err(Error::internal(format!(
+            "BTree local page {} starts at row {} but page-data file has {} rows",
+            local_page_id, start, num_rows
+        )));
+    }
+    let start = usize::try_from(start).map_err(|_| {
+        Error::internal(format!(
+            "BTree local page {} row start {} does not fit in usize",
+            local_page_id, start
+        ))
+    })?;
+    let end = usize::try_from(end.min(num_rows)).map_err(|_| {
+        Error::internal(format!(
+            "BTree local page {} row end does not fit in usize",
+            local_page_id
+        ))
+    })?;
+    Ok(start..end)
+}
+
+/// One missing BTree page linked to its global cache key and page_data row range.
+#[derive(Debug, Clone)]
+struct BTreePageToRead {
+    global_page_id: u32,
+    row_range: Range<usize>,
+}
+
+/// A coalesced row interval that may materialize one or more adjacent pages.
+#[derive(Debug, Clone)]
+struct BTreeRowRangeToRead {
+    range: Range<usize>,
+    pages: Vec<BTreePageToRead>,
+}
+
+/// One bounded read_ranges call against a single BTree page_data file.
+#[derive(Debug, Clone)]
+struct BTreeCoalescedReadBatch {
+    file_name: String,
+    ranges: Vec<BTreeRowRangeToRead>,
+    num_pages: usize,
+}
+
+impl BTreeCoalescedReadBatch {
+    fn rows_requested(&self) -> usize {
+        self.ranges
+            .iter()
+            .map(|range| range.range.end - range.range.start)
+            .sum()
+    }
+}
+
+/// Counts actual storage materialization after cache checks and coalescing.
+#[derive(Debug, Clone, Default)]
+struct BTreeCoalescedReadMetrics {
+    cache_hits: usize,
+    cache_misses: usize,
+    batches: usize,
+    row_ranges: usize,
+    pages_read: usize,
+}
+
 #[derive(Debug, Copy, Clone)]
 enum Matches {
     Some(u32),
@@ -831,11 +1010,33 @@ impl BTreeLookup {
     }
 }
 
-// We only need to open a file reader for pages if we need to load a page.  If all
-// pages are cached we don't open it.  If we do open it we should only open it once.
+/// Caches page-data FileReader instances per physical file for one BTree search.
+/// Cache misses in the same physical file share one reader instead of reopening page-data.
+type BTreeFileReaderCache =
+    Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn IndexReader>>>>>>;
+
+async fn get_cached_btree_file_reader(
+    readers: &BTreeFileReaderCache,
+    store: &Arc<dyn IndexStore>,
+    file_name: &str,
+) -> Result<Arc<dyn IndexReader>> {
+    let reader_cell = {
+        let mut guard = readers.lock().await;
+        guard
+            .entry(file_name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    };
+    let reader = reader_cell
+        .get_or_try_init(|| async { store.open_index_file(file_name).await })
+        .await?;
+    Ok(reader.clone())
+}
+
 #[derive(Clone)]
 struct LazyIndexReader {
     index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
+    ranged_readers: BTreeFileReaderCache,
     store: Arc<dyn IndexStore>,
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
 }
@@ -847,6 +1048,7 @@ impl LazyIndexReader {
     ) -> Self {
         Self {
             index_reader: Arc::new(tokio::sync::Mutex::new(None)),
+            ranged_readers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             store,
             ranges_to_files,
         }
@@ -859,6 +1061,7 @@ impl LazyIndexReader {
                 Arc::new(LazyRangedIndexReader::new(
                     self.store.clone(),
                     ranges_to_files.clone(),
+                    self.ranged_readers.clone(),
                 ))
             } else {
                 self.store.open_index_file(BTREE_PAGES_NAME).await?
@@ -867,13 +1070,24 @@ impl LazyIndexReader {
         }
         Ok(reader.as_ref().unwrap().clone())
     }
+
+    async fn get_file_reader(&self, file_name: &str) -> Result<Arc<dyn IndexReader>> {
+        if self.ranges_to_files.is_some() {
+            get_cached_btree_file_reader(&self.ranged_readers, &self.store, file_name).await
+        } else if file_name == BTREE_PAGES_NAME {
+            self.get().await
+        } else {
+            Err(Error::internal(format!(
+                "Unexpected BTree page file '{}' for non-range-partitioned index.",
+                file_name
+            )))
+        }
+    }
 }
 
 /// Index reader to dispatch page query to corresponding ranged page-files.
 struct LazyRangedIndexReader {
-    #[allow(clippy::type_complexity)]
-    readers:
-        Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<dyn IndexReader>>>>>>,
+    readers: BTreeFileReaderCache,
     store: Arc<dyn IndexStore>,
     ranges_to_files: Arc<RangeInclusiveMap<u32, (String, u32)>>,
 }
@@ -882,40 +1096,27 @@ impl LazyRangedIndexReader {
     fn new(
         store: Arc<dyn IndexStore>,
         ranges_to_files: Arc<RangeInclusiveMap<u32, (String, u32)>>,
+        readers: BTreeFileReaderCache,
     ) -> Self {
         Self {
-            readers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            readers,
             store,
             ranges_to_files,
         }
     }
 
     async fn get_reader(&self, file_name: &str) -> Result<Arc<dyn IndexReader>> {
-        let reader_cell = {
-            let mut guard = self.readers.lock().await;
-            guard
-                .entry(file_name.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
-                .clone()
-        };
-        let reader = reader_cell
-            .get_or_try_init(|| async { self.store.open_index_file(file_name).await })
-            .await?;
-        Ok(reader.clone())
+        get_cached_btree_file_reader(&self.readers, &self.store, file_name).await
     }
 
     async fn get_reader_and_local_page_idx(
         &self,
         page_idx: u32,
     ) -> Result<(Arc<dyn IndexReader>, u32)> {
-        let (page_file_name, offset) = self.ranges_to_files.get(&page_idx).ok_or_else(|| {
-            Error::internal(format!(
-                "Unexpected page index, index {} is out of range.",
-                page_idx
-            ))
-        })?;
-        let reader = self.get_reader(page_file_name).await?;
-        Ok((reader.clone(), page_idx - *offset))
+        let (page_file_name, local_page_idx) =
+            resolve_btree_page_file(page_idx, Some(&self.ranges_to_files))?;
+        let reader = self.get_reader(&page_file_name).await?;
+        Ok((reader.clone(), local_page_idx))
     }
 }
 
@@ -1260,12 +1461,230 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
+        pages_read: Arc<AtomicUsize>,
     ) -> Result<Arc<FlatIndex>> {
         self.index_cache
             .get_or_insert_with_key(BTreePageKey { page_number }, move || async move {
+                pages_read.fetch_add(1, AtomicOrdering::Relaxed);
                 self.read_page(page_number, index_reader, metrics).await
             })
             .await
+    }
+
+    async fn lookup_pages(
+        &self,
+        pages: &[Matches],
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<(HashMap<u32, Arc<FlatIndex>>, BTreeCoalescedReadMetrics)> {
+        let mut page_indices = HashMap::with_capacity(pages.len());
+        let mut missing_pages = Vec::new();
+        let mut missing_seen = HashSet::new();
+        let mut read_metrics = BTreeCoalescedReadMetrics::default();
+
+        for matches in pages {
+            let page_number = matches.page_id();
+            if page_indices.contains_key(&page_number) || missing_seen.contains(&page_number) {
+                continue;
+            }
+
+            let cache_key = BTreePageKey { page_number };
+            if let Some(page) = self.index_cache.get_with_key(&cache_key).await {
+                read_metrics.cache_hits += 1;
+                page_indices.insert(page_number, page);
+            } else if missing_seen.insert(page_number) {
+                missing_pages.push(page_number);
+            }
+        }
+
+        if missing_pages.is_empty() {
+            return Ok((page_indices, read_metrics));
+        }
+        read_metrics.cache_misses = missing_pages.len();
+
+        if missing_pages.len() == 1 {
+            let page_number = missing_pages[0];
+            let pages_read_counter = Arc::new(AtomicUsize::new(0));
+            let page = self
+                .lookup_page(
+                    page_number,
+                    index_reader,
+                    metrics,
+                    pages_read_counter.clone(),
+                )
+                .await?;
+            let pages_read = pages_read_counter.load(AtomicOrdering::Relaxed);
+            page_indices.insert(page_number, page);
+            read_metrics.pages_read = pages_read;
+            return Ok((page_indices, read_metrics));
+        }
+
+        let mut coalesced_metrics = self
+            .read_missing_pages(missing_pages, index_reader, metrics, &mut page_indices)
+            .await?;
+        coalesced_metrics.cache_hits = read_metrics.cache_hits;
+        coalesced_metrics.cache_misses = read_metrics.cache_misses;
+        Ok((page_indices, coalesced_metrics))
+    }
+
+    /// Materializes cache misses only and emits one summary event per storage batch.
+    async fn read_missing_pages(
+        &self,
+        page_numbers: Vec<u32>,
+        index_reader: LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+        page_indices: &mut HashMap<u32, Arc<FlatIndex>>,
+    ) -> Result<BTreeCoalescedReadMetrics> {
+        let read_batches = self
+            .plan_coalesced_page_reads(page_numbers, index_reader.clone())
+            .await?;
+        let mut read_metrics = BTreeCoalescedReadMetrics::default();
+
+        for (batch_id, read_batch) in read_batches.into_iter().enumerate() {
+            let reader = index_reader.get_file_reader(&read_batch.file_name).await?;
+            let row_ranges = read_batch
+                .ranges
+                .iter()
+                .map(|range| range.range.clone())
+                .collect::<Vec<_>>();
+
+            read_metrics.batches += 1;
+            read_metrics.row_ranges += row_ranges.len();
+            read_metrics.pages_read += read_batch.num_pages;
+
+            metrics.record_parts_loaded(read_batch.num_pages);
+            let rows_requested = read_batch.rows_requested();
+            let read_started = Instant::now();
+            let serialized_ranges = reader.read_ranges(row_ranges, None).await?;
+            let read_ranges_elapsed_ms = read_started.elapsed().as_millis() as u64;
+            if serialized_ranges.len() != read_batch.ranges.len() {
+                return Err(Error::internal(format!(
+                    "BTree coalesced read expected {} batches from '{}', got {}",
+                    read_batch.ranges.len(),
+                    read_batch.file_name,
+                    serialized_ranges.len()
+                )));
+            }
+            info!(
+                target: TRACE_IO_EVENTS,
+                r#type = "btree_coalesced_read_batch",
+                index_type = "btree",
+                batch_id = batch_id,
+                file_name = %read_batch.file_name,
+                page_count = read_batch.num_pages,
+                row_range_count = read_batch.ranges.len(),
+                rows_requested = rows_requested,
+                read_ranges_elapsed_ms = read_ranges_elapsed_ms,
+            );
+
+            for (range_to_read, serialized_range) in
+                read_batch.ranges.iter().zip(serialized_ranges.into_iter())
+            {
+                let mut offset = 0;
+                for page in &range_to_read.pages {
+                    let page_len = page.row_range.end - page.row_range.start;
+                    let mut serialized_page = serialized_range.slice(offset, page_len);
+                    offset += page_len;
+
+                    if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                        serialized_page =
+                            frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+                    }
+                    let page_index = Arc::new(FlatIndex::try_new(serialized_page)?);
+                    let cache_key = BTreePageKey {
+                        page_number: page.global_page_id,
+                    };
+                    self.index_cache
+                        .insert_with_key(&cache_key, page_index.clone())
+                        .await;
+                    page_indices.insert(page.global_page_id, page_index);
+                }
+            }
+        }
+
+        Ok(read_metrics)
+    }
+
+    /// Plans storage batches without changing the missing global page set.
+    async fn plan_coalesced_page_reads(
+        &self,
+        page_numbers: Vec<u32>,
+        index_reader: LazyIndexReader,
+    ) -> Result<Vec<BTreeCoalescedReadBatch>> {
+        let mut pages_by_file: HashMap<String, Vec<(u32, u32)>> =
+            HashMap::with_capacity(page_numbers.len());
+        for page_number in page_numbers {
+            let (file_name, local_page_id) =
+                resolve_btree_page_file(page_number, self.ranges_to_files.as_deref())?;
+            pages_by_file
+                .entry(file_name)
+                .or_default()
+                .push((page_number, local_page_id));
+        }
+
+        let mut read_batches = Vec::with_capacity(pages_by_file.len());
+        for (file_name, mut pages) in pages_by_file {
+            pages.sort_unstable_by_key(|(_, local_page_id)| *local_page_id);
+            let reader = index_reader.get_file_reader(&file_name).await?;
+            let num_rows = reader.num_rows();
+
+            let mut current_ranges = Vec::new();
+            let mut current_pages = 0;
+            let mut previous_local_page = None;
+
+            for (global_page_id, local_page_id) in pages {
+                let row_range = btree_page_row_range(local_page_id, self.batch_size, num_rows)?;
+                let starts_new_range = previous_local_page
+                    .and_then(|previous: u32| previous.checked_add(1))
+                    != Some(local_page_id);
+                let next_range_count = current_ranges.len() + usize::from(starts_new_range);
+                if current_pages > 0
+                    && (current_pages + 1 > DEFAULT_BTREE_MAX_COALESCED_PAGES_PER_BATCH
+                        || next_range_count > DEFAULT_BTREE_MAX_COALESCED_RANGES_PER_BATCH)
+                {
+                    read_batches.push(BTreeCoalescedReadBatch {
+                        file_name: file_name.clone(),
+                        ranges: std::mem::take(&mut current_ranges),
+                        num_pages: current_pages,
+                    });
+                    current_pages = 0;
+                    previous_local_page = None;
+                }
+
+                let starts_new_range = previous_local_page
+                    .and_then(|previous: u32| previous.checked_add(1))
+                    != Some(local_page_id);
+                let page_to_read = BTreePageToRead {
+                    global_page_id,
+                    row_range: row_range.clone(),
+                };
+                if starts_new_range {
+                    current_ranges.push(BTreeRowRangeToRead {
+                        range: row_range,
+                        pages: vec![page_to_read],
+                    });
+                } else if let Some(current_range) = current_ranges.last_mut() {
+                    current_range.range.end = row_range.end;
+                    current_range.pages.push(page_to_read);
+                } else {
+                    return Err(Error::internal(
+                        "BTree coalesced read planner lost the current row range",
+                    ));
+                }
+                current_pages += 1;
+                previous_local_page = Some(local_page_id);
+            }
+
+            if current_pages > 0 {
+                read_batches.push(BTreeCoalescedReadBatch {
+                    file_name,
+                    ranges: current_ranges,
+                    num_pages: current_pages,
+                });
+            }
+        }
+
+        Ok(read_batches)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1288,17 +1707,13 @@ impl BTreeIndex {
         FlatIndex::try_new(serialized_page)
     }
 
-    async fn search_page(
+    fn search_materialized_page(
         &self,
         query: &SargableQuery,
         matches: Matches,
-        index_reader: LazyIndexReader,
+        subindex: Arc<FlatIndex>,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
-        let subindex = self
-            .lookup_page(matches.page_id(), index_reader, metrics)
-            .await?;
-
         match matches {
             Matches::Some(_) => {
                 // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
@@ -1703,6 +2118,7 @@ impl ScalarIndex for BTreeIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        let search_started = Instant::now();
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let mut pages = match query {
             SargableQuery::Equals(val) => self
@@ -1778,13 +2194,40 @@ impl ScalarIndex for BTreeIndex {
             }
         }
 
+        let read_plan = btree_page_read_plan(&pages, self.ranges_to_files.as_deref())?;
+        info!(
+            target: TRACE_IO_EVENTS,
+            r#type = "btree_read_plan",
+            index_type = "btree",
+            btree_candidate_pages = read_plan.candidate_pages,
+            btree_physical_files = read_plan.physical_files,
+            btree_page_runs = read_plan.page_runs,
+            btree_min_page_id = ?read_plan.min_page_id,
+            btree_max_page_id = ?read_plan.max_page_id,
+        );
+
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+        let (page_indices, coalesced_metrics) = self
+            .lookup_pages(&pages, lazy_index_reader, metrics)
+            .await?;
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
-                self.search_page(query, page_index, lazy_index_reader.clone(), metrics)
-                    .boxed()
+                let subindex = page_indices
+                    .get(&page_index.page_id())
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "BTree page {} was not loaded before search",
+                            page_index.page_id()
+                        ))
+                    })
+                    .cloned();
+                async move {
+                    let subindex = subindex?;
+                    self.search_materialized_page(query, page_index, subindex, metrics)
+                }
+                .boxed()
             })
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
@@ -1799,6 +2242,30 @@ impl ScalarIndex for BTreeIndex {
 
         // Merge matching row IDs
         let selection = NullableRowAddrSet::union_all(&results);
+        let pages_read_from_storage = coalesced_metrics.pages_read;
+        let search_elapsed_ms = search_started.elapsed().as_millis() as u64;
+        let search_metrics = BTreeSearchMetrics {
+            candidate_pages: read_plan.candidate_pages,
+            cache_hits: coalesced_metrics.cache_hits,
+            cache_misses: coalesced_metrics.cache_misses,
+            coalesced_batches: coalesced_metrics.batches,
+            coalesced_row_ranges: coalesced_metrics.row_ranges,
+            pages_read_from_storage,
+            search_elapsed_ms,
+        };
+        metrics.record_btree_search(&search_metrics);
+        info!(
+            target: TRACE_IO_EVENTS,
+            r#type = "btree_search",
+            index_type = "btree",
+            btree_candidate_pages = search_metrics.candidate_pages,
+            btree_cache_hits = search_metrics.cache_hits,
+            btree_cache_misses = search_metrics.cache_misses,
+            btree_coalesced_batches = search_metrics.coalesced_batches,
+            btree_coalesced_row_ranges = search_metrics.coalesced_row_ranges,
+            btree_pages_read_from_storage = search_metrics.pages_read_from_storage,
+            btree_search_elapsed_ms = search_metrics.search_elapsed_ms,
+        );
 
         Ok(SearchResult::Exact(selection))
     }
@@ -2973,11 +3440,17 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+        sync::Mutex,
+    };
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
-    use arrow_array::{FixedSizeListArray, record_batch};
+    use arrow_array::{FixedSizeListArray, RecordBatch, record_batch};
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
         physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
@@ -2987,20 +3460,20 @@ mod tests {
     use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use futures::stream;
-    use lance_core::cache::LanceCache;
-    use lance_core::utils::tempfile::TempObjDir;
+    use lance_core::{Result, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use lance_select::{RowAddrTreeMap, RowSetOps};
     use object_store::path::Path;
 
-    use crate::metrics::LocalMetricsCollector;
+    use crate::metrics::{BTreeSearchMetrics, LocalMetricsCollector, MetricsCollector};
     use crate::progress::{IndexBuildProgress, noop_progress};
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+            IndexReader, IndexStore, IndexWriter, OldIndexDataFilter, SargableQuery, ScalarIndex,
+            SearchResult,
             btree::{BTREE_PAGES_NAME, BTreeIndex},
             lance_format::LanceIndexStore,
         },
@@ -3008,10 +3481,10 @@ mod tests {
 
     use super::{
         BTreeIndexPlugin, BTreeIndexState, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        OrderableScalarValue, part_lookup_file_path, part_page_data_file_path, train_btree_index,
+        OrderableScalarValue, btree_page_read_plan, part_lookup_file_path,
+        part_page_data_file_path, train_btree_index,
     };
     use crate::scalar::registry::ScalarIndexPlugin;
-    use arrow_array::RecordBatch;
     use lance_core::cache::{CacheCodecImpl, CacheKey};
     use rangemap::RangeInclusiveMap;
 
@@ -3020,6 +3493,247 @@ mod tests {
         IndexBuildProgress,
         lance_core::Result<()>
     );
+
+    #[derive(Debug, Default)]
+    struct BTreeSearchMetricsCollector {
+        searches: Mutex<Vec<BTreeSearchMetrics>>,
+    }
+
+    impl BTreeSearchMetricsCollector {
+        fn last_search(&self) -> BTreeSearchMetrics {
+            self.searches
+                .lock()
+                .unwrap()
+                .last()
+                .expect("BTree search should report summary metrics")
+                .clone()
+        }
+    }
+
+    impl MetricsCollector for BTreeSearchMetricsCollector {
+        fn record_parts_loaded(&self, _num_parts: usize) {}
+
+        fn record_index_loads(&self, _num_indexes: usize) {}
+
+        fn record_comparisons(&self, _num_comparisons: usize) {}
+
+        fn record_btree_search(&self, metrics: &BTreeSearchMetrics) {
+            self.searches.lock().unwrap().push(metrics.clone());
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BTreePageReadCounters {
+        record_batch_reads: AtomicUsize,
+        range_batch_reads: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct CountingIndexStore {
+        inner: Arc<dyn IndexStore>,
+        counters: Arc<BTreePageReadCounters>,
+    }
+
+    impl CountingIndexStore {
+        fn new(inner: Arc<dyn IndexStore>) -> Self {
+            Self {
+                inner,
+                counters: Arc::new(BTreePageReadCounters::default()),
+            }
+        }
+
+        fn counters(&self) -> Arc<BTreePageReadCounters> {
+            self.counters.clone()
+        }
+    }
+
+    impl DeepSizeOf for CountingIndexStore {
+        fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+            self.inner.deep_size_of_children(context)
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for CountingIndexStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.clone(),
+                counters: self.counters.clone(),
+            })
+        }
+
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<arrow_schema::Schema>,
+        ) -> Result<Box<dyn IndexWriter>> {
+            self.inner.new_index_file(name, schema).await
+        }
+
+        async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+            let inner = self.inner.open_index_file(name).await?;
+            Ok(Arc::new(CountingIndexReader {
+                inner,
+                file_name: name.to_string(),
+                counters: self.counters.clone(),
+            }))
+        }
+
+        async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
+            self.inner.copy_index_file(name, dest_store).await
+        }
+
+        async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()> {
+            self.inner.rename_index_file(name, new_name).await
+        }
+
+        async fn delete_index_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_index_file(name).await
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
+    struct CountingIndexReader {
+        inner: Arc<dyn IndexReader>,
+        file_name: String,
+        counters: Arc<BTreePageReadCounters>,
+    }
+
+    impl CountingIndexReader {
+        fn is_btree_page_data(&self) -> bool {
+            self.file_name.ends_with(BTREE_PAGES_NAME)
+        }
+    }
+
+    #[async_trait]
+    impl IndexReader for CountingIndexReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            if self.is_btree_page_data() {
+                self.counters
+                    .record_batch_reads
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.read_record_batch(n, batch_size).await
+        }
+
+        async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
+            self.inner.read_global_buffer(index).await
+        }
+
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            self.inner.read_range(range, projection).await
+        }
+
+        async fn read_ranges(
+            &self,
+            ranges: Vec<std::ops::Range<usize>>,
+            projection: Option<&[&str]>,
+        ) -> Result<Vec<RecordBatch>> {
+            if self.is_btree_page_data() {
+                self.counters
+                    .range_batch_reads
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.read_ranges(ranges, projection).await
+        }
+
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.inner.schema()
+        }
+    }
+
+    async fn build_btree_index_at(
+        path: &str,
+        batch_size: u64,
+        num_batches: u32,
+    ) -> Arc<LanceIndexStore> {
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            object_store::path::Path::from(path),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(batch_size), BatchCount::from(num_batches));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(stream.schema(), stream));
+
+        train_btree_index(stream, store.as_ref(), batch_size, None, None)
+            .await
+            .unwrap();
+
+        store
+    }
+
+    async fn build_range_partitioned_btree_index_at(
+        path: &str,
+        batch_size: u64,
+        pages_per_file: u32,
+    ) -> Arc<LanceIndexStore> {
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            object_store::path::Path::from(path),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        for range_id in 0..2_u32 {
+            let start_value = (u64::from(range_id) * batch_size * u64::from(pages_per_file)) as i32;
+            let stream = gen_batch()
+                .col("value", array::step_custom::<Int32Type>(start_value, 1))
+                .col(
+                    "_rowid",
+                    array::step_custom::<UInt64Type>(start_value as u64, 1),
+                )
+                .into_df_stream(RowCount::from(batch_size), BatchCount::from(pages_per_file));
+            let stream = Box::pin(RecordBatchStreamAdapter::new(stream.schema(), stream));
+
+            train_btree_index(stream, store.as_ref(), batch_size, None, Some(range_id))
+                .await
+                .unwrap();
+        }
+
+        let part_page_files = (0..2_u64)
+            .map(|range_id| part_page_data_file_path(range_id << 32))
+            .collect::<Vec<_>>();
+        let part_lookup_files = (0..2_u64)
+            .map(|range_id| part_lookup_file_path(range_id << 32))
+            .collect::<Vec<_>>();
+        super::merge_metadata_files(
+            store.as_ref(),
+            &part_page_files,
+            &part_lookup_files,
+            Some(1),
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        store
+    }
+
     #[test]
     fn test_scalar_value_size() {
         let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
@@ -3190,6 +3904,247 @@ mod tests {
         let query2 = index.search(&query, &metrics);
         tokio::join!(query1, query2).0.unwrap();
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_btree_range_query_coalesces_page_data_reads() {
+        let store = build_btree_index_at("btree-coalesces-page-data-reads", 4096, 64).await;
+        let counting_store = Arc::new(CountingIndexStore::new(store));
+        let counters = counting_store.counters();
+        let index = BTreeIndex::load(counting_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let metrics = BTreeSearchMetricsCollector::default();
+        let lower_value = 4096;
+        let upper_value = 4096 * 49;
+        let query = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(lower_value))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(upper_value))),
+        );
+        let result = index.search(&query, &metrics).await.unwrap();
+
+        let SearchResult::Exact(row_ids) = result else {
+            panic!("expected exact BTree result");
+        };
+        let actual_rows: Vec<u64> = row_ids
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
+            .collect();
+        assert_eq!(actual_rows, (4096_u64..4096 * 49).collect::<Vec<_>>());
+
+        let search = metrics.last_search();
+        let lower = OrderableScalarValue(ScalarValue::Int32(Some(lower_value)));
+        let upper = OrderableScalarValue(ScalarValue::Int32(Some(upper_value)));
+        let pages = index.page_lookup.pages_between((
+            std::ops::Bound::Included(&lower),
+            std::ops::Bound::Excluded(&upper),
+        ));
+        let read_plan = btree_page_read_plan(&pages, index.ranges_to_files.as_deref()).unwrap();
+
+        assert!(
+            search.candidate_pages > 1,
+            "expected broad range to match many pages, got {:?}",
+            search
+        );
+        assert_eq!(read_plan.candidate_pages, search.candidate_pages);
+        assert_eq!(read_plan.physical_files, 1);
+        assert_eq!(read_plan.page_runs, 1);
+        let min_page_id = read_plan.min_page_id.expect("range should select pages");
+        let max_page_id = read_plan.max_page_id.expect("range should select pages");
+        assert!(max_page_id >= min_page_id, "got {:?}", read_plan);
+        assert_eq!(
+            (max_page_id - min_page_id + 1) as usize,
+            read_plan.candidate_pages
+        );
+        assert_eq!(search.pages_read_from_storage, search.candidate_pages);
+        assert_eq!(search.cache_hits, 0);
+        assert_eq!(search.cache_misses, search.candidate_pages);
+        assert_eq!(search.coalesced_batches, 1, "got {:?}", search);
+        assert_eq!(search.coalesced_row_ranges, 1, "got {:?}", search);
+
+        let record_batch_reads = counters.record_batch_reads.load(Ordering::Relaxed);
+        assert!(
+            record_batch_reads < search.candidate_pages,
+            "expected BTree page_data reads to use fewer single-page reads than the per-page pattern, got {} reads and metrics {:?}",
+            record_batch_reads,
+            search
+        );
+        assert_eq!(record_batch_reads, 0);
+        assert_eq!(counters.range_batch_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_range_partitioned_btree_coalesces_reads_per_page_file() {
+        let store =
+            build_range_partitioned_btree_index_at("btree-range-partitioned-coalescing", 4096, 16)
+                .await;
+        let counting_store = Arc::new(CountingIndexStore::new(store));
+        let counters = counting_store.counters();
+        let index = BTreeIndex::load(counting_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let metrics = BTreeSearchMetricsCollector::default();
+        let lower_value = 4096;
+        let upper_value = 4096 * 31;
+        let query = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(lower_value))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(upper_value))),
+        );
+        let result = index.search(&query, &metrics).await.unwrap();
+
+        let SearchResult::Exact(row_ids) = result else {
+            panic!("expected exact BTree result");
+        };
+        let actual_rows: Vec<u64> = row_ids
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
+            .collect();
+        assert_eq!(actual_rows, (4096_u64..4096 * 31).collect::<Vec<_>>());
+
+        let search = metrics.last_search();
+        let lower = OrderableScalarValue(ScalarValue::Int32(Some(lower_value)));
+        let upper = OrderableScalarValue(ScalarValue::Int32(Some(upper_value)));
+        let pages = index.page_lookup.pages_between((
+            std::ops::Bound::Included(&lower),
+            std::ops::Bound::Excluded(&upper),
+        ));
+        let read_plan = btree_page_read_plan(&pages, index.ranges_to_files.as_deref()).unwrap();
+
+        assert_eq!(search.candidate_pages, 32, "got {:?}", search);
+        assert_eq!(search.pages_read_from_storage, 32, "got {:?}", search);
+        assert_eq!(search.cache_hits, 0, "got {:?}", search);
+        assert_eq!(
+            search.cache_misses, search.candidate_pages,
+            "got {:?}",
+            search
+        );
+        assert_eq!(read_plan.candidate_pages, search.candidate_pages);
+        assert_eq!(read_plan.physical_files, 2, "got {:?}", read_plan);
+        assert_eq!(read_plan.page_runs, 2, "got {:?}", read_plan);
+        assert_eq!(search.coalesced_batches, 2, "got {:?}", search);
+        assert_eq!(search.coalesced_row_ranges, 2, "got {:?}", search);
+        assert_eq!(search.pages_read_from_storage, search.candidate_pages);
+
+        let record_batch_reads = counters.record_batch_reads.load(Ordering::Relaxed);
+        assert!(
+            record_batch_reads < search.candidate_pages,
+            "expected range-partitioned BTree page_data reads to use fewer single-page reads than the per-page pattern, got {} reads and metrics {:?}",
+            record_batch_reads,
+            search
+        );
+        assert_eq!(record_batch_reads, 0);
+        assert_eq!(counters.range_batch_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_btree_coalesced_reads_preserve_page_cache_hits() {
+        let store = build_btree_index_at("btree-cache-hit-coalescing", 4096, 64).await;
+        let counting_store = Arc::new(CountingIndexStore::new(store));
+        let counters = counting_store.counters();
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let index = BTreeIndex::load(counting_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let query = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(4096))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(4096 * 49))),
+        );
+        let first_metrics = BTreeSearchMetricsCollector::default();
+        index.search(&query, &first_metrics).await.unwrap();
+        let first = first_metrics.last_search();
+        assert_eq!(
+            first.pages_read_from_storage, first.candidate_pages,
+            "got {:?}",
+            first
+        );
+        assert_eq!(first.cache_hits, 0, "got {:?}", first);
+        assert_eq!(first.coalesced_batches, 1, "got {:?}", first);
+
+        let first_batch_reads = counters.range_batch_reads.load(Ordering::Relaxed);
+        let second_metrics = BTreeSearchMetricsCollector::default();
+        index.search(&query, &second_metrics).await.unwrap();
+        let second = second_metrics.last_search();
+
+        assert_eq!(second.candidate_pages, first.candidate_pages);
+        assert_eq!(second.pages_read_from_storage, 0, "got {:?}", second);
+        assert_eq!(second.cache_misses, 0, "got {:?}", second);
+        assert_eq!(
+            second.cache_hits, second.candidate_pages,
+            "got {:?}",
+            second
+        );
+        assert_eq!(second.coalesced_batches, 0, "got {:?}", second);
+        assert_eq!(
+            counters.range_batch_reads.load(Ordering::Relaxed),
+            first_batch_reads,
+            "cached BTree pages should not be reread through the coalesced path"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_btree_search_metrics_count_actual_cache_outcomes() {
+        let store = build_btree_index_at("btree-duplicate-candidate-metrics", 4096, 2).await;
+        let cache = Arc::new(LanceCache::with_capacity(100 * 1024 * 1024));
+        let loaded_index = BTreeIndex::load(store, None, cache.as_ref()).await.unwrap();
+
+        let mut tree = BTreeMap::new();
+        tree.insert(
+            OrderableScalarValue(ScalarValue::Int32(Some(0))),
+            vec![
+                super::PageRecord {
+                    max: OrderableScalarValue(ScalarValue::Int32(Some(4095))),
+                    page_number: 0,
+                },
+                super::PageRecord {
+                    max: OrderableScalarValue(ScalarValue::Int32(Some(4095))),
+                    page_number: 0,
+                },
+            ],
+        );
+        let duplicate_lookup_index = BTreeIndex::new(
+            Arc::new(super::BTreeLookup {
+                tree,
+                null_pages: vec![],
+                all_null_pages: vec![],
+            }),
+            loaded_index.store.clone(),
+            loaded_index.data_type.clone(),
+            loaded_index.index_cache.clone(),
+            loaded_index.batch_size,
+            loaded_index.ranges_to_files.clone(),
+            loaded_index.frag_reuse_index.clone(),
+            loaded_index.lookup_batch.clone(),
+        );
+
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(0)));
+        let cold_metrics = BTreeSearchMetricsCollector::default();
+        duplicate_lookup_index
+            .search(&query, &cold_metrics)
+            .await
+            .unwrap();
+        let cold = cold_metrics.last_search();
+        assert_eq!(cold.candidate_pages, 2, "got {:?}", cold);
+        assert_eq!(cold.pages_read_from_storage, 1, "got {:?}", cold);
+        assert_eq!(cold.cache_hits, 0, "got {:?}", cold);
+        assert_eq!(cold.cache_misses, 1, "got {:?}", cold);
+
+        let warm_metrics = BTreeSearchMetricsCollector::default();
+        duplicate_lookup_index
+            .search(&query, &warm_metrics)
+            .await
+            .unwrap();
+        let warm = warm_metrics.last_search();
+        assert_eq!(warm.candidate_pages, 2, "got {:?}", warm);
+        assert_eq!(warm.pages_read_from_storage, 0, "got {:?}", warm);
+        assert_eq!(warm.cache_hits, 1, "got {:?}", warm);
+        assert_eq!(warm.cache_misses, 0, "got {:?}", warm);
     }
 
     #[tokio::test]
