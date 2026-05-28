@@ -16,6 +16,7 @@ package org.lance.update;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -32,10 +33,16 @@ import java.util.Optional;
  * stable row id.
  */
 public class UpdateParams {
+  // Defaults are kept in sync with the Rust core defaults declared on
+  // `lance::dataset::UpdateBuilder` (`conflict_retries = 10`,
+  // `retry_timeout = 30s`). When the Rust defaults change, update both sides.
+  private static final int DEFAULT_CONFLICT_RETRIES = 10;
+  private static final long DEFAULT_RETRY_TIMEOUT_MS = 30_000L;
+
   private final Map<String, String> updates;
   private Optional<String> whereClause = Optional.empty();
-  private int conflictRetries = 10;
-  private long retryTimeoutMs = 30 * 1000;
+  private int conflictRetries = DEFAULT_CONFLICT_RETRIES;
+  private long retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS;
 
   public UpdateParams(Map<String, String> updates) {
     Preconditions.checkNotNull(updates, "updates must not be null");
@@ -61,7 +68,7 @@ public class UpdateParams {
   /**
    * Set number of times to retry the operation if there is contention.
    *
-   * <p>Default is 10.
+   * <p>Default mirrors the Rust core default ({@value #DEFAULT_CONFLICT_RETRIES}).
    *
    * @param retries Number of times to retry the operation if there is contention.
    * @return This UpdateParams instance.
@@ -76,7 +83,8 @@ public class UpdateParams {
    * Set the timeout in milliseconds used to limit retries.
    *
    * <p>This is the maximum time to spend on the operation before giving up. At least one attempt
-   * will be made, regardless of how long it takes to complete. Default is 30000.
+   * will be made, regardless of how long it takes to complete. Default mirrors the Rust core
+   * default ({@value #DEFAULT_RETRY_TIMEOUT_MS} ms).
    *
    * @param timeoutMs Timeout in milliseconds used to limit retries.
    * @return This UpdateParams instance.
@@ -87,8 +95,9 @@ public class UpdateParams {
     return this;
   }
 
+  /** Returns an unmodifiable view of the update expressions. */
   public Map<String, String> updates() {
-    return updates;
+    return Collections.unmodifiableMap(updates);
   }
 
   public Optional<String> whereClause() {

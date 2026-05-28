@@ -43,8 +43,11 @@ public final class UpdateResult {
 
   @Override
   public String toString() {
+    // Avoid dumping the full Dataset (which includes native handles, schema, manifest, etc.).
+    // A lightweight identifier (uri + version) is enough for diagnostics.
     return MoreObjects.toStringHelper(this)
-        .add("dataset", dataset)
+        .add("datasetUri", dataset.uri())
+        .add("datasetVersion", dataset.version())
         .add("numRowsUpdated", numRowsUpdated)
         .toString();
   }

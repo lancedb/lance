@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.operation.Append;
 import org.lance.update.UpdateParams;
 import org.lance.update.UpdateResult;
 
@@ -33,11 +34,15 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 
 public class UpdateTest {
+  private static final int ROW_COUNT = 5;
+  private static final String ROW_ID_COLUMN = "_rowid";
+
   @TempDir private Path tempDir;
   private RootAllocator allocator;
   private TestUtils.SimpleTestDataset testDataset;
@@ -48,8 +53,21 @@ public class UpdateTest {
     String datasetPath = tempDir.resolve(UUID.randomUUID().toString()).toString();
     allocator = new RootAllocator(Long.MAX_VALUE);
     testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-    testDataset.createEmptyDataset().close();
-    dataset = testDataset.write(1, 5);
+
+    // Enable stable row ids so that `_rowid` is a stable u64 identifier and can be
+    // used as an update predicate (the core feature exercised by the rowid tests).
+    Dataset empty =
+        testDataset.createDatasetWithWriteParams(
+            new WriteParams.Builder().withEnableStableRowIds(true).build());
+
+    FragmentMetadata fragment = testDataset.createNewFragment(ROW_COUNT);
+    SourcedTransaction transaction =
+        new SourcedTransaction.Builder(empty)
+            .operation(Append.builder().fragments(Arrays.asList(fragment)).build())
+            .readVersion(empty.version())
+            .build();
+    dataset = transaction.commit();
+    empty.close();
   }
 
   @AfterEach
@@ -64,10 +82,10 @@ public class UpdateTest {
   public void testUpdateAllRows() {
     UpdateResult result = dataset.update(new UpdateParams(ImmutableMap.of("name", "'updated'")));
 
-    Assertions.assertEquals(5, result.getNumRowsUpdated());
+    Assertions.assertEquals(ROW_COUNT, result.getNumRowsUpdated());
     try (Dataset newDataset = result.getDataset()) {
       List<String> names = readNames(newDataset);
-      Assertions.assertEquals(5, names.size());
+      Assertions.assertEquals(ROW_COUNT, names.size());
       for (String name : names) {
         Assertions.assertEquals("updated", name);
       }
@@ -81,148 +99,75 @@ public class UpdateTest {
 
     Assertions.assertEquals(1, result.getNumRowsUpdated());
     try (Dataset newDataset = result.getDataset()) {
-      // id=2 should be 'updated'; others remain "Person <i>".
-      try (LanceScanner scanner =
-          newDataset.newScan(
-              new ScanOptions.Builder().columns(java.util.Arrays.asList("id", "name")).build())) {
-        try (ArrowReader reader = scanner.scanBatches()) {
-          int seen = 0;
-          while (reader.loadNextBatch()) {
-            VectorSchemaRoot batch = reader.getVectorSchemaRoot();
-            IntVector idVector = (IntVector) batch.getVector("id");
-            VarCharVector nameVector = (VarCharVector) batch.getVector("name");
-            for (int i = 0; i < batch.getRowCount(); i++) {
-              int id = idVector.get(i);
-              String name = new String(nameVector.get(i));
-              if (id == 2) {
-                Assertions.assertEquals("updated", name);
-              } else {
-                Assertions.assertEquals("Person " + id, name);
-              }
-              seen++;
-            }
-          }
-          Assertions.assertEquals(5, seen);
-        }
-      } catch (Exception e) {
-        throw new RuntimeException(e);
-      }
+      assertNamesById(
+          newDataset, id -> id == 2 ? "updated" : "Person " + id, /* expectedRows= */ ROW_COUNT);
     }
   }
 
   @Test
   public void testUpdateByRowId() throws Exception {
-    // Read the stable row id of one row and update by `_rowid`.
-    long targetRowId;
-    int targetId;
-    try (LanceScanner scanner =
-        dataset.newScan(
-            new ScanOptions.Builder()
-                .columns(java.util.Arrays.asList("id"))
-                .withRowId(true)
-                .build())) {
-      try (ArrowReader reader = scanner.scanBatches()) {
-        Assertions.assertTrue(reader.loadNextBatch());
-        VectorSchemaRoot batch = reader.getVectorSchemaRoot();
-        UInt8Vector rowIdVector = (UInt8Vector) batch.getVector("_rowid");
-        IntVector idVector = (IntVector) batch.getVector("id");
-        targetRowId = rowIdVector.get(2);
-        targetId = idVector.get(2);
-      }
-    }
+    List<long[]> sample = readRowIdsAndIds(dataset);
+    long targetRowId = sample.get(0)[2];
+    int targetId = (int) sample.get(1)[2];
 
     UpdateResult result =
         dataset.update(
             new UpdateParams(ImmutableMap.of("name", "'updated'"))
-                .withWhere("_rowid = " + targetRowId));
+                .withWhere(ROW_ID_COLUMN + " = " + targetRowId));
 
     Assertions.assertEquals(1, result.getNumRowsUpdated());
     try (Dataset newDataset = result.getDataset()) {
-      try (LanceScanner scanner =
-          newDataset.newScan(
-              new ScanOptions.Builder().columns(java.util.Arrays.asList("id", "name")).build())) {
-        try (ArrowReader reader = scanner.scanBatches()) {
-          int updated = 0;
-          while (reader.loadNextBatch()) {
-            VectorSchemaRoot batch = reader.getVectorSchemaRoot();
-            IntVector idVector = (IntVector) batch.getVector("id");
-            VarCharVector nameVector = (VarCharVector) batch.getVector("name");
-            for (int i = 0; i < batch.getRowCount(); i++) {
-              int id = idVector.get(i);
-              String name = new String(nameVector.get(i));
-              if (id == targetId) {
-                Assertions.assertEquals("updated", name);
-                updated++;
-              } else {
-                Assertions.assertEquals("Person " + id, name);
-              }
-            }
-          }
-          Assertions.assertEquals(1, updated);
-        }
-      }
+      assertNamesById(
+          newDataset,
+          id -> id == targetId ? "updated" : "Person " + id,
+          /* expectedRows= */ ROW_COUNT);
     }
   }
 
   @Test
   public void testUpdateByRowIdInList() throws Exception {
-    List<Long> targetRowIds = new ArrayList<>();
-    List<Integer> targetIds = new ArrayList<>();
-    try (LanceScanner scanner =
-        dataset.newScan(
-            new ScanOptions.Builder()
-                .columns(java.util.Arrays.asList("id"))
-                .withRowId(true)
-                .build())) {
-      try (ArrowReader reader = scanner.scanBatches()) {
-        Assertions.assertTrue(reader.loadNextBatch());
-        VectorSchemaRoot batch = reader.getVectorSchemaRoot();
-        UInt8Vector rowIdVector = (UInt8Vector) batch.getVector("_rowid");
-        IntVector idVector = (IntVector) batch.getVector("id");
-        for (int idx : new int[] {0, 2, 4}) {
-          targetRowIds.add(rowIdVector.get(idx));
-          targetIds.add(idVector.get(idx));
-        }
-      }
-    }
+    List<long[]> sample = readRowIdsAndIds(dataset);
+    long[] rowIds = sample.get(0);
+    long[] ids = sample.get(1);
+    int[] indices = new int[] {0, 2, 4};
 
     StringBuilder inList = new StringBuilder();
-    for (int i = 0; i < targetRowIds.size(); i++) {
+    List<Integer> targetIds = new ArrayList<>();
+    for (int i = 0; i < indices.length; i++) {
       if (i > 0) {
         inList.append(", ");
       }
-      inList.append(targetRowIds.get(i));
+      inList.append(rowIds[indices[i]]);
+      targetIds.add((int) ids[indices[i]]);
     }
 
     UpdateResult result =
         dataset.update(
             new UpdateParams(ImmutableMap.of("name", "'updated'"))
-                .withWhere("_rowid IN (" + inList + ")"));
+                .withWhere(ROW_ID_COLUMN + " IN (" + inList + ")"));
 
     Assertions.assertEquals(targetIds.size(), result.getNumRowsUpdated());
     try (Dataset newDataset = result.getDataset()) {
-      try (LanceScanner scanner =
-          newDataset.newScan(
-              new ScanOptions.Builder().columns(java.util.Arrays.asList("id", "name")).build())) {
-        try (ArrowReader reader = scanner.scanBatches()) {
-          int updated = 0;
-          while (reader.loadNextBatch()) {
-            VectorSchemaRoot batch = reader.getVectorSchemaRoot();
-            IntVector idVector = (IntVector) batch.getVector("id");
-            VarCharVector nameVector = (VarCharVector) batch.getVector("name");
-            for (int i = 0; i < batch.getRowCount(); i++) {
-              int id = idVector.get(i);
-              String name = new String(nameVector.get(i));
-              if (targetIds.contains(id)) {
-                Assertions.assertEquals("updated", name);
-                updated++;
-              } else {
-                Assertions.assertEquals("Person " + id, name);
-              }
-            }
-          }
-          Assertions.assertEquals(targetIds.size(), updated);
-        }
+      assertNamesById(
+          newDataset,
+          id -> targetIds.contains(id) ? "updated" : "Person " + id,
+          /* expectedRows= */ ROW_COUNT);
+    }
+  }
+
+  @Test
+  public void testUpdateWithRetryParameters() {
+    // Ensure builder-style retry knobs round-trip through the JNI layer.
+    UpdateResult result =
+        dataset.update(
+            new UpdateParams(ImmutableMap.of("name", "'retried'"))
+                .withConflictRetries(3)
+                .withRetryTimeoutMs(60_000));
+
+    Assertions.assertEquals(ROW_COUNT, result.getNumRowsUpdated());
+    try (Dataset newDataset = result.getDataset()) {
+      for (String name : readNames(newDataset)) {
+        Assertions.assertEquals("retried", name);
       }
     }
   }
@@ -233,11 +178,67 @@ public class UpdateTest {
         IllegalArgumentException.class, () -> new UpdateParams(Collections.emptyMap()));
   }
 
-  private List<String> readNames(Dataset dataset) {
+  /**
+   * Returns a 2-element list: index 0 contains the {@code _rowid} values, index 1 contains the
+   * {@code id} values. Both arrays are sized to {@link #ROW_COUNT}.
+   */
+  private List<long[]> readRowIdsAndIds(Dataset ds) throws Exception {
+    long[] rowIds = new long[ROW_COUNT];
+    long[] ids = new long[ROW_COUNT];
+    try (LanceScanner scanner =
+        ds.newScan(
+            new ScanOptions.Builder().columns(Arrays.asList("id")).withRowId(true).build())) {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        int row = 0;
+        while (reader.loadNextBatch()) {
+          VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+          // Lance stable `_rowid` is an Arrow uint64; Arrow Java represents uint64 as
+          // `UInt8Vector` (the "8" refers to byte width, not bit width).
+          UInt8Vector rowIdVector = (UInt8Vector) batch.getVector(ROW_ID_COLUMN);
+          IntVector idVector = (IntVector) batch.getVector("id");
+          for (int i = 0; i < batch.getRowCount(); i++) {
+            rowIds[row] = rowIdVector.get(i);
+            ids[row] = idVector.get(i);
+            row++;
+          }
+        }
+        Assertions.assertEquals(ROW_COUNT, row);
+      }
+    }
+    return Arrays.asList(rowIds, ids);
+  }
+
+  private interface IntToString {
+    String apply(int id);
+  }
+
+  private void assertNamesById(Dataset ds, IntToString expected, int expectedRows) {
+    try (LanceScanner scanner =
+        ds.newScan(new ScanOptions.Builder().columns(Arrays.asList("id", "name")).build())) {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        int seen = 0;
+        while (reader.loadNextBatch()) {
+          VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+          IntVector idVector = (IntVector) batch.getVector("id");
+          VarCharVector nameVector = (VarCharVector) batch.getVector("name");
+          for (int i = 0; i < batch.getRowCount(); i++) {
+            int id = idVector.get(i);
+            String name = new String(nameVector.get(i));
+            Assertions.assertEquals(expected.apply(id), name);
+            seen++;
+          }
+        }
+        Assertions.assertEquals(expectedRows, seen);
+      }
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private List<String> readNames(Dataset ds) {
     List<String> names = new ArrayList<>();
     try (LanceScanner scanner =
-        dataset.newScan(
-            new ScanOptions.Builder().columns(java.util.Arrays.asList("name")).build())) {
+        ds.newScan(new ScanOptions.Builder().columns(Arrays.asList("name")).build())) {
       try (ArrowReader reader = scanner.scanBatches()) {
         while (reader.loadNextBatch()) {
           VectorSchemaRoot batch = reader.getVectorSchemaRoot();

@@ -31,26 +31,33 @@ fn inner_update<'local>(
     let conflict_retries = extract_conflict_retries(env, &jparam)?;
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
 
-    let update_result = unsafe {
+    // Clone the inner Dataset out of the `get_rust_field` guard and drop the
+    // guard before running the long-lived async update. Otherwise the guard
+    // would block any other JNI call on the same dataset for the entire
+    // duration of `execute()`.
+    let inner_dataset = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
-
-        let mut builder = UpdateBuilder::new(Arc::new(dataset.clone().inner))
-            .conflict_retries(conflict_retries)
-            .retry_timeout(Duration::from_millis(retry_timeout_ms));
-
-        if let Some(predicate) = where_clause {
-            builder = builder.update_where(&predicate)?;
-        }
-
-        for (column, expr) in &updates {
-            builder = builder.set(column, expr)?;
-        }
-
-        let job = builder.build()?;
-        RT.block_on(job.execute())?
+        dataset.inner.clone()
     };
 
-    let new_ds = Arc::try_unwrap(update_result.new_dataset).unwrap();
+    let mut builder = UpdateBuilder::new(Arc::new(inner_dataset))
+        .conflict_retries(conflict_retries)
+        .retry_timeout(Duration::from_millis(retry_timeout_ms));
+
+    if let Some(predicate) = where_clause {
+        builder = builder.update_where(&predicate)?;
+    }
+
+    for (column, expr) in &updates {
+        builder = builder.set(column, expr)?;
+    }
+
+    let job = builder.build()?;
+    let update_result = RT.block_on(job.execute())?;
+
+    // Avoid panicking if Lance core retains a clone of the Arc; fall back to a
+    // deep clone so the JNI boundary stays panic-free.
+    let new_ds = Arc::try_unwrap(update_result.new_dataset).unwrap_or_else(|arc| (*arc).clone());
 
     UpdateResultJava {
         dataset: BlockingDataset { inner: new_ds },
