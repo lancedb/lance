@@ -41,7 +41,7 @@ pub use utils::PreFilterSource;
 /// Declares which vesrion of the relational algebra we are producing
 ///
 /// In order to enable plan pushdown (executing parts of the physical plan on different nodes)
-/// we must treat the physical plan serialization and the inputs and outputs of phsyical plan
+/// we must treat the physical plan serialization and the inputs and outputs of phyical plan
 /// nodes as part of the public API surface.
 ///
 /// We should attempt to handle as many versions as possible on read paths.  This variable
