@@ -3425,6 +3425,7 @@ mod tests {
         #[values(IndexFileVersion::Legacy, IndexFileVersion::V3)] index_version: IndexFileVersion,
     ) {
         // Most vector search algorithms are approximate, so they may not return all results.
+        // IvfFlat is exact under this test's parameters.
         let is_approximate = !matches!(&test_case.index_type, TestIndexType::IvfFlat);
         let mut index_params = match test_case.index_type {
             TestIndexType::IvfPq { pq } => VectorIndexParams::with_ivf_pq_params(
@@ -3503,8 +3504,9 @@ mod tests {
             let recall = results.num_rows() as f32 / num_non_null as f32;
             assert!(
                 recall >= 0.99,
-                "Recall too low: {} ({} / {})",
+                "Recall {} below threshold {} ({}/{})",
                 recall,
+                0.99,
                 results.num_rows(),
                 num_non_null,
             );
