@@ -3075,8 +3075,9 @@ class LanceDataset(pa.dataset.Dataset):
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
             method returns metadata for one segment but does not commit
-            the index to the dataset. The segment can be planned, merged, and
-            committed later using the segment builder and commit APIs.
+            the index to the dataset. The segment can be optionally merged with
+            other segments and committed later with
+            ``commit_existing_index_segments(...)``.
             This parameter is passed via kwargs internally.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
@@ -3751,8 +3752,8 @@ class LanceDataset(pa.dataset.Dataset):
             This enables distributed/fragment-level indexing. When provided, the
             method creates one segment but does not commit the index
             to the dataset. The returned metadata can be passed to
-            ``create_index_segment_builder().with_index_type(...).with_segments(...)``
-            and then committed with ``commit_existing_index_segments(...)``.
+            ``merge_existing_index_segments(...)`` if grouping is needed and then
+            committed with ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
@@ -3935,10 +3936,9 @@ class LanceDataset(pa.dataset.Dataset):
         1. run :meth:`create_index_uncommitted` on each worker with that worker's
            assigned ``fragment_ids``
         2. collect the returned :class:`Index` objects
-        3. call :meth:`IndexSegmentBuilder.with_index_type` with the concrete
-           distributed index type
-        4. pass them to :meth:`IndexSegmentBuilder.with_segments`
-        5. build one or more physical segments and commit them with
+        3. optionally merge caller-defined groups with
+           :meth:`merge_existing_index_segments`
+        4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
         Parameters are the same as :meth:`create_index`, with one additional
@@ -4019,9 +4019,9 @@ class LanceDataset(pa.dataset.Dataset):
         Merge distributed scalar index metadata.
 
         Vector distributed indexing no longer uses this API. For vector indices,
-        build segments with :meth:`create_index_uncommitted`, plan or
-        merge them with :meth:`create_index_segment_builder`, and publish them
-        with :meth:`commit_existing_index_segments`.
+        build segments with :meth:`create_index_uncommitted`, optionally merge
+        them with :meth:`merge_existing_index_segments`, and publish them with
+        :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
@@ -4057,17 +4057,6 @@ class LanceDataset(pa.dataset.Dataset):
         # Merge physical index files at the index directory
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
         return None
-
-    def create_index_segment_builder(self):
-        """
-        Create a builder for turning existing segments into physical segments.
-
-        Provide the segment metadata returned by
-        :meth:`create_index_uncommitted` through
-        :meth:`IndexSegmentBuilder.with_segments`, and declare the segment type
-        with :meth:`IndexSegmentBuilder.with_index_type`.
-        """
-        return self._ds.create_index_segment_builder()
 
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """

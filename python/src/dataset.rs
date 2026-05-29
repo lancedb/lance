@@ -96,7 +96,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentPlan};
+use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
@@ -463,36 +463,6 @@ impl MergeInsertBuilder {
     }
 }
 
-#[pyclass(
-    name = "IndexSegmentBuilder",
-    module = "lance",
-    subclass,
-    skip_from_py_object
-)]
-#[derive(Clone)]
-pub struct PyIndexSegmentBuilder {
-    dataset: Arc<LanceDataset>,
-    index_type: Option<IndexType>,
-    segments: Vec<IndexMetadata>,
-    target_segment_bytes: Option<u64>,
-}
-
-impl PyIndexSegmentBuilder {
-    fn builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
-        let mut builder = self
-            .dataset
-            .create_index_segment_builder()
-            .with_segments(self.segments.clone());
-        if let Some(index_type) = self.index_type {
-            builder = builder.with_index_type(index_type);
-        }
-        if let Some(target_segment_bytes) = self.target_segment_bytes {
-            builder = builder.with_target_segment_bytes(target_segment_bytes);
-        }
-        builder
-    }
-}
-
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
     let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
         PyValueError::new_err(format!(
@@ -533,81 +503,6 @@ fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegm
         }
     }
     Ok(extracted)
-}
-
-#[pymethods]
-impl PyIndexSegmentBuilder {
-    fn with_index_type<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        index_type: &str,
-    ) -> PyResult<PyRefMut<'a, Self>> {
-        let normalized = index_type.to_uppercase();
-        slf.index_type = Some(match normalized.as_str() {
-            "INVERTED" | "FTS" => IndexType::Inverted,
-            "VECTOR" => IndexType::Vector,
-            "IVF_FLAT" => IndexType::IvfFlat,
-            "IVF_PQ" => IndexType::IvfPq,
-            "IVF_SQ" => IndexType::IvfSq,
-            "IVF_RQ" => IndexType::IvfRq,
-            "IVF_HNSW_FLAT" => IndexType::IvfHnswFlat,
-            "IVF_HNSW_PQ" => IndexType::IvfHnswPq,
-            "IVF_HNSW_SQ" => IndexType::IvfHnswSq,
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "Unsupported index type for segment builder: {index_type}"
-                )));
-            }
-        });
-        Ok(slf)
-    }
-
-    fn with_segments<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        segments: &Bound<'_, PyAny>,
-    ) -> PyResult<PyRefMut<'a, Self>> {
-        let mut indices = Vec::new();
-        for item in segments.try_iter()? {
-            indices.push(item?.extract::<PyLance<IndexMetadata>>()?.0);
-        }
-        slf.segments = indices;
-        Ok(slf)
-    }
-
-    fn with_target_segment_bytes<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        bytes: u64,
-    ) -> PyResult<PyRefMut<'a, Self>> {
-        slf.target_segment_bytes = Some(bytes);
-        Ok(slf)
-    }
-
-    fn plan(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegmentPlan>>> {
-        let plans = rt()
-            .block_on(Some(py), self.builder().plan())?
-            .infer_error()?;
-        plans
-            .into_iter()
-            .map(|plan| Py::new(py, PyIndexSegmentPlan::from_inner(plan)))
-            .collect()
-    }
-
-    fn build(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<Py<PyIndexSegment>> {
-        let plan = plan.extract::<PyRef<'_, PyIndexSegmentPlan>>()?;
-        let segment = rt()
-            .block_on(Some(py), self.builder().build(&plan.inner))?
-            .infer_error()?;
-        Py::new(py, PyIndexSegment::from_inner(segment))
-    }
-
-    fn build_all(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegment>>> {
-        let segments = rt()
-            .block_on(Some(py), self.builder().build_all())?
-            .infer_error()?;
-        segments
-            .into_iter()
-            .map(|segment| Py::new(py, PyIndexSegment::from_inner(segment)))
-            .collect()
-    }
 }
 
 impl MergeInsertBuilder {
@@ -2500,15 +2395,6 @@ impl Dataset {
         };
 
         Ok(PyLance(index_metadata))
-    }
-
-    fn create_index_segment_builder(&self) -> PyResult<PyIndexSegmentBuilder> {
-        Ok(PyIndexSegmentBuilder {
-            dataset: self.ds.clone(),
-            index_type: None,
-            segments: Vec::new(),
-            target_segment_bytes: None,
-        })
     }
 
     fn merge_existing_index_segments(
