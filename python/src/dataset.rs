@@ -33,6 +33,7 @@ use pyo3::{
     pyclass,
     types::{IntoPyDict, PyDict},
 };
+use uuid::Uuid;
 
 use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
@@ -1106,7 +1107,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1124,6 +1125,7 @@ impl Dataset {
         fragment_readahead: Option<usize>,
         scan_in_order: Option<bool>,
         fragments: Option<Vec<FileFragment>>,
+        index_segments: Option<Vec<String>>,
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
         use_stats: Option<bool>,
@@ -1302,6 +1304,22 @@ impl Dataset {
             scanner.with_fragments(fragments);
         }
 
+        if let Some(index_segments) = index_segments {
+            let index_segments = index_segments
+                .into_iter()
+                .map(|segment| {
+                    Uuid::parse_str(&segment).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "invalid index segment uuid '{segment}': {err}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            scanner
+                .with_index_segments(index_segments)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+
         if let Some(scan_stats_callback) = scan_stats_callback {
             let callback = Self::make_scan_stats_callback(scan_stats_callback.clone())?;
             scanner.scan_stats_callback(callback);
@@ -1371,7 +1389,12 @@ impl Dataset {
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
-                DataType::UInt8 => {
+                DataType::UInt8
+                    if !matches!(
+                        q.data_type(),
+                        DataType::List(_) | DataType::FixedSizeList(_, _)
+                    ) =>
+                {
                     let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
                         PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
                     })?;
@@ -3375,6 +3398,7 @@ impl Dataset {
                 field_dict.set_item("field_id", &field.field_id)?;
                 field_dict.set_item("source_ids", field.source_ids.clone())?;
                 field_dict.set_item("transform", field.transform.clone())?;
+                field_dict.set_item("expression", field.expression.clone())?;
                 field_dict.set_item("result_type", &field.result_type)?;
                 field_dict.set_item("parameters", field.parameters.clone())?;
                 fields.append(field_dict)?;
@@ -3386,12 +3410,12 @@ impl Dataset {
         Ok(Some(dict))
     }
 
-    /// Get a RegionWriter for the specified region.
+    /// Get a ShardWriter for the specified shard.
     ///
     /// `initialize_mem_wal()` must be called before using this method.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature=(
-        region_id,
+        shard_id,
         *,
         durable_write=None,
         sync_indexed_write=None,
@@ -3410,7 +3434,7 @@ impl Dataset {
     fn mem_wal_writer(
         &self,
         py: Python<'_>,
-        region_id: String,
+        shard_id: String,
         durable_write: Option<bool>,
         sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
@@ -3424,11 +3448,11 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
-    ) -> PyResult<crate::mem_wal::PyRegionWriter> {
+    ) -> PyResult<crate::mem_wal::PyShardWriter> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
-        let uuid = uuid::Uuid::parse_str(&region_id)
-            .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
+        let uuid = uuid::Uuid::parse_str(&shard_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
 
         let config = writer_config_from_kwargs(
             durable_write,
@@ -3455,7 +3479,7 @@ impl Dataset {
             )?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-        Ok(crate::mem_wal::PyRegionWriter::new(
+        Ok(crate::mem_wal::PyShardWriter::new(
             writer,
             uuid,
             self.ds.clone(),
@@ -4286,6 +4310,12 @@ fn prepare_vector_index_params(
             sq_params.sample_rate = sample_rate;
         }
 
+        if let Some(max_iters) = kwargs.get_item("max_iters")? {
+            let max_iters: usize = max_iters.extract()?;
+            ivf_params.max_iters = max_iters;
+            pq_params.max_iters = max_iters;
+        }
+
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
             ivf_params.num_partitions = Some(n.extract()?)
@@ -4443,6 +4473,13 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
+    if let Some(kwargs) = kwargs
+        && let Some(acc) = kwargs.get_item("accelerator")?
+    {
+        params
+            .runtime_hints
+            .insert("lancedb.accelerator".to_string(), acc.to_string());
+    }
     Ok(params)
 }
 

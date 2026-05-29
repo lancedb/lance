@@ -16,7 +16,7 @@ use crate::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
         },
-        vector_index_details,
+        vector_index_details, vector_index_details_default,
     },
 };
 use futures::future::{BoxFuture, try_join_all};
@@ -386,7 +386,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details(vec_params),
                     index_version,
                     files: Some(files),
                 }
@@ -425,7 +425,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 let files =
                     list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
                     files: Some(files),
                 }
@@ -1373,8 +1373,8 @@ mod tests {
     #[tokio::test]
     async fn test_distributed_build_bitmap() {
         use datafusion::common::ScalarValue;
-        use lance_core::utils::mask::RowSetOps;
         use lance_index::scalar::{SargableQuery, SearchResult, bitmap::BITMAP_LOOKUP_NAME};
+        use lance_select::RowSetOps;
 
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -2106,7 +2106,7 @@ mod tests {
                 vec![IndexSegment::new(
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
-                    Arc::new(vector_index_details()),
+                    Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
                 )],
             )

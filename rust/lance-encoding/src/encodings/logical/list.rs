@@ -265,7 +265,15 @@ mod tests {
     async fn try_encode_v22_pages(
         array: ArrayRef,
     ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
-        let arrow_field = Field::new("", array.data_type().clone(), true);
+        try_encode_v22_pages_with_metadata(array, HashMap::new()).await
+    }
+
+    async fn try_encode_v22_pages_with_metadata(
+        array: ArrayRef,
+        field_metadata: HashMap<String, String>,
+    ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
+        let arrow_field =
+            Field::new("", array.data_type().clone(), true).with_metadata(field_metadata);
         let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
         let encoding_strategy = crate::encoder::default_encoding_strategy(LanceFileVersion::V2_2);
         let mut column_index_seq = crate::encoder::ColumnIndexSequence::default();
@@ -307,7 +315,7 @@ mod tests {
         try_encode_v22_pages(array).await.unwrap()
     }
 
-    fn assert_sparse_boolean_layout(
+    fn assert_split_miniblock_layout(
         pages: &[crate::encoder::EncodedPage],
         expect_structural_only_page: bool,
     ) {
@@ -339,11 +347,11 @@ mod tests {
 
         assert!(
             miniblock_pages > 0,
-            "expected sparse boolean values to remain on mini-block pages"
+            "expected leaf values to remain on mini-block pages"
         );
         assert_eq!(
             fullzip_pages, 0,
-            "sparse boolean list pages should not fall back to full-zip"
+            "split list pages should not fall back to full-zip"
         );
         if expect_structural_only_page {
             assert!(
@@ -1089,7 +1097,7 @@ mod tests {
             .with_max_file_version(LanceFileVersion::V2_2);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_sparse_boolean_layout(&pages, false);
+        assert_split_miniblock_layout(&pages, false);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1125,7 +1133,7 @@ mod tests {
             .with_max_file_version(LanceFileVersion::V2_2);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_sparse_boolean_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1162,7 +1170,7 @@ mod tests {
             .with_max_file_version(LanceFileVersion::V2_2);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_sparse_boolean_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1193,7 +1201,7 @@ mod tests {
             .with_max_file_version(LanceFileVersion::V2_2);
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
-        assert_sparse_boolean_layout(&pages, true);
+        assert_split_miniblock_layout(&pages, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
@@ -1265,5 +1273,85 @@ mod tests {
             .with_indices(vec![0])
             .with_max_file_version(LanceFileVersion::V2_2);
         check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::new()).await;
+    }
+
+    /// Builds the HNSW-flush repro shape: a dense prefix where every row has
+    /// `NEIGHBORS_PER_ROW` distinct values, followed by a long tail of empty
+    /// lists. Mirrors `HNSW::schema()` `__neighbors` / `__dists` columns:
+    /// dense level-0 lists, then ~6x as many mostly-empty higher-level rows.
+    fn make_hnsw_shaped_list_u32() -> ListArray {
+        const DENSE_ROWS: u32 = 40_000;
+        const NEIGHBORS_PER_ROW: u32 = 32;
+        const EMPTY_TAIL_ROWS: u32 = 240_000;
+
+        let mut list_builder = ListBuilder::new(UInt32Builder::new());
+        let mut next_val: u32 = 0;
+        for _ in 0..DENSE_ROWS {
+            for _ in 0..NEIGHBORS_PER_ROW {
+                list_builder.values().append_value(next_val);
+                next_val = next_val.wrapping_add(1);
+            }
+            list_builder.append(true);
+        }
+        for _ in 0..EMPTY_TAIL_ROWS {
+            list_builder.append(true);
+        }
+        list_builder.finish()
+    }
+
+    /// Reproduces the HNSW-flush shape at v2.2 on the auto path (no
+    /// `STRUCTURAL_ENCODING` metadata): a dense level-0 prefix followed by a
+    /// long tail of empty lists. The global levels/values ratio looks dense,
+    /// so this used to encode as a single mini-block page whose final chunk
+    /// absorbed every trailing empty list and overflowed the per-chunk `u16`
+    /// `num_levels`, corrupting the read. The structural page planner now
+    /// splits on top-level row boundaries: the dense prefix stays on
+    /// mini-block pages and the empty tail becomes structural-only pages, so
+    /// the round-trip is lossless without falling back to full-zip.
+    #[test_log::test(tokio::test)]
+    async fn test_list_hnsw_shape_splits_to_miniblock_v2_2() {
+        let list_array = make_hnsw_shaped_list_u32();
+        let dense_rows: u64 = 40_000;
+        let total_rows = list_array.len() as u64;
+
+        let test_cases = TestCases::default()
+            .with_range(0..1000)
+            .with_range(dense_rows.saturating_sub(8)..(dense_rows + 8))
+            .with_range(0..total_rows)
+            .with_indices(vec![0, dense_rows - 1, dense_rows, total_rows - 1])
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    /// Companion to the auto-path test: even when the user explicitly requests
+    /// `STRUCTURAL_ENCODING_MINIBLOCK`, the structural page planner splits the
+    /// HNSW shape so every emitted page fits the mini-block per-chunk budget.
+    /// The request is honored (the dense prefix stays on mini-block pages
+    /// rather than being forced to full-zip) and the round-trip is lossless.
+    #[test_log::test(tokio::test)]
+    async fn test_forced_miniblock_hnsw_shape_splits_to_miniblock_v2_2() {
+        let list_array = make_hnsw_shaped_list_u32();
+        let total_rows = list_array.len() as u64;
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..total_rows)
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = try_encode_v22_pages_with_metadata(list_array.clone(), field_metadata.clone())
+            .await
+            .unwrap();
+        assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
     }
 }

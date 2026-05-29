@@ -92,7 +92,7 @@ if TYPE_CHECKING:
         pa.Array,
         pa.Scalar,
         np.ndarray,
-        Iterable[float],
+        Iterable[Union[float, Iterable[float]]],
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 _BLOB_PANDAS_MODE_LAZY = "lazy"
@@ -1009,6 +1009,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
+        index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
@@ -1099,6 +1100,17 @@ class LanceDataset(pa.dataset.Dataset):
                     "distance_range": (0.0, 1.0),
                 }
 
+            ``q`` may also be a 2-D array-like value, or a list of vectors, for
+            fixed-size vector columns. In that case Lance runs a batch nearest-neighbor
+            query, returns up to ``k`` rows for each query vector, and adds
+            an Int32 non-null ``query_index`` as the first output column to identify
+            the source query for each result row.
+            Flattened 1-D arrays whose length is a multiple of the vector dimension are
+            rejected. Datasets that already contain a ``query_index`` column cannot be
+            used for batch nearest-neighbor search. When ``use_index`` is true and a
+            vector index is available, each query vector is searched through the index
+            path; otherwise the flat batch path is used.
+
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be
             smaller than this size.  Note: this can be overridden by
@@ -1124,6 +1136,11 @@ class LanceDataset(pa.dataset.Dataset):
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
+        index_segments: iterable of str or uuid.UUID, default None
+            If specified, restrict vector index search to these index segment UUIDs.
+            Only supported for vector search. If fragments is also specified, rows
+            from those fragments not covered by the selected index segments will be
+            searched with flat KNN.
         prefilter: bool, default False
             If True then the filter will be applied before the vector query is run.
             This will generate more correct results but it may be a more costly
@@ -1172,8 +1189,9 @@ class LanceDataset(pa.dataset.Dataset):
             - query: str
                 The query string to search for.
         fast_search:  bool, default False
-            If True, then the search will only be performed on the indexed data, which
-            yields faster search time.
+            If True, then vector search, full text search, and scalar-indexed
+            filters will only search indexed fragments, which yields faster
+            search time but may skip recently appended unindexed data.
         scan_stats_callback: Callable[[ScanStatistics], None], default None
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
@@ -1251,6 +1269,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.fragment_readahead, fragment_readahead)
         setopt(builder.scan_in_order, scan_in_order)
         setopt(builder.with_fragments, fragments)
+        setopt(builder.with_index_segments, index_segments)
         setopt(builder.late_materialization, late_materialization)
         setopt(builder.blob_handling, blob_handling)
         setopt(builder.with_row_id, with_row_id)
@@ -1417,6 +1436,8 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool, optional, default True
             Use stats pushdown during filters.
         fast_search: bool, optional, default False
+            Only search indexed fragments for vector, full text, and scalar-indexed
+            filter queries. This may skip recently appended unindexed data.
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents contains "hello" or "world".
@@ -4740,19 +4761,19 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> None:
         """Initialize MemWAL on this dataset.
 
-        Must be called once before any calls to `mem_wal_writer`. The dataset
-        schema must have at least one field annotated with the
-        ``lance-schema:unenforced-primary-key`` Arrow field metadata.
+        Must be called once before any calls to `mem_wal_writer`. Append-only
+        tables may omit primary-key metadata; primary keys are only required
+        for primary-key lookup and last-write-wins deduplication workflows.
 
         At most one sharding mode may be selected: bucket sharding
         (``bucket_column`` + ``num_buckets``), identity sharding
         (``identity_column``), or ``unsharded``. With none selected, shards are
-        managed manually by passing region IDs to `mem_wal_writer`.
+        managed manually by passing shard IDs to `mem_wal_writer`.
 
         Any writer-configuration keyword arguments (``durable_write``,
         ``max_memtable_size``, ``max_wal_flush_interval_ms``, etc. — the same
         knobs accepted by `mem_wal_writer`) are recorded as the default
-        `~lance.mem_wal.RegionWriter` configuration in the MemWAL index, so
+        `~lance.mem_wal.ShardWriter` configuration in the MemWAL index, so
         every writer starts from the same defaults.
 
         Parameters
@@ -4761,8 +4782,7 @@ class LanceDataset(pa.dataset.Dataset):
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
         bucket_column : str, optional
-            With ``num_buckets``, hash-bucket writes by this column, which must
-            be the single-column unenforced primary key.
+            With ``num_buckets``, hash-bucket writes by this scalar column.
         num_buckets : int, optional
             Number of hash buckets (shards). Required with ``bucket_column``.
         identity_column : str, optional
@@ -4773,7 +4793,6 @@ class LanceDataset(pa.dataset.Dataset):
         Raises
         ------
         IOError
-            - Dataset has no ``lance-schema:unenforced-primary-key`` field.
             - An entry in *maintained_indexes* does not exist on the dataset.
             - MemWAL has already been initialized on this dataset.
         ValueError
@@ -4815,7 +4834,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def mem_wal_writer(
         self,
-        region_id: str,
+        shard_id: str,
         *,
         durable_write: Optional[bool] = None,
         sync_indexed_write: Optional[bool] = None,
@@ -4830,17 +4849,17 @@ class LanceDataset(pa.dataset.Dataset):
         async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
-    ) -> "mem_wal.RegionWriter":
-        """Get a RegionWriter for the specified region.
+    ) -> "mem_wal.ShardWriter":
+        """Get a ShardWriter for the specified shard.
 
         `initialize_mem_wal` must be called before using this method.
-        Each *region* is an independent write shard; use different region IDs
+        Each shard is an independent write path; use different shard IDs
         to achieve parallel ingestion without writer contention.
 
         Parameters
         ----------
-        region_id : str
-            UUID string identifying the write region (e.g.
+        shard_id : str
+            UUID string identifying the write shard (e.g.
             ``str(uuid.uuid4())``).
         durable_write : bool, optional
             Whether to fsync WAL writes (default: ``True``).
@@ -4873,8 +4892,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        RegionWriter
-            A context-manager-compatible writer for the specified region.
+        ShardWriter
+            A context-manager-compatible writer for the specified shard.
 
         Examples
         --------
@@ -4893,9 +4912,9 @@ class LanceDataset(pa.dataset.Dataset):
         ...         tmpdir,
         ...     )
         ...     ds.initialize_mem_wal()
-        ...     region_id = str(uuid.uuid4())
+        ...     shard_id = str(uuid.uuid4())
         ...     new_data = pa.table({"id": [2], "val": [0.2]}, schema=schema)
-        ...     with ds.mem_wal_writer(region_id) as writer:
+        ...     with ds.mem_wal_writer(shard_id) as writer:
         ...         writer.put(new_data)
         """
         import lance.mem_wal as _mw
@@ -4919,8 +4938,8 @@ class LanceDataset(pa.dataset.Dataset):
             ]
             if val is not None
         }
-        raw = self._ds.mem_wal_writer(region_id, **kwargs)
-        return _mw.RegionWriter(raw)
+        raw = self._ds.mem_wal_writer(shard_id, **kwargs)
+        return _mw.ShardWriter(raw)
 
 
 class SqlQuery:
@@ -5688,6 +5707,7 @@ class ScannerBuilder:
         self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
         self._fragments = None
+        self._index_segments = None
         self._with_row_id = False
         self._with_row_address = False
         self._use_stats = True
@@ -5972,6 +5992,24 @@ class ScannerBuilder:
         self._fragments = fragments
         return self
 
+    def with_index_segments(
+        self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
+    ) -> ScannerBuilder:
+        if index_segments is not None:
+            segment_ids = []
+            for segment_id in index_segments:
+                if isinstance(segment_id, (str, uuid.UUID)):
+                    segment_ids.append(str(segment_id))
+                else:
+                    raise TypeError(
+                        "index_segments must be an iterable of str or uuid.UUID. "
+                        f"Got {type(segment_id)} instead."
+                    )
+            index_segments = segment_ids
+
+        self._index_segments = index_segments
+        return self
+
     def nearest(
         self,
         column: str,
@@ -5991,6 +6029,16 @@ class ScannerBuilder:
 
         Parameters
         ----------
+        q: QueryVectorLike
+            A single query vector or, for fixed-size vector columns, a 2-D array-like
+            or list-shaped batch of query vectors. Batch queries return up to ``k`` rows
+            per query and include Int32 non-null ``query_index`` as the first output
+            column. Flattened 1-D inputs whose length is a multiple of the vector
+            dimension are rejected. Datasets with an existing ``query_index`` column
+            cannot be used for batch search.
+            When ``use_index`` is true and a vector index is available, each query
+            vector is searched through the index path; otherwise the flat batch path
+            is used.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -6017,10 +6065,10 @@ class ScannerBuilder:
         return self
 
     def fast_search(self, flag: bool) -> ScannerBuilder:
-        """Enable fast search, which only perform search on the indexed data.
+        """Enable fast search, which only performs search on indexed fragments.
 
-        Users can use `Table::optimize()` or `create_index()` to include the new data
-        into index, thus make new data searchable.
+        Users can use `Table::optimize()` or `create_index()` to include new data
+        in an index, thus making new data searchable.
         """
         self._fast_search = flag
         return self
@@ -6139,6 +6187,7 @@ class ScannerBuilder:
             self._fragment_readahead,
             self._scan_in_order,
             self._fragments,
+            self._index_segments,
             self._with_row_id,
             self._with_row_address,
             self._use_stats,
@@ -7139,7 +7188,15 @@ def _build_vector_search_query(
     column: str
         The name of the vector column to search.
     q: QueryVectorLike
-        The query vector.
+        The query vector. For fixed-size vector columns, this may be a 2-D
+        array-like or list-shaped batch of query vectors. Batch queries return up to
+        ``k`` rows per query vector and include Int32 non-null ``query_index`` as
+        the first output column.
+        Flattened 1-D inputs whose length is a multiple of the vector dimension are
+        rejected. Datasets with an existing ``query_index`` column cannot be used for
+        batch search. When ``use_index`` is true and a vector index is available,
+        each query vector is searched through the index path; otherwise the flat batch
+        path is used.
     k: int, optional
         The number of nearest neighbors to return.
     metric: str, optional

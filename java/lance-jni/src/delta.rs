@@ -109,7 +109,7 @@ fn inner_native_build<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_delta_DatasetDelta_listTransactions<'local>(
+pub extern "system" fn Java_org_lance_delta_DatasetDelta_nativeListTransactions<'local>(
     mut env: JNIEnv<'local>,
     j_delta: JObject<'local>,
 ) -> JObject<'local> {
@@ -140,7 +140,7 @@ fn inner_list_transactions<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_delta_DatasetDelta_getInsertedRows<'local>(
+pub extern "system" fn Java_org_lance_delta_DatasetDelta_nativeGetInsertedRows<'local>(
     mut env: JNIEnv<'local>,
     j_delta: JObject<'local>,
     stream_addr: jlong,
@@ -164,7 +164,7 @@ fn inner_get_inserted_rows<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_delta_DatasetDelta_getUpdatedRows<'local>(
+pub extern "system" fn Java_org_lance_delta_DatasetDelta_nativeGetUpdatedRows<'local>(
     mut env: JNIEnv<'local>,
     j_delta: JObject<'local>,
     stream_addr: jlong,

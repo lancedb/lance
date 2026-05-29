@@ -1,6 +1,6 @@
 # Tokenizers
 
-Currently, Lance has built-in support for Jieba and Lindera. However, it doesn't come with its own language models.
+Currently, Lance has built-in support for ICU, Jieba, and Lindera. ICU uses built-in segmenter data. Jieba and Lindera require external language models.
 If tokenization is needed, you can download language models by yourself.
 You can specify the location where the language models are stored by setting the environment variable LANCE_LANGUAGE_MODEL_HOME.
 If it's not set, the default value is
@@ -11,6 +11,14 @@ ${system data directory}/lance/language_models
 
 It also supports configuring user dictionaries,
 which makes it convenient for users to expand their own dictionaries without retraining the language models.
+
+## ICU Tokenizer
+
+ICU uses Unicode word boundary rules and bundled dictionary data for complex scripts. It is useful for mixed-language text and does not require downloading a language model.
+
+```python
+ds.create_scalar_index("text", "INVERTED", base_tokenizer="icu")
+```
 
 ## Language Models of Jieba
 

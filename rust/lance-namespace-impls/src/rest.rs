@@ -22,12 +22,12 @@ use lance_namespace::models::{
     AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableIndexRequest,
-    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse, DeleteTableTagRequest,
-    DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
@@ -1460,9 +1460,22 @@ impl LanceNamespace for RestNamespace {
         self.record_op("refresh_materialized_view");
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
-        let path = format!("/v1/table/{}/refresh", encoded_id);
+        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "refresh_materialized_view", &id)
+            .await
+    }
+
+    async fn create_materialized_view(
+        &self,
+        request: CreateMaterializedViewRequest,
+    ) -> Result<CreateMaterializedViewResponse> {
+        self.record_op("create_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_materialized_view", &id)
             .await
     }
 

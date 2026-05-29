@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::write::do_write_fragments;
-use crate::dataset::{DATA_DIR, WriteMode, WriteParams};
+use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases};
+use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
 ///
@@ -196,11 +196,27 @@ impl<'a> FragmentCreateBuilder<'a> {
         stream: SendableRecordBatchStream,
         schema: Schema,
     ) -> Result<Vec<Fragment>> {
-        let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
+        let mut params = self.write_params.cloned().unwrap_or_default();
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let version = params.data_storage_version.unwrap_or_default();
+        let needs_existing_dataset = params.target_base_names_or_paths.is_some()
+            || params.target_bases.is_some()
+            || params.initial_bases.is_some();
+        let existing_dataset = if needs_existing_dataset {
+            self.existing_dataset(&params).await?
+        } else {
+            None
+        };
+        let existing_base_paths = existing_dataset
+            .as_ref()
+            .map(|dataset| &dataset.manifest.base_paths);
+        let target_bases_info = if needs_existing_dataset {
+            validate_and_resolve_target_bases(&mut params, existing_base_paths).await?
+        } else {
+            None
+        };
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -208,14 +224,14 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
         do_write_fragments(
-            None,
+            existing_dataset.as_ref(),
             object_store,
             &base_path,
             &schema,
             stream,
-            params.into_owned(),
+            params,
             version,
-            None, // Fragment creation doesn't use target_bases
+            target_bases_info,
         )
         .await
     }
@@ -313,6 +329,25 @@ impl<'a> FragmentCreateBuilder<'a> {
         }
     }
 
+    async fn existing_dataset(&self, params: &WriteParams) -> Result<Option<Dataset>> {
+        let mut builder = DatasetBuilder::from_uri(self.dataset_uri).with_read_params(ReadParams {
+            store_options: params.store_params.clone(),
+            commit_handler: params.commit_handler.clone(),
+            session: params.session.clone(),
+            ..Default::default()
+        });
+        if let Some(base_store_params) = &params.base_store_params {
+            for (base_path, store_params) in base_store_params {
+                builder = builder.with_base_store_params(base_path, store_params.clone());
+            }
+        }
+        match builder.load().await {
+            Ok(dataset) => Ok(Some(dataset)),
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn validate_schema(expected: &Schema, actual: &ArrowSchema) -> Result<()> {
         if actual.fields().is_empty() {
             return Err(Error::invalid_input("Cannot write with an empty schema."));
@@ -334,9 +369,11 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::{TempDir, TempStrDir};
+    use lance_table::format::BasePath;
     use rstest::rstest;
 
     use super::*;
+    use crate::dataset::InsertBuilder;
 
     fn test_data() -> Box<dyn RecordBatchReader + Send> {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -531,6 +568,39 @@ mod tests {
         assert_eq!(fragments[2].deletion_file, None);
         assert_eq!(fragments[2].files.len(), 1);
         assert_eq!(fragments[2].files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_write_fragments_with_target_base() {
+        let primary = TempStrDir::default();
+        let base1 = TempStrDir::default();
+        let base2 = TempStrDir::default();
+        let create_params = WriteParams::default()
+            .with_initial_bases(vec![
+                BasePath::new(0, base1.to_string(), Some("base1".to_string()), false),
+                BasePath::new(0, base2.to_string(), Some("base2".to_string()), false),
+            ])
+            .with_target_base_names_or_paths(vec!["base1".to_string()]);
+
+        let dataset = InsertBuilder::new(primary.as_str())
+            .with_params(&create_params)
+            .execute_stream(test_data())
+            .await
+            .unwrap();
+
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }
+        .with_target_base_names_or_paths(vec!["base2".to_string()]);
+        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+            .write_params(&append_params)
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].files[0].base_id, Some(2));
     }
 
     #[rstest]

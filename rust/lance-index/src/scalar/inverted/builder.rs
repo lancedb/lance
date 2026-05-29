@@ -23,10 +23,10 @@ use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
 use lance_core::error::LanceOptionExt;
-use lance_core::utils::mask::RowSetOps;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_io::object_store::ObjectStore;
+use lance_select::RowSetOps;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
@@ -3093,7 +3093,7 @@ mod tests {
         let stream2 = Box::pin(stream2);
 
         // Use RowIds filter instead of Fragments — should not affect deleted_fragments
-        let mut valid_ids = lance_core::utils::mask::RowAddrTreeMap::new();
+        let mut valid_ids = lance_select::RowAddrTreeMap::new();
         valid_ids.insert(0);
         let old_data_filter = Some(crate::scalar::OldIndexDataFilter::RowIds(valid_ids));
 

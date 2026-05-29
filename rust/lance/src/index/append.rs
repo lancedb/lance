@@ -4,10 +4,7 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
-use lance_core::{
-    Error, Result,
-    utils::mask::{RowAddrTreeMap, RowSetOps},
-};
+use lance_core::{Error, Result};
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     metrics::NoOpMetricsCollector,
@@ -17,6 +14,7 @@ use lance_index::{
         CreatedIndex, OldIndexDataFilter, inverted::InvertedIndex, lance_format::LanceIndexStore,
     },
 };
+use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, list_index_files_with_sizes};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -28,7 +26,7 @@ use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::load_training_data;
-use crate::index::vector_index_details;
+use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -268,7 +266,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 vec![removed_segment],
                 new_fragment_bitmap,
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
                     files: Some(files),
                 },
@@ -313,6 +311,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 }
             }
 
+            // Carry forward existing index details, preferring the first segment
+            // that has populated (non-empty) details.
+            let index_details = old_indices
+                .iter()
+                .rev()
+                .filter_map(|idx| idx.index_details.as_ref())
+                .find(|d| !d.value.is_empty())
+                .map(|d| d.as_ref().clone())
+                .unwrap_or_else(vector_index_details_default);
+
             let index_dir = dataset.indices_dir().join(new_uuid.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
@@ -321,7 +329,10 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 removed_indices,
                 frag_bitmap,
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details,
+                    // retain_supported_indices guarantees all old_indices have
+                    // index_version <= our max supported version, so we can safely
+                    // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
                     files: Some(files),
                 },
@@ -504,6 +515,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 ))
             }
             it if it.is_scalar() => {
+                let num_to_merge = options
+                    .num_indices_to_merge
+                    .unwrap_or(1)
+                    .min(old_indices.len());
+                if unindexed.is_empty() && num_to_merge <= 1 {
+                    return Ok(None);
+                }
+
                 // Use effective bitmap (intersected with existing dataset fragments)
                 // to avoid carrying stale data from pruned indices.
                 let effective_old_frags: RoaringBitmap = old_indices
@@ -968,6 +987,7 @@ mod tests {
             .unwrap()
             .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
+            .nprobes(2)
             .refine(1)
             .try_into_batch()
             .await
@@ -1275,5 +1295,62 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_scalar_no_unindexed_fragments() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let ids = StringArray::from_iter_values((0..32).map(|i| format!("song-{i}")));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let before = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(before.len(), 1);
+        let original_uuid = before[0].uuid;
+        let original_version = dataset.manifest.version;
+
+        // `merge(1)` would historically rebuild the single existing segment
+        // (steady state, nothing unindexed) and replace its UUID; with the
+        // short-circuit it must skip work entirely.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+
+        let after = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(after.len(), 1, "no new segment should be produced");
+        assert_eq!(
+            after[0].uuid, original_uuid,
+            "no-op optimize must not churn the index UUID"
+        );
+        assert_eq!(
+            dataset.manifest.version, original_version,
+            "no-op optimize must not advance the dataset version"
+        );
+
+        // The default options also short-circuit (num_to_merge defaults to 1
+        // when there is a single old segment).
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let after_default = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(after_default[0].uuid, original_uuid);
+        assert_eq!(dataset.manifest.version, original_version);
     }
 }

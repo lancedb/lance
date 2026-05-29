@@ -18,8 +18,10 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::ShardSnapshot;
+use super::flushed_cache::FlushedMemTableCache;
 use super::planner::LsmScanPlanner;
 use crate::dataset::Dataset;
+use crate::session::Session;
 
 /// Either a base Lance table, or an explicit base path used to resolve
 /// flushed-generation directories when no base dataset is configured.
@@ -73,6 +75,14 @@ pub struct LsmScanner {
 
     // Primary key columns (required for deduplication)
     pk_columns: Vec<String>,
+
+    /// Session threaded into flushed-generation opens so the first open of
+    /// each generation populates the shared index / file-metadata caches.
+    /// Defaults to the base table's session when one is present.
+    session: Option<Arc<Session>>,
+    /// Cache of opened flushed-generation datasets. When set, repeated
+    /// queries against the same generation skip the manifest read entirely.
+    flushed_cache: Option<Arc<FlushedMemTableCache>>,
 }
 
 impl LsmScanner {
@@ -90,6 +100,10 @@ impl LsmScanner {
     ) -> Self {
         let lance_schema = base_table.schema();
         let arrow_schema: arrow_schema::Schema = lance_schema.into();
+        // Default the session to the base table's so the common path reuses
+        // the shared index / metadata caches without extra wiring. An
+        // explicit `with_session` still overrides this.
+        let session = Some(base_table.session());
         Self {
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),
@@ -102,6 +116,8 @@ impl LsmScanner {
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
+            session,
+            flushed_cache: None,
         }
     }
 
@@ -138,6 +154,8 @@ impl LsmScanner {
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
+            session: None,
+            flushed_cache: None,
         }
     }
 
@@ -167,6 +185,29 @@ impl LsmScanner {
         memtables: InMemoryMemTables,
     ) -> Self {
         self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Thread an existing session into flushed-generation opens.
+    ///
+    /// The first open of each flushed generation then populates the shared
+    /// index / file-metadata caches, so later queries skip re-decoding them.
+    /// When a base table is configured this defaults to its session; call
+    /// this to override (e.g. on a fresh-tier-only scanner that owns its own
+    /// long-lived session).
+    pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Inject a cache of opened flushed-generation datasets.
+    ///
+    /// With a cache, repeated queries against the same generation become a
+    /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
+    /// is owned and sized by the caller (see [`FlushedMemTableCache`]); not
+    /// set by default, so behavior is unchanged unless opted in.
+    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+        self.flushed_cache = Some(cache);
         self
     }
 
@@ -239,7 +280,13 @@ impl LsmScanner {
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
-        let planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        let mut planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        if let Some(session) = &self.session {
+            planner = planner.with_session(session.clone());
+        }
+        if let Some(cache) = &self.flushed_cache {
+            planner = planner.with_flushed_cache(cache.clone());
+        }
 
         planner
             .plan_scan(
@@ -250,6 +297,33 @@ impl LsmScanner {
                 self.with_memtable_gen,
                 self.with_row_address,
             )
+            .await
+    }
+
+    /// Build a local-scoring FTS plan spanning base + flushed + active sources.
+    ///
+    /// Routes through [`super::LsmFtsSearchPlanner`]. Output schema is
+    /// `projection ∪ pk_columns + _score`; per-source local BM25 `_score`
+    /// is merged DESC and capped at `k`. `column` must be FTS-indexed on
+    /// the queried sources.
+    pub async fn full_text_search(
+        &self,
+        column: &str,
+        query: lance_index::scalar::FullTextSearchQuery,
+        k: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let collector = self.build_collector();
+        let base_schema = self.schema();
+        let mut planner =
+            super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        if let Some(session) = &self.session {
+            planner = planner.with_session(session.clone());
+        }
+        if let Some(cache) = &self.flushed_cache {
+            planner = planner.with_flushed_cache(cache.clone());
+        }
+        planner
+            .plan_search(column, query, k, self.projection.as_deref())
             .await
     }
 
@@ -289,6 +363,32 @@ impl LsmScanner {
             .map_err(|e| Error::io(format!("Failed to count rows: {}", e)))?;
 
         Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
+    }
+
+    /// Test which `pks` have been (re)written in the WAL fresh tier — the active
+    /// and frozen memtables and flushed generations this scanner spans — i.e.
+    /// are shadowed above the base table. `pks` is a batch whose columns include
+    /// the primary-key columns; the returned `Vec<bool>` is aligned with its
+    /// rows. Hashing matches the scanner's internal dedup, so the caller never
+    /// hashes PKs itself. Flushed membership comes from the injected
+    /// [`FlushedMemTableCache`] when one is set.
+    pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
+        let sources = self.build_collector().collect()?;
+        let sets = super::block_list::fresh_tier_block_list(
+            &sources,
+            &self.pk_columns,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        )
+        .await?;
+        let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
+        Ok((0..pks.num_rows())
+            .map(|row| {
+                let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
+                sets.iter().any(|set| set.contains(&hash))
+            })
+            .collect())
     }
 
     /// Build the data source collector.
@@ -387,5 +487,51 @@ mod tests {
         };
 
         assert_eq!(memtable_ref.generation, 10);
+    }
+
+    #[tokio::test]
+    async fn contains_pks_reports_fresh_tier_membership() {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let id_batch = |ids: &[i32]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids.to_vec()))],
+            )
+            .unwrap()
+        };
+        let mk = |ids: &[i32], generation: u64| {
+            let store = BatchStore::with_capacity(8);
+            store.append(id_batch(ids)).unwrap();
+            InMemoryMemTableRef {
+                batch_store: Arc::new(store),
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation,
+            }
+        };
+
+        // Fresh-tier only: active gen 2 (pk=1,2) + frozen gen 1 (pk=3).
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            shard,
+            InMemoryMemTables {
+                active: mk(&[1, 2], 2),
+                frozen: vec![mk(&[3], 1)],
+            },
+        );
+
+        // pk=1 (active), pk=4 (absent), pk=3 (frozen).
+        let result = scanner.contains_pks(&id_batch(&[1, 4, 3])).await.unwrap();
+        assert_eq!(result, vec![true, false, true]);
     }
 }

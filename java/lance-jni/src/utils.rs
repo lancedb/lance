@@ -477,6 +477,7 @@ pub fn get_vector_index_params(
                 stages,
                 version: IndexFileVersion::V3,
                 skip_transpose: false,
+                runtime_hints: Default::default(),
             })
         },
     )?;

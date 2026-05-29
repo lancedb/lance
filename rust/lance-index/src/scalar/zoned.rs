@@ -12,9 +12,9 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{ROW_ADDR, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
+use lance_select::RowAddrTreeMap;
 
 //
 // Example: Suppose we have two fragments, each with 4 rows.

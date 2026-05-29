@@ -62,6 +62,7 @@ mod storage_options;
 mod task_tracker;
 pub mod traits;
 mod transaction;
+mod update;
 pub mod utils;
 mod vector_trainer;
 
