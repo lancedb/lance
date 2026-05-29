@@ -2380,10 +2380,7 @@ mod tests {
             ("at_most", IndexExprResult::at_most(mk(&[1, 2, 3]))),
             ("at_least", IndexExprResult::at_least(mk(&[1, 2]))),
             // Refined: non-empty lower strictly inside non-universe upper.
-            (
-                "refined",
-                IndexExprResult::new(mk(&[1, 2]), mk(&[1, 2, 3])),
-            ),
+            ("refined", IndexExprResult::new(mk(&[1, 2]), mk(&[1, 2, 3]))),
         ];
 
         for (name, original) in cases {

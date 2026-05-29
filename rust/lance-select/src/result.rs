@@ -446,7 +446,11 @@ impl IndexExprResult {
                 Self::exact(lower)
             } else {
                 let upper = RowAddrMask::from_arrow(upper_col)?;
-                Self { lower, upper, exact: false }
+                Self {
+                    lower,
+                    upper,
+                    exact: false,
+                }
             }
         } else if first_col_name == "result" {
             let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
