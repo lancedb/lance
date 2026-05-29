@@ -25,7 +25,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
-use object_store::path::Path;
+use object_store::path::{Path, PathPart};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
@@ -285,7 +285,7 @@ impl PartitionArtifactBuilder {
         };
         write_json(
             self.object_store.as_ref(),
-            &self.root_dir.child(PARTITION_ARTIFACT_MANIFEST_FILE_NAME),
+            &path_child(&self.root_dir, PARTITION_ARTIFACT_MANIFEST_FILE_NAME),
             &manifest,
         )
         .await?;
@@ -394,11 +394,10 @@ impl PartitionArtifactBuilder {
 
     /// Path of the finalized file for one bucket.
     fn final_bucket_path(&self, bucket_id: usize) -> Path {
-        self.root_dir
-            .child(PARTITION_ARTIFACT_PARTITIONS_DIR)
-            .child(format!(
-                "{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
-            ))
+        path_child(
+            &path_child(&self.root_dir, PARTITION_ARTIFACT_PARTITIONS_DIR),
+            format!("{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"),
+        )
     }
 
     /// Relative path recorded in the manifest for one finalized bucket.
@@ -531,7 +530,7 @@ impl PartitionArtifactShuffleReader {
     /// This reads the manifest once, validates it, and initializes the shared
     /// scheduler and reader cache used by partition reads.
     async fn try_open_with_store(object_store: Arc<ObjectStore>, root_dir: Path) -> Result<Self> {
-        let manifest_path = root_dir.child("manifest.json");
+        let manifest_path = path_child(&root_dir, "manifest.json");
         let manifest_bytes = object_store.read_one_all(&manifest_path).await?;
         let manifest: PartitionArtifactManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|error| {
@@ -608,7 +607,12 @@ fn join_relative_path(root_dir: &Path, relative_path: &str) -> Path {
     relative_path
         .split('/')
         .filter(|segment| !segment.is_empty())
-        .fold(root_dir.clone(), |path, segment| path.child(segment))
+        .fold(root_dir.clone(), |path, segment| path_child(&path, segment))
+}
+
+#[allow(deprecated)]
+fn path_child<'a>(path: &Path, child: impl Into<PathPart<'a>>) -> Path {
+    path.child(child)
 }
 
 #[async_trait::async_trait]
@@ -653,12 +657,14 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
         let schema = Arc::new(reader.schema().as_ref().into());
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             schema,
-            reader.read_stream(
-                ReadBatchParams::Ranges(ranges.into()),
-                u32::MAX,
-                16,
-                FilterExpression::no_filter(),
-            )?,
+            reader
+                .read_stream(
+                    ReadBatchParams::Ranges(ranges.into()),
+                    u32::MAX,
+                    16,
+                    FilterExpression::no_filter(),
+                )
+                .await?,
         ))))
     }
 
@@ -827,7 +833,8 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::local());
         let root_path = Path::from_filesystem_path(&root_dir).unwrap();
-        let partition_path = root_path.child("partitions").child("bucket-00000.lance");
+        let partition_path =
+            path_child(&path_child(&root_path, "partitions"), "bucket-00000.lance");
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
             arrow_schema::Field::new(
