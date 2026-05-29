@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
@@ -351,7 +352,19 @@ impl UpdateJob {
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
+        let deletions_result = self.apply_deletions(&row_addrs).await;
+        let (old_fragments, removed_fragment_ids) = match deletions_result {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_data_fragments(
+                    &self.dataset.object_store,
+                    &self.dataset.base,
+                    &new_fragments,
+                )
+                .await;
+                return Err(e);
+            }
+        };
         let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
 
         let num_updated_rows = new_fragments
@@ -1579,5 +1592,99 @@ mod tests {
                 assert_eq!(updated_names.value(i), "foo");
             }
         }
+    }
+
+    fn count_data_files(base_dir: &str) -> usize {
+        let data_dir = std::path::Path::new(base_dir).join("data");
+        if !data_dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().is_file())
+            .count()
+    }
+
+    /// Site 4 in PR #6320: when `UpdateJob::apply_deletions` fails after the new
+    /// rewrite fragments have been written, those new data files must be cleaned up.
+    #[tokio::test]
+    async fn test_update_cleans_up_data_on_apply_deletions_failure() {
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..30)),
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "foo", 30,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        Dataset::write(batches, &routed_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let baseline_files = count_data_files(test_uri);
+        assert!(baseline_files > 0);
+
+        // Fail writes to `_deletions/`: this is where `apply_deletions` writes
+        // the new deletion file. The rewrite fragments (in `data/`) are written
+        // earlier and should be successfully created, then cleaned up on failure.
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when("put", "_deletions", "injected deletions failure");
+        failing.fail_when("put_multipart", "_deletions", "injected deletions failure");
+
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 5")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Update should fail when deletion-file write fails"
+        );
+
+        assert_eq!(
+            count_data_files(test_uri),
+            baseline_files,
+            "Rewritten data files should be cleaned up on apply_deletions failure"
+        );
     }
 }

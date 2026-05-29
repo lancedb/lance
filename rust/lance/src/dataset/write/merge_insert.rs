@@ -41,6 +41,7 @@ pub mod inserted_rows;
 use assign_action::merge_insert_action;
 use inserted_rows::KeyExistenceFilter;
 
+use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
@@ -1784,8 +1785,19 @@ impl MergeInsertJob {
 
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec.into_iter());
 
-            let (old_fragments, removed_fragment_ids) =
-                Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
+            let deletions_result = Self::apply_deletions(&self.dataset, &removed_row_addrs).await;
+            let (old_fragments, removed_fragment_ids) = match deletions_result {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup_data_fragments(
+                        &self.dataset.object_store,
+                        &self.dataset.base,
+                        &new_fragments,
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
 
             // Commit updated and new fragments
             let operation = Operation::Update {
@@ -9356,5 +9368,123 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         for i in 0..rows_per_frag {
             assert_eq!(values.value(i), 888.0, "row {i} should have value_a=888.0");
         }
+    }
+
+    fn count_data_files(base_dir: &str) -> usize {
+        let data_dir = std::path::Path::new(base_dir).join("data");
+        if !data_dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().is_file())
+            .count()
+    }
+
+    /// Site 3 in PR #6320: when `MergeInsertJob::apply_deletions` fails after
+    /// the new fragments have been written, the new data files must be cleaned up.
+    #[tokio::test]
+    async fn test_merge_insert_cleans_up_data_on_apply_deletions_failure() {
+        use crate::utils::test::FailingProxyStore;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..30)),
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "foo", 30,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            &routed_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create a scalar index on the join key. This forces the merge insert
+        // to take the slow (non-fast) path, which is the path that has the
+        // post-write cleanup we want to exercise.
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let baseline_files = count_data_files(test_uri);
+        assert!(baseline_files > 0);
+
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when("put", "_deletions", "injected deletions failure");
+        failing.fail_when("put_multipart", "_deletions", "injected deletions failure");
+
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        // Update existing keys (5..15 already exist) to force the apply_deletions path.
+        let new_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(5..15)),
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "bar", 10,
+                ))),
+            ],
+        )
+        .unwrap();
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_data)], schema.clone()));
+
+        let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+
+        let result = job.execute_reader(new_reader).await;
+        assert!(
+            result.is_err(),
+            "Merge insert should fail when deletion-file write fails"
+        );
+
+        assert_eq!(
+            count_data_files(test_uri),
+            baseline_files,
+            "Newly written merge-insert data files should be cleaned up on apply_deletions failure"
+        );
     }
 }
