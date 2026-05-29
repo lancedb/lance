@@ -3904,9 +3904,10 @@ impl PrimitiveStructuralEncoder {
         }
 
         // (2) Per-chunk num_levels u16-overflow check. The HNSW persistence
-        // shape (dense level-0 lists then 5x as many empty higher-level rows)
-        // has a low global ratio (e.g. 1.19) so (1) passes, but the trailing
-        // empties cluster into the final chunk via `slice_rest` and overflow.
+        // shape (~40k dense level-0 lists followed by ~6x as many empty
+        // higher-level rows) has a low global ratio (~1.19) so (1) passes,
+        // but the trailing empties cluster into the final chunk via
+        // `slice_rest` and overflow.
         Self::any_chunk_levels_overflow_u16(repdef, num_values)
     }
 
@@ -3941,34 +3942,34 @@ impl PrimitiveStructuralEncoder {
         if (def_levels.len() as u64) <= u16_max {
             return false;
         }
-        let chunk_val_size = *miniblock::MAX_MINIBLOCK_VALUES;
+        let max_visibles_per_chunk = *miniblock::MAX_MINIBLOCK_VALUES;
 
-        let mut visible_in_chunk: u64 = 0;
-        let mut levels_in_chunk: u64 = 0;
-        let mut visible_seen: u64 = 0;
+        let mut visibles_in_current_chunk: u64 = 0;
+        let mut levels_in_current_chunk: u64 = 0;
+        let mut visibles_seen_total: u64 = 0;
         for &def_lvl in def_levels.iter() {
-            levels_in_chunk += 1;
+            levels_in_current_chunk += 1;
             // Short-circuit: if the current chunk already exceeds u16, no
             // further scanning is needed.
-            if levels_in_chunk > u16_max {
+            if levels_in_current_chunk > u16_max {
                 return true;
             }
             if def_lvl <= max_visible {
-                visible_in_chunk += 1;
-                visible_seen += 1;
-                let is_last_value = visible_seen == num_values;
-                if visible_in_chunk == chunk_val_size && !is_last_value {
+                visibles_in_current_chunk += 1;
+                visibles_seen_total += 1;
+                let is_last_value = visibles_seen_total == num_values;
+                if visibles_in_current_chunk == max_visibles_per_chunk && !is_last_value {
                     // Encoder would call slice_next here. Boundary invisibles
                     // (none yet — we just finished a visible value) carry to
                     // the next chunk.
-                    visible_in_chunk = 0;
-                    levels_in_chunk = 0;
+                    visibles_in_current_chunk = 0;
+                    levels_in_current_chunk = 0;
                 }
             }
         }
         // Final chunk (slice_rest) takes everything left in the current
         // accumulator, including any trailing empties after the last value.
-        levels_in_chunk > u16_max
+        levels_in_current_chunk > u16_max
     }
 
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
@@ -4278,15 +4279,18 @@ impl PrimitiveStructuralEncoder {
             // packed >65 535 levels into one chunk (HNSW persistence shape;
             // see `repdef_too_sparse_for_miniblock`). The heuristic should
             // route such shapes to fullzip before reaching this point; if it
-            // doesn't (e.g. the caller explicitly forces `MINIBLOCK`), surface
-            // an error rather than a silent corruption.
+            // doesn't (e.g. a future shape sneaks past the heuristic), surface
+            // a clear input-shape error rather than a silent corruption.
             let num_levels_u16 = u16::try_from(num_chunk_levels).map_err(|_| {
-                Error::internal(format!(
-                    "miniblock chunk has {} levels but per-chunk header is u16 \
-                     (max {}); this shape needs fullzip encoding",
-                    num_chunk_levels,
-                    u16::MAX,
-                ))
+                Error::invalid_input_source(
+                    format!(
+                        "miniblock chunk has {} levels but per-chunk header is u16 \
+                         (max {}); this shape needs fullzip encoding",
+                        num_chunk_levels,
+                        u16::MAX,
+                    )
+                    .into(),
+                )
             })?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
@@ -5479,6 +5483,23 @@ impl PrimitiveStructuralEncoder {
                         support_large_chunk,
                     )
                 } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
+                    // If the user explicitly asked for miniblock but the
+                    // heuristic vetoed it, warn so the override is observable
+                    // rather than silent.
+                    let user_forced_miniblock = encoding_metadata
+                        .get(STRUCTURAL_ENCODING_META_KEY)
+                        .map(|v| v.to_lowercase() == STRUCTURAL_ENCODING_MINIBLOCK)
+                        .unwrap_or(false);
+                    if too_sparse && user_forced_miniblock {
+                        log::warn!(
+                            "Field '{}' requested {}={} but the rep/def shape would \
+                             overflow miniblock per-chunk limits; encoding as fullzip \
+                             instead to avoid corruption.",
+                            field.name,
+                            STRUCTURAL_ENCODING_META_KEY,
+                            STRUCTURAL_ENCODING_MINIBLOCK,
+                        );
+                    }
                     log::debug!(
                         "Encoding column {} with {} items using full-zip layout",
                         column_idx,
