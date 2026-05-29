@@ -13,7 +13,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -30,7 +29,7 @@ use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
 use std::future::Future;
 
 use crate::Dataset;
@@ -101,17 +100,15 @@ impl FilterLoader for SelectionVectorToPrefilter {
             Error::internal("Selection vector source for prefilter did not yield any batches")
         })?;
         // The vector-search prefilter wants the set of rows the search is
-        // allowed to consider. Under the {lower, upper} interval form the
-        // `upper` mask is exactly that — rows outside it are guaranteed
-        // not to match. For an `Exact` result `upper == lower`; for
-        // `AtLeast` `upper` is the universe (which lets the search see
-        // everything, matching the AtLeast semantics).
-        RowAddrMask::from_arrow(batch["upper"].as_binary_opt::<i32>().ok_or_else(|| {
-            Error::internal(format!(
-                "Expected selection vector input to yield binary arrays but got {}",
-                batch["upper"].data_type()
-            ))
-        })?)
+        // allowed to consider — the `upper` bound of the index expression
+        // result. Rows outside the upper bound are guaranteed not to match,
+        // so the vector search can skip them.
+        //
+        // Use deserialize() here (rather than indexing "upper" directly) to
+        // support both the TwoMask and the legacy ThreeVariant wire formats
+        // that ScalarIndexExec may emit.
+        let (result, _) = IndexExprResult::deserialize(&batch)?;
+        Ok(result.upper)
     }
 }
 
