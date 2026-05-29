@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use super::index::FlatMetadata;
 use crate::frag_reuse::FragReuseIndex;
@@ -351,25 +351,10 @@ impl VectorStore for FlatBinStorage {
 
 pub struct FlatDistanceCal<'a, T: ArrowPrimitiveType> {
     vectors: &'a [T::Native],
-    query: QueryVector<'a, T>,
+    query: Cow<'a, [T::Native]>,
     dimension: usize,
     #[allow(clippy::type_complexity)]
     distance_fn: fn(&[T::Native], &[T::Native]) -> f32,
-}
-
-enum QueryVector<'a, T: ArrowPrimitiveType> {
-    Borrowed(&'a [T::Native]),
-    Owned(Vec<T::Native>),
-}
-
-impl<'a, T: ArrowPrimitiveType> QueryVector<'a, T> {
-    #[inline]
-    fn as_slice(&self) -> &[T::Native] {
-        match self {
-            Self::Borrowed(query) => query,
-            Self::Owned(query) => query,
-        }
-    }
 }
 
 impl<'a, T> FlatDistanceCal<'a, T>
@@ -383,7 +368,7 @@ where
         let dimension = vectors.value_length() as usize;
         Self {
             vectors: flat_array.values(),
-            query: QueryVector::Owned(query.as_primitive::<T>().values().to_vec()),
+            query: Cow::Owned(query.as_primitive::<T>().values().to_vec()),
             dimension,
             distance_fn: distance_type.func(),
         }
@@ -396,7 +381,7 @@ where
         let id = id as usize;
         Self {
             vectors,
-            query: QueryVector::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
+            query: Cow::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
             dimension,
             distance_fn: distance_type.func(),
         }
@@ -415,7 +400,7 @@ impl<'a> FlatDistanceCal<'a, UInt8Type> {
         let dimension = vectors.value_length() as usize;
         Self {
             vectors: flat_array.values(),
-            query: QueryVector::Owned(query.as_primitive::<UInt8Type>().values().to_vec()),
+            query: Cow::Owned(query.as_primitive::<UInt8Type>().values().to_vec()),
             dimension,
             distance_fn: hamming,
         }
@@ -432,7 +417,7 @@ impl<'a> FlatDistanceCal<'a, UInt8Type> {
         let id = id as usize;
         Self {
             vectors,
-            query: QueryVector::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
+            query: Cow::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
             dimension,
             distance_fn: hamming,
         }
@@ -449,13 +434,13 @@ impl<T: ArrowPrimitiveType> FlatDistanceCal<'_, T> {
 impl<T: ArrowPrimitiveType> DistCalculator for FlatDistanceCal<'_, T> {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
-        let query = self.query.as_slice();
+        let query = self.query.as_ref();
         let vector = self.get_vector(id);
         (self.distance_fn)(query, vector)
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
-        let query = self.query.as_slice();
+        let query = self.query.as_ref();
         self.vectors
             .chunks_exact(self.dimension)
             .map(|vector| (self.distance_fn)(query, vector))
