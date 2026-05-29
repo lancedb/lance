@@ -242,7 +242,9 @@ mod tests {
     use arrow_array::{
         Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
         UInt8Array, UInt64Array,
-        builder::{Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder},
+        builder::{
+            Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder, UInt32Builder,
+        },
     };
 
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -942,6 +944,87 @@ mod tests {
             .with_range(0..1000)
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    /// Builds the HNSW-flush repro shape: a dense prefix where every row has
+    /// `NEIGHBORS_PER_ROW` distinct values, followed by a long tail of empty
+    /// lists. Mirrors `HNSW::schema()` `__neighbors` / `__dists` columns:
+    /// dense level-0 lists, then ~6× as many mostly-empty higher-level rows.
+    fn make_hnsw_shaped_list_u32() -> ListArray {
+        const DENSE_ROWS: u32 = 40_000;
+        const NEIGHBORS_PER_ROW: u32 = 32;
+        const EMPTY_TAIL_ROWS: u32 = 240_000;
+
+        let mut list_builder = ListBuilder::new(UInt32Builder::new());
+        let mut next_val: u32 = 0;
+        for _ in 0..DENSE_ROWS {
+            for _ in 0..NEIGHBORS_PER_ROW {
+                list_builder.values().append_value(next_val);
+                next_val = next_val.wrapping_add(1);
+            }
+            list_builder.append(true);
+        }
+        for _ in 0..EMPTY_TAIL_ROWS {
+            list_builder.append(true);
+        }
+        list_builder.finish()
+    }
+
+    /// Reproduces the HNSW-shaped variable-length `List` miniblock bug at v2.2
+    /// **on the auto-routing path** (no `STRUCTURAL_ENCODING` metadata): a
+    /// dense prefix followed by a long tail of empty lists. Globally the data
+    /// looks dense, so the unfixed `repdef_too_sparse_for_miniblock` heuristic
+    /// picks miniblock; the final chunk's level count then overflows the u16
+    /// stored in the chunk header and the read drops rows. After the heuristic
+    /// fix, this shape correctly routes to fullzip and the round-trip is
+    /// lossless.
+    #[test_log::test(tokio::test)]
+    async fn test_list_hnsw_shape_auto_routes_around_miniblock_overflow_v2_2() {
+        let list_array = make_hnsw_shaped_list_u32();
+        let dense_rows: u64 = 40_000;
+        let total_rows = list_array.len() as u64;
+
+        let field_metadata = HashMap::new();
+
+        let test_cases = TestCases::default()
+            .with_range(0..1000)
+            .with_range(dense_rows.saturating_sub(8)..(dense_rows + 8))
+            .with_range(0..total_rows)
+            .with_indices(vec![0, dense_rows - 1, dense_rows, total_rows - 1])
+            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    /// Companion to the auto-routing test: even when the user *explicitly*
+    /// sets `STRUCTURAL_ENCODING_MINIBLOCK` on the HNSW shape, the heuristic
+    /// must still detect the per-chunk `num_levels: u16` overflow and override
+    /// the request with fullzip — silently overriding a corrupt-encoding
+    /// preference is the safe behaviour given v2.2 is a stable on-disk format
+    /// whose chunk header width cannot widen.
+    ///
+    /// (The codec-side `u16::try_from` safety net at the chunk-build site is
+    /// dormant on this shape precisely because the heuristic intercepts it;
+    /// the safety net is there in case a future shape sneaks past the
+    /// heuristic.)
+    #[test_log::test(tokio::test)]
+    async fn test_forced_miniblock_hnsw_shape_routed_to_fullzip_v2_2() {
+        let list_array = make_hnsw_shaped_list_u32();
+        let total_rows = list_array.len() as u64;
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..total_rows)
+            .with_min_file_version(LanceFileVersion::V2_2)
             .with_max_file_version(LanceFileVersion::V2_2);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
