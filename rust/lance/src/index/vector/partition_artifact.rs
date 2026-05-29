@@ -176,9 +176,7 @@ impl PartitionArtifactBuilder {
             ));
         }
 
-        let num_buckets = num_partitions
-            .min(PARTITION_ARTIFACT_DEFAULT_BUCKETS)
-            .max(1);
+        let num_buckets = num_partitions.clamp(1, PARTITION_ARTIFACT_DEFAULT_BUCKETS);
         let final_schema = Arc::new(ArrowSchema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
             Field::new(
@@ -414,7 +412,7 @@ impl PartitionArtifactBuilder {
 /// [`ShuffleReader`] interface, so this adapter hides the manifest parsing and
 /// file caching needed to expose partition-local record batch streams.
 #[derive(Debug)]
-pub(crate) struct PartitionArtifactShuffleReader {
+pub struct PartitionArtifactShuffleReader {
     scheduler: Arc<ScanScheduler>,
     root_dir: Path,
     partitions: Vec<PartitionArtifactPartition>,
@@ -503,7 +501,7 @@ async fn write_json<T: Serialize>(
 
 impl PartitionArtifactShuffleReader {
     /// Open an artifact reader from a URI and optional storage options.
-    pub(crate) async fn try_open(
+    pub async fn try_open(
         uri: &str,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Result<Self> {
@@ -986,7 +984,7 @@ mod tests {
                 true,
             ),
         ]));
-        let row_ids = UInt64Array::from_iter_values((0..num_rows as u64).into_iter());
+        let row_ids = UInt64Array::from_iter_values(0..num_rows as u64);
         let part_ids = UInt32Array::from_iter_values((0..num_rows).map(|_| 0_u32));
         let pq_values = UInt8Array::from_iter_values((0..num_rows * 2).map(|v| (v % 251) as u8));
         let pq_codes = FixedSizeListArray::try_new_from_values(pq_values, 2).unwrap();

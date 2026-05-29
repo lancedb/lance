@@ -562,6 +562,7 @@ def test_create_index_unsupported_accelerator(tmp_path):
             accelerator="cuda:abc",
         )
 
+
 def test_create_index_accelerator_fallback(tmp_path, caplog):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
