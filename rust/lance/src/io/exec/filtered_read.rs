@@ -38,7 +38,7 @@ use lance_datafusion::utils::{
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult, deserialize_index_expr_result};
+use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap};
 use lance_table::format::Fragment;
@@ -77,7 +77,7 @@ impl EvaluatedIndex {
     }
 
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
-        let (index_result, applicable_fragments) = deserialize_index_expr_result(batch)?;
+        let (index_result, applicable_fragments) = IndexExprResult::deserialize(batch)?;
 
         Ok(Self {
             index_result,
@@ -2134,6 +2134,7 @@ mod tests {
         optimize::OptimizeOptions,
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
+    use lance_select::result::IndexExprResultFormat;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -2264,6 +2265,7 @@ mod tests {
                     Some(Arc::new(ScalarIndexExec::new(
                         self.dataset.clone(),
                         index_query,
+                        IndexExprResultFormat::default(),
                     )))
                 } else {
                     None
@@ -2361,11 +2363,10 @@ mod tests {
 
     /// Round-trip every interval shape through the arrow wire format and
     /// confirm the endpoints survive. Exercises both
-    /// `serialize_index_expr_result` and `EvaluatedIndex::try_from_arrow`
+    /// `IndexExprResult::serialize` and `EvaluatedIndex::try_from_arrow`
     /// so the schema names stay in sync.
     #[test]
     fn test_index_expr_result_serialize_roundtrip() {
-        use lance_index::scalar::expression::serialize_index_expr_result;
         use lance_select::{RowAddrMask, RowAddrTreeMap};
 
         let mk = |rows: &[u64]| RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(rows));
@@ -2389,7 +2390,8 @@ mod tests {
         ];
 
         for (name, original) in cases {
-            let batch = serialize_index_expr_result(&original, &frags)
+            let batch = original
+                .serialize(&frags, IndexExprResultFormat::default())
                 .unwrap_or_else(|e| panic!("serialize {name}: {e}"));
             let decoded = EvaluatedIndex::try_from_arrow(&batch)
                 .unwrap_or_else(|e| panic!("try_from_arrow {name}: {e}"));

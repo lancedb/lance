@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use datafusion::config::ConfigOptions;
+use lance_select::result::IndexExprResultFormat;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -95,9 +96,7 @@ use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
-use crate::io::exec::scalar_index::{
-    INDEX_EXPR_RESULT_SCHEMA, MaterializeIndexExec, ScalarIndexExec, serialize_index_expr_result,
-};
+use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
     LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -106,7 +105,10 @@ use crate::io::exec::{
     },
     project,
 };
-use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
+use crate::io::exec::{
+    AddRowOffsetExec, LANCE_RELATIONAL_ALGEBRA_VERSION, LanceFilterExec, LanceScanConfig,
+    get_physical_optimizer,
+};
 use crate::{Error, Result};
 use crate::{
     datatypes::Schema,
@@ -824,6 +826,9 @@ pub struct Scanner {
 
     aggregate: Option<Aggregate>,
 
+    /// Which version of the relational algebra to use when generating the physical plan
+    relational_algebra_version: u32,
+
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
     // There are two behaviors we are moving away from:
@@ -1047,6 +1052,7 @@ impl Scanner {
             legacy_with_row_id: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
+            relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
         };
         scanner.apply_blob_handling();
         scanner
@@ -2795,6 +2801,15 @@ impl Scanner {
         })
     }
 
+    fn index_expr_result_format(&self) -> IndexExprResultFormat {
+        if self.relational_algebra_version > 1 {
+            IndexExprResultFormat::TwoMask
+        } else {
+            // In version 1 we used the legacy three-variant format for index expr results
+            IndexExprResultFormat::ThreeVariant
+        }
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -2842,9 +2857,13 @@ impl Scanner {
             read_options = read_options.with_only_indexed_fragments();
         }
 
+        let result_format = self.index_expr_result_format();
         let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
-                as Arc<dyn ExecutionPlan>
+            Arc::new(ScalarIndexExec::new(
+                self.dataset.clone(),
+                index_query,
+                result_format,
+            )) as Arc<dyn ExecutionPlan>
         });
 
         Ok(Arc::new(FilteredReadExec::try_new(
@@ -2901,12 +2920,11 @@ impl Scanner {
         let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
         let index_result = IndexExprResult::exact(row_addr_mask);
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
-        let batch = serialize_index_expr_result(&index_result, &fragments_covered)?;
+        let format = self.index_expr_result_format();
+        let batch = index_result.serialize(&fragments_covered, format)?;
+        let schema = batch.schema();
         let stream = futures::stream::once(async move { Ok(batch) });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
-            INDEX_EXPR_RESULT_SCHEMA.clone(),
-            stream,
-        ));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
         Ok(Arc::new(OneShotExec::new(stream)))
     }
 
@@ -4728,13 +4746,14 @@ impl Scanner {
 
             if missing_frags.is_empty() || self.fast_search {
                 log::trace!("prefilter entirely satisfied by exact index search");
+                let result_format = self.index_expr_result_format();
                 // We can only avoid materializing the index for a prefilter if:
                 // 1. The search is indexed
                 // 2. The index search is an exact search with no recheck or refine
                 // 3. The indices cover at least the same fragments as the vector index,
                 //    unless fast_search allows skipping uncovered fragments.
                 return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
-                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone()),
+                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone(), result_format),
                 )));
             } else {
                 log::trace!("exact index search did not cover all fragments");

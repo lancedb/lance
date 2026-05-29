@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    ops::Bound,
-    sync::{Arc, LazyLock},
-};
+use std::{ops::Bound, sync::Arc};
 
-use arrow::{
-    array::{AsArray, BinaryBuilder},
-    datatypes::UInt32Type,
-};
-use arrow_array::{Array, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
@@ -29,8 +21,7 @@ use super::{
 use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use lance_select::{NullableRowAddrMask, RowAddrMask};
-use roaring::RoaringBitmap;
+use lance_select::NullableRowAddrMask;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -1296,33 +1287,10 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-/// When we evaluate a scalar index query we return a batch with three columns and two rows.
-///
-/// The first two columns carry the result's `lower` and `upper` row-address
-/// mask bounds (the interval form of [`IndexExprResult`]). The third column
-/// has the fragments-covered bitmap in the first row and null in the second.
-pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new("lower", DataType::Binary, true),
-        Field::new("upper", DataType::Binary, true),
-        Field::new("fragments_covered", DataType::Binary, true),
-    ]))
-});
-
-/// Same as [`INDEX_EXPR_RESULT_SCHEMA`], but with the legacy `result` and `discriminant` fields included.
-pub static LEGACY_INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new("result".to_string(), DataType::Binary, true),
-        Field::new("discriminant".to_string(), DataType::UInt32, true),
-        Field::new("fragments_covered".to_string(), DataType::Binary, true),
-    ]))
-});
-
-// `IndexExprResult` and `NullableIndexExprResult` themselves live in the
-// `lance-select` crate so that benchmarks and downstream consumers can
-// depend on the mask substrate without pulling in all of `lance-index`.
-// The wire-format helpers below stay here, where the `INDEX_EXPR_RESULT_SCHEMA`
-// constant they reference is defined.
+// `IndexExprResult` and `NullableIndexExprResult` (along with their schemas and
+// wire-format methods) live in `lance-select` so that benchmarks and downstream
+// consumers can depend on the mask substrate without pulling in all of
+// `lance-index`.
 pub use lance_select::{IndexExprResult, NullableIndexExprResult};
 
 impl From<SearchResult> for NullableIndexExprResult {
@@ -1333,165 +1301,6 @@ impl From<SearchResult> for NullableIndexExprResult {
             SearchResult::AtLeast(mask) => Self::at_least(NullableRowAddrMask::AllowList(mask)),
         }
     }
-}
-
-/// Build an `IndexExprResult` from the `(lower, upper)` row-mask pair
-/// produced by [`serialize_index_expr_result`].
-pub fn index_expr_result_from_parts(lower: RowAddrMask, upper: RowAddrMask) -> IndexExprResult {
-    IndexExprResult { lower, upper }
-}
-
-/// Serialize an `IndexExprResult` plus its applicable-fragments bitmap
-/// into the `INDEX_EXPR_RESULT_SCHEMA` record-batch layout used to hand
-/// scalar-index results to the read planner.
-///
-/// When the result is exact (`lower == upper`) the `upper` column is encoded
-/// as two nulls instead of duplicating the `lower` payload — the sentinel is
-/// safe because `RowAddrMask::into_arrow` always produces exactly one
-/// non-null row, so a fully-null `upper` cannot collide with any real mask.
-#[instrument(skip_all)]
-pub fn serialize_index_expr_result(
-    result: &IndexExprResult,
-    fragments_covered_by_result: &RoaringBitmap,
-) -> Result<RecordBatch> {
-    let lower_arr = result.lower.into_arrow()?;
-    let upper_arr = if result.is_exact() {
-        let mut upper_builder = BinaryBuilder::new();
-        upper_builder.append_null();
-        upper_builder.append_null();
-        upper_builder.finish()
-    } else {
-        result.upper.into_arrow()?
-    };
-    let mut fragments_covered_builder = BinaryBuilder::new();
-    let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
-    let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
-    fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
-    fragments_covered_builder.append_value(fragments_covered_bytes);
-    fragments_covered_builder.append_null();
-    let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
-    Ok(RecordBatch::try_new(
-        INDEX_EXPR_RESULT_SCHEMA.clone(),
-        vec![
-            Arc::new(lower_arr),
-            Arc::new(upper_arr),
-            Arc::new(fragments_covered_arr),
-        ],
-    )?)
-}
-
-pub fn deserialize_index_expr_result(
-    batch: &RecordBatch,
-) -> Result<(IndexExprResult, RoaringBitmap)> {
-    if batch.num_rows() != 2 {
-        return Err(Error::invalid_input_source(
-            format!(
-                "Expected a batch with exactly 2 rows but there are {} rows",
-                batch.num_rows()
-            )
-            .into(),
-        ));
-    }
-    if batch.num_columns() != 3 {
-        return Err(Error::invalid_input_source(
-            format!(
-                "Expected a batch with exactly two columns but there are {} columns",
-                batch.num_columns()
-            )
-            .into(),
-        ));
-    }
-
-    let schema = batch.schema();
-    let first_col_name = schema.field(0).name();
-    let index_result = if first_col_name == "lower" {
-        // New style
-        let lower = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
-        let upper_col = batch.column(1).as_binary::<i32>();
-        // A fully-null upper column is the "exact" sentinel written by
-        // `serialize_index_expr_result` — reuse `lower` for `upper` instead
-        // of duplicating the payload on the wire.
-        let upper = if upper_col.is_null(0) && upper_col.is_null(1) {
-            lower.clone()
-        } else {
-            RowAddrMask::from_arrow(upper_col)?
-        };
-        index_expr_result_from_parts(lower, upper)
-    } else if first_col_name == "result" {
-        // Legacy style
-        let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
-        let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
-        if match_type == 0 {
-            IndexExprResult::exact(row_addr_mask)
-        } else if match_type == 1 {
-            IndexExprResult::at_most(row_addr_mask)
-        } else if match_type == 2 {
-            IndexExprResult::at_least(row_addr_mask)
-        } else {
-            return Err(Error::internal(format!(
-                "Unexpected match type: {}",
-                match_type
-            )));
-        }
-    } else {
-        return Err(Error::internal(format!(
-            "Unexpected column name: {}",
-            first_col_name
-        )));
-    };
-
-    let applicable_fragments = batch.column(2).as_binary::<i32>();
-    let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
-
-    Ok((index_result, applicable_fragments))
-}
-
-/// Serializes the `IndexExprResult` into the legacy `LEGACY_INDEX_EXPR_RESULT_SCHEMA` record-batch layout.
-///
-/// This can be used for backwards compatibility purposes.
-///
-/// Refined intervals (a non-empty `lower` strictly inside a non-universe
-/// `upper`) cannot be represented in the legacy three-shape encoding, so we
-/// degrade to `AtMost(upper)`: the upper bound is already a valid superset of
-/// the answer, and `AtMost` signals to the consumer that a recheck is
-/// required. A warning is logged when this lossy conversion happens.
-pub fn legacy_serialize_index_expr_result(
-    result: &IndexExprResult,
-    fragments_covered_by_result: &RoaringBitmap,
-) -> Result<RecordBatch> {
-    let (row_addr_mask, discriminant) = if result.is_exact() {
-        (&result.lower, 0u32)
-    } else if result.is_at_most() {
-        (&result.upper, 1)
-    } else if result.is_at_least() {
-        (&result.lower, 2)
-    } else {
-        tracing::warn!(
-            "Legacy serialization of refined index-expr result: degrading to AtMost(upper); \
-             downstream will recheck the candidates"
-        );
-        (&result.upper, 1)
-    };
-    let row_addr_mask_arr = row_addr_mask.into_arrow()?;
-    let discriminant_arr =
-        Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
-
-    let mut fragments_covered_builder = BinaryBuilder::new();
-    let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
-    let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
-    fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
-    fragments_covered_builder.append_value(fragments_covered_bytes);
-    fragments_covered_builder.append_null();
-    let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
-
-    Ok(RecordBatch::try_new(
-        LEGACY_INDEX_EXPR_RESULT_SCHEMA.clone(),
-        vec![
-            Arc::new(row_addr_mask_arr),
-            Arc::new(discriminant_arr),
-            Arc::new(fragments_covered_arr),
-        ],
-    )?)
 }
 
 impl ScalarIndexExpr {
@@ -2148,11 +1957,14 @@ impl PlannerIndexExt for Planner {
 mod tests {
     use std::collections::HashMap;
 
+    use arrow_array::Array;
     use arrow_schema::{Field, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
+    use lance_select::result::IndexExprResultFormat;
+    use roaring::RoaringBitmap;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -3150,66 +2962,76 @@ mod tests {
         }
     }
 
-    /// `serialize_index_expr_result` / `deserialize_index_expr_result` are the
-    /// (non-legacy) wire format hand-off between `ScalarIndexExec` and the
-    /// read planner once `LANCE_RELATIONAL_ALGEBRA_VERSION` moves past 1. The
-    /// pair must round-trip every degenerate-interval shape (Exact, AtMost,
-    /// AtLeast) plus the fragments-covered bitmap.
     #[test]
     fn test_serialize_index_expr_result_round_trip() {
         use lance_select::{RowAddrMask, RowAddrTreeMap};
 
-        let mut addrs = RowAddrTreeMap::new();
-        addrs.insert_range(0..5);
-        addrs.insert_range(100..103);
+        for format in [
+            IndexExprResultFormat::TwoMask,
+            IndexExprResultFormat::ThreeVariant,
+        ] {
+            let mut addrs = RowAddrTreeMap::new();
+            addrs.insert_range(0..5);
+            addrs.insert_range(100..103);
 
-        let mut fragments_covered = RoaringBitmap::new();
-        fragments_covered.insert(0);
-        fragments_covered.insert(7);
+            let mut fragments_covered = RoaringBitmap::new();
+            fragments_covered.insert(0);
+            fragments_covered.insert(7);
 
-        let cases = [
-            (
-                "exact",
-                IndexExprResult::exact(RowAddrMask::from_allowed(addrs.clone())),
-            ),
-            (
-                "at_most",
-                IndexExprResult::at_most(RowAddrMask::from_allowed(addrs.clone())),
-            ),
-            (
-                "at_least",
-                IndexExprResult::at_least(RowAddrMask::from_allowed(addrs)),
-            ),
-        ];
+            let cases = [
+                (
+                    "exact",
+                    IndexExprResult::exact(RowAddrMask::from_allowed(addrs.clone())),
+                ),
+                (
+                    "at_most",
+                    IndexExprResult::at_most(RowAddrMask::from_allowed(addrs.clone())),
+                ),
+                (
+                    "at_least",
+                    IndexExprResult::at_least(RowAddrMask::from_allowed(addrs)),
+                ),
+            ];
 
-        for (label, original) in cases {
-            let batch = serialize_index_expr_result(&original, &fragments_covered).unwrap();
-            assert_eq!(batch.schema(), *INDEX_EXPR_RESULT_SCHEMA, "case {label}");
-            assert_eq!(batch.num_rows(), 2, "case {label}");
+            for (label, original) in cases {
+                let batch = original.serialize(&fragments_covered, format).unwrap();
+                assert_eq!(
+                    batch.schema(),
+                    *format.schema(),
+                    "format {format:?}, case {label}"
+                );
+                assert_eq!(batch.num_rows(), 2, "format {format:?}, case {label}");
 
-            let (round_tripped, round_tripped_frags) =
-                deserialize_index_expr_result(&batch).unwrap();
-            assert_eq!(round_tripped.lower, original.lower, "case {label}: lower");
-            assert_eq!(round_tripped.upper, original.upper, "case {label}: upper");
-            assert_eq!(
-                round_tripped_frags, fragments_covered,
-                "case {label}: frags"
-            );
-            assert_eq!(
-                round_tripped.is_exact(),
-                original.is_exact(),
-                "case {label}"
-            );
-            assert_eq!(
-                round_tripped.is_at_most(),
-                original.is_at_most(),
-                "case {label}"
-            );
-            assert_eq!(
-                round_tripped.is_at_least(),
-                original.is_at_least(),
-                "case {label}"
-            );
+                let (round_tripped, round_tripped_frags) =
+                    IndexExprResult::deserialize(&batch).unwrap();
+                assert_eq!(
+                    round_tripped.lower, original.lower,
+                    "format {format:?}, case {label}: lower"
+                );
+                assert_eq!(
+                    round_tripped.upper, original.upper,
+                    "format {format:?}, case {label}: upper"
+                );
+                assert_eq!(
+                    round_tripped_frags, fragments_covered,
+                    "format {format:?}, case {label}: frags"
+                );
+                assert_eq!(
+                    round_tripped.is_exact(),
+                    original.is_exact(),
+                    "format {format:?}, case {label}"
+                );
+                assert_eq!(
+                    round_tripped.is_at_most(),
+                    original.is_at_most(),
+                    "format {format:?}, case {label}"
+                );
+                assert_eq!(
+                    round_tripped.is_at_least(),
+                    original.is_at_least(),
+                    "format {format:?}, case {label}"
+                );
+            }
         }
     }
 
@@ -3226,43 +3048,43 @@ mod tests {
         let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(0u64..5));
         let fragments_covered = RoaringBitmap::from_iter([0u32]);
 
+        use arrow::array::AsArray;
+
         // Exact: upper column must be fully null on the wire.
-        let exact_batch =
-            serialize_index_expr_result(&IndexExprResult::exact(mask.clone()), &fragments_covered)
-                .unwrap();
+        let exact_batch = IndexExprResult::exact(mask.clone())
+            .serialize(&fragments_covered, IndexExprResultFormat::TwoMask)
+            .unwrap();
         let exact_upper = exact_batch.column(1).as_binary::<i32>();
         assert!(exact_upper.is_null(0) && exact_upper.is_null(1));
 
         // Non-exact (at_most): upper column must carry the upper mask, so at
         // least one row is non-null (`AllowList(mask)` puts the payload at
         // row 1).
-        let at_most_batch = serialize_index_expr_result(
-            &IndexExprResult::at_most(mask.clone()),
-            &fragments_covered,
-        )
-        .unwrap();
+        let at_most_batch = IndexExprResult::at_most(mask.clone())
+            .serialize(&fragments_covered, IndexExprResultFormat::TwoMask)
+            .unwrap();
         let at_most_upper = at_most_batch.column(1).as_binary::<i32>();
         assert!(!(at_most_upper.is_null(0) && at_most_upper.is_null(1)));
 
         // Non-exact (at_least): upper = all_rows, which `into_arrow`
         // encodes as `BlockList(empty)` — row 0 holds the empty-tree bytes,
         // row 1 is null. Round-trip must preserve `is_at_least`.
-        let at_least_batch =
-            serialize_index_expr_result(&IndexExprResult::at_least(mask), &fragments_covered)
-                .unwrap();
+        let at_least_batch = IndexExprResult::at_least(mask)
+            .serialize(&fragments_covered, IndexExprResultFormat::TwoMask)
+            .unwrap();
         let at_least_upper = at_least_batch.column(1).as_binary::<i32>();
         assert!(!at_least_upper.is_null(0));
-        let (round_tripped, _) = deserialize_index_expr_result(&at_least_batch).unwrap();
+        let (round_tripped, _) = IndexExprResult::deserialize(&at_least_batch).unwrap();
         assert!(round_tripped.is_at_least());
         assert!(!round_tripped.is_exact());
     }
 
     /// A refined `IndexExprResult` (`lower` strictly inside a non-universe
-    /// `upper`) has no legacy three-shape encoding. The legacy serializer
+    /// `upper`) has no legacy three-shape encoding. The serializer
     /// must not error in that case — it must degrade to `AtMost(upper)` so
     /// older read planners still see a valid superset and recheck.
     #[test]
-    fn test_legacy_serialize_refined_degrades_to_at_most() {
+    fn test_three_variant_serialize_refined_degrades_to_at_most() {
         use lance_select::{RowAddrMask, RowAddrTreeMap};
 
         let lower_addrs = RowAddrTreeMap::from_iter(0u64..3);
@@ -3275,12 +3097,17 @@ mod tests {
 
         let fragments_covered = RoaringBitmap::from_iter([0u32, 1]);
 
-        let batch = legacy_serialize_index_expr_result(&refined, &fragments_covered).unwrap();
-        assert_eq!(batch.schema(), *LEGACY_INDEX_EXPR_RESULT_SCHEMA);
+        let batch = refined
+            .serialize(&fragments_covered, IndexExprResultFormat::ThreeVariant)
+            .unwrap();
+        assert_eq!(
+            batch.schema(),
+            *IndexExprResultFormat::ThreeVariant.schema()
+        );
 
         // Discriminant 1 == AtMost; the round-tripped result carries the
         // original `upper` as the AtMost mask (empty lower, upper = upper).
-        let (round_tripped, round_tripped_frags) = deserialize_index_expr_result(&batch).unwrap();
+        let (round_tripped, round_tripped_frags) = IndexExprResult::deserialize(&batch).unwrap();
         assert!(round_tripped.is_at_most());
         assert_eq!(round_tripped.upper, RowAddrMask::from_allowed(upper_addrs));
         assert_eq!(round_tripped_frags, fragments_covered);

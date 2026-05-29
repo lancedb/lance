@@ -42,6 +42,14 @@
 //! the per-endpoint algebra already implements two-valued and SQL
 //! three-valued logic correctly inside each mask type.
 
+use std::sync::{Arc, LazyLock};
+
+use arrow_array::{Array, RecordBatch, UInt32Array, builder::BinaryBuilder};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use roaring::RoaringBitmap;
+
+use lance_core::{Error, Result};
+
 use crate::mask::{NullableRowAddrMask, RowAddrMask, RowSetOps};
 
 /// Result of an index search before NULL rows are dropped. Each endpoint
@@ -262,5 +270,177 @@ impl std::ops::BitOr<Self> for IndexExprResult {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
         }
+    }
+}
+
+static TWO_MASK_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("lower", DataType::Binary, true),
+        Field::new("upper", DataType::Binary, true),
+        Field::new("fragments_covered", DataType::Binary, true),
+    ]))
+});
+
+static THREE_VARIANT_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("result".to_string(), DataType::Binary, true),
+        Field::new("discriminant".to_string(), DataType::UInt32, true),
+        Field::new("fragments_covered".to_string(), DataType::Binary, true),
+    ]))
+});
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexExprResultFormat {
+    ThreeVariant, // A legacy format that used AtMost/AtLeast/Exact variants
+    #[default]
+    TwoMask, // The two-mask format with upper and lower
+}
+
+impl IndexExprResultFormat {
+    pub fn schema(&self) -> &SchemaRef {
+        match self {
+            Self::ThreeVariant => &THREE_VARIANT_RESULT_SCHEMA,
+            Self::TwoMask => &TWO_MASK_RESULT_SCHEMA,
+        }
+    }
+}
+
+impl IndexExprResult {
+    /// Serialize into the `INDEX_EXPR_RESULT_SCHEMA` record-batch layout used to
+    /// hand scalar-index results to the read planner.
+    #[tracing::instrument(skip_all)]
+    fn serialize_standard(&self, fragments_covered: &RoaringBitmap) -> Result<RecordBatch> {
+        let lower_arr = self.lower.into_arrow()?;
+        let upper_arr = if self.is_exact() {
+            let mut b = BinaryBuilder::new();
+            b.append_null();
+            b.append_null();
+            b.finish()
+        } else {
+            self.upper.into_arrow()?
+        };
+        let mut frags_builder = BinaryBuilder::new();
+        let mut frags_bytes = Vec::with_capacity(fragments_covered.serialized_size());
+        fragments_covered.serialize_into(&mut frags_bytes)?;
+        frags_builder.append_value(frags_bytes);
+        frags_builder.append_null();
+        Ok(RecordBatch::try_new(
+            TWO_MASK_RESULT_SCHEMA.clone(),
+            vec![
+                Arc::new(lower_arr),
+                Arc::new(upper_arr),
+                Arc::new(frags_builder.finish()) as Arc<dyn Array>,
+            ],
+        )?)
+    }
+
+    /// Serialize into the legacy three-variant record-batch layout.
+    ///
+    /// Refined intervals (a non-empty `lower` strictly inside a non-universe `upper`)
+    /// cannot be represented in the legacy encoding and are degraded to `AtMost(upper)`.
+    fn serialize_three_variant(&self, fragments_covered: &RoaringBitmap) -> Result<RecordBatch> {
+        let (mask, discriminant) = if self.is_exact() {
+            (&self.lower, 0u32)
+        } else if self.is_at_most() {
+            (&self.upper, 1)
+        } else if self.is_at_least() {
+            (&self.lower, 2)
+        } else {
+            tracing::warn!(
+                "Legacy serialization of refined index-expr result: degrading to AtMost(upper); \
+                 answer will remain correct but query will be more expensive"
+            );
+            (&self.upper, 1)
+        };
+        let mask_arr = mask.into_arrow()?;
+        let discriminant_arr =
+            Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
+        let mut frags_builder = BinaryBuilder::new();
+        let mut frags_bytes = Vec::with_capacity(fragments_covered.serialized_size());
+        fragments_covered.serialize_into(&mut frags_bytes)?;
+        frags_builder.append_value(frags_bytes);
+        frags_builder.append_null();
+        Ok(RecordBatch::try_new(
+            THREE_VARIANT_RESULT_SCHEMA.clone(),
+            vec![
+                Arc::new(mask_arr),
+                discriminant_arr,
+                Arc::new(frags_builder.finish()) as Arc<dyn Array>,
+            ],
+        )?)
+    }
+
+    pub fn serialize(
+        &self,
+        fragments_covered: &RoaringBitmap,
+        format: IndexExprResultFormat,
+    ) -> Result<RecordBatch> {
+        match format {
+            IndexExprResultFormat::ThreeVariant => self.serialize_three_variant(fragments_covered),
+            IndexExprResultFormat::TwoMask => self.serialize_standard(fragments_covered),
+        }
+    }
+
+    /// Deserialize from a record batch produced by [`Self::serialize`] or
+    /// [`Self::serialize_legacy`].
+    pub fn deserialize(batch: &RecordBatch) -> Result<(Self, RoaringBitmap)> {
+        use arrow_array::cast::AsArray;
+
+        if batch.num_rows() != 2 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Expected a batch with exactly 2 rows but there are {} rows",
+                    batch.num_rows()
+                )
+                .into(),
+            ));
+        }
+        if batch.num_columns() != 3 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Expected a batch with exactly three columns but there are {} columns",
+                    batch.num_columns()
+                )
+                .into(),
+            ));
+        }
+
+        let first_col_name = batch.schema().field(0).name().clone();
+        let index_result = if first_col_name == "lower" {
+            let lower = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
+            let upper_col = batch.column(1).as_binary::<i32>();
+            let upper = if upper_col.is_null(0) && upper_col.is_null(1) {
+                lower.clone()
+            } else {
+                RowAddrMask::from_arrow(upper_col)?
+            };
+            Self { lower, upper }
+        } else if first_col_name == "result" {
+            let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
+            let match_type = batch
+                .column(1)
+                .as_primitive::<arrow_array::types::UInt32Type>()
+                .values()[0];
+            if match_type == 0 {
+                Self::exact(row_addr_mask)
+            } else if match_type == 1 {
+                Self::at_most(row_addr_mask)
+            } else if match_type == 2 {
+                Self::at_least(row_addr_mask)
+            } else {
+                return Err(Error::internal(format!(
+                    "Unexpected match type: {match_type}"
+                )));
+            }
+        } else {
+            return Err(Error::internal(format!(
+                "Unexpected column name: {first_col_name}"
+            )));
+        };
+
+        let frags_col = batch.column(2).as_binary::<i32>();
+        let fragments = RoaringBitmap::deserialize_from(frags_col.value(0))?;
+
+        Ok((index_result, fragments))
     }
 }

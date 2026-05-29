@@ -13,7 +13,6 @@ use crate::{
         prefilter::DatasetPreFilter,
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
     },
-    io::exec::LANCE_RELATIONAL_ALGEBRA_VERSION,
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
@@ -41,46 +40,13 @@ use lance_index::{
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
-        expression::{
-            IndexExprResult, LEGACY_INDEX_EXPR_RESULT_SCHEMA, ScalarIndexExpr, ScalarIndexLoader,
-            ScalarIndexSearch,
-        },
+        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
     },
 };
-use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultFormat};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::{debug_span, instrument};
-
-pub fn serialize_index_expr_result(
-    result: &IndexExprResult,
-    fragments_covered_by_result: &RoaringBitmap,
-) -> Result<RecordBatch> {
-    if LANCE_RELATIONAL_ALGEBRA_VERSION > 1 {
-        lance_index::scalar::expression::serialize_index_expr_result(
-            result,
-            fragments_covered_by_result,
-        )
-    } else {
-        lance_index::scalar::expression::legacy_serialize_index_expr_result(
-            result,
-            fragments_covered_by_result,
-        )
-    }
-}
-
-/// Schema of the record batch emitted by [`serialize_index_expr_result`] under
-/// the currently-active [`LANCE_RELATIONAL_ALGEBRA_VERSION`]. Use this anywhere
-/// the schema must match what `ScalarIndexExec` (or any other producer that
-/// calls the wrapper) actually emits — otherwise the plan's advertised schema
-/// will drift from the wire format.
-pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    if LANCE_RELATIONAL_ALGEBRA_VERSION > 1 {
-        lance_index::scalar::expression::INDEX_EXPR_RESULT_SCHEMA.clone()
-    } else {
-        LEGACY_INDEX_EXPR_RESULT_SCHEMA.clone()
-    }
-});
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
@@ -107,6 +73,7 @@ pub struct ScalarIndexExec {
     expr: ScalarIndexExpr,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    result_format: IndexExprResultFormat,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -123,9 +90,13 @@ impl DisplayAs for ScalarIndexExec {
 }
 
 impl ScalarIndexExec {
-    pub fn new(dataset: Arc<Dataset>, expr: ScalarIndexExpr) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        expr: ScalarIndexExpr,
+        result_format: IndexExprResultFormat,
+    ) -> Self {
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(INDEX_EXPR_RESULT_SCHEMA.clone()),
+            EquivalenceProperties::new(result_format.schema().clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -135,6 +106,7 @@ impl ScalarIndexExec {
             expr,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            result_format,
         }
     }
 
@@ -172,6 +144,7 @@ impl ScalarIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
+        result_format: IndexExprResultFormat,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
@@ -184,7 +157,7 @@ impl ScalarIndexExec {
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
-            serialize_index_expr_result(&query_result, &fragments_covered_by_result)
+            query_result.serialize(&fragments_covered_by_result, result_format)
         }
     }
 }
@@ -199,7 +172,7 @@ impl ExecutionPlan for ScalarIndexExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        INDEX_EXPR_RESULT_SCHEMA.clone()
+        self.result_format.schema().clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -228,13 +201,14 @@ impl ExecutionPlan for ScalarIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.metrics.clone(),
+            self.result_format,
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            INDEX_EXPR_RESULT_SCHEMA.clone(),
+            self.result_format.schema().clone(),
             stream,
             partition,
             &self.metrics,
@@ -247,7 +221,7 @@ impl ExecutionPlan for ScalarIndexExec {
     ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         Ok(datafusion::physical_plan::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(2),
-            ..datafusion::physical_plan::Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
+            ..datafusion::physical_plan::Statistics::new_unknown(self.result_format.schema())
         })
     }
 
@@ -780,10 +754,8 @@ mod tests {
     use std::{ops::Bound, sync::Arc};
 
     use crate::index::DatasetIndexExt;
-    use arrow::{
-        array::AsArray,
-        datatypes::{UInt32Type, UInt64Type},
-    };
+    use arrow::datatypes::UInt64Type;
+    use arrow_schema::Schema;
     use datafusion::{
         execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
         scalar::ScalarValue,
@@ -795,12 +767,10 @@ mod tests {
         IndexType,
         scalar::{
             SargableQuery, ScalarIndexParams,
-            expression::{
-                LEGACY_INDEX_EXPR_RESULT_SCHEMA, ScalarIndexExpr, ScalarIndexSearch,
-                deserialize_index_expr_result,
-            },
+            expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
+    use lance_select::result::IndexExprResultFormat;
 
     use crate::{
         Dataset,
@@ -887,12 +857,11 @@ mod tests {
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
     /// the same schema the batch actually carries — otherwise downstream
     /// consumers that trust `ExecutionPlan::schema()` will see a different
-    /// shape than they receive. While `LANCE_RELATIONAL_ALGEBRA_VERSION ==
-    /// 1`, both must be the legacy layout. This test also exercises
-    /// `partition_statistics` and the stream's `RecordBatchStream::schema`
-    /// to catch drift in either advertisement path.
+    /// shape than they receive.
+    ///
+    /// The schema depends on the `IndexExprResultFormat` passed to `ScalarIndexExec::new`.
     #[tokio::test]
-    async fn test_scalar_index_exec_advertises_legacy_schema() {
+    async fn test_scalar_index_exec_advertises_correct_schema() {
         let TestFixture {
             dataset,
             _tmp_dir_guard,
@@ -909,69 +878,36 @@ mod tests {
             needs_recheck: false,
         });
 
-        let plan = ScalarIndexExec::new(dataset, query);
+        let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
+            assert_eq!(plan.schema(), schema);
+            assert_eq!(
+                plan.partition_statistics(None)
+                    .unwrap()
+                    .column_statistics
+                    .len(),
+                schema.fields().len(),
+            );
 
-        let legacy_schema = LEGACY_INDEX_EXPR_RESULT_SCHEMA.clone();
-        assert_eq!(plan.schema(), legacy_schema);
-        assert_eq!(
-            plan.partition_statistics(None)
-                .unwrap()
-                .column_statistics
-                .len(),
-            legacy_schema.fields().len(),
+            let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+            assert_eq!(stream.schema(), schema);
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].schema(), schema);
+        };
+
+        let plan = ScalarIndexExec::new(
+            dataset.clone(),
+            query.clone(),
+            IndexExprResultFormat::ThreeVariant,
         );
+        let schema = IndexExprResultFormat::ThreeVariant.schema().clone();
 
-        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
-        assert_eq!(stream.schema(), legacy_schema);
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].schema(), legacy_schema);
-    }
+        verify(plan, schema).await;
 
-    /// The wire format that `ScalarIndexExec` hands to the read planner is
-    /// part of the relational-algebra public surface (see
-    /// `LANCE_RELATIONAL_ALGEBRA_VERSION`). While version is `1` the layout
-    /// must remain the pre-`{lower, upper}`-refactor `{result, discriminant,
-    /// fragments_covered}` shape so older read planners can still consume
-    /// the batch. This test pins that behavior end-to-end through
-    /// `ScalarIndexExec::execute`.
-    #[tokio::test]
-    async fn test_scalar_index_exec_returns_legacy_format() {
-        let TestFixture {
-            dataset,
-            _tmp_dir_guard,
-        } = test_fixture().await;
+        let plan = ScalarIndexExec::new(dataset, query, IndexExprResultFormat::TwoMask);
+        let schema = IndexExprResultFormat::TwoMask.schema().clone();
 
-        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
-            column: "ordered".to_string(),
-            index_name: "ordered_idx".to_string(),
-            index_type: "BTree".to_string(),
-            query: Arc::new(SargableQuery::Range(
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::UInt64(Some(47))),
-            )),
-            needs_recheck: false,
-        });
-
-        let plan = ScalarIndexExec::new(dataset, query);
-        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-
-        assert_eq!(batches.len(), 1);
-        let batch = &batches[0];
-        assert_eq!(batch.schema(), *LEGACY_INDEX_EXPR_RESULT_SCHEMA);
-        assert_eq!(batch.num_rows(), 2);
-
-        // Discriminant 0 == Exact; a `<` query over a BTree index is exact.
-        let discriminant = batch.column(1).as_primitive::<UInt32Type>();
-        assert_eq!(discriminant.value(0), 0);
-        assert_eq!(discriminant.value(1), 0);
-
-        // The batch should still round-trip back to an `IndexExprResult` covering
-        // 47 rows (one per matching value in `ordered < 47`).
-        let (result, _frags) = deserialize_index_expr_result(batch).unwrap();
-        assert!(result.is_exact());
-        assert_eq!(result.upper.max_len().unwrap(), 47);
+        verify(plan, schema).await;
     }
 
     #[test]
@@ -995,7 +931,11 @@ mod tests {
 
         // These plans aren't even valid but it appears we defer all work (even validation) until
         // read time.
-        let plan = ScalarIndexExec::new(arc_dasaset.clone(), query.clone());
+        let plan = ScalarIndexExec::new(
+            arc_dasaset.clone(),
+            query.clone(),
+            IndexExprResultFormat::default(),
+        );
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
 
         let plan = MapIndexExec::new(
