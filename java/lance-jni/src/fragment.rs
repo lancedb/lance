@@ -101,6 +101,9 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -120,6 +123,9 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
+            base_store_params_obj,
+            initial_bases,
+            target_bases,
             namespace_obj,
             table_id_obj,
             allow_external_blob_outside_bases,
@@ -142,6 +148,9 @@ fn inner_create_with_ffi_array<'local>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -170,6 +179,9 @@ fn inner_create_with_ffi_array<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        base_store_params_obj,
+        initial_bases,
+        target_bases,
         namespace_obj,
         table_id_obj,
         allow_external_blob_outside_bases,
@@ -191,6 +203,9 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -209,6 +224,9 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             enable_stable_row_ids,
             data_storage_version,
             storage_options_obj,
+            base_store_params_obj,
+            initial_bases,
+            target_bases,
             namespace_obj,
             table_id_obj,
             allow_external_blob_outside_bases,
@@ -230,6 +248,9 @@ fn inner_create_with_ffi_stream<'local>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -248,6 +269,9 @@ fn inner_create_with_ffi_stream<'local>(
         enable_stable_row_ids,
         data_storage_version,
         storage_options_obj,
+        base_store_params_obj,
+        initial_bases,
+        target_bases,
         namespace_obj,
         table_id_obj,
         allow_external_blob_outside_bases,
@@ -267,6 +291,9 @@ fn create_fragment<'a>(
     enable_stable_row_ids: JObject,             // Optional<Boolean>
     data_storage_version: JObject,              // Optional<String>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
+    initial_bases: JObject,                     // Optional<List<BasePath>>
+    target_bases: JObject,                      // Optional<List<String>>
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
@@ -285,9 +312,9 @@ fn create_fragment<'a>(
         &data_storage_version,
         None,
         &storage_options_obj,
-        &JObject::null(), // base store params are not used when creating fragments
-        &JObject::null(), // not used when creating fragments
-        &JObject::null(), // not used when creating fragments
+        &base_store_params_obj,
+        &initial_bases,
+        &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
     )?;

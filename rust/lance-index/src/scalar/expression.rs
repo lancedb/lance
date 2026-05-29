@@ -24,11 +24,9 @@ use super::{
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
-use lance_core::{
-    Error, Result,
-    utils::mask::{NullableRowAddrMask, RowAddrMask},
-};
+use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use lance_select::{NullableRowAddrMask, RowAddrMask};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
@@ -1308,12 +1306,12 @@ pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-#[derive(Debug)]
-enum NullableIndexExprResult {
-    Exact(NullableRowAddrMask),
-    AtMost(NullableRowAddrMask),
-    AtLeast(NullableRowAddrMask),
-}
+// `IndexExprResult` and `NullableIndexExprResult` themselves live in the
+// `lance-select` crate so that benchmarks and downstream consumers can
+// depend on the mask substrate without pulling in all of `lance-index`.
+// The wire-format helpers below stay here, where the `INDEX_EXPR_RESULT_SCHEMA`
+// constant they reference is defined.
+pub use lance_select::{IndexExprResult, NullableIndexExprResult};
 
 impl From<SearchResult> for NullableIndexExprResult {
     fn from(result: SearchResult) -> Self {
@@ -1325,132 +1323,50 @@ impl From<SearchResult> for NullableIndexExprResult {
     }
 }
 
-impl std::ops::BitAnd<Self> for NullableIndexExprResult {
-    type Output = Self;
-
-    fn bitand(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs & rhs),
-            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(lhs), Self::Exact(rhs)) => {
-                Self::AtMost(lhs & rhs)
-            }
-            (Self::Exact(exact), Self::AtLeast(_)) | (Self::AtLeast(_), Self::Exact(exact)) => {
-                // We could do better here, elements in both lhs and rhs are known
-                // to be true and don't require a recheck.  We only need to recheck
-                // elements in lhs that are not in rhs
-                Self::AtMost(exact)
-            }
-            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs & rhs),
-            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs & rhs),
-            (Self::AtMost(most), Self::AtLeast(_)) | (Self::AtLeast(_), Self::AtMost(most)) => {
-                Self::AtMost(most)
-            }
-        }
+/// Parse an `IndexExprResult` from its serialized `(mask, discriminant)`
+/// representation. Counterpart to [`serialize_index_expr_result`].
+pub fn index_expr_result_from_parts(
+    mask: RowAddrMask,
+    discriminant: u32,
+) -> Result<IndexExprResult> {
+    match discriminant {
+        0 => Ok(IndexExprResult::Exact(mask)),
+        1 => Ok(IndexExprResult::AtMost(mask)),
+        2 => Ok(IndexExprResult::AtLeast(mask)),
+        _ => Err(Error::invalid_input_source(
+            format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
+        )),
     }
 }
 
-impl std::ops::BitOr<Self> for NullableIndexExprResult {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (Self::Exact(lhs), Self::Exact(rhs)) => Self::Exact(lhs | rhs),
-            (Self::Exact(lhs), Self::AtMost(rhs)) | (Self::AtMost(rhs), Self::Exact(lhs)) => {
-                // We could do better here, elements in lhs are known to be true
-                // and don't require a recheck.  We only need to recheck elements
-                // in rhs that are not in lhs
-                Self::AtMost(lhs | rhs)
-            }
-            (Self::Exact(lhs), Self::AtLeast(rhs)) | (Self::AtLeast(rhs), Self::Exact(lhs)) => {
-                Self::AtLeast(lhs | rhs)
-            }
-            (Self::AtMost(lhs), Self::AtMost(rhs)) => Self::AtMost(lhs | rhs),
-            (Self::AtLeast(lhs), Self::AtLeast(rhs)) => Self::AtLeast(lhs | rhs),
-            (Self::AtMost(_), Self::AtLeast(least)) | (Self::AtLeast(least), Self::AtMost(_)) => {
-                Self::AtLeast(least)
-            }
-        }
-    }
-}
-
-impl NullableIndexExprResult {
-    pub fn drop_nulls(self) -> IndexExprResult {
-        match self {
-            Self::Exact(mask) => IndexExprResult::Exact(mask.drop_nulls()),
-            Self::AtMost(mask) => IndexExprResult::AtMost(mask.drop_nulls()),
-            Self::AtLeast(mask) => IndexExprResult::AtLeast(mask.drop_nulls()),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum IndexExprResult {
-    // The answer is exactly the rows in the allow list minus the rows in the block list
-    Exact(RowAddrMask),
-    // The answer is at most the rows in the allow list minus the rows in the block list
-    // Some of the rows in the allow list may not be in the result and will need to be filtered
-    // by a recheck.  Every row in the block list is definitely not in the result.
-    AtMost(RowAddrMask),
-    // The answer is at least the rows in the allow list minus the rows in the block list
-    // Some of the rows in the block list might be in the result.  Every row in the allow list is
-    // definitely in the result.
-    AtLeast(RowAddrMask),
-}
-
-impl IndexExprResult {
-    pub fn row_addr_mask(&self) -> &RowAddrMask {
-        match self {
-            Self::Exact(mask) => mask,
-            Self::AtMost(mask) => mask,
-            Self::AtLeast(mask) => mask,
-        }
-    }
-
-    pub fn discriminant(&self) -> u32 {
-        match self {
-            Self::Exact(_) => 0,
-            Self::AtMost(_) => 1,
-            Self::AtLeast(_) => 2,
-        }
-    }
-
-    pub fn from_parts(mask: RowAddrMask, discriminant: u32) -> Result<Self> {
-        match discriminant {
-            0 => Ok(Self::Exact(mask)),
-            1 => Ok(Self::AtMost(mask)),
-            2 => Ok(Self::AtLeast(mask)),
-            _ => Err(Error::invalid_input_source(
-                format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
-            )),
-        }
-    }
-
-    #[instrument(skip_all)]
-    pub fn serialize_to_arrow(
-        &self,
-        fragments_covered_by_result: &RoaringBitmap,
-    ) -> Result<RecordBatch> {
-        let row_addr_mask = self.row_addr_mask();
-        let row_addr_mask_arr = row_addr_mask.into_arrow()?;
-        let discriminant = self.discriminant();
-        let discriminant_arr =
-            Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
-        let mut fragments_covered_builder = BinaryBuilder::new();
-        let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
-        let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
-        fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
-        fragments_covered_builder.append_value(fragments_covered_bytes);
-        fragments_covered_builder.append_null();
-        let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
-        Ok(RecordBatch::try_new(
-            INDEX_EXPR_RESULT_SCHEMA.clone(),
-            vec![
-                Arc::new(row_addr_mask_arr),
-                Arc::new(discriminant_arr),
-                Arc::new(fragments_covered_arr),
-            ],
-        )?)
-    }
+/// Serialize an `IndexExprResult` plus its applicable-fragments bitmap
+/// into the `INDEX_EXPR_RESULT_SCHEMA` record-batch layout used to hand
+/// scalar-index results to the read planner.
+#[instrument(skip_all)]
+pub fn serialize_index_expr_result(
+    result: &IndexExprResult,
+    fragments_covered_by_result: &RoaringBitmap,
+) -> Result<RecordBatch> {
+    let row_addr_mask = result.row_addr_mask();
+    let row_addr_mask_arr = row_addr_mask.into_arrow()?;
+    let discriminant = result.discriminant();
+    let discriminant_arr =
+        Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
+    let mut fragments_covered_builder = BinaryBuilder::new();
+    let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
+    let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
+    fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
+    fragments_covered_builder.append_value(fragments_covered_bytes);
+    fragments_covered_builder.append_null();
+    let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
+    Ok(RecordBatch::try_new(
+        INDEX_EXPR_RESULT_SCHEMA.clone(),
+        vec![
+            Arc::new(row_addr_mask_arr),
+            Arc::new(discriminant_arr),
+            Arc::new(fragments_covered_arr),
+        ],
+    )?)
 }
 
 impl ScalarIndexExpr {
@@ -1469,16 +1385,7 @@ impl ScalarIndexExpr {
         match self {
             Self::Not(inner) => {
                 let result = inner.evaluate_impl(index_loader, metrics).await?;
-                // Flip certainty: NOT(AtMost) → AtLeast, NOT(AtLeast) → AtMost
-                Ok(match result {
-                    NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
-                    NullableIndexExprResult::AtMost(mask) => {
-                        NullableIndexExprResult::AtLeast(!mask)
-                    }
-                    NullableIndexExprResult::AtLeast(mask) => {
-                        NullableIndexExprResult::AtMost(!mask)
-                    }
-                })
+                Ok(!result)
             }
             Self::And(lhs, rhs) => {
                 let lhs_result = lhs.evaluate_impl(index_loader, metrics);
@@ -2663,7 +2570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_not_flips_certainty() {
-        use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+        use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
 
         // Test that NOT flips certainty for inexact index results
         // This tests the implementation in evaluate_impl for Self::Not
@@ -2709,7 +2616,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_and_or_preserve_certainty() {
-        use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap};
+        use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
 
         // Test that AND/OR correctly propagate certainty
         let make_at_most = || {

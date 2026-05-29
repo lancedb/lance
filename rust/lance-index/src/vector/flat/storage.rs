@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use super::index::FlatMetadata;
 use crate::frag_reuse::FragReuseIndex;
@@ -183,11 +183,7 @@ impl VectorStore for FlatFloatStorage {
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        Self::DistanceCalculator::new(
-            self.vectors.as_ref(),
-            self.vectors.value(id as usize),
-            self.distance_type,
-        )
+        Self::DistanceCalculator::new_from_id(self.vectors.as_ref(), id, self.distance_type)
     }
 }
 
@@ -349,17 +345,13 @@ impl VectorStore for FlatBinStorage {
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        Self::DistanceCalculator::new_binary(
-            self.vectors.as_ref(),
-            self.vectors.value(id as usize),
-            self.distance_type,
-        )
+        Self::DistanceCalculator::new_binary_from_id(self.vectors.as_ref(), id, self.distance_type)
     }
 }
 
 pub struct FlatDistanceCal<'a, T: ArrowPrimitiveType> {
     vectors: &'a [T::Native],
-    query: Vec<T::Native>,
+    query: Cow<'a, [T::Native]>,
     dimension: usize,
     #[allow(clippy::type_complexity)]
     distance_fn: fn(&[T::Native], &[T::Native]) -> f32,
@@ -376,7 +368,20 @@ where
         let dimension = vectors.value_length() as usize;
         Self {
             vectors: flat_array.values(),
-            query: query.as_primitive::<T>().values().to_vec(),
+            query: Cow::Owned(query.as_primitive::<T>().values().to_vec()),
+            dimension,
+            distance_fn: distance_type.func(),
+        }
+    }
+
+    fn new_from_id(vectors: &'a FixedSizeListArray, id: u32, distance_type: DistanceType) -> Self {
+        let flat_array = vectors.values().as_primitive::<T>();
+        let dimension = vectors.value_length() as usize;
+        let vectors = flat_array.values();
+        let id = id as usize;
+        Self {
+            vectors,
+            query: Cow::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
             dimension,
             distance_fn: distance_type.func(),
         }
@@ -395,7 +400,24 @@ impl<'a> FlatDistanceCal<'a, UInt8Type> {
         let dimension = vectors.value_length() as usize;
         Self {
             vectors: flat_array.values(),
-            query: query.as_primitive::<UInt8Type>().values().to_vec(),
+            query: Cow::Owned(query.as_primitive::<UInt8Type>().values().to_vec()),
+            dimension,
+            distance_fn: hamming,
+        }
+    }
+
+    fn new_binary_from_id(
+        vectors: &'a FixedSizeListArray,
+        id: u32,
+        _distance_type: DistanceType,
+    ) -> Self {
+        let flat_array = vectors.values().as_primitive::<UInt8Type>();
+        let dimension = vectors.value_length() as usize;
+        let vectors = flat_array.values();
+        let id = id as usize;
+        Self {
+            vectors,
+            query: Cow::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
             dimension,
             distance_fn: hamming,
         }
@@ -412,12 +434,13 @@ impl<T: ArrowPrimitiveType> FlatDistanceCal<'_, T> {
 impl<T: ArrowPrimitiveType> DistCalculator for FlatDistanceCal<'_, T> {
     #[inline]
     fn distance(&self, id: u32) -> f32 {
+        let query = self.query.as_ref();
         let vector = self.get_vector(id);
-        (self.distance_fn)(&self.query, vector)
+        (self.distance_fn)(query, vector)
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
-        let query = &self.query;
+        let query = self.query.as_ref();
         self.vectors
             .chunks_exact(self.dimension)
             .map(|vector| (self.distance_fn)(query, vector))
@@ -453,6 +476,27 @@ impl<'a> FlatFloatDistanceCalc<'a> {
             DataType::Float64 => Self::Float64(FlatDistanceCal::<Float64Type>::new(
                 vectors,
                 query,
+                distance_type,
+            )),
+            dt => panic!("flat float storage does not support data type {dt}"),
+        }
+    }
+
+    fn new_from_id(vectors: &'a FixedSizeListArray, id: u32, distance_type: DistanceType) -> Self {
+        match vectors.value_type() {
+            DataType::Float16 => Self::Float16(FlatDistanceCal::<Float16Type>::new_from_id(
+                vectors,
+                id,
+                distance_type,
+            )),
+            DataType::Float32 => Self::Float32(FlatDistanceCal::<Float32Type>::new_from_id(
+                vectors,
+                id,
+                distance_type,
+            )),
+            DataType::Float64 => Self::Float64(FlatDistanceCal::<Float64Type>::new_from_id(
+                vectors,
+                id,
                 distance_type,
             )),
             dt => panic!("flat float storage does not support data type {dt}"),

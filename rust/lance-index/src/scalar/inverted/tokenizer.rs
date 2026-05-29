@@ -24,7 +24,7 @@ use crate::scalar::inverted::tokenizer::document_tokenizer::{
 };
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
-    AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
+    AsciiFoldingFilter, IcuTokenizer, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
     SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
     WhitespaceTokenizer,
 };
@@ -41,10 +41,11 @@ pub struct InvertedIndexParams {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    /// - `icu`: ICU dictionary-based word segmentation
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
-    /// `simple` is recommended for most cases and the default value
+    /// `icu` is recommended for most cases and is the default value
     pub(crate) base_tokenizer: String,
 
     /// language for stemming and stop words
@@ -151,7 +152,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                 .base_tokenizer
                 .as_ref()
                 .cloned()
-                .unwrap_or(defaults.base_tokenizer),
+                .unwrap_or_else(|| "simple".to_string()),
             language: serde_json::from_str(details.language.as_str())?,
             with_position: details.with_position,
             max_token_length: details.max_token_length.map(|l| l as usize),
@@ -183,7 +184,7 @@ fn default_max_ngram_length() -> u32 {
 
 impl Default for InvertedIndexParams {
     fn default() -> Self {
-        Self::new("simple".to_owned(), Language::English)
+        Self::new("icu".to_owned(), Language::English)
     }
 }
 
@@ -191,7 +192,8 @@ impl InvertedIndexParams {
     /// Create a new `InvertedIndexParams` with the given base tokenizer and language.
     ///
     /// The `base_tokenizer` can be one of the following:
-    /// - `simple`: splits tokens on whitespace and punctuation, default
+    /// - `icu`: ICU dictionary-based word segmentation, default
+    /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
     /// - `ngram`: N-Gram tokenizer
@@ -385,6 +387,7 @@ impl InvertedIndexParams {
             "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
             "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
             "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
@@ -437,6 +440,23 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::InvertedIndexParams;
+    use lance_tokenizer::TokenStream;
+
+    #[test]
+    fn test_default_uses_icu_tokenizer() {
+        assert_eq!(InvertedIndexParams::default().base_tokenizer, "icu");
+    }
+
+    #[test]
+    fn test_missing_details_base_tokenizer_uses_legacy_simple_default() {
+        let mut details =
+            crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        details.base_tokenizer = None;
+
+        let params = InvertedIndexParams::try_from(&details).unwrap();
+
+        assert_eq!(params.base_tokenizer, "simple");
+    }
 
     #[test]
     fn test_build_only_fields_are_not_serialized() {
@@ -484,5 +504,18 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
+    }
+
+    #[test]
+    fn test_build_icu_tokenizer() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .stem(false)
+            .remove_stop_words(false)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_doc("Hello, こんにちは世界!");
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| tokens.push(token.text.clone()));
+        assert_eq!(tokens, vec!["hello", "こんにちは", "世界"]);
     }
 }

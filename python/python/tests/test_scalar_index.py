@@ -651,9 +651,13 @@ def test_lance_mem_pool_env_var(tmp_path):
 
 
 @pytest.mark.parametrize("with_position", [True, False])
-def test_full_text_search(dataset, with_position):
+@pytest.mark.parametrize("base_tokenizer", ["simple", "icu"])
+def test_full_text_search(dataset, with_position, base_tokenizer):
     dataset.create_scalar_index(
-        "doc", index_type="INVERTED", with_position=with_position
+        "doc",
+        index_type="INVERTED",
+        with_position=with_position,
+        base_tokenizer=base_tokenizer,
     )
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py()
@@ -688,6 +692,27 @@ def test_unindexed_full_text_search_on_empty_index(tmp_path):
         full_text_query="hello",
     ).to_table()
     assert results.num_rows == 1
+
+
+def test_default_fts_tokenizer_handles_unspaced_multilingual_text(tmp_path):
+    data = pa.table(
+        {
+            "id": [0, 1],
+            "text": ["Hello, こんにちは世界!", "Hello, こんにちは!"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index(
+        "text",
+        index_type="INVERTED",
+        stem=False,
+        remove_stop_words=False,
+        ascii_folding=False,
+    )
+
+    results = ds.to_table(full_text_query="世界")
+
+    assert results["id"].to_pylist() == [0]
 
 
 def test_full_text_search_without_index(dataset):
@@ -840,7 +865,8 @@ def test_ngram_fts(tmp_path):
     )
 
 
-def test_fts_fts(tmp_path):
+@pytest.mark.parametrize("base_tokenizer", ["simple", "icu"])
+def test_fts_fts(tmp_path, base_tokenizer):
     # Tests creating two FTS indices with the same name but different parameters
     dataset = lance.write_dataset(
         pa.table(
@@ -855,7 +881,11 @@ def test_fts_fts(tmp_path):
         tmp_path,
     )
     dataset.create_scalar_index(
-        "text", "INVERTED", with_position=True, remove_stop_words=False
+        "text",
+        "INVERTED",
+        with_position=True,
+        remove_stop_words=False,
+        base_tokenizer=base_tokenizer,
     )
 
     results = dataset.to_table(full_text_query='"was a puppy"', prefilter=True)
@@ -865,7 +895,11 @@ def test_fts_fts(tmp_path):
     assert results.num_rows == 3
 
     dataset.create_scalar_index(
-        "text", "INVERTED", name="no_pos_idx", with_position=False
+        "text",
+        "INVERTED",
+        name="no_pos_idx",
+        with_position=False,
+        base_tokenizer=base_tokenizer,
     )
 
     # There is no way to currently specify which index to use.  Instead
@@ -965,7 +999,7 @@ def test_fts_stats(dataset):
     params = stats["params"]
 
     assert params["with_position"] is False
-    assert params["base_tokenizer"] == "simple"
+    assert params["base_tokenizer"] == "icu"
     assert params["language"] == "English"
     assert params["max_token_length"] == 40
     assert params["lower_case"] is True
@@ -1024,7 +1058,8 @@ def test_fts_optimize_num_indices_to_merge(tmp_path):
     assert ds.to_table(full_text_query="iota")["id"].to_pylist() == [5]
 
 
-def test_fts_score(tmp_path):
+@pytest.mark.parametrize("base_tokenizer", ["simple", "icu"])
+def test_fts_score(tmp_path, base_tokenizer):
     # the number of tokens matters for scoring,
     # make a table that all docs have the same number of tokens
     data = pa.table(
@@ -1034,7 +1069,7 @@ def test_fts_score(tmp_path):
         }
     )
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer=base_tokenizer)
 
     results = ds.to_table(full_text_query="lance search text")
     assert results.num_rows == 3
@@ -1046,7 +1081,7 @@ def test_fts_score(tmp_path):
         "text",
         "lance search text",
         tmp_path,
-        index_params={"with_position": False},
+        index_params={"with_position": False, "base_tokenizer": base_tokenizer},
     )
 
 
@@ -1434,7 +1469,7 @@ def test_fts_deleted_rows_with_stable_row_ids(tmp_path):
     # Regression test: stable-row-id prefiltering must not leak deleted rows.
     data = pa.table(
         {
-            "text": [f"dup_{i}" for i in range(200)],
+            "text": [f"dup {i}" for i in range(200)],
             "category": [["A", "B", "C", "D", "E"][i % 5] for i in range(200)],
         }
     )
@@ -1659,6 +1694,22 @@ def test_jieba_tokenizer(tmp_path):
     ds.create_scalar_index("text", "INVERTED", base_tokenizer="jieba/default")
     results = ds.to_table(
         full_text_query="我们",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_icu_tokenizer(tmp_path):
+    data = pa.table(
+        {
+            "text": ["Hello, こんにちは世界!", "Hello, こんにちは!"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer="icu")
+    results = ds.to_table(
+        full_text_query="世界",
         prefilter=True,
         with_row_id=True,
     )
@@ -4640,7 +4691,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     details = indices[0].details
     assert details is not None and len(details) > 0
     assert details["lance_tokenizer"] is None
-    assert details["base_tokenizer"] == "simple"
+    assert details["base_tokenizer"] == "icu"
     assert details["language"] == "English"
     assert not details["with_position"]
     assert details["max_token_length"] == 40

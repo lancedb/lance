@@ -108,6 +108,7 @@
 
 use std::{
     iter::{Copied, Zip},
+    ops::Range,
     sync::Arc,
 };
 
@@ -120,6 +121,32 @@ use lance_core::{Error, Result, utils::bit::log_2_ceil};
 use crate::buffer::LanceBuffer;
 
 pub type LevelBuffer = Vec<u16>;
+
+/// A contiguous top-level-row range that can be encoded as one structural page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StructuralPageSplit {
+    /// Top-level row offset, relative to the original unsplit page.
+    pub(crate) row_start: u64,
+    /// Number of top-level rows in this split.
+    pub(crate) num_rows: u64,
+    /// Rep/def level range, relative to the original unsplit page.
+    pub(crate) level_range: Range<usize>,
+    /// Visible value offset, relative to the original unsplit page.
+    pub(crate) value_start: u64,
+    /// Number of visible values in this split.
+    pub(crate) num_values: u64,
+}
+
+/// Planner result for structural page budget handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StructuralPagePlan {
+    /// The original page can be encoded as-is.
+    Fits,
+    /// The original page should be split on top-level row boundaries.
+    Split(Vec<StructuralPageSplit>),
+    /// One top-level row is larger than the requested structural page budget.
+    UnsplittableOverBudget(u64),
+}
 
 // As we build def levels we add this to special values to indicate that they
 // are special so that we can skip over them when processing lower levels.
@@ -253,27 +280,47 @@ pub struct SerializedRepDefs {
     ///
     /// This is None if there are no lists
     pub max_visible_level: Option<u16>,
+    has_fsl: bool,
 }
 
 impl SerializedRepDefs {
-    pub fn new(
-        repetition_levels: Option<LevelBuffer>,
-        definition_levels: Option<LevelBuffer>,
-        def_meaning: Vec<DefinitionInterpretation>,
-    ) -> Self {
+    fn max_visible_level(def_meaning: &[DefinitionInterpretation]) -> Option<u16> {
         let first_list = def_meaning.iter().position(|level| level.is_list());
-        let max_visible_level = first_list.map(|first_list| {
+        first_list.map(|first_list| {
             def_meaning
                 .iter()
                 .map(|level| level.num_def_levels())
                 .take(first_list)
                 .sum::<u16>()
-        });
+        })
+    }
+
+    pub fn new(
+        repetition_levels: Option<LevelBuffer>,
+        definition_levels: Option<LevelBuffer>,
+        def_meaning: Vec<DefinitionInterpretation>,
+    ) -> Self {
+        Self::new_with_fixed_size_list_levels(
+            repetition_levels,
+            definition_levels,
+            def_meaning,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_fixed_size_list_levels(
+        repetition_levels: Option<LevelBuffer>,
+        definition_levels: Option<LevelBuffer>,
+        def_meaning: Vec<DefinitionInterpretation>,
+        has_fsl: bool,
+    ) -> Self {
+        let max_visible_level = Self::max_visible_level(&def_meaning);
         Self {
             repetition_levels: repetition_levels.map(Arc::from),
             definition_levels: definition_levels.map(Arc::from),
             def_meaning,
             max_visible_level,
+            has_fsl,
         }
     }
 
@@ -284,6 +331,7 @@ impl SerializedRepDefs {
             definition_levels: None,
             def_meaning,
             max_visible_level: None,
+            has_fsl: false,
         }
     }
 
@@ -297,6 +345,10 @@ impl SerializedRepDefs {
         self.definition_levels
             .as_ref()
             .map(|def| RepDefSlicer::new(self, def.clone()))
+    }
+
+    pub(crate) fn has_fixed_size_list_levels(&self) -> bool {
+        self.has_fsl
     }
 }
 
@@ -461,6 +513,7 @@ struct SerializerContext {
     current_def: u16,
     current_len: usize,
     current_num_specials: usize,
+    has_fsl: bool,
 }
 
 impl SerializerContext {
@@ -492,6 +545,7 @@ impl SerializerContext {
             current_def: max_def,
             current_len: 0,
             current_num_specials: 0,
+            has_fsl: false,
         }
     }
 
@@ -733,6 +787,7 @@ impl SerializerContext {
     }
 
     fn record_fsl(&mut self, fsl_desc: &FslDesc) {
+        self.has_fsl = true;
         self.record_validity_buf(&fsl_desc.validity);
         self.multiply_levels(fsl_desc.dimension);
     }
@@ -745,9 +800,203 @@ impl SerializerContext {
         }
     }
 
+    fn normalize_specials_and_plan_splits(
+        &mut self,
+        def_meaning: &[DefinitionInterpretation],
+        max_levels_per_page: Option<u64>,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<StructuralPagePlan> {
+        // Extremely sparse lists can have many rep/def levels for very few
+        // visible leaf values.  If this ratio becomes too skewed then a
+        // miniblock structural chunk can exceed its packed rep/def metadata
+        // budget even though the value buffers are small.  We detect that case
+        // while normalizing special def levels and split the structural page on
+        // top-level row boundaries so each emitted page stays within the
+        // miniblock structural budget.
+        if self.def_levels.is_empty() {
+            return Ok(StructuralPagePlan::Fits);
+        }
+
+        if self.rep_levels.is_empty() {
+            self.normalize_specials();
+            return Ok(StructuralPagePlan::Fits);
+        }
+
+        if self.rep_levels.len() != self.def_levels.len() {
+            return Err(Error::internal(format!(
+                "Cannot plan structural page splits with mismatched rep/def lengths: rep={}, def={}",
+                self.rep_levels.len(),
+                self.def_levels.len()
+            )));
+        }
+
+        let Some(max_levels_per_page) = max_levels_per_page else {
+            self.normalize_specials();
+            return Ok(StructuralPagePlan::Fits);
+        };
+
+        if num_values == 0 {
+            self.normalize_specials();
+            return Ok(StructuralPagePlan::Fits);
+        }
+
+        let max_schema_rep = def_meaning.iter().filter(|level| level.is_list()).count() as u16;
+        let max_visible_level = SerializedRepDefs::max_visible_level(def_meaning);
+        let should_plan = !self.has_fsl && max_schema_rep > 0 && max_visible_level.is_some();
+
+        if !should_plan {
+            self.normalize_specials();
+            return Ok(StructuralPagePlan::Fits);
+        }
+
+        let max_visible_level = max_visible_level.unwrap();
+        let mut splits = Vec::new();
+        let mut counted_rows = 0u64;
+        let mut counted_values = 0u64;
+        let mut saw_structural_overhead = false;
+        let mut unsplittable_over_budget = None;
+
+        let mut current_row_level_start = None;
+        let mut current_row_num_values = 0u64;
+
+        let mut current_page_row_start = 0u64;
+        let mut current_page_num_rows = 0u64;
+        let mut current_page_level_start = 0usize;
+        let mut current_page_level_end = 0usize;
+        let mut current_page_value_start = 0u64;
+        let mut current_page_num_values = 0u64;
+        let mut current_page_num_levels = 0u64;
+        let mut current_page_has_structural_overhead = false;
+
+        let mut finish_row =
+            |row_level_start: usize, row_level_end: usize, row_num_values: u64| -> Result<()> {
+                let row_num_levels = (row_level_end - row_level_start) as u64;
+                let row_has_structural_overhead = row_num_levels > row_num_values;
+                saw_structural_overhead |= row_has_structural_overhead;
+
+                if row_has_structural_overhead && row_num_levels > max_levels_per_page {
+                    unsplittable_over_budget = Some(row_num_levels);
+                }
+
+                if current_page_num_rows > 0
+                    && (current_page_has_structural_overhead || row_has_structural_overhead)
+                    && current_page_num_levels + row_num_levels > max_levels_per_page
+                {
+                    splits.push(StructuralPageSplit {
+                        row_start: current_page_row_start,
+                        num_rows: current_page_num_rows,
+                        level_range: current_page_level_start..current_page_level_end,
+                        value_start: current_page_value_start,
+                        num_values: current_page_num_values,
+                    });
+                    current_page_row_start = counted_rows;
+                    current_page_num_rows = 0;
+                    current_page_level_start = row_level_start;
+                    current_page_value_start = counted_values;
+                    current_page_num_values = 0;
+                    current_page_num_levels = 0;
+                    current_page_has_structural_overhead = false;
+                }
+
+                if current_page_num_rows == 0 {
+                    current_page_level_start = row_level_start;
+                }
+                current_page_num_rows += 1;
+                current_page_level_end = row_level_end;
+                current_page_num_values += row_num_values;
+                current_page_num_levels += row_num_levels;
+                current_page_has_structural_overhead |= row_has_structural_overhead;
+                counted_rows += 1;
+                counted_values += row_num_values;
+                Ok(())
+            };
+
+        for (idx, (rep_level, def_level)) in self
+            .rep_levels
+            .iter()
+            .copied()
+            .zip(self.def_levels.iter_mut())
+            .enumerate()
+        {
+            if *def_level > SPECIAL_THRESHOLD {
+                *def_level -= SPECIAL_THRESHOLD;
+            }
+
+            if rep_level == max_schema_rep {
+                if let Some(level_start) = current_row_level_start {
+                    finish_row(level_start, idx, current_row_num_values)?;
+                    current_row_num_values = 0;
+                } else if idx != 0 {
+                    return Err(Error::internal(format!(
+                        "Cannot plan structural page splits: first top-level row starts at level {}, expected 0",
+                        idx
+                    )));
+                }
+                current_row_level_start = Some(idx);
+            }
+
+            if current_row_level_start.is_none() {
+                return Err(Error::internal(
+                    "Cannot plan structural page splits: found levels before the first top-level row start",
+                ));
+            }
+            if *def_level <= max_visible_level {
+                current_row_num_values += 1;
+            }
+        }
+
+        let Some(level_start) = current_row_level_start else {
+            return Err(Error::internal(
+                "Cannot plan structural page splits: found no top-level row starts",
+            ));
+        };
+        finish_row(level_start, self.rep_levels.len(), current_row_num_values)?;
+
+        if counted_rows != num_rows {
+            return Err(Error::internal(format!(
+                "Cannot plan structural page splits: expected {} top-level row starts, found {}",
+                num_rows, counted_rows
+            )));
+        }
+        if counted_values != num_values {
+            return Err(Error::internal(format!(
+                "Cannot plan structural page splits: counted {} visible values, expected {}",
+                counted_values, num_values
+            )));
+        }
+        if !saw_structural_overhead {
+            return Ok(StructuralPagePlan::Fits);
+        }
+        if let Some(row_num_levels) = unsplittable_over_budget {
+            return Ok(StructuralPagePlan::UnsplittableOverBudget(row_num_levels));
+        }
+
+        if current_page_num_rows > 0 {
+            splits.push(StructuralPageSplit {
+                row_start: current_page_row_start,
+                num_rows: current_page_num_rows,
+                level_range: current_page_level_start..current_page_level_end,
+                value_start: current_page_value_start,
+                num_values: current_page_num_values,
+            });
+        }
+
+        if splits.len() > 1 {
+            Ok(StructuralPagePlan::Split(splits))
+        } else {
+            Ok(StructuralPagePlan::Fits)
+        }
+    }
+
     fn build(mut self) -> SerializedRepDefs {
         if self.current_len == 0 {
-            return SerializedRepDefs::new(None, None, self.def_meaning);
+            return SerializedRepDefs::new_with_fixed_size_list_levels(
+                None,
+                None,
+                self.def_meaning,
+                self.has_fsl,
+            );
         }
 
         self.normalize_specials();
@@ -766,7 +1015,64 @@ impl SerializerContext {
         // Need to reverse the def meaning since we build rep / def levels in reverse
         let def_meaning = self.def_meaning.into_iter().rev().collect::<Vec<_>>();
 
-        SerializedRepDefs::new(repetition_levels, definition_levels, def_meaning)
+        SerializedRepDefs::new_with_fixed_size_list_levels(
+            repetition_levels,
+            definition_levels,
+            def_meaning,
+            self.has_fsl,
+        )
+    }
+
+    fn build_with_structural_plan(
+        mut self,
+        max_levels_per_page: Option<u64>,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
+        if self.current_len == 0 {
+            return Ok((
+                SerializedRepDefs::new_with_fixed_size_list_levels(
+                    None,
+                    None,
+                    self.def_meaning,
+                    self.has_fsl,
+                ),
+                StructuralPagePlan::Fits,
+            ));
+        }
+
+        // Need to reverse the def meaning since we build rep / def levels in reverse
+        let def_meaning = std::mem::take(&mut self.def_meaning)
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let plan = self.normalize_specials_and_plan_splits(
+            &def_meaning,
+            max_levels_per_page,
+            num_rows,
+            num_values,
+        )?;
+
+        let definition_levels = if self.def_levels.is_empty() {
+            None
+        } else {
+            Some(self.def_levels)
+        };
+        let repetition_levels = if self.rep_levels.is_empty() {
+            None
+        } else {
+            Some(self.rep_levels)
+        };
+
+        Ok((
+            SerializedRepDefs::new_with_fixed_size_list_levels(
+                repetition_levels,
+                definition_levels,
+                def_meaning,
+                self.has_fsl,
+            ),
+            plan,
+        ))
     }
 }
 
@@ -1103,17 +1409,49 @@ impl RepDefBuilder {
     /// Converts the validity / offsets buffers that have been gathered so far
     /// into repetition and definition levels
     pub fn serialize(builders: Vec<Self>) -> SerializedRepDefs {
+        Self::serialize_builders(builders).0.build()
+    }
+
+    /// Converts gathered structural buffers into rep/def levels and an encode-time plan.
+    pub(crate) fn serialize_with_structural_plan(
+        builders: Vec<Self>,
+        max_levels_for_bits: impl FnOnce(u64) -> u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
+        let (context, bits_per_level) = Self::serialize_builders(builders);
+        context.build_with_structural_plan(
+            bits_per_level.map(max_levels_for_bits),
+            num_rows,
+            num_values,
+        )
+    }
+
+    fn serialize_builders(builders: Vec<Self>) -> (SerializerContext, Option<u64>) {
         assert!(!builders.is_empty());
         if builders.iter().all(|b| b.is_empty()) {
             // No repetition, all-valid
-            return SerializedRepDefs::empty(
-                builders
-                    .first()
-                    .unwrap()
-                    .repdefs
-                    .iter()
-                    .map(|_| DefinitionInterpretation::AllValidItem)
-                    .collect::<Vec<_>>(),
+            let def_meaning = builders
+                .first()
+                .unwrap()
+                .repdefs
+                .iter()
+                .map(|_| DefinitionInterpretation::AllValidItem)
+                .collect::<Vec<_>>();
+            return (
+                SerializerContext {
+                    def_meaning,
+                    rep_levels: LevelBuffer::default(),
+                    spare_rep: LevelBuffer::default(),
+                    def_levels: LevelBuffer::default(),
+                    spare_def: LevelBuffer::default(),
+                    current_rep: 0,
+                    current_def: 0,
+                    current_len: 0,
+                    current_num_specials: 0,
+                    has_fsl: false,
+                },
+                None,
             );
         }
 
@@ -1139,6 +1477,18 @@ impl RepDefBuilder {
                 .sum::<usize>();
         let max_rep = combined_layers.iter().map(|l| l.max_rep()).sum::<u16>();
         let max_def = combined_layers.iter().map(|l| l.max_def()).sum::<u16>();
+        let bits_per_rep = if max_rep > 0 {
+            u64::from(u16::BITS - max_rep.leading_zeros())
+        } else {
+            0
+        };
+        let bits_per_def = if max_def > 0 {
+            u64::from(u16::BITS - max_def.leading_zeros())
+        } else {
+            0
+        };
+        let bits_per_level =
+            (bits_per_rep + bits_per_def > 0).then_some(bits_per_rep + bits_per_def);
 
         let mut context = SerializerContext::new(total_len, num_layers, max_rep, max_def);
         for layer in combined_layers.into_iter() {
@@ -1154,7 +1504,7 @@ impl RepDefBuilder {
                 }
             }
         }
-        context.build()
+        (context, bits_per_level)
     }
 }
 

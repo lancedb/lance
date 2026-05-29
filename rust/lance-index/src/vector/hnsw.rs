@@ -69,7 +69,19 @@ pub(crate) fn select_neighbors_heuristic(
     if candidates.len() <= k {
         return candidates.iter().cloned().collect_vec();
     }
-    let mut candidates = candidates.to_vec();
+
+    select_neighbors_heuristic_owned(storage, candidates.to_vec(), k)
+}
+
+pub(crate) fn select_neighbors_heuristic_owned(
+    storage: &impl VectorStore,
+    mut candidates: Vec<OrderedNode>,
+    k: usize,
+) -> Vec<OrderedNode> {
+    if candidates.len() <= k {
+        return candidates;
+    }
+
     candidates.sort_unstable();
 
     let mut results: Vec<OrderedNode> = Vec::with_capacity(k);

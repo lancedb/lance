@@ -184,6 +184,62 @@ message VectorIndex {
   VectorMetricType metric_type = 4;
 }
 
+// Details for vector indexes, stored in the manifest's index_details field.
+message VectorIndexDetails {
+  VectorMetricType metric_type = 1;
+
+  // The target number of vectors per partition.
+  // 0 means unset.
+  uint64 target_partition_size = 2;
+
+  // Optional HNSW index configuration. If set, the index has an HNSW layer.
+  optional HnswParameters hnsw_index_config = 3;
+
+  message ProductQuantization {
+    uint32 num_bits = 1;
+    uint32 num_sub_vectors = 2;
+  }
+  message ScalarQuantization {
+    uint32 num_bits = 1;
+  }
+  message RabitQuantization {
+    enum RotationType {
+      FAST = 0;
+      MATRIX = 1;
+    }
+    uint32 num_bits = 1;
+    RotationType rotation_type = 2;
+  }
+
+  // No quantization; vectors are stored as-is.
+  message FlatCompression {}
+
+  oneof compression {
+    ProductQuantization pq = 4;
+    ScalarQuantization sq = 5;
+    RabitQuantization rq = 6;
+    FlatCompression flat = 8;
+  }
+
+  // Runtime hints: optional build preferences that don't affect index structure.
+  // Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters", "lancedb.accelerator").
+  // Unrecognized keys must be silently ignored by all runtimes.
+  map<string, string> runtime_hints = 9;
+}
+
+// Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
+message HnswParameters {
+  // The maximum number of outgoing edges per node in the HNSW graph. Higher values
+  // means more connections, better recall, but more memory and slower builds.
+  // Referred to as "M" in the HNSW literature.
+  uint32 max_connections = 1;
+  // "construction exploration factor": The size of the dynamic list used during
+  // index construction.
+  uint32 construction_ef = 2;
+  // The maximum number of levels in the HNSW graph.
+  uint32 max_level = 3;
+}
+
 message JsonIndexDetails {
   string path = 1;
   google.protobuf.Any target_details = 2;

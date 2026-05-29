@@ -124,6 +124,22 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Set runtime-only object store parameters for registered base paths.
+   *
+   * <p>Entries are keyed by the exact {@link BasePath#getPath()} value persisted in the manifest.
+   * Each value is the storage options map used for that base. Bases without an explicit entry use
+   * {@link #storageOptions(Map)} as the fallback.
+   *
+   * @param baseStoreParams object store parameters keyed by base path URI
+   * @return this builder
+   */
+  public WriteFragmentBuilder baseStoreParams(Map<String, Map<String, String>> baseStoreParams) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withBaseStoreParams(baseStoreParams);
+    return this;
+  }
+
+  /**
    * Set the namespace client for automatic credential refresh.
    *
    * <p>When provided with `tableId`, a storage options provider will be created automatically to
@@ -220,6 +236,30 @@ public class WriteFragmentBuilder {
   public WriteFragmentBuilder dataStorageVersion(String version) {
     ensureWriteParamsBuilder();
     this.writeParamsBuilder.withDataStorageVersion(version);
+    return this;
+  }
+
+  /**
+   * Register base paths when creating a new dataset from fragments.
+   *
+   * @param bases base paths to register
+   * @return this builder
+   */
+  public WriteFragmentBuilder initialBases(List<BasePath> bases) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withInitialBases(bases);
+    return this;
+  }
+
+  /**
+   * Set base names or paths where new fragment files should be written.
+   *
+   * @param targetBases base names or exact paths
+   * @return this builder
+   */
+  public WriteFragmentBuilder targetBases(List<String> targetBases) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withTargetBases(targetBases);
     return this;
   }
 

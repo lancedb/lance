@@ -188,25 +188,29 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
-            path: self.path.clone(),
-            options: GetOptions {
-                range: Some(
-                    Range {
-                        start: range.start as u64,
-                        end: range.end as u64,
-                    }
-                    .into(),
-                ),
-                ..Default::default()
-            },
-        });
-        Box::pin(do_get_with_outer_retry(
-            self.download_retry_count,
-            get_request,
-            move || format!("range {:?}", range),
-        ))
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        let get_range = Range {
+            start: range.start as u64,
+            end: range.end as u64,
+        };
+        Box::pin(async move {
+            let bytes = do_with_retry(move || {
+                let object_store = object_store.clone();
+                let path = path.clone();
+                let get_range = get_range.clone();
+                Box::pin(async move { object_store.get_ranges(&path, &[get_range]).await })
+            })
+            .await?;
+
+            bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| object_store::Error::Generic {
+                    store: "CloudObjectReader",
+                    source: "get_ranges returned no bytes".into(),
+                })
+        })
     }
 
     #[instrument(level = "debug", skip_all)]

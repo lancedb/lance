@@ -24,11 +24,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::instrument;
 
 use lance_core::{Error, Result};
-use rand::{Rng, rng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::{HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic};
+use super::{
+    HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
+};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
@@ -44,6 +46,15 @@ use crate::vector::{DIST_COL, Query, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
+/// Fixed seed for HNSW node-level assignment.
+///
+/// A constant seed makes graph construction reproducible (same data + params =>
+/// same graph), which keeps index builds deterministic and tests stable. Recall
+/// is statistically unaffected — the level distribution is identical, only the
+/// random draws become fixed. Shared by the offline ([`HNSWBuilder`]) and online
+/// ([`super::online::OnlineHnswBuilder`]) builders so both produce comparable graphs.
+pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
+
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
@@ -58,6 +69,16 @@ pub struct HnswBuildParams {
 
     /// number of vectors ahead to prefetch while building the graph
     pub prefetch_distance: Option<usize>,
+}
+
+impl From<&HnswBuildParams> for crate::pb::HnswParameters {
+    fn from(params: &HnswBuildParams) -> Self {
+        Self {
+            max_connections: params.m as u32,
+            construction_ef: params.ef_construction as u32,
+            max_level: params.max_level as u32,
+        }
+    }
 }
 
 impl Default for HnswBuildParams {
@@ -475,7 +496,7 @@ impl HnswBuilder {
             if len > 0 {
                 nodes.push(RwLock::new(GraphBuilderNode::new(0, max_level as usize)));
             }
-            let mut level_rng = rng();
+            let mut level_rng = SmallRng::seed_from_u64(HNSW_LEVEL_RNG_SEED);
             for i in 1..len {
                 nodes.push(RwLock::new(GraphBuilderNode::new(
                     i as u32,
@@ -546,26 +567,23 @@ impl HnswBuilder {
             }
         }
         for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
-            let _: Vec<_> = pruned_neighbors
-                .iter()
-                .map(|unpruned_edge| {
-                    let level = level as u16;
-                    let m_max = match level {
-                        0 => self.params.m * 2,
-                        _ => self.params.m,
-                    };
-                    if unpruned_edge.dist
-                        < nodes[unpruned_edge.id as usize]
-                            .read()
-                            .unwrap()
-                            .cutoff(level, m_max)
-                    {
-                        let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
-                        chosen_node.add_neighbor(node, unpruned_edge.dist, level);
-                        self.prune(storage, &mut chosen_node, level);
-                    }
-                })
-                .collect();
+            for unpruned_edge in pruned_neighbors {
+                let level = level as u16;
+                let m_max = match level {
+                    0 => self.params.m * 2,
+                    _ => self.params.m,
+                };
+                if unpruned_edge.dist
+                    < nodes[unpruned_edge.id as usize]
+                        .read()
+                        .unwrap()
+                        .cutoff(level, m_max)
+                {
+                    let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
+                    chosen_node.add_neighbor(node, unpruned_edge.dist, level);
+                    self.prune(storage, &mut chosen_node, level);
+                }
+            }
         }
     }
 
@@ -602,13 +620,13 @@ impl HnswBuilder {
         };
 
         let neighbors_ranked = &mut builder_node.level_neighbors_ranked[level as usize];
-        let level_neighbors = neighbors_ranked.clone();
-        if level_neighbors.len() <= m_max {
+        if neighbors_ranked.len() <= m_max {
             builder_node.update_from_ranked_neighbors(level);
             return;
         }
 
-        *neighbors_ranked = select_neighbors_heuristic(storage, &level_neighbors, m_max);
+        let level_neighbors = std::mem::take(neighbors_ranked);
+        *neighbors_ranked = select_neighbors_heuristic_owned(storage, level_neighbors, m_max);
         builder_node.update_from_ranked_neighbors(level);
     }
 }

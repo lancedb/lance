@@ -23,6 +23,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
+use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
@@ -388,19 +389,35 @@ pub async fn open_scalar_index(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    if index_details.type_url.ends_with("LabelListIndexDetails") {
-        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
-    }
-
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 
     let index_cache = dataset
         .index_cache
         .for_index(&uuid_str, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
-    plugin
+    if let Some(index) = plugin
+        .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
+        .await?
+    {
+        // Compatibility check is only needed on first load; a cache hit means
+        // the index was already validated when it was originally opened in
+        // this session, so we can skip the extra `open_index_file` IOP.
+        return Ok(index);
+    }
+
+    if index_details.type_url.ends_with("LabelListIndexDetails") {
+        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
+    }
+
+    let index = plugin
         .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
-        .await
+        .await?;
+
+    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = uuid_str, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
+    metrics.record_index_load();
+
+    plugin.put_in_cache(&index_cache, index.clone()).await?;
+    Ok(index)
 }
 
 pub(crate) async fn infer_scalar_index_details(
@@ -607,12 +624,12 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{datatypes::Field, utils::address::RowAddress};
     use lance_datagen::array;
+    use lance_index::pb::VectorIndexDetails;
     use lance_index::{IndexType, optimize::OptimizeOptions};
     use lance_index::{
         pbold::NGramIndexDetails,
         scalar::{BuiltinIndexType, ScalarIndexParams},
     };
-    use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
         name: &str,

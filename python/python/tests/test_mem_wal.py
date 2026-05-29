@@ -11,8 +11,12 @@ import pytest
 from lance.mem_wal import (
     LsmPointLookupPlanner,
     LsmScanner,
-    RegionSnapshot,
+    ShardingField,
+    ShardingSpec,
+    ShardSnapshot,
+    evaluate_sharding_spec,
 )
+from lance.schema import LanceSchema
 
 _PK_META = {"lance-schema:unenforced-primary-key": "true"}
 _LOOKUP_SCHEMA = pa.schema(
@@ -51,13 +55,13 @@ def _append_only_table(ids, prefix: str) -> pa.Table:
     )
 
 
-def _write_flushed_gen(base_path: str, region_id: str, gen_folder: str, data: pa.Table):
+def _write_flushed_gen(base_path: str, shard_id: str, gen_folder: str, data: pa.Table):
     """Write a flushed-generation Lance dataset at the expected sub-path.
 
     The collector resolves flushed generation paths as:
-        {base_dataset_path}/_mem_wal/{region_id}/{gen_folder}
+        {base_dataset_path}/_mem_wal/{shard_id}/{gen_folder}
     """
-    gen_path = os.path.join(base_path, "_mem_wal", region_id, gen_folder)
+    gen_path = os.path.join(base_path, "_mem_wal", shard_id, gen_folder)
     lance.write_dataset(data, gen_path, schema=_LOOKUP_SCHEMA)
 
 
@@ -71,10 +75,10 @@ def test_point_lookup_with_memtables(tmp_path):
     base   : ids [1, 2, 3]  names ["base_1",  "base_2",  "base_3"]
     gen_1  : ids [2]        names ["gen1_2"]          ← update to id=2
 
-    RegionSnapshot: flushed_generation(gen=1, path="gen_1"), current_generation=2
+    ShardSnapshot: flushed_generation(gen=1, path="gen_1"), current_generation=2
     """
     ds_path = str(tmp_path / "base")
-    region_id = str(uuid.uuid4())
+    shard_id = str(uuid.uuid4())
 
     # --- Base dataset ---
     base_ds = lance.write_dataset(
@@ -83,11 +87,11 @@ def test_point_lookup_with_memtables(tmp_path):
     base_ds.initialize_mem_wal()
 
     # --- Flushed generation: overwrites id=2 ---
-    _write_flushed_gen(ds_path, region_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_flushed_gen(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
-    # --- RegionSnapshot describing the flushed state ---
+    # --- ShardSnapshot describing the flushed state ---
     snap = (
-        RegionSnapshot(region_id)
+        ShardSnapshot(shard_id)
         .with_flushed_generation(1, "gen_1")
         .with_current_generation(2)
     )
@@ -127,17 +131,17 @@ def test_lsm_scanner_with_memtables(tmp_path):
     Expected result: 3 unique rows — id=2 from gen_1, id=1 and id=3 from base.
     """
     ds_path = str(tmp_path / "base")
-    region_id = str(uuid.uuid4())
+    shard_id = str(uuid.uuid4())
 
     base_ds = lance.write_dataset(
         _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
     )
     base_ds.initialize_mem_wal()
 
-    _write_flushed_gen(ds_path, region_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_flushed_gen(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
     snap = (
-        RegionSnapshot(region_id)
+        ShardSnapshot(shard_id)
         .with_flushed_generation(1, "gen_1")
         .with_current_generation(2)
     )
@@ -153,14 +157,14 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[3] == "base_3"
 
 
-def test_region_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
+def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
     ds_path = str(tmp_path / "base")
-    region_id = str(uuid.uuid4())
+    shard_id = str(uuid.uuid4())
     ds = lance.write_dataset(_lookup_table([0], "base"), ds_path, schema=_LOOKUP_SCHEMA)
     ds.initialize_mem_wal()
 
     with ds.mem_wal_writer(
-        region_id,
+        shard_id,
         durable_write=True,
         max_wal_buffer_size=1,
         max_wal_flush_interval_ms=10,
@@ -249,15 +253,15 @@ def _e2e_batch(schema, start_id: int, num_rows: int) -> pa.RecordBatch:
     )
 
 
-def test_region_writer_e2e_correctness(tmp_path):
+def test_shard_writer_e2e_correctness(tmp_path):
     """
-    End-to-end correctness test for RegionWriter covering:
+    End-to-end correctness test for ShardWriter covering:
     - Multi-round writes that trigger WAL and MemTable flushes
-    - File-system layout verification (_mem_wal/<region_id>/wal/ and manifest/)
+    - File-system layout verification (_mem_wal/<shard_id>/wal/ and manifest/)
     - Flushed generation data readable via LsmScanner
     - New writer created after close can write and scan correctly
 
-    Mirrors Rust test: region_writer_tests::test_region_writer_e2e_correctness
+    Mirrors Rust test: shard_writer_tests::test_shard_writer_e2e_correctness
     """
     schema = _e2e_schema()
     ds_path = str(tmp_path / "ds")
@@ -272,9 +276,9 @@ def test_region_writer_e2e_correctness(tmp_path):
     ds.initialize_mem_wal(maintained_indexes=["id_btree"])
 
     # Small buffers to trigger WAL and MemTable flushes during the test
-    region_id = str(uuid.uuid4())
+    shard_id = str(uuid.uuid4())
     writer = ds.mem_wal_writer(
-        region_id,
+        shard_id,
         durable_write=True,
         sync_indexed_write=True,
         max_wal_buffer_size=10 * 1024,  # 10 KB
@@ -304,7 +308,7 @@ def test_region_writer_e2e_correctness(tmp_path):
     assert closed_memtable_stats["generation"] >= 1
 
     # === File-system layout ===
-    mem_wal_dir = os.path.join(ds_path, "_mem_wal", region_id)
+    mem_wal_dir = os.path.join(ds_path, "_mem_wal", shard_id)
     assert os.path.isdir(mem_wal_dir), f"MemWAL directory missing: {mem_wal_dir}"
 
     wal_dir = os.path.join(mem_wal_dir, "wal")
@@ -325,9 +329,9 @@ def test_region_writer_e2e_correctness(tmp_path):
 
     # === New writer: write and read back via active MemTable scanner ===
     ds2 = lance.dataset(ds_path)
-    region_id2 = str(uuid.uuid4())
+    shard_id2 = str(uuid.uuid4())
     with ds2.mem_wal_writer(
-        region_id2, durable_write=False, sync_indexed_write=True
+        shard_id2, durable_write=False, sync_indexed_write=True
     ) as writer2:
         verify_batch = _e2e_batch(schema, start_id=10000, num_rows=10)
         writer2.put(pa.Table.from_batches([verify_batch]))
@@ -375,13 +379,22 @@ def test_initialize_mem_wal_unsharded(tmp_path):
 
 def test_initialize_mem_wal_bucket_sharding(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
-    ds.initialize_mem_wal(bucket_column="id", num_buckets=8)
+    ds.initialize_mem_wal(bucket_column="name", num_buckets=8)
 
     details = ds.mem_wal_index_details()
     assert details["num_shards"] == 8
     field = details["sharding_specs"][0]["fields"][0]
     assert field["transform"] == "bucket"
+    assert "expression" in field
     assert field["parameters"]["num_buckets"] == "8"
+    assert len(field["source_ids"]) == 1
+
+    batch = _lookup_table([1, 2, 3], "base").to_batches()[0]
+    result = evaluate_sharding_spec(
+        batch, details["sharding_specs"][0], LanceSchema.from_pyarrow(batch.schema)
+    )
+    assert result.column_names == [field["field_id"]]
+    assert result.num_rows == batch.num_rows
 
 
 def test_initialize_mem_wal_bucket_sharding_without_primary_key(tmp_path):
@@ -454,6 +467,55 @@ def test_initialize_mem_wal_rejects_partial_bucket(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
     with pytest.raises(ValueError, match="num_buckets"):
         ds.initialize_mem_wal(bucket_column="id")
+
+
+def test_evaluate_sharding_spec_python_binding():
+    batch = pa.record_batch(
+        [pa.array([1, 2, None, 3], type=pa.int32())],
+        names=["id"],
+    )
+    spec = ShardingSpec(
+        1,
+        [
+            ShardingField(
+                field_id="bucket",
+                source_ids=[0],
+                transform="bucket",
+                result_type="int32",
+                parameters={"num_buckets": "8"},
+            )
+        ],
+    )
+
+    result = evaluate_sharding_spec(batch, spec, LanceSchema.from_pyarrow(batch.schema))
+
+    assert result.column_names == ["bucket"]
+    assert result.column(0).to_pylist() == [2, 7, 0, 1]
+
+
+def test_evaluate_sharding_spec_python_binding_column_parameter():
+    batch = pa.record_batch(
+        [pa.array(["a", "b", None], type=pa.utf8())],
+        names=["key"],
+    )
+    spec = {
+        "spec_id": 1,
+        "fields": [
+            {
+                "field_id": "key_bucket",
+                "source_ids": [0],
+                "transform": "bucket",
+                "expression": None,
+                "result_type": "int32",
+                "parameters": {"num_buckets": "8"},
+            }
+        ],
+    }
+
+    result = evaluate_sharding_spec(batch, spec, LanceSchema.from_pyarrow(batch.schema))
+
+    assert result.column_names == ["key_bucket"]
+    assert result.column(0).to_pylist() == [1, 5, 0]
 
 
 def test_mem_wal_index_details_none_before_init(tmp_path):

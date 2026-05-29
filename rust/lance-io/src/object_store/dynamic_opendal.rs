@@ -3,8 +3,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use object_store::path::Path;
 use object_store::{
@@ -167,6 +169,18 @@ impl OSObjectStore for DynamicOpenDalStore {
             .await
             .map_err(|e| self.map_store_error(e))?
             .get_opts(location, options)
+            .await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.current_store()
+            .await
+            .map_err(|e| self.map_store_error(e))?
+            .get_ranges(location, ranges)
             .await
     }
 

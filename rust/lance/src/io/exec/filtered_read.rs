@@ -32,9 +32,6 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::{
-    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
-};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
@@ -43,8 +40,11 @@ use lance_datafusion::utils::{
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
+use lance_index::scalar::expression::{FilterPlan, IndexExprResult, index_expr_result_from_parts};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_select::{
+    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
+};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
@@ -101,7 +101,7 @@ impl EvaluatedIndex {
         }
         let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
         let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
-        let index_result = IndexExprResult::from_parts(row_addr_mask, match_type)?;
+        let index_result = index_expr_result_from_parts(row_addr_mask, match_type)?;
 
         let applicable_fragments = batch.column(2).as_binary::<i32>();
         let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
@@ -515,18 +515,31 @@ impl FilteredReadStream {
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
     ) -> FilteredReadInternalPlan {
-        // For pushing down scan_range_after_filter
+        // For pushing down scan_range_after_filter.
+        //
+        // This is only valid when there is no refine filter left to evaluate.  An exact scalar
+        // index result is exact for the indexed predicate, but not for the full predicate if a
+        // refine filter can still reject rows.
+        let can_push_down_scan_range_after_filter = options.refine_filter.is_none();
         let mut scan_planned_with_limit_pushed_down = false;
-        let mut to_skip = options
-            .scan_range_after_filter
-            .as_ref()
-            .map(|r| r.start)
-            .unwrap_or(0);
-        let mut to_take = options
-            .scan_range_after_filter
-            .as_ref()
-            .map(|r| r.end - r.start)
-            .unwrap_or(u64::MAX);
+        let mut to_skip = if can_push_down_scan_range_after_filter {
+            options
+                .scan_range_after_filter
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut to_take = if can_push_down_scan_range_after_filter {
+            options
+                .scan_range_after_filter
+                .as_ref()
+                .map(|r| r.end - r.start)
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
 
         // Full fragment ranges to read before applying scan_range_after_filter
         let mut fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
@@ -580,9 +593,10 @@ impl FilteredReadStream {
                 &mut to_take,
                 &mut fragments_to_read,
                 &mut scan_push_down_fragments_to_read,
+                options.only_indexed_fragments,
             );
 
-            if to_take == 0 {
+            if can_push_down_scan_range_after_filter && to_take == 0 {
                 scan_planned_with_limit_pushed_down = true;
                 fragments_to_read = scan_push_down_fragments_to_read;
                 break;
@@ -706,6 +720,7 @@ impl FilteredReadStream {
         to_take: &mut u64,
         fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
         scan_push_down_fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
+        only_indexed_fragments: bool,
     ) {
         let fragment_id = fragment.id() as u32;
 
@@ -738,10 +753,13 @@ impl FilteredReadStream {
                     }
                 }
             } else {
-                // Fragment not indexed - add full fragment to unindexed_ranges
-                fragments_to_read.insert(fragment_id, to_read);
+                // Fragment not indexed.  Normally we add the full fragment to keep
+                // results complete.  Fast search intentionally accepts staleness.
+                if !only_indexed_fragments {
+                    fragments_to_read.insert(fragment_id, to_read);
+                }
             }
-        } else {
+        } else if !only_indexed_fragments {
             // No index at all - add full fragment to unindexed_ranges
             fragments_to_read.insert(fragment_id, to_read);
         }
@@ -1279,6 +1297,8 @@ pub struct FilteredReadOptions {
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
+    /// If true, skip fragments that are not covered by the scalar index result.
+    pub only_indexed_fragments: bool,
 }
 
 impl FilteredReadOptions {
@@ -1307,6 +1327,7 @@ impl FilteredReadOptions {
             refine_filter: None,
             full_filter: None,
             io_buffer_size_bytes: None,
+            only_indexed_fragments: false,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1457,6 +1478,12 @@ impl FilteredReadOptions {
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
     pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
         self.io_buffer_size_bytes = Some(io_buffer_size);
+        self
+    }
+
+    /// Only read fragments covered by a scalar index result.
+    pub fn with_only_indexed_fragments(mut self) -> Self {
+        self.only_indexed_fragments = true;
         self
     }
 }
@@ -2961,6 +2988,34 @@ mod tests {
             let result = plan.with_fetch(None);
             assert!(result.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_with_fetch_limit_after_scalar_index_refine_filter() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let filter_plan = fixture
+            .filter_plan("fully_indexed < 50 AND not_indexed >= 10", true)
+            .await;
+        let options = base_options.with_filter_plan(filter_plan);
+        let plan = fixture.make_plan(options).await;
+
+        assert!(plan.index_input.is_some());
+        assert!(plan.options().refine_filter.is_some());
+
+        let limited_plan = plan.with_fetch(Some(10)).unwrap();
+        let limited_plan = limited_plan
+            .as_any()
+            .downcast_ref::<FilteredReadExec>()
+            .unwrap();
+        assert_eq!(limited_plan.options().scan_range_after_filter, Some(0..10));
+
+        let stream = limited_plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let actual_values = get_fully_indexed_values(batches).await;
+        assert_eq!(actual_values, (10..20).collect::<Vec<_>>());
     }
 
     #[tokio::test]
