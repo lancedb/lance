@@ -12,6 +12,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+icu_segmenter = { workspace = true, optional = true }
 jieba-rs = { workspace = true, optional = true }
 lindera = { workspace = true, optional = true }
 rust-stemmers = "1.2.0"
@@ -21,6 +22,7 @@ unicode-normalization = "0.1.25"
 [features]
 jieba-rs = ["dep:jieba-rs"]
 lindera = ["dep:lindera"]
+tokenizer-icu = ["dep:icu_segmenter"]
 tokenizer-jieba = ["jieba-rs"]
 tokenizer-lindera = ["lindera"]
 

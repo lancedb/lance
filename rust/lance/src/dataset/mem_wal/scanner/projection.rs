@@ -125,36 +125,6 @@ pub fn canonical_output_schema(
     Arc::new(Schema::new(fields))
 }
 
-/// Like [`canonical_output_schema`] but with the internal LSM bookkeeping
-/// columns appended: `_memtable_gen` (UInt64, NOT NULL) and `_freshness`
-/// (UInt64, nullable). Used by the vector-search pipeline to carry source
-/// identity + per-source row order through the union and the global
-/// dedup; both columns are dropped by a downstream `project_to_canonical`
-/// before returning to the caller.
-pub fn canonical_internal_schema(
-    user_projection: Option<&[String]>,
-    base_schema: &SchemaRef,
-    pk_columns: &[String],
-    include_distance: bool,
-) -> SchemaRef {
-    use crate::dataset::mem_wal::scanner::exec::{FRESHNESS_COLUMN, MEMTABLE_GEN_COLUMN};
-
-    let canonical =
-        canonical_output_schema(user_projection, base_schema, pk_columns, include_distance);
-    let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
-    fields.push(Arc::new(Field::new(
-        MEMTABLE_GEN_COLUMN,
-        DataType::UInt64,
-        false,
-    )));
-    fields.push(Arc::new(Field::new(
-        FRESHNESS_COLUMN,
-        DataType::UInt64,
-        true,
-    )));
-    Arc::new(Schema::new(fields))
-}
-
 /// Wrap `plan` so the named columns become typed NULL literals; all
 /// other columns are forwarded unchanged. Schema is preserved (same
 /// fields, same dtypes). Useful for stripping the *value* of an

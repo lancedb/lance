@@ -3121,6 +3121,75 @@ def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
     assert scanner_table == actual
 
 
+def test_update_by_rowid(tmp_path: Path):
+    nrows = 30
+    table = pa.table(
+        {
+            "id": pa.array(range(nrows), pa.int64()),
+            "name": pa.array(["foo"] * nrows, pa.string()),
+        }
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "dataset",
+        max_rows_per_file=10,
+        enable_stable_row_ids=True,
+    )
+
+    orig = dataset.to_table(columns=["id"], with_row_id=True)
+    target_idx = 5
+    target_row_id = orig.column("_rowid")[target_idx].as_py()
+    target_id = orig.column("id")[target_idx].as_py()
+
+    update_dict = dataset.update(
+        updates=dict(name="'updated'"),
+        where=f"_rowid = {target_row_id}",
+    )
+    check_update_stats(update_dict, (1,))
+
+    actual = dataset.to_table().sort_by("id")
+    for row in actual.to_pylist():
+        if row["id"] == target_id:
+            assert row["name"] == "updated"
+        else:
+            assert row["name"] == "foo"
+
+
+def test_update_by_rowid_in_list(tmp_path: Path):
+    nrows = 30
+    table = pa.table(
+        {
+            "id": pa.array(range(nrows), pa.int64()),
+            "name": pa.array(["foo"] * nrows, pa.string()),
+        }
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "dataset",
+        max_rows_per_file=10,
+        enable_stable_row_ids=True,
+    )
+
+    orig = dataset.to_table(columns=["id"], with_row_id=True)
+    target_indices = [3, 7, 15]
+    target_row_ids = [orig.column("_rowid")[i].as_py() for i in target_indices]
+    target_ids = {orig.column("id")[i].as_py() for i in target_indices}
+
+    in_list = ", ".join(str(rid) for rid in target_row_ids)
+    update_dict = dataset.update(
+        updates=dict(name="'updated'"),
+        where=f"_rowid IN ({in_list})",
+    )
+    check_update_stats(update_dict, (3,))
+
+    actual = dataset.to_table().sort_by("id")
+    for row in actual.to_pylist():
+        if row["id"] in target_ids:
+            assert row["name"] == "updated"
+        else:
+            assert row["name"] == "foo"
+
+
 def test_update_dataset_all_types(tmp_path: Path):
     table = pa.table(
         {
@@ -4424,6 +4493,22 @@ def test_use_scalar_index(tmp_path: Path):
     assert "ScalarIndexQuery" not in dataset.scanner(
         filter="filter = 10", use_scalar_index=False
     ).explain_plan(True)
+
+
+def test_fast_search_scalar_index_skips_unindexed_fragments(tmp_path: Path):
+    table = pa.table({"filter": range(100)})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=100)
+    dataset.create_scalar_index("filter", "BTREE")
+    dataset = lance.write_dataset(
+        pa.table({"filter": range(100, 110)}), tmp_path, mode="append"
+    )
+
+    normal = dataset.to_table(filter="filter >= 95")
+    fast = dataset.to_table(filter="filter >= 95", fast_search=True)
+
+    assert normal.num_rows == 15
+    assert fast.num_rows == 5
+    assert sorted(fast.column("filter").to_pylist()) == list(range(95, 100))
 
 
 EXPECTED_DEFAULT_STORAGE_VERSION = stable_version()

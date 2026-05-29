@@ -63,35 +63,37 @@ public class VectorSearchTest {
     }
   }
 
-  // rust/lance-linalg/src/distance/l2.rs:256:5:
-  // 5assertion `left == right` failed
-  // Directly panic instead of throwing an exception
-  // @Test
-  // void search_invalid_vector() throws Exception {
-  //   try (TestVectorDataset testVectorDataset = new
-  // TestVectorDataset(tempDir.resolve("test_create_index"))) {
-  //     try (Dataset dataset = testVectorDataset.create()) {
-  //       float[] key = new float[30];
-  //       for (int i = 0; i < 30; i++) {
-  //         key[i] = (float) (i + 30);
-  //       }
-  //       ScanOptions options = new ScanOptions.Builder()
-  //           .nearest(new Query.Builder()
-  //               .setColumn(TestVectorDataset.vectorColumnName)
-  //               .setKey(key)
-  //               .setK(5)
-  //               .setUseIndex(false)
-  //               .build())
-  //           .build();
-  //       assertThrows(IllegalArgumentException.class, () -> {
-  //         try (Scanner scanner = dataset.newScan(options)) {
-  //           try (ArrowReader reader = scanner.scanBatches()) {
-  //           }
-  //         }
-  //       });
-  //     }
-  //   }
-  // }
+  @Test
+  void search_invalid_vector() throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("search_invalid_vector"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        float[] key = new float[30];
+        for (int i = 0; i < 30; i++) {
+          key[i] = (float) (i + 30);
+        }
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .nearest(
+                    new Query.Builder()
+                        .setColumn(TestVectorDataset.vectorColumnName)
+                        .setKey(key)
+                        .setK(5)
+                        .setUseIndex(false)
+                        .build())
+                .build();
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              try (Scanner scanner = dataset.newScan(options)) {
+                try (ArrowReader reader = scanner.scanBatches()) {
+                  reader.loadNextBatch();
+                }
+              }
+            });
+      }
+    }
+  }
 
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
