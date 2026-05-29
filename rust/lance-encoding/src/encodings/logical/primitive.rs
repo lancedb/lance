@@ -3942,11 +3942,11 @@ impl PrimitiveStructuralEncoder {
         if (def_levels.len() as u64) <= u16_max {
             return false;
         }
-        let max_visibles_per_chunk = *miniblock::MAX_MINIBLOCK_VALUES;
+        let max_visible_per_chunk = *miniblock::MAX_MINIBLOCK_VALUES;
 
-        let mut visibles_in_current_chunk: u64 = 0;
+        let mut visible_in_chunk: u64 = 0;
         let mut levels_in_current_chunk: u64 = 0;
-        let mut visibles_seen_total: u64 = 0;
+        let mut visible_seen_total: u64 = 0;
         for &def_lvl in def_levels.iter() {
             levels_in_current_chunk += 1;
             // Short-circuit: if the current chunk already exceeds u16, no
@@ -3955,14 +3955,14 @@ impl PrimitiveStructuralEncoder {
                 return true;
             }
             if def_lvl <= max_visible {
-                visibles_in_current_chunk += 1;
-                visibles_seen_total += 1;
-                let is_last_value = visibles_seen_total == num_values;
-                if visibles_in_current_chunk == max_visibles_per_chunk && !is_last_value {
+                visible_in_chunk += 1;
+                visible_seen_total += 1;
+                let is_last_value = visible_seen_total == num_values;
+                if visible_in_chunk == max_visible_per_chunk && !is_last_value {
                     // Encoder would call slice_next here. Boundary invisibles
                     // (none yet — we just finished a visible value) carry to
                     // the next chunk.
-                    visibles_in_current_chunk = 0;
+                    visible_in_chunk = 0;
                     levels_in_current_chunk = 0;
                 }
             }
