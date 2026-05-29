@@ -521,7 +521,7 @@ pub async fn do_write_fragments(
     let source_store_params = params.store_params.clone().unwrap_or_default();
 
     let writer_generator = WriterGenerator::new(
-        object_store,
+        object_store.clone(),
         base_dir,
         schema,
         storage_version,
@@ -535,71 +535,140 @@ pub async fn do_write_fragments(
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
-    let mut fragments = Vec::new();
+    let mut fragments: Vec<Fragment> = Vec::new();
     let mut bytes_completed: u64 = 0;
     let mut rows_completed: u64 = 0;
     let mut files_written: u32 = 0;
-    while let Some(batch_chunk) = buffered_reader.next().await {
-        let batch_chunk = batch_chunk?;
 
-        if writer.is_none() {
-            let (new_writer, new_fragment) = writer_generator.new_writer().await?;
-            params.progress.begin(&new_fragment).await?;
-            writer = Some(new_writer);
-            fragments.push(new_fragment);
-        }
+    // Wrap the loop in an async block so `?` returns into `loop_result` and we
+    // can run cleanup before propagating the error.
+    let loop_result: Result<()> = async {
+        while let Some(batch_chunk) = buffered_reader.next().await {
+            let batch_chunk = batch_chunk?;
 
-        writer.as_mut().unwrap().write(&batch_chunk).await?;
-        for batch in &batch_chunk {
-            num_rows_in_current_file += batch.num_rows() as u32;
-        }
+            if writer.is_none() {
+                let (new_writer, new_fragment) = writer_generator.new_writer().await?;
+                params.progress.begin(&new_fragment).await?;
+                writer = Some(new_writer);
+                fragments.push(new_fragment);
+            }
 
-        if let Some(cb) = &params.write_progress {
-            let current_bytes = writer.as_mut().unwrap().tell().await?;
-            cb.call(WriteStats {
-                bytes_written: bytes_completed + current_bytes,
-                rows_written: rows_completed + num_rows_in_current_file as u64,
-                files_written,
-            });
-        }
+            writer.as_mut().unwrap().write(&batch_chunk).await?;
+            for batch in &batch_chunk {
+                num_rows_in_current_file += batch.num_rows() as u32;
+            }
 
-        if num_rows_in_current_file >= params.max_rows_per_file as u32
-            || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
-        {
-            let (num_rows, data_file) = writer.take().unwrap().finish().await?;
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-            debug_assert_eq!(num_rows, num_rows_in_current_file);
-            bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
-            rows_completed += num_rows as u64;
-            files_written += 1;
-            params.progress.complete(fragments.last().unwrap()).await?;
-            let last_fragment = fragments.last_mut().unwrap();
-            last_fragment.physical_rows = Some(num_rows as usize);
-            last_fragment.files.push(data_file);
-            num_rows_in_current_file = 0;
+            if let Some(cb) = &params.write_progress {
+                let current_bytes = writer.as_mut().unwrap().tell().await?;
+                cb.call(WriteStats {
+                    bytes_written: bytes_completed + current_bytes,
+                    rows_written: rows_completed + num_rows_in_current_file as u64,
+                    files_written,
+                });
+            }
+
+            if num_rows_in_current_file >= params.max_rows_per_file as u32
+                || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
+            {
+                let (num_rows, data_file) = writer.take().unwrap().finish().await?;
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+                debug_assert_eq!(num_rows, num_rows_in_current_file);
+                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+                rows_completed += num_rows as u64;
+                files_written += 1;
+                let last_fragment = fragments.last_mut().unwrap();
+                last_fragment.physical_rows = Some(num_rows as usize);
+                last_fragment.files.push(data_file);
+                // Notify after pushing the data file so it's tracked for cleanup
+                // if the callback fails.
+                params.progress.complete(fragments.last().unwrap()).await?;
+                if let Some(cb) = &params.write_progress {
+                    cb.call(WriteStats {
+                        bytes_written: bytes_completed,
+                        rows_written: rows_completed,
+                        files_written,
+                    });
+                }
+                num_rows_in_current_file = 0;
+            }
         }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = loop_result {
+        // Drop the writer so its in-progress file is cleaned up (LocalWriter
+        // removes its temp file; ObjectWriter aborts the multipart upload).
+        drop(writer.take());
+        cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+        return Err(e);
     }
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        let (num_rows, data_file) = writer.finish().await?;
-        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-        bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
-        rows_completed += num_rows as u64;
-        files_written += 1;
-        if let Some(cb) = &params.write_progress {
-            cb.call(WriteStats {
-                bytes_written: bytes_completed,
-                rows_written: rows_completed,
-                files_written,
-            });
+        match writer.finish().await {
+            Ok((num_rows, data_file)) => {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
+                rows_completed += num_rows as u64;
+                files_written += 1;
+                let last_fragment = fragments.last_mut().unwrap();
+                last_fragment.physical_rows = Some(num_rows as usize);
+                last_fragment.files.push(data_file);
+                if let Some(cb) = &params.write_progress {
+                    cb.call(WriteStats {
+                        bytes_written: bytes_completed,
+                        rows_written: rows_completed,
+                        files_written,
+                    });
+                }
+            }
+            Err(e) => {
+                drop(writer);
+                cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+                return Err(e);
+            }
         }
-        let last_fragment = fragments.last_mut().unwrap();
-        last_fragment.physical_rows = Some(num_rows as usize);
-        last_fragment.files.push(data_file);
     }
 
     Ok(fragments)
+}
+
+/// Best-effort cleanup of data files for fragments that were written but not committed.
+///
+/// Contract:
+/// - Errors from individual `delete` calls are logged and swallowed, never returned —
+///   callers should propagate the original write error.
+/// - Only files in the dataset's default storage (`base_id == None`) are deleted;
+///   files in external bases are skipped because we don't have their object stores here.
+/// - Safe to call with an empty slice.
+/// - Must be called before the fragments are committed, otherwise live data may be deleted.
+pub(crate) async fn cleanup_data_fragments(
+    object_store: &ObjectStore,
+    base_dir: &Path,
+    fragments: &[Fragment],
+) {
+    let data_dir = base_dir.clone().join(DATA_DIR);
+    let mut skipped_external = 0usize;
+    for fragment in fragments {
+        for file in &fragment.files {
+            if file.base_id.is_none() {
+                let path = data_dir.clone().join(file.path.as_str());
+                if let Err(e) = object_store.delete(&path).await {
+                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+                }
+            } else {
+                skipped_external += 1;
+            }
+        }
+    }
+    if skipped_external > 0 {
+        log::warn!(
+            "Skipped cleanup of {} orphaned data file(s) in external bases: \
+             cleanup not supported for external bases",
+            skipped_external
+        );
+    }
 }
 
 pub async fn validate_and_resolve_target_bases(
@@ -3186,6 +3255,180 @@ mod tests {
             all_ids,
             vec![1, 2, 3, 4, 5, 6],
             "All data should be correctly written"
+        );
+    }
+
+    /// Returns the number of files in `<base_dir>/data/`.
+    fn count_data_files(base_dir: &str) -> usize {
+        let data_dir = std::path::Path::new(base_dir).join("data");
+        if !data_dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().is_file())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_data_files_on_failed_write() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        let good_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Build a stream: one good batch, then an error.
+        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+            Ok(good_batch.clone()),
+            Err(DataFusionError::External("injected failure".into())),
+        ];
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(items),
+        ));
+
+        let result = do_write_fragments(
+            None,
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams::default(),
+            LanceFileVersion::V2_1,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Expected write to fail");
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "All partial data files should be cleaned up on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_data_files_on_failed_write_multi_file() {
+        // Verify cleanup when a failure occurs after one file has already been completed
+        // (i.e., max_rows_per_file causes a file boundary before the error).
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        // 3 rows per file; 2 good batches of 3 rows (fills one file), then error.
+        let good_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+            Ok(good_batch.clone()),
+            Ok(good_batch.clone()),
+            Err(DataFusionError::External("injected failure".into())),
+        ];
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(items),
+        ));
+
+        let result = do_write_fragments(
+            None,
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            },
+            LanceFileVersion::V2_1,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Expected write to fail");
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "All data files (including completed ones) should be cleaned up on failure"
+        );
+    }
+
+    /// Verifies the external-base branch in `cleanup_data_fragments`: files with
+    /// `base_id == Some(_)` are skipped (logged but not deleted via the dataset's
+    /// object store), while same-fragment files with `base_id == None` are deleted.
+    #[tokio::test]
+    async fn test_cleanup_data_fragments_skips_external_base() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        // Create a real local data file we expect to be cleaned up.
+        let data_dir = base_dir.clone().join(DATA_DIR);
+        let local_filename = "local.lance";
+        let local_path = data_dir.clone().join(local_filename);
+        object_store.put(&local_path, b"x").await.unwrap();
+        // Sanity check: file is on disk.
+        assert_eq!(count_data_files(test_uri), 1);
+
+        let mut external_file = DataFile::new_unstarted("external.lance", 2, 1);
+        external_file.base_id = Some(42);
+        let local_file = DataFile::new_unstarted(local_filename, 2, 1);
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![external_file, local_file],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        }];
+
+        cleanup_data_fragments(&object_store, &base_dir, &fragments).await;
+
+        // The local file should be removed; the external file is skipped without
+        // erroring (its base store isn't known here).
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "Local data file should be deleted by cleanup"
         );
     }
 }

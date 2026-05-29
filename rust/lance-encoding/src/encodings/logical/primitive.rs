@@ -3835,16 +3835,29 @@ impl PrimitiveStructuralEncoder {
 
     /// Checks if the rep/def levels are too sparse for miniblock encoding.
     ///
-    /// Miniblock chunks are limited to ~32KiB total. Data can use up to ~16KiB,
-    /// leaving ~16KiB for both rep and def buffers combined. Each chunk has at most
-    /// MAX_MINIBLOCK_VALUES (4096) data values, but when data has many empty/null
-    /// lists, the number of rep/def levels can far exceed the number of data values
-    /// (each empty list adds a level entry with no corresponding data value).
+    /// Two distinct conditions both force a fallback to fullzip:
     ///
-    /// We estimate the compressed bits per level by computing the max value in each
-    /// buffer and taking ceil(log2(max_val + 1)) — the minimum bits needed to
-    /// bitpack each level. We then calculate the maximum number of levels that fit
-    /// in 16KiB and compare against the actual levels-to-values ratio.
+    /// 1. **Compressed rep+def bytes overflow the per-chunk budget**: each
+    ///    miniblock chunk only has ~16KiB for rep+def buffers combined, and
+    ///    if the levels-to-values ratio is high enough that a chunk's
+    ///    bit-packed levels would exceed that budget, we can't use miniblock.
+    ///    This is a *global* ratio check that captures uniformly-sparse data
+    ///    (e.g., 2.5M rows with 100 non-empty lists scattered across).
+    ///
+    /// 2. **A single chunk's `num_levels` overflows the `u16` header field**
+    ///    on disk. v2.2 is a stable format whose per-chunk metadata stores
+    ///    `num_levels` as a `u16`, capping each chunk at 65 535 levels. The
+    ///    *global* ratio above can look healthy (HNSW: ~1.19 levels per value)
+    ///    while one chunk — typically the final chunk consumed via
+    ///    `slice_rest`, which absorbs every trailing empty list — packs far
+    ///    more than 65 535 levels. We catch this with a single linear pass
+    ///    over the def levels that simulates the encoder's chunking
+    ///    (`MAX_MINIBLOCK_VALUES` visible values per non-last chunk, last
+    ///    chunk takes the rest) and checks the worst-case per-chunk level
+    ///    count against `u16::MAX`.
+    ///
+    /// Cheap on the dense path: when there are no rep/def levels (no nesting,
+    /// no nullability above the leaf) we early-exit without scanning anything.
     fn repdef_too_sparse_for_miniblock(
         repdef: &crate::repdef::SerializedRepDefs,
         num_values: u64,
@@ -3881,16 +3894,82 @@ impl PrimitiveStructuralEncoder {
             return false;
         }
 
-        // 16KiB budget for rep+def combined (half the ~32KiB chunk limit)
+        // (1) Global rep+def budget check.
         const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
         let max_levels_per_chunk = REPDEF_BUDGET_BITS / bits_per_level;
-
-        // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
-        // ratio tells us how many levels a chunk of that size would need.
         let levels_per_chunk =
             (num_levels as f64 / num_values as f64) * *miniblock::MAX_MINIBLOCK_VALUES as f64;
+        if levels_per_chunk > max_levels_per_chunk as f64 {
+            return true;
+        }
 
-        levels_per_chunk > max_levels_per_chunk as f64
+        // (2) Per-chunk num_levels u16-overflow check. The HNSW persistence
+        // shape (~40k dense level-0 lists followed by ~6x as many empty
+        // higher-level rows) has a low global ratio (~1.19) so (1) passes,
+        // but the trailing empties cluster into the final chunk via
+        // `slice_rest` and overflow.
+        Self::any_chunk_levels_overflow_u16(repdef, num_values)
+    }
+
+    /// Simulates the miniblock chunking the encoder is about to perform and
+    /// returns `true` if any chunk would carry more levels than the on-disk
+    /// `u16 num_levels` header can express (`> u16::MAX`).
+    ///
+    /// Mirrors [`RepDefSlicer::slice_next`] semantics: each non-last chunk
+    /// consumes levels until it has accumulated `MAX_MINIBLOCK_VALUES`
+    /// *visible* values (def level ≤ max_visible), leaving any boundary
+    /// invisibles after the chunk's last visible value for the next chunk; the
+    /// final chunk is via `slice_rest`, which scoops up every remaining level
+    /// (including any trailing all-empty rows that no value chunk would
+    /// otherwise have claimed).
+    fn any_chunk_levels_overflow_u16(
+        repdef: &crate::repdef::SerializedRepDefs,
+        num_values: u64,
+    ) -> bool {
+        // Without rep levels the encoder uses a 1:1 levels-to-values mapping,
+        // so each chunk has at most MAX_MINIBLOCK_VALUES levels — well under
+        // u16::MAX. Nothing to check on the dense / nullable-leaf-only path.
+        let Some(max_visible) = repdef.max_visible_level else {
+            return false;
+        };
+        let Some(def_levels) = repdef.definition_levels.as_ref() else {
+            return false;
+        };
+        // If even the *total* level count fits in u16, no chunk can overflow,
+        // so the linear scan would always return false. Cheap O(1) shortcut on
+        // small/medium pages.
+        let u16_max = u16::MAX as u64;
+        if (def_levels.len() as u64) <= u16_max {
+            return false;
+        }
+        let max_visible_per_chunk = *miniblock::MAX_MINIBLOCK_VALUES;
+
+        let mut visible_in_chunk: u64 = 0;
+        let mut levels_in_current_chunk: u64 = 0;
+        let mut visible_seen_total: u64 = 0;
+        for &def_lvl in def_levels.iter() {
+            levels_in_current_chunk += 1;
+            // Short-circuit: if the current chunk already exceeds u16, no
+            // further scanning is needed.
+            if levels_in_current_chunk > u16_max {
+                return true;
+            }
+            if def_lvl <= max_visible {
+                visible_in_chunk += 1;
+                visible_seen_total += 1;
+                let is_last_value = visible_seen_total == num_values;
+                if visible_in_chunk == max_visible_per_chunk && !is_last_value {
+                    // Encoder would call slice_next here. Boundary invisibles
+                    // (none yet — we just finished a visible value) carry to
+                    // the next chunk.
+                    visible_in_chunk = 0;
+                    levels_in_current_chunk = 0;
+                }
+            }
+        }
+        // Final chunk (slice_rest) takes everything left in the current
+        // accumulator, including any trailing empties after the last value.
+        levels_in_current_chunk > u16_max
     }
 
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
@@ -4194,9 +4273,28 @@ impl PrimitiveStructuralEncoder {
             chunk_fixed_width.compute_stat();
             let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
             let compressed_levels = compressor.compress(chunk_levels_block)?;
+            // `num_levels` is a `u16` in the v2.2 on-disk per-chunk header
+            // (`primitive.rs:467` reads it as `u16::from_le_bytes`). Silently
+            // truncating here used to corrupt the round-trip when chunking
+            // packed >65 535 levels into one chunk (HNSW persistence shape;
+            // see `repdef_too_sparse_for_miniblock`). The heuristic should
+            // route such shapes to fullzip before reaching this point; if it
+            // doesn't (e.g. a future shape sneaks past the heuristic), surface
+            // a clear input-shape error rather than a silent corruption.
+            let num_levels_u16 = u16::try_from(num_chunk_levels).map_err(|_| {
+                Error::invalid_input_source(
+                    format!(
+                        "miniblock chunk has {} levels but per-chunk header is u16 \
+                         (max {}); this shape needs fullzip encoding",
+                        num_chunk_levels,
+                        u16::MAX,
+                    )
+                    .into(),
+                )
+            })?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
-                num_levels: num_chunk_levels as u16,
+                num_levels: num_levels_u16,
             });
         }
         debug_assert_eq!(levels.num_levels_remaining(), 0);
@@ -5385,6 +5483,23 @@ impl PrimitiveStructuralEncoder {
                         support_large_chunk,
                     )
                 } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
+                    // If the user explicitly asked for miniblock but the
+                    // heuristic vetoed it, warn so the override is observable
+                    // rather than silent.
+                    let user_forced_miniblock = encoding_metadata
+                        .get(STRUCTURAL_ENCODING_META_KEY)
+                        .map(|v| v.to_lowercase() == STRUCTURAL_ENCODING_MINIBLOCK)
+                        .unwrap_or(false);
+                    if too_sparse && user_forced_miniblock {
+                        log::warn!(
+                            "Field '{}' requested {}={} but the rep/def shape would \
+                             overflow miniblock per-chunk limits; encoding as fullzip \
+                             instead to avoid corruption.",
+                            field.name,
+                            STRUCTURAL_ENCODING_META_KEY,
+                            STRUCTURAL_ENCODING_MINIBLOCK,
+                        );
+                    }
                     log::debug!(
                         "Encoding column {} with {} items using full-zip layout",
                         column_idx,

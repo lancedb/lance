@@ -17,8 +17,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::Expr;
-use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::{Expr, expr::ScalarFunction};
 use deepsize::DeepSizeOf;
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::{Error, Result};

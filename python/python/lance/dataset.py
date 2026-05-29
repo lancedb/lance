@@ -1009,6 +1009,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
+        index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
@@ -1135,6 +1136,11 @@ class LanceDataset(pa.dataset.Dataset):
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
+        index_segments: iterable of str or uuid.UUID, default None
+            If specified, restrict vector index search to these index segment UUIDs.
+            Only supported for vector search. If fragments is also specified, rows
+            from those fragments not covered by the selected index segments will be
+            searched with flat KNN.
         prefilter: bool, default False
             If True then the filter will be applied before the vector query is run.
             This will generate more correct results but it may be a more costly
@@ -1263,6 +1269,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.fragment_readahead, fragment_readahead)
         setopt(builder.scan_in_order, scan_in_order)
         setopt(builder.with_fragments, fragments)
+        setopt(builder.with_index_segments, index_segments)
         setopt(builder.late_materialization, late_materialization)
         setopt(builder.blob_handling, blob_handling)
         setopt(builder.with_row_id, with_row_id)
@@ -5702,6 +5709,7 @@ class ScannerBuilder:
         self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
         self._fragments = None
+        self._index_segments = None
         self._with_row_id = False
         self._with_row_address = False
         self._use_stats = True
@@ -5986,6 +5994,24 @@ class ScannerBuilder:
         self._fragments = fragments
         return self
 
+    def with_index_segments(
+        self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
+    ) -> ScannerBuilder:
+        if index_segments is not None:
+            segment_ids = []
+            for segment_id in index_segments:
+                if isinstance(segment_id, (str, uuid.UUID)):
+                    segment_ids.append(str(segment_id))
+                else:
+                    raise TypeError(
+                        "index_segments must be an iterable of str or uuid.UUID. "
+                        f"Got {type(segment_id)} instead."
+                    )
+            index_segments = segment_ids
+
+        self._index_segments = index_segments
+        return self
+
     def nearest(
         self,
         column: str,
@@ -6163,6 +6189,7 @@ class ScannerBuilder:
             self._fragment_readahead,
             self._scan_in_order,
             self._fragments,
+            self._index_segments,
             self._with_row_id,
             self._with_row_address,
             self._use_stats,

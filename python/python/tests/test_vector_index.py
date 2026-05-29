@@ -9,6 +9,7 @@ import shutil
 import string
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -2224,6 +2225,24 @@ def test_prewarm_index(tmp_path):
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
+
+
+def test_scanner_rejects_unknown_index_segments(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
+
+    with pytest.raises(
+        ValueError, match="with_index_segments referenced unknown index segments"
+    ):
+        dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128).astype(np.float32),
+                "k": 10,
+            },
+            index_segments=[uuid.uuid4()],
+        ).to_table()
 
 
 def test_vector_index_distance_range(tmp_path):

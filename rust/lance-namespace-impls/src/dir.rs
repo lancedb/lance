@@ -47,22 +47,25 @@ use lance_namespace::models::{
     AnalyzeTableQueryPlanRequest, BatchDeleteTableVersionsRequest,
     BatchDeleteTableVersionsResponse, CountTableRowsRequest, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableVersionRequest,
-    CreateTableVersionResponse, DeclareTableRequest, DeclareTableResponse,
+    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
     DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
     DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
     ExplainTableQueryPlanRequest, FragmentStats, FragmentSummary, GetTableStatsRequest,
-    GetTableStatsResponse, Identity, IndexContent, InsertIntoTableRequest, InsertIntoTableResponse,
-    ListNamespacesRequest, ListNamespacesResponse, ListTableIndicesRequest,
-    ListTableIndicesResponse, ListTableVersionsRequest, ListTableVersionsResponse,
-    ListTablesRequest, ListTablesResponse, MergeInsertIntoTableRequest,
+    GetTableStatsResponse, GetTableTagVersionRequest, GetTableTagVersionResponse, Identity,
+    IndexContent, InsertIntoTableRequest, InsertIntoTableResponse, ListNamespacesRequest,
+    ListNamespacesResponse, ListTableIndicesRequest, ListTableIndicesResponse,
+    ListTableTagsRequest, ListTableTagsResponse, ListTableVersionsRequest,
+    ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, MergeInsertIntoTableRequest,
     MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest,
     QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest, RestoreTableResponse,
-    TableExistsRequest, TableVersion, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse,
+    TableExistsRequest, TableVersion, TagContents as ModelTagContents,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 
 use lance_core::{Error, Result};
@@ -1022,6 +1025,41 @@ impl DirectoryNamespace {
                 message: format!("Table location not found for: {:?}", id),
             })
         })
+    }
+
+    /// Map a Lance ref-related error returned by `Dataset::tags()` operations into
+    /// the appropriate `NamespaceError` for tag APIs (create/get/update/delete).
+    fn map_tag_error(err: lance_core::Error, tag: &str, table_uri: &str) -> lance_core::Error {
+        match err {
+            lance_core::Error::RefNotFound { .. } => NamespaceError::TableTagNotFound {
+                message: format!("tag '{}' for table at '{}'", tag, table_uri),
+            }
+            .into(),
+            lance_core::Error::RefConflict { .. } => NamespaceError::TableTagAlreadyExists {
+                message: format!("tag '{}' for table at '{}'", tag, table_uri),
+            }
+            .into(),
+            lance_core::Error::InvalidRef { message } => NamespaceError::InvalidInput {
+                message: format!("invalid tag '{}': {}", tag, message),
+            }
+            .into(),
+            lance_core::Error::VersionNotFound { message } => {
+                NamespaceError::TableVersionNotFound {
+                    message: format!(
+                        "version referenced by tag '{}' not found for table at '{}': {}",
+                        tag, table_uri, message
+                    ),
+                }
+                .into()
+            }
+            other => NamespaceError::Internal {
+                message: format!(
+                    "tag operation failed for tag '{}' on table at '{}': {}",
+                    tag, table_uri, other
+                ),
+            }
+            .into(),
+        }
     }
 
     async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
@@ -4073,6 +4111,168 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         Ok(Bytes::from(buffer))
+    }
+
+    async fn list_table_tags(
+        &self,
+        request: ListTableTagsRequest,
+    ) -> Result<ListTableTagsResponse> {
+        self.record_op("list_table_tags");
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "list_table_tags")
+            .await?;
+
+        let raw_tags = dataset.tags().list().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to list tags for table at '{}': {}", table_uri, e),
+            })
+        })?;
+
+        let tags = raw_tags
+            .into_iter()
+            .map(|(name, contents)| {
+                let mut tag_model =
+                    ModelTagContents::new(contents.version as i64, contents.manifest_size as i64);
+                tag_model.branch = contents.branch;
+                (name, tag_model)
+            })
+            .collect();
+
+        Ok(ListTableTagsResponse {
+            tags,
+            page_token: None,
+        })
+    }
+
+    async fn get_table_tag_version(
+        &self,
+        request: GetTableTagVersionRequest,
+    ) -> Result<GetTableTagVersionResponse> {
+        self.record_op("get_table_tag_version");
+        if request.tag.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "tag name must not be empty for get_table_tag_version".to_string(),
+            }
+            .into());
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "get_table_tag_version")
+            .await?;
+
+        let version = dataset
+            .tags()
+            .get_version(&request.tag)
+            .await
+            .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
+
+        Ok(GetTableTagVersionResponse {
+            version: version as i64,
+        })
+    }
+
+    async fn create_table_tag(
+        &self,
+        request: CreateTableTagRequest,
+    ) -> Result<CreateTableTagResponse> {
+        self.record_op("create_table_tag");
+        if request.tag.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "tag name must not be empty for create_table_tag".to_string(),
+            }
+            .into());
+        }
+        if request.version <= 0 {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "tag version must be a positive integer, got {} for create_table_tag",
+                    request.version
+                ),
+            }
+            .into());
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "create_table_tag")
+            .await?;
+
+        dataset
+            .tags()
+            .create(&request.tag, request.version as u64)
+            .await
+            .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
+
+        Ok(CreateTableTagResponse {
+            transaction_id: None,
+        })
+    }
+
+    async fn delete_table_tag(
+        &self,
+        request: DeleteTableTagRequest,
+    ) -> Result<DeleteTableTagResponse> {
+        self.record_op("delete_table_tag");
+        if request.tag.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "tag name must not be empty for delete_table_tag".to_string(),
+            }
+            .into());
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "delete_table_tag")
+            .await?;
+
+        dataset
+            .tags()
+            .delete(&request.tag)
+            .await
+            .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
+
+        Ok(DeleteTableTagResponse {
+            transaction_id: None,
+        })
+    }
+
+    async fn update_table_tag(
+        &self,
+        request: UpdateTableTagRequest,
+    ) -> Result<UpdateTableTagResponse> {
+        self.record_op("update_table_tag");
+        if request.tag.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "tag name must not be empty for update_table_tag".to_string(),
+            }
+            .into());
+        }
+        if request.version <= 0 {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "tag version must be a positive integer, got {} for update_table_tag",
+                    request.version
+                ),
+            }
+            .into());
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "update_table_tag")
+            .await?;
+
+        dataset
+            .tags()
+            .update(&request.tag, request.version as u64)
+            .await
+            .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
+
+        Ok(UpdateTableTagResponse {
+            transaction_id: None,
+        })
     }
 
     fn namespace_id(&self) -> String {
@@ -9644,5 +9844,247 @@ mod tests {
         let err_msg = err.to_string();
         assert!(err_msg.contains("Table not found"));
         assert!(err_msg.contains("table id 'workspace$missing_table'"));
+    }
+
+    /// Helper used by tag tests: creates a table with `versions` total versions
+    /// (1 create + N-1 appends) and returns the namespace plus the table id.
+    async fn create_tagged_test_table(
+        versions: u32,
+    ) -> (Arc<DirectoryNamespace>, TempStdDir, Vec<String>) {
+        use arrow::array::{Int32Array, RecordBatchIterator};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use lance::dataset::{Dataset, WriteMode, WriteParams};
+
+        assert!(versions >= 1, "versions must be at least 1");
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let table_id = vec!["tag_table".to_string()];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let initial_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(initial_batch)], arrow_schema.clone());
+        let write_params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write_into_namespace(
+            batches,
+            namespace.clone() as Arc<dyn LanceNamespace>,
+            table_id.clone(),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        for i in 1..versions {
+            let value_start = (i as i32) * 10;
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![
+                    value_start,
+                    value_start + 1,
+                ]))],
+            )
+            .unwrap();
+            let batches = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema.clone());
+            dataset.append(batches, None).await.unwrap();
+        }
+
+        (namespace, temp_dir, table_id)
+    }
+
+    #[tokio::test]
+    async fn test_create_and_list_tags() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(3).await;
+
+        let mut req = CreateTableTagRequest::new("v1".to_string(), 1);
+        req.id = Some(table_id.clone());
+        namespace.create_table_tag(req).await.unwrap();
+
+        let mut req = CreateTableTagRequest::new("v2".to_string(), 2);
+        req.id = Some(table_id.clone());
+        namespace.create_table_tag(req).await.unwrap();
+
+        let mut list_req = ListTableTagsRequest::new();
+        list_req.id = Some(table_id);
+        let resp = namespace.list_table_tags(list_req).await.unwrap();
+
+        assert_eq!(resp.tags.len(), 2, "expected 2 tags, got: {:?}", resp.tags);
+        assert_eq!(resp.tags.get("v1").unwrap().version, 1);
+        assert_eq!(resp.tags.get("v2").unwrap().version, 2);
+        assert!(resp.page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_existing_tag_conflict() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let mut req = CreateTableTagRequest::new("v1".to_string(), 1);
+        req.id = Some(table_id.clone());
+        namespace.create_table_tag(req).await.unwrap();
+
+        let mut req = CreateTableTagRequest::new("v1".to_string(), 2);
+        req.id = Some(table_id);
+        let err = namespace.create_table_tag(req).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("already exists"),
+            "expected already-exists error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_tag_version() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(3).await;
+
+        let mut req = CreateTableTagRequest::new("release".to_string(), 2);
+        req.id = Some(table_id.clone());
+        namespace.create_table_tag(req).await.unwrap();
+
+        let mut get_req = GetTableTagVersionRequest::new("release".to_string());
+        get_req.id = Some(table_id);
+        let resp = namespace.get_table_tag_version(get_req).await.unwrap();
+        assert_eq!(resp.version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_unknown_tag() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let mut get_req = GetTableTagVersionRequest::new("does-not-exist".to_string());
+        get_req.id = Some(table_id);
+        let err = namespace.get_table_tag_version(get_req).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("not found"),
+            "expected not-found error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_tag_to_new_version() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(3).await;
+
+        let mut req = CreateTableTagRequest::new("rolling".to_string(), 1);
+        req.id = Some(table_id.clone());
+        namespace.create_table_tag(req).await.unwrap();
+
+        let mut update_req = UpdateTableTagRequest::new("rolling".to_string(), 3);
+        update_req.id = Some(table_id.clone());
+        namespace.update_table_tag(update_req).await.unwrap();
+
+        let mut get_req = GetTableTagVersionRequest::new("rolling".to_string());
+        get_req.id = Some(table_id);
+        let resp = namespace.get_table_tag_version(get_req).await.unwrap();
+        assert_eq!(resp.version, 3);
+    }
+
+    #[tokio::test]
+    async fn test_update_unknown_tag() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let mut update_req = UpdateTableTagRequest::new("ghost".to_string(), 1);
+        update_req.id = Some(table_id);
+        let err = namespace.update_table_tag(update_req).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("not found"),
+            "expected not-found error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_tag() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let mut req = CreateTableTagRequest::new("doomed".to_string(), 1);
+        req.id = Some(table_id.clone());
+        namespace.create_table_tag(req).await.unwrap();
+
+        let mut delete_req = DeleteTableTagRequest::new("doomed".to_string());
+        delete_req.id = Some(table_id.clone());
+        namespace.delete_table_tag(delete_req).await.unwrap();
+
+        let mut list_req = ListTableTagsRequest::new();
+        list_req.id = Some(table_id.clone());
+        let resp = namespace.list_table_tags(list_req).await.unwrap();
+        assert!(resp.tags.is_empty(), "tag should be removed after delete");
+
+        // A second get should return NotFound.
+        let mut get_req = GetTableTagVersionRequest::new("doomed".to_string());
+        get_req.id = Some(table_id);
+        let err = namespace.get_table_tag_version(get_req).await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_unknown_tag() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let mut delete_req = DeleteTableTagRequest::new("nope".to_string());
+        delete_req.id = Some(table_id);
+        let err = namespace.delete_table_tag(delete_req).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("not found"),
+            "expected not-found error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_invalid_version() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        // version 0 should be rejected as InvalidInput before reaching the dataset.
+        let mut req = CreateTableTagRequest::new("v0".to_string(), 0);
+        req.id = Some(table_id.clone());
+        let err = namespace.create_table_tag(req).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("positive"),
+            "expected positive-version error, got: {}",
+            err
+        );
+
+        // empty tag name should also be rejected.
+        let mut req = CreateTableTagRequest::new(String::new(), 1);
+        req.id = Some(table_id);
+        let err = namespace.create_table_tag(req).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("must not be empty"),
+            "expected empty-tag-name error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_table_not_found() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut req = CreateTableTagRequest::new("v1".to_string(), 1);
+        req.id = Some(vec!["does_not_exist".to_string()]);
+        let err = namespace.create_table_tag(req).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Table") && msg.to_lowercase().contains("not found"),
+            "expected TableNotFound error, got: {}",
+            err
+        );
     }
 }
