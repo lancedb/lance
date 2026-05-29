@@ -4338,7 +4338,9 @@ fn prepare_vector_index_params(
             }
 
             let centroid_type = match column_type {
-                DataType::List(field) if matches!(field.data_type(), DataType::FixedSizeList(_, _)) => {
+                DataType::List(field)
+                    if matches!(field.data_type(), DataType::FixedSizeList(_, _)) =>
+                {
                     field.data_type()
                 }
                 _ => column_type,
@@ -4348,13 +4350,14 @@ fn prepare_vector_index_params(
             // as the vectors that will be indexed.
             let mut centroids: Arc<dyn Array> = batch.column(0).clone();
             if centroids.data_type() != centroid_type {
-                centroids = cast_with_options(centroids.as_ref(), centroid_type, &Default::default())
-                    .map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Failed to cast centroids to column type: {}",
-                            e
-                        ))
-                    })?;
+                centroids =
+                    cast_with_options(centroids.as_ref(), centroid_type, &Default::default())
+                        .map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "Failed to cast centroids to column type: {}",
+                                e
+                            ))
+                        })?;
             }
             let centroids = as_fixed_size_list_array(centroids.as_ref());
 
