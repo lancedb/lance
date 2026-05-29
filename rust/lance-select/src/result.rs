@@ -381,8 +381,7 @@ impl IndexExprResult {
         }
     }
 
-    /// Deserialize from a record batch produced by [`Self::serialize`] or
-    /// [`Self::serialize_legacy`].
+    /// Deserialize from a record batch produced by [`Self::serialize`].
     pub fn deserialize(batch: &RecordBatch) -> Result<(Self, RoaringBitmap)> {
         use arrow_array::cast::AsArray;
 
