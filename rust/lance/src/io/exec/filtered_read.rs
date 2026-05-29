@@ -38,9 +38,11 @@ use lance_datafusion::utils::{
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
+use lance_index::scalar::expression::FilterPlan;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_select::{RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap};
+use lance_select::{
+    IndexExprResult, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
+};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
@@ -2134,7 +2136,7 @@ mod tests {
         optimize::OptimizeOptions,
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
-    use lance_select::result::IndexExprResultFormat;
+    use lance_select::result::IndexExprResultWireFormat;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -2265,7 +2267,7 @@ mod tests {
                     Some(Arc::new(ScalarIndexExec::new(
                         self.dataset.clone(),
                         index_query,
-                        IndexExprResultFormat::default(),
+                        IndexExprResultWireFormat::default(),
                     )))
                 } else {
                     None
@@ -2385,7 +2387,7 @@ mod tests {
 
         for (name, original) in cases {
             let batch = original
-                .serialize(&frags, IndexExprResultFormat::default())
+                .serialize(&frags, IndexExprResultWireFormat::default())
                 .unwrap_or_else(|e| panic!("serialize {name}: {e}"));
             let decoded = EvaluatedIndex::try_from_arrow(&batch)
                 .unwrap_or_else(|e| panic!("try_from_arrow {name}: {e}"));

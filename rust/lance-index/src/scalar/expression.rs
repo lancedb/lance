@@ -21,7 +21,7 @@ use super::{
 use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use lance_select::NullableRowAddrMask;
+use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -1287,12 +1287,6 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-// `IndexExprResult` and `NullableIndexExprResult` (along with their schemas and
-// wire-format methods) live in `lance-select` so that benchmarks and downstream
-// consumers can depend on the mask substrate without pulling in all of
-// `lance-index`.
-pub use lance_select::{IndexExprResult, NullableIndexExprResult};
-
 impl From<SearchResult> for NullableIndexExprResult {
     fn from(result: SearchResult) -> Self {
         match result {
@@ -1963,7 +1957,7 @@ mod tests {
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
-    use lance_select::result::IndexExprResultFormat;
+    use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
@@ -2967,8 +2961,8 @@ mod tests {
         use lance_select::{RowAddrMask, RowAddrTreeMap};
 
         for format in [
-            IndexExprResultFormat::TwoMask,
-            IndexExprResultFormat::ThreeVariant,
+            IndexExprResultWireFormat::TwoMask,
+            IndexExprResultWireFormat::ThreeVariant,
         ] {
             let mut addrs = RowAddrTreeMap::new();
             addrs.insert_range(0..5);
@@ -3052,7 +3046,7 @@ mod tests {
 
         // Exact: upper column must be fully null on the wire.
         let exact_batch = IndexExprResult::exact(mask.clone())
-            .serialize(&fragments_covered, IndexExprResultFormat::TwoMask)
+            .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
             .unwrap();
         let exact_upper = exact_batch.column(1).as_binary::<i32>();
         assert!(exact_upper.is_null(0) && exact_upper.is_null(1));
@@ -3061,7 +3055,7 @@ mod tests {
         // least one row is non-null (`AllowList(mask)` puts the payload at
         // row 1).
         let at_most_batch = IndexExprResult::at_most(mask.clone())
-            .serialize(&fragments_covered, IndexExprResultFormat::TwoMask)
+            .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
             .unwrap();
         let at_most_upper = at_most_batch.column(1).as_binary::<i32>();
         assert!(!(at_most_upper.is_null(0) && at_most_upper.is_null(1)));
@@ -3070,7 +3064,7 @@ mod tests {
         // encodes as `BlockList(empty)` — row 0 holds the empty-tree bytes,
         // row 1 is null. Round-trip must preserve `is_at_least`.
         let at_least_batch = IndexExprResult::at_least(mask)
-            .serialize(&fragments_covered, IndexExprResultFormat::TwoMask)
+            .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
             .unwrap();
         let at_least_upper = at_least_batch.column(1).as_binary::<i32>();
         assert!(!at_least_upper.is_null(0));
@@ -3098,11 +3092,11 @@ mod tests {
         let fragments_covered = RoaringBitmap::from_iter([0u32, 1]);
 
         let batch = refined
-            .serialize(&fragments_covered, IndexExprResultFormat::ThreeVariant)
+            .serialize(&fragments_covered, IndexExprResultWireFormat::ThreeVariant)
             .unwrap();
         assert_eq!(
             batch.schema(),
-            *IndexExprResultFormat::ThreeVariant.schema()
+            *IndexExprResultWireFormat::ThreeVariant.schema()
         );
 
         // Discriminant 1 == AtMost; the round-tripped result carries the

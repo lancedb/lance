@@ -323,13 +323,13 @@ static THREE_VARIANT_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexExprResultFormat {
+pub enum IndexExprResultWireFormat {
     ThreeVariant, // A legacy format that used AtMost/AtLeast/Exact variants
     #[default]
     TwoMask, // The two-mask format with upper and lower
 }
 
-impl IndexExprResultFormat {
+impl IndexExprResultWireFormat {
     pub fn schema(&self) -> &SchemaRef {
         match self {
             Self::ThreeVariant => &THREE_VARIANT_RESULT_SCHEMA,
@@ -406,11 +406,13 @@ impl IndexExprResult {
     pub fn serialize(
         &self,
         fragments_covered: &RoaringBitmap,
-        format: IndexExprResultFormat,
+        format: IndexExprResultWireFormat,
     ) -> Result<RecordBatch> {
         match format {
-            IndexExprResultFormat::ThreeVariant => self.serialize_three_variant(fragments_covered),
-            IndexExprResultFormat::TwoMask => self.serialize_standard(fragments_covered),
+            IndexExprResultWireFormat::ThreeVariant => {
+                self.serialize_three_variant(fragments_covered)
+            }
+            IndexExprResultWireFormat::TwoMask => self.serialize_standard(fragments_covered),
         }
     }
 

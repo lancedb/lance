@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use datafusion::config::ConfigOptions;
-use lance_select::result::IndexExprResultFormat;
+use lance_select::result::IndexExprResultWireFormat;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -66,8 +66,8 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
-use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt};
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
@@ -76,7 +76,7 @@ use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use tracing::{Span, info_span, instrument};
@@ -2801,12 +2801,12 @@ impl Scanner {
         })
     }
 
-    fn index_expr_result_format(&self) -> IndexExprResultFormat {
+    fn index_expr_result_format(&self) -> IndexExprResultWireFormat {
         if self.relational_algebra_version > 1 {
-            IndexExprResultFormat::TwoMask
+            IndexExprResultWireFormat::TwoMask
         } else {
             // In version 1 we used the legacy three-variant format for index expr results
-            IndexExprResultFormat::ThreeVariant
+            IndexExprResultWireFormat::ThreeVariant
         }
     }
 

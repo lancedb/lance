@@ -40,10 +40,12 @@ use lance_index::{
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
-        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
+        expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
     },
 };
-use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultFormat};
+use lance_select::{
+    IndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::{debug_span, instrument};
@@ -73,7 +75,7 @@ pub struct ScalarIndexExec {
     expr: ScalarIndexExpr,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    result_format: IndexExprResultFormat,
+    result_format: IndexExprResultWireFormat,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -93,7 +95,7 @@ impl ScalarIndexExec {
     pub fn new(
         dataset: Arc<Dataset>,
         expr: ScalarIndexExpr,
-        result_format: IndexExprResultFormat,
+        result_format: IndexExprResultWireFormat,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(result_format.schema().clone()),
@@ -144,7 +146,7 @@ impl ScalarIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
-        result_format: IndexExprResultFormat,
+        result_format: IndexExprResultWireFormat,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
@@ -770,7 +772,7 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::result::IndexExprResultFormat;
+    use lance_select::result::IndexExprResultWireFormat;
 
     use crate::{
         Dataset,
@@ -859,7 +861,7 @@ mod tests {
     /// consumers that trust `ExecutionPlan::schema()` will see a different
     /// shape than they receive.
     ///
-    /// The schema depends on the `IndexExprResultFormat` passed to `ScalarIndexExec::new`.
+    /// The schema depends on the `IndexExprResultWireFormat` passed to `ScalarIndexExec::new`.
     #[tokio::test]
     async fn test_scalar_index_exec_advertises_correct_schema() {
         let TestFixture {
@@ -898,14 +900,14 @@ mod tests {
         let plan = ScalarIndexExec::new(
             dataset.clone(),
             query.clone(),
-            IndexExprResultFormat::ThreeVariant,
+            IndexExprResultWireFormat::ThreeVariant,
         );
-        let schema = IndexExprResultFormat::ThreeVariant.schema().clone();
+        let schema = IndexExprResultWireFormat::ThreeVariant.schema().clone();
 
         verify(plan, schema).await;
 
-        let plan = ScalarIndexExec::new(dataset, query, IndexExprResultFormat::TwoMask);
-        let schema = IndexExprResultFormat::TwoMask.schema().clone();
+        let plan = ScalarIndexExec::new(dataset, query, IndexExprResultWireFormat::TwoMask);
+        let schema = IndexExprResultWireFormat::TwoMask.schema().clone();
 
         verify(plan, schema).await;
     }
@@ -934,7 +936,7 @@ mod tests {
         let plan = ScalarIndexExec::new(
             arc_dasaset.clone(),
             query.clone(),
-            IndexExprResultFormat::default(),
+            IndexExprResultWireFormat::default(),
         );
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
 
