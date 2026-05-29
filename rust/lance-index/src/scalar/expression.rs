@@ -3089,10 +3089,10 @@ mod tests {
 
         let lower_addrs = RowAddrTreeMap::from_iter(0u64..3);
         let upper_addrs = RowAddrTreeMap::from_iter(0u64..10);
-        let refined = IndexExprResult {
-            lower: RowAddrMask::from_allowed(lower_addrs),
-            upper: RowAddrMask::from_allowed(upper_addrs.clone()),
-        };
+        let refined = IndexExprResult::new(
+            RowAddrMask::from_allowed(lower_addrs),
+            RowAddrMask::from_allowed(upper_addrs.clone()),
+        );
         assert!(!refined.is_exact() && !refined.is_at_most() && !refined.is_at_least());
 
         let fragments_covered = RoaringBitmap::from_iter([0u32, 1]);

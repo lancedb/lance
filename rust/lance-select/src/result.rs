@@ -61,6 +61,9 @@ pub struct NullableIndexExprResult {
     /// Rows that may be TRUE. Rows outside `upper` are guaranteed to be
     /// FALSE / NULL (and so not in a `WHERE` answer set).
     pub upper: NullableRowAddrMask,
+    // O(1) cache for is_exact(). Set by constructors and propagated
+    // elementwise through the boolean algebra.
+    exact: bool,
 }
 
 impl NullableIndexExprResult {
@@ -70,6 +73,7 @@ impl NullableIndexExprResult {
         Self {
             lower: mask.clone(),
             upper: mask,
+            exact: true,
         }
     }
 
@@ -80,6 +84,7 @@ impl NullableIndexExprResult {
         Self {
             lower: NullableRowAddrMask::allow_nothing(),
             upper: mask,
+            exact: false,
         }
     }
 
@@ -90,10 +95,11 @@ impl NullableIndexExprResult {
         Self {
             lower: mask,
             upper: NullableRowAddrMask::all_rows(),
+            exact: false,
         }
     }
 
-    /// True if `lower == upper` — the answer is precisely the lower
+    /// True if the result is exact — the answer is precisely the lower
     /// (== upper) mask.
     ///
     /// This is a **structural** check on the canonical form produced by
@@ -109,7 +115,7 @@ impl NullableIndexExprResult {
     /// The three shape predicates are not mutually exclusive — see the
     /// note on [`Self::is_at_least`] for the precedence convention.
     pub fn is_exact(&self) -> bool {
-        self.lower == self.upper
+        self.exact
     }
 
     /// True if `lower` matches no rows (canonical `AllowList(∅)`) — the
@@ -142,6 +148,7 @@ impl NullableIndexExprResult {
         IndexExprResult {
             lower: self.lower.drop_nulls(),
             upper: self.upper.drop_nulls(),
+            exact: self.exact,
         }
     }
 }
@@ -153,6 +160,7 @@ impl std::ops::Not for NullableIndexExprResult {
         Self {
             lower: !self.upper,
             upper: !self.lower,
+            exact: self.exact,
         }
     }
 }
@@ -164,6 +172,7 @@ impl std::ops::BitAnd<Self> for NullableIndexExprResult {
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
+            exact: self.exact && rhs.exact,
         }
     }
 }
@@ -175,6 +184,7 @@ impl std::ops::BitOr<Self> for NullableIndexExprResult {
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
+            exact: self.exact && rhs.exact,
         }
     }
 }
@@ -188,6 +198,9 @@ pub struct IndexExprResult {
     /// Rows that may be in the answer. Rows outside `upper` are
     /// guaranteed not in the answer.
     pub upper: RowAddrMask,
+    // O(1) cache for is_exact(). Set by constructors and propagated
+    // elementwise through the boolean algebra.
+    exact: bool,
 }
 
 impl IndexExprResult {
@@ -197,6 +210,7 @@ impl IndexExprResult {
         Self {
             lower: mask.clone(),
             upper: mask,
+            exact: true,
         }
     }
 
@@ -205,6 +219,7 @@ impl IndexExprResult {
         Self {
             lower: RowAddrMask::allow_nothing(),
             upper: mask,
+            exact: false,
         }
     }
 
@@ -213,15 +228,30 @@ impl IndexExprResult {
         Self {
             lower: mask,
             upper: RowAddrMask::all_rows(),
+            exact: false,
         }
     }
 
-    /// True if `lower == upper` — the answer is precisely the lower
+    /// Construct a refined interval result — `lower` rows are guaranteed
+    /// matches and `upper` rows are candidates, with `lower ⊆ upper`.
+    ///
+    /// Use [`Self::exact`] / [`Self::at_most`] / [`Self::at_least`] for
+    /// the three degenerate shapes; this constructor is only needed when
+    /// both endpoints are non-trivial.
+    pub fn new(lower: RowAddrMask, upper: RowAddrMask) -> Self {
+        Self {
+            lower,
+            upper,
+            exact: false,
+        }
+    }
+
+    /// True if the result is exact — the answer is precisely the lower
     /// (== upper) mask. See [`NullableIndexExprResult::is_exact`] for the
     /// structural-form caveat and the precedence convention shared with
     /// [`Self::is_at_most`] / [`Self::is_at_least`].
     pub fn is_exact(&self) -> bool {
-        self.lower == self.upper
+        self.exact
     }
 
     /// True if `lower` matches no rows (canonical `AllowList(∅)`) — the
@@ -247,6 +277,7 @@ impl std::ops::Not for IndexExprResult {
         Self {
             lower: !self.upper,
             upper: !self.lower,
+            exact: self.exact,
         }
     }
 }
@@ -258,6 +289,7 @@ impl std::ops::BitAnd<Self> for IndexExprResult {
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
+            exact: self.exact && rhs.exact,
         }
     }
 }
@@ -269,6 +301,7 @@ impl std::ops::BitOr<Self> for IndexExprResult {
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
+            exact: self.exact && rhs.exact,
         }
     }
 }
@@ -408,12 +441,13 @@ impl IndexExprResult {
         let index_result = if first_col_name == "lower" {
             let lower = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
             let upper_col = batch.column(1).as_binary::<i32>();
-            let upper = if upper_col.is_null(0) && upper_col.is_null(1) {
-                lower.clone()
+            if upper_col.is_null(0) && upper_col.is_null(1) {
+                // Null upper column is the serialized form of an exact result.
+                Self::exact(lower)
             } else {
-                RowAddrMask::from_arrow(upper_col)?
-            };
-            Self { lower, upper }
+                let upper = RowAddrMask::from_arrow(upper_col)?;
+                Self { lower, upper, exact: false }
+            }
         } else if first_col_name == "result" {
             let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
             let match_type = batch

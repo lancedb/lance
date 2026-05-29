@@ -2382,10 +2382,7 @@ mod tests {
             // Refined: non-empty lower strictly inside non-universe upper.
             (
                 "refined",
-                IndexExprResult {
-                    lower: mk(&[1, 2]),
-                    upper: mk(&[1, 2, 3]),
-                },
+                IndexExprResult::new(mk(&[1, 2]), mk(&[1, 2, 3])),
             ),
         ];
 
