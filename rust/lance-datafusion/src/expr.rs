@@ -17,6 +17,16 @@ const MS_PER_DAY: i64 = 86400000;
 // will always yield "x = 7_u64" regardless of the type of the column "x".  As a result, we
 // need to do that literal coercion ourselves.
 pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarValue> {
+    // A dictionary target coerces the value to the dictionary's value type and
+    // re-wraps it as a dictionary literal. Nulls keep their untyped form,
+    // matching the existing `ScalarValue::Null` behavior for all targets.
+    if let DataType::Dictionary(key_type, value_type) = ty {
+        if value.is_null() {
+            return Some(value.clone());
+        }
+        let inner = safe_coerce_scalar(value, value_type)?;
+        return Some(ScalarValue::Dictionary(key_type.clone(), Box::new(inner)));
+    }
     match value {
         ScalarValue::Int8(val) => match ty {
             DataType::Int8 => Some(value.clone()),
@@ -436,6 +446,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::BinaryView => Some(value.clone()),
             _ => None,
         },
+        // A dictionary-encoded literal (e.g. produced by DataFusion's dictionary
+        // cast in the scalar-index path) coerces by unwrapping its underlying value.
+        ScalarValue::Dictionary(_, inner) => safe_coerce_scalar(inner, ty),
         _ => None,
     }
 }
@@ -773,6 +786,75 @@ mod tests {
                 &DataType::BinaryView
             ),
             Some(ScalarValue::BinaryView(Some(vec![1, 2, 3])))
+            );
+    }
+    
+    #[test]
+    fn test_dictionary_coerce() {
+        let dict_ty = DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
+
+        // A string literal coerces to a dictionary target by wrapping the
+        // coerced value in a dictionary scalar.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8(Some("com".to_string())), &dict_ty),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+            ))
+        );
+
+        // The inner value is coerced through to the dictionary value type, so a
+        // LargeUtf8 literal lands as a Utf8 value inside the dictionary.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::LargeUtf8(Some("com".to_string())), &dict_ty),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+            ))
+        );
+
+        // A dictionary literal round-trips back to its value type.
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Dictionary(
+                    Box::new(DataType::Int16),
+                    Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+                ),
+                &DataType::Utf8,
+            ),
+            Some(ScalarValue::Utf8(Some("com".to_string())))
+        );
+
+        // A dictionary literal coerces to a dictionary target, adopting the
+        // target's key type.
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+                ),
+                &dict_ty,
+            ),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+            ))
+        );
+
+        // Null literals keep their untyped form, matching the behavior for all
+        // other target types.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8(None), &dict_ty),
+            Some(ScalarValue::Utf8(None))
+        );
+
+        // A value that cannot be coerced to the dictionary value type fails.
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Utf8(Some("com".to_string())),
+                &DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Int32)),
+            ),
+            None
         );
     }
 }
