@@ -43,7 +43,7 @@ use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::{
-    LsmDataSourceCollector, LsmPointLookupPlanner, ShardSnapshot,
+    InMemoryMemTableRef, LsmDataSourceCollector, LsmPointLookupPlanner, ShardSnapshot,
 };
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
@@ -132,6 +132,62 @@ fn build_queries(rows: usize, queries: usize, miss_ratio: f64, seed: u64) -> Vec
         out.swap(i, j);
     }
     out
+}
+
+// ----------------------------------------------------------------------
+// Lance direct BTree fast-path (bypasses DataFusion)
+// ----------------------------------------------------------------------
+
+/// Resolve a single key against the active MemTable's BTree index without
+/// building a DataFusion plan: probe the index, honor the MVCC visibility
+/// watermark, pick the newest matching row position, and slice that one row
+/// out of the BatchStore. Returns `None` if the key isn't present/visible.
+///
+/// This mirrors what `BTreeIndexExec` does internally, minus the plan/stream
+/// machinery — it is the lower bound on how fast the current MemTable index
+/// can answer a point lookup. Single-active-memtable only (the bench never
+/// flushes), `KEY_COL` BTree assumed present.
+fn fast_lookup(active: &InMemoryMemTableRef, key: i64) -> Option<RecordBatch> {
+    use arrow_array::Array;
+
+    let btree = active.index_store.get_btree_by_column(KEY_COL)?;
+    let max_vbp = active.index_store.max_visible_batch_position();
+
+    // Highest visible row (exclusive end) across batches whose position is
+    // within the watermark. Batch position == iteration index for a
+    // never-flushed store.
+    let mut visible_end: u64 = 0;
+    for (bp, sb) in active.batch_store.iter().enumerate() {
+        if bp <= max_vbp {
+            visible_end += sb.num_rows as u64;
+        } else {
+            break;
+        }
+    }
+    if visible_end == 0 {
+        return None;
+    }
+    let max_visible_row = visible_end - 1;
+
+    // Newest visible row position carrying this key (largest position wins).
+    let pos = btree
+        .get(&ScalarValue::Int64(Some(key)))
+        .into_iter()
+        .filter(|&p| p <= max_visible_row)
+        .max()?;
+
+    // Map the global position to (batch, row) and slice one row.
+    let mut start: u64 = 0;
+    for sb in active.batch_store.iter() {
+        let end = start + sb.num_rows as u64;
+        if pos >= start && pos < end {
+            let row = (pos - start) as usize;
+            let cols: Vec<_> = sb.data.columns().iter().map(|c| c.slice(row, 1)).collect();
+            return RecordBatch::try_new(sb.data.schema(), cols).ok();
+        }
+        start = end;
+    }
+    None
 }
 
 // ----------------------------------------------------------------------
@@ -296,6 +352,34 @@ enum Engine {
     Both,
 }
 
+/// How the Lance arm resolves a point lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanceReadMode {
+    /// Build + execute a DataFusion `ExecutionPlan` per lookup (production
+    /// `LsmPointLookupPlanner::plan_lookup` path).
+    Plan,
+    /// Probe the active MemTable's BTree index directly and materialize the
+    /// row from the BatchStore, bypassing DataFusion. Single-active-memtable
+    /// fast path (no flushed generations); misses fall through as "not found".
+    Fast,
+}
+
+impl LanceReadMode {
+    fn parse(v: &str) -> std::result::Result<Self, String> {
+        match v {
+            "plan" => Ok(Self::Plan),
+            "fast" => Ok(Self::Fast),
+            _ => Err(format!("unknown lance-read-mode '{v}', expected plan|fast")),
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Fast => "fast",
+        }
+    }
+}
+
 impl Engine {
     fn parse(v: &str) -> std::result::Result<Self, String> {
         match v {
@@ -316,6 +400,7 @@ struct Args {
     threads: usize,
     batch_rows: usize,
     engine: Engine,
+    lance_read_mode: LanceReadMode,
     uri: String,
     seed: u64,
     /// Skip the RocksDB WAL on writes. Off by default so RocksDB writes a WAL
@@ -334,6 +419,7 @@ impl Default for Args {
             threads: 8,
             batch_rows: 1_000,
             engine: Engine::Both,
+            lance_read_mode: LanceReadMode::Plan,
             uri: String::new(),
             seed: 0x5EED,
             rocksdb_disable_wal: false,
@@ -376,6 +462,10 @@ fn parse_args() -> Result<Args> {
             "--batch-rows" => args.batch_rows = parse_val(&flag, &value)?,
             "--engine" => {
                 args.engine = Engine::parse(&value).map_err(lance_core::Error::invalid_input)?
+            }
+            "--lance-read-mode" => {
+                args.lance_read_mode =
+                    LanceReadMode::parse(&value).map_err(lance_core::Error::invalid_input)?
             }
             "--uri" => {
                 args.uri = value;
@@ -530,6 +620,9 @@ async fn run_lance(
             shard_snapshot = shard_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
         }
     }
+    // Keep a handle to the active MemTable for the direct fast path before
+    // the collector takes ownership of the refs.
+    let active = Arc::new(in_memory_refs.active.clone());
     let collector = LsmDataSourceCollector::new(dataset.clone(), vec![shard_snapshot])
         .with_in_memory_memtables(shard_id, in_memory_refs);
     let planner = Arc::new(LsmPointLookupPlanner::new(
@@ -538,15 +631,24 @@ async fn run_lance(
         arrow_schema,
     ));
 
-    // Warmup + correctness: a hit key must resolve to one row.
+    // Warmup + correctness: a hit key must resolve to exactly one row under
+    // whichever read mode we're timing.
     {
         let probe = insert_order[insert_order.len() / 2];
-        let plan = planner
-            .plan_lookup(&[ScalarValue::Int64(Some(probe))], None)
-            .await?;
-        let ctx = SessionContext::new();
-        let batches: Vec<RecordBatch> = plan.execute(0, ctx.task_ctx())?.try_collect().await?;
-        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let n = match args.lance_read_mode {
+            LanceReadMode::Plan => {
+                let plan = planner
+                    .plan_lookup(&[ScalarValue::Int64(Some(probe))], None)
+                    .await?;
+                let ctx = SessionContext::new();
+                let batches: Vec<RecordBatch> =
+                    plan.execute(0, ctx.task_ctx())?.try_collect().await?;
+                batches.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
+            LanceReadMode::Fast => fast_lookup(&active, probe)
+                .map(|b| b.num_rows())
+                .unwrap_or(0),
+        };
         assert_eq!(n, 1, "warmup lookup for key {probe} returned {n} rows");
     }
 
@@ -560,12 +662,18 @@ async fn run_lance(
     let t_read = Instant::now();
     for &(key, expect_hit) in queries {
         let t0 = Instant::now();
-        let plan = planner
-            .plan_lookup(&[ScalarValue::Int64(Some(key))], None)
-            .await?;
-        let batches: Vec<RecordBatch> = plan.execute(0, task_ctx.clone())?.try_collect().await?;
+        let n = match args.lance_read_mode {
+            LanceReadMode::Plan => {
+                let plan = planner
+                    .plan_lookup(&[ScalarValue::Int64(Some(key))], None)
+                    .await?;
+                let batches: Vec<RecordBatch> =
+                    plan.execute(0, task_ctx.clone())?.try_collect().await?;
+                batches.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
+            LanceReadMode::Fast => fast_lookup(&active, key).map(|b| b.num_rows()).unwrap_or(0),
+        };
         latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
-        let n: usize = batches.iter().map(|b| b.num_rows()).sum();
         if expect_hit {
             assert_eq!(n, 1, "expected hit for key {key}, got {n}");
             hits += 1;
@@ -580,8 +688,30 @@ async fn run_lance(
     let stats = compute_stats(latencies_us);
 
     // --- read phase: N-thread QPS ---
-    let read_qps_nt = if args.threads > 1 {
-        let keys: Arc<Vec<i64>> = Arc::new(queries.iter().map(|(k, _)| *k).collect());
+    let keys: Arc<Vec<i64>> = Arc::new(queries.iter().map(|(k, _)| *k).collect());
+    let read_qps_nt = if args.threads <= 1 {
+        read_qps_1t
+    } else if args.lance_read_mode == LanceReadMode::Fast {
+        // Direct path is synchronous; fan out over OS threads like RocksDB.
+        let t = Instant::now();
+        let mut handles = Vec::with_capacity(args.threads);
+        for shard in 0..args.threads {
+            let active = active.clone();
+            let keys = keys.clone();
+            let threads = args.threads;
+            handles.push(std::thread::spawn(move || {
+                let mut i = shard;
+                while i < keys.len() {
+                    std::hint::black_box(fast_lookup(&active, keys[i]));
+                    i += threads;
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9)
+    } else {
         let t = Instant::now();
         let mut handles = Vec::with_capacity(args.threads);
         for shard in 0..args.threads {
@@ -616,8 +746,6 @@ async fn run_lance(
         }
         let s = t.elapsed().as_secs_f64();
         total as f64 / s.max(1e-9)
-    } else {
-        read_qps_1t
     };
 
     let peak_rss_mb = sampler.stop();
@@ -640,7 +768,10 @@ async fn run_lance(
     std::mem::forget(writer);
 
     Ok(EngineResult {
-        engine: "lance",
+        engine: match args.lance_read_mode {
+            LanceReadMode::Plan => "lance",
+            LanceReadMode::Fast => "lance-fast",
+        },
         write_rows_per_s,
         write_cpu_s,
         read_p50_us: stats.p50_us,
@@ -850,7 +981,7 @@ fn print_comparison(results: &[EngineResult]) {
     }
     // Ratios when both ran.
     if let (Some(l), Some(rdb)) = (
-        results.iter().find(|r| r.engine == "lance"),
+        results.iter().find(|r| r.engine.starts_with("lance")),
         results.iter().find(|r| r.engine == "rocksdb"),
     ) {
         let safe = |a: f64, b: f64| if b > 0.0 { a / b } else { f64::NAN };
@@ -868,8 +999,9 @@ fn print_comparison(results: &[EngineResult]) {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_kv_point_lookup engine={:?} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
+        "bench=mem_wal_kv_point_lookup engine={:?} lance_read_mode={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
         args.engine,
+        args.lance_read_mode.as_str(),
         args.rows,
         args.value_size,
         args.queries,
