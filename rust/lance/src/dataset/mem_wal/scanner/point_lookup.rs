@@ -232,21 +232,24 @@ impl LsmPointLookupPlanner {
         pk_values: &[ScalarValue],
         projection: Option<&[String]>,
     ) -> Result<Option<RecordBatch>> {
-        // Fast path: single-column key, the key's scalar type exactly matches
-        // the PK column's Arrow type, and no system columns in the output.
-        // The exact-type requirement avoids the `OrderableScalarValue` panic on
-        // comparing mismatched variants — the plan path coerces, so a
-        // coercible-but-different literal (e.g. `Int64` for an `Int32` PK)
-        // falls back rather than risking a panic or a wrong result.
-        let pk_type_matches = self.pk_columns.len() == 1
+        // Fast path: exactly one key value (which must match the single PK
+        // column), the key's scalar type exactly matches the PK column's Arrow
+        // type, and no system columns in the output. The length check is first
+        // so `pk_values[0]` is only indexed once it is known to exist (an empty
+        // slice falls through to the plan path, which returns a clean
+        // `invalid_input` error rather than panicking). The exact-type
+        // requirement avoids the `OrderableScalarValue` panic on comparing
+        // mismatched variants — the plan path coerces, so a coercible-but-
+        // different literal (e.g. `Int64` for an `Int32` PK) falls back.
+        let fast_eligible = pk_values.len() == 1
+            && self.pk_columns.len() == 1
             && self
                 .base_schema
                 .field_with_name(&self.pk_columns[0])
                 .ok()
                 .map(|f| f.data_type() == &pk_values[0].data_type())
                 .unwrap_or(false);
-        if pk_values.len() == self.pk_columns.len() && self.pk_columns.len() == 1 && pk_type_matches
-        {
+        if fast_eligible {
             let target =
                 canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
             let has_system_col = target.fields().iter().any(|f| is_system_column(f.name()));
@@ -1205,5 +1208,29 @@ mod tests {
             .expect("must not panic on a coercible-but-different key type")
             .expect("plan path coerces Int64 → Int32 and finds id=20");
         assert_eq!(id_at(&row), 20);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_empty_pk_values_errors_not_panics() {
+        // Regression: the fast-path eligibility check must not index
+        // `pk_values[0]` before verifying the slice is non-empty. An empty
+        // slice falls through to the plan path's length validation.
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let active = active_memtable_ref(&schema, &[create_test_batch(&schema, &[1], "v")], 1);
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active,
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let err = planner.lookup(&[], None).await;
+        assert!(err.is_err(), "empty pk_values must error, not panic");
     }
 }
