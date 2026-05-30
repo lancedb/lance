@@ -2082,6 +2082,12 @@ struct BlockMeta {
     freq_width: u8,
     /// bit width of the packed position deltas.
     pos_width: u8,
+    /// Block-local BM25 score bound inputs: the largest frequency and the
+    /// smallest doc length in the block. `doc_weight(max_freq, min_dl)` is the
+    /// block's per-doc upper bound, used to skip whole non-competitive blocks
+    /// in the single-term top-k scan (block-max WAND).
+    max_freq: u32,
+    min_dl: u32,
 }
 
 /// Per-term locator into a partition's shared posting buffers.
@@ -2154,14 +2160,16 @@ fn build_partition(
             // A doc's position count equals its frequency, so no count is
             // stored — doc `i`'s slice is found from the freq prefix sum.
             let mut pos_deltas: Vec<u32> = Vec::new();
+            let mut blk_min_dl = u32::MAX;
             for &(d, _, ref positions) in chunk {
                 let mut prev_p = 0u32;
                 for &p in positions {
                     pos_deltas.push(p - prev_p);
                     prev_p = p;
                 }
-                term_min_dl = term_min_dl.min(docs.num_tokens(d));
+                blk_min_dl = blk_min_dl.min(docs.num_tokens(d));
             }
+            term_min_dl = term_min_dl.min(blk_min_dl);
             let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
             bitpack_put(&mut pos_data, &pos_deltas, pos_width);
             block_meta.push(BlockMeta {
@@ -2172,6 +2180,8 @@ fn build_partition(
                 doc_width,
                 freq_width,
                 pos_width,
+                max_freq: blk_max_freq,
+                min_dl: blk_min_dl.max(1),
             });
             term_max_freq = term_max_freq.max(blk_max_freq);
         }
@@ -2381,7 +2391,64 @@ impl Partition {
     /// are skipped. Because the threshold is shared across all partitions and
     /// the tail, a partition processed late prunes against an already-warm
     /// threshold instead of cold-starting.
+    /// Single-term top-k with block-max skipping. For each 128-doc block, the
+    /// per-block upper bound `qw * doc_weight(block.max_freq, block.min_dl)`
+    /// bounds every doc's score in the block; when the top-k heap is full and
+    /// that bound cannot beat the current k-th score, the block is skipped
+    /// without decoding. This keeps cost ~O(competitive blocks) instead of
+    /// O(df), the gap behind term-query latency scaling with corpus size.
+    /// Exactness is preserved: the bound is sound, so no top-k doc is dropped.
+    fn score_single_into(&self, term_id: u32, qw: f32, scorer: &MemBM25Scorer, topk: &mut TopK) {
+        let pref = self.postings[term_id as usize];
+        let bp = BitPacker4x::new();
+        let mut docs: Vec<u32> = Vec::new();
+        let mut freqs: Vec<u32> = Vec::new();
+        for block in 0..pref.block_count {
+            let bm = self.block_meta[(pref.block_start + block) as usize];
+            let block_ub = qw * scorer.doc_weight(bm.max_freq, bm.min_dl);
+            if block_ub <= topk.threshold() {
+                continue; // no doc in this block can enter the top-k
+            }
+            let n = block_len(pref.doc_count, block);
+            let df_start = bm.df_offset as usize;
+            unpack_block(
+                &bp,
+                &self.doc_freq_data,
+                df_start,
+                n,
+                bm.doc_width,
+                &mut docs,
+            );
+            for d in &mut docs {
+                *d += bm.first_doc;
+            }
+            let freq_start = df_start + bitpack_len(n, bm.doc_width);
+            unpack_block(
+                &bp,
+                &self.doc_freq_data,
+                freq_start,
+                n,
+                bm.freq_width,
+                &mut freqs,
+            );
+            for i in 0..n {
+                let doc = docs[i];
+                let dl = self.docs.num_tokens(doc);
+                let score = qw * scorer.doc_weight(freqs[i], dl);
+                topk.offer(score, self.docs.row_id(doc));
+            }
+        }
+    }
+
     fn wand_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
+        // Single-term top-k: block-max skip. Multi-term: pivot WAND below.
+        if tokens.len() == 1 {
+            if let Some(id) = self.term_id(&tokens[0]) {
+                let qw = scorer.query_weight(&tokens[0]);
+                self.score_single_into(id, qw, scorer, topk);
+            }
+            return;
+        }
         let mut lanes: Vec<WandLane> = Vec::with_capacity(tokens.len());
         for token in tokens {
             if let Some(id) = self.term_id(token) {
