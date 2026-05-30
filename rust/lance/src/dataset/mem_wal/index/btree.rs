@@ -52,12 +52,14 @@ impl Ord for IndexKey {
 pub struct BTreeMemIndex {
     /// Ordered map: (scalar_value, row_position) -> (). Serves range queries.
     lookup: SkipMap<IndexKey, ()>,
-    /// Equality sidecar: value -> newest (largest) row position. Gives O(1)
-    /// equality point lookups instead of an O(log n) skiplist range scan (the
-    /// dominant point-lookup cost). Only the newest position is kept; the rare
-    /// case where it isn't visible yet (a concurrent newer write) falls back to
-    /// the ordered `lookup` to find the newest *visible* version.
-    equality_hash: DashMap<ScalarValue, RowPosition>,
+    /// Optional equality sidecar: value -> newest (largest) row position. When
+    /// present, gives O(1) equality point lookups instead of an O(log n)
+    /// skiplist range scan (the dominant point-lookup cost). Built **only for
+    /// the primary-key index**, since non-PK btrees (used for range filtering)
+    /// never point-look-up and shouldn't pay the dual write/memory cost. Only
+    /// the newest position is kept; the rare case where it isn't visible yet (a
+    /// concurrent newer write) falls back to the ordered `lookup`.
+    equality_hash: Option<DashMap<ScalarValue, RowPosition>>,
     /// Field ID this index is built on.
     field_id: i32,
     /// Column name (for Arrow batch lookups).
@@ -65,27 +67,35 @@ pub struct BTreeMemIndex {
 }
 
 impl BTreeMemIndex {
-    /// Create a new BTree index for the given field.
-    pub fn new(field_id: i32, column_name: String) -> Self {
+    /// Create a new BTree index for the given field. `with_equality_hash`
+    /// builds the O(1) equality sidecar — pass `true` only for the primary-key
+    /// index, where point lookups happen.
+    pub fn new(field_id: i32, column_name: String, with_equality_hash: bool) -> Self {
         Self {
             lookup: SkipMap::new(),
-            equality_hash: DashMap::new(),
+            equality_hash: with_equality_hash.then(DashMap::new),
             field_id,
             column_name,
         }
     }
 
-    /// Index one (value, row_position) into both the ordered skiplist (for
-    /// ranges) and the equality hash (newest position wins).
+    /// Whether this index maintains the O(1) equality sidecar.
+    pub fn has_equality_hash(&self) -> bool {
+        self.equality_hash.is_some()
+    }
+
+    /// Index one (value, row_position) into the ordered skiplist (for ranges)
+    /// and, when present, the equality hash (newest position wins).
     fn add(&self, value: OrderableScalarValue, row_position: RowPosition) {
-        self.equality_hash
-            .entry(value.0.clone())
-            .and_modify(|p| {
-                if row_position > *p {
-                    *p = row_position;
-                }
-            })
-            .or_insert(row_position);
+        if let Some(hash) = &self.equality_hash {
+            hash.entry(value.0.clone())
+                .and_modify(|p| {
+                    if row_position > *p {
+                        *p = row_position;
+                    }
+                })
+                .or_insert(row_position);
+        }
         self.lookup.insert(
             IndexKey {
                 value,
@@ -205,7 +215,7 @@ impl BTreeMemIndex {
     /// yet (a concurrent newer write), fall back to [`Self::get`] to find the
     /// newest *visible* version.
     pub fn get_eq(&self, value: &ScalarValue) -> Option<RowPosition> {
-        self.equality_hash.get(value).map(|e| *e.value())
+        self.equality_hash.as_ref()?.get(value).map(|e| *e.value())
     }
 
     pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
@@ -346,6 +356,9 @@ pub struct BTreeIndexConfig {
     pub field_id: i32,
     /// Column name (for Arrow batch lookups).
     pub column: String,
+    /// Whether this is the primary-key index — only then is the O(1) equality
+    /// hash sidecar built (point lookups happen on the PK).
+    pub is_primary_key: bool,
 }
 
 #[cfg(test)]
@@ -376,7 +389,7 @@ mod tests {
     #[test]
     fn test_btree_index_insert_and_lookup() {
         let schema = create_test_schema();
-        let index = BTreeMemIndex::new(0, "id".to_string());
+        let index = BTreeMemIndex::new(0, "id".to_string(), false);
 
         let batch = create_test_batch(&schema, 0);
         // row_offset = 0 for first batch
@@ -397,7 +410,7 @@ mod tests {
     #[test]
     fn test_btree_get_eq_newest_absent_and_range_intact() {
         let schema = create_test_schema();
-        let index = BTreeMemIndex::new(0, "id".to_string());
+        let index = BTreeMemIndex::new(0, "id".to_string(), true);
         // ids 0,1,2 at positions 0,1,2 ...
         index.insert(&create_test_batch(&schema, 0), 0).unwrap();
         // ... then the same ids again at positions 3,4,5 (an update).
@@ -418,7 +431,7 @@ mod tests {
     #[test]
     fn test_btree_index_multiple_batches() {
         let schema = create_test_schema();
-        let index = BTreeMemIndex::new(0, "id".to_string());
+        let index = BTreeMemIndex::new(0, "id".to_string(), false);
 
         let batch1 = create_test_batch(&schema, 0);
         let batch2 = create_test_batch(&schema, 10);
@@ -442,7 +455,7 @@ mod tests {
         use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 
         let schema = create_test_schema();
-        let index = BTreeMemIndex::new(0, "id".to_string());
+        let index = BTreeMemIndex::new(0, "id".to_string(), false);
 
         let batch1 = create_test_batch(&schema, 0); // ids: 0, 1, 2
         let batch2 = create_test_batch(&schema, 10); // ids: 10, 11, 12
@@ -493,7 +506,7 @@ mod tests {
     #[test]
     fn test_btree_index_snapshot() {
         let schema = create_test_schema();
-        let index = BTreeMemIndex::new(0, "id".to_string());
+        let index = BTreeMemIndex::new(0, "id".to_string(), false);
 
         let batch = create_test_batch(&schema, 0);
         index.insert(&batch, 0).unwrap();

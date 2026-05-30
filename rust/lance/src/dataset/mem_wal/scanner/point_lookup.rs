@@ -642,19 +642,30 @@ fn probe_position(
         return Ok(ProbePos::Miss);
     }
 
-    let pos = match btree.get_eq(pk_value) {
-        None => return Ok(ProbePos::Miss),
-        Some(p) if p < visible_end => p,
-        Some(_) => {
-            let Some(p) = btree
-                .get(pk_value)
-                .into_iter()
-                .filter(|&p| p < visible_end)
-                .max()
-            else {
-                return Ok(ProbePos::Miss);
-            };
-            p
+    // Newest *visible* position of the key. With the equality hash (PK index),
+    // probe it O(1) and only range-scan when the newest isn't visible yet.
+    // Without the hash (a non-PK btree), range-scan the ordered skiplist
+    // directly — correct, just O(log n).
+    let newest_visible_by_range = || {
+        btree
+            .get(pk_value)
+            .into_iter()
+            .filter(|&p| p < visible_end)
+            .max()
+    };
+    let pos = if btree.has_equality_hash() {
+        match btree.get_eq(pk_value) {
+            None => return Ok(ProbePos::Miss),
+            Some(p) if p < visible_end => p,
+            Some(_) => match newest_visible_by_range() {
+                Some(p) => p,
+                None => return Ok(ProbePos::Miss),
+            },
+        }
+    } else {
+        match newest_visible_by_range() {
+            Some(p) => p,
+            None => return Ok(ProbePos::Miss),
         }
     };
 
@@ -1583,5 +1594,71 @@ mod tests {
             .unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_without_equality_hash_uses_range_fallback() {
+        // A btree with no equality hash (a non-PK index) must still resolve
+        // equality point lookups correctly — via the ordered range scan.
+        use crate::dataset::mem_wal::index::{BTreeIndexConfig, IndexStore, MemIndexConfig};
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+
+        let schema = create_pk_schema();
+        let batch = create_test_batch(&schema, &[10, 20, 30], "v");
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let index_store = IndexStore::from_configs(
+            &[MemIndexConfig::BTree(BTreeIndexConfig {
+                name: "id_idx".to_string(),
+                field_id: 0,
+                column: "id".to_string(),
+                is_primary_key: false, // no equality hash
+            })],
+            1000,
+            100,
+        )
+        .unwrap();
+        let (idx, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, row_offset, Some(idx))
+            .unwrap();
+        assert!(
+            !index_store
+                .get_btree_by_column("id")
+                .unwrap()
+                .has_equality_hash(),
+            "non-PK btree should have no equality hash"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: Arc::new(index_store),
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(20))], None)
+            .await
+            .unwrap()
+            .expect("range fallback must find the row");
+        assert_eq!(id_at(&row), 20);
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(99))], None)
+                .await
+                .unwrap()
+                .is_none(),
+            "absent key must miss"
+        );
     }
 }

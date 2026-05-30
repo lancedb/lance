@@ -94,10 +94,17 @@ impl MemIndexConfig {
     /// Create a BTree index config from base table IndexMetadata.
     pub fn btree_from_metadata(index_meta: &IndexMetadata, schema: &LanceSchema) -> Result<Self> {
         let (field_id, column) = Self::extract_field_info(index_meta, schema)?;
+        // Only the primary-key btree gets the O(1) equality hash; non-PK btrees
+        // serve range filters and never point-look-up.
+        let is_primary_key = schema
+            .unenforced_primary_key()
+            .iter()
+            .any(|f| f.name == column);
         Ok(Self::BTree(BTreeIndexConfig {
             name: index_meta.name.clone(),
             field_id,
             column,
+            is_primary_key,
         }))
     }
 
@@ -263,7 +270,7 @@ impl IndexStore {
         for config in configs {
             match config {
                 MemIndexConfig::BTree(c) => {
-                    let index = BTreeMemIndex::new(c.field_id, c.column.clone());
+                    let index = BTreeMemIndex::new(c.field_id, c.column.clone(), c.is_primary_key);
                     registry.btree_indexes.insert(c.name.clone(), index);
                 }
                 MemIndexConfig::Hnsw(c) => {
@@ -288,10 +295,13 @@ impl IndexStore {
         Ok(registry)
     }
 
-    /// Add a BTree/scalar index (implemented using skip-list for better concurrency).
+    /// Add a BTree/scalar index (implemented using skip-list for better
+    /// concurrency). Builds the equality hash by default — this is a low-level
+    /// / test helper; the production memtable path goes through
+    /// [`Self::from_configs`], which gates the hash on the primary key.
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.btree_indexes
-            .insert(name, BTreeMemIndex::new(field_id, column));
+            .insert(name, BTreeMemIndex::new(field_id, column, true));
     }
 
     /// Add an HNSW vector index with default build parameters.
@@ -732,6 +742,7 @@ mod tests {
                 name: "pk_idx".to_string(),
                 field_id: 0,
                 column: "id".to_string(),
+                is_primary_key: true,
             }),
             MemIndexConfig::Fts(FtsIndexConfig::new(
                 "search_idx".to_string(),
@@ -747,6 +758,35 @@ mod tests {
         // Also test field_id lookup
         assert!(registry.get_btree_by_field_id(0).is_some());
         assert!(registry.get_fts_by_field_id(2).is_some());
+    }
+
+    #[test]
+    fn test_from_configs_equality_hash_only_for_primary_key() {
+        // Only the PK btree should carry the O(1) equality hash; a non-PK btree
+        // (range filtering) must not pay the dual write/memory cost.
+        let configs = vec![
+            MemIndexConfig::BTree(BTreeIndexConfig {
+                name: "pk_idx".to_string(),
+                field_id: 0,
+                column: "id".to_string(),
+                is_primary_key: true,
+            }),
+            MemIndexConfig::BTree(BTreeIndexConfig {
+                name: "score_idx".to_string(),
+                field_id: 1,
+                column: "score".to_string(),
+                is_primary_key: false,
+            }),
+        ];
+        let registry = IndexStore::from_configs(&configs, 100_000, 1_000).unwrap();
+        assert!(
+            registry.get_btree("pk_idx").unwrap().has_equality_hash(),
+            "PK btree must build the equality hash"
+        );
+        assert!(
+            !registry.get_btree("score_idx").unwrap().has_equality_hash(),
+            "non-PK btree must NOT build the equality hash"
+        );
     }
 
     #[test]
