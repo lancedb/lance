@@ -649,6 +649,7 @@ impl TailIndex {
     }
 
     /// Install one batch's term chunks then publish a new visibility snapshot.
+    #[allow(clippy::too_many_arguments)] // one batch's fields, threaded together
     fn append_batch(
         &self,
         batch_position: usize,
