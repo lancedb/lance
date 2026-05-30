@@ -63,6 +63,44 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
     T::dot(from, to)
 }
 
+/// Dot product between two f32 slices, dispatched to the widest SIMD backend
+/// available at runtime. See [`crate::distance::l2::l2_f32`] for why this is
+/// needed on top of the generic [`dot`].
+#[inline]
+pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use lance_core::utils::cpu::SimdSupport;
+        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
+            // SAFETY: guarded by the runtime AVX-512 detection above.
+            return unsafe { dot_f32_avx512(x, y) };
+        }
+    }
+    dot(x, y)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dot_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let a = _mm512_loadu_ps(x.as_ptr().add(i));
+        let b = _mm512_loadu_ps(y.as_ptr().add(i));
+        acc = _mm512_fmadd_ps(a, b, acc);
+        i += 16;
+    }
+    let mut sum = _mm512_reduce_add_ps(acc);
+    while i < n {
+        sum += x[i] * y[i];
+        i += 1;
+    }
+    sum
+}
+
 /// Negative [Dot] distance.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
@@ -328,6 +366,17 @@ mod tests {
     };
     use num_traits::{Float, FromPrimitive};
     use proptest::prelude::*;
+
+    #[test]
+    fn test_dot_f32_dispatch_matches_scalar() {
+        use approx::assert_relative_eq;
+        // Covers tail handling for lengths around the 16-lane AVX-512 stride.
+        for dim in [1usize, 7, 15, 16, 17, 31, 33, 64, 100, 1024] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.25 + 1.5).collect();
+            assert_relative_eq!(dot_f32(&x, &y), dot(&x, &y), max_relative = 1e-5);
+        }
+    }
 
     #[test]
     fn test_dot() {
