@@ -190,6 +190,75 @@ fn fast_lookup(active: &InMemoryMemTableRef, key: i64) -> Option<RecordBatch> {
     None
 }
 
+/// Batch get: resolve many keys against the active MemTable BTree in one pass,
+/// gathering all matching rows per source batch with a single vectorized
+/// `take`, then concatenating into one RecordBatch. This amortizes per-call
+/// overhead across the whole batch and uses Arrow's columnar gather — the
+/// shape where the batch system should beat row-at-a-time point lookups.
+/// Returns the found rows (missing keys omitted).
+fn fast_lookup_batch(active: &InMemoryMemTableRef, keys: &[i64]) -> RecordBatch {
+    use arrow_array::UInt32Array;
+    use arrow_select::concat::concat_batches;
+    use arrow_select::take::take;
+
+    let schema = active.schema.clone();
+    let Some(btree) = active.index_store.get_btree_by_column(KEY_COL) else {
+        return RecordBatch::new_empty(schema);
+    };
+    let len = active.batch_store.len();
+    if len == 0 {
+        return RecordBatch::new_empty(schema);
+    }
+    let max_vbp = active.index_store.max_visible_batch_position();
+    let last_visible_idx = max_vbp.min(len - 1);
+    let last = active.batch_store.get(last_visible_idx).unwrap();
+    let visible_end = last.row_offset + last.num_rows as u64;
+
+    // Group target rows by their owning batch so each batch is gathered once.
+    let mut by_batch: HashMap<usize, Vec<u32>> = HashMap::new();
+    for &k in keys {
+        let Some(pos) = btree
+            .get(&ScalarValue::Int64(Some(k)))
+            .into_iter()
+            .filter(|&p| p < visible_end)
+            .max()
+        else {
+            continue;
+        };
+        let (mut lo, mut hi) = (0usize, last_visible_idx);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if active.batch_store.get(mid).unwrap().row_offset <= pos {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let stored = active.batch_store.get(lo).unwrap();
+        by_batch
+            .entry(lo)
+            .or_default()
+            .push((pos - stored.row_offset) as u32);
+    }
+
+    let mut out = Vec::with_capacity(by_batch.len());
+    for (bid, rows) in by_batch {
+        let stored = active.batch_store.get(bid).unwrap();
+        let idx = UInt32Array::from(rows);
+        let cols: Vec<_> = stored
+            .data
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), &idx, None).unwrap())
+            .collect();
+        out.push(RecordBatch::try_new(stored.data.schema(), cols).unwrap());
+    }
+    if out.is_empty() {
+        return RecordBatch::new_empty(schema);
+    }
+    concat_batches(&out[0].schema(), &out).unwrap()
+}
+
 // ----------------------------------------------------------------------
 // Latency stats
 // ----------------------------------------------------------------------
@@ -409,6 +478,11 @@ struct Args {
     batch_rows: usize,
     engine: Engine,
     lance_read_mode: LanceReadMode,
+    /// When > 0, the read phase measures **batch get** of this many keys per
+    /// call (Lance: one vectorized BTree gather; RocksDB: `multi_get`) instead
+    /// of single-key point lookups, reporting keys/sec. Sync on both sides
+    /// (std threads) to compare the engines' batch primitives directly.
+    batch_get: usize,
     uri: String,
     seed: u64,
     /// Skip the RocksDB WAL on writes. Off by default so RocksDB writes a WAL
@@ -428,6 +502,7 @@ impl Default for Args {
             batch_rows: 1_000,
             engine: Engine::Both,
             lance_read_mode: LanceReadMode::Plan,
+            batch_get: 0,
             uri: String::new(),
             seed: 0x5EED,
             rocksdb_disable_wal: false,
@@ -468,6 +543,7 @@ fn parse_args() -> Result<Args> {
             "--miss-ratio" => args.miss_ratio = parse_val(&flag, &value)?,
             "--threads" => args.threads = parse_val(&flag, &value)?,
             "--batch-rows" => args.batch_rows = parse_val(&flag, &value)?,
+            "--batch-get" => args.batch_get = parse_val(&flag, &value)?,
             "--engine" => {
                 args.engine = Engine::parse(&value).map_err(lance_core::Error::invalid_input)?
             }
@@ -663,6 +739,84 @@ async fn run_lance(
                 .unwrap_or(0),
         };
         assert_eq!(n, 1, "warmup lookup for key {probe} returned {n} rows");
+    }
+
+    // --- batch-get path: one vectorized BTree gather per `batch_get` keys ---
+    if args.batch_get > 0 {
+        let bg = args.batch_get;
+        let hit_keys: Vec<i64> = queries
+            .iter()
+            .filter(|(_, h)| *h)
+            .map(|(k, _)| *k)
+            .collect();
+        let cpu1 = process_cpu_secs();
+        let mut latencies_us = Vec::with_capacity(hit_keys.len().div_ceil(bg));
+        let mut found_total = 0usize;
+        let t = Instant::now();
+        for chunk in hit_keys.chunks(bg) {
+            let t0 = Instant::now();
+            let batch = fast_lookup_batch(&active, chunk);
+            latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+            found_total += batch.num_rows();
+        }
+        let s1 = t.elapsed().as_secs_f64();
+        let read_qps_1t = hit_keys.len() as f64 / s1.max(1e-9); // keys/sec
+        let read_cpu_s = process_cpu_secs() - cpu1;
+        assert_eq!(
+            found_total,
+            hit_keys.len(),
+            "batch get must find all hit keys"
+        );
+
+        let read_qps_nt = if args.threads > 1 {
+            let keys = Arc::new(hit_keys);
+            let nchunks = keys.len().div_ceil(bg);
+            let t = Instant::now();
+            let mut handles = Vec::with_capacity(args.threads);
+            for shard in 0..args.threads {
+                let keys = keys.clone();
+                let active = active.clone();
+                let threads = args.threads;
+                handles.push(std::thread::spawn(move || {
+                    let mut ci = shard;
+                    while ci < nchunks {
+                        let lo = ci * bg;
+                        let hi = (lo + bg).min(keys.len());
+                        std::hint::black_box(fast_lookup_batch(&active, &keys[lo..hi]));
+                        ci += threads;
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9)
+        } else {
+            read_qps_1t
+        };
+        let stats = compute_stats(latencies_us);
+        let peak_rss_mb = sampler.stop();
+        println!(
+            "[lance] batch_get={bg} keys/s_1t={read_qps_1t:.0} keys/s_{}t={read_qps_nt:.0} per_batch p50={:.2}us p99={:.2}us (found={found_total})",
+            args.threads, stats.p50_us, stats.p99_us
+        );
+        drop(writer);
+        return Ok(EngineResult {
+            engine: "lance-batch",
+            write_rows_per_s,
+            write_cpu_s,
+            read_p50_us: stats.p50_us,
+            read_p95_us: stats.p95_us,
+            read_p99_us: stats.p99_us,
+            read_mean_us: stats.mean_us,
+            read_qps_1t,
+            read_qps_nt,
+            read_cpu_s,
+            hits: found_total,
+            misses_resolved: 0,
+            peak_rss_mb,
+            rss_after_load_mb,
+        });
     }
 
     // --- read phase: single-thread latency + hit/miss accounting ---
@@ -888,6 +1042,92 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
         write_buf >> 20
     );
 
+    // --- batch-get path: RocksDB multi_get of `batch_get` keys per call ---
+    if args.batch_get > 0 {
+        let bg = args.batch_get;
+        let hit_keys: Vec<i64> = queries
+            .iter()
+            .filter(|(_, h)| *h)
+            .map(|(k, _)| *k)
+            .collect();
+        let multiget = |db: &DB, chunk: &[i64]| -> usize {
+            db.multi_get(chunk.iter().map(|k| k.to_be_bytes()))
+                .into_iter()
+                .filter(|r| matches!(r, Ok(Some(_))))
+                .count()
+        };
+        let cpu1 = process_cpu_secs();
+        let mut latencies_us = Vec::with_capacity(hit_keys.len().div_ceil(bg));
+        let mut found_total = 0usize;
+        let t = Instant::now();
+        for chunk in hit_keys.chunks(bg) {
+            let t0 = Instant::now();
+            found_total += multiget(&db, chunk);
+            latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+        }
+        let s1 = t.elapsed().as_secs_f64();
+        let read_qps_1t = hit_keys.len() as f64 / s1.max(1e-9);
+        let read_cpu_s = process_cpu_secs() - cpu1;
+        assert_eq!(
+            found_total,
+            hit_keys.len(),
+            "multi_get must find all hit keys"
+        );
+
+        let read_qps_nt = if args.threads > 1 {
+            let keys = Arc::new(hit_keys);
+            let nchunks = keys.len().div_ceil(bg);
+            let t = Instant::now();
+            let mut handles = Vec::with_capacity(args.threads);
+            for shard in 0..args.threads {
+                let keys = keys.clone();
+                let db = db.clone();
+                let threads = args.threads;
+                handles.push(std::thread::spawn(move || {
+                    let mut ci = shard;
+                    while ci < nchunks {
+                        let lo = ci * bg;
+                        let hi = (lo + bg).min(keys.len());
+                        std::hint::black_box(
+                            db.multi_get(keys[lo..hi].iter().map(|k| k.to_be_bytes())),
+                        );
+                        ci += threads;
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9)
+        } else {
+            read_qps_1t
+        };
+        let stats = compute_stats(latencies_us);
+        let peak_rss_mb = sampler.stop();
+        println!(
+            "[rocksdb] batch_get={bg} keys/s_1t={read_qps_1t:.0} keys/s_{}t={read_qps_nt:.0} per_batch p50={:.2}us p99={:.2}us (found={found_total})",
+            args.threads, stats.p50_us, stats.p99_us
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&db_path);
+        return Ok(EngineResult {
+            engine: "rocksdb",
+            write_rows_per_s,
+            write_cpu_s,
+            read_p50_us: stats.p50_us,
+            read_p95_us: stats.p95_us,
+            read_p99_us: stats.p99_us,
+            read_mean_us: stats.mean_us,
+            read_qps_1t,
+            read_qps_nt,
+            read_cpu_s,
+            hits: found_total,
+            misses_resolved: 0,
+            peak_rss_mb,
+            rss_after_load_mb,
+        });
+    }
+
     // --- read phase: single-thread latency ---
     let cpu1 = process_cpu_secs();
     let mut latencies_us = Vec::with_capacity(queries.len());
@@ -1038,9 +1278,10 @@ fn print_comparison(results: &[EngineResult]) {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_kv_point_lookup engine={:?} lance_read_mode={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
+        "bench=mem_wal_kv_point_lookup engine={:?} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
         args.engine,
         args.lance_read_mode.as_str(),
+        args.batch_get,
         args.rows,
         args.value_size,
         args.queries,
@@ -1078,6 +1319,7 @@ async fn run(args: Args) -> Result<()> {
         "queries": args.queries,
         "miss_ratio": args.miss_ratio,
         "threads": args.threads,
+        "batch_get": args.batch_get,
         "results": results.iter().map(|r| r.to_json(&args)).collect::<Vec<_>>(),
     });
     let text = serde_json::to_string_pretty(&out)
