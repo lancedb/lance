@@ -362,6 +362,10 @@ enum LanceReadMode {
     /// row from the BatchStore, bypassing DataFusion. Single-active-memtable
     /// fast path (no flushed generations); misses fall through as "not found".
     Fast,
+    /// Call the production `LsmPointLookupPlanner::lookup` API, which uses the
+    /// direct BTree fast path internally and falls back to the plan path for
+    /// on-disk sources. Measures the real shipped point-lookup latency.
+    Api,
 }
 
 impl LanceReadMode {
@@ -369,13 +373,17 @@ impl LanceReadMode {
         match v {
             "plan" => Ok(Self::Plan),
             "fast" => Ok(Self::Fast),
-            _ => Err(format!("unknown lance-read-mode '{v}', expected plan|fast")),
+            "api" => Ok(Self::Api),
+            _ => Err(format!(
+                "unknown lance-read-mode '{v}', expected plan|fast|api"
+            )),
         }
     }
     fn as_str(self) -> &'static str {
         match self {
             Self::Plan => "plan",
             Self::Fast => "fast",
+            Self::Api => "api",
         }
     }
 }
@@ -648,6 +656,11 @@ async fn run_lance(
             LanceReadMode::Fast => fast_lookup(&active, probe)
                 .map(|b| b.num_rows())
                 .unwrap_or(0),
+            LanceReadMode::Api => planner
+                .lookup(&[ScalarValue::Int64(Some(probe))], None)
+                .await?
+                .map(|b| b.num_rows())
+                .unwrap_or(0),
         };
         assert_eq!(n, 1, "warmup lookup for key {probe} returned {n} rows");
     }
@@ -672,6 +685,11 @@ async fn run_lance(
                 batches.iter().map(|b| b.num_rows()).sum::<usize>()
             }
             LanceReadMode::Fast => fast_lookup(&active, key).map(|b| b.num_rows()).unwrap_or(0),
+            LanceReadMode::Api => planner
+                .lookup(&[ScalarValue::Int64(Some(key))], None)
+                .await?
+                .map(|b| b.num_rows())
+                .unwrap_or(0),
         };
         latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
         if expect_hit {
@@ -712,6 +730,8 @@ async fn run_lance(
         }
         keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9)
     } else {
+        // Plan and Api are async; fan out over tokio tasks.
+        let mode = args.lance_read_mode;
         let t = Instant::now();
         let mut handles = Vec::with_capacity(args.threads);
         for shard in 0..args.threads {
@@ -724,16 +744,28 @@ async fn run_lance(
                 let mut done = 0usize;
                 let mut i = shard;
                 while i < keys.len() {
-                    let plan = planner
-                        .plan_lookup(&[ScalarValue::Int64(Some(keys[i]))], None)
-                        .await
-                        .unwrap();
-                    let _b: Vec<RecordBatch> = plan
-                        .execute(0, task_ctx.clone())
-                        .unwrap()
-                        .try_collect()
-                        .await
-                        .unwrap();
+                    match mode {
+                        LanceReadMode::Api => {
+                            std::hint::black_box(
+                                planner
+                                    .lookup(&[ScalarValue::Int64(Some(keys[i]))], None)
+                                    .await
+                                    .unwrap(),
+                            );
+                        }
+                        _ => {
+                            let plan = planner
+                                .plan_lookup(&[ScalarValue::Int64(Some(keys[i]))], None)
+                                .await
+                                .unwrap();
+                            let _b: Vec<RecordBatch> = plan
+                                .execute(0, task_ctx.clone())
+                                .unwrap()
+                                .try_collect()
+                                .await
+                                .unwrap();
+                        }
+                    }
                     done += 1;
                     i += threads;
                 }
@@ -771,6 +803,7 @@ async fn run_lance(
         engine: match args.lance_read_mode {
             LanceReadMode::Plan => "lance",
             LanceReadMode::Fast => "lance-fast",
+            LanceReadMode::Api => "lance-api",
         },
         write_rows_per_s,
         write_cpu_s,
