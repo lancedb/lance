@@ -57,6 +57,8 @@ deepsize.workspace = true
 half.workspace = true
 # Fast non-cryptographic hasher for the hot FTS mem-index insert path.
 rustc-hash = "2.1"
+# Compact FST term dictionary for the FTS mem-index partitions.
+fst = "0.4"
 itertools.workspace = true
 moka.workspace = true
 object_store = { workspace = true }

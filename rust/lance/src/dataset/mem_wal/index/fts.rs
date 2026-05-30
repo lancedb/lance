@@ -56,6 +56,7 @@ use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewA
 use arrow_schema::DataType;
 use bitpacking::{BitPacker, BitPacker4x};
 use crossbeam_skiplist::SkipMap;
+use fst::{Map, Streamer};
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::Operator;
@@ -732,24 +733,6 @@ impl IndexState {
     }
 }
 
-/// Deduplicates term `Arc<str>`s across partitions: a term that appears in
-/// many partitions is then backed by a single string allocation.
-#[derive(Default)]
-struct TermInterner {
-    seen: Mutex<HashSet<Arc<str>>>,
-}
-
-impl TermInterner {
-    fn intern(&self, term: &Arc<str>) -> Arc<str> {
-        let mut seen = self.seen.lock().expect("term interner poisoned");
-        if let Some(existing) = seen.get(term.as_ref()) {
-            return existing.clone();
-        }
-        seen.insert(term.clone());
-        term.clone()
-    }
-}
-
 /// In-memory full-text search index. See module docs for the concurrency
 /// model and visibility contract.
 pub struct FtsMemIndex {
@@ -765,9 +748,6 @@ pub struct FtsMemIndex {
     /// `{partitions, tail}` published atomically. The tail mutates in place
     /// between freezes; the whole state is swapped on freeze.
     state: ArcSwap<IndexState>,
-
-    /// Shared term-string interner for frozen partitions.
-    term_interner: TermInterner,
 
     /// The tail freezes into a partition once it reaches this many docs.
     freeze_threshold_rows: usize,
@@ -843,7 +823,6 @@ impl FtsMemIndex {
             tokenizer_pool: Arc::new(pool),
             writer_tokenizer: Mutex::new(writer_tokenizer),
             state: ArcSwap::from(IndexState::empty()),
-            term_interner: TermInterner::default(),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
             merge: Arc::new(Mutex::new(None)),
         }
@@ -919,11 +898,7 @@ impl FtsMemIndex {
         let st = self.state.load_full();
         let (mut terms, mut postings, mut blocks, mut df, mut pos, mut docs) = (0, 0, 0, 0, 0, 0);
         for p in st.partitions.iter() {
-            terms += p
-                .terms
-                .iter()
-                .map(|t| std::mem::size_of::<Arc<str>>() + t.len())
-                .sum::<usize>();
+            terms += p.term_fst.as_fst().as_bytes().len();
             postings += p.postings.len() * std::mem::size_of::<PostingRef>();
             blocks += p.block_meta.len() * std::mem::size_of::<BlockMeta>();
             df += p.doc_freq_data.len();
@@ -1058,7 +1033,7 @@ impl FtsMemIndex {
     /// fresh empty tail. Only the writer calls this; readers snapshotting the
     /// old `IndexState` keep a consistent view across the freeze.
     fn freeze(&self, st: &IndexState) {
-        let Some(partition) = Partition::from_tail(&st.tail, &self.term_interner) else {
+        let Some(partition) = Partition::from_tail(&st.tail) else {
             return;
         };
         let mut partitions: Vec<Arc<Partition>> = st.partitions.iter().cloned().collect();
@@ -1356,8 +1331,8 @@ impl FtsMemIndex {
             }
         }
         for p in st.partitions.iter() {
-            for key in p.tokens() {
-                let dist = levenshtein_distance(term, key);
+            for key in p.collect_terms() {
+                let dist = levenshtein_distance(term, key.as_ref());
                 if dist <= max_distance && seen.insert(key.to_string()) {
                     matches.push((key.to_string(), dist));
                 }
@@ -1635,10 +1610,9 @@ impl FtsMemIndex {
         // Step 3: merge per-term postings across every partition and the tail.
         let mut term_postings: HashMap<String, Vec<(u32, u32, Option<Vec<u32>>)>> = HashMap::new();
         for p in st.partitions.iter() {
-            for term_id in 0..p.terms.len() as u32 {
-                let bucket = term_postings
-                    .entry(p.terms[term_id as usize].to_string())
-                    .or_default();
+            for (term_id, term) in p.collect_terms().into_iter().enumerate() {
+                let term_id = term_id as u32;
+                let bucket = term_postings.entry(term.to_string()).or_default();
                 let mut cursor = PostingCursor::new(p, term_id);
                 while let Some(local_doc) = cursor.doc() {
                     let row_pos = p.docs.row_id(local_doc);
@@ -2378,10 +2352,12 @@ struct PostingRef {
 /// (VByte + delta, 128-doc blocks) into three shared buffers, so per-term
 /// overhead is one `PostingRef`. See `compress-fts-partition-memory/DESIGN.md`.
 struct Partition {
-    /// term texts, sorted; the index is the local term id. Interned, so the
-    /// string bytes are shared across partitions.
-    terms: Box<[Arc<str>]>,
-    /// per term, parallel to `terms`.
+    /// Term dictionary: a compact FST mapping each term's bytes to its local
+    /// term id (0-based, dense, in sorted order). Replaces a `Box<[Arc<str>]>`
+    /// + binary search — smaller (prefix-shared, no per-term pointers) and
+    /// O(term length) lookup.
+    term_fst: Map<Vec<u8>>,
+    /// per term, indexed by the FST's term id.
     postings: Box<[PostingRef]>,
     /// per-block metadata for every term's blocks, concatenated.
     block_meta: Box<[BlockMeta]>,
@@ -2401,7 +2377,8 @@ fn build_partition(
 ) -> Partition {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let bp = BitPacker4x::new();
-    let mut terms = Vec::with_capacity(entries.len());
+    // Terms are inserted in sorted order; the FST value is the dense term id.
+    let mut term_builder = fst::MapBuilder::memory();
     let mut postings = Vec::with_capacity(entries.len());
     let mut block_meta: Vec<BlockMeta> = Vec::new();
     let mut doc_freq_data: Vec<u8> = Vec::new();
@@ -2455,6 +2432,7 @@ fn build_partition(
             });
             term_max_freq = term_max_freq.max(blk_max_freq);
         }
+        let term_id = postings.len() as u64;
         postings.push(PostingRef {
             block_start,
             block_count: block_meta.len() as u32 - block_start,
@@ -2462,10 +2440,14 @@ fn build_partition(
             max_freq: term_max_freq,
             min_dl: term_min_dl.max(1),
         });
-        terms.push(term);
+        term_builder
+            .insert(term.as_bytes(), term_id)
+            .expect("terms inserted in sorted, unique order");
     }
+    let term_fst =
+        Map::new(term_builder.into_inner().expect("fst build")).expect("valid fst bytes");
     Partition {
-        terms: terms.into_boxed_slice(),
+        term_fst,
         postings: postings.into_boxed_slice(),
         block_meta: block_meta.into_boxed_slice(),
         doc_freq_data: doc_freq_data.into_boxed_slice(),
@@ -2505,20 +2487,24 @@ impl Partition {
         self.postings.iter().map(|p| p.doc_count as usize).sum()
     }
 
-    /// Local term id of `token`, via binary search over the sorted `terms`.
+    /// Local term id of `token`, via the FST term dictionary.
     fn term_id(&self, token: &str) -> Option<u32> {
-        self.terms
-            .binary_search_by(|t| t.as_ref().cmp(token))
-            .ok()
-            .map(|i| i as u32)
+        self.term_fst.get(token.as_bytes()).map(|v| v as u32)
     }
 
     fn contains_token(&self, token: &str) -> bool {
         self.term_id(token).is_some()
     }
 
-    fn tokens(&self) -> impl Iterator<Item = &Arc<str>> {
-        self.terms.iter()
+    /// All terms, indexed by term id (recovered from the FST). Used by the
+    /// flush, merge, and fuzzy-expansion paths; not on the hot search path.
+    fn collect_terms(&self) -> Vec<Arc<str>> {
+        let mut out: Vec<Arc<str>> = vec![Arc::from(""); self.term_fst.len()];
+        let mut stream = self.term_fst.stream();
+        while let Some((key, id)) = stream.next() {
+            out[id as usize] = Arc::from(std::str::from_utf8(key).expect("utf8 term"));
+        }
+        out
     }
 
     /// Number of docs in this partition containing `token`.
@@ -2530,11 +2516,7 @@ impl Partition {
 
     fn memory_size(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self
-                .terms
-                .iter()
-                .map(|t| std::mem::size_of::<Arc<str>>() + t.len())
-                .sum::<usize>()
+            + self.term_fst.as_fst().as_bytes().len()
             + self.postings.len() * std::mem::size_of::<PostingRef>()
             + self.block_meta.len() * std::mem::size_of::<BlockMeta>()
             + self.doc_freq_data.len()
@@ -2543,9 +2525,8 @@ impl Partition {
     }
 
     /// Freeze the visible contents of `tail` into a new partition. Returns
-    /// `None` if the tail has no visible docs. Terms are interned so their
-    /// bytes are shared with other partitions.
-    fn from_tail(tail: &TailIndex, interner: &TermInterner) -> Option<Self> {
+    /// `None` if the tail has no visible docs.
+    fn from_tail(tail: &TailIndex) -> Option<Self> {
         let snap = tail.snapshot();
         if snap.visible_count == 0 {
             return None;
@@ -2584,7 +2565,7 @@ impl Partition {
                 continue;
             }
             docs_for_term.sort_by_key(|(d, _, _)| *d);
-            entries.push((interner.intern(entry.key()), docs_for_term));
+            entries.push((entry.key().clone(), docs_for_term));
         }
         Some(build_partition(entries, docs))
     }
@@ -2599,8 +2580,10 @@ impl Partition {
             for (rp, nt) in p.docs.iter() {
                 docs.append(*rp, *nt);
             }
-            for term_id in 0..p.terms.len() as u32 {
-                let bucket = merged.entry(p.terms[term_id as usize].clone()).or_default();
+            let terms = p.collect_terms();
+            for (term_id, term) in terms.into_iter().enumerate() {
+                let term_id = term_id as u32;
+                let bucket = merged.entry(term).or_default();
                 let mut cursor = PostingCursor::new(p, term_id);
                 while let Some(doc) = cursor.doc() {
                     let positions = cursor.positions().to_vec();
