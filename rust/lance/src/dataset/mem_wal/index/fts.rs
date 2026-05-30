@@ -62,6 +62,7 @@ use lance_index::scalar::inverted::query::Operator;
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_tokenizer::TokenStream;
+use rustc_hash::FxHashMap;
 
 use super::RowPosition;
 
@@ -363,18 +364,6 @@ struct Positions {
 }
 
 impl Positions {
-    fn empty() -> Self {
-        Self {
-            offsets: vec![0],
-            data: Vec::new(),
-        }
-    }
-
-    fn push_doc(&mut self, positions: &[u32]) {
-        self.data.extend_from_slice(positions);
-        self.offsets.push(self.data.len() as u32);
-    }
-
     fn doc_positions(&self, doc_idx: usize) -> &[u32] {
         let start = self.offsets[doc_idx] as usize;
         let end = self.offsets[doc_idx + 1] as usize;
@@ -646,7 +635,7 @@ impl TailIndex {
         rows: u32,
         doc_lengths: Vec<u32>,
         total_tokens: u64,
-        term_builders: HashMap<Arc<str>, BatchTermBuilder>,
+        term_builders: FxHashMap<Arc<str>, BatchTermBuilder>,
     ) {
         for (term, builder) in term_builders {
             let chunk = builder.build(batch_position);
@@ -901,7 +890,7 @@ impl FtsMemIndex {
                 batch.num_rows() as u32,
                 vec![0; batch.num_rows()],
                 0,
-                HashMap::new(),
+                FxHashMap::default(),
             );
             return Ok(());
         };
@@ -916,30 +905,35 @@ impl FtsMemIndex {
             .expect("writer tokenizer poisoned — single-writer invariant violated");
         let tokenizer: &mut dyn LanceTokenizer = tok_guard.as_mut();
 
-        // Per-term builders (frequency + per-doc positions, indexed by
-        // local doc index in this batch).
-        let mut term_builders: HashMap<Arc<str>, BatchTermBuilder> = HashMap::new();
+        // Per-term postings for this batch. Tokens are appended directly
+        // (`observe`) as they stream out of the tokenizer, avoiding the
+        // per-document map and per-`(term, doc)` `Vec` allocation that
+        // dominated insert cost. `FxHashMap` skips SipHash on the hot lookup.
+        let mut term_builders: FxHashMap<Arc<str>, BatchTermBuilder> = FxHashMap::default();
         let mut doc_lengths: Vec<u32> = Vec::with_capacity(batch.num_rows());
         let mut total_tokens: u64 = 0;
 
         for (local_doc_idx, text_opt) in texts.iter().enumerate() {
-            // Track each doc's position even for null/missing rows so the
+            // Track each doc's token count even for null/missing rows so the
             // dense `doc_lengths` array stays aligned with `row_offset + i`.
             let mut doc_token_count: u32 = 0;
-            // term -> (frequency, positions). Keyed by `String` so we only
-            // pay the `Arc<str>` allocation once per unique term per doc,
-            // when transferring to `term_builders` below.
-            let mut per_doc: HashMap<String, (u32, Vec<u32>)> = HashMap::new();
+            let row_position = row_offset + local_doc_idx as u64;
 
             if let Some(text) = text_opt {
                 let mut stream = tokenizer.token_stream_for_doc(text);
                 let mut position: u32 = 0;
                 while let Some(tok) = stream.next() {
-                    let entry = per_doc
-                        .entry(tok.text.clone())
-                        .or_insert_with(|| (0, Vec::new()));
-                    entry.0 += 1;
-                    entry.1.push(position);
+                    let term = tok.text.as_str();
+                    // One hash lookup per token: extend the term's builder, or
+                    // intern its `Arc<str>` once on first sight this batch.
+                    if let Some(builder) = term_builders.get_mut(term) {
+                        builder.observe(row_position, position);
+                    } else {
+                        term_builders.insert(
+                            Arc::<str>::from(term),
+                            BatchTermBuilder::with_first(row_position, position),
+                        );
+                    }
                     position += 1;
                     doc_token_count += 1;
                 }
@@ -947,23 +941,6 @@ impl FtsMemIndex {
 
             doc_lengths.push(doc_token_count);
             total_tokens += doc_token_count as u64;
-
-            let row_position = row_offset + local_doc_idx as u64;
-            for (term, (freq, positions)) in per_doc {
-                // Reuse an interned `Arc<str>` if we've already seen the
-                // term in this batch. The first occurrence pays the
-                // allocation; subsequent occurrences clone the Arc.
-                let term_arc: Arc<str> =
-                    if let Some((existing, _)) = term_builders.get_key_value(term.as_str()) {
-                        Arc::clone(existing)
-                    } else {
-                        Arc::<str>::from(term.as_str())
-                    };
-                let builder = term_builders
-                    .entry(term_arc)
-                    .or_insert_with(BatchTermBuilder::new);
-                builder.push_doc(row_position, freq, positions);
-            }
         }
 
         // Drop the tokenizer guard before publishing so we don't hold it
@@ -1547,25 +1524,41 @@ impl TermSlice {
 
 /// Helper used during insert to accumulate a single batch's contribution to
 /// one term.
+/// Accumulates one batch's postings for a single term in a flat,
+/// allocation-light layout. Tokens are appended directly as they stream out
+/// of the tokenizer (`observe`), so there is no intermediate per-document map
+/// or per-`(term, doc)` `Vec` — the dominant insert-path allocation cost.
+///
+/// `row_positions[i]`/`frequencies[i]` describe the i-th document this term
+/// appears in (documents are observed in ascending row order, so
+/// `row_positions` is sorted). `pos_data` is every position concatenated in
+/// document order; document `i`'s slice is delimited by the `frequencies`
+/// prefix sum, materialized into a CSR `Positions` at `build`.
 struct BatchTermBuilder {
     row_positions: Vec<u64>,
     frequencies: Vec<u32>,
-    positions: Vec<Vec<u32>>,
+    pos_data: Vec<u32>,
 }
 
 impl BatchTermBuilder {
-    fn new() -> Self {
+    /// Start a builder seeded with the term's first observed occurrence.
+    fn with_first(row_position: u64, position: u32) -> Self {
         Self {
-            row_positions: Vec::new(),
-            frequencies: Vec::new(),
-            positions: Vec::new(),
+            row_positions: vec![row_position],
+            frequencies: vec![1],
+            pos_data: vec![position],
         }
     }
 
-    fn push_doc(&mut self, row_position: u64, frequency: u32, positions: Vec<u32>) {
-        self.row_positions.push(row_position);
-        self.frequencies.push(frequency);
-        self.positions.push(positions);
+    /// Record one token occurrence of this term at `position` in document
+    /// `row_position`. Documents must be observed in non-decreasing row order.
+    fn observe(&mut self, row_position: u64, position: u32) {
+        if self.row_positions.last().copied() != Some(row_position) {
+            self.row_positions.push(row_position);
+            self.frequencies.push(0);
+        }
+        *self.frequencies.last_mut().expect("seeded on construction") += 1;
+        self.pos_data.push(position);
     }
 
     /// Always materializes the per-doc positions: in-memory phrase queries
@@ -1573,15 +1566,22 @@ impl BatchTermBuilder {
     /// consults `params.has_positions()` and emits a `Count` recorder
     /// instead of `Position` when positions should not be persisted.
     fn build(self, batch_position: usize) -> Arc<TermChunk> {
-        let mut p = Positions::empty();
-        for doc in &self.positions {
-            p.push_doc(doc);
+        // CSR offsets are the frequency prefix sum.
+        let mut offsets = Vec::with_capacity(self.frequencies.len() + 1);
+        offsets.push(0u32);
+        let mut acc = 0u32;
+        for &f in &self.frequencies {
+            acc += f;
+            offsets.push(acc);
         }
         Arc::new(TermChunk {
             batch_position,
             row_positions: self.row_positions,
             frequencies: self.frequencies,
-            positions: Some(p),
+            positions: Some(Positions {
+                offsets,
+                data: self.pos_data,
+            }),
         })
     }
 }

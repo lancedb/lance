@@ -55,6 +55,8 @@ dashmap = "6"
 deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
+# Fast non-cryptographic hasher for the hot FTS mem-index insert path.
+rustc-hash = "2.1"
 itertools.workspace = true
 moka.workspace = true
 object_store = { workspace = true }
