@@ -84,6 +84,10 @@ pub struct LsmPointLookupPlanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Precomputed canonical output schema for the no-projection case, so the
+    /// hot `lookup(.., None)` path clones an `Arc` instead of rebuilding the
+    /// schema on every call.
+    none_target: SchemaRef,
 }
 
 impl LsmPointLookupPlanner {
@@ -99,6 +103,7 @@ impl LsmPointLookupPlanner {
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
     ) -> Self {
+        let none_target = canonical_output_schema(None, &base_schema, &pk_columns, false);
         Self {
             collector,
             pk_columns,
@@ -106,6 +111,7 @@ impl LsmPointLookupPlanner {
             bloom_filters: std::collections::HashMap::new(),
             session: None,
             flushed_cache: None,
+            none_target,
         }
     }
 
@@ -250,47 +256,44 @@ impl LsmPointLookupPlanner {
                 .map(|f| f.data_type() == &pk_values[0].data_type())
                 .unwrap_or(false);
         if fast_eligible {
-            let target =
-                canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
-            let has_system_col = target.fields().iter().any(|f| is_system_column(f.name()));
-            if !has_system_col {
-                let mut sources = self.collector.collect()?;
-                // Newest generation first: in-memory memtables (active + frozen)
-                // outrank flushed generations and the base table.
-                sources.sort_by_key(|s| std::cmp::Reverse(s.generation()));
-
-                let mut exhausted_in_memory = true;
-                for source in &sources {
-                    let LsmDataSource::ActiveMemTable {
-                        batch_store,
-                        index_store,
-                        ..
-                    } = source
-                    else {
-                        // Reached an on-disk source; the plan path handles it
-                        // (and re-probes the already-missed memtables cheaply).
-                        exhausted_in_memory = false;
-                        break;
-                    };
-                    match probe_memtable(
-                        batch_store,
-                        index_store,
-                        &self.pk_columns[0],
-                        &pk_values[0],
-                        &target,
-                    )? {
-                        Probe::Hit(batch) => return Ok(Some(batch)),
-                        Probe::Miss => continue,
-                        Probe::NoIndex => {
-                            exhausted_in_memory = false;
-                            break;
+            // Reuse the cached schema for the common `None` case; only an
+            // explicit projection rebuilds it.
+            let target = match projection {
+                None => self.none_target.clone(),
+                Some(_) => {
+                    canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)
+                }
+            };
+            if !target.fields().iter().any(|f| is_system_column(f.name())) {
+                // Probe in-memory memtables newest-first *by reference* (no
+                // source `Arc` clones / allocation in the single-memtable case),
+                // so concurrent readers don't contend on source refcounts.
+                let outcome = self.collector.find_in_memory_newest_first(
+                    |m| -> Result<Option<FastOutcome>> {
+                        match probe_memtable(
+                            &m.batch_store,
+                            &m.index_store,
+                            &self.pk_columns[0],
+                            &pk_values[0],
+                            &target,
+                        )? {
+                            Probe::Hit(batch) => Ok(Some(FastOutcome::Hit(batch))),
+                            Probe::Miss => Ok(None),
+                            Probe::NoIndex => Ok(Some(FastOutcome::NeedsFallback)),
+                        }
+                    },
+                )?;
+                match outcome {
+                    Some(FastOutcome::Hit(batch)) => return Ok(Some(batch)),
+                    Some(FastOutcome::NeedsFallback) => { /* fall through to plan */ }
+                    None => {
+                        // Every in-memory memtable missed. If there is no
+                        // on-disk source, the key does not exist; otherwise the
+                        // plan path consults the base table / flushed gens.
+                        if !self.collector.has_on_disk_sources() {
+                            return Ok(None);
                         }
                     }
-                }
-                if exhausted_in_memory {
-                    // Every source was an in-memory memtable and none held the
-                    // key — it does not exist.
-                    return Ok(None);
                 }
             }
         }
@@ -417,6 +420,15 @@ impl LsmPointLookupPlanner {
             canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
         Ok(Arc::new(EmptyExec::new(schema)))
     }
+}
+
+/// Result of probing the in-memory memtables newest-first in `lookup()`.
+enum FastOutcome {
+    /// A visible row was found; here it is, projected.
+    Hit(RecordBatch),
+    /// A memtable could not be probed directly (no BTree on the key) — the
+    /// caller must fall back to the plan path.
+    NeedsFallback,
 }
 
 /// Outcome of a direct BTree probe against one in-memory memtable.
