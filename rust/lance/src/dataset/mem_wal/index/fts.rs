@@ -2234,6 +2234,72 @@ fn unpack_block(
     }
 }
 
+/// Bit width for a block of ascending doc ids encoded as consecutive gaps from
+/// `first` (`docs[0] == first`, so the leading gap is 0). This is far smaller
+/// than a frame-of-reference width (`bit_width(last - first)`) for dense terms —
+/// the width tracks the largest gap, not the block's span.
+fn doc_block_width(bp: &BitPacker4x, docs: &[u32], first: u32) -> u8 {
+    if docs.len() == POSTING_BLOCK {
+        let mut input = [0u32; POSTING_BLOCK];
+        input.copy_from_slice(docs);
+        bp.num_bits_sorted(first, &input)
+    } else {
+        let mut prev = first;
+        let mut max_gap = 0u32;
+        for &d in docs {
+            max_gap = max_gap.max(d - prev);
+            prev = d;
+        }
+        bit_width(max_gap)
+    }
+}
+
+/// Pack ascending doc ids as consecutive gaps from `first`: SIMD
+/// `compress_sorted` for a full block, scalar gaps otherwise.
+fn pack_doc_block(bp: &BitPacker4x, buf: &mut Vec<u8>, docs: &[u32], first: u32, width: u8) {
+    if docs.len() == POSTING_BLOCK && width > 0 {
+        let mut input = [0u32; POSTING_BLOCK];
+        input.copy_from_slice(docs);
+        let mut out = [0u8; POSTING_BLOCK * 4];
+        let n = bp.compress_sorted(first, &input, &mut out, width);
+        buf.extend_from_slice(&out[..n]);
+    } else {
+        let mut gaps: Vec<u32> = Vec::with_capacity(docs.len());
+        let mut prev = first;
+        for &d in docs {
+            gaps.push(d - prev);
+            prev = d;
+        }
+        bitpack_put(buf, &gaps, width);
+    }
+}
+
+/// Inverse of `pack_doc_block`: reconstruct ascending doc ids into `out`.
+fn unpack_doc_block(
+    bp: &BitPacker4x,
+    buf: &[u8],
+    start: usize,
+    n: usize,
+    width: u8,
+    first: u32,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    if n == POSTING_BLOCK && width > 0 {
+        let mut decoded = [0u32; POSTING_BLOCK];
+        let bytes = bitpack_len(POSTING_BLOCK, width);
+        bp.decompress_sorted(first, &buf[start..start + bytes], &mut decoded, width);
+        out.extend_from_slice(&decoded);
+    } else {
+        bitpack_get(buf, start, n, width, out); // gaps
+        let mut acc = first;
+        for g in out.iter_mut() {
+            acc += *g;
+            *g = acc;
+        }
+    }
+}
+
 /// Random-access read of `n` width-`width` values at logical index `s` from a
 /// bit-packed stream whose first value starts at byte `base` of `buf`. Used to
 /// decode one document's positions without touching the rest of the block.
@@ -2350,10 +2416,11 @@ fn build_partition(
             let pos_offset = pos_data.len() as u32;
             let first_doc = chunk[0].0;
             let last_doc = chunk[chunk.len() - 1].0;
-            // doc ids: bit-pack `doc - first_doc` at a fixed block width.
-            let doc_width = bit_width(last_doc - first_doc);
-            let doc_deltas: Vec<u32> = chunk.iter().map(|&(d, _, _)| d - first_doc).collect();
-            pack_block(&bp, &mut doc_freq_data, &doc_deltas, doc_width);
+            // doc ids: bit-pack consecutive gaps from `first_doc` (width tracks
+            // the largest gap, not the block span — much tighter for dense terms).
+            let docs_block: Vec<u32> = chunk.iter().map(|&(d, _, _)| d).collect();
+            let doc_width = doc_block_width(&bp, &docs_block, first_doc);
+            pack_doc_block(&bp, &mut doc_freq_data, &docs_block, first_doc, doc_width);
             // frequencies: bit-pack at a fixed block width.
             let blk_max_freq = chunk.iter().map(|&(_, f, _)| f).max().unwrap_or(0);
             let freq_width = bit_width(blk_max_freq);
@@ -2626,17 +2693,15 @@ impl Partition {
             }
             let n = block_len(pref.doc_count, block);
             let df_start = bm.df_offset as usize;
-            unpack_block(
+            unpack_doc_block(
                 &bp,
                 &self.doc_freq_data,
                 df_start,
                 n,
                 bm.doc_width,
+                bm.first_doc,
                 &mut docs,
             );
-            for d in &mut docs {
-                *d += bm.first_doc;
-            }
             let freq_start = df_start + bitpack_len(n, bm.doc_width);
             unpack_block(
                 &bp,
@@ -2916,20 +2981,17 @@ impl<'a> PostingCursor<'a> {
         }
         let bm = self.part.block_meta[(self.pref.block_start + block) as usize];
         let n = block_len(self.pref.doc_count, block);
-        self.docs.clear();
-        // doc ids: bit-packed `doc - first_doc`.
+        // doc ids: consecutive gaps from `first_doc` (see `pack_doc_block`).
         let df_start = bm.df_offset as usize;
-        unpack_block(
+        unpack_doc_block(
             &self.bp,
             &self.part.doc_freq_data,
             df_start,
             n,
             bm.doc_width,
+            bm.first_doc,
             &mut self.docs,
         );
-        for d in &mut self.docs {
-            *d += bm.first_doc;
-        }
         // frequencies follow the doc-id block.
         let freq_start = df_start + bitpack_len(n, bm.doc_width);
         unpack_block(
