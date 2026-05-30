@@ -795,9 +795,11 @@ async fn run_lance(
         peak_rss_mb
     );
 
-    // Keep the active MemTable Arcs alive through the read phase; forget the
-    // writer to skip its async-in-sync-drop path (mirrors sibling benches).
-    std::mem::forget(writer);
+    // Reads are done; release the writer (and, when this function returns, the
+    // planner/collector that hold the MemTable Arcs) so Lance memory is freed
+    // before any subsequent in-process engine — otherwise `--engine both`
+    // would inflate the RocksDB RSS sample. ShardWriter has no blocking Drop.
+    drop(writer);
 
     Ok(EngineResult {
         engine: match args.lance_read_mode {
@@ -832,6 +834,10 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     let sampler = RssSampler::start();
     let db_path = format!("{}/rocksdb", args.uri.trim_end_matches('/'));
     let _ = std::fs::remove_dir_all(&db_path);
+    // RocksDB's create_if_missing creates the DB dir but not missing parents;
+    // for `--engine rocksdb` (no Lance arm to create `--uri`) make it ourselves.
+    std::fs::create_dir_all(&db_path)
+        .map_err(|e| lance_core::Error::io(format!("mkdir {db_path}: {e}")))?;
 
     // In-memory tuning: one skiplist memtable holds every row, no SST flush,
     // no auto compaction. write_buffer_size is set above the whole dataset.

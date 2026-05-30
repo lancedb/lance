@@ -232,8 +232,21 @@ impl LsmPointLookupPlanner {
         pk_values: &[ScalarValue],
         projection: Option<&[String]>,
     ) -> Result<Option<RecordBatch>> {
-        // Fast path: single-column key, no system columns in the output.
-        if pk_values.len() == self.pk_columns.len() && self.pk_columns.len() == 1 {
+        // Fast path: single-column key, the key's scalar type exactly matches
+        // the PK column's Arrow type, and no system columns in the output.
+        // The exact-type requirement avoids the `OrderableScalarValue` panic on
+        // comparing mismatched variants — the plan path coerces, so a
+        // coercible-but-different literal (e.g. `Int64` for an `Int32` PK)
+        // falls back rather than risking a panic or a wrong result.
+        let pk_type_matches = self.pk_columns.len() == 1
+            && self
+                .base_schema
+                .field_with_name(&self.pk_columns[0])
+                .ok()
+                .map(|f| f.data_type() == &pk_values[0].data_type())
+                .unwrap_or(false);
+        if pk_values.len() == self.pk_columns.len() && self.pk_columns.len() == 1 && pk_type_matches
+        {
             let target =
                 canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
             let has_system_col = target.fields().iter().any(|f| is_system_column(f.name()));
@@ -429,49 +442,67 @@ fn probe_memtable(
         return Ok(Probe::NoIndex);
     };
 
-    // Batches visible at the captured watermark form a prefix [0, max_vbp].
-    let visible = batch_store.visible_batches(index_store.max_visible_batch_position());
-    let total_visible_rows: u64 = visible.iter().map(|b| b.num_rows as u64).sum();
-    if total_visible_rows == 0 {
+    // Visible batches are the committed prefix [0, last_visible_idx]. Each
+    // `StoredBatch` carries its cumulative `row_offset`, so the visible row
+    // count and the position→batch mapping are O(1)/O(log) — no per-lookup
+    // allocation or linear scan over all batches.
+    let len = batch_store.len();
+    if len == 0 {
         return Ok(Probe::Miss);
     }
-    let max_visible_row = total_visible_rows - 1;
+    let last_visible_idx = index_store.max_visible_batch_position().min(len - 1);
+    let last = batch_store.get(last_visible_idx).ok_or_else(|| {
+        lance_core::Error::internal("point-lookup: visible batch index out of range")
+    })?;
+    let visible_end = last.row_offset + last.num_rows as u64; // exclusive
+    if visible_end == 0 {
+        return Ok(Probe::Miss);
+    }
 
-    // Largest matching position = newest insert for this key (KeepMaxRowAddr).
+    // Largest matching, visible position = newest insert for this key
+    // (matches `WithinSourceDedupExec::KeepMaxRowAddr`).
     let Some(pos) = btree
         .get(pk_value)
         .into_iter()
-        .filter(|&p| p <= max_visible_row)
+        .filter(|&p| p < visible_end)
         .max()
     else {
         return Ok(Probe::Miss);
     };
 
-    // Map the global row position into the owning visible batch and slice it.
-    let mut start: u64 = 0;
-    for stored in &visible {
-        let end = start + stored.num_rows as u64;
-        if pos >= start && pos < end {
-            let row = (pos - start) as usize;
-            let cols: Vec<Arc<dyn Array>> = target
-                .fields()
-                .iter()
-                .map(|f| {
-                    let idx = stored.data.schema().index_of(f.name()).map_err(|_| {
-                        lance_core::Error::invalid_input(format!(
-                            "point-lookup projection column '{}' not found in memtable batch",
-                            f.name()
-                        ))
-                    })?;
-                    Ok(stored.data.column(idx).slice(row, 1))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let batch = RecordBatch::try_new(target.clone(), cols)?;
-            return Ok(Probe::Hit(batch));
+    // Binary-search the owning batch by `row_offset` (batches are appended in
+    // increasing offset order).
+    let (mut lo, mut hi) = (0usize, last_visible_idx);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let off = batch_store.get(mid).map(|b| b.row_offset).ok_or_else(|| {
+            lance_core::Error::internal("point-lookup: batch index out of range during search")
+        })?;
+        if off <= pos {
+            lo = mid;
+        } else {
+            hi = mid - 1;
         }
-        start = end;
     }
-    Ok(Probe::Miss)
+    let stored = batch_store
+        .get(lo)
+        .ok_or_else(|| lance_core::Error::internal("point-lookup: resolved batch missing"))?;
+    let row = (pos - stored.row_offset) as usize;
+    let cols: Vec<Arc<dyn Array>> = target
+        .fields()
+        .iter()
+        .map(|f| {
+            let idx = stored.data.schema().index_of(f.name()).map_err(|_| {
+                lance_core::Error::invalid_input(format!(
+                    "point-lookup projection column '{}' not found in memtable batch",
+                    f.name()
+                ))
+            })?;
+            Ok(stored.data.column(idx).slice(row, 1))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(target.clone(), cols)?;
+    Ok(Probe::Hit(batch))
 }
 
 #[cfg(test)]
@@ -1141,6 +1172,38 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["name", "id"]);
         assert_eq!(name_at(&row), "v_20");
+        assert_eq!(id_at(&row), 20);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_type_mismatch_falls_back_no_panic() {
+        // PK is Int32; an Int64 literal must NOT take the direct BTree probe
+        // (which could panic comparing mismatched OrderableScalarValue
+        // variants) — it falls back to the coercing plan path.
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let active = active_memtable_ref(
+            &schema,
+            &[create_test_batch(&schema, &[10, 20, 30], "v")],
+            1,
+        );
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active,
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let row = planner
+            .lookup(&[ScalarValue::Int64(Some(20))], None)
+            .await
+            .expect("must not panic on a coercible-but-different key type")
+            .expect("plan path coerces Int64 → Int32 and finds id=20");
         assert_eq!(id_at(&row), 20);
     }
 }
