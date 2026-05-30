@@ -582,7 +582,8 @@ class IndicesBuilder:
             vector_type = self._describe_vector_type(field.type)
             if vector_type is None:
                 raise TypeError(
-                    f"Vector column {c} must be FixedSizeListArray "
+                    f"Vector column {c} must be FixedSizeListArray, "
+                    "list<FixedSizeList> (multivector), or "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
             _, value_type = vector_type
@@ -602,7 +603,8 @@ class IndicesBuilder:
         if vector_type is not None:
             return vector_type[0]
         raise TypeError(
-            "Vector column must be FixedSizeListArray "
+            "Vector column must be FixedSizeListArray, "
+            "list<FixedSizeList> (multivector), or "
             f"1-dimensional FixedShapeTensorArray, got {data_type}"
         )
 
