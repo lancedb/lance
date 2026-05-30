@@ -755,6 +755,22 @@ pub struct FtsMemIndex {
 
     /// The tail freezes into a partition once it reaches this many docs.
     freeze_threshold_rows: usize,
+
+    /// Background tiered-merge slot. `None` = idle; `Some` with `result: None`
+    /// = a merge is running on a worker thread; `Some` with `result: Some` =
+    /// the merged partition is ready for the writer to install. Only the
+    /// writer mutates `state`; the worker is read-only and just fills `result`,
+    /// so the single-writer / lock-free-reader contract is preserved.
+    merge: Arc<Mutex<Option<PendingMerge>>>,
+}
+
+/// A tiered merge dispatched to a background worker.
+struct PendingMerge {
+    /// `Arc::as_ptr` of each source partition, for identity-matching the
+    /// merged-away partitions when the writer installs the result.
+    sources: Vec<usize>,
+    /// Filled by the worker when the merge completes.
+    result: Option<Arc<Partition>>,
 }
 
 impl std::fmt::Debug for FtsMemIndex {
@@ -781,9 +797,18 @@ impl FtsMemIndex {
     const DEFAULT_FREEZE_THRESHOLD_ROWS: usize = 50_000;
 
     /// Hard cap on live partitions: when a freeze would exceed it, all
-    /// partitions are merged into one. With the default freeze threshold this
-    /// only triggers past ~1.6M docs.
+    /// partitions are merged into one synchronously. This is only a safety net;
+    /// the background tiered merge normally keeps the count far below it.
     const MAX_PARTITIONS: usize = 32;
+
+    /// Background tiered-merge factor: once a size tier (partitions bucketed by
+    /// `floor(log2(doc_count))`) accumulates this many partitions, they are
+    /// merged into one larger partition off the writer thread. Mirrors Lucene's
+    /// tiered merge — it bounds the live partition count to ~`O(log n)` (so
+    /// per-query overhead and posting fragmentation stay low) while amortizing
+    /// total merge work, and runs in the background so write throughput is
+    /// unaffected.
+    const MERGE_FACTOR: usize = 8;
 
     /// Create a new FTS index for the given field with default parameters.
     pub fn new(field_id: i32, column_name: String) -> Self {
@@ -804,6 +829,7 @@ impl FtsMemIndex {
             state: ArcSwap::from(IndexState::empty()),
             term_interner: TermInterner::default(),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
+            merge: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1018,6 +1044,8 @@ impl FtsMemIndex {
         };
         let mut partitions: Vec<Arc<Partition>> = st.partitions.iter().cloned().collect();
         partitions.push(Arc::new(partition));
+        // Fold in any completed background merge before re-evaluating tiers.
+        self.install_pending_merge(&mut partitions);
         if partitions.len() > Self::MAX_PARTITIONS {
             partitions = vec![Arc::new(Partition::merge(&partitions))];
         }
@@ -1025,6 +1053,67 @@ impl FtsMemIndex {
             partitions: Arc::from(partitions.into_boxed_slice()),
             tail: TailIndex::new(),
         }));
+        // Kick off a background merge if a size tier is now over-full.
+        self.maybe_start_merge();
+    }
+
+    /// Install a completed background merge into `partitions` (in place):
+    /// drop the merged-away source partitions and append the merged one.
+    /// No-op while a merge is still running or none is pending.
+    fn install_pending_merge(&self, partitions: &mut Vec<Arc<Partition>>) {
+        let mut guard = self.merge.lock().expect("merge slot poisoned");
+        let Some(pending) = guard.as_ref() else {
+            return;
+        };
+        let Some(merged) = pending.result.clone() else {
+            return; // still running
+        };
+        let sources: HashSet<usize> = pending.sources.iter().copied().collect();
+        // Install only if every source is still live. If a synchronous
+        // `MAX_PARTITIONS` collapse merged the sources away while this merge
+        // ran, the merged docs are already present — appending it would
+        // double-count, so discard the stale result instead.
+        let present = partitions
+            .iter()
+            .filter(|p| sources.contains(&(Arc::as_ptr(p) as usize)))
+            .count();
+        if present == sources.len() {
+            partitions.retain(|p| !sources.contains(&(Arc::as_ptr(p) as usize)));
+            partitions.push(merged);
+        }
+        *guard = None;
+    }
+
+    /// If no merge is in flight and some size tier holds at least
+    /// `MERGE_FACTOR` partitions, dispatch their merge to a background thread.
+    fn maybe_start_merge(&self) {
+        let mut guard = self.merge.lock().expect("merge slot poisoned");
+        if guard.is_some() {
+            return; // one merge at a time
+        }
+        let partitions = self.state.load();
+        let Some(group) = select_merge_group(&partitions.partitions, Self::MERGE_FACTOR) else {
+            return;
+        };
+        let sources: Vec<usize> = group.iter().map(|p| Arc::as_ptr(p) as usize).collect();
+        *guard = Some(PendingMerge {
+            sources,
+            result: None,
+        });
+        drop(guard);
+        let slot = Arc::clone(&self.merge);
+        // Read-only merge off the writer thread; the writer installs the result
+        // on a later freeze. The worker shares ownership of `slot` (and, via
+        // `group`, the source partitions), so it is safe even if the index is
+        // dropped mid-merge.
+        std::thread::spawn(move || {
+            let merged = Arc::new(Partition::merge(&group));
+            if let Ok(mut g) = slot.lock() {
+                if let Some(p) = g.as_mut() {
+                    p.result = Some(merged);
+                }
+            }
+        });
     }
 
     // ------------------------------------------------------------------
@@ -2229,6 +2318,24 @@ fn build_partition(
         pos_data: pos_data.into_boxed_slice(),
         docs,
     }
+}
+
+/// Pick a size tier (partitions bucketed by `floor(log2(doc_count))`) holding
+/// at least `factor` partitions and return its members to merge. Prefers the
+/// smallest such tier, so a merge fuses similarly-sized partitions and total
+/// merge work stays amortized (a partition is re-merged only as it climbs
+/// tiers). `None` when no tier is over-full.
+fn select_merge_group(partitions: &[Arc<Partition>], factor: usize) -> Option<Vec<Arc<Partition>>> {
+    let mut buckets: HashMap<u32, Vec<Arc<Partition>>> = HashMap::new();
+    for p in partitions {
+        let tier = u64::BITS - (p.doc_count().max(1) as u64).leading_zeros();
+        buckets.entry(tier).or_default().push(p.clone());
+    }
+    buckets
+        .into_iter()
+        .filter(|(_, g)| g.len() >= factor)
+        .min_by_key(|(tier, _)| *tier)
+        .map(|(_, g)| g)
 }
 
 impl Partition {
@@ -4041,6 +4148,45 @@ mod tests {
         assert_eq!(index.doc_count(), 120);
         // Merge must preserve every posting: "hello" hits 2 docs per batch.
         assert_eq!(index.search("hello").len(), 80);
+        for e in index.search("hello") {
+            assert!(e.score.is_finite() && e.score > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_background_tiered_merge_reduces_partition_count() {
+        // 16 single-batch freezes (freeze_threshold_rows = 1) make 16 tiny
+        // same-tier partitions. The tiered merge (MERGE_FACTOR = 8) runs in the
+        // background and the writer installs it on a later freeze. Total inserts
+        // stay below MAX_PARTITIONS (32), so any reduction is from the tier
+        // merge — not the synchronous safety-net collapse.
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(1);
+        for i in 0..16 {
+            index
+                .insert(&create_test_batch(&schema), (i * 100) as u64)
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut total = 16u64;
+        while index.state.load().partitions.len() >= 16
+            && total < 30
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            index
+                .insert(&create_test_batch(&schema), total * 100)
+                .unwrap();
+            total += 1;
+        }
+        let parts = index.state.load().partitions.len();
+        assert!(
+            parts < 16,
+            "background tier merge should reduce partitions below 16, got {parts}"
+        );
+        // Merge is doc-preserving: counts are exact regardless of timing.
+        assert_eq!(index.doc_count(), total as usize * 3);
+        assert_eq!(index.search("hello").len(), total as usize * 2);
         for e in index.search("hello") {
             assert!(e.score.is_finite() && e.score > 0.0);
         }
