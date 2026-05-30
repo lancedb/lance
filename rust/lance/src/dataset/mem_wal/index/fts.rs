@@ -870,6 +870,35 @@ impl FtsMemIndex {
         total
     }
 
+    /// Component memory breakdown (bytes), for diagnostics:
+    /// `(num_partitions, term_strings, postings_meta, block_meta, doc_freq, pos, docs, tail)`.
+    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        let st = self.state.load_full();
+        let (mut terms, mut postings, mut blocks, mut df, mut pos, mut docs) = (0, 0, 0, 0, 0, 0);
+        for p in st.partitions.iter() {
+            terms += p
+                .terms
+                .iter()
+                .map(|t| std::mem::size_of::<Arc<str>>() + t.len())
+                .sum::<usize>();
+            postings += p.postings.len() * std::mem::size_of::<PostingRef>();
+            blocks += p.block_meta.len() * std::mem::size_of::<BlockMeta>();
+            df += p.doc_freq_data.len();
+            pos += p.pos_data.len();
+            docs += p.docs.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
+        }
+        (
+            st.partitions.len(),
+            terms,
+            postings,
+            blocks,
+            df,
+            pos,
+            docs,
+            st.tail.memory_size(),
+        )
+    }
+
     // ------------------------------------------------------------------
     // Insert
     // ------------------------------------------------------------------

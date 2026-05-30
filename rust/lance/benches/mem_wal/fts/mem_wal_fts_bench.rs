@@ -464,6 +464,20 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     }
     let build_s = build_start.elapsed().as_secs_f64();
 
+    let (nparts, t_terms, t_post, t_blk, t_df, t_pos, t_docs, t_tail) = index.memory_breakdown();
+    let mb = |b: usize| b as f64 / 1.0e6;
+    eprintln!(
+        "mem_breakdown parts={nparts} term_str={:.1} postings={:.1} block_meta={:.1} \
+         doc_freq={:.1} pos={:.1} docs={:.1} tail={:.1} (MB)",
+        mb(t_terms),
+        mb(t_post),
+        mb(t_blk),
+        mb(t_df),
+        mb(t_pos),
+        mb(t_docs),
+        mb(t_tail),
+    );
+
     // Parse queries.
     struct Q {
         kind: String,
