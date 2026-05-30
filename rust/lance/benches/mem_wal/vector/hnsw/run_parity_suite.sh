@@ -21,6 +21,10 @@ SIZES="${SIZES:-100000 500000 1000000}"
 DIM="${DIM:-1024}"
 QUERIES="${QUERIES:-5000}"
 QUERY_REPEATS="${QUERY_REPEATS:-20}"
+# Sustained measurement: when > 0, write rebuilds the graph and read loops the
+# query workload for this many seconds, reporting steady-state (not burst).
+INSERT_SECONDS="${INSERT_SECONDS:-0}"
+QUERY_SECONDS="${QUERY_SECONDS:-0}"
 TRUTH_QUERIES="${TRUTH_QUERIES:-200}"
 K="${K:-10}"
 M="${M:-12}"
@@ -62,6 +66,7 @@ run_one() {
         --k "$K" --m "$M" --ef-construction "$EF_CONSTRUCTION" --ef-search "$EF_SEARCH"
         --threads "$THREADS" --seed "$SEED" --clusters "$CLUSTERS" --noise "$NOISE"
         --query-repeats "$QUERY_REPEATS"
+        --insert-seconds "$INSERT_SECONDS" --query-seconds "$QUERY_SECONDS"
     )
     local out="$OUT_DIR/${tag}.out"
     local timef="$OUT_DIR/${tag}.time"

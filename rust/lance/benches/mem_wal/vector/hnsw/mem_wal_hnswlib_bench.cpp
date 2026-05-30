@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
@@ -31,6 +32,8 @@ struct Args {
     size_t clusters = 4096;
     float noise = 0.05f;
     size_t query_repeats = 1;
+    double insert_seconds = 0.0;
+    double query_seconds = 0.0;
 };
 
 Args parse_args(int argc, char **argv);
@@ -112,30 +115,47 @@ int main(int argc, char **argv) {
         double generate_s = elapsed_seconds(generate_start);
 
         hnswlib::L2Space space(static_cast<int>(args.dim));
-        hnswlib::HierarchicalNSW<float> index(
-            &space,
-            args.rows,
-            args.m,
-            args.ef_construction,
-            static_cast<size_t>(args.seed));
-        index.setEf(args.ef_search);
 
+        // Sustained write: rebuild a fresh index in a loop for `insert_seconds`
+        // (or a single build when 0) so throughput reflects steady-state, not a
+        // burst. The last index is retained for the query phase.
         auto insert_start = clock_now();
-        parallel_for(0, args.rows, args.threads, [&](size_t row, size_t) {
-            index.addPoint(static_cast<void *>(data.data() + row * args.dim), row);
-        });
+        size_t insert_passes = 0;
+        double insert_core = 0.0;
+        std::unique_ptr<hnswlib::HierarchicalNSW<float>> index;
+        do {
+            index = std::make_unique<hnswlib::HierarchicalNSW<float>>(
+                &space,
+                args.rows,
+                args.m,
+                args.ef_construction,
+                static_cast<size_t>(args.seed));
+            index->setEf(args.ef_search);
+            auto core = clock_now();
+            parallel_for(0, args.rows, args.threads, [&](size_t row, size_t) {
+                index->addPoint(static_cast<void *>(data.data() + row * args.dim), row);
+            });
+            insert_core += elapsed_seconds(core);
+            ++insert_passes;
+        } while (args.insert_seconds > 0.0 && elapsed_seconds(insert_start) < args.insert_seconds);
         double insert_s = elapsed_seconds(insert_start);
-        double insert_qps = static_cast<double>(args.rows) / insert_s;
+        double insert_qps = static_cast<double>(args.rows * insert_passes) / insert_s;
+        // insert_core excludes index allocation + destruction.
+        double insert_core_s = insert_core;
+        double insert_core_qps = static_cast<double>(args.rows * insert_passes) / insert_core_s;
 
+        // Sustained read: run the query workload in a loop for `query_seconds`
+        // (or `query_repeats` passes when 0).
         std::vector<size_t> queries = query_ids(args, args.queries);
         auto query_start = clock_now();
         std::atomic<size_t> hits{0};
-        for (size_t rep = 0; rep < args.query_repeats; ++rep) {
+        size_t query_passes = 0;
+        for (;;) {
             hits.store(0, std::memory_order_relaxed);
             parallel_for(0, queries.size(), args.threads, [&](size_t idx, size_t) {
                 size_t row = queries[idx];
                 std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
-                    index.searchKnn(data.data() + row * args.dim, args.k);
+                    index->searchKnn(data.data() + row * args.dim, args.k);
                 bool found = false;
                 while (!result.empty()) {
                     if (static_cast<size_t>(result.top().second) == row) {
@@ -148,9 +168,17 @@ int main(int argc, char **argv) {
                     hits.fetch_add(1, std::memory_order_relaxed);
                 }
             });
+            ++query_passes;
+            if (args.query_seconds > 0.0) {
+                if (elapsed_seconds(query_start) >= args.query_seconds) {
+                    break;
+                }
+            } else if (query_passes >= args.query_repeats) {
+                break;
+            }
         }
         double query_s = elapsed_seconds(query_start);
-        double query_qps = static_cast<double>(args.queries * args.query_repeats) / query_s;
+        double query_qps = static_cast<double>(args.queries * query_passes) / query_s;
         double self_recall = static_cast<double>(hits.load()) / static_cast<double>(args.queries);
 
         std::vector<size_t> truth_queries = query_ids(args, args.truth_queries);
@@ -161,7 +189,7 @@ int main(int argc, char **argv) {
             const float *query = data.data() + row * args.dim;
             std::vector<size_t> truth = exact_top_k(query, data, args);
             std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
-                index.searchKnn(query, args.k);
+                index->searchKnn(query, args.k);
             while (!result.empty()) {
                 size_t id = static_cast<size_t>(result.top().second);
                 for (size_t truth_id : truth) {
@@ -181,8 +209,12 @@ int main(int argc, char **argv) {
                   << " dim=" << args.dim
                   << " generate_s=" << generate_s
                   << " insert_s=" << insert_s
+                  << " insert_passes=" << insert_passes
                   << " insert_qps=" << insert_qps
+                  << " insert_core_s=" << insert_core_s
+                  << " insert_core_qps=" << insert_core_qps
                   << " query_s=" << query_s
+                  << " query_passes=" << query_passes
                   << " query_qps=" << query_qps
                   << " truth_s=" << truth_s
                   << " recall_at_" << args.k << "=" << recall_at_k
@@ -247,6 +279,10 @@ Args parse_args(int argc, char **argv) {
             args.noise = std::stof(value);
         } else if (flag == "--query-repeats") {
             args.query_repeats = parse_size(value);
+        } else if (flag == "--insert-seconds") {
+            args.insert_seconds = std::stod(value);
+        } else if (flag == "--query-seconds") {
+            args.query_seconds = std::stod(value);
         } else {
             throw std::invalid_argument("unknown argument: " + flag);
         }
