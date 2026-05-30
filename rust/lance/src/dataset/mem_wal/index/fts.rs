@@ -2353,9 +2353,9 @@ struct PostingRef {
 /// overhead is one `PostingRef`. See `compress-fts-partition-memory/DESIGN.md`.
 struct Partition {
     /// Term dictionary: a compact FST mapping each term's bytes to its local
-    /// term id (0-based, dense, in sorted order). Replaces a `Box<[Arc<str>]>`
-    /// + binary search — smaller (prefix-shared, no per-term pointers) and
-    /// O(term length) lookup.
+    /// term id (0-based, dense, in sorted order). Replaces a sorted
+    /// `Box<[Arc<str>]>` searched by binary search; smaller (prefix-shared, no
+    /// per-term pointers) with O(term length) lookup.
     term_fst: Map<Vec<u8>>,
     /// per term, indexed by the FST's term id.
     postings: Box<[PostingRef]>,
