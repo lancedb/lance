@@ -592,13 +592,19 @@ impl<'a> Drop for PooledTokenizer<'a> {
 struct TailIndex {
     /// Per-term posting slices. `Arc<str>` interns the term so a single
     /// allocation backs every chunk that mentions it.
-    terms: SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     /// Atomically-swapped visibility snapshot.
     snapshot: ArcSwap<Snapshot>,
     /// Strictly-monotonic, dense, 0-based batch position counter. Dense
     /// positions are required by the `batch_position < visible_count`
     /// visibility filter; the tail therefore assigns its own.
     next_batch_position: AtomicUsize,
+    /// Writer-only fast path: term -> its posting slot. Only a term's *first*
+    /// appearance in this tail generation pays the sorted `SkipMap` lookup;
+    /// later batches reuse the cached handle, so the per-batch cost is a flat
+    /// hash probe instead of a skiplist search. Reset implicitly when the tail
+    /// is replaced on freeze. Uncontended — the single writer holds it briefly.
+    writer_term_cache: Mutex<FxHashMap<Arc<str>, Arc<ArcSwap<TermSlice>>>>,
 }
 
 impl TailIndex {
@@ -607,6 +613,7 @@ impl TailIndex {
             terms: SkipMap::new(),
             snapshot: ArcSwap::from(Snapshot::empty()),
             next_batch_position: AtomicUsize::new(0),
+            writer_term_cache: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -637,14 +644,25 @@ impl TailIndex {
         total_tokens: u64,
         term_builders: FxHashMap<Arc<str>, BatchTermBuilder>,
     ) {
+        let mut cache = self
+            .writer_term_cache
+            .lock()
+            .expect("writer term cache poisoned — single-writer invariant violated");
         for (term, builder) in term_builders {
             let chunk = builder.build(batch_position);
-            let entry = self
-                .terms
-                .get_or_insert_with(term, TermSlice::empty_arc_swap);
-            let cur = entry.value().load();
-            entry.value().store(cur.with_chunk_appended(chunk));
+            // First sight of the term this generation populates the SkipMap
+            // (so readers can find it) and caches the slot; later batches hit
+            // only the cache.
+            let slot = cache.entry(term).or_insert_with_key(|term| {
+                self.terms
+                    .get_or_insert_with(term.clone(), TermSlice::empty_arc_swap)
+                    .value()
+                    .clone()
+            });
+            let cur = slot.load();
+            slot.store(cur.with_chunk_appended(chunk));
         }
+        drop(cache);
         let new_meta = Arc::new(BatchMeta {
             batch_position,
             row_offset,
@@ -1517,8 +1535,8 @@ impl FtsMemIndex {
 // ============================================================================
 
 impl TermSlice {
-    fn empty_arc_swap() -> ArcSwap<Self> {
-        ArcSwap::from(Self::empty())
+    fn empty_arc_swap() -> Arc<ArcSwap<Self>> {
+        Arc::new(ArcSwap::from(Self::empty()))
     }
 }
 
@@ -1677,7 +1695,7 @@ fn build_scorer(st: &IndexState, tail_snap: &Snapshot, tokens: &[String]) -> Mem
 
 /// Number of visible tail docs containing `token`.
 fn tail_token_df(
-    terms: &SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     token: &str,
     visible_count: usize,
 ) -> usize {
@@ -1698,7 +1716,7 @@ fn tail_token_df(
 /// contribution per document. Uses the shared corpus-wide `scorer`.
 fn score_terms(
     snap: &Snapshot,
-    terms: &SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     tokens: &[String],
     scorer: &MemBM25Scorer,
 ) -> Vec<FtsEntry> {
@@ -1739,7 +1757,7 @@ fn score_terms(
 /// `tokens.len() >= 2` here. Scored with the shared corpus-wide `scorer`.
 fn phrase_search_tail(
     snap: &Snapshot,
-    terms: &SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     tokens: &[String],
     slop: u32,
     scorer: &MemBM25Scorer,
