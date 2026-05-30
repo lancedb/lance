@@ -474,15 +474,25 @@ fn probe_memtable(
         return Ok(Probe::Miss);
     }
 
-    // Largest matching, visible position = newest insert for this key
-    // (matches `WithinSourceDedupExec::KeepMaxRowAddr`).
-    let Some(pos) = btree
-        .get(pk_value)
-        .into_iter()
-        .filter(|&p| p < visible_end)
-        .max()
-    else {
-        return Ok(Probe::Miss);
+    // O(1) equality probe for the newest position of this key, then a
+    // visibility check. Only when the newest write isn't visible yet (a
+    // concurrent newer version past the watermark) do we fall back to the
+    // ordered range scan to find the newest *visible* position. Either way the
+    // result matches `WithinSourceDedupExec::KeepMaxRowAddr`.
+    let pos = match btree.get_eq(pk_value) {
+        None => return Ok(Probe::Miss),
+        Some(p) if p < visible_end => p,
+        Some(_) => {
+            let Some(p) = btree
+                .get(pk_value)
+                .into_iter()
+                .filter(|&p| p < visible_end)
+                .max()
+            else {
+                return Ok(Probe::Miss);
+            };
+            p
+        }
     };
 
     // Binary-search the owning batch by `row_offset` (batches are appended in

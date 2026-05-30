@@ -10,6 +10,7 @@ use arrow_array::types::*;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
 use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::scalar::btree::OrderableScalarValue;
@@ -49,8 +50,14 @@ impl Ord for IndexKey {
 /// Implemented using crossbeam-skiplist for concurrent access with O(log n) operations.
 #[derive(Debug)]
 pub struct BTreeMemIndex {
-    /// Ordered map: (scalar_value, row_position) -> ()
+    /// Ordered map: (scalar_value, row_position) -> (). Serves range queries.
     lookup: SkipMap<IndexKey, ()>,
+    /// Equality sidecar: value -> newest (largest) row position. Gives O(1)
+    /// equality point lookups instead of an O(log n) skiplist range scan (the
+    /// dominant point-lookup cost). Only the newest position is kept; the rare
+    /// case where it isn't visible yet (a concurrent newer write) falls back to
+    /// the ordered `lookup` to find the newest *visible* version.
+    equality_hash: DashMap<ScalarValue, RowPosition>,
     /// Field ID this index is built on.
     field_id: i32,
     /// Column name (for Arrow batch lookups).
@@ -62,9 +69,30 @@ impl BTreeMemIndex {
     pub fn new(field_id: i32, column_name: String) -> Self {
         Self {
             lookup: SkipMap::new(),
+            equality_hash: DashMap::new(),
             field_id,
             column_name,
         }
+    }
+
+    /// Index one (value, row_position) into both the ordered skiplist (for
+    /// ranges) and the equality hash (newest position wins).
+    fn add(&self, value: OrderableScalarValue, row_position: RowPosition) {
+        self.equality_hash
+            .entry(value.0.clone())
+            .and_modify(|p| {
+                if row_position > *p {
+                    *p = row_position;
+                }
+            })
+            .or_insert(row_position);
+        self.lookup.insert(
+            IndexKey {
+                value,
+                row_position,
+            },
+            (),
+        );
     }
 
     /// Get the field ID this index is built on.
@@ -96,11 +124,10 @@ impl BTreeMemIndex {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    let key = IndexKey {
-                        value: OrderableScalarValue(ScalarValue::$scalar_variant(value)),
+                    self.add(
+                        OrderableScalarValue(ScalarValue::$scalar_variant(value)),
                         row_position,
-                    };
-                    self.lookup.insert(key, ());
+                    );
                 }
             }};
         }
@@ -125,13 +152,10 @@ impl BTreeMemIndex {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    let key = IndexKey {
-                        value: OrderableScalarValue(ScalarValue::Utf8(
-                            value.map(|s| s.to_string()),
-                        )),
+                    self.add(
+                        OrderableScalarValue(ScalarValue::Utf8(value.map(|s| s.to_string()))),
                         row_position,
-                    };
-                    self.lookup.insert(key, ());
+                    );
                 }
             }
             DataType::LargeUtf8 => {
@@ -141,13 +165,10 @@ impl BTreeMemIndex {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    let key = IndexKey {
-                        value: OrderableScalarValue(ScalarValue::LargeUtf8(
-                            value.map(|s| s.to_string()),
-                        )),
+                    self.add(
+                        OrderableScalarValue(ScalarValue::LargeUtf8(value.map(|s| s.to_string()))),
                         row_position,
-                    };
-                    self.lookup.insert(key, ());
+                    );
                 }
             }
             DataType::Boolean => {
@@ -157,11 +178,10 @@ impl BTreeMemIndex {
                     .unwrap();
                 for (row_idx, value) in typed_array.iter().enumerate() {
                     let row_position = row_offset + row_idx as u64;
-                    let key = IndexKey {
-                        value: OrderableScalarValue(ScalarValue::Boolean(value)),
+                    self.add(
+                        OrderableScalarValue(ScalarValue::Boolean(value)),
                         row_position,
-                    };
-                    self.lookup.insert(key, ());
+                    );
                 }
             }
             // Fallback for other types - use per-row extraction
@@ -169,11 +189,7 @@ impl BTreeMemIndex {
                 for row_idx in 0..array.len() {
                     let value = ScalarValue::try_from_array(array, row_idx)?;
                     let row_position = row_offset + row_idx as u64;
-                    let key = IndexKey {
-                        value: OrderableScalarValue(value),
-                        row_position,
-                    };
-                    self.lookup.insert(key, ());
+                    self.add(OrderableScalarValue(value), row_position);
                 }
             }
         }
@@ -181,6 +197,17 @@ impl BTreeMemIndex {
     }
 
     /// Look up row positions for an exact value.
+    /// Newest row position indexed for `value`, or `None` if the value was
+    /// never indexed. O(1) hash probe — the equality point-lookup fast path.
+    ///
+    /// Returns the largest position seen for the value. The caller checks it
+    /// against the visibility watermark; if that newest position isn't visible
+    /// yet (a concurrent newer write), fall back to [`Self::get`] to find the
+    /// newest *visible* version.
+    pub fn get_eq(&self, value: &ScalarValue) -> Option<RowPosition> {
+        self.equality_hash.get(value).map(|e| *e.value())
+    }
+
     pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
         let orderable = OrderableScalarValue(value.clone());
         let start = IndexKey {
@@ -365,6 +392,27 @@ mod tests {
         let result = index.get(&ScalarValue::Int32(Some(1)));
         assert!(!result.is_empty());
         assert_eq!(result, vec![1]);
+    }
+
+    #[test]
+    fn test_btree_get_eq_newest_absent_and_range_intact() {
+        let schema = create_test_schema();
+        let index = BTreeMemIndex::new(0, "id".to_string());
+        // ids 0,1,2 at positions 0,1,2 ...
+        index.insert(&create_test_batch(&schema, 0), 0).unwrap();
+        // ... then the same ids again at positions 3,4,5 (an update).
+        index.insert(&create_test_batch(&schema, 0), 3).unwrap();
+
+        // get_eq returns the NEWEST (largest) position.
+        assert_eq!(index.get_eq(&ScalarValue::Int32(Some(0))), Some(3));
+        assert_eq!(index.get_eq(&ScalarValue::Int32(Some(1))), Some(4));
+        // Absent key.
+        assert_eq!(index.get_eq(&ScalarValue::Int32(Some(999))), None);
+        // The ordered range scan still returns every position (range queries
+        // and the visibility fallback rely on it).
+        let mut all = index.get(&ScalarValue::Int32(Some(0)));
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 3]);
     }
 
     #[test]

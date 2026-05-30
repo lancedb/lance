@@ -170,11 +170,17 @@ fn fast_lookup(active: &InMemoryMemTableRef, key: i64) -> Option<RecordBatch> {
     let max_visible_row = visible_end - 1;
 
     // Newest visible row position carrying this key (largest position wins).
-    let pos = btree
-        .get(&ScalarValue::Int64(Some(key)))
-        .into_iter()
-        .filter(|&p| p <= max_visible_row)
-        .max()?;
+    // O(1) hash probe with a range-scan fallback only when the newest write
+    // isn't visible yet.
+    let pos = match btree.get_eq(&ScalarValue::Int64(Some(key))) {
+        None => return None,
+        Some(p) if p <= max_visible_row => p,
+        Some(_) => btree
+            .get(&ScalarValue::Int64(Some(key)))
+            .into_iter()
+            .filter(|&p| p <= max_visible_row)
+            .max()?,
+    };
 
     // Map the global position to (batch, row) and slice one row.
     let mut start: u64 = 0;
@@ -217,13 +223,20 @@ fn fast_lookup_batch(active: &InMemoryMemTableRef, keys: &[i64]) -> RecordBatch 
     // Group target rows by their owning batch so each batch is gathered once.
     let mut by_batch: HashMap<usize, Vec<u32>> = HashMap::new();
     for &k in keys {
-        let Some(pos) = btree
-            .get(&ScalarValue::Int64(Some(k)))
-            .into_iter()
-            .filter(|&p| p < visible_end)
-            .max()
-        else {
-            continue;
+        let pos = match btree.get_eq(&ScalarValue::Int64(Some(k))) {
+            None => continue,
+            Some(p) if p < visible_end => p,
+            Some(_) => {
+                match btree
+                    .get(&ScalarValue::Int64(Some(k)))
+                    .into_iter()
+                    .filter(|&p| p < visible_end)
+                    .max()
+                {
+                    Some(p) => p,
+                    None => continue,
+                }
+            }
         };
         let (mut lo, mut hi) = (0usize, last_visible_idx);
         while lo < hi {
