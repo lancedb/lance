@@ -436,9 +436,9 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
             .lower_case(false)
             .stem(false)
             .remove_stop_words(false)
-            .with_position(true)
+            .with_position(args.with_position)
     } else {
-        InvertedIndexParams::default().with_position(true)
+        InvertedIndexParams::default().with_position(args.with_position)
     };
     let mut index = FtsMemIndex::with_params(0, TEXT_COL.to_string(), params);
     if let Some(rows) = args.freeze_threshold {
@@ -512,6 +512,18 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
                 .collect()
         })
         .collect();
+
+    // Without positions, phrase search is unsupported — drop phrase queries so
+    // both sides measure the same (term-only) workload apples-to-apples.
+    let (queries, truth): (Vec<Q>, Vec<Vec<usize>>) = if args.with_position {
+        (queries, truth)
+    } else {
+        queries
+            .into_iter()
+            .zip(truth)
+            .filter(|(q, _)| q.kind != "phrase")
+            .unzip()
+    };
 
     let opts = SearchOptions::new()
         .with_limit(args.k)
@@ -710,6 +722,10 @@ struct BenchArgs {
     /// Override the tail freeze threshold (docs); large values keep a big
     /// mutable tail to expose tail-read cost. None = index default.
     freeze_threshold: Option<usize>,
+    /// Index token positions (enables phrase). `--no-positions` turns this off
+    /// for an apples-to-apples term-only comparison against Lucene
+    /// `DOCS_AND_FREQS`. Default true.
+    with_position: bool,
 }
 
 fn main() -> Result<()> {
@@ -759,6 +775,7 @@ fn main() -> Result<()> {
                     .position(|a| *a == "--freeze-threshold")
                     .and_then(|i| argv.get(i + 1))
                     .and_then(|s| s.parse().ok()),
+                with_position: !argv.contains(&"--no-positions"),
             };
             run_bench(&args)
         }

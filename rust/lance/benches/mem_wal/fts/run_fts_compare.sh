@@ -93,6 +93,21 @@ print(f"{tot / n:.4f}")
 PY
 }
 
+# Optional apples-to-apples toggles:
+#   POSITIONS=0  index without token positions on BOTH sides (term-only, no
+#                phrase) — Lance with_position=false vs Lucene DOCS_AND_FREQS.
+#   IMMUTABLE=1  Lance reads only immutable frozen segments (the Lucene model).
+LANCE_FLAGS=""
+LUCENE_FLAGS=""
+if [ "${POSITIONS:-1}" = "0" ]; then
+    LANCE_FLAGS="$LANCE_FLAGS --no-positions"
+    LUCENE_FLAGS="$LUCENE_FLAGS --no-positions"
+fi
+if [ "${IMMUTABLE:-0}" = "1" ]; then
+    LANCE_FLAGS="$LANCE_FLAGS --immutable"
+fi
+echo "lance flags:'$LANCE_FLAGS'  lucene flags:'$LUCENE_FLAGS'"
+
 echo ""
 for SIZE in $SIZES; do
     DIR="$WORK/n$SIZE"
@@ -106,11 +121,11 @@ for SIZE in $SIZES; do
     for RUN in a b; do
         echo "--- run $RUN: lance ---"
         "$LANCE_BIN" --bench bench --in-dir "$DIR" --run "$RUN" --k "$K" \
-            --threads "$THREADS" | tee "$RESULT_DIR/lance_n${SIZE}_run${RUN}.txt" \
+            --threads "$THREADS" $LANCE_FLAGS | tee "$RESULT_DIR/lance_n${SIZE}_run${RUN}.txt" \
             | grep '^{' > "$RESULT_DIR/lance_n${SIZE}_run${RUN}.json"
         echo "--- run $RUN: lucene ---"
         "$JAVA" -cp "$LUCENE_CP:$WORK" LuceneFtsBench --in-dir "$DIR" --run "$RUN" \
-            --k "$K" --threads "$THREADS" | tee "$RESULT_DIR/lucene_n${SIZE}_run${RUN}.txt" \
+            --k "$K" --threads "$THREADS" $LUCENE_FLAGS | tee "$RESULT_DIR/lucene_n${SIZE}_run${RUN}.txt" \
             | grep '^{' > "$RESULT_DIR/lucene_n${SIZE}_run${RUN}.json"
         ov="$(mutual_overlap "$DIR/lance_fts_run${RUN}_topk.txt" \
                              "$DIR/lucene_run${RUN}_topk.txt" "$K")"

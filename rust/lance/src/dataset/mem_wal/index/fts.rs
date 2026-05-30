@@ -657,13 +657,14 @@ impl TailIndex {
         doc_lengths: Vec<u32>,
         total_tokens: u64,
         term_builders: FxHashMap<Arc<str>, BatchTermBuilder>,
+        with_position: bool,
     ) {
         let mut cache = self
             .writer_term_cache
             .lock()
             .expect("writer term cache poisoned — single-writer invariant violated");
         for (term, builder) in term_builders {
-            let chunk = builder.build(batch_position);
+            let chunk = builder.build(batch_position, with_position);
             // First sight of the term this generation populates the SkipMap
             // (so readers can find it) and caches the slot; later batches hit
             // only the cache.
@@ -979,6 +980,7 @@ impl FtsMemIndex {
                 vec![0; batch.num_rows()],
                 0,
                 FxHashMap::default(),
+                self.params.has_positions(),
             );
             return Ok(());
         };
@@ -1042,6 +1044,7 @@ impl FtsMemIndex {
             doc_lengths,
             total_tokens,
             term_builders,
+            self.params.has_positions(),
         );
 
         if st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
@@ -1255,6 +1258,12 @@ impl FtsMemIndex {
         if tokens.len() == 1 {
             // A single-token phrase reduces to a regular term search.
             return self.search_match(st, tokens, None, include_tail);
+        }
+        // A multi-token phrase needs token positions; without them (the index
+        // was built `with_position = false`) phrase search is unsupported, as
+        // on disk and in Lucene (`DOCS_AND_FREQS`).
+        if !self.params.has_positions() {
+            return Vec::new();
         }
         let tail_snap = st.tail.snapshot();
         let scan_tail = include_tail && tail_snap.visible_count > 0;
@@ -1752,27 +1761,31 @@ impl BatchTermBuilder {
         self.pos_data.push(position);
     }
 
-    /// Always materializes the per-doc positions: in-memory phrase queries
-    /// rely on them regardless of `params.has_positions()`. The flush path
-    /// consults `params.has_positions()` and emits a `Count` recorder
-    /// instead of `Position` when positions should not be persisted.
-    fn build(self, batch_position: usize) -> Arc<TermChunk> {
-        // CSR offsets are the frequency prefix sum.
-        let mut offsets = Vec::with_capacity(self.frequencies.len() + 1);
-        offsets.push(0u32);
-        let mut acc = 0u32;
-        for &f in &self.frequencies {
-            acc += f;
-            offsets.push(acc);
-        }
+    /// Freeze the accumulated postings into a `TermChunk`. Positions are stored
+    /// only when `with_position` (the column's FTS index config) is set — the
+    /// same contract as the on-disk format and Lucene's
+    /// `DOCS_AND_FREQS_AND_POSITIONS` vs `DOCS_AND_FREQS`. Without positions,
+    /// term/BM25 search works but phrase search is unsupported.
+    fn build(self, batch_position: usize, with_position: bool) -> Arc<TermChunk> {
+        let positions = with_position.then(|| {
+            // CSR offsets are the frequency prefix sum.
+            let mut offsets = Vec::with_capacity(self.frequencies.len() + 1);
+            offsets.push(0u32);
+            let mut acc = 0u32;
+            for &f in &self.frequencies {
+                acc += f;
+                offsets.push(acc);
+            }
+            Positions {
+                offsets,
+                data: self.pos_data,
+            }
+        });
         Arc::new(TermChunk {
             batch_position,
             row_positions: self.row_positions,
             frequencies: self.frequencies,
-            positions: Some(Positions {
-                offsets,
-                data: self.pos_data,
-            }),
+            positions,
         })
     }
 }
@@ -3042,6 +3055,17 @@ mod tests {
         ]))
     }
 
+    /// A position-enabled index — required for phrase search. The default
+    /// `InvertedIndexParams` (`with_position = false`) indexes no positions, so
+    /// phrase tests must opt in, mirroring the on-disk / Lucene contract.
+    fn position_index(field_id: i32, column: &str) -> FtsMemIndex {
+        FtsMemIndex::with_params(
+            field_id,
+            column.to_string(),
+            InvertedIndexParams::default().with_position(true),
+        )
+    }
+
     fn create_test_batch(schema: &ArrowSchema) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(schema.clone()),
@@ -3101,7 +3125,7 @@ mod tests {
     #[test]
     fn test_phrase_search_exact_match() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3111,7 +3135,7 @@ mod tests {
         assert_eq!(entries[0].row_position, 0);
 
         let batch2 = create_test_batch(&schema);
-        let index2 = FtsMemIndex::new(1, "description".to_string());
+        let index2 = position_index(1, "description");
         index2.insert(&batch2, 0).unwrap();
 
         let entries = index2.search_phrase("hello world", 0);
@@ -3126,7 +3150,7 @@ mod tests {
     #[test]
     fn test_phrase_search_with_slop() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3154,7 +3178,7 @@ mod tests {
     #[test]
     fn test_phrase_search_no_match() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3176,7 +3200,7 @@ mod tests {
     #[test]
     fn test_phrase_search_single_token() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3196,6 +3220,32 @@ mod tests {
 
         let entries = index.search_phrase("", 0);
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_without_positions_disables_phrase_and_skips_storage() {
+        // Default params (`with_position = false`): the index stores no token
+        // positions, so term/BM25 search works but phrase search does not — the
+        // same contract as the on-disk format and Lucene `DOCS_AND_FREQS`.
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(1);
+        index.insert(&create_test_batch(&schema), 0).unwrap();
+
+        assert_eq!(index.search("hello").len(), 2);
+        assert!(
+            index.search_phrase("hello world", 0).is_empty(),
+            "phrase search requires positions"
+        );
+        // The frozen partition stored no positions.
+        let (_, _, _, _, _, pos, _, _) = index.memory_breakdown();
+        assert_eq!(pos, 0, "no positions stored when with_position = false");
+
+        // With positions enabled the same phrase matches.
+        let with_pos = position_index(1, "description").with_freeze_threshold_rows(1);
+        with_pos.insert(&create_test_batch(&schema), 0).unwrap();
+        assert_eq!(with_pos.search_phrase("hello world", 0).len(), 1);
+        let (_, _, _, _, _, pos2, _, _) = with_pos.memory_breakdown();
+        assert!(pos2 > 0, "positions stored when with_position = true");
     }
 
     fn create_boolean_test_batch(schema: &ArrowSchema) -> RecordBatch {
@@ -3336,7 +3386,7 @@ mod tests {
     #[test]
     fn test_boolean_nested_phrase() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_boolean_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3368,7 +3418,7 @@ mod tests {
     #[test]
     fn test_search_query_phrase() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3917,7 +3967,7 @@ mod tests {
         // every token's position constraint holds, any returned entry
         // implicitly proves both tokens were visible together.
         let schema = create_test_schema();
-        let index = Arc::new(FtsMemIndex::new(1, "description".to_string()));
+        let index = Arc::new(position_index(1, "description"));
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut readers = Vec::new();
@@ -4183,7 +4233,7 @@ mod tests {
     #[test]
     fn test_phrase_across_partitions() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(3);
+        let index = position_index(1, "description").with_freeze_threshold_rows(3);
         // Each batch has "hello world" at its row_offset row.
         for i in 0..4 {
             index
