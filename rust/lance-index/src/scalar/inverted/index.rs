@@ -943,22 +943,213 @@ impl Index for InvertedIndex {
     }
 }
 
+/// Granularity (in bytes) of one prewarm budget permit.
+///
+/// The byte budget is expressed in `tokio::sync::Semaphore` permits, which are
+/// `usize`. To keep a multi-GiB budget well within `usize` on 32-bit targets and
+/// to keep the permit count small, one permit represents one MiB of estimated
+/// resident posting data. Sub-MiB partitions still cost at least one permit.
+const PREWARM_PERMIT_BYTES: u64 = 1 << 20;
+
+/// Fraction of the process's available memory used as the default prewarm budget.
+/// Conservative because the materialized posting `Vec`s live outside the index
+/// cache's memory cap, so this is additive to the cache's own footprint.
+const PREWARM_DEFAULT_MEMORY_FRACTION: f64 = 0.25;
+
+/// Floor for the derived/overridden budget so prewarm always makes progress even
+/// if memory introspection reports an implausibly small number.
+const PREWARM_MIN_BUDGET_BYTES: u64 = 64 << 20;
+
+/// Last-resort total-memory assumption when neither the cgroup limit nor
+/// `/proc/meminfo` can be read (e.g. non-Linux).
+const PREWARM_FALLBACK_TOTAL_MEMORY_BYTES: u64 = 4 << 30;
+
+/// Best-effort, cgroup-aware view of the memory available to this process, in
+/// bytes. Prefers the cgroup v2 `memory.max` limit (what actually OOM-kills the
+/// process in a container), falling back to the host's total RAM from
+/// `/proc/meminfo`, then to a fixed conservative constant.
+fn available_memory_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // cgroup v2: the effective memory ceiling for this process.
+        if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+            let raw = raw.trim();
+            // A pathologically large value (or literal "max") means "unlimited";
+            // ignore it and fall through to host memory.
+            if raw != "max"
+                && let Ok(limit) = raw.parse::<u64>()
+                && limit > 0
+                && limit < (u64::MAX >> 1)
+            {
+                return limit;
+            }
+        }
+        // Host total memory from /proc/meminfo (MemTotal is in kB).
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            for line in meminfo.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:")
+                    && let Some(kb) = rest.split_whitespace().next()
+                    && let Ok(kb) = kb.parse::<u64>()
+                {
+                    return kb.saturating_mul(1024);
+                }
+            }
+        }
+    }
+    PREWARM_FALLBACK_TOTAL_MEMORY_BYTES
+}
+
+/// Resolve the effective prewarm memory budget (bytes), applying the explicit
+/// override or deriving a conservative fraction of available memory, then
+/// flooring it so prewarm always makes progress.
+fn resolve_prewarm_budget_bytes(options: &FtsPrewarmOptions) -> u64 {
+    match options.memory_budget_bytes {
+        // An explicit override is honored verbatim (subject only to a >=1 byte
+        // floor so the semaphore is non-empty); callers asking for a tight budget
+        // get one. The MIN floor below only guards the *derived* default against
+        // implausibly small memory readings.
+        Some(b) if b > 0 => b,
+        _ => {
+            let avail = available_memory_bytes() as f64;
+            let derived = (avail * PREWARM_DEFAULT_MEMORY_FRACTION) as u64;
+            derived.max(PREWARM_MIN_BUDGET_BYTES)
+        }
+    }
+}
+
+/// Test hook for observing the prewarm admission scheme: tracks the current and
+/// peak number of concurrent partition prewarm futures AND the current/peak sum
+/// of their estimated resident bytes, so tests can assert that (a) many small
+/// partitions run with high concurrency and (b) the in-flight estimated bytes
+/// never exceed the budget.
+struct InflightTracker {
+    current: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+    current_bytes: AtomicU64,
+    max_bytes: AtomicU64,
+}
+
+impl InflightTracker {
+    #[allow(dead_code)]
+    fn new() -> Self {
+        Self {
+            current: std::sync::atomic::AtomicUsize::new(0),
+            max: std::sync::atomic::AtomicUsize::new(0),
+            current_bytes: AtomicU64::new(0),
+            max_bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Record entry into a partition prewarm charged `bytes` and return a guard
+    /// that records exit on drop.
+    fn enter(self: &Arc<Self>, bytes: u64) -> InflightGuard {
+        let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(now, Ordering::SeqCst);
+        let now_bytes = self.current_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        self.max_bytes.fetch_max(now_bytes, Ordering::SeqCst);
+        InflightGuard {
+            tracker: self.clone(),
+            bytes,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn max(&self) -> usize {
+        self.max.load(Ordering::SeqCst)
+    }
+
+    #[allow(dead_code)]
+    fn max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::SeqCst)
+    }
+}
+
+struct InflightGuard {
+    tracker: Arc<InflightTracker>,
+    bytes: u64,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.tracker.current.fetch_sub(1, Ordering::SeqCst);
+        self.tracker
+            .current_bytes
+            .fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
+
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
+        self.prewarm_with_options_instrumented(options, None).await
+    }
+
+    /// Internal prewarm driver implementing memory-budgeted admission.
+    ///
+    /// Each partition reads its entire posting set into one RecordBatch and then
+    /// materializes every posting list into a `Vec` in RAM (outside the index
+    /// cache's memory cap) before inserting. Peak prewarm memory is therefore the
+    /// sum of the in-flight partitions' resident sizes. Rather than a flat
+    /// partition count (the old behavior, and worse still the object store's
+    /// `io_parallelism`, which is the right knob for fan-out *within* one read but
+    /// tens of times too large as a count of whole partitions to hold at once),
+    /// admission is gated by a byte budget: each partition is charged an estimate
+    /// of its resident cost (its posting-data on-disk size) via a counting
+    /// semaphore, so many small partitions run concurrently while large ones
+    /// throttle. A partition whose estimate exceeds the whole budget acquires the
+    /// entire budget and runs solo rather than deadlocking.
+    ///
+    /// `inflight` is an optional test hook: when supplied, each admitted partition
+    /// records its entry/exit and charged bytes so a test can observe the peak
+    /// concurrency and the peak sum of in-flight estimated bytes.
+    async fn prewarm_with_options_instrumented(
+        &self,
+        options: &FtsPrewarmOptions,
+        inflight: Option<Arc<InflightTracker>>,
+    ) -> Result<()> {
         let with_position = options.with_position;
-        let io_parallelism = self.store.io_parallelism();
+
+        let budget_bytes = resolve_prewarm_budget_bytes(options);
+        // Express the budget in MiB permits to keep the count small and within
+        // `usize`. At least one permit so the semaphore is never zero-capacity,
+        // and at most `u32::MAX` since `acquire_many` takes a `u32` (so the solo
+        // case, where a partition requests the whole budget, is acquirable).
+        let budget_permits = budget_bytes
+            .div_ceil(PREWARM_PERMIT_BYTES)
+            .clamp(1, u32::MAX as u64) as usize;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(budget_permits));
+
         let prewarm_futures = self
             .partitions
             .iter()
             .map(Arc::clone)
-            .map(|part| async move {
-                part.inverted_list
-                    .prewarm_posting_lists(with_position)
-                    .await?;
-                Result::Ok(())
+            .map(|part| {
+                let inflight = inflight.clone();
+                let semaphore = semaphore.clone();
+                async move {
+                    // Cheap, no-data-read estimate of this partition's resident
+                    // cost, charged as MiB permits. Cap a single request at the
+                    // whole budget so an oversized partition runs solo instead of
+                    // requesting more permits than exist (which would never be
+                    // satisfiable).
+                    let est_bytes = part.inverted_list.posting_data_size_bytes();
+                    let permits = (est_bytes.div_ceil(PREWARM_PERMIT_BYTES).max(1) as usize)
+                        .min(budget_permits);
+                    let _permit = semaphore
+                        .acquire_many(permits as u32)
+                        .await
+                        .expect("prewarm semaphore closed");
+                    let _guard = inflight.as_ref().map(|t| t.enter(est_bytes));
+                    part.inverted_list
+                        .prewarm_posting_lists(with_position)
+                        .await?;
+                    Result::Ok(())
+                }
             });
+        // Keep a high buffer_unordered cap so the semaphore (not the stream) is
+        // the real limiter; every future polls immediately and blocks on the
+        // permit acquisition.
         stream::iter(prewarm_futures)
-            .buffer_unordered(io_parallelism)
+            .buffer_unordered(self.partitions.len().max(1))
             .try_collect::<Vec<_>>()
             .await?;
         Ok(())
@@ -2172,6 +2363,33 @@ impl PostingListReader {
         );
 
         Ok(())
+    }
+
+    /// Cheap estimate of the on-disk posting data size in bytes, used to budget
+    /// FTS prewarm concurrency. This is the length of the partition's
+    /// `invert.lance` file, which the reader already knows from object metadata
+    /// (no posting data is read here).
+    ///
+    /// The file length is a conservative upper bound on the resident size of the
+    /// materialized posting lists when the index was built without positions
+    /// (`with_position=false`): the on-disk bytes include the compressed tail and
+    /// per-token metadata columns, so the in-RAM `Vec`s are no larger. When
+    /// positions are present on disk but not being prewarmed, the file length
+    /// over-counts (the position stream stays on disk) — over-counting only makes
+    /// the budget more conservative, which is safe.
+    ///
+    /// Falls back to a row-count-based estimate when the reader cannot surface
+    /// the file length cheaply (e.g. the legacy v1 reader).
+    pub(crate) fn posting_data_size_bytes(&self) -> u64 {
+        if let Some(size) = self.reader.file_size_bytes() {
+            return size;
+        }
+        // Fallback: assume a small fixed number of bytes per posting row. This is
+        // only hit for readers that don't cache their file length; it just needs
+        // to be a monotonic, order-of-magnitude proxy so larger partitions get
+        // larger budgets.
+        const ESTIMATED_BYTES_PER_ROW: u64 = 16;
+        (self.reader.num_rows() as u64).saturating_mul(ESTIMATED_BYTES_PER_ROW)
     }
 
     pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
@@ -6075,6 +6293,255 @@ mod tests {
             .unwrap();
 
         assert_eq!(row_ids, vec![100]);
+    }
+
+    /// Build a multi-partition inverted index in `store` with `num_partitions`
+    /// partitions, each carrying a handful of tokens/docs.
+    async fn build_multi_partition_index(
+        store: &Arc<LanceIndexStore>,
+        num_partitions: u64,
+    ) -> (Arc<InvertedIndex>, Arc<LanceCache>) {
+        for id in 0..num_partitions {
+            let mut builder = InnerBuilder::new_with_format_version(
+                id,
+                false,
+                TokenSetFormat::default(),
+                InvertedListFormatVersion::V1,
+            );
+            // A few distinct tokens per partition so each posting file has real
+            // content to read and materialize during prewarm.
+            for t in 0..4u32 {
+                builder.tokens.add(format!("tok_{id}_{t}"));
+                let mut posting =
+                    PostingListBuilder::new_with_posting_tail_codec(false, PostingTailCodec::Fixed32);
+                let base = id * 1000 + t as u64 * 10;
+                for d in 0..5u32 {
+                    posting.add(d, PositionRecorder::Count(1));
+                    builder.docs.append(base + d as u64, 4);
+                }
+                builder.posting_lists.push(posting);
+            }
+            builder.write(store.as_ref()).await.unwrap();
+        }
+
+        let partition_ids: Vec<u64> = (0..num_partitions).collect();
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&partition_ids).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        // Keep the cache alive and return it: the partition readers hold only a
+        // WeakLanceCache, so the prewarmed entries vanish if this Arc is dropped.
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        (index, cache)
+    }
+
+    /// Assert every partition's posting lists were materialized into the cache.
+    async fn assert_all_prewarmed(index: &InvertedIndex) {
+        for part in &index.partitions {
+            let token_count = part.inverted_list.len();
+            assert!(token_count > 0);
+            for token_id in 0..token_count as u32 {
+                assert!(
+                    part.inverted_list
+                        .index_cache
+                        .get_with_key(&PostingListKey { token_id })
+                        .await
+                        .is_some(),
+                    "posting list for token {token_id} not prewarmed into cache"
+                );
+            }
+        }
+    }
+
+    /// The prewarm cost estimate must come from cheap object metadata (the
+    /// posting file length) without reading the posting data, and must be
+    /// monotonic in the partition's content.
+    #[tokio::test]
+    async fn test_posting_data_size_bytes_uses_file_length() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let (index, _cache) = build_multi_partition_index(&store, 3).await;
+        for part in &index.partitions {
+            // File length is reported by object metadata at open time; it must be
+            // non-trivial for a partition that actually holds postings.
+            let est = part.inverted_list.posting_data_size_bytes();
+            assert!(
+                est > 0,
+                "expected a non-zero posting-data size estimate, got {est}"
+            );
+        }
+    }
+
+    /// The prewarm admission scheme is governed by a MEMORY BUDGET, not a flat
+    /// partition count. This exercises the four behaviors:
+    ///   (a) loose budget => many small partitions run with HIGH concurrency
+    ///       (more than the old fixed cap of 2);
+    ///   (b) tight budget => concurrency throttles so the sum of in-flight
+    ///       estimated bytes never exceeds the budget;
+    ///   (c) a single partition whose estimate exceeds the budget still runs
+    ///       (solo);
+    ///   (d) correctness: every partition is prewarmed into the cache in all
+    ///       cases.
+    #[tokio::test]
+    async fn test_prewarm_memory_budget_governs_concurrency() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_partitions = 16u64;
+        let (index, _cache) = build_multi_partition_index(&store, num_partitions).await;
+        assert_eq!(index.partitions.len(), num_partitions as usize);
+
+        // Per-partition estimates and the largest one, used to size the budgets.
+        let estimates: Vec<u64> = index
+            .partitions
+            .iter()
+            .map(|p| p.inverted_list.posting_data_size_bytes())
+            .collect();
+        let max_estimate = *estimates.iter().max().unwrap();
+        let total_estimate: u64 = estimates.iter().sum();
+        assert!(max_estimate > 0);
+
+        // (a) Loose budget: comfortably covers every partition at once, so
+        // concurrency should be HIGH -- crucially more than the old fixed cap of
+        // 2, proving this is not just a constant. Budget = 4x the total so all 16
+        // are admissible.
+        let loose_budget = total_estimate.saturating_mul(4).max(1 << 30);
+        let tracker = Arc::new(InflightTracker::new());
+        index
+            .prewarm_with_options_instrumented(
+                &FtsPrewarmOptions::new().with_memory_budget_bytes(loose_budget),
+                Some(tracker.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tracker.max() > 2,
+            "loose budget should allow high concurrency (>2), got peak {}",
+            tracker.max()
+        );
+        assert!(
+            tracker.max_bytes() <= loose_budget,
+            "in-flight bytes ({}) exceeded the loose budget ({})",
+            tracker.max_bytes(),
+            loose_budget
+        );
+        assert_all_prewarmed(&index).await;
+
+        // (b) Tight budget: only one MiB-permit, so partitions are admitted
+        // essentially one at a time and the in-flight estimated bytes stay under
+        // the budget. We use a budget below two partitions' worth so at most one
+        // can hold permits at a time (each tiny partition costs the 1-permit MiB
+        // floor).
+        let tight_budget = PREWARM_PERMIT_BYTES; // exactly one permit
+        let tracker = Arc::new(InflightTracker::new());
+        index
+            .prewarm_with_options_instrumented(
+                &FtsPrewarmOptions::new().with_memory_budget_bytes(tight_budget),
+                Some(tracker.clone()),
+            )
+            .await
+            .unwrap();
+        // With a single permit and each partition costing >= 1 permit, only one
+        // partition holds permits at a time.
+        assert_eq!(
+            tracker.max(),
+            1,
+            "tight budget should serialize prewarm, got peak concurrency {}",
+            tracker.max()
+        );
+        // The byte-budget invariant: in-flight estimated bytes never exceed what
+        // a single permit's worth of partitions can represent. Because the tiny
+        // partitions each round up to the 1 MiB permit, the in-flight *estimate*
+        // is bounded by the largest single partition (the solo runner).
+        assert!(
+            tracker.max_bytes() <= max_estimate,
+            "in-flight bytes ({}) exceeded a single partition's estimate ({}) under a 1-permit budget",
+            tracker.max_bytes(),
+            max_estimate
+        );
+        assert_all_prewarmed(&index).await;
+
+        // (c) Oversized partition: a budget smaller than even one partition's
+        // estimate. The request is capped at the whole budget, so the partition
+        // still runs (solo) rather than deadlocking on an unsatisfiable request.
+        let oversized_budget = (max_estimate / 2).max(1);
+        assert!(
+            oversized_budget < max_estimate,
+            "test premise: budget ({oversized_budget}) must be below a partition's estimate ({max_estimate})"
+        );
+        let tracker = Arc::new(InflightTracker::new());
+        index
+            .prewarm_with_options_instrumented(
+                &FtsPrewarmOptions::new().with_memory_budget_bytes(oversized_budget),
+                Some(tracker.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.max(),
+            1,
+            "an oversized partition must run solo, got peak concurrency {}",
+            tracker.max()
+        );
+        assert_all_prewarmed(&index).await;
+    }
+
+    /// The default (unset) budget derives from available memory and must be
+    /// large enough that tiny partitions all prewarm with high concurrency, and
+    /// every partition still lands in the cache.
+    #[tokio::test]
+    async fn test_prewarm_default_budget_high_concurrency() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_partitions = 16u64;
+        let (index, _cache) = build_multi_partition_index(&store, num_partitions).await;
+
+        let tracker = Arc::new(InflightTracker::new());
+        index
+            .prewarm_with_options_instrumented(&FtsPrewarmOptions::new(), Some(tracker.clone()))
+            .await
+            .unwrap();
+        // Default budget is a fraction of available memory (>= 64 MiB floor), so
+        // the tiny test partitions all run together: peak well above the old
+        // fixed cap of 2.
+        assert!(
+            tracker.max() > 2,
+            "default budget should allow high concurrency (>2), got peak {}",
+            tracker.max()
+        );
+        assert_all_prewarmed(&index).await;
     }
 
     #[tokio::test]

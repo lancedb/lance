@@ -232,6 +232,18 @@ pub trait IndexReader: Send + Sync {
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
     fn schema(&self) -> &lance_core::datatypes::Schema;
+    /// Best-effort on-disk byte size of the underlying file, if known cheaply.
+    ///
+    /// This is metadata that the reader already holds after opening the file
+    /// (the object store reports the file length on open); it does NOT require
+    /// reading the file's data. Returns `None` when the concrete reader cannot
+    /// surface the size without extra I/O, in which case callers should fall
+    /// back to a row-count-based estimate.
+    ///
+    /// Used by FTS prewarm to budget how many partitions to materialize at once.
+    fn file_size_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Trait abstracting I/O away from index logic

@@ -266,6 +266,12 @@ impl IndexReader for current_reader::FileReader {
     fn schema(&self) -> &lance_core::datatypes::Schema {
         Self::schema(self)
     }
+
+    fn file_size_bytes(&self) -> Option<u64> {
+        // The object store reports the file length when the file is opened, and
+        // the reader caches it in its metadata, so this is free (no I/O).
+        Some(self.metadata().file_size())
+    }
 }
 
 #[async_trait]
