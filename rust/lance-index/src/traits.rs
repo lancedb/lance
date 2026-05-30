@@ -58,6 +58,24 @@ pub type ScalarIndexCriteria<'a> = IndexCriteria<'a>;
 pub struct FtsPrewarmOptions {
     /// If true, prewarm positions along with posting lists.
     pub with_position: bool,
+    /// Memory budget, in bytes, governing how many partitions prewarm
+    /// concurrently.
+    ///
+    /// Prewarm reads and materializes an entire partition's posting lists into
+    /// RAM (outside the index cache's memory cap) before inserting them, so peak
+    /// prewarm memory is roughly the sum of the in-flight partitions' resident
+    /// sizes. Rather than a flat partition count — which throttles many tiny
+    /// partitions as hard as a few huge ones — admission is gated by this byte
+    /// budget: each partition is charged an estimate of its resident cost (its
+    /// posting-data on-disk size) and only runs once the budget can cover it.
+    /// Many small partitions therefore run concurrently while large partitions
+    /// throttle, keeping total estimated resident memory under the budget.
+    ///
+    /// `None` (the default) derives the budget from the process's available
+    /// memory (cgroup-aware); see the prewarm implementation. A single partition
+    /// whose estimate exceeds the budget is still admitted on its own (it runs
+    /// solo rather than deadlocking).
+    pub memory_budget_bytes: Option<u64>,
 }
 
 impl FtsPrewarmOptions {
@@ -67,6 +85,13 @@ impl FtsPrewarmOptions {
 
     pub fn with_position(mut self, with_position: bool) -> Self {
         self.with_position = with_position;
+        self
+    }
+
+    /// Override the prewarm memory budget (in bytes). When unset, the budget is
+    /// derived from the process's available memory.
+    pub fn with_memory_budget_bytes(mut self, memory_budget_bytes: u64) -> Self {
+        self.memory_budget_bytes = Some(memory_budget_bytes);
         self
     }
 }
