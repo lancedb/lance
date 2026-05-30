@@ -1194,7 +1194,6 @@ mod tests {
             name: "name_btree".to_string(),
             field_id: 1,
             column: "name".to_string(),
-            is_primary_key: true,
         })];
 
         let schema = create_pk_schema();
@@ -1329,7 +1328,6 @@ mod tests {
             name: "id_btree".to_string(),
             field_id: 0,
             column: "id".to_string(),
-            is_primary_key: true,
         })];
 
         let schema = create_test_schema();

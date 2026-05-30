@@ -2720,7 +2720,6 @@ mod tests {
             name: "id_idx".to_string(),
             field_id: 0,
             column: "id".to_string(),
-            is_primary_key: true,
         })];
 
         let writer = ShardWriter::open(
@@ -2773,7 +2772,6 @@ mod tests {
             name: "id_idx".to_string(),
             field_id: 0,
             column: "id".to_string(),
-            is_primary_key: true,
         })];
 
         let writer = ShardWriter::open(
@@ -3359,7 +3357,6 @@ mod tests {
             name: "id_idx".to_string(),
             field_id: 0,
             column: "id".to_string(),
-            is_primary_key: true,
         })];
 
         let err = ShardWriter::open(

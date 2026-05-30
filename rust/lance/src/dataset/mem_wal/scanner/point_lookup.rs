@@ -642,31 +642,11 @@ fn probe_position(
         return Ok(ProbePos::Miss);
     }
 
-    // Newest *visible* position of the key. With the equality hash (PK index),
-    // probe it O(1) and only range-scan when the newest isn't visible yet.
-    // Without the hash (a non-PK btree), range-scan the ordered skiplist
-    // directly — correct, just O(log n).
-    let newest_visible_by_range = || {
-        btree
-            .get(pk_value)
-            .into_iter()
-            .filter(|&p| p < visible_end)
-            .max()
-    };
-    let pos = if btree.has_equality_hash() {
-        match btree.get_eq(pk_value) {
-            None => return Ok(ProbePos::Miss),
-            Some(p) if p < visible_end => p,
-            Some(_) => match newest_visible_by_range() {
-                Some(p) => p,
-                None => return Ok(ProbePos::Miss),
-            },
-        }
-    } else {
-        match newest_visible_by_range() {
-            Some(p) => p,
-            None => return Ok(ProbePos::Miss),
-        }
+    // Newest visible position of the key — a single seek-and-stop on the
+    // ordered skiplist (largest key ≤ (value, max_visible_row)). No range
+    // collect, no allocation.
+    let Some(pos) = btree.get_newest_visible(pk_value, visible_end - 1) else {
+        return Ok(ProbePos::Miss);
     };
 
     // Binary-search the owning batch by `row_offset` (appended in order).
@@ -1597,9 +1577,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lookup_without_equality_hash_uses_range_fallback() {
-        // A btree with no equality hash (a non-PK index) must still resolve
-        // equality point lookups correctly — via the ordered range scan.
+    async fn test_lookup_against_from_configs_built_index() {
+        // A point lookup against an index built the production way
+        // (`IndexStore::from_configs`) resolves correctly via the seek-and-stop
+        // skiplist probe.
         use crate::dataset::mem_wal::index::{BTreeIndexConfig, IndexStore, MemIndexConfig};
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
 
@@ -1611,7 +1592,6 @@ mod tests {
                 name: "id_idx".to_string(),
                 field_id: 0,
                 column: "id".to_string(),
-                is_primary_key: false, // no equality hash
             })],
             1000,
             100,
@@ -1621,13 +1601,6 @@ mod tests {
         index_store
             .insert_with_batch_position(&batch, row_offset, Some(idx))
             .unwrap();
-        assert!(
-            !index_store
-                .get_btree_by_column("id")
-                .unwrap()
-                .has_equality_hash(),
-            "non-PK btree should have no equality hash"
-        );
 
         let temp = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp.path().to_str().unwrap());
