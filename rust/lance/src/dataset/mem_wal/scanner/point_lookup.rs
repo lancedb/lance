@@ -671,7 +671,8 @@ fn probe_position(
 }
 
 /// Gather `rows` from `batch_store`'s batch `batch_idx` into the `target`
-/// schema with a single vectorized `take` per call.
+/// schema. A single row is a zero-copy `slice` (the common point-lookup case);
+/// multiple rows use one vectorized `take` per column.
 fn gather_rows(
     batch_store: &BatchStore,
     batch_idx: usize,
@@ -681,7 +682,7 @@ fn gather_rows(
     let stored = batch_store
         .get(batch_idx)
         .ok_or_else(|| lance_core::Error::internal("point-lookup: gather batch missing"))?;
-    let indices = arrow_array::UInt32Array::from(rows.to_vec());
+    let indices = (rows.len() > 1).then(|| arrow_array::UInt32Array::from(rows.to_vec()));
     let cols: Vec<Arc<dyn Array>> = target
         .fields()
         .iter()
@@ -692,8 +693,12 @@ fn gather_rows(
                     f.name()
                 ))
             })?;
-            arrow_select::take::take(stored.data.column(idx).as_ref(), &indices, None)
-                .map_err(lance_core::Error::from)
+            let col = stored.data.column(idx);
+            match &indices {
+                None => Ok(col.slice(rows[0] as usize, 1)),
+                Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)
+                    .map_err(lance_core::Error::from),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(target.clone(), cols)?)
