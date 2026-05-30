@@ -17,6 +17,56 @@ use lance_index::scalar::btree::OrderableScalarValue;
 
 use super::RowPosition;
 
+/// Compact, directly-hashable key for the equality hash sidecar.
+///
+/// Keying the hash on a primitive (an inline `i64` etc.) instead of the large
+/// `ScalarValue` enum shrinks per-key memory and makes hash/compare a typed
+/// operation rather than a wide enum match — the equality-probe hot path. An
+/// index is always built on a single column of a single type, so the
+/// `Utf8`/`LargeUtf8` (and the int-width) variants never collide within one
+/// index. Nulls and types not enumerated here fall back to `Other` (rare).
+/// Floats are keyed by their bit pattern so they're `Hash + Eq`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum EqKey {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F32(u32),
+    F64(u64),
+    Str(Box<str>),
+    Other(ScalarValue),
+}
+
+impl EqKey {
+    fn from_scalar(v: &ScalarValue) -> Self {
+        match v {
+            ScalarValue::Boolean(Some(b)) => Self::Bool(*b),
+            ScalarValue::Int8(Some(x)) => Self::I8(*x),
+            ScalarValue::Int16(Some(x)) => Self::I16(*x),
+            ScalarValue::Int32(Some(x)) => Self::I32(*x),
+            ScalarValue::Int64(Some(x)) => Self::I64(*x),
+            ScalarValue::UInt8(Some(x)) => Self::U8(*x),
+            ScalarValue::UInt16(Some(x)) => Self::U16(*x),
+            ScalarValue::UInt32(Some(x)) => Self::U32(*x),
+            ScalarValue::UInt64(Some(x)) => Self::U64(*x),
+            ScalarValue::Float32(Some(f)) => Self::F32(f.to_bits()),
+            ScalarValue::Float64(Some(f)) => Self::F64(f.to_bits()),
+            ScalarValue::Date32(Some(x)) => Self::I32(*x),
+            ScalarValue::Date64(Some(x)) => Self::I64(*x),
+            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+                Self::Str(s.as_str().into())
+            }
+            other => Self::Other(other.clone()),
+        }
+    }
+}
+
 /// Composite key for BTree index.
 ///
 /// By combining (scalar_value, row_position), each entry is unique.
@@ -52,12 +102,12 @@ impl Ord for IndexKey {
 pub struct BTreeMemIndex {
     /// Ordered map: (scalar_value, row_position) -> (). Serves range queries.
     lookup: SkipMap<IndexKey, ()>,
-    /// Equality sidecar: value -> newest (largest) row position. Gives O(1)
-    /// equality point lookups instead of an O(log n) skiplist range scan (the
-    /// dominant point-lookup cost). Only the newest position is kept; the rare
-    /// case where it isn't visible yet (a concurrent newer write) falls back to
-    /// the ordered `lookup` to find the newest *visible* version.
-    equality_hash: DashMap<ScalarValue, RowPosition>,
+    /// Equality sidecar: compact value key -> newest (largest) row position.
+    /// Gives O(1) equality point lookups instead of an O(log n) skiplist range
+    /// scan (the dominant point-lookup cost). Only the newest position is kept;
+    /// the rare case where it isn't visible yet (a concurrent newer write)
+    /// falls back to the ordered `lookup` to find the newest *visible* version.
+    equality_hash: DashMap<EqKey, RowPosition>,
     /// Field ID this index is built on.
     field_id: i32,
     /// Column name (for Arrow batch lookups).
@@ -79,7 +129,7 @@ impl BTreeMemIndex {
     /// ranges) and the equality hash (newest position wins).
     fn add(&self, value: OrderableScalarValue, row_position: RowPosition) {
         self.equality_hash
-            .entry(value.0.clone())
+            .entry(EqKey::from_scalar(&value.0))
             .and_modify(|p| {
                 if row_position > *p {
                     *p = row_position;
@@ -205,7 +255,9 @@ impl BTreeMemIndex {
     /// yet (a concurrent newer write), fall back to [`Self::get`] to find the
     /// newest *visible* version.
     pub fn get_eq(&self, value: &ScalarValue) -> Option<RowPosition> {
-        self.equality_hash.get(value).map(|e| *e.value())
+        self.equality_hash
+            .get(&EqKey::from_scalar(value))
+            .map(|e| *e.value())
     }
 
     pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
