@@ -1540,8 +1540,6 @@ impl TermSlice {
     }
 }
 
-/// Helper used during insert to accumulate a single batch's contribution to
-/// one term.
 /// Accumulates one batch's postings for a single term in a flat,
 /// allocation-light layout. Tokens are appended directly as they stream out
 /// of the tokenizer (`observe`), so there is no intermediate per-document map
@@ -2385,12 +2383,6 @@ impl Partition {
         results
     }
 
-    /// WAND top-k over an OR query, contributing into the caller's shared
-    /// [`TopK`]. Exact: each term's `(max_freq, min_dl)` gives a sound score
-    /// upper bound, so docs that provably cannot beat the shared threshold
-    /// are skipped. Because the threshold is shared across all partitions and
-    /// the tail, a partition processed late prunes against an already-warm
-    /// threshold instead of cold-starting.
     /// Single-term top-k with block-max skipping. For each 128-doc block, the
     /// per-block upper bound `qw * doc_weight(block.max_freq, block.min_dl)`
     /// bounds every doc's score in the block; when the top-k heap is full and
@@ -2440,6 +2432,12 @@ impl Partition {
         }
     }
 
+    /// WAND top-k over an OR query, contributing into the caller's shared
+    /// [`TopK`]. Exact: each term's `(max_freq, min_dl)` gives a sound score
+    /// upper bound, so docs that provably cannot beat the shared threshold
+    /// are skipped. Because the threshold is shared across all partitions and
+    /// the tail, a partition processed late prunes against an already-warm
+    /// threshold instead of cold-starting.
     fn wand_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
         // Single-term top-k: block-max skip. Multi-term: pivot WAND below.
         if tokens.len() == 1 {
