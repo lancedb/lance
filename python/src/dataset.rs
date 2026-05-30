@@ -4354,7 +4354,7 @@ fn prepare_vector_index_params(
                     cast_with_options(centroids.as_ref(), centroid_type, &Default::default())
                         .map_err(|e| {
                             PyValueError::new_err(format!(
-                                "Failed to cast centroids to column type: {}",
+                                "Failed to cast centroids to vector type: {}",
                                 e
                             ))
                         })?;
