@@ -145,6 +145,13 @@ pub struct SearchOptions {
     pub wand_factor: f32,
     /// Maximum number of results to return. None means unlimited.
     pub limit: Option<usize>,
+    /// Whether to also search the mutable tail (rows written since the last
+    /// freeze). `true` (default) is read-your-writes: every completed batch is
+    /// visible, at the cost of scanning the un-indexed tail on each query.
+    /// `false` searches only the immutable frozen partitions — the Lucene
+    /// model (a reader sees only flushed segments), which removes the tail
+    /// scan from the hot path. Trades read-recency for query latency.
+    pub include_tail: bool,
 }
 
 impl Default for SearchOptions {
@@ -152,6 +159,7 @@ impl Default for SearchOptions {
         Self {
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
+            include_tail: true,
         }
     }
 }
@@ -170,6 +178,12 @@ impl SearchOptions {
     /// Set the maximum number of results to return.
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Set whether to search the mutable tail (see [`Self::include_tail`]).
+    pub fn with_include_tail(mut self, include_tail: bool) -> Self {
+        self.include_tail = include_tail;
         self
     }
 }
@@ -1128,7 +1142,7 @@ impl FtsMemIndex {
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(term);
-        self.search_match(&st, &tokens, None)
+        self.search_match(&st, &tokens, None, true)
     }
 
     /// Search for documents containing an exact phrase, optionally allowing
@@ -1136,7 +1150,18 @@ impl FtsMemIndex {
     pub fn search_phrase(&self, phrase: &str, slop: u32) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(phrase);
-        self.search_phrase_tokens(&st, &tokens, slop)
+        self.search_phrase_tokens(&st, &tokens, slop, true)
+    }
+
+    /// Freeze the current mutable tail into an immutable partition, so a
+    /// subsequent `include_tail = false` search sees all rows written so far
+    /// (the analogue of a Lucene commit/flush before opening a reader). No-op
+    /// when the tail is empty. Writer-side: callers hold the single-writer role.
+    pub fn flush(&self) {
+        let st = self.state.load_full();
+        if st.tail.visible_count() > 0 {
+            self.freeze(&st);
+        }
     }
 
     /// Expand a term to fuzzy matches within the specified edit distance.
@@ -1149,7 +1174,7 @@ impl FtsMemIndex {
         max_expansions: usize,
     ) -> Vec<(String, u32)> {
         let st = self.state.load_full();
-        self.expand_fuzzy_term(&st, term, max_distance, max_expansions)
+        self.expand_fuzzy_term(&st, term, max_distance, max_expansions, true)
     }
 
     /// Search for documents using fuzzy matching on each query token.
@@ -1161,7 +1186,7 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(query);
-        self.search_fuzzy_tokens(&st, &tokens, fuzziness, max_expansions)
+        self.search_fuzzy_tokens(&st, &tokens, fuzziness, max_expansions, true)
     }
 
     /// BM25 OR-search over the query tokens, scored with one corpus-wide
@@ -1175,6 +1200,7 @@ impl FtsMemIndex {
         st: &IndexState,
         tokens: &[String],
         limit: Option<usize>,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1182,7 +1208,8 @@ impl FtsMemIndex {
         // Snapshot the tail once so the scorer's stats and the scanned tail
         // postings are from the same visibility point.
         let tail_snap = st.tail.snapshot();
-        let scorer = build_scorer(st, &tail_snap, tokens);
+        let scan_tail = include_tail && tail_snap.visible_count > 0;
+        let scorer = build_scorer(st, &tail_snap, tokens, include_tail);
         if scorer.num_docs() == 0 {
             return Vec::new();
         }
@@ -1191,7 +1218,7 @@ impl FtsMemIndex {
                 let mut topk = TopK::new(k);
                 // Scan the tail first so the shared threshold is warm before
                 // the partition WANDs run.
-                if tail_snap.visible_count > 0 {
+                if scan_tail {
                     for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer) {
                         topk.offer(e.score, e.row_position);
                     }
@@ -1206,7 +1233,7 @@ impl FtsMemIndex {
                 for p in st.partitions.iter() {
                     results.extend(p.search_match(tokens, Operator::Or, &scorer));
                 }
-                if tail_snap.visible_count > 0 {
+                if scan_tail {
                     results.extend(score_terms(&tail_snap, &st.tail.terms, tokens, &scorer));
                 }
                 results
@@ -1214,16 +1241,23 @@ impl FtsMemIndex {
         }
     }
 
-    fn search_phrase_tokens(&self, st: &IndexState, tokens: &[String], slop: u32) -> Vec<FtsEntry> {
+    fn search_phrase_tokens(
+        &self,
+        st: &IndexState,
+        tokens: &[String],
+        slop: u32,
+        include_tail: bool,
+    ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
         }
         if tokens.len() == 1 {
             // A single-token phrase reduces to a regular term search.
-            return self.search_match(st, tokens, None);
+            return self.search_match(st, tokens, None, include_tail);
         }
         let tail_snap = st.tail.snapshot();
-        let scorer = build_scorer(st, &tail_snap, tokens);
+        let scan_tail = include_tail && tail_snap.visible_count > 0;
+        let scorer = build_scorer(st, &tail_snap, tokens, include_tail);
         if scorer.num_docs() == 0 {
             return Vec::new();
         }
@@ -1231,7 +1265,7 @@ impl FtsMemIndex {
         for p in st.partitions.iter() {
             results.extend(p.search_phrase(tokens, slop, &scorer));
         }
-        if tail_snap.visible_count > 0 {
+        if scan_tail {
             results.extend(phrase_search_tail(
                 &tail_snap,
                 &st.tail.terms,
@@ -1249,6 +1283,7 @@ impl FtsMemIndex {
         tokens: &[String],
         fuzziness: Option<u32>,
         max_expansions: usize,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1257,7 +1292,9 @@ impl FtsMemIndex {
         let mut seen: HashSet<String> = HashSet::new();
         for tok in tokens {
             let max_dist = fuzziness.unwrap_or_else(|| auto_fuzziness(tok));
-            for (matched, _) in self.expand_fuzzy_term(st, tok, max_dist, max_expansions) {
+            for (matched, _) in
+                self.expand_fuzzy_term(st, tok, max_dist, max_expansions, include_tail)
+            {
                 if seen.insert(matched.clone()) {
                     expanded.push(matched);
                 }
@@ -1266,26 +1303,28 @@ impl FtsMemIndex {
         if expanded.is_empty() {
             return Vec::new();
         }
-        self.search_match(st, &expanded, None)
+        self.search_match(st, &expanded, None, include_tail)
     }
 
-    /// Expand `term` against the term dictionaries of every partition and the
-    /// visible tail.
+    /// Expand `term` against the term dictionaries of every partition (and the
+    /// visible tail, when `include_tail`).
     fn expand_fuzzy_term(
         &self,
         st: &IndexState,
         term: &str,
         max_distance: u32,
         max_expansions: usize,
+        include_tail: bool,
     ) -> Vec<(String, u32)> {
         let tail_snap = st.tail.snapshot();
         if max_distance == 0 {
-            let in_tail = st
-                .tail
-                .terms
-                .get(term)
-                .map(|e| has_visible_chunk(&e.value().load(), tail_snap.visible_count))
-                .unwrap_or(false);
+            let in_tail = include_tail
+                && st
+                    .tail
+                    .terms
+                    .get(term)
+                    .map(|e| has_visible_chunk(&e.value().load(), tail_snap.visible_count))
+                    .unwrap_or(false);
             let in_partition = st.partitions.iter().any(|p| p.contains_token(term));
             return if in_tail || in_partition {
                 vec![(term.to_string(), 0)]
@@ -1296,7 +1335,7 @@ impl FtsMemIndex {
         let mut matches: Vec<(String, u32)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for entry in st.tail.terms.iter() {
-            if !has_visible_chunk(&entry.value().load(), tail_snap.visible_count) {
+            if !include_tail || !has_visible_chunk(&entry.value().load(), tail_snap.visible_count) {
                 continue;
             }
             let key: &Arc<str> = entry.key();
@@ -1326,28 +1365,31 @@ impl FtsMemIndex {
     /// per-batch monotonic visibility contract for compound queries.
     pub fn search_query(&self, query: &FtsQueryExpr) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        self.search_query_with_state(query, &st, None)
+        self.search_query_with_state(query, &st, None, true)
     }
 
     /// `limit` is the caller's top-k, threaded down so a top-level `Match`
     /// leaf can prune with WAND. Compound branches (`Boolean`/`Boost`) need
     /// their children's full result sets, so they pass `None` downward.
+    /// `include_tail` selects read-your-writes vs immutable-only (see
+    /// [`SearchOptions::include_tail`]) and is threaded uniformly to every leaf.
     fn search_query_with_state(
         &self,
         query: &FtsQueryExpr,
         st: &IndexState,
         limit: Option<usize>,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
         match query {
             FtsQueryExpr::Match { query, boost } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_match(st, &tokens, limit);
+                let mut results = self.search_match(st, &tokens, limit, include_tail);
                 apply_boost(&mut results, *boost);
                 results
             }
             FtsQueryExpr::Phrase { query, slop, boost } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_phrase_tokens(st, &tokens, *slop);
+                let mut results = self.search_phrase_tokens(st, &tokens, *slop, include_tail);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1358,8 +1400,13 @@ impl FtsMemIndex {
                 boost,
             } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results =
-                    self.search_fuzzy_tokens(st, &tokens, *fuzziness, *max_expansions);
+                let mut results = self.search_fuzzy_tokens(
+                    st,
+                    &tokens,
+                    *fuzziness,
+                    *max_expansions,
+                    include_tail,
+                );
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1367,12 +1414,18 @@ impl FtsMemIndex {
                 must,
                 should,
                 must_not,
-            } => self.search_boolean(must, should, must_not, st),
+            } => self.search_boolean(must, should, must_not, st, include_tail),
             FtsQueryExpr::Boost {
                 positive,
                 negative,
                 negative_boost,
-            } => self.search_boost(positive, negative.as_deref(), *negative_boost, st),
+            } => self.search_boost(
+                positive,
+                negative.as_deref(),
+                *negative_boost,
+                st,
+                include_tail,
+            ),
         }
     }
 
@@ -1383,7 +1436,8 @@ impl FtsMemIndex {
         options: SearchOptions,
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let mut results = self.search_query_with_state(query, &st, options.limit);
+        let mut results =
+            self.search_query_with_state(query, &st, options.limit, options.include_tail);
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1413,12 +1467,13 @@ impl FtsMemIndex {
         negative: Option<&FtsQueryExpr>,
         negative_boost: f32,
         st: &IndexState,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
-        let mut results = self.search_query_with_state(positive, st, None);
+        let mut results = self.search_query_with_state(positive, st, None, include_tail);
         let Some(neg) = negative else {
             return results;
         };
-        let negative_results = self.search_query_with_state(neg, st, None);
+        let negative_results = self.search_query_with_state(neg, st, None, include_tail);
         let negative_set: HashSet<RowPosition> = negative_results
             .into_iter()
             .map(|e| e.row_position)
@@ -1437,29 +1492,30 @@ impl FtsMemIndex {
         should: &[FtsQueryExpr],
         must_not: &[FtsQueryExpr],
         st: &IndexState,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
         let excluded: HashSet<RowPosition> = must_not
             .iter()
-            .flat_map(|q| self.search_query_with_state(q, st, None))
+            .flat_map(|q| self.search_query_with_state(q, st, None, include_tail))
             .map(|e| e.row_position)
             .collect();
 
         let mut result_map: HashMap<RowPosition, f32> = if must.is_empty() {
             let mut map: HashMap<RowPosition, f32> = HashMap::new();
             for q in should {
-                for entry in self.search_query_with_state(q, st, None) {
+                for entry in self.search_query_with_state(q, st, None, include_tail) {
                     *map.entry(entry.row_position).or_default() += entry.score;
                 }
             }
             map
         } else {
-            let first_results = self.search_query_with_state(&must[0], st, None);
+            let first_results = self.search_query_with_state(&must[0], st, None, include_tail);
             let mut map: HashMap<RowPosition, f32> = first_results
                 .into_iter()
                 .map(|e| (e.row_position, e.score))
                 .collect();
             for q in must.iter().skip(1) {
-                let results = self.search_query_with_state(q, st, None);
+                let results = self.search_query_with_state(q, st, None, include_tail);
                 let result_set: HashMap<RowPosition, f32> = results
                     .into_iter()
                     .map(|e| (e.row_position, e.score))
@@ -1470,7 +1526,7 @@ impl FtsMemIndex {
                     .collect();
             }
             for q in should {
-                for entry in self.search_query_with_state(q, st, None) {
+                for entry in self.search_query_with_state(q, st, None, include_tail) {
                     if let Some(score) = map.get_mut(&entry.row_position) {
                         *score += entry.score;
                     }
@@ -1783,14 +1839,26 @@ fn find_doc_in_chunks(
     None
 }
 
-/// Build a corpus-wide BM25 scorer over every partition and the tail, for the
-/// (deduplicated) set of query tokens. A single scorer makes partition-WAND
-/// scores and tail-scan scores directly comparable. `tail_snap` must be the
-/// *same* tail snapshot the caller scans, so the scorer's stats and the
-/// scanned postings stay mutually consistent.
-fn build_scorer(st: &IndexState, tail_snap: &Snapshot, tokens: &[String]) -> MemBM25Scorer {
-    let mut total_tokens = tail_snap.cumulative_total_tokens;
-    let mut num_docs = tail_snap.cumulative_doc_count as usize;
+/// Build a corpus-wide BM25 scorer for the (deduplicated) query tokens. A
+/// single scorer makes partition-WAND scores and tail-scan scores directly
+/// comparable. The corpus stats span exactly what the caller searches: the
+/// frozen partitions always, plus the tail when `include_tail` is set (in
+/// which case `tail_snap` must be the *same* snapshot the caller scans, so the
+/// stats and the scanned postings stay mutually consistent).
+fn build_scorer(
+    st: &IndexState,
+    tail_snap: &Snapshot,
+    tokens: &[String],
+    include_tail: bool,
+) -> MemBM25Scorer {
+    let (mut total_tokens, mut num_docs) = if include_tail {
+        (
+            tail_snap.cumulative_total_tokens,
+            tail_snap.cumulative_doc_count as usize,
+        )
+    } else {
+        (0, 0)
+    };
     for p in st.partitions.iter() {
         total_tokens += p.total_tokens();
         num_docs += p.doc_count();
@@ -1800,7 +1868,11 @@ fn build_scorer(st: &IndexState, tail_snap: &Snapshot, tokens: &[String]) -> Mem
         if token_docs.contains_key(token) {
             continue;
         }
-        let mut df = tail_token_df(&st.tail.terms, token, tail_snap.visible_count);
+        let mut df = if include_tail {
+            tail_token_df(&st.tail.terms, token, tail_snap.visible_count)
+        } else {
+            0
+        };
         for p in st.partitions.iter() {
             df += p.token_df(token);
         }
@@ -4023,12 +4095,12 @@ mod tests {
         let tail_snap = st.tail.snapshot();
         let apple = index.tokenize_for_search("apple").pop().unwrap();
         // "apple" is present -> an OR search over it matches.
-        let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple));
+        let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple), true);
         let or_hits = p.search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer);
         assert_eq!(or_hits.len(), 3);
         // Adding an absent term to an AND query short-circuits to nothing.
         let and_tokens = vec![apple, "definitely_missing".to_string()];
-        let and_scorer = build_scorer(&st, &tail_snap, &and_tokens);
+        let and_scorer = build_scorer(&st, &tail_snap, &and_tokens, true);
         let and_hits = p.search_match(&and_tokens, Operator::And, &and_scorer);
         assert!(and_hits.is_empty());
     }
@@ -4151,6 +4223,33 @@ mod tests {
         for e in index.search("hello") {
             assert!(e.score.is_finite() && e.score > 0.0);
         }
+    }
+
+    #[test]
+    fn test_include_tail_option_and_flush() {
+        let schema = create_test_schema();
+        // threshold 5 with 3-row batches: batch@0 stays in tail; batch@100
+        // pushes the tail to 6 and freezes both; batch@200 stays in the tail.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(5);
+        index.insert(&create_test_batch(&schema), 0).unwrap();
+        index.insert(&create_test_batch(&schema), 100).unwrap();
+        index.insert(&create_test_batch(&schema), 200).unwrap();
+        let immutable = SearchOptions::new().with_include_tail(false);
+        let match_hello = FtsQueryExpr::match_query("hello");
+
+        // Read-your-writes (default) sees all three batches (2 "hello"/batch).
+        assert_eq!(index.search("hello").len(), 6);
+        // Immutable-only sees only the two frozen batches.
+        assert_eq!(
+            index
+                .search_with_options(&match_hello, immutable.clone())
+                .len(),
+            4
+        );
+        // Flushing the tail makes it immutable; immutable-only now sees all.
+        index.flush();
+        assert_eq!(index.search_with_options(&match_hello, immutable).len(), 6);
+        assert_eq!(index.search("hello").len(), 6);
     }
 
     #[test]

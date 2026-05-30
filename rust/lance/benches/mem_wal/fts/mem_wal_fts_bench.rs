@@ -462,6 +462,12 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         index.insert(&batch, row as u64)?;
         row = end;
     }
+    // Immutable-read mode flushes the tail into a segment (Lucene-commit
+    // analogue) so an `include_tail = false` query sees every row; counted in
+    // build time as Lucene counts its final commit.
+    if args.immutable {
+        index.flush();
+    }
     let build_s = build_start.elapsed().as_secs_f64();
 
     let (nparts, t_terms, t_post, t_blk, t_df, t_pos, t_docs, t_tail) = index.memory_breakdown();
@@ -504,7 +510,9 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         })
         .collect();
 
-    let opts = SearchOptions::new().with_limit(args.k);
+    let opts = SearchOptions::new()
+        .with_limit(args.k)
+        .with_include_tail(!args.immutable);
     let make_query = |q: &Q| -> FtsQueryExpr {
         let text = if args.run == 'a' { &q.tok } else { &q.raw };
         if q.kind == "phrase" {
@@ -693,6 +701,9 @@ struct BenchArgs {
     in_dir: std::path::PathBuf,
     run: char,
     k: usize,
+    /// Read only immutable segments (flush the tail, `include_tail = false`) —
+    /// the Lucene model. Default false keeps read-your-writes (tail included).
+    immutable: bool,
 }
 
 fn main() -> Result<()> {
@@ -736,6 +747,7 @@ fn main() -> Result<()> {
                 in_dir: get("--in-dir", "/tmp/fts_compare").into(),
                 run: get("--run", "a").chars().next().unwrap_or('a'),
                 k: get("--k", "10").parse().unwrap(),
+                immutable: argv.contains(&"--immutable"),
             };
             run_bench(&args)
         }
