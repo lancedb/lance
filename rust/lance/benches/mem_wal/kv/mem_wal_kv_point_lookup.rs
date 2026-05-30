@@ -762,15 +762,28 @@ async fn run_lance(
             .filter(|(_, h)| *h)
             .map(|(k, _)| *k)
             .collect();
+        // `api` mode exercises the production `lookup_many` (async); `fast`/`plan`
+        // use the bench's direct `fast_lookup_batch`. Both gather columnar.
+        let use_api = matches!(args.lance_read_mode, LanceReadMode::Api);
+        let to_scalars = |chunk: &[i64]| -> Vec<ScalarValue> {
+            chunk.iter().map(|k| ScalarValue::Int64(Some(*k))).collect()
+        };
         let cpu1 = process_cpu_secs();
         let mut latencies_us = Vec::with_capacity(hit_keys.len().div_ceil(bg));
         let mut found_total = 0usize;
         let t = Instant::now();
         for chunk in hit_keys.chunks(bg) {
             let t0 = Instant::now();
-            let batch = fast_lookup_batch(&active, chunk);
+            let n = if use_api {
+                planner
+                    .lookup_many(&to_scalars(chunk), None)
+                    .await?
+                    .num_rows()
+            } else {
+                fast_lookup_batch(&active, chunk).num_rows()
+            };
             latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
-            found_total += batch.num_rows();
+            found_total += n;
         }
         let s1 = t.elapsed().as_secs_f64();
         let read_qps_1t = hit_keys.len() as f64 / s1.max(1e-9); // keys/sec
@@ -785,23 +798,50 @@ async fn run_lance(
             let keys = Arc::new(hit_keys);
             let nchunks = keys.len().div_ceil(bg);
             let t = Instant::now();
-            let mut handles = Vec::with_capacity(args.threads);
-            for shard in 0..args.threads {
-                let keys = keys.clone();
-                let active = active.clone();
-                let threads = args.threads;
-                handles.push(std::thread::spawn(move || {
-                    let mut ci = shard;
-                    while ci < nchunks {
-                        let lo = ci * bg;
-                        let hi = (lo + bg).min(keys.len());
-                        std::hint::black_box(fast_lookup_batch(&active, &keys[lo..hi]));
-                        ci += threads;
-                    }
-                }));
-            }
-            for h in handles {
-                h.join().unwrap();
+            if use_api {
+                let mut handles = Vec::with_capacity(args.threads);
+                for shard in 0..args.threads {
+                    let keys = keys.clone();
+                    let planner = planner.clone();
+                    let threads = args.threads;
+                    handles.push(tokio::spawn(async move {
+                        let mut ci = shard;
+                        while ci < nchunks {
+                            let lo = ci * bg;
+                            let hi = (lo + bg).min(keys.len());
+                            let scalars: Vec<ScalarValue> = keys[lo..hi]
+                                .iter()
+                                .map(|k| ScalarValue::Int64(Some(*k)))
+                                .collect();
+                            std::hint::black_box(
+                                planner.lookup_many(&scalars, None).await.unwrap(),
+                            );
+                            ci += threads;
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            } else {
+                let mut handles = Vec::with_capacity(args.threads);
+                for shard in 0..args.threads {
+                    let keys = keys.clone();
+                    let active = active.clone();
+                    let threads = args.threads;
+                    handles.push(std::thread::spawn(move || {
+                        let mut ci = shard;
+                        while ci < nchunks {
+                            let lo = ci * bg;
+                            let hi = (lo + bg).min(keys.len());
+                            std::hint::black_box(fast_lookup_batch(&active, &keys[lo..hi]));
+                            ci += threads;
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.join().unwrap();
+                }
             }
             keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9)
         } else {
