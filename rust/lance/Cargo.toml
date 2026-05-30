@@ -48,6 +48,10 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+# Only used by the `mem_wal_kv_point_lookup` benchmark, gated behind the
+# `bench-rocksdb` feature. Off by default so normal builds / `cargo test`
+# never compile the bundled librocksdb C++ sources.
+rocksdb = { version = "0.23", optional = true, default-features = false }
 crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
@@ -154,6 +158,8 @@ huggingface = ["lance-io/huggingface"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
+# Compile the RocksDB comparison arm of the mem_wal_kv_point_lookup bench.
+bench-rocksdb = ["dep:rocksdb"]
 
 [[bin]]
 name = "lq"
@@ -261,6 +267,11 @@ harness = false
 [[bench]]
 name = "mem_wal_fts_read_bench"
 path = "benches/mem_wal/fts/mem_wal_fts_read_bench.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_kv_point_lookup"
+path = "benches/mem_wal/kv/mem_wal_kv_point_lookup.rs"
 harness = false
 
 [[bench]]
