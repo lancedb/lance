@@ -159,6 +159,20 @@ impl LsmDataSourceCollector {
                 .any(|s| !s.flushed_generations.is_empty())
     }
 
+    /// The in-memory memtables (active + frozen across all shards) as
+    /// references, **newest generation first**. Used by batch point lookups
+    /// that probe many keys against the same set of memtables; clones no
+    /// `Arc`s. Empty when there are no in-memory memtables.
+    pub fn in_memory_refs_newest_first(&self) -> Vec<&InMemoryMemTableRef> {
+        let mut refs: Vec<&InMemoryMemTableRef> = Vec::new();
+        for mems in self.in_memory_memtables.values() {
+            refs.push(&mems.active);
+            refs.extend(mems.frozen.iter());
+        }
+        refs.sort_by_key(|m| std::cmp::Reverse(m.generation));
+        refs
+    }
+
     /// Visit the in-memory memtables (active + frozen) **newest generation
     /// first** by reference, calling `f` until it returns `Some`; returns that
     /// value (or `None` if every memtable was visited without one).
