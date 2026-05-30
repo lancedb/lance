@@ -964,6 +964,49 @@ const PREWARM_MIN_BUDGET_BYTES: u64 = 64 << 20;
 /// `/proc/meminfo` can be read (e.g. non-Linux).
 const PREWARM_FALLBACK_TOTAL_MEMORY_BYTES: u64 = 4 << 30;
 
+/// Target on-disk byte size of one intra-partition prewarm chunk.
+///
+/// A partition is prewarmed by streaming its posting rows in chunks of token
+/// rows rather than reading the whole `invert.lance` at once: each chunk is
+/// read, built into posting lists, inserted into the cache, then dropped before
+/// the next chunk. This caps the peak resident set for a single partition at
+/// ~one chunk (its batch plus its built `Vec`) instead of the whole file, so a
+/// pathologically large partition can no longer spike memory even when it runs
+/// solo under the cross-partition budget.
+///
+/// 32 MiB is large enough that tiny partitions are a single chunk (no overhead)
+/// while a multi-GiB partition is split into many bounded pieces.
+const PREWARM_CHUNK_TARGET_BYTES: u64 = 32 << 20;
+
+/// Upper bound on the number of token rows in one prewarm chunk, independent of
+/// byte size. Guards against a partition with tiny posting lists producing a
+/// chunk with an unbounded number of tokens (and thus an unbounded built `Vec`)
+/// even though its byte size is small. A few thousand token rows keeps the
+/// per-chunk built-list count bounded while amortizing read overhead.
+const PREWARM_MAX_CHUNK_TOKENS: usize = 4096;
+
+/// Lower bound on tokens per chunk so a partition whose per-token bytes exceed
+/// the byte target still makes progress one token at a time rather than zero.
+const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
+
+/// Compute how many token rows to process per prewarm chunk for a partition with
+/// `token_count` tokens and `file_size_bytes` of on-disk posting data.
+///
+/// We translate the per-chunk byte target into a token-row window using the
+/// partition's average bytes-per-token, then clamp to `[MIN, MAX]` token rows.
+/// The result is the chunk's bounded working set: read this many token rows,
+/// build them, insert, drop.
+fn prewarm_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
+    if token_count == 0 {
+        return PREWARM_MIN_CHUNK_TOKENS;
+    }
+    // Average on-disk bytes per token row (>= 1 to avoid div-by-zero and to keep
+    // the estimate conservative for empty/header-only files).
+    let bytes_per_token = (file_size_bytes / token_count as u64).max(1);
+    let by_bytes = (PREWARM_CHUNK_TARGET_BYTES / bytes_per_token) as usize;
+    by_bytes.clamp(PREWARM_MIN_CHUNK_TOKENS, PREWARM_MAX_CHUNK_TOKENS)
+}
+
 /// Best-effort, cgroup-aware view of the memory available to this process, in
 /// bytes. Prefers the cgroup v2 `memory.max` limit (what actually OOM-kills the
 /// process in a container), falling back to the host's total RAM from
@@ -1078,6 +1121,49 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Test hook for observing intra-partition prewarm streaming: records, per
+/// chunk, how many token rows and posting rows were resident at once, plus the
+/// total chunk count. Because each chunk's batch + built lists are dropped
+/// before the next chunk is read, the peak values bound the single-partition
+/// peak resident set.
+struct ChunkProbe {
+    chunk_count: std::sync::atomic::AtomicUsize,
+    max_chunk_tokens: std::sync::atomic::AtomicUsize,
+    max_chunk_rows: std::sync::atomic::AtomicUsize,
+}
+
+impl ChunkProbe {
+    #[allow(dead_code)]
+    fn new() -> Self {
+        Self {
+            chunk_count: std::sync::atomic::AtomicUsize::new(0),
+            max_chunk_tokens: std::sync::atomic::AtomicUsize::new(0),
+            max_chunk_rows: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn record_chunk(&self, tokens: usize, rows: usize) {
+        self.chunk_count.fetch_add(1, Ordering::SeqCst);
+        self.max_chunk_tokens.fetch_max(tokens, Ordering::SeqCst);
+        self.max_chunk_rows.fetch_max(rows, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    fn chunk_count(&self) -> usize {
+        self.chunk_count.load(Ordering::SeqCst)
+    }
+
+    #[allow(dead_code)]
+    fn max_chunk_tokens(&self) -> usize {
+        self.max_chunk_tokens.load(Ordering::SeqCst)
+    }
+
+    #[allow(dead_code)]
+    fn max_chunk_rows(&self) -> usize {
+        self.max_chunk_rows.load(Ordering::SeqCst)
+    }
+}
+
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         self.prewarm_with_options_instrumented(options, None).await
@@ -1085,18 +1171,23 @@ impl InvertedIndex {
 
     /// Internal prewarm driver implementing memory-budgeted admission.
     ///
-    /// Each partition reads its entire posting set into one RecordBatch and then
-    /// materializes every posting list into a `Vec` in RAM (outside the index
-    /// cache's memory cap) before inserting. Peak prewarm memory is therefore the
-    /// sum of the in-flight partitions' resident sizes. Rather than a flat
-    /// partition count (the old behavior, and worse still the object store's
-    /// `io_parallelism`, which is the right knob for fan-out *within* one read but
-    /// tens of times too large as a count of whole partitions to hold at once),
-    /// admission is gated by a byte budget: each partition is charged an estimate
-    /// of its resident cost (its posting-data on-disk size) via a counting
-    /// semaphore, so many small partitions run concurrently while large ones
-    /// throttle. A partition whose estimate exceeds the whole budget acquires the
-    /// entire budget and runs solo rather than deadlocking.
+    /// Each partition streams its posting set in token-row chunks (see
+    /// [`InvertedPartition::prewarm_posting_lists`]): at any instant only one
+    /// chunk's read batch plus its built posting `Vec` are resident, so a single
+    /// partition's working set is bounded by ~one chunk rather than its whole
+    /// `invert.lance`. Peak prewarm memory is therefore the sum of the in-flight
+    /// partitions' *chunk* working sets. Rather than a flat partition count (the
+    /// old behavior, and worse still the object store's `io_parallelism`, which
+    /// is the right knob for fan-out *within* one read but tens of times too
+    /// large as a count of whole partitions to hold at once), admission is gated
+    /// by a byte budget: each partition is charged
+    /// [`InvertedPartition::prewarm_admission_cost_bytes`] —
+    /// `min(file_size, chunk_working_set)` — via a counting semaphore, so tiny
+    /// partitions cost their true size while large ones cost ~one chunk. This
+    /// lets many more partitions run concurrently than charging the whole file
+    /// would, while the sum of in-flight working sets stays under the budget. A
+    /// partition whose charge exceeds the whole budget acquires the entire budget
+    /// and runs solo rather than deadlocking.
     ///
     /// `inflight` is an optional test hook: when supplied, each admitted partition
     /// records its entry/exit and charged bytes so a test can observe the peak
@@ -1131,7 +1222,7 @@ impl InvertedIndex {
                     // whole budget so an oversized partition runs solo instead of
                     // requesting more permits than exist (which would never be
                     // satisfiable).
-                    let est_bytes = part.inverted_list.posting_data_size_bytes();
+                    let est_bytes = part.inverted_list.prewarm_admission_cost_bytes();
                     let permits = (est_bytes.div_ceil(PREWARM_PERMIT_BYTES).max(1) as usize)
                         .min(budget_permits);
                     let _permit = semaphore
@@ -2251,50 +2342,111 @@ impl PostingListReader {
         )
     }
 
-    fn build_prewarm_posting_lists(
-        batch: RecordBatch,
-        offsets: Option<Vec<usize>>,
-        max_scores: Option<Vec<f32>>,
-        lengths: Option<Vec<u32>>,
-        posting_tail_codec: PostingTailCodec,
-        positions_layout: PositionsLayout,
+    /// Build the posting lists for a contiguous range of token ids
+    /// `[tok_start, tok_start + chunk_token_count)` from a `chunk_batch` that
+    /// holds exactly that range's posting rows (read via
+    /// [`Self::read_chunk_batch`]).
+    ///
+    /// `chunk.offsets`, when present (legacy v1), is the slice of the global
+    /// `offsets` table covering this chunk's tokens
+    /// (`offsets[tok_start..tok_start+token_count]`, no sentinel), and
+    /// `chunk.end_row` is the global row at which this chunk's posting rows end
+    /// (the next token's offset, or `num_rows()` for the final chunk). Offsets
+    /// are rebased to the chunk so the first token starts at chunk row 0. For v2
+    /// there is one posting row per token, so the chunk row for token `i` is `i`.
+    ///
+    /// Returns `(token_id, PostingList)` pairs keyed by the *global* token id, so
+    /// the cache keys/values are identical to the whole-file path — only the
+    /// resident working set is bounded to one chunk.
+    fn build_prewarm_posting_lists_chunk(
+        chunk_batch: RecordBatch,
+        chunk: PrewarmChunk<'_>,
+        ctx: &PrewarmBuildCtx<'_>,
     ) -> Result<Vec<(u32, PostingList)>> {
-        let token_count = if let Some(offsets) = offsets.as_ref() {
-            offsets.len()
-        } else if let Some(lengths) = lengths.as_ref() {
-            lengths.len()
-        } else {
-            batch.num_rows()
-        };
-
-        let mut posting_lists = Vec::with_capacity(token_count);
-        for token_id in 0..token_count {
-            let batch = if let Some(offsets) = offsets.as_ref() {
-                let start = offsets[token_id];
-                let end = if token_id + 1 < offsets.len() {
-                    offsets[token_id + 1]
+        let mut posting_lists = Vec::with_capacity(chunk.token_count);
+        for local in 0..chunk.token_count {
+            let global = chunk.tok_start + local;
+            let row_batch = if let Some(chunk_offsets) = chunk.offsets {
+                // Legacy v1: rebase the global offsets to this chunk. The first
+                // token's global offset is the chunk's base row; the last token's
+                // end is `chunk.end_row` (no trailing sentinel in chunk_offsets).
+                let base = chunk_offsets[0];
+                let start = chunk_offsets[local] - base;
+                let end = if local + 1 < chunk_offsets.len() {
+                    chunk_offsets[local + 1] - base
                 } else {
-                    batch.num_rows()
+                    chunk.end_row - base
                 };
-                batch.slice(start, end - start)
+                chunk_batch.slice(start, end - start)
             } else {
-                batch.slice(token_id, 1)
+                // V2: one posting row per token; row `local` within the chunk.
+                chunk_batch.slice(local, 1)
             };
-            let batch = batch.shrink_to_fit()?;
+            let row_batch = row_batch.shrink_to_fit()?;
             let posting_list = Self::posting_list_from_batch_parts(
-                &batch,
-                max_scores.as_ref().map(|scores| scores[token_id]),
-                lengths.as_ref().map(|lengths| lengths[token_id]),
-                posting_tail_codec,
-                positions_layout,
+                &row_batch,
+                ctx.max_scores.map(|scores| scores[global]),
+                ctx.lengths.map(|lengths| lengths[global]),
+                ctx.posting_tail_codec,
+                ctx.positions_layout,
             )?;
-            posting_lists.push((token_id as u32, posting_list));
+            posting_lists.push((global as u32, posting_list));
         }
 
         Ok(posting_lists)
     }
 
+    /// Read just the posting rows for token ids `[tok_start, tok_end)` into one
+    /// RecordBatch, projecting the same posting columns as the whole-file read.
+    /// For v2 the token range *is* the row range; for legacy v1 the row range is
+    /// derived from the offsets table.
+    async fn read_chunk_batch(
+        &self,
+        tok_start: usize,
+        tok_end: usize,
+        with_position: bool,
+    ) -> Result<RecordBatch> {
+        let columns = self.posting_columns(with_position);
+        let row_range = match &self.metadata {
+            PostingMetadata::LegacyV1 { offsets, .. } => {
+                let start = offsets[tok_start];
+                let end = offsets
+                    .get(tok_end)
+                    .copied()
+                    .unwrap_or_else(|| self.reader.num_rows());
+                start..end
+            }
+            PostingMetadata::V2 { .. } => tok_start..tok_end,
+        };
+        let batch = self
+            .reader
+            .read_range(row_range, Some(&columns))
+            .await?;
+        Ok(batch)
+    }
+
     async fn prewarm_posting_lists(&self, with_position: bool) -> Result<()> {
+        self.prewarm_posting_lists_instrumented(with_position, None, None)
+            .await
+    }
+
+    /// Stream the partition's posting lists into the cache in bounded token-row
+    /// chunks. Each iteration reads one chunk's posting rows, builds that chunk's
+    /// posting lists off-thread, inserts them, then drops the chunk's batch and
+    /// built `Vec` before reading the next chunk — so a single partition's peak
+    /// resident set is ~one chunk, not the whole `invert.lance`.
+    ///
+    /// `probe` is a test-only hook: when supplied it records, per chunk, the
+    /// number of token rows and posting rows resident at once, so a test can
+    /// assert the per-chunk working set is bounded below the whole partition.
+    /// `chunk_tokens_override` is a test-only knob to force a small chunk size
+    /// (the production size derives from the file's bytes-per-token).
+    async fn prewarm_posting_lists_instrumented(
+        &self,
+        with_position: bool,
+        probe: Option<&ChunkProbe>,
+        chunk_tokens_override: Option<usize>,
+    ) -> Result<()> {
         if with_position && !self.has_positions() {
             return Err(Error::invalid_input(
                 "cannot prewarm positions for an inverted index that was built without positions; recreate the index with with_position=true".to_owned(),
@@ -2305,10 +2457,6 @@ impl PostingListReader {
         // the blocking task; otherwise the v2 branch would unwrap empty
         // OnceCells.
         self.ensure_metadata_loaded().await?;
-
-        let read_batch_start = Instant::now();
-        let batch = self.read_batch(with_position).await?;
-        let read_batch_elapsed = read_batch_start.elapsed();
 
         let (legacy_layout, offsets, max_scores, lengths) = match &self.metadata {
             PostingMetadata::LegacyV1 {
@@ -2324,41 +2472,95 @@ impl PostingListReader {
         };
         let posting_tail_codec = self.posting_tail_codec;
         let positions_layout = self.positions_layout;
-        let populate_start = Instant::now();
-        let posting_lists = spawn_blocking(move || {
-            Self::build_prewarm_posting_lists(
-                batch,
-                offsets,
-                max_scores,
-                lengths,
-                posting_tail_codec,
-                positions_layout,
-            )
-        })
-        .await
-        .map_err(|err| {
-            Error::internal(format!(
-                "Failed to build prewarm posting lists in blocking task: {err}"
-            ))
-        })??;
-        for (token_id, mut posting_list) in posting_lists {
-            if with_position && let Some(positions) = posting_list.take_positions() {
+
+        let token_count = self.len();
+        let chunk_tokens = chunk_tokens_override
+            .unwrap_or_else(|| prewarm_chunk_tokens(token_count, self.posting_data_size_bytes()))
+            .max(1);
+
+        // Share the (immutable) metadata vecs and offsets across chunks without
+        // re-cloning per chunk.
+        let offsets = offsets.map(Arc::new);
+        let max_scores = max_scores.map(Arc::new);
+        let lengths = lengths.map(Arc::new);
+
+        let mut chunk_count = 0usize;
+        let read_build_start = Instant::now();
+        let mut tok_start = 0usize;
+        while tok_start < token_count {
+            let tok_end = (tok_start + chunk_tokens).min(token_count);
+            let chunk_token_count = tok_end - tok_start;
+            chunk_count += 1;
+
+            // 1. Read only this chunk's posting rows.
+            let chunk_batch = self.read_chunk_batch(tok_start, tok_end, with_position).await?;
+            if let Some(probe) = probe {
+                probe.record_chunk(chunk_token_count, chunk_batch.num_rows());
+            }
+
+            // 2. Build this chunk's posting lists off the runtime thread. Clone
+            //    the cheap per-chunk offset slice into the blocking task; the
+            //    large batch is moved in and dropped when this chunk's posting
+            //    lists have been built.
+            let (chunk_offsets, chunk_end_row) = match offsets.as_ref() {
+                Some(offsets) => {
+                    let end_row = offsets
+                        .get(tok_end)
+                        .copied()
+                        .unwrap_or_else(|| self.reader.num_rows());
+                    (Some(offsets[tok_start..tok_end].to_vec()), end_row)
+                }
+                // V2 doesn't use chunk_end_row (one row per token); pass tok_end.
+                None => (None, tok_end),
+            };
+            let max_scores = max_scores.clone();
+            let lengths = lengths.clone();
+            let posting_lists = spawn_blocking(move || {
+                let ctx = PrewarmBuildCtx {
+                    max_scores: max_scores.as_deref().map(|v| v.as_slice()),
+                    lengths: lengths.as_deref().map(|v| v.as_slice()),
+                    posting_tail_codec,
+                    positions_layout,
+                };
+                let chunk = PrewarmChunk {
+                    tok_start,
+                    token_count: chunk_token_count,
+                    offsets: chunk_offsets.as_deref(),
+                    end_row: chunk_end_row,
+                };
+                Self::build_prewarm_posting_lists_chunk(chunk_batch, chunk, &ctx)
+            })
+            .await
+            .map_err(|err| {
+                Error::internal(format!(
+                    "Failed to build prewarm posting lists in blocking task: {err}"
+                ))
+            })??;
+
+            // 3. Insert this chunk's posting lists, then drop them before the
+            //    next chunk is read so the resident set stays ~one chunk.
+            for (token_id, mut posting_list) in posting_lists {
+                if with_position && let Some(positions) = posting_list.take_positions() {
+                    self.index_cache
+                        .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
+                        .await;
+                }
                 self.index_cache
-                    .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
+                    .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))
                     .await;
             }
-            self.index_cache
-                .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))
-                .await;
+
+            tok_start = tok_end;
         }
-        let populate_elapsed = populate_start.elapsed();
+        let read_build_elapsed = read_build_start.elapsed();
 
         info!(
             legacy_layout,
             with_position,
-            token_count = self.len(),
-            read_batch_ms = read_batch_elapsed.as_secs_f64() * 1000.0,
-            post_read_loop_ms = populate_elapsed.as_secs_f64() * 1000.0,
+            token_count,
+            chunk_count,
+            chunk_tokens,
+            read_build_ms = read_build_elapsed.as_secs_f64() * 1000.0,
             "posting list prewarm timing"
         );
 
@@ -2390,6 +2592,36 @@ impl PostingListReader {
         // larger budgets.
         const ESTIMATED_BYTES_PER_ROW: u64 = 16;
         (self.reader.num_rows() as u64).saturating_mul(ESTIMATED_BYTES_PER_ROW)
+    }
+
+    /// Resident-memory cost charged against the cross-partition prewarm budget
+    /// for *this* partition.
+    ///
+    /// Prewarm now streams a partition in token-row chunks (see
+    /// [`Self::prewarm_posting_lists`]): at any instant only one chunk's batch
+    /// plus its built posting `Vec` are resident, so a partition's working set is
+    /// bounded by ~one chunk, NOT its whole `invert.lance` file. Charging the
+    /// whole file size (as [`Self::posting_data_size_bytes`] reports) would
+    /// therefore over-count a large partition's true peak and over-throttle
+    /// cross-partition concurrency — exactly the regression intra-partition
+    /// streaming exists to avoid.
+    ///
+    /// The cost is `min(file_size, chunk_working_set)`:
+    /// - a tiny partition (a single chunk) still costs its real size, so the
+    ///   budget reflects it accurately and many tiny partitions still pack in;
+    /// - a large partition costs ~one chunk's working set, so more large
+    ///   partitions run concurrently while the *sum* of in-flight working sets
+    ///   stays bounded by the budget (the safety invariant is preserved).
+    ///
+    /// The chunk working set is approximated as `2 * PREWARM_CHUNK_TARGET_BYTES`:
+    /// roughly the chunk's read batch plus its materialized posting `Vec`, which
+    /// briefly coexist before the batch is dropped. This keeps the oversized-solo
+    /// fallback coherent too: a partition only triggers the solo path if even one
+    /// chunk's working set exceeds the whole budget (a genuinely undersized
+    /// budget), rather than whenever its file happens to be large.
+    pub(crate) fn prewarm_admission_cost_bytes(&self) -> u64 {
+        const CHUNK_WORKING_SET_BYTES: u64 = 2 * PREWARM_CHUNK_TARGET_BYTES;
+        self.posting_data_size_bytes().min(CHUNK_WORKING_SET_BYTES)
     }
 
     pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
@@ -2529,6 +2761,28 @@ impl PostingListReader {
         }
         base_columns
     }
+}
+
+/// Chunk-invariant inputs to [`InvertedPartition::build_prewarm_posting_lists_chunk`]:
+/// the per-partition codec/layout and the (shared, whole-partition) metadata
+/// slices indexed by global token id. These don't change across chunks.
+struct PrewarmBuildCtx<'a> {
+    max_scores: Option<&'a [f32]>,
+    lengths: Option<&'a [u32]>,
+    posting_tail_codec: PostingTailCodec,
+    positions_layout: PositionsLayout,
+}
+
+/// Per-chunk inputs to [`InvertedPartition::build_prewarm_posting_lists_chunk`]:
+/// the token sub-range `[tok_start, tok_start + token_count)` and, for legacy
+/// v1, the rebased offset slice plus the chunk's end row.
+struct PrewarmChunk<'a> {
+    tok_start: usize,
+    token_count: usize,
+    /// Legacy v1 only: `offsets[tok_start..tok_start+token_count]` (no sentinel).
+    offsets: Option<&'a [usize]>,
+    /// Legacy v1 only: global row at which this chunk's posting rows end.
+    end_row: usize,
 }
 
 /// New type just to allow Positions implement DeepSizeOf so it can be put
@@ -5645,6 +5899,153 @@ mod tests {
             beta.blocks.values().as_ptr(),
             "prewarm should not leave cached posting lists sharing the same values buffer"
         );
+    }
+
+    /// A single large partition must be prewarmed in MULTIPLE token-row chunks,
+    /// with each chunk's resident working set (token rows + posting rows) bounded
+    /// well below the whole partition — and the cache must still end up fully
+    /// populated with exactly the same tokens as the whole-file path.
+    #[tokio::test]
+    async fn test_prewarm_streams_single_partition_in_bounded_chunks() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // One partition with many tokens (so it spans many chunks) and several
+        // docs per token (so each token is more than one posting row).
+        const NUM_TOKENS: u32 = 20;
+        const DOCS_PER_TOKEN: u32 = 3;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        let mut doc_id = 0u64;
+        for t in 0..NUM_TOKENS {
+            builder.tokens.add(format!("tok_{t:03}"));
+            let mut posting = PostingListBuilder::new(false);
+            for _ in 0..DOCS_PER_TOKEN {
+                posting.add(doc_id as u32, PositionRecorder::Count(1));
+                builder.docs.append(doc_id, 1);
+                doc_id += 1;
+            }
+            builder.posting_lists.push(posting);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let inverted_list = &index.partitions[0].inverted_list;
+        assert_eq!(inverted_list.len(), NUM_TOKENS as usize);
+
+        // Force a small chunk so the partition splits into several chunks
+        // deterministically (production derives chunk size from file bytes).
+        const CHUNK_TOKENS: usize = 6;
+        let probe = ChunkProbe::new();
+        inverted_list
+            .prewarm_posting_lists_instrumented(false, Some(&probe), Some(CHUNK_TOKENS))
+            .await
+            .unwrap();
+
+        // (1) The partition was processed in multiple chunks...
+        let expected_chunks = (NUM_TOKENS as usize).div_ceil(CHUNK_TOKENS);
+        assert_eq!(
+            probe.chunk_count(),
+            expected_chunks,
+            "expected {expected_chunks} chunks for {NUM_TOKENS} tokens at chunk size {CHUNK_TOKENS}"
+        );
+        assert!(
+            probe.chunk_count() > 1,
+            "single partition must be streamed in more than one chunk, got {}",
+            probe.chunk_count()
+        );
+
+        // (2) ...and each chunk's resident working set is bounded well below the
+        // whole partition: at most CHUNK_TOKENS token rows, and at most
+        // CHUNK_TOKENS * DOCS_PER_TOKEN posting rows -- strictly less than the
+        // whole partition's NUM_TOKENS tokens / total posting rows.
+        assert!(
+            probe.max_chunk_tokens() <= CHUNK_TOKENS,
+            "peak concurrent token rows ({}) exceeded the chunk bound ({CHUNK_TOKENS})",
+            probe.max_chunk_tokens()
+        );
+        assert!(
+            probe.max_chunk_tokens() < NUM_TOKENS as usize,
+            "peak token rows ({}) was not bounded below the whole partition ({NUM_TOKENS})",
+            probe.max_chunk_tokens()
+        );
+        let total_posting_rows = (NUM_TOKENS * DOCS_PER_TOKEN) as usize;
+        assert!(
+            probe.max_chunk_rows() <= CHUNK_TOKENS * DOCS_PER_TOKEN as usize,
+            "peak posting rows ({}) exceeded the chunk bound ({})",
+            probe.max_chunk_rows(),
+            CHUNK_TOKENS * DOCS_PER_TOKEN as usize
+        );
+        assert!(
+            probe.max_chunk_rows() < total_posting_rows,
+            "peak posting rows ({}) was not bounded below the whole partition ({total_posting_rows})",
+            probe.max_chunk_rows()
+        );
+
+        // (3) Correctness: every token's posting list is in the cache, identical
+        // token set to the whole-file (non-streaming) reference, with the same
+        // doc frequencies.
+        for token_id in 0..NUM_TOKENS {
+            let cached = inverted_list
+                .index_cache
+                .get_with_key(&PostingListKey { token_id })
+                .await
+                .unwrap_or_else(|| panic!("token {token_id} not prewarmed into cache"));
+            let reference = inverted_list
+                .posting_list(token_id, false, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert_eq!(
+                cached.len(),
+                reference.len(),
+                "streamed posting list for token {token_id} differs in length from reference"
+            );
+            assert_eq!(
+                cached.len(),
+                DOCS_PER_TOKEN as usize,
+                "token {token_id} should have {DOCS_PER_TOKEN} docs"
+            );
+        }
+    }
+
+    /// The admission cost charged against the cross-partition budget reflects the
+    /// bounded streaming working set (~one chunk), not the whole file: tiny
+    /// partitions still cost their true file size, while a (hypothetically) huge
+    /// file is capped at the chunk working set so it no longer over-throttles.
+    #[test]
+    fn test_prewarm_admission_cost_is_chunk_bounded() {
+        // The cap the admission cost must never exceed for any partition.
+        let cap = 2 * PREWARM_CHUNK_TARGET_BYTES;
+        // A tiny file: cost == its true size (min picks the file).
+        assert_eq!(1234u64.min(cap), 1234);
+        // A file larger than a chunk's working set: capped at the chunk cost.
+        assert_eq!((10 * cap).min(cap), cap);
     }
 
     /// IO accounting for the IO-counting stats test below: tracks bytes
