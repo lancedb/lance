@@ -847,10 +847,11 @@ impl FtsMemIndex {
         }
     }
 
-    /// Override the tail freeze threshold. Used by tests to exercise the
-    /// multi-partition path with small inputs.
-    #[cfg(test)]
-    fn with_freeze_threshold_rows(mut self, rows: usize) -> Self {
+    /// Override the tail freeze threshold (docs) — the analogue of Lucene's
+    /// `ramBufferSizeMB`. Larger keeps more rows in the un-indexed mutable tail
+    /// (cheaper writes, costlier read-your-writes scans); smaller freezes into
+    /// block-max-searchable partitions sooner.
+    pub fn with_freeze_threshold_rows(mut self, rows: usize) -> Self {
         self.freeze_threshold_rows = rows.max(1);
         self
     }

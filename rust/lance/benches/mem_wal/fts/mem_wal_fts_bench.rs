@@ -440,7 +440,10 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     } else {
         InvertedIndexParams::default().with_position(true)
     };
-    let index = FtsMemIndex::with_params(0, TEXT_COL.to_string(), params);
+    let mut index = FtsMemIndex::with_params(0, TEXT_COL.to_string(), params);
+    if let Some(rows) = args.freeze_threshold {
+        index = index.with_freeze_threshold_rows(rows);
+    }
     let sch = schema();
 
     // Build: insert in batches of 1000, doc id == line number == row position.
@@ -704,6 +707,9 @@ struct BenchArgs {
     /// Read only immutable segments (flush the tail, `include_tail = false`) —
     /// the Lucene model. Default false keeps read-your-writes (tail included).
     immutable: bool,
+    /// Override the tail freeze threshold (docs); large values keep a big
+    /// mutable tail to expose tail-read cost. None = index default.
+    freeze_threshold: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -748,6 +754,11 @@ fn main() -> Result<()> {
                 run: get("--run", "a").chars().next().unwrap_or('a'),
                 k: get("--k", "10").parse().unwrap(),
                 immutable: argv.contains(&"--immutable"),
+                freeze_threshold: argv
+                    .iter()
+                    .position(|a| *a == "--freeze-threshold")
+                    .and_then(|i| argv.get(i + 1))
+                    .and_then(|s| s.parse().ok()),
             };
             run_bench(&args)
         }
