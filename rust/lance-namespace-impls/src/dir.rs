@@ -38,7 +38,7 @@ use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -192,6 +192,8 @@ pub struct DirectoryNamespaceBuilder {
     /// When true, table versions are stored in the `__manifest` table instead of
     /// relying on Lance's native version management.
     table_version_storage_enabled: bool,
+    /// Number of manifest shards. Zero means the legacy single `__manifest` table.
+    manifest_shard_count: usize,
     /// When true, enables migration mode where the namespace checks the manifest first
     /// before falling back to directory listing for root-level tables. When false (default),
     /// root-level tables use directory listing directly without checking the manifest,
@@ -231,6 +233,7 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
                 "table_version_storage_enabled",
                 &self.table_version_storage_enabled,
             )
+            .field("manifest_shard_count", &self.manifest_shard_count)
             .field(
                 "dir_listing_to_manifest_migration_enabled",
                 &self.dir_listing_to_manifest_migration_enabled,
@@ -268,6 +271,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled: true,
             table_version_tracking_enabled: false, // Default to disabled
             table_version_storage_enabled: false,  // Default to disabled
+            manifest_shard_count: 0,
             dir_listing_to_manifest_migration_enabled: false, // Default to disabled
             credential_vendor_properties: HashMap::new(),
             context_provider: None,
@@ -338,6 +342,15 @@ impl DirectoryNamespaceBuilder {
     /// When disabled (default), version storage uses per-table storage operations.
     pub fn table_version_storage_enabled(mut self, enabled: bool) -> Self {
         self.table_version_storage_enabled = enabled;
+        self
+    }
+
+    /// Configure the number of manifest shards.
+    ///
+    /// A value of 0 keeps the legacy single `__manifest` table. Values greater
+    /// than 0 enable sharded manifest mode.
+    pub fn manifest_shard_count(mut self, shard_count: usize) -> Self {
+        self.manifest_shard_count = shard_count;
         self
     }
 
@@ -464,6 +477,11 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
+        let manifest_shard_count = properties
+            .get("manifest_shard_count")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
         // Extract dir_listing_to_manifest_migration_enabled (default: false)
         let dir_listing_to_manifest_migration_enabled = properties
             .get("dir_listing_to_manifest_migration_enabled")
@@ -511,6 +529,7 @@ impl DirectoryNamespaceBuilder {
             inline_optimization_enabled,
             table_version_tracking_enabled,
             table_version_storage_enabled,
+            manifest_shard_count,
             dir_listing_to_manifest_migration_enabled,
             credential_vendor_properties,
             context_provider: None,
@@ -699,20 +718,42 @@ impl DirectoryNamespaceBuilder {
             Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
 
         let manifest_ns = if self.manifest_enabled {
-            match manifest::ManifestNamespace::from_directory(
-                self.root.clone(),
-                self.storage_options.clone(),
-                self.session.clone(),
-                object_store.clone(),
-                base_path.clone(),
-                self.dir_listing_enabled,
-                self.inline_optimization_enabled,
-                self.commit_retries,
-                self.table_version_storage_enabled,
-            )
-            .await
-            {
+            let manifest_result = if self.manifest_shard_count > 0 {
+                manifest::ShardedManifestNamespace::from_directory(
+                    self.root.clone(),
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                    object_store.clone(),
+                    base_path.clone(),
+                    self.dir_listing_enabled,
+                    self.inline_optimization_enabled,
+                    self.commit_retries,
+                    self.table_version_storage_enabled,
+                    self.manifest_shard_count,
+                )
+                .await
+                .map(|ns| ManifestCatalog::Sharded(Arc::new(ns)))
+            } else {
+                manifest::ManifestNamespace::from_directory(
+                    self.root.clone(),
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                    object_store.clone(),
+                    base_path.clone(),
+                    self.dir_listing_enabled,
+                    self.inline_optimization_enabled,
+                    self.commit_retries,
+                    self.table_version_storage_enabled,
+                )
+                .await
+                .map(|ns| ManifestCatalog::Single(Arc::new(ns)))
+            };
+
+            match manifest_result {
                 Ok(ns) => Some(Arc::new(ns)),
+                Err(e) if self.manifest_shard_count > 0 => {
+                    return Err(e);
+                }
                 Err(e) => {
                     // Failed to initialize manifest namespace, fall back to directory listing only
                     log::warn!(
@@ -805,6 +846,226 @@ impl DirectoryNamespaceBuilder {
 ///
 /// ## Manifest-based Listing
 ///
+enum ManifestCatalog {
+    Single(Arc<manifest::ManifestNamespace>),
+    Sharded(Arc<manifest::ShardedManifestNamespace>),
+}
+
+impl std::fmt::Debug for ManifestCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Single(ns) => f.debug_tuple("Single").field(ns).finish(),
+            Self::Sharded(ns) => f.debug_tuple("Sharded").field(ns).finish(),
+        }
+    }
+}
+
+impl ManifestCatalog {
+    async fn list_manifest_table_locations(&self) -> Result<HashSet<String>> {
+        match self {
+            Self::Single(ns) => ns.list_manifest_table_locations().await,
+            Self::Sharded(ns) => ns.list_manifest_table_locations().await,
+        }
+    }
+
+    async fn register_table(&self, name: &str, location: String) -> Result<()> {
+        match self {
+            Self::Single(ns) => ns.register_table(name, location).await,
+            Self::Sharded(ns) => ns.register_table(name, location).await,
+        }
+    }
+
+    async fn insert_into_manifest_with_metadata(
+        &self,
+        entries: Vec<manifest::ManifestEntry>,
+    ) -> Result<()> {
+        match self {
+            Self::Single(ns) => ns.insert_into_manifest_with_metadata(entries).await,
+            Self::Sharded(ns) => ns.insert_into_manifest_with_metadata(entries).await,
+        }
+    }
+
+    #[cfg(test)]
+    async fn query_table_versions(
+        &self,
+        object_id: &str,
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<(i64, String)>> {
+        match self {
+            Self::Single(ns) => ns.query_table_versions(object_id, descending, limit).await,
+            Self::Sharded(ns) => ns.query_table_versions(object_id, descending, limit).await,
+        }
+    }
+
+    #[cfg(test)]
+    async fn delete_table_versions(&self, object_id: &str, ranges: &[(i64, i64)]) -> Result<i64> {
+        match self {
+            Self::Single(ns) => ns.delete_table_versions(object_id, ranges).await,
+            Self::Sharded(ns) => {
+                ns.batch_delete_table_versions_by_ranges(&[(
+                    object_id.to_string(),
+                    ranges.to_vec(),
+                )])
+                .await
+            }
+        }
+    }
+
+    async fn list_table_versions(
+        &self,
+        table_id: &[String],
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<ListTableVersionsResponse> {
+        match self {
+            Self::Single(ns) => ns.list_table_versions(table_id, descending, limit).await,
+            Self::Sharded(ns) => ns.list_table_versions(table_id, descending, limit).await,
+        }
+    }
+
+    async fn describe_table_version(
+        &self,
+        table_id: &[String],
+        version: i64,
+    ) -> Result<DescribeTableVersionResponse> {
+        match self {
+            Self::Single(ns) => ns.describe_table_version(table_id, version).await,
+            Self::Sharded(ns) => ns.describe_table_version(table_id, version).await,
+        }
+    }
+
+    async fn batch_delete_table_versions_by_ranges(
+        &self,
+        table_ranges: &[(String, Vec<(i64, i64)>)],
+    ) -> Result<i64> {
+        match self {
+            Self::Single(ns) => ns.batch_delete_table_versions_by_ranges(table_ranges).await,
+            Self::Sharded(ns) => ns.batch_delete_table_versions_by_ranges(table_ranges).await,
+        }
+    }
+}
+
+#[async_trait]
+impl LanceNamespace for ManifestCatalog {
+    fn namespace_id(&self) -> String {
+        match self {
+            Self::Single(ns) => ns.namespace_id(),
+            Self::Sharded(ns) => ns.namespace_id(),
+        }
+    }
+
+    async fn list_namespaces(
+        &self,
+        request: ListNamespacesRequest,
+    ) -> Result<ListNamespacesResponse> {
+        match self {
+            Self::Single(ns) => ns.list_namespaces(request).await,
+            Self::Sharded(ns) => ns.list_namespaces(request).await,
+        }
+    }
+
+    async fn describe_namespace(
+        &self,
+        request: DescribeNamespaceRequest,
+    ) -> Result<DescribeNamespaceResponse> {
+        match self {
+            Self::Single(ns) => ns.describe_namespace(request).await,
+            Self::Sharded(ns) => ns.describe_namespace(request).await,
+        }
+    }
+
+    async fn create_namespace(
+        &self,
+        request: CreateNamespaceRequest,
+    ) -> Result<CreateNamespaceResponse> {
+        match self {
+            Self::Single(ns) => ns.create_namespace(request).await,
+            Self::Sharded(ns) => ns.create_namespace(request).await,
+        }
+    }
+
+    async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
+        match self {
+            Self::Single(ns) => ns.drop_namespace(request).await,
+            Self::Sharded(ns) => ns.drop_namespace(request).await,
+        }
+    }
+
+    async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+        match self {
+            Self::Single(ns) => ns.namespace_exists(request).await,
+            Self::Sharded(ns) => ns.namespace_exists(request).await,
+        }
+    }
+
+    async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
+        match self {
+            Self::Single(ns) => ns.list_tables(request).await,
+            Self::Sharded(ns) => ns.list_tables(request).await,
+        }
+    }
+
+    async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
+        match self {
+            Self::Single(ns) => ns.describe_table(request).await,
+            Self::Sharded(ns) => ns.describe_table(request).await,
+        }
+    }
+
+    async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+        match self {
+            Self::Single(ns) => ns.table_exists(request).await,
+            Self::Sharded(ns) => ns.table_exists(request).await,
+        }
+    }
+
+    async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
+        match self {
+            Self::Single(ns) => ns.drop_table(request).await,
+            Self::Sharded(ns) => ns.drop_table(request).await,
+        }
+    }
+
+    async fn create_table(
+        &self,
+        request: CreateTableRequest,
+        request_data: Bytes,
+    ) -> Result<CreateTableResponse> {
+        match self {
+            Self::Single(ns) => ns.create_table(request, request_data).await,
+            Self::Sharded(ns) => ns.create_table(request, request_data).await,
+        }
+    }
+
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        match self {
+            Self::Single(ns) => ns.declare_table(request).await,
+            Self::Sharded(ns) => ns.declare_table(request).await,
+        }
+    }
+
+    async fn register_table(
+        &self,
+        request: lance_namespace::models::RegisterTableRequest,
+    ) -> Result<lance_namespace::models::RegisterTableResponse> {
+        match self {
+            Self::Single(ns) => LanceNamespace::register_table(ns.as_ref(), request).await,
+            Self::Sharded(ns) => LanceNamespace::register_table(ns.as_ref(), request).await,
+        }
+    }
+
+    async fn deregister_table(
+        &self,
+        request: lance_namespace::models::DeregisterTableRequest,
+    ) -> Result<lance_namespace::models::DeregisterTableResponse> {
+        match self {
+            Self::Single(ns) => LanceNamespace::deregister_table(ns.as_ref(), request).await,
+            Self::Sharded(ns) => LanceNamespace::deregister_table(ns.as_ref(), request).await,
+        }
+    }
+}
+
 /// When `manifest_enabled=true`, the namespace uses a special `__manifest` Lance table to track tables
 /// instead of scanning the filesystem. This provides:
 /// - Better performance for listing operations
@@ -827,7 +1088,7 @@ pub struct DirectoryNamespace {
     session: Option<Arc<Session>>,
     object_store: Arc<ObjectStore>,
     base_path: Path,
-    manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
+    manifest_ns: Option<Arc<ManifestCatalog>>,
     dir_listing_enabled: bool,
     /// When true, root-level table operations check the manifest first before
     /// falling back to directory listing. When false, root-level tables skip
@@ -4320,6 +4581,132 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn create_sharded_namespace(temp_path: &str) -> DirectoryNamespace {
+        DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .manifest_shard_count(4)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_sharded_manifest_table_operations() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = create_sharded_namespace(temp_path).await;
+
+        create_scalar_table(&namespace, "alpha").await;
+        create_scalar_table(&namespace, "beta").await;
+
+        let response = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                page_token: None,
+                limit: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let tables = response.tables.into_iter().collect::<HashSet<_>>();
+        assert_eq!(
+            tables,
+            HashSet::from(["alpha".to_string(), "beta".to_string()])
+        );
+
+        let describe = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(vec!["alpha".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(describe.table.as_deref(), Some("alpha"));
+
+        for shard_index in 0..4 {
+            let shard_uri = format!("{}/__manifest_shard_{:06}", temp_path, shard_index);
+            DatasetBuilder::from_uri(shard_uri).load().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sharded_table_version_storage_records_versions() {
+        use futures::TryStreamExt;
+        use lance_namespace::models::{CreateTableVersionRequest, ListTableVersionsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .manifest_shard_count(4)
+            .table_version_tracking_enabled(true)
+            .table_version_storage_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        create_scalar_table(&namespace, "versions").await;
+        let describe = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(vec!["versions".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let table_uri = describe.location.unwrap();
+        let dataset = Dataset::open(&table_uri).await.unwrap();
+        let object_store = dataset.object_store(None).await.unwrap();
+        let manifest_metas: Vec<_> = object_store
+            .inner
+            .list(Some(&dataset.versions_dir()))
+            .try_collect()
+            .await
+            .unwrap();
+        let manifest_meta = manifest_metas
+            .iter()
+            .find(|meta| {
+                meta.location
+                    .filename()
+                    .is_some_and(|filename| filename.ends_with(".manifest"))
+            })
+            .unwrap();
+        let manifest_data = object_store
+            .inner
+            .get(&manifest_meta.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let staging_path = dataset.versions_dir().join("staging_manifest");
+        object_store
+            .inner
+            .put(&staging_path, manifest_data.into())
+            .await
+            .unwrap();
+
+        let mut create_req = CreateTableVersionRequest::new(2, staging_path.to_string());
+        create_req.id = Some(vec!["versions".to_string()]);
+        create_req.naming_scheme = Some("V2".to_string());
+        namespace.create_table_version(create_req).await.unwrap();
+
+        let mut list_req = ListTableVersionsRequest::new();
+        list_req.id = Some(vec!["versions".to_string()]);
+        let versions = namespace.list_table_versions(list_req).await.unwrap();
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.versions[0].version, 2);
+
+        let describe_version = namespace
+            .describe_table_version(DescribeTableVersionRequest {
+                id: Some(vec!["versions".to_string()]),
+                version: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(describe_version.version.version, 2);
     }
 
     async fn open_dataset(namespace: &DirectoryNamespace, table_name: &str) -> Dataset {
@@ -9194,20 +9581,22 @@ mod tests {
             let version = response.version.unwrap();
             assert_eq!(version.version, 2);
 
-            // Verify the version is recorded in __manifest by querying it
+            // Verify the version is recorded in __manifest by listing versions
+            // through the same production path used by the namespace.
             let manifest_ns = namespace.manifest_ns.as_ref().unwrap();
-            let table_id_str = manifest::ManifestNamespace::str_object_id(&table_id);
             let versions = manifest_ns
-                .query_table_versions(&table_id_str, false, None)
+                .list_table_versions(&table_id, false, None)
                 .await
                 .unwrap();
 
             assert!(
-                !versions.is_empty(),
+                !versions.versions.is_empty(),
                 "Version should be recorded in __manifest"
             );
-            let (ver, _path) = &versions[0];
-            assert_eq!(*ver, 2, "Recorded version should be 2");
+            assert_eq!(
+                versions.versions[0].version, 2,
+                "Recorded version should be 2"
+            );
         }
     }
 
