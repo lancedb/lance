@@ -1108,10 +1108,10 @@ impl FtsMemIndex {
         // dropped mid-merge.
         std::thread::spawn(move || {
             let merged = Arc::new(Partition::merge(&group));
-            if let Ok(mut g) = slot.lock() {
-                if let Some(p) = g.as_mut() {
-                    p.result = Some(merged);
-                }
+            if let Ok(mut g) = slot.lock()
+                && let Some(p) = g.as_mut()
+            {
+                p.result = Some(merged);
             }
         });
     }
