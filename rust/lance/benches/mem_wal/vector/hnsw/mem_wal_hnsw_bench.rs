@@ -31,6 +31,7 @@ struct Args {
     seed: u64,
     clusters: usize,
     noise: f32,
+    query_repeats: usize,
 }
 
 impl Default for Args {
@@ -48,6 +49,7 @@ impl Default for Args {
             seed: 100,
             clusters: 4096,
             noise: 0.05,
+            query_repeats: 1,
         }
     }
 }
@@ -111,18 +113,21 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let search_query_ids = query_ids(&args, args.queries);
     let query_start = Instant::now();
-    let hits: usize = search_query_ids
-        .par_iter()
-        .map(|row| {
-            let query = snapshot.vector(*row as u32);
-            let results = graph
-                .search(query, SearchParams::new(args.k, args.ef_search), &snapshot)
-                .expect("search should succeed");
-            usize::from(results.iter().any(|result| result.id as usize == *row))
-        })
-        .sum();
+    let mut hits = 0usize;
+    for _ in 0..args.query_repeats {
+        hits = search_query_ids
+            .par_iter()
+            .map(|row| {
+                let query = snapshot.vector(*row as u32);
+                let results = graph
+                    .search(query, SearchParams::new(args.k, args.ef_search), &snapshot)
+                    .expect("search should succeed");
+                usize::from(results.iter().any(|result| result.id as usize == *row))
+            })
+            .sum();
+    }
     let query_s = query_start.elapsed().as_secs_f64();
-    let query_qps = args.queries as f64 / query_s;
+    let query_qps = (args.queries * args.query_repeats) as f64 / query_s;
     let self_recall = hits as f64 / args.queries as f64;
 
     let truth_query_ids = query_ids(&args, args.truth_queries);
@@ -204,6 +209,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--seed" => args.seed = value.parse()?,
             "--clusters" => args.clusters = value.parse()?,
             "--noise" => args.noise = value.parse()?,
+            "--query-repeats" => args.query_repeats = value.parse()?,
             _ => return Err(format!("unknown argument: {flag}").into()),
         }
     }

@@ -30,6 +30,7 @@ struct Args {
     uint64_t seed = 100;
     size_t clusters = 4096;
     float noise = 0.05f;
+    size_t query_repeats = 1;
 };
 
 Args parse_args(int argc, char **argv);
@@ -129,24 +130,27 @@ int main(int argc, char **argv) {
         std::vector<size_t> queries = query_ids(args, args.queries);
         auto query_start = clock_now();
         std::atomic<size_t> hits{0};
-        parallel_for(0, queries.size(), args.threads, [&](size_t idx, size_t) {
-            size_t row = queries[idx];
-            std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
-                index.searchKnn(data.data() + row * args.dim, args.k);
-            bool found = false;
-            while (!result.empty()) {
-                if (static_cast<size_t>(result.top().second) == row) {
-                    found = true;
-                    break;
+        for (size_t rep = 0; rep < args.query_repeats; ++rep) {
+            hits.store(0, std::memory_order_relaxed);
+            parallel_for(0, queries.size(), args.threads, [&](size_t idx, size_t) {
+                size_t row = queries[idx];
+                std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
+                    index.searchKnn(data.data() + row * args.dim, args.k);
+                bool found = false;
+                while (!result.empty()) {
+                    if (static_cast<size_t>(result.top().second) == row) {
+                        found = true;
+                        break;
+                    }
+                    result.pop();
                 }
-                result.pop();
-            }
-            if (found) {
-                hits.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
+                if (found) {
+                    hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
         double query_s = elapsed_seconds(query_start);
-        double query_qps = static_cast<double>(args.queries) / query_s;
+        double query_qps = static_cast<double>(args.queries * args.query_repeats) / query_s;
         double self_recall = static_cast<double>(hits.load()) / static_cast<double>(args.queries);
 
         std::vector<size_t> truth_queries = query_ids(args, args.truth_queries);
@@ -241,6 +245,8 @@ Args parse_args(int argc, char **argv) {
             args.clusters = parse_size(value);
         } else if (flag == "--noise") {
             args.noise = std::stof(value);
+        } else if (flag == "--query-repeats") {
+            args.query_repeats = parse_size(value);
         } else {
             throw std::invalid_argument("unknown argument: " + flag);
         }
