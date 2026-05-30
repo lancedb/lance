@@ -341,6 +341,16 @@ impl LsmPointLookupPlanner {
         if keys.is_empty() {
             return Ok(RecordBatch::new_empty(target));
         }
+        // One key: the batch grouping (refs vec + hash map + pending) has
+        // nothing to amortize, so it's pure overhead — delegate to the cheaper
+        // single-lookup path. Keeps a one-element `lookup_many` (e.g. a routed
+        // `pk IN (x)`) as fast as `lookup`.
+        if keys.len() == 1 {
+            return Ok(self
+                .lookup(keys, projection)
+                .await?
+                .unwrap_or_else(|| RecordBatch::new_empty(target)));
+        }
 
         // Fast path: single pk column, every key matches the pk Arrow type, no
         // system columns in the output. Otherwise the per-key path (correct for
