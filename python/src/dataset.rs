@@ -3157,6 +3157,7 @@ impl Dataset {
     #[pyo3(signature=(
         *,
         maintained_indexes=None,
+        maintained_hnsw_params=None,
         bucket_column=None,
         num_buckets=None,
         identity_column=None,
@@ -3179,6 +3180,7 @@ impl Dataset {
         &mut self,
         py: Python<'_>,
         maintained_indexes: Option<Vec<String>>,
+        maintained_hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
         bucket_column: Option<String>,
         num_buckets: Option<u32>,
         identity_column: Option<String>,
@@ -3235,6 +3237,30 @@ impl Dataset {
         );
         let maintained_indexes = maintained_indexes.unwrap_or_default();
 
+        // Translate the {index_name: {param: value}} dict into HnswBuildParams,
+        // rejecting unknown keys so typos surface instead of being ignored.
+        let mut hnsw_overrides: Vec<(String, HnswBuildParams)> = Vec::new();
+        if let Some(overrides) = maintained_hnsw_params {
+            for (index_name, params) in overrides {
+                let mut build = HnswBuildParams::default();
+                for (key, value) in params {
+                    match key.as_str() {
+                        "m" => build = build.num_edges(value as usize),
+                        "ef_construction" => build = build.ef_construction(value as usize),
+                        "max_level" => build = build.max_level(value as u16),
+                        other => {
+                            return Err(PyValueError::new_err(format!(
+                                "unknown HNSW build param '{}' for index '{}'; \
+                                 expected one of 'm', 'ef_construction', 'max_level'",
+                                other, index_name
+                            )));
+                        }
+                    }
+                }
+                hnsw_overrides.push((index_name, build));
+            }
+        }
+
         let mut ds = Arc::clone(&self.ds);
         let new_ds = rt()
             .block_on(Some(py), async move {
@@ -3248,6 +3274,9 @@ impl Dataset {
                     builder = builder.unsharded();
                 }
                 builder = builder.maintained_indexes(maintained_indexes);
+                for (index_name, params) in hnsw_overrides {
+                    builder = builder.maintained_index_hnsw_params(index_name, params);
+                }
                 if let Some(config) = writer_config {
                     builder = builder.writer_config_defaults(config);
                 }
@@ -3279,6 +3308,16 @@ impl Dataset {
         dict.set_item("num_shards", details.num_shards)?;
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
+
+        let hnsw_params = PyDict::new(py);
+        for (index_name, params) in &details.maintained_hnsw_params {
+            let inner = PyDict::new(py);
+            inner.set_item("m", params.m as u32)?;
+            inner.set_item("ef_construction", params.ef_construction as u32)?;
+            inner.set_item("max_level", params.max_level as u32)?;
+            hnsw_params.set_item(index_name, inner)?;
+        }
+        dict.set_item("maintained_hnsw_params", hnsw_params)?;
 
         let specs = PyList::empty(py);
         for spec in &details.sharding_specs {

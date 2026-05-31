@@ -4779,6 +4779,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         *,
         maintained_indexes: Optional[List[str]] = None,
+        maintained_hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
         bucket_column: Optional[str] = None,
         num_buckets: Optional[int] = None,
         identity_column: Optional[str] = None,
@@ -4819,6 +4820,13 @@ class LanceDataset(pa.dataset.Dataset):
         maintained_indexes : list of str, optional
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
+        maintained_hnsw_params : dict, optional
+            Per-index HNSW build-parameter overrides, keyed by maintained vector
+            index name. Each value is a dict with any of ``m`` (graph degree;
+            level 0 keeps ``2*m``, equivalent to FAISS's ``M``),
+            ``ef_construction``, and ``max_level``. Without an override an index
+            uses the default parameters (``m = 20``). Each key must also appear
+            in *maintained_indexes*.
         bucket_column : str, optional
             With ``num_buckets``, hash-bucket writes by this scalar column.
         num_buckets : int, optional
@@ -4839,6 +4847,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.initialize_mem_wal(
             maintained_indexes=maintained_indexes,
+            maintained_hnsw_params=maintained_hnsw_params,
             bucket_column=bucket_column,
             num_buckets=num_buckets,
             identity_column=identity_column,

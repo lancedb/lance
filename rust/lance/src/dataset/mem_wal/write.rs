@@ -4528,6 +4528,88 @@ mod shard_writer_tests {
     }
 
     #[tokio::test]
+    async fn test_initialize_mem_wal_maintained_hnsw_params() {
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+
+        let vector_dim = 32;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_maintained_hnsw_params_{}", Uuid::new_v4());
+
+        let initial = create_test_batch(&schema, 0, 256, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .expect("Failed to create vector index");
+
+        // Overriding params for an index not in maintained_indexes must fail.
+        let err = dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["vector_idx"])
+            .maintained_index_hnsw_params(
+                "missing_idx",
+                HnswBuildParams::default().num_edges(7),
+            )
+            .execute()
+            .await
+            .expect_err("override on a non-maintained index must be rejected");
+        assert!(
+            err.to_string().contains("missing_idx"),
+            "error should name the offending index: {err}"
+        );
+
+        dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["vector_idx"])
+            .maintained_index_hnsw_params(
+                "vector_idx",
+                HnswBuildParams::default().num_edges(7).ef_construction(48),
+            )
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL with HNSW params");
+
+        // The override is persisted in the MemWAL index details.
+        let details = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("MemWAL details should exist");
+        let params = details
+            .maintained_hnsw_params
+            .get("vector_idx")
+            .expect("override should be persisted for vector_idx");
+        assert_eq!(params.m, 7);
+        assert_eq!(params.ef_construction, 48);
+
+        // And a writer opens against the configured maintained index.
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id).with_durable_write(false),
+            )
+            .await
+            .expect("mem_wal_writer must accept the HNSW-param override");
+        writer
+            .put(vec![create_test_batch(&schema, 300, 10, vector_dim)])
+            .await
+            .unwrap();
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_initialize_mem_wal_bucket_sharding() {
         let vector_dim = 128;
         let schema = create_test_schema(vector_dim);

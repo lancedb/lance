@@ -35,6 +35,7 @@ use lance::dataset::mem_wal::{
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{MemWalIndexDetails, ShardManifest, ShardingField, ShardingSpec};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
@@ -43,7 +44,9 @@ use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{IntoJava, export_vec, import_vec, import_vec_to_rust};
+use crate::traits::{
+    FromJString, IntoJava, export_vec, import_vec, import_vec_from_method, import_vec_to_rust,
+};
 use crate::utils::to_rust_map;
 
 const NATIVE_SHARD_WRITER: &str = "nativeShardWriterHandle";
@@ -957,6 +960,27 @@ fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject
         .call_method(&params, "maintainedIndexes", "()Ljava/util/List;", &[])?
         .l()?;
     let maintained_indexes = env.get_strings(&maintained_list)?;
+    let maintained_hnsw_params = import_vec_from_method(
+        env,
+        &params,
+        "maintainedHnswParams",
+        |env, item| -> Result<(String, HnswBuildParams)> {
+            let index_name = env
+                .call_method(&item, "indexName", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let index_name: String = JString::from(index_name).extract(env)?;
+            let m = env.call_method(&item, "m", "()I", &[])?.i()? as usize;
+            let ef_construction = env.call_method(&item, "efConstruction", "()I", &[])?.i()? as usize;
+            let max_level = env.call_method(&item, "maxLevel", "()I", &[])?.i()? as u16;
+            Ok((
+                index_name,
+                HnswBuildParams::default()
+                    .num_edges(m)
+                    .ef_construction(ef_construction)
+                    .max_level(max_level),
+            ))
+        },
+    )?;
     let bucket_column = env.get_optional_string_from_method(&params, "bucketColumn")?;
     let num_buckets = env.get_optional_u32_from_method(&params, "numBuckets")?;
     let identity_column = env.get_optional_string_from_method(&params, "identityColumn")?;
@@ -996,6 +1020,9 @@ fn inner_initialize_mem_wal(env: &mut JNIEnv, jdataset: JObject, params: JObject
         builder = builder.unsharded();
     }
     builder = builder.maintained_indexes(maintained_indexes);
+    for (index_name, hnsw_params) in maintained_hnsw_params {
+        builder = builder.maintained_index_hnsw_params(index_name, hnsw_params);
+    }
     if let Some(config) = writer_config {
         builder = builder.writer_config_defaults(config);
     }
