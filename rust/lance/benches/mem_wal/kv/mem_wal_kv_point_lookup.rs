@@ -489,6 +489,32 @@ impl KeyType {
     }
 }
 
+/// Where the data under test lives. `Active` = the in-memory active MemTable
+/// (never flushed). `Flushed` = an on-disk flushed generation (a Lance data
+/// file + on-disk BTree index, read via the indexed-scan path) vs a single
+/// RocksDB SST on disk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Storage {
+    Active,
+    Flushed,
+}
+
+impl Storage {
+    fn parse(v: &str) -> std::result::Result<Self, String> {
+        match v {
+            "active" => Ok(Self::Active),
+            "flushed" => Ok(Self::Flushed),
+            _ => Err(format!("unknown storage '{v}', expected active|flushed")),
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Flushed => "flushed",
+        }
+    }
+}
+
 /// Deterministic 16-byte UUID for a logical key: a scrambled high half (so keys
 /// scatter across the byte space like real UUIDs) plus the key in the low half
 /// (so distinct keys never collide). Same key → same bytes, so lookups resolve.
@@ -524,6 +550,7 @@ struct Args {
     batch_rows: usize,
     engine: Engine,
     key_type: KeyType,
+    storage: Storage,
     lance_read_mode: LanceReadMode,
     /// When > 0, the read phase measures **batch get** of this many keys per
     /// call (Lance: one vectorized BTree gather; RocksDB: `multi_get`) instead
@@ -549,6 +576,7 @@ impl Default for Args {
             batch_rows: 1_000,
             engine: Engine::Both,
             key_type: KeyType::Int,
+            storage: Storage::Active,
             lance_read_mode: LanceReadMode::Plan,
             batch_get: 0,
             uri: String::new(),
@@ -597,6 +625,9 @@ fn parse_args() -> Result<Args> {
             }
             "--key-type" => {
                 args.key_type = KeyType::parse(&value).map_err(lance_core::Error::invalid_input)?
+            }
+            "--storage" => {
+                args.storage = Storage::parse(&value).map_err(lance_core::Error::invalid_input)?
             }
             "--lance-read-mode" => {
                 args.lance_read_mode =
@@ -1093,6 +1124,150 @@ async fn run_lance(
 }
 
 // ----------------------------------------------------------------------
+// Lance flushed (on-disk) engine
+// ----------------------------------------------------------------------
+
+/// One indexed point lookup against the flushed dataset: filter `id = key` on
+/// the on-disk BTree scalar index, returning the matched row count.
+async fn flushed_probe(dataset: &Dataset, key: i64) -> Result<usize> {
+    use futures::StreamExt;
+    let mut scanner = dataset.scan();
+    scanner.filter(&format!("{KEY_COL} = {key}"))?;
+    let mut stream = scanner.try_into_stream().await?;
+    let mut n = 0;
+    while let Some(batch) = stream.next().await {
+        n += batch?.num_rows();
+    }
+    Ok(n)
+}
+
+/// Flushed Lance: write all rows as one on-disk Lance dataset with a BTree
+/// scalar index — the exact artifact a MemTable flush emits (forward-written
+/// data file + on-disk BTree index) — then point-lookup through the indexed
+/// scan path. Int keys only (the SQL filter literal is the integer).
+async fn run_lance_flushed(
+    args: &Args,
+    insert_order: &[i64],
+    queries: &[(i64, bool)],
+) -> Result<EngineResult> {
+    assert_eq!(
+        args.key_type,
+        KeyType::Int,
+        "flushed mode currently supports --key-type int only"
+    );
+    let sampler = RssSampler::start();
+    let key_type = args.key_type;
+    let schema = make_schema(key_type);
+    let uri = format!("{}/lance_flushed", args.uri.trim_end_matches('/'));
+    let _ = std::fs::remove_dir_all(&uri);
+
+    // --- write + flush: build the on-disk data file + BTree index ---
+    let cpu0 = process_cpu_secs();
+    let t_write = Instant::now();
+    let batches: Vec<RecordBatch> = insert_order
+        .chunks(args.batch_rows)
+        .map(|c| make_batch(schema.clone(), c, args.value_size, key_type))
+        .collect();
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let mut dataset = Dataset::write(reader, &uri, Some(WriteParams::default())).await?;
+    dataset
+        .create_index(
+            &[KEY_COL],
+            IndexType::BTree,
+            Some(BTREE_INDEX_NAME.to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await?;
+    let write_s = t_write.elapsed().as_secs_f64();
+    let write_cpu_s = process_cpu_secs() - cpu0;
+    let write_rows_per_s = args.rows as f64 / write_s.max(1e-9);
+    let rss_after_load_mb = sampler.peak_mb();
+    println!(
+        "[lance] wrote+flushed {} rows + btree index in {:.2}s = {:.0} rows/s (cpu {:.2}s)",
+        args.rows, write_s, write_rows_per_s, write_cpu_s
+    );
+    let dataset = Arc::new(dataset);
+
+    // warmup + correctness: a hit resolves to exactly one row via the index.
+    if let Some((probe, _)) = queries.iter().find(|(_, h)| *h) {
+        let n = flushed_probe(&dataset, *probe).await?;
+        assert_eq!(n, 1, "flushed warmup lookup for key {probe} returned {n}");
+    }
+
+    // --- single-thread read latency ---
+    let cpu1 = process_cpu_secs();
+    let mut latencies_us = Vec::with_capacity(queries.len());
+    let mut hits = 0usize;
+    let mut misses_resolved = 0usize;
+    let t_read = Instant::now();
+    for &(key, expect_hit) in queries {
+        let t0 = Instant::now();
+        let n = flushed_probe(&dataset, key).await?;
+        latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+        if expect_hit {
+            assert_eq!(n, 1, "expected hit for key {key}, got {n}");
+            hits += 1;
+        } else {
+            assert_eq!(n, 0, "expected miss for key {key}, got {n}");
+            misses_resolved += 1;
+        }
+    }
+    let read_1t_s = t_read.elapsed().as_secs_f64();
+    let read_qps_1t = queries.len() as f64 / read_1t_s.max(1e-9);
+    let read_cpu_s = process_cpu_secs() - cpu1;
+    let stats = compute_stats(latencies_us);
+
+    // --- N-thread QPS (tokio tasks, shared Arc<Dataset>) ---
+    let keys: Arc<Vec<i64>> = Arc::new(queries.iter().map(|(k, _)| *k).collect());
+    let read_qps_nt = if args.threads <= 1 {
+        read_qps_1t
+    } else {
+        let t = Instant::now();
+        let mut handles = Vec::with_capacity(args.threads);
+        for shard in 0..args.threads {
+            let dataset = dataset.clone();
+            let keys = keys.clone();
+            let threads = args.threads;
+            handles.push(tokio::spawn(async move {
+                let mut i = shard;
+                while i < keys.len() {
+                    let _ = flushed_probe(&dataset, keys[i]).await;
+                    i += threads;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        queries.len() as f64 / t.elapsed().as_secs_f64().max(1e-9)
+    };
+
+    let peak_rss_mb = sampler.stop();
+    println!(
+        "[lance] read p50={:.2}us p95={:.2}us p99={:.2}us mean={:.2}us qps_1t={:.0} qps_{}t={:.0} (hits={hits} miss={misses_resolved}) peak_rss={:.0}MB",
+        stats.p50_us, stats.p95_us, stats.p99_us, stats.mean_us, read_qps_1t, args.threads, read_qps_nt, peak_rss_mb
+    );
+
+    Ok(EngineResult {
+        engine: "lance-flushed",
+        write_rows_per_s,
+        write_cpu_s,
+        read_p50_us: stats.p50_us,
+        read_p95_us: stats.p95_us,
+        read_p99_us: stats.p99_us,
+        read_mean_us: stats.mean_us,
+        read_qps_1t,
+        read_qps_nt,
+        read_cpu_s,
+        hits,
+        misses_resolved,
+        peak_rss_mb,
+        rss_after_load_mb,
+    })
+}
+
+// ----------------------------------------------------------------------
 // RocksDB engine (only with --features bench-rocksdb)
 // ----------------------------------------------------------------------
 
@@ -1120,6 +1295,17 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     opts.set_disable_auto_compactions(true);
     // Never trigger a flush by buffer count either.
     opts.set_db_write_buffer_size(write_buf);
+    // Realistic SST read config for the `--storage flushed` comparison: a
+    // whole-key bloom filter + a block cache large enough to hold the SST's
+    // index/filter and hot data blocks (warm reads). Harmless for `active`
+    // mode (data stays in the memtable, which doesn't use the block cache).
+    {
+        let mut bbt = rocksdb::BlockBasedOptions::default();
+        bbt.set_bloom_filter(10.0, false);
+        let cache = rocksdb::Cache::new_lru_cache((1usize << 30).max(write_buf / 2));
+        bbt.set_block_cache(&cache);
+        opts.set_block_based_table_factory(&bbt);
+    }
 
     let db = Arc::new(
         DB::open(&opts, &db_path)
@@ -1157,6 +1343,20 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
         write_cpu_s,
         write_buf >> 20
     );
+
+    // `--storage flushed`: flush the memtable to a single on-disk SST (auto
+    // compaction is off, so it stays one SST). Reads then go to the SST via the
+    // block cache + bloom, matching the Lance flushed-generation comparison.
+    if args.storage == Storage::Flushed {
+        db.flush()
+            .map_err(|e| lance_core::Error::io(format!("rocksdb flush: {e}")))?;
+        let n_sst = db
+            .property_int_value("rocksdb.num-files-at-level0")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        println!("[rocksdb] flushed memtable to SST (L0 files={n_sst})");
+    }
 
     // --- batch-get path: RocksDB multi_get of `batch_get` keys per call ---
     if args.batch_get > 0 {
@@ -1394,8 +1594,9 @@ fn print_comparison(results: &[EngineResult]) {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_kv_point_lookup engine={:?} key_type={} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
+        "bench=mem_wal_kv_point_lookup engine={:?} storage={} key_type={} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
         args.engine,
+        args.storage.as_str(),
         args.key_type.as_str(),
         args.lance_read_mode.as_str(),
         args.batch_get,
@@ -1413,7 +1614,11 @@ async fn run(args: Args) -> Result<()> {
 
     let mut results = Vec::new();
     if matches!(args.engine, Engine::Lance | Engine::Both) {
-        results.push(run_lance(&args, &insert_order, &queries).await?);
+        let res = match args.storage {
+            Storage::Active => run_lance(&args, &insert_order, &queries).await?,
+            Storage::Flushed => run_lance_flushed(&args, &insert_order, &queries).await?,
+        };
+        results.push(res);
     }
     if matches!(args.engine, Engine::Rocksdb | Engine::Both) {
         // RocksDB arm is synchronous; run it on a blocking thread so it does
