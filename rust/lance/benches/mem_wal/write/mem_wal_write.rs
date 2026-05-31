@@ -356,7 +356,7 @@ async fn create_dataset(
     // Create initial dataset with 1000 rows for index training
     let initial_batch = create_test_batch(schema, 0, BASE_DATASET_ROWS, vector_dim);
     let batches = RecordBatchIterator::new([Ok(initial_batch)], Arc::new(schema.clone()));
-    let write_params = WriteParams::default();
+    let write_params = WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2), ..Default::default() };
     let mut dataset = Dataset::write(batches, &uri, Some(write_params))
         .await
         .expect("Failed to create dataset");

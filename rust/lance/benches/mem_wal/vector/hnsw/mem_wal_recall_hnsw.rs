@@ -298,7 +298,7 @@ async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::
     }
     let base_batch = make_batch(0, &base_vec, schema.clone());
     let reader = RecordBatchIterator::new(std::iter::once(Ok(base_batch)), schema.clone());
-    let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(reader, uri, Some(WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2), ..Default::default() })).await?;
     let ivf = IvfBuildParams::new(16);
     let pq = PQBuildParams::new(16, 8);
     let params = VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf, pq);

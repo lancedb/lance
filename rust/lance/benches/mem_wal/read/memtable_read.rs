@@ -223,7 +223,7 @@ async fn setup_lance(batches: Vec<RecordBatch>) -> LanceSetup {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     let uri = format!("memory://lance_bench_{}", Uuid::new_v4());
-    let write_params = WriteParams {
+    let write_params = WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -245,7 +245,7 @@ async fn setup_lance_per_batch(batches: Vec<RecordBatch>, batch_size: usize) -> 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     let uri = format!("memory://lance_per_batch_{}", Uuid::new_v4());
-    let write_params = WriteParams {
+    let write_params = WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
@@ -267,7 +267,7 @@ async fn setup_lance_with_fts(batches: Vec<RecordBatch>) -> LanceSetup {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     let uri = format!("memory://lance_fts_bench_{}", Uuid::new_v4());
-    let write_params = WriteParams {
+    let write_params = WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -299,7 +299,7 @@ async fn setup_lance_per_batch_with_fts(
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     let uri = format!("memory://lance_fts_per_batch_{}", Uuid::new_v4());
-    let write_params = WriteParams {
+    let write_params = WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
@@ -332,7 +332,7 @@ async fn setup_lance_with_vector_index(
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     let uri = format!("memory://lance_vec_bench_{}", Uuid::new_v4());
-    let write_params = WriteParams {
+    let write_params = WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -378,7 +378,7 @@ async fn setup_lance_per_batch_with_vector_index(
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     let uri = format!("memory://lance_vec_per_batch_{}", Uuid::new_v4());
-    let write_params = WriteParams {
+    let write_params = WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
