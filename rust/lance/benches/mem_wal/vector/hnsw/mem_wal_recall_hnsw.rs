@@ -35,6 +35,7 @@ use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::ROW_ID;
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::prefilter::NoFilter;
 use lance_index::vector::Query;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -315,11 +316,23 @@ async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::
             true,
         )
         .await?;
-    dataset
+    // Optionally override the maintained HNSW index's graph degree `m` (and
+    // ef_construction) so we can run matched-`m` comparisons vs FAISS. m=0 keeps
+    // the library default (m=20).
+    let hnsw_m = env_usize("BENCH_HNSW_M", 0);
+    let mut init = dataset
         .initialize_mem_wal()
-        .maintained_indexes([VECTOR_INDEX_NAME])
-        .execute()
-        .await?;
+        .maintained_indexes([VECTOR_INDEX_NAME]);
+    if hnsw_m > 0 {
+        let efc = env_usize("BENCH_HNSW_EFC", 200);
+        init = init.maintained_index_hnsw_params(
+            VECTOR_INDEX_NAME,
+            HnswBuildParams::default()
+                .num_edges(hnsw_m)
+                .ef_construction(efc),
+        );
+    }
+    init.execute().await?;
     Ok(())
 }
 

@@ -13,6 +13,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::vector::hnsw::builder::HnswBuildParams;
 use crate::{Index, IndexType};
 
 pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
@@ -314,6 +315,12 @@ pub struct MemWalIndexDetails {
     /// an individual writer may still override any value at runtime in its
     /// own (non-persisted) `ShardWriterConfig`.
     pub writer_config_defaults: HashMap<String, String>,
+    /// Per-index HNSW build parameters for maintained vector indexes, keyed by
+    /// index name. An index without an entry uses the default build parameters.
+    ///
+    /// `prefetch_distance` is a runtime perf hint and is not persisted; it is
+    /// restored to the default on read.
+    pub maintained_hnsw_params: HashMap<String, HnswBuildParams>,
 }
 
 impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
@@ -331,6 +338,16 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
                 .collect(),
             index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
             writer_config_defaults: details.writer_config_defaults.clone(),
+            maintained_hnsw_params: details
+                .maintained_hnsw_params
+                .iter()
+                .map(|(index_name, params)| pb::MemWalHnswParams {
+                    index_name: index_name.clone(),
+                    m: params.m as u32,
+                    ef_construction: params.ef_construction as u32,
+                    max_level: params.max_level as u32,
+                })
+                .collect(),
         }
     }
 }
@@ -360,6 +377,21 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .map(IndexCatchupProgress::try_from)
                 .collect::<lance_core::Result<_>>()?,
             writer_config_defaults: details.writer_config_defaults,
+            maintained_hnsw_params: details
+                .maintained_hnsw_params
+                .into_iter()
+                .map(|params| {
+                    (
+                        params.index_name,
+                        HnswBuildParams {
+                            max_level: params.max_level as u16,
+                            m: params.m as usize,
+                            ef_construction: params.ef_construction as usize,
+                            ..HnswBuildParams::default()
+                        },
+                    )
+                })
+                .collect(),
         })
     }
 }
@@ -455,5 +487,42 @@ impl Index for MemWalIndex {
 
     async fn calculate_included_frags(&self) -> lance_core::Result<RoaringBitmap> {
         Ok(RoaringBitmap::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_maintained_hnsw_params_round_trip() {
+        let mut maintained_hnsw_params = HashMap::new();
+        maintained_hnsw_params.insert(
+            "vec_idx".to_string(),
+            HnswBuildParams::default()
+                .num_edges(32)
+                .ef_construction(200),
+        );
+        let details = MemWalIndexDetails {
+            maintained_indexes: vec!["vec_idx".to_string()],
+            maintained_hnsw_params,
+            ..Default::default()
+        };
+
+        let proto: pb::MemWalIndexDetails = (&details).into();
+        assert_eq!(proto.maintained_hnsw_params.len(), 1);
+        assert_eq!(proto.maintained_hnsw_params[0].index_name, "vec_idx");
+        assert_eq!(proto.maintained_hnsw_params[0].m, 32);
+        assert_eq!(proto.maintained_hnsw_params[0].ef_construction, 200);
+
+        let restored = MemWalIndexDetails::try_from(proto).unwrap();
+        let params = restored.maintained_hnsw_params.get("vec_idx").unwrap();
+        assert_eq!(params.m, 32);
+        assert_eq!(params.ef_construction, 200);
+        // prefetch_distance is not persisted; restored to the default.
+        assert_eq!(
+            params.prefetch_distance,
+            HnswBuildParams::default().prefetch_distance
+        );
     }
 }

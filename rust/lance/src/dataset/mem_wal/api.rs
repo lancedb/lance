@@ -13,6 +13,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
@@ -94,6 +95,7 @@ pub struct InitializeMemWalBuilder<'a> {
     sharding: Sharding,
     maintained_indexes: Vec<String>,
     writer_config_defaults: HashMap<String, String>,
+    maintained_hnsw_params: HashMap<String, HnswBuildParams>,
 }
 
 impl<'a> InitializeMemWalBuilder<'a> {
@@ -103,6 +105,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             sharding: Sharding::Manual,
             maintained_indexes: Vec::new(),
             writer_config_defaults: HashMap::new(),
+            maintained_hnsw_params: HashMap::new(),
         }
     }
 
@@ -154,6 +157,27 @@ impl<'a> InitializeMemWalBuilder<'a> {
         self
     }
 
+    /// Override the HNSW build parameters for a maintained vector index.
+    ///
+    /// `index_name` must also appear in [`maintained_indexes`](Self::maintained_indexes)
+    /// and reference a vector index on the dataset; this is validated by
+    /// [`execute`](Self::execute). The parameters control the in-memory HNSW
+    /// graph built in each MemTable (and, on flush, the on-disk graph serialized
+    /// from it). Without an override, the index uses the default build
+    /// parameters (`m = 20`). `m` is the graph degree (level 0 retains `2*m`),
+    /// equivalent to FAISS's `M`.
+    ///
+    /// Calling this repeatedly for the same index replaces the previous value.
+    pub fn maintained_index_hnsw_params(
+        mut self,
+        index_name: impl Into<String>,
+        params: HnswBuildParams,
+    ) -> Self {
+        self.maintained_hnsw_params
+            .insert(index_name.into(), params);
+        self
+    }
+
     /// Record `config` as the default `ShardWriter` configuration.
     ///
     /// Every tunable field is persisted into the MemWAL index so that all
@@ -194,6 +218,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             sharding,
             maintained_indexes,
             writer_config_defaults,
+            maintained_hnsw_params,
         } = self;
 
         // Resolve (and validate) the sharding choice before any I/O.
@@ -204,6 +229,15 @@ impl<'a> InitializeMemWalBuilder<'a> {
             if !indices.iter().any(|idx| &idx.name == index_name) {
                 return Err(Error::invalid_input(format!(
                     "Index '{}' not found on dataset. maintained_indexes must reference existing indexes.",
+                    index_name
+                )));
+            }
+        }
+        // Every HNSW-param override must target a maintained index.
+        for index_name in maintained_hnsw_params.keys() {
+            if !maintained_indexes.iter().any(|name| name == index_name) {
+                return Err(Error::invalid_input(format!(
+                    "maintained_index_hnsw_params references '{}', which is not in maintained_indexes.",
                     index_name
                 )));
             }
@@ -219,6 +253,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             sharding_specs,
             maintained_indexes,
             writer_config_defaults,
+            maintained_hnsw_params,
             ..Default::default()
         };
 
@@ -660,8 +695,13 @@ impl DatasetMemWalExt for Dataset {
                     )?);
                 }
                 "vector" => {
+                    let hnsw_params = mem_wal_index
+                        .details
+                        .maintained_hnsw_params
+                        .get(index_name)
+                        .cloned();
                     let vector_config =
-                        load_vector_index_config(self, index_name, &index_meta).await?;
+                        load_vector_index_config(self, index_name, &index_meta, hnsw_params).await?;
                     index_configs.push(vector_config);
                 }
                 _ => {
@@ -704,6 +744,7 @@ async fn load_vector_index_config(
     dataset: &Dataset,
     index_name: &str,
     index_meta: &lance_table::format::IndexMetadata,
+    hnsw_params: Option<HnswBuildParams>,
 ) -> Result<MemIndexConfig> {
     use lance_index::metrics::NoOpMetricsCollector;
 
@@ -732,12 +773,16 @@ async fn load_vector_index_config(
         })?
         .metric_type();
 
-    Ok(MemIndexConfig::hnsw(
-        index_name.to_string(),
-        *field_id,
-        column,
-        distance_type,
-    ))
+    Ok(match hnsw_params {
+        Some(params) => MemIndexConfig::hnsw_with_params(
+            index_name.to_string(),
+            *field_id,
+            column,
+            distance_type,
+            params,
+        ),
+        None => MemIndexConfig::hnsw(index_name.to_string(), *field_id, column, distance_type),
+    })
 }
 
 #[cfg(test)]
