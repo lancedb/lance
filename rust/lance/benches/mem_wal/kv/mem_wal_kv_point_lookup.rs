@@ -213,8 +213,7 @@ fn fast_lookup_batch(active: &InMemoryMemTableRef, keys: &[i64], key_type: KeyTy
     // Group target rows by their owning batch so each batch is gathered once.
     let mut by_batch: HashMap<usize, Vec<u32>> = HashMap::new();
     for &k in keys {
-        let Some(pos) = btree.get_newest_visible(&key_scalar(k, key_type), visible_end - 1)
-        else {
+        let Some(pos) = btree.get_newest_visible(&key_scalar(k, key_type), visible_end - 1) else {
             continue;
         };
         let (mut lo, mut hi) = (0usize, last_visible_idx);
@@ -746,7 +745,12 @@ async fn run_lance(
     let mut lo = 0usize;
     while lo < insert_order.len() {
         let hi = (lo + args.batch_rows).min(insert_order.len());
-        let batch = make_batch(schema.clone(), &insert_order[lo..hi], args.value_size, key_type);
+        let batch = make_batch(
+            schema.clone(),
+            &insert_order[lo..hi],
+            args.value_size,
+            key_type,
+        );
         writer.put(vec![batch]).await?;
         lo = hi;
     }
@@ -886,7 +890,11 @@ async fn run_lance(
                         while ci < nchunks {
                             let lo = ci * bg;
                             let hi = (lo + bg).min(keys.len());
-                            std::hint::black_box(fast_lookup_batch(&active, &keys[lo..hi], key_type));
+                            std::hint::black_box(fast_lookup_batch(
+                                &active,
+                                &keys[lo..hi],
+                                key_type,
+                            ));
                             ci += threads;
                         }
                     }));
@@ -943,7 +951,9 @@ async fn run_lance(
                     plan.execute(0, task_ctx.clone())?.try_collect().await?;
                 batches.iter().map(|b| b.num_rows()).sum::<usize>()
             }
-            LanceReadMode::Fast => fast_lookup(&active, key, key_type).map(|b| b.num_rows()).unwrap_or(0),
+            LanceReadMode::Fast => fast_lookup(&active, key, key_type)
+                .map(|b| b.num_rows())
+                .unwrap_or(0),
             LanceReadMode::Api => planner
                 .lookup(&[key_scalar(key, key_type)], None)
                 .await?

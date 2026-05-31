@@ -259,12 +259,20 @@ impl LsmPointLookupPlanner {
                 .map(|f| f.data_type() == &pk_values[0].data_type())
                 .unwrap_or(false);
         if fast_eligible {
-            // Reuse the cached schema for the common `None` case; only an
-            // explicit projection rebuilds it.
-            let target = match projection {
-                None => self.none_target.clone(),
+            // Borrow the cached schema for the common `None` case (no `Arc`
+            // clone — the clone would contend on a shared refcount under
+            // concurrency); only an explicit projection builds a fresh schema.
+            let projected;
+            let target: &SchemaRef = match projection {
+                None => &self.none_target,
                 Some(_) => {
-                    canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)
+                    projected = canonical_output_schema(
+                        projection,
+                        &self.base_schema,
+                        &self.pk_columns,
+                        false,
+                    );
+                    &projected
                 }
             };
             if !target.fields().iter().any(|f| is_system_column(f.name())) {
@@ -278,7 +286,7 @@ impl LsmPointLookupPlanner {
                             &m.index_store,
                             &self.pk_columns[0],
                             &pk_values[0],
-                            &target,
+                            target,
                         )? {
                             Probe::Hit(batch) => Ok(Some(FastOutcome::Hit(batch))),
                             Probe::Miss => Ok(None),
@@ -684,11 +692,15 @@ fn gather_rows(
         .get(batch_idx)
         .ok_or_else(|| lance_core::Error::internal("point-lookup: gather batch missing"))?;
     let indices = (rows.len() > 1).then(|| arrow_array::UInt32Array::from(rows.to_vec()));
+    // Borrow the stored schema once (no `Arc` clone): `schema()` clones the
+    // shared schema `Arc`, and under concurrency that refcount cache line
+    // ping-pongs across cores. `schema_ref()` borrows it.
+    let stored_schema = stored.data.schema_ref();
     let cols: Vec<Arc<dyn Array>> = target
         .fields()
         .iter()
         .map(|f| {
-            let idx = stored.data.schema().index_of(f.name()).map_err(|_| {
+            let idx = stored_schema.index_of(f.name()).map_err(|_| {
                 lance_core::Error::invalid_input(format!(
                     "point-lookup projection column '{}' not found in memtable batch",
                     f.name()
