@@ -2405,7 +2405,7 @@ fn bitpack_read_at(buf: &[u8], base: usize, s: usize, n: usize, width: u8, out: 
 /// reader (the doc/freq offset is derived from per-block widths; the position
 /// offset accumulates the stored per-block byte length), so they are not stored.
 #[derive(Clone, Copy)]
-struct BlockMeta {
+struct BlockMeta<'a> {
     /// first / last doc id in the block (block doc ids are ascending).
     first_doc: u32,
     last_doc: u32,
@@ -2420,11 +2420,31 @@ struct BlockMeta {
     freq_width: u8,
     /// bit width of the packed position deltas.
     pos_width: u8,
-    /// Block-local BM25 score bound inputs (largest freq, smallest doc length):
-    /// `doc_weight(max_freq, min_dl)` bounds every doc's score in the block,
-    /// used to skip non-competitive blocks (block-max WAND).
-    max_freq: u32,
-    min_dl: u32,
+    /// Block-local BM25 "impacts": the Pareto `(freq, dl)` frontier of the
+    /// block's docs (no doc dominated by another with both higher freq and
+    /// shorter length), stored as `impacts_len` varint pairs. Because
+    /// `doc_weight` rises with freq and falls with dl, the block's max score is
+    /// `max` over this frontier — a tight (exact) bound used to skip
+    /// non-competitive blocks (block-max WAND). A loose single `(max_freq,
+    /// min_dl)` pair would inflate the bound and defeat skipping.
+    impacts: &'a [u8],
+    impacts_len: u32,
+}
+
+impl BlockMeta<'_> {
+    /// Tight block-max BM25 bound: `qw * max_d doc_weight(freq_d, dl_d)` over the
+    /// block, evaluated at the Pareto frontier (the only docs that can be the max
+    /// for any `avgdl`). Sound: every block doc is dominated by a frontier point.
+    fn block_ub(&self, scorer: &MemBM25Scorer, qw: f32) -> f32 {
+        let mut pos = 0usize;
+        let mut best = 0.0f32;
+        for _ in 0..self.impacts_len {
+            let freq = read_varint(self.impacts, &mut pos) as u32;
+            let dl = read_varint(self.impacts, &mut pos) as u32;
+            best = best.max(scorer.doc_weight(freq, dl));
+        }
+        qw * best
+    }
 }
 
 /// Per-term locator. The term's per-block metadata lives in the partition's
@@ -2477,7 +2497,7 @@ impl<'a> BlockReader<'a> {
 
     /// Parse the next block's metadata (without decoding its payload), advancing
     /// the derived doc/freq and position offsets. `None` once exhausted.
-    fn next_meta(&mut self) -> Option<BlockMeta> {
+    fn next_meta(&mut self) -> Option<BlockMeta<'a>> {
         if self.block_idx >= self.block_count {
             return None;
         }
@@ -2494,8 +2514,14 @@ impl<'a> BlockReader<'a> {
         let pos_width = self.bytes[self.pos + 2];
         self.pos += 3;
         let pos_bytes = read_varint(self.bytes, &mut self.pos) as usize;
-        let max_freq = read_varint(self.bytes, &mut self.pos) as u32;
-        let min_dl = read_varint(self.bytes, &mut self.pos) as u32;
+        // Pareto `(freq, dl)` frontier: a count followed by that many varint
+        // pairs. Capture the pair bytes as a slice and skip past them.
+        let impacts_len = read_varint(self.bytes, &mut self.pos) as u32;
+        let impacts_start = self.pos;
+        for _ in 0..impacts_len {
+            read_varint(self.bytes, &mut self.pos);
+            read_varint(self.bytes, &mut self.pos);
+        }
         let bm = BlockMeta {
             first_doc,
             last_doc,
@@ -2505,8 +2531,8 @@ impl<'a> BlockReader<'a> {
             doc_width,
             freq_width,
             pos_width,
-            max_freq,
-            min_dl,
+            impacts: &self.bytes[impacts_start..self.pos],
+            impacts_len,
         };
         self.df_offset += bitpack_len(n, doc_width) + bitpack_len(n, freq_width);
         self.pos_offset += pos_bytes;
@@ -2536,6 +2562,39 @@ struct Partition {
     pos_data: Box<[u8]>,
     /// local doc id -> (MemTable row position, token count).
     docs: DocSet,
+}
+
+/// Maximum stored `(freq, dl)` impacts per block. The frontier can't exceed the
+/// number of distinct freqs in a block, so it is naturally small; beyond this a
+/// block falls back to the single loose `(max_freq, min_dl)` point (still a sound
+/// bound), capping storage for rare high-freq-variance blocks.
+const MAX_BLOCK_IMPACTS: usize = 16;
+
+/// Pareto `(freq, dl)` frontier of a block's docs: the points not dominated by
+/// another with both `freq' >= freq` and `dl' <= dl`. Since `doc_weight` rises
+/// with freq and falls with dl, the block's max BM25 score for ANY `avgdl` is
+/// reached on this frontier — so `max` over it is a tight (exact) block bound.
+/// `pairs` is sorted in place.
+fn block_impacts(pairs: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
+    // dl ascending, then freq descending: sweep keeping a running max freq; a
+    // point joins the frontier iff its freq exceeds every point with a
+    // smaller-or-equal dl seen so far (each added point has a strictly larger
+    // freq, so |frontier| <= distinct freqs).
+    pairs.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    let mut frontier: Vec<(u32, u32)> = Vec::new();
+    let mut max_f = 0u32;
+    for &(f, d) in pairs.iter() {
+        if frontier.is_empty() || f > max_f {
+            frontier.push((f, d.max(1)));
+            max_f = f;
+        }
+    }
+    if frontier.len() > MAX_BLOCK_IMPACTS {
+        let max_freq = frontier.iter().map(|&(f, _)| f).max().unwrap_or(0);
+        let min_dl = frontier.iter().map(|&(_, d)| d).min().unwrap_or(1).max(1);
+        return vec![(max_freq, min_dl)];
+    }
+    frontier
 }
 
 /// Build a partition from `(term, sorted (doc, freq, positions))` entries.
@@ -2582,13 +2641,16 @@ fn build_partition(
             // stored — doc `i`'s slice is found from the freq prefix sum.
             let mut pos_deltas: Vec<u32> = Vec::new();
             let mut blk_min_dl = u32::MAX;
-            for &(d, _, ref positions) in chunk {
+            let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(chunk.len());
+            for &(d, f, ref positions) in chunk {
                 let mut prev_p = 0u32;
                 for &p in positions {
                     pos_deltas.push(p - prev_p);
                     prev_p = p;
                 }
-                blk_min_dl = blk_min_dl.min(docs.num_tokens(d));
+                let dl = docs.num_tokens(d);
+                blk_min_dl = blk_min_dl.min(dl);
+                pairs.push((f, dl));
             }
             term_min_dl = term_min_dl.min(blk_min_dl);
             let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
@@ -2608,8 +2670,14 @@ fn build_partition(
                 &mut block_bytes,
                 (pos_data.len() - pos_offset_before) as u64,
             );
-            put_varint(&mut block_bytes, blk_max_freq as u64);
-            put_varint(&mut block_bytes, blk_min_dl.max(1) as u64);
+            // Block-max impacts: the Pareto (freq, dl) frontier, as a count then
+            // that many varint pairs (read back by `BlockReader::next_meta`).
+            let impacts = block_impacts(&mut pairs);
+            put_varint(&mut block_bytes, impacts.len() as u64);
+            for (f, d) in impacts {
+                put_varint(&mut block_bytes, f as u64);
+                put_varint(&mut block_bytes, d as u64);
+            }
             prev_last_doc = last_doc;
             block_count += 1;
             term_max_freq = term_max_freq.max(blk_max_freq);
@@ -2852,7 +2920,7 @@ impl Partition {
         let mut freqs: Vec<u32> = Vec::new();
         let mut reader = BlockReader::new(self, &pref);
         while let Some(bm) = reader.next_meta() {
-            let block_ub = qw * scorer.doc_weight(bm.max_freq, bm.min_dl);
+            let block_ub = bm.block_ub(scorer, qw);
             if block_ub <= topk.threshold() {
                 continue; // no doc in this block can enter the top-k
             }
@@ -3122,7 +3190,7 @@ struct PostingCursor<'a> {
     reader: BlockReader<'a>,
     /// Metadata of the block currently decoded into `docs`/`freqs`, or `None`
     /// when the posting list is exhausted.
-    cur: Option<BlockMeta>,
+    cur: Option<BlockMeta<'a>>,
     /// Whether `docs`/`freqs` hold `cur`'s payload (false while `skip_to` walks
     /// past whole blocks without decoding them).
     decoded: bool,
@@ -3165,7 +3233,7 @@ impl<'a> PostingCursor<'a> {
     }
 
     /// Decode the doc ids + freqs of block `bm` into `docs`/`freqs`.
-    fn decode(&mut self, bm: BlockMeta) {
+    fn decode(&mut self, bm: BlockMeta<'a>) {
         let df_start = bm.df_offset as usize;
         unpack_doc_block(
             &self.bp,
@@ -3221,11 +3289,10 @@ impl<'a> PostingCursor<'a> {
         self.docs.get(self.i).copied()
     }
 
-    /// `query_weight * doc_weight(block.max_freq, block.min_dl)` — the current
-    /// block's per-doc BM25 upper bound (0 when exhausted).
+    /// The current block's per-doc BM25 upper bound from its impacts frontier
+    /// (0 when exhausted). See [`BlockMeta::block_ub`].
     fn current_block_ub(&self, scorer: &MemBM25Scorer, qw: f32) -> f32 {
-        self.cur
-            .map_or(0.0, |b| qw * scorer.doc_weight(b.max_freq, b.min_dl))
+        self.cur.map_or(0.0, |b| b.block_ub(scorer, qw))
     }
 
     /// `doc()` under a `&mut` receiver — for use as a loop condition while the
@@ -4564,6 +4631,38 @@ mod tests {
         index.flush();
         assert_eq!(index.search_with_options(&match_hello, immutable).len(), 6);
         assert_eq!(index.search("hello").len(), 6);
+    }
+
+    #[test]
+    fn test_block_impacts_frontier_is_tight_and_sound() {
+        // The Pareto (freq, dl) frontier must dominate every input pair (sound
+        // upper bound) and contain no dominated pair (minimal/tight).
+        let dominates = |a: (u32, u32), b: (u32, u32)| a.0 >= b.0 && a.1 <= b.1;
+        let cases: Vec<Vec<(u32, u32)>> = vec![
+            vec![(3, 10), (1, 5), (2, 8), (5, 20), (1, 4)],
+            vec![(1, 100); 5],          // all identical => single frontier point
+            vec![(9, 2)],               // single doc
+            vec![(1, 9), (2, 8), (3, 7), (4, 6), (5, 5)], // fully Pareto-optimal
+        ];
+        for input in cases {
+            let mut pairs = input.clone();
+            let frontier = block_impacts(&mut pairs);
+            assert!(!frontier.is_empty());
+            // Soundness: every input pair is dominated by some frontier pair.
+            for &p in &input {
+                let dl = (p.0, p.1.max(1));
+                assert!(
+                    frontier.iter().any(|&f| dominates(f, dl)),
+                    "{p:?} not dominated by frontier {frontier:?}"
+                );
+            }
+            // Tightness: no frontier pair dominates another.
+            for (i, &a) in frontier.iter().enumerate() {
+                for (j, &b) in frontier.iter().enumerate() {
+                    assert!(i == j || !dominates(a, b), "frontier not minimal: {frontier:?}");
+                }
+            }
+        }
     }
 
     #[test]
