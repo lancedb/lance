@@ -400,6 +400,10 @@ struct TermChunk {
     batch_position: usize,
     row_positions: Vec<u64>,
     frequencies: Vec<u32>,
+    /// Largest frequency in the chunk; `doc_weight(max_freq, 1)` bounds any
+    /// doc's tf-component, used to skip the whole tail scan when it cannot beat
+    /// the top-k threshold.
+    max_freq: u32,
     /// Per-doc token positions. Always `Some` in the current
     /// implementation (the writer tracks positions unconditionally so
     /// in-memory phrase queries work even when `params.has_positions()`
@@ -1196,15 +1200,23 @@ impl FtsMemIndex {
         match limit {
             Some(k) if k > 0 => {
                 let mut topk = TopK::new(k);
-                // Scan the tail first so the shared threshold is warm before
-                // the partition WANDs run.
-                if scan_tail {
-                    for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer) {
-                        topk.offer(e.score, e.row_position);
-                    }
-                }
+                // Scan the block-max partitions first to warm the shared
+                // threshold, then the (un-skippable) tail last — so the tail
+                // scan can be skipped wholesale when its score bound can't beat
+                // the threshold.
                 for p in st.partitions.iter() {
                     p.wand_into(tokens, &scorer, &mut topk);
+                }
+                if scan_tail {
+                    for e in score_terms(
+                        &tail_snap,
+                        &st.tail.terms,
+                        tokens,
+                        &scorer,
+                        topk.threshold(),
+                    ) {
+                        topk.offer(e.score, e.row_position);
+                    }
                 }
                 topk.into_entries()
             }
@@ -1214,7 +1226,13 @@ impl FtsMemIndex {
                     results.extend(p.search_match(tokens, Operator::Or, &scorer));
                 }
                 if scan_tail {
-                    results.extend(score_terms(&tail_snap, &st.tail.terms, tokens, &scorer));
+                    results.extend(score_terms(
+                        &tail_snap,
+                        &st.tail.terms,
+                        tokens,
+                        &scorer,
+                        f32::NEG_INFINITY,
+                    ));
                 }
                 results
             }
@@ -1756,10 +1774,12 @@ impl BatchTermBuilder {
                 data: self.pos_data,
             }
         });
+        let max_freq = self.frequencies.iter().copied().max().unwrap_or(0);
         Arc::new(TermChunk {
             batch_position,
             row_positions: self.row_positions,
             frequencies: self.frequencies,
+            max_freq,
             positions,
         })
     }
@@ -1896,8 +1916,14 @@ fn score_terms(
     terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     tokens: &[String],
     scorer: &MemBM25Scorer,
+    theta: f32,
 ) -> Vec<FtsEntry> {
-    let mut doc_scores: HashMap<RowPosition, f32> = HashMap::new();
+    // Per-token tail data + its score upper bound (max freq over visible chunks,
+    // scored at the most generous doc length of 1). If even the sum of those
+    // bounds cannot beat the current top-k threshold, no tail doc can enter the
+    // results, so skip the whole tail scan. Sound: `doc_weight` is monotone.
+    let mut tail_ub = 0.0f32;
+    let mut tail_terms: Vec<(f32, Arc<TermSlice>)> = Vec::with_capacity(tokens.len());
     for token in tokens {
         let Some(entry) = terms.get(token.as_str()) else {
             continue;
@@ -1907,6 +1933,21 @@ fn score_terms(
             continue;
         }
         let slice = entry.value().load_full();
+        let max_freq = slice
+            .chunks
+            .iter()
+            .filter(|c| c.batch_position < snap.visible_count)
+            .map(|c| c.max_freq)
+            .max()
+            .unwrap_or(0);
+        tail_ub += qw * scorer.doc_weight(max_freq, 1);
+        tail_terms.push((qw, slice));
+    }
+    if tail_ub <= theta {
+        return Vec::new();
+    }
+    let mut doc_scores: HashMap<RowPosition, f32> = HashMap::new();
+    for (qw, slice) in tail_terms {
         for chunk in &slice.chunks {
             if chunk.batch_position >= snap.visible_count {
                 continue;
@@ -2877,6 +2918,29 @@ impl Partition {
             };
             let pivot_doc = lanes[pivot].cursor.doc().unwrap();
             if lanes[0].cursor.doc().unwrap() == pivot_doc {
+                // Block-max prune: bound pivot_doc's score with each contributing
+                // lane's *current-block* max (tighter than the term-level `ub`)
+                // where its block covers pivot_doc, the term bound otherwise.
+                // Sound — lanes after `pivot` are past pivot_doc, so cannot
+                // contribute. If the bound can't beat theta, skip pivot_doc.
+                let block_ub: f32 = lanes[..=pivot]
+                    .iter()
+                    .map(|l| {
+                        if l.cursor.current_block_covers(pivot_doc) {
+                            l.cursor.current_block_ub(scorer, l.qw)
+                        } else {
+                            l.ub
+                        }
+                    })
+                    .sum();
+                if block_ub <= theta {
+                    for l in lanes.iter_mut() {
+                        if l.cursor.doc() == Some(pivot_doc) {
+                            l.cursor.advance();
+                        }
+                    }
+                    continue;
+                }
                 // Every lane positioned at pivot_doc contributes; score it.
                 let dl = self.docs.num_tokens(pivot_doc);
                 let mut score = 0.0f32;
@@ -3139,6 +3203,19 @@ impl<'a> PostingCursor<'a> {
     fn doc(&self) -> Option<u32> {
         self.cur?;
         self.docs.get(self.i).copied()
+    }
+
+    /// Whether the current block's doc range covers `doc`.
+    fn current_block_covers(&self, doc: u32) -> bool {
+        self.cur
+            .is_some_and(|b| b.first_doc <= doc && doc <= b.last_doc)
+    }
+
+    /// `query_weight * doc_weight(block.max_freq, block.min_dl)` — the current
+    /// block's per-doc BM25 upper bound (0 when exhausted).
+    fn current_block_ub(&self, scorer: &MemBM25Scorer, qw: f32) -> f32 {
+        self.cur
+            .map_or(0.0, |b| qw * scorer.doc_weight(b.max_freq, b.min_dl))
     }
 
     /// `doc()` under a `&mut` receiver — for use as a loop condition while the
@@ -4477,6 +4554,34 @@ mod tests {
         index.flush();
         assert_eq!(index.search_with_options(&match_hello, immutable).len(), 6);
         assert_eq!(index.search("hello").len(), 6);
+    }
+
+    #[test]
+    fn test_multi_term_wand_and_tail_skip_match_exhaustive() {
+        // Multi-term OR across frozen partitions + a non-empty tail. The
+        // block-max-pruned WAND (limited) + tail-skip must return the same
+        // top-k scores as the exhaustive (unlimited) scan.
+        let schema = create_test_schema();
+        // threshold 5 with 3-row batches leaves the last batch in the tail.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(5);
+        for i in 0..5 {
+            index
+                .insert(&create_test_batch(&schema), (i * 100) as u64)
+                .unwrap();
+        }
+        let query = FtsQueryExpr::match_query("hello world");
+        let mut exhaustive = index.search_query(&query);
+        exhaustive.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        for k in [1usize, 3, 10] {
+            let limited = index.search_with_options(&query, SearchOptions::new().with_limit(k));
+            let mut got: Vec<f32> = limited.iter().map(|e| e.score).collect();
+            got.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let want: Vec<f32> = exhaustive.iter().take(k).map(|e| e.score).collect();
+            assert_eq!(got.len(), want.len(), "k={k}");
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-4, "k={k}: {g} vs {w}");
+            }
+        }
     }
 
     #[test]
