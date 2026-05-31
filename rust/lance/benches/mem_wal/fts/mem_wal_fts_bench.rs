@@ -270,8 +270,8 @@ async fn run_gen(args: &GenArgs) -> Result<()> {
 }
 
 struct Query {
-    kind: &'static str, // "term" | "phrase"
-    text: String,       // term: one token; phrase: "a b"
+    kind: &'static str, // "term" | "phrase" | "or"
+    text: String,       // term: one token; phrase/or: space-joined tokens
 }
 
 const STOPWORDS: &[&str] = &[
@@ -325,6 +325,22 @@ fn build_query_set(tok_docs: &[Vec<String>], args: &GenArgs) -> Vec<Query> {
         }
         idx += stride;
     }
+
+    // OR (multi-term) queries: 3 mid-frequency tokens joined, matched as a
+    // SHOULD/OR — exercises the multi-term block-max WAND. Use tokens past the
+    // term-query slice so they are distinct from the single-term set.
+    let mid: Vec<&str> = by_freq.iter().skip(skip).map(|(t, _)| *t).collect();
+    let mut oi = args.num_term_queries;
+    for _ in 0..args.num_or_queries {
+        if oi + 3 > mid.len() {
+            break;
+        }
+        queries.push(Query {
+            kind: "or",
+            text: format!("{} {} {}", mid[oi], mid[oi + 1], mid[oi + 2]),
+        });
+        oi += 3;
+    }
     queries
 }
 
@@ -354,11 +370,14 @@ fn exact_bm25_truth(tok_docs: &[Vec<String>], queries: &[Query], k: usize) -> Ve
         .iter()
         .map(|q| {
             let mut scores: HashMap<usize, f64> = HashMap::new();
-            if q.kind == "term" {
-                if let Some(pl) = postings.get(q.text.as_str()) {
-                    let df = pl.len() as f64;
-                    for &(doc, tf) in pl {
-                        *scores.entry(doc).or_default() += term_score(tf as f64, df, dl[doc]);
+            if q.kind != "phrase" {
+                // term (1 token) or or (multi-token): sum each token's BM25.
+                for word in q.text.split(' ') {
+                    if let Some(pl) = postings.get(word) {
+                        let df = pl.len() as f64;
+                        for &(doc, tf) in pl {
+                            *scores.entry(doc).or_default() += term_score(tf as f64, df, dl[doc]);
+                        }
                     }
                 }
             } else {
@@ -527,7 +546,8 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
 
     let opts = SearchOptions::new()
         .with_limit(args.k)
-        .with_include_tail(!args.immutable);
+        .with_include_tail(!args.immutable)
+        .with_tail_skip(!args.no_tail_skip);
     let make_query = |q: &Q| -> FtsQueryExpr {
         let text = if args.run == 'a' { &q.tok } else { &q.raw };
         if q.kind == "phrase" {
@@ -583,6 +603,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     // recall@k vs exact BM25 (Run A only — truth is over the canonical corpus).
     let (mut term_recall, mut term_n) = (0.0f64, 0usize);
     let (mut phrase_recall, mut phrase_n) = (0.0f64, 0usize);
+    let (mut or_recall, mut or_n) = (0.0f64, 0usize);
     if args.run == 'a' {
         for (i, q) in queries.iter().enumerate() {
             let t: std::collections::HashSet<usize> = truth
@@ -594,12 +615,19 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
             }
             let hit = topk[i].iter().filter(|d| t.contains(d)).count() as f64;
             let r = hit / args.k as f64;
-            if q.kind == "phrase" {
-                phrase_recall += r;
-                phrase_n += 1;
-            } else {
-                term_recall += r;
-                term_n += 1;
+            match q.kind.as_str() {
+                "phrase" => {
+                    phrase_recall += r;
+                    phrase_n += 1;
+                }
+                "or" => {
+                    or_recall += r;
+                    or_n += 1;
+                }
+                _ => {
+                    term_recall += r;
+                    term_n += 1;
+                }
             }
         }
     }
@@ -629,19 +657,31 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
     } else {
         f64::NAN
     };
+    let or_recall_v = if or_n > 0 {
+        or_recall / or_n as f64
+    } else {
+        f64::NAN
+    };
 
-    // Per-query-type latency split — `latencies_us` is parallel to `queries`.
+    // Per-query-type latency split via a second timing pass, bucketed by kind
+    // (`latencies_us` was sorted above for the overall percentile, so it can no
+    // longer be zipped with `queries` in query order).
     let mut term_lat: Vec<f64> = Vec::new();
     let mut phrase_lat: Vec<f64> = Vec::new();
-    for (q, &lat) in queries.iter().zip(&latencies_us) {
-        if q.kind == "phrase" {
-            phrase_lat.push(lat);
-        } else {
-            term_lat.push(lat);
+    let mut or_lat: Vec<f64> = Vec::new();
+    for q in &queries {
+        let t0 = Instant::now();
+        let _ = index.search_with_options(&make_query(q), opts.clone());
+        let lat = t0.elapsed().as_secs_f64() * 1.0e6;
+        match q.kind.as_str() {
+            "phrase" => phrase_lat.push(lat),
+            "or" => or_lat.push(lat),
+            _ => term_lat.push(lat),
         }
     }
     term_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
     phrase_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    or_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pct = |v: &[f64], p: f64| {
         if v.is_empty() {
             f64::NAN
@@ -650,13 +690,16 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         }
     };
     println!(
-        "result split: term_p50={:.1} term_p95={:.1} ({} q) | phrase_p50={:.1} phrase_p95={:.1} ({} q)",
+        "result split: term_p50={:.1} term_p95={:.1} ({} q) | phrase_p50={:.1} phrase_p95={:.1} ({} q) | or_p50={:.1} or_p95={:.1} ({} q)",
         pct(&term_lat, 50.0),
         pct(&term_lat, 95.0),
         term_lat.len(),
         pct(&phrase_lat, 50.0),
         pct(&phrase_lat, 95.0),
         phrase_lat.len(),
+        pct(&or_lat, 50.0),
+        pct(&or_lat, 95.0),
+        or_lat.len(),
     );
 
     println!(
@@ -681,7 +724,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         "{{\"impl\":\"lance_fts\",\"run\":\"{}\",\"docs\":{},\"queries\":{},\"k\":{},\
          \"build_s\":{:.4},\"build_docs_per_s\":{:.1},\
          \"q_p50_us\":{:.2},\"q_p95_us\":{:.2},\"qps_1t\":{:.1},\"qps_nt\":{:.1},\
-         \"term_recall_at_k\":{:.4},\"phrase_recall_at_k\":{:.4},\"mem_bytes\":{}}}",
+         \"term_recall_at_k\":{:.4},\"phrase_recall_at_k\":{:.4},\"or_recall_at_k\":{:.4},\"mem_bytes\":{}}}",
         args.run,
         docs.len(),
         queries.len(),
@@ -694,6 +737,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         qps_nt,
         term_recall_v,
         phrase_recall_v,
+        or_recall_v,
         index.memory_usage(),
     );
     Ok(())
@@ -709,6 +753,7 @@ struct GenArgs {
     cache_dir: std::path::PathBuf,
     num_term_queries: usize,
     num_phrase_queries: usize,
+    num_or_queries: usize,
     k: usize,
 }
 
@@ -726,6 +771,10 @@ struct BenchArgs {
     /// for an apples-to-apples term-only comparison against Lucene
     /// `DOCS_AND_FREQS`. Default true.
     with_position: bool,
+    /// Disable block-max tail pruning (`--no-tail-skip`) to A/B the tail-skip
+    /// optimization: forces a full visible-tail scan on every top-k query.
+    /// Default false (pruning on).
+    no_tail_skip: bool,
 }
 
 fn main() -> Result<()> {
@@ -752,6 +801,7 @@ fn main() -> Result<()> {
                 cache_dir: get("--cache-dir", "/tmp/fineweb_cache").into(),
                 num_term_queries: get("--num-term-queries", "100").parse().unwrap(),
                 num_phrase_queries: get("--num-phrase-queries", "50").parse().unwrap(),
+                num_or_queries: get("--num-or-queries", "50").parse().unwrap(),
                 k: get("--k", "10").parse().unwrap(),
             };
             let rt = tokio::runtime::Runtime::new()
@@ -776,6 +826,7 @@ fn main() -> Result<()> {
                     .and_then(|i| argv.get(i + 1))
                     .and_then(|s| s.parse().ok()),
                 with_position: !argv.contains(&"--no-positions"),
+                no_tail_skip: argv.contains(&"--no-tail-skip"),
             };
             run_bench(&args)
         }

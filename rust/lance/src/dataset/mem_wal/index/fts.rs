@@ -153,6 +153,11 @@ pub struct SearchOptions {
     /// model (a reader sees only flushed segments), which removes the tail
     /// scan from the hot path. Trades read-recency for query latency.
     pub include_tail: bool,
+    /// Whether to skip the whole tail scan when its score upper bound cannot
+    /// beat the current top-k threshold (block-max-style tail pruning). `true`
+    /// (default) prunes; `false` always scans the visible tail. Only affects
+    /// top-k term queries; exposed mainly to A/B the optimization.
+    pub tail_skip: bool,
 }
 
 impl Default for SearchOptions {
@@ -161,6 +166,7 @@ impl Default for SearchOptions {
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
+            tail_skip: true,
         }
     }
 }
@@ -185,6 +191,12 @@ impl SearchOptions {
     /// Set whether to search the mutable tail (see [`Self::include_tail`]).
     pub fn with_include_tail(mut self, include_tail: bool) -> Self {
         self.include_tail = include_tail;
+        self
+    }
+
+    /// Set whether to prune the tail scan by score bound (see [`Self::tail_skip`]).
+    pub fn with_tail_skip(mut self, tail_skip: bool) -> Self {
+        self.tail_skip = tail_skip;
         self
     }
 }
@@ -1126,7 +1138,7 @@ impl FtsMemIndex {
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(term);
-        self.search_match(&st, &tokens, None, true)
+        self.search_match(&st, &tokens, None, true, true)
     }
 
     /// Search for documents containing an exact phrase, optionally allowing
@@ -1185,6 +1197,7 @@ impl FtsMemIndex {
         tokens: &[String],
         limit: Option<usize>,
         include_tail: bool,
+        tail_skip: bool,
     ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1203,18 +1216,17 @@ impl FtsMemIndex {
                 // Scan the block-max partitions first to warm the shared
                 // threshold, then the (un-skippable) tail last — so the tail
                 // scan can be skipped wholesale when its score bound can't beat
-                // the threshold.
+                // the threshold. `tail_skip = false` forces a full tail scan.
                 for p in st.partitions.iter() {
                     p.wand_into(tokens, &scorer, &mut topk);
                 }
                 if scan_tail {
-                    for e in score_terms(
-                        &tail_snap,
-                        &st.tail.terms,
-                        tokens,
-                        &scorer,
-                        topk.threshold(),
-                    ) {
+                    let theta = if tail_skip {
+                        topk.threshold()
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+                    for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer, theta) {
                         topk.offer(e.score, e.row_position);
                     }
                 }
@@ -1251,7 +1263,7 @@ impl FtsMemIndex {
         }
         if tokens.len() == 1 {
             // A single-token phrase reduces to a regular term search.
-            return self.search_match(st, tokens, None, include_tail);
+            return self.search_match(st, tokens, None, include_tail, true);
         }
         // A multi-token phrase needs token positions; without them (the index
         // was built `with_position = false`) phrase search is unsupported, as
@@ -1307,7 +1319,7 @@ impl FtsMemIndex {
         if expanded.is_empty() {
             return Vec::new();
         }
-        self.search_match(st, &expanded, None, include_tail)
+        self.search_match(st, &expanded, None, include_tail, true)
     }
 
     /// Expand `term` against the term dictionaries of every partition (and the
@@ -1369,7 +1381,7 @@ impl FtsMemIndex {
     /// per-batch monotonic visibility contract for compound queries.
     pub fn search_query(&self, query: &FtsQueryExpr) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        self.search_query_with_state(query, &st, None, true)
+        self.search_query_with_state(query, &st, None, true, true)
     }
 
     /// `limit` is the caller's top-k, threaded down so a top-level `Match`
@@ -1383,11 +1395,12 @@ impl FtsMemIndex {
         st: &IndexState,
         limit: Option<usize>,
         include_tail: bool,
+        tail_skip: bool,
     ) -> Vec<FtsEntry> {
         match query {
             FtsQueryExpr::Match { query, boost } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_match(st, &tokens, limit, include_tail);
+                let mut results = self.search_match(st, &tokens, limit, include_tail, tail_skip);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1440,8 +1453,13 @@ impl FtsMemIndex {
         options: SearchOptions,
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let mut results =
-            self.search_query_with_state(query, &st, options.limit, options.include_tail);
+        let mut results = self.search_query_with_state(
+            query,
+            &st,
+            options.limit,
+            options.include_tail,
+            options.tail_skip,
+        );
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1473,11 +1491,11 @@ impl FtsMemIndex {
         st: &IndexState,
         include_tail: bool,
     ) -> Vec<FtsEntry> {
-        let mut results = self.search_query_with_state(positive, st, None, include_tail);
+        let mut results = self.search_query_with_state(positive, st, None, include_tail, true);
         let Some(neg) = negative else {
             return results;
         };
-        let negative_results = self.search_query_with_state(neg, st, None, include_tail);
+        let negative_results = self.search_query_with_state(neg, st, None, include_tail, true);
         let negative_set: HashSet<RowPosition> = negative_results
             .into_iter()
             .map(|e| e.row_position)
@@ -1500,26 +1518,27 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         let excluded: HashSet<RowPosition> = must_not
             .iter()
-            .flat_map(|q| self.search_query_with_state(q, st, None, include_tail))
+            .flat_map(|q| self.search_query_with_state(q, st, None, include_tail, true))
             .map(|e| e.row_position)
             .collect();
 
         let mut result_map: HashMap<RowPosition, f32> = if must.is_empty() {
             let mut map: HashMap<RowPosition, f32> = HashMap::new();
             for q in should {
-                for entry in self.search_query_with_state(q, st, None, include_tail) {
+                for entry in self.search_query_with_state(q, st, None, include_tail, true) {
                     *map.entry(entry.row_position).or_default() += entry.score;
                 }
             }
             map
         } else {
-            let first_results = self.search_query_with_state(&must[0], st, None, include_tail);
+            let first_results =
+                self.search_query_with_state(&must[0], st, None, include_tail, true);
             let mut map: HashMap<RowPosition, f32> = first_results
                 .into_iter()
                 .map(|e| (e.row_position, e.score))
                 .collect();
             for q in must.iter().skip(1) {
-                let results = self.search_query_with_state(q, st, None, include_tail);
+                let results = self.search_query_with_state(q, st, None, include_tail, true);
                 let result_set: HashMap<RowPosition, f32> = results
                     .into_iter()
                     .map(|e| (e.row_position, e.score))
@@ -1530,7 +1549,7 @@ impl FtsMemIndex {
                     .collect();
             }
             for q in should {
-                for entry in self.search_query_with_state(q, st, None, include_tail) {
+                for entry in self.search_query_with_state(q, st, None, include_tail, true) {
                     if let Some(score) = map.get_mut(&entry.row_position) {
                         *score += entry.score;
                     }
@@ -4573,13 +4592,20 @@ mod tests {
         let mut exhaustive = index.search_query(&query);
         exhaustive.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         for k in [1usize, 3, 10] {
-            let limited = index.search_with_options(&query, SearchOptions::new().with_limit(k));
-            let mut got: Vec<f32> = limited.iter().map(|e| e.score).collect();
-            got.sort_by(|a, b| b.partial_cmp(a).unwrap());
-            let want: Vec<f32> = exhaustive.iter().take(k).map(|e| e.score).collect();
-            assert_eq!(got.len(), want.len(), "k={k}");
-            for (g, w) in got.iter().zip(&want) {
-                assert!((g - w).abs() < 1e-4, "k={k}: {g} vs {w}");
+            // Tail-skip is only an optimization: pruning the tail (default) and
+            // forcing a full tail scan must both equal the exhaustive top-k.
+            for tail_skip in [true, false] {
+                let limited = index.search_with_options(
+                    &query,
+                    SearchOptions::new().with_limit(k).with_tail_skip(tail_skip),
+                );
+                let mut got: Vec<f32> = limited.iter().map(|e| e.score).collect();
+                got.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let want: Vec<f32> = exhaustive.iter().take(k).map(|e| e.score).collect();
+                assert_eq!(got.len(), want.len(), "k={k} tail_skip={tail_skip}");
+                for (g, w) in got.iter().zip(&want) {
+                    assert!((g - w).abs() < 1e-4, "k={k} tail_skip={tail_skip}: {g} vs {w}");
+                }
             }
         }
     }
