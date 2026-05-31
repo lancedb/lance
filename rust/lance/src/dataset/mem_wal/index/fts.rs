@@ -45,7 +45,6 @@
 //! into one builder. The on-disk format is unchanged from Lance's existing
 //! inverted index.
 
-use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -1318,7 +1317,7 @@ impl FtsMemIndex {
                 // scan can be skipped wholesale when its score bound can't beat
                 // the threshold. `tail_skip = false` forces a full tail scan.
                 for p in st.partitions.iter() {
-                    p.wand_into(tokens, &scorer, &mut topk);
+                    p.or_topk_into(tokens, &scorer, &mut topk);
                 }
                 if scan_tail {
                     let theta = if tail_skip {
@@ -2949,7 +2948,7 @@ impl Partition {
     }
 
     /// Exact O(matches) BM25 OR/AND-search of the partition by direct posting
-    /// scan. The pruned top-k path is `wand_into`; this is the unbounded and
+    /// scan. The pruned top-k path is `or_topk_into`; this is the unbounded and
     /// AND path. Scored with `scorer`, so scores match `score_terms`.
     fn search_match(
         &self,
@@ -3055,14 +3054,13 @@ impl Partition {
         }
     }
 
-    /// WAND top-k over an OR query, contributing into the caller's shared
-    /// [`TopK`]. Exact: each term's `(max_freq, min_dl)` gives a sound score
-    /// upper bound, so docs that provably cannot beat the shared threshold
-    /// are skipped. Because the threshold is shared across all partitions and
-    /// the tail, a partition processed late prunes against an already-warm
-    /// threshold instead of cold-starting.
-    fn wand_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
-        // Single-term top-k: block-max skip. Multi-term: pivot WAND below.
+    /// Top-k OR over the query tokens, contributing into the caller's shared
+    /// [`TopK`]. Single-term uses block-max skipping; multi-term uses MaxScore
+    /// (see [`Self::maxscore_loop`]). Exact, and because the threshold is shared
+    /// across all partitions and the tail, a partition processed late prunes
+    /// against an already-warm threshold instead of cold-starting.
+    fn or_topk_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
+        // Single-term top-k: block-max skip. Multi-term: MaxScore below.
         if tokens.len() == 1 {
             if let Some(id) = self.term_id(&tokens[0]) {
                 let qw = scorer.query_weight(&tokens[0]);
@@ -3089,87 +3087,7 @@ impl Partition {
         if lanes.is_empty() {
             return;
         }
-        if std::env::var_os("FTS_WAND").is_some() {
-            self.wand_loop(lanes, scorer, topk);
-        } else {
-            self.maxscore_loop(lanes, scorer, topk);
-        }
-    }
-
-    /// Classic block-max WAND pivot loop (see [`Self::wand_into`]).
-    fn wand_loop(&self, mut lanes: Vec<WandLane>, scorer: &MemBM25Scorer, topk: &mut TopK) {
-        loop {
-            // Lanes are kept non-exhausted; the cached `doc` avoids per-iteration
-            // `cursor.doc()` calls in the sort / pivot / contributor scan.
-            lanes.sort_unstable_by_key(|l| l.doc.unwrap());
-            let theta = topk.threshold();
-            // Pivot: first lane whose cumulative upper bound exceeds theta.
-            let mut acc = 0.0f32;
-            let mut pivot = None;
-            for (i, l) in lanes.iter().enumerate() {
-                acc += l.ub;
-                if acc > theta {
-                    pivot = Some(i);
-                    break;
-                }
-            }
-            let Some(pivot) = pivot else {
-                break; // no remaining doc can reach theta
-            };
-            let pivot_doc = lanes[pivot].doc.unwrap();
-            if lanes[0].doc == Some(pivot_doc) {
-                // Block-max prune: bound pivot_doc's score by the sum of each
-                // contributing lane's *current-block* max (tighter than the
-                // term-level `ub`). The contributing lanes are exactly those
-                // positioned at pivot_doc — the same set the scoring loop below
-                // sums. They must all be included: ties at pivot_doc can sort a
-                // contributing lane *after* `pivot`, and omitting it would
-                // under-bound the score and unsoundly skip a true top-k doc.
-                let block_ub: f32 = lanes
-                    .iter()
-                    .filter(|l| l.doc == Some(pivot_doc))
-                    .map(|l| l.cursor.current_block_ub(scorer, l.qw))
-                    .sum();
-                if block_ub <= theta {
-                    for l in lanes.iter_mut() {
-                        if l.doc == Some(pivot_doc) {
-                            l.cursor.advance();
-                            l.doc = l.cursor.doc();
-                        }
-                    }
-                    lanes.retain(|l| l.doc.is_some());
-                    if lanes.is_empty() {
-                        break;
-                    }
-                    continue;
-                }
-                // Every lane positioned at pivot_doc contributes; score it.
-                let dl = self.docs.num_tokens(pivot_doc);
-                let mut score = 0.0f32;
-                for l in lanes.iter_mut() {
-                    if l.doc == Some(pivot_doc) {
-                        score += l.qw * scorer.doc_weight(l.cursor.freq(), dl);
-                        l.cursor.advance();
-                        l.doc = l.cursor.doc();
-                    }
-                }
-                topk.offer(score, self.docs.row_id(pivot_doc));
-                lanes.retain(|l| l.doc.is_some());
-                if lanes.is_empty() {
-                    break;
-                }
-            } else {
-                // A lane before the pivot trails pivot_doc; skip it forward.
-                lanes[0].cursor.skip_to(pivot_doc);
-                lanes[0].doc = lanes[0].cursor.doc();
-                if lanes[0].doc.is_none() {
-                    lanes.swap_remove(0);
-                    if lanes.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
+        self.maxscore_loop(lanes, scorer, topk);
     }
 
     /// MaxScore top-k over an OR query. Terms are sorted by their max
@@ -3413,12 +3331,6 @@ struct PostingCursor<'a> {
     i: usize,
     /// SIMD bit-(un)packer for full 128-doc blocks.
     bp: BitPacker4x,
-    /// Memoized `(df_offset, block_ub)` for the current block. The bound is
-    /// constant within a block and `query_weight`/`scorer` are fixed for the
-    /// cursor's life, so OR's per-pivot `current_block_ub` calls are O(1) after
-    /// the first; keyed by `df_offset` (unique per block) so it self-invalidates
-    /// when the block changes — no reset needed at the block-advance sites.
-    ub_cache: Cell<Option<(u32, f32)>>,
 }
 
 impl<'a> PostingCursor<'a> {
@@ -3438,7 +3350,6 @@ impl<'a> PostingCursor<'a> {
             pos_scratch: Vec::new(),
             i: 0,
             bp: BitPacker4x::new(),
-            ub_cache: Cell::new(None),
         };
         if let Some(bm) = cursor.cur {
             cursor.decode(bm);
@@ -3501,22 +3412,6 @@ impl<'a> PostingCursor<'a> {
     fn doc(&self) -> Option<u32> {
         self.cur?;
         self.docs.get(self.i).copied()
-    }
-
-    /// The current block's per-doc BM25 upper bound from its impacts frontier
-    /// (0 when exhausted), memoized per block. See [`BlockMeta::block_ub`].
-    fn current_block_ub(&self, scorer: &MemBM25Scorer, qw: f32) -> f32 {
-        let Some(b) = self.cur else {
-            return 0.0;
-        };
-        if let Some((off, v)) = self.ub_cache.get()
-            && off == b.df_offset
-        {
-            return v;
-        }
-        let v = b.block_ub(scorer, qw);
-        self.ub_cache.set(Some((b.df_offset, v)));
-        v
     }
 
     /// `doc()` under a `&mut` receiver — for use as a loop condition while the
