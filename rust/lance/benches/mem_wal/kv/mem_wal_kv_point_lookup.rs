@@ -563,6 +563,12 @@ struct Args {
     /// Skip the RocksDB WAL on writes. Off by default so RocksDB writes a WAL
     /// like Lance's durable MemTable path, keeping the write comparison fair.
     rocksdb_disable_wal: bool,
+    /// Cold-storage mode: assume the dataset is larger than RAM so reads miss
+    /// the caches and hit NVMe. Caps the RocksDB write buffer + uses a small
+    /// block cache + compacts to one SST, and drops the OS page cache before
+    /// the read phase (both engines). Use with a `--rows`×`--value-size` larger
+    /// than RAM. Only affects the `--storage flushed` path.
+    cold: bool,
     output: Option<PathBuf>,
 }
 
@@ -583,6 +589,7 @@ impl Default for Args {
             uri: String::new(),
             seed: 0x5EED,
             rocksdb_disable_wal: false,
+            cold: false,
             output: None,
         }
     }
@@ -608,6 +615,10 @@ fn parse_args() -> Result<Args> {
         }
         if flag == "--rocksdb-disable-wal" {
             args.rocksdb_disable_wal = true;
+            continue;
+        }
+        if flag == "--cold" {
+            args.cold = true;
             continue;
         }
         let value = iter
@@ -1128,6 +1139,15 @@ async fn run_lance(
 // Lance flushed (on-disk) engine
 // ----------------------------------------------------------------------
 
+/// Drop the OS page cache so subsequent reads hit storage (cold). Best-effort:
+/// needs passwordless sudo (true on the bench box); failures are ignored.
+fn drop_page_cache() {
+    let _ = std::process::Command::new("sudo")
+        .args(["sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"])
+        .status();
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 /// One indexed point lookup via the **DataFusion** path: `scan().filter("id =
 /// key")` parses + plans + executes a query per lookup (uses the on-disk BTree
 /// index). Returns the matched row count.
@@ -1260,6 +1280,12 @@ async fn run_lance_flushed(
         assert_eq!(n, 1, "flushed warmup lookup for key {probe} returned {n}");
     }
 
+    // Cold mode: drop the OS page cache so reads hit NVMe (data > RAM assumed).
+    if args.cold {
+        drop_page_cache();
+        println!("[lance] dropped page cache (cold reads from NVMe)");
+    }
+
     // --- single-thread read latency ---
     let cpu1 = process_cpu_secs();
     let mut latencies_us = Vec::with_capacity(queries.len());
@@ -1350,25 +1376,33 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     std::fs::create_dir_all(&db_path)
         .map_err(|e| lance_core::Error::io(format!("mkdir {db_path}: {e}")))?;
 
-    // In-memory tuning: one skiplist memtable holds every row, no SST flush,
-    // no auto compaction. write_buffer_size is set above the whole dataset.
-    let write_buf = args.rows * (args.value_size + 200) + (64 << 20);
+    // Write-buffer sizing. Default (warm): above the whole dataset so one
+    // memtable holds every row. Cold: cap at 512MB so a larger-than-RAM dataset
+    // flushes to SSTs during write instead of OOMing the memtable.
+    let write_buf = if args.cold {
+        512usize << 20
+    } else {
+        args.rows * (args.value_size + 200) + (64 << 20)
+    };
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.set_write_buffer_size(write_buf);
     opts.set_max_write_buffer_number(4);
     opts.set_min_write_buffer_number_to_merge(2);
     opts.set_disable_auto_compactions(true);
-    // Never trigger a flush by buffer count either.
     opts.set_db_write_buffer_size(write_buf);
-    // Realistic SST read config for the `--storage flushed` comparison: a
-    // whole-key bloom filter + a block cache large enough to hold the SST's
-    // index/filter and hot data blocks (warm reads). Harmless for `active`
-    // mode (data stays in the memtable, which doesn't use the block cache).
+    // Block cache for the `--storage flushed` SST reads. Warm: large enough to
+    // hold the SST index/filter + hot data blocks. Cold: small (128MB) so data
+    // blocks miss the cache and reads go to NVMe (index/filter stay in memory).
     {
         let mut bbt = rocksdb::BlockBasedOptions::default();
         bbt.set_bloom_filter(10.0, false);
-        let cache = rocksdb::Cache::new_lru_cache((1usize << 30).max(write_buf / 2));
+        let cache_bytes = if args.cold {
+            128usize << 20
+        } else {
+            (1usize << 30).max(write_buf / 2)
+        };
+        let cache = rocksdb::Cache::new_lru_cache(cache_bytes);
         bbt.set_block_cache(&cache);
         opts.set_block_based_table_factory(&bbt);
     }
@@ -1416,12 +1450,23 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     if args.storage == Storage::Flushed {
         db.flush()
             .map_err(|e| lance_core::Error::io(format!("rocksdb flush: {e}")))?;
+        // Cold (larger-than-RAM): writes produced many L0 SSTs; compact them
+        // into one so reads aren't a fan-out over hundreds of SSTs.
+        if args.cold {
+            db.compact_range::<&[u8], &[u8]>(None, None);
+        }
         let n_sst = db
             .property_int_value("rocksdb.num-files-at-level0")
             .ok()
             .flatten()
             .unwrap_or(0);
         println!("[rocksdb] flushed memtable to SST (L0 files={n_sst})");
+    }
+
+    // Cold mode: drop the OS page cache so reads hit NVMe.
+    if args.cold {
+        drop_page_cache();
+        println!("[rocksdb] dropped page cache (cold reads from NVMe)");
     }
 
     // --- batch-get path: RocksDB multi_get of `batch_get` keys per call ---
