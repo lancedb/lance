@@ -64,6 +64,7 @@ use lance_index::scalar::inverted::query::Operator;
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_tokenizer::TokenStream;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::RowPosition;
@@ -2882,48 +2883,42 @@ impl Partition {
                 pos_to_doc.insert(rp, doc_id);
             }
         }
-        let timing = std::env::var_os("FTS_FREEZE_TIMING").is_some();
-        let t_collect = std::time::Instant::now();
-        let mut entries: Vec<(Arc<str>, Vec<(u32, u32, Vec<u32>)>)> = Vec::new();
-        for entry in tail.terms.iter() {
-            let slice = entry.value().load();
-            let mut docs_for_term: Vec<(u32, u32, Vec<u32>)> = Vec::new();
-            for chunk in slice.chunks() {
-                if chunk.batch_position >= snap.visible_count {
-                    continue;
-                }
-                for (i, rp) in chunk.row_positions.iter().enumerate() {
-                    let Some(&doc_id) = pos_to_doc.get(rp) else {
+        // Snapshot the term slices (a cheap sequential skip-list walk of Arc
+        // clones), then build each term's sorted posting list in parallel — the
+        // per-term work (chunk traversal + sort) dominates the freeze and is
+        // independent across terms. `pos_to_doc`/`snap` are shared read-only.
+        let term_slices: Vec<(Arc<str>, Arc<TermSlice>)> = tail
+            .terms
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load_full()))
+            .collect();
+        let entries: Vec<(Arc<str>, Vec<(u32, u32, Vec<u32>)>)> = term_slices
+            .into_par_iter()
+            .filter_map(|(key, slice)| {
+                let mut docs_for_term: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+                for chunk in slice.chunks() {
+                    if chunk.batch_position >= snap.visible_count {
                         continue;
-                    };
-                    let pos = chunk
-                        .positions
-                        .as_ref()
-                        .map(|p| p.doc_positions(i).to_vec())
-                        .unwrap_or_default();
-                    docs_for_term.push((doc_id, chunk.frequencies[i], pos));
+                    }
+                    for (i, rp) in chunk.row_positions.iter().enumerate() {
+                        let Some(&doc_id) = pos_to_doc.get(rp) else {
+                            continue;
+                        };
+                        let pos = chunk
+                            .positions
+                            .as_ref()
+                            .map(|p| p.doc_positions(i).to_vec())
+                            .unwrap_or_default();
+                        docs_for_term.push((doc_id, chunk.frequencies[i], pos));
+                    }
                 }
-            }
-            if docs_for_term.is_empty() {
-                continue;
-            }
-            docs_for_term.sort_by_key(|(d, _, _)| *d);
-            entries.push((entry.key().clone(), docs_for_term));
-        }
-        if timing {
-            let n_terms = entries.len();
-            let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
-            let t_build = std::time::Instant::now();
-            let part = build_partition(entries, docs);
-            eprintln!(
-                "FREEZE timing: collect={:.1}ms build={:.1}ms terms={} docs={}",
-                collect_ms,
-                t_build.elapsed().as_secs_f64() * 1e3,
-                n_terms,
-                snap.cumulative_doc_count,
-            );
-            return Some(part);
-        }
+                if docs_for_term.is_empty() {
+                    return None;
+                }
+                docs_for_term.sort_by_key(|(d, _, _)| *d);
+                Some((key, docs_for_term))
+            })
+            .collect();
         Some(build_partition(entries, docs))
     }
 
