@@ -30,9 +30,13 @@ use futures::TryStreamExt;
 use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::mem_wal::write::{MemTableScanner, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
-use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use lance_core::ROW_ID;
 use lance_index::IndexType;
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::prefilter::NoFilter;
+use lance_index::vector::Query;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -502,6 +506,95 @@ async fn run_checkpoint(
                 best = Some((ef, mean_recall, median_q, p99_q));
             }
         }
+
+        // Raw-index path: call VectorIndex::search() directly (partition-find +
+        // HNSW+SQ search, returns _rowid/_distance) bypassing the DataFusion
+        // scanner/take/projection. The RAW_READ vs FLUSHED_READ latency delta at
+        // matched ef isolates the DataFusion per-query overhead from the actual
+        // index search cost.
+        let idx_metas = gen_ds.load_indices_by_name(VECTOR_INDEX_NAME).await?;
+        let uuid = idx_metas
+            .first()
+            .ok_or_else(|| lance_core::Error::io("flushed gen has no vector index".to_string()))?
+            .uuid
+            .to_string();
+        let vidx = gen_ds
+            .open_vector_index(VECTOR_COL, &uuid, &NoOpMetricsCollector)
+            .await?;
+        // _rowid -> corpus index, to score recall on the raw path (built once,
+        // outside the timed region).
+        let mut rowid_to_corpus: std::collections::HashMap<u64, i64> =
+            std::collections::HashMap::new();
+        {
+            let mut scan = gen_ds.scan();
+            scan.with_row_id();
+            scan.project(&["id"])?;
+            let mut stream = scan.try_into_stream().await?;
+            while let Some(b) = stream.try_next().await? {
+                let rid = b
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| lance_core::Error::io("row id missing".to_string()))?
+                    .as_primitive::<arrow_array::types::UInt64Type>();
+                let idc = b
+                    .column_by_name("id")
+                    .ok_or_else(|| lance_core::Error::io("id missing".to_string()))?
+                    .as_primitive::<arrow_array::types::Int64Type>();
+                for i in 0..b.num_rows() {
+                    rowid_to_corpus.insert(rid.value(i), idc.value(i) - id_offset);
+                }
+            }
+        }
+        for &ef in &efs {
+            let mut recall_sum = 0.0f64;
+            let mut lat: Vec<u128> = Vec::with_capacity(num_queries);
+            for q in 0..num_queries {
+                let q_vec = &queries[q * DIM..(q + 1) * DIM];
+                let bf_set = &gt_sets[q];
+                let query = Query {
+                    column: VECTOR_COL.to_string(),
+                    key: Arc::new(Float32Array::from(q_vec.to_vec())),
+                    k,
+                    lower_bound: None,
+                    upper_bound: None,
+                    minimum_nprobes: 1,
+                    maximum_nprobes: Some(1),
+                    ef: Some(ef),
+                    refine_factor: None,
+                    metric_type: Some(DistanceType::Cosine),
+                    use_index: true,
+                    query_parallelism: 1,
+                    dist_q_c: 0.0,
+                };
+                let t = Instant::now();
+                let batch = vidx
+                    .search(&query, Arc::new(NoFilter), &NoOpMetricsCollector)
+                    .await?;
+                lat.push(t.elapsed().as_micros());
+                let mut hits = 0usize;
+                if let Some(c) = batch.column_by_name(ROW_ID) {
+                    let col = c.as_primitive::<arrow_array::types::UInt64Type>();
+                    for i in 0..col.len() {
+                        if let Some(corpus_idx) = rowid_to_corpus.get(&col.value(i)) {
+                            if bf_set.contains(corpus_idx) {
+                                hits += 1;
+                            }
+                        }
+                    }
+                }
+                recall_sum += hits as f64 / k as f64;
+            }
+            lat.sort();
+            println!(
+                "RAW_READ cp={} ef={} mean_recall={:.4} median_us={} p99_us={}",
+                cp,
+                ef,
+                recall_sum / num_queries as f64,
+                lat[lat.len() / 2],
+                lat[lat.len() * 99 / 100]
+            );
+            std::io::stdout().flush().ok();
+        }
+
         let (_, mr, med, p99) = best.unwrap_or((0, 0.0, 0, 0));
         return Ok(CheckpointResult {
             rows: cp,
