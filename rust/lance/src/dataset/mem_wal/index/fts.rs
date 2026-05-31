@@ -3107,23 +3107,25 @@ impl Partition {
             if let Some(id) = self.term_id(token) {
                 let pref = &self.postings[id as usize];
                 let qw = scorer.query_weight(token);
+                let cursor = PostingCursor::new(self, id);
+                let doc = cursor.doc();
                 lanes.push(WandLane {
-                    cursor: PostingCursor::new(self, id),
+                    cursor,
                     qw,
                     ub: qw * scorer.doc_weight(pref.max_freq, pref.min_dl),
+                    doc,
                 });
             }
         }
+        lanes.retain(|l| l.doc.is_some());
         if lanes.is_empty() {
             return;
         }
         loop {
             ITERS.with(|c| c.set(c.get() + 1));
-            lanes.retain(|l| l.cursor.doc().is_some());
-            if lanes.is_empty() {
-                break;
-            }
-            lanes.sort_by_key(|l| l.cursor.doc().unwrap());
+            // Lanes are kept non-exhausted; the cached `doc` avoids per-iteration
+            // `cursor.doc()` calls in the sort / pivot / contributor scan.
+            lanes.sort_unstable_by_key(|l| l.doc.unwrap());
             let theta = topk.threshold();
             // Pivot: first lane whose cumulative upper bound exceeds theta.
             let mut acc = 0.0f32;
@@ -3138,8 +3140,8 @@ impl Partition {
             let Some(pivot) = pivot else {
                 break; // no remaining doc can reach theta
             };
-            let pivot_doc = lanes[pivot].cursor.doc().unwrap();
-            if lanes[0].cursor.doc().unwrap() == pivot_doc {
+            let pivot_doc = lanes[pivot].doc.unwrap();
+            if lanes[0].doc == Some(pivot_doc) {
                 // Block-max prune: bound pivot_doc's score by the sum of each
                 // contributing lane's *current-block* max (tighter than the
                 // term-level `ub`). The contributing lanes are exactly those
@@ -3149,14 +3151,19 @@ impl Partition {
                 // under-bound the score and unsoundly skip a true top-k doc.
                 let block_ub: f32 = lanes
                     .iter()
-                    .filter(|l| l.cursor.doc() == Some(pivot_doc))
+                    .filter(|l| l.doc == Some(pivot_doc))
                     .map(|l| l.cursor.current_block_ub(scorer, l.qw))
                     .sum();
                 if block_ub <= theta {
                     for l in lanes.iter_mut() {
-                        if l.cursor.doc() == Some(pivot_doc) {
+                        if l.doc == Some(pivot_doc) {
                             l.cursor.advance();
+                            l.doc = l.cursor.doc();
                         }
+                    }
+                    lanes.retain(|l| l.doc.is_some());
+                    if lanes.is_empty() {
+                        break;
                     }
                     continue;
                 }
@@ -3164,16 +3171,28 @@ impl Partition {
                 let dl = self.docs.num_tokens(pivot_doc);
                 let mut score = 0.0f32;
                 for l in lanes.iter_mut() {
-                    if l.cursor.doc() == Some(pivot_doc) {
+                    if l.doc == Some(pivot_doc) {
                         score += l.qw * scorer.doc_weight(l.cursor.freq(), dl);
                         l.cursor.advance();
+                        l.doc = l.cursor.doc();
                     }
                 }
                 topk.offer(score, self.docs.row_id(pivot_doc));
                 SCORED.with(|c| c.set(c.get() + 1));
+                lanes.retain(|l| l.doc.is_some());
+                if lanes.is_empty() {
+                    break;
+                }
             } else {
                 // A lane before the pivot trails pivot_doc; skip it forward.
                 lanes[0].cursor.skip_to(pivot_doc);
+                lanes[0].doc = lanes[0].cursor.doc();
+                if lanes[0].doc.is_none() {
+                    lanes.swap_remove(0);
+                    if lanes.is_empty() {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -3315,6 +3334,10 @@ struct WandLane<'a> {
     qw: f32,
     /// Upper bound on this term's contribution to any doc's score.
     ub: f32,
+    /// Cached `cursor.doc()`, refreshed only when the lane moves. The WAND loop
+    /// reads this field (not `cursor.doc()`) in its per-iteration retain / sort /
+    /// pivot, which dominates OR latency (~20 iterations per scored doc).
+    doc: Option<u32>,
 }
 
 /// A decoding cursor over one term's compressed posting list. Decodes a
