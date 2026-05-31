@@ -1244,6 +1244,55 @@ async fn flushed_lookup(
     }
 }
 
+/// Batched flushed lookup over a chunk of keys: `direct` searches the index for
+/// each key then issues one `take_rows` for all; otherwise one DataFusion scan
+/// with `id IN (...)`. Returns the total matched row count.
+async fn flushed_batch(
+    dataset: &Dataset,
+    scalar_index: &Arc<dyn lance_index::scalar::ScalarIndex>,
+    keys: &[i64],
+    direct: bool,
+) -> Result<usize> {
+    if direct {
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::SargableQuery;
+        let mut rids = Vec::with_capacity(keys.len());
+        for &k in keys {
+            let q = SargableQuery::Equals(ScalarValue::Int64(Some(k)));
+            let r = scalar_index.search(&q, &NoOpMetricsCollector).await?;
+            if let Some(rid) = r
+                .row_addrs()
+                .true_rows()
+                .row_addrs()
+                .and_then(|mut it| it.next())
+                .map(u64::from)
+            {
+                rids.push(rid);
+            }
+        }
+        if rids.is_empty() {
+            return Ok(0);
+        }
+        let batch = dataset.take_rows(&rids, dataset.schema().clone()).await?;
+        Ok(batch.num_rows())
+    } else {
+        use futures::StreamExt;
+        let list = keys
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut scanner = dataset.scan();
+        scanner.filter(&format!("{KEY_COL} IN ({list})"))?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut n = 0;
+        while let Some(b) = stream.next().await {
+            n += b?.num_rows();
+        }
+        Ok(n)
+    }
+}
+
 /// Flushed Lance: write all rows as one on-disk Lance dataset with a BTree
 /// scalar index — the exact artifact a MemTable flush emits (forward-written
 /// data file + on-disk BTree index) — then point-lookup through the indexed
@@ -1326,6 +1375,74 @@ async fn run_lance_flushed(
     if args.cold {
         drop_page_cache();
         println!("[lance] dropped page cache (cold reads from NVMe)");
+    }
+
+    // --- batch-get path: gather `batch_get` keys per call from the flushed gen ---
+    if args.batch_get > 0 {
+        let bg = args.batch_get;
+        let hit_keys: Vec<i64> = queries
+            .iter()
+            .filter(|(_, h)| *h)
+            .map(|(k, _)| *k)
+            .collect();
+        let cpu1 = process_cpu_secs();
+        let mut latencies_us = Vec::with_capacity(hit_keys.len().div_ceil(bg));
+        let mut found_total = 0usize;
+        let t = Instant::now();
+        for chunk in hit_keys.chunks(bg) {
+            let t0 = Instant::now();
+            found_total += flushed_batch(&dataset, &scalar_index, chunk, direct).await?;
+            latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
+        }
+        let read_qps_1t = hit_keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9);
+        let read_cpu_s = process_cpu_secs() - cpu1;
+        let keys_arc: Arc<Vec<i64>> = Arc::new(hit_keys.clone());
+        let read_qps_nt = if args.threads <= 1 {
+            read_qps_1t
+        } else {
+            let t = Instant::now();
+            let mut handles = Vec::with_capacity(args.threads);
+            for shard in 0..args.threads {
+                let dataset = dataset.clone();
+                let si = scalar_index.clone();
+                let keys = keys_arc.clone();
+                let threads = args.threads;
+                handles.push(tokio::spawn(async move {
+                    let chunks: Vec<&[i64]> = keys.chunks(bg).collect();
+                    let mut i = shard;
+                    while i < chunks.len() {
+                        let _ = flushed_batch(&dataset, &si, chunks[i], direct).await;
+                        i += threads;
+                    }
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+            hit_keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9)
+        };
+        let stats = compute_stats(latencies_us);
+        let peak_rss_mb = sampler.stop();
+        println!(
+            "[lance] batch_get={bg} keys/s_1t={read_qps_1t:.0} keys/s_{}t={read_qps_nt:.0} per_batch p50={:.2}us p99={:.2}us (found={found_total})",
+            args.threads, stats.p50_us, stats.p99_us
+        );
+        return Ok(EngineResult {
+            engine: "lance-flushed-batch",
+            write_rows_per_s,
+            write_cpu_s,
+            read_p50_us: stats.p50_us,
+            read_p95_us: stats.p95_us,
+            read_p99_us: stats.p99_us,
+            read_mean_us: stats.mean_us,
+            read_qps_1t,
+            read_qps_nt,
+            read_cpu_s,
+            hits: found_total,
+            misses_resolved: 0,
+            peak_rss_mb,
+            rss_after_load_mb,
+        });
     }
 
     // --- single-thread read latency ---
