@@ -11,6 +11,7 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use datafusion::common::ScalarValue;
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -91,6 +92,11 @@ pub struct LsmPointLookupPlanner {
     /// hot `lookup(.., None)` path clones an `Arc` instead of rebuilding the
     /// schema on every call.
     none_target: SchemaRef,
+    /// Shared DataFusion task context for plan execution. Built once and reused
+    /// across lookups: `SessionContext::new()` per lookup is a real fixed cost
+    /// on the plan fallback path (the part of point-lookup latency that doesn't
+    /// scale with generation count).
+    task_ctx: Arc<TaskContext>,
 }
 
 impl LsmPointLookupPlanner {
@@ -115,6 +121,7 @@ impl LsmPointLookupPlanner {
             session: None,
             flushed_cache: None,
             none_target,
+            task_ctx: SessionContext::new().task_ctx(),
         }
     }
 
@@ -130,6 +137,36 @@ impl LsmPointLookupPlanner {
     pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
         self
+    }
+
+    /// Open every flushed generation once, up front, so later lookups that fall
+    /// back to the plan path never pay a per-lookup dataset open.
+    ///
+    /// A point lookup that misses the active memtable consults the flushed
+    /// generations via [`open_flushed_dataset`]. Without a warm
+    /// [`FlushedMemTableCache`] each such lookup re-opens the generation
+    /// (manifest read + `Dataset` construction) — a fixed per-lookup cost that
+    /// does not scale with generation count and dominates the actual BTree work.
+    /// Call this during scan setup (after [`Self::with_session`] /
+    /// [`Self::with_flushed_cache`]) so the generations are resident before
+    /// serving queries; with a cache set, the opens are retained and subsequent
+    /// lookups are a pure `Arc::clone`. Opens run concurrently.
+    pub async fn prewarm(&self) -> Result<()> {
+        let opens = self
+            .collector
+            .collect()?
+            .into_iter()
+            .filter_map(|source| match source {
+                LsmDataSource::FlushedMemTable { path, .. } => Some(async move {
+                    open_flushed_dataset(&path, self.session.as_ref(), self.flushed_cache.as_ref())
+                        .await
+                        .map(|_| ())
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        futures::future::try_join_all(opens).await?;
+        Ok(())
     }
 
     /// Add a bloom filter for a generation.
@@ -318,8 +355,10 @@ impl LsmPointLookupPlanner {
         projection: Option<&[String]>,
     ) -> Result<Option<RecordBatch>> {
         let plan = self.plan_lookup(pk_values, projection).await?;
-        let ctx = SessionContext::new();
-        let batches: Vec<RecordBatch> = plan.execute(0, ctx.task_ctx())?.try_collect().await?;
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, self.task_ctx.clone())?
+            .try_collect()
+            .await?;
         for batch in batches {
             if batch.num_rows() > 0 {
                 return Ok(Some(batch.slice(0, 1)));
@@ -1203,6 +1242,44 @@ mod tests {
             "new_1",
             "flushed-arm lookup must return the row at the smallest _rowid (newest under reverse-write)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_then_flushed_lookup() {
+        // `prewarm` opens every flushed generation up front (into the shared
+        // session + flushed cache); a subsequent gen-key lookup must still
+        // return the correct newest row, now served from the warm cache.
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        // Reverse-write: newest row at the smallest physical position.
+        let row_new = create_test_batch(&schema, &[1], "new");
+        let row_old = create_test_batch(&schema, &[1], "old");
+        create_dataset(&gen1_uri, vec![row_new, row_old]).await;
+
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
+        let cache = Arc::new(FlushedMemTableCache::new(4));
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_session(Arc::new(Session::default()))
+            .with_flushed_cache(cache);
+
+        // Prewarm must succeed and leave the generation resident.
+        planner.prewarm().await.unwrap();
+
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap()
+            .expect("pk=1 lives in the flushed generation");
+        assert_eq!(row.num_rows(), 1);
+        assert_eq!(name_at(&row), "new_1");
     }
 
     /// Build an in-memory active memtable ref from batches, with a BTree on

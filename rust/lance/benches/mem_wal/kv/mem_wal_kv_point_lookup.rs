@@ -43,7 +43,8 @@ use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::{
-    InMemoryMemTableRef, LsmDataSourceCollector, LsmPointLookupPlanner, ShardSnapshot,
+    FlushedMemTableCache, InMemoryMemTableRef, LsmDataSourceCollector, LsmPointLookupPlanner,
+    ShardSnapshot,
 };
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
@@ -856,11 +857,18 @@ async fn run_lance(
     let active = Arc::new(in_memory_refs.active.clone());
     let collector = LsmDataSourceCollector::new(dataset.clone(), vec![shard_snapshot])
         .with_in_memory_memtables(shard_id, in_memory_refs);
-    let planner = Arc::new(LsmPointLookupPlanner::new(
-        collector,
-        vec![KEY_COL.to_string()],
-        arrow_schema,
-    ));
+    // Thread the dataset session + a flushed-dataset cache into the planner and
+    // prewarm every flushed generation, so gen-key lookups never re-open a
+    // generation per query (the equivalent of RocksDB keeping its DB + SSTs
+    // resident). Without this, each plan-path lookup pays a fresh manifest read
+    // + Dataset open — a fixed per-lookup cost independent of generation count.
+    let flushed_cache = Arc::new(FlushedMemTableCache::new((gens as u64).max(1)));
+    let planner = Arc::new(
+        LsmPointLookupPlanner::new(collector, vec![KEY_COL.to_string()], arrow_schema)
+            .with_session(dataset.session())
+            .with_flushed_cache(flushed_cache),
+    );
+    planner.prewarm().await?;
 
     // Warmup + correctness: a hit key must resolve to exactly one row under
     // whichever read mode we're timing.
