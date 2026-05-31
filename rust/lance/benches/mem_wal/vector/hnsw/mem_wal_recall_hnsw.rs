@@ -340,7 +340,16 @@ async fn run_checkpoint(
 ) -> lance_core::Result<CheckpointResult> {
     println!("\n=== checkpoint rows={} ===", cp);
     let temp = tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
-    let uri = format!("file://{}/lsm", temp.path().display());
+    // When BENCH_URI_BASE is set, write to a persistent path and flush the
+    // MemTable to an on-disk generation (instead of querying the active
+    // MemTable), printing the flushed generation's dataset path for a
+    // downstream direct-read benchmark.
+    let flush_base = std::env::var("BENCH_URI_BASE").ok();
+    let local_dir = flush_base.as_ref().map(|b| format!("{}/cp_{}", b, cp));
+    let uri = match &local_dir {
+        Some(d) => format!("file://{}", d),
+        None => format!("file://{}/lsm", temp.path().display()),
+    };
     build_base_dataset(&uri, schema.clone()).await?;
     let dataset = Arc::new(Dataset::open(&uri).await?);
 
@@ -401,6 +410,46 @@ async fn run_checkpoint(
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
+
+    // Flush mode: seal the active MemTable to a persistent on-disk generation
+    // (single-partition IVF_HNSW_SQ at the base dataset's storage version) and
+    // print its dataset path. Validates we can flush cp=100k/500k/1M.
+    if let Some(dir) = &local_dir {
+        let seal_start = Instant::now();
+        writer.force_seal_active().await?;
+        let mut waited = 0u64;
+        let gen_path = loop {
+            if let Some(m) = writer.manifest().await? {
+                if let Some(fg) = m.flushed_generations.last() {
+                    break format!("{}/_mem_wal/{}/{}", dir, shard_id.as_hyphenated(), fg.path);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            waited += 1;
+            if waited > 1200 {
+                return Err(lance_core::Error::io(format!("flush timed out for cp={cp}")));
+            }
+        };
+        println!(
+            "FLUSHED_OK cp={} id_offset={} flush_s={:.2} path={}",
+            cp,
+            id_offset,
+            seal_start.elapsed().as_secs_f64(),
+            gen_path
+        );
+        std::io::stdout().flush().ok();
+        writer.close().await?;
+        return Ok(CheckpointResult {
+            rows: cp,
+            write_wall,
+            mean_recall: 0.0,
+            min_recall: 0.0,
+            median_query_us: 0,
+            p99_query_us: 0,
+            bf_total: Duration::ZERO,
+            hnsw_total: Duration::ZERO,
+        });
+    }
 
     let active = writer.active_memtable_ref().await?;
     let mut recall_sum: f64 = 0.0;

@@ -163,6 +163,23 @@ def run_lance(base, rows, corpus, queries, gt):
     return {"build_s": build_s, "nlist": 1, "sweep": sweep("lance", make_q, None, queries, gt)}
 
 
+def run_lance_flushed(base, rows, corpus, queries, gt, lance_path, id_offset, column):
+    # Open a flushed MemTable generation directly from its dataset path and
+    # benchmark its on-disk IVF_HNSW_SQ index (single partition), fully cached.
+    import lance
+    ds = lance.dataset(lance_path, index_cache_size_bytes=48 * 1024**3)
+
+    def make_q(ef):
+        def q(v):
+            ids = ds.to_table(nearest={"column": column, "q": v, "k": K,
+                                       "nprobes": 1, "ef": ef},
+                              columns=["id"]).column("id").to_numpy()
+            return ids - id_offset  # map flushed-gen id -> corpus index
+        return q
+    return {"lance_path": lance_path, "id_offset": id_offset,
+            "sweep": sweep("lance_flushed", make_q, None, queries, gt)}
+
+
 def run_faiss(base, rows, corpus, queries, gt):
     # Full-precision HNSW reference (shows what no quantization buys).
     import faiss
@@ -232,9 +249,13 @@ def cmd_run(args):
     queries = np.load(os.path.join(d, "queries.npy"))
     gt = np.load(os.path.join(d, "gt.npy"))
     print(f"=== {args.system} rows={args.rows} corpus={len(corpus)} ===", flush=True)
-    fn = {"lance": run_lance, "faiss": run_faiss, "faiss_sq": run_faiss_sq,
-          "diskann": run_diskann}[args.system]
-    res = fn(args.base, args.rows, corpus, queries, gt)
+    if args.system == "lance_flushed":
+        res = run_lance_flushed(args.base, args.rows, corpus, queries, gt,
+                                args.lance_path, args.id_offset, args.column)
+    else:
+        fn = {"lance": run_lance, "faiss": run_faiss, "faiss_sq": run_faiss_sq,
+              "diskann": run_diskann}[args.system]
+        res = fn(args.base, args.rows, corpus, queries, gt)
     res["rows"] = args.rows
     res["system"] = args.system
     out = os.path.join(args.base, f"result_{args.rows}_{args.system}.json")
@@ -248,6 +269,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare"); p.add_argument("--rows", type=int, required=True); p.add_argument("--base", required=True)
     r = sub.add_parser("run"); r.add_argument("--rows", type=int, required=True); r.add_argument("--base", required=True); r.add_argument("--system", required=True)
+    r.add_argument("--lance-path", default=None); r.add_argument("--id-offset", type=int, default=0); r.add_argument("--column", default="vector")
     args = ap.parse_args()
     (cmd_prepare if args.cmd == "prepare" else cmd_run)(args)
 
