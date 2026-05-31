@@ -1877,6 +1877,7 @@ fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
     RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
         rotation_type: rabit_quantizer.rotation_type(),
+        rotation: None,
     }
 }
 

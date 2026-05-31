@@ -3023,6 +3023,51 @@ def test_commit_existing_index_segments_accepts_index_metadata(tmp_path):
     assert 0 < len(results) <= 5
 
 
+def test_distributed_ivf_rq_shared_rotation(tmp_path):
+    """Two IVF_RQ segments built on separate fragments with one shared RaBitQ rotation
+    merge into a single committed, queryable index. The shared ``rq_rotation`` (from
+    ``lance.lance.indices.build_rq_rotation``) is what makes the independently built
+    segments mergeable."""
+    from lance.lance import indices
+
+    dim = 32
+    ds = _make_sample_dataset_base(
+        tmp_path, "dist_rq_merge", n_rows=512, dim=dim, max_rows_per_file=256
+    )
+    frags = ds.get_fragments()
+    assert len(frags) == 2
+
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
+        distance_type="l2",
+        sample_rate=8,
+    )
+    rq_rotation = indices.build_rq_rotation(dimension=dim, num_bits=1)
+    base_kwargs = {
+        "column": "vector",
+        "index_type": "IVF_RQ",
+        "num_partitions": 2,
+        "num_bits": 1,
+        "ivf_centroids": ivf_model.centroids,
+        "rq_rotation": rq_rotation,
+    }
+    first = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[0].fragment_id],
+    )
+    second = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[1].fragment_id],
+    )
+
+    merged = ds.merge_existing_index_segments([first, second])
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged])
+
+    q = np.random.rand(dim).astype(np.float32)
+    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert 0 < len(results) <= 5
+
+
 def test_index_segment_builder_builds_vector_segments(tmp_path):
     ds = _make_sample_dataset_base(tmp_path, "segment_builder_ds", 2000, 128)
     frags = ds.get_fragments()

@@ -3304,6 +3304,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        rq_rotation: Optional[str] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -3619,6 +3620,9 @@ class LanceDataset(pa.dataset.Dataset):
         if skip_transpose:
             kwargs["skip_transpose"] = True
 
+        if rq_rotation is not None:
+            kwargs["rq_rotation"] = rq_rotation
+
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
         if fragment_ids is not None:
@@ -3919,6 +3923,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        rq_rotation: Optional[str] = None,
         **kwargs,
     ) -> Index:
         """
@@ -3945,6 +3950,12 @@ class LanceDataset(pa.dataset.Dataset):
         requirement:
 
         - ``fragment_ids`` must be provided
+        - ``rq_rotation`` (``IVF_RQ`` only): a JSON string produced by
+          ``lance.lance.indices.build_rq_rotation``. It must be identical across all
+          workers for their segments to be mergeable, since it pins the RaBitQ
+          rotation so every segment rotates vectors the same way. If omitted, each
+          call generates its own random rotation, which is only safe for a single,
+          non-merged segment.
 
         Returns
         -------
@@ -3974,6 +3985,7 @@ class LanceDataset(pa.dataset.Dataset):
             index_uuid=index_uuid,
             target_partition_size=target_partition_size,
             skip_transpose=skip_transpose,
+            rq_rotation=rq_rotation,
             require_commit=False,
             **kwargs,
         )

@@ -20,6 +20,7 @@ use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -4427,6 +4428,13 @@ fn prepare_vector_index_params(
             }
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
+        };
+
+        if let Some(r) = kwargs.get_item("rq_rotation")? {
+            let json: String = r.extract()?;
+            let meta: RabitQuantizationMetadata = serde_json::from_str(&json)
+                .map_err(|e| PyValueError::new_err(format!("Invalid rq_rotation JSON: {e}")))?;
+            rq_params.rotation = Some(meta);
         };
 
         if let Some(version) = kwargs.get_item("index_file_version")? {

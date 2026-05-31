@@ -14,6 +14,7 @@ use lance_core::{Error, Result};
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
 
+use crate::vector::bq::storage::RabitQuantizationMetadata;
 use crate::vector::quantizer::QuantizerBuildParams;
 
 pub mod builder;
@@ -100,10 +101,16 @@ impl FromStr for RQRotationType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct RQBuildParams {
     pub num_bits: u8,
     pub rotation_type: RQRotationType,
+    /// Optional pre-built rotation to reuse instead of generating a fresh random one.
+    ///
+    /// Distributed `IVF_RQ` builds mint one rotation and broadcast it so every segment
+    /// rotates vectors identically. This is transient build-time state and is never
+    /// persisted to the `RabitQuantization` params proto.
+    pub rotation: Option<RabitQuantizationMetadata>,
 }
 
 impl RQBuildParams {
@@ -111,6 +118,7 @@ impl RQBuildParams {
         Self {
             num_bits,
             rotation_type: RQRotationType::default(),
+            rotation: None,
         }
     }
 
@@ -118,6 +126,7 @@ impl RQBuildParams {
         Self {
             num_bits,
             rotation_type,
+            rotation: None,
         }
     }
 }
@@ -146,6 +155,7 @@ impl Default for RQBuildParams {
         Self {
             num_bits: 1,
             rotation_type: RQRotationType::default(),
+            rotation: None,
         }
     }
 }

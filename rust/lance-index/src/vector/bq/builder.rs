@@ -22,7 +22,7 @@ use crate::vector::bq::storage::{
 use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
 use crate::vector::bq::{
     RQBuildParams, RQRotationType,
-    rotation::{apply_fast_rotation, random_fast_rotation_signs},
+    rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
 };
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
 
@@ -324,6 +324,46 @@ impl Quantization for RabitQuantizer {
             ));
         }
 
+        // Reuse a supplied rotation instead of generating a fresh random one.
+        if let Some(meta) = &params.rotation {
+            let expected_code_dim = dim * params.num_bits as usize;
+            if meta.num_bits != params.num_bits || meta.code_dim as usize != expected_code_dim {
+                return Err(Error::invalid_input(format!(
+                    "supplied RaBitQ rotation does not match build params: rotation \
+                     num_bits={}, code_dim={}; expected num_bits={}, code_dim={}",
+                    meta.num_bits, meta.code_dim, params.num_bits, expected_code_dim
+                )));
+            }
+
+            match meta.rotation_type {
+                RQRotationType::Fast => {
+                    let signs = meta.fast_rotation_signs.as_ref().ok_or_else(|| {
+                        Error::invalid_input("supplied fast RaBitQ rotation is missing signs")
+                    })?;
+                    let expected_len = fast_rotation_signs_len(meta.code_dim as usize);
+                    if signs.len() != expected_len {
+                        return Err(Error::invalid_input(format!(
+                            "supplied fast RaBitQ rotation signs length {} does not match \
+                             expected {} for code_dim={}",
+                            signs.len(),
+                            expected_len,
+                            meta.code_dim
+                        )));
+                    }
+                }
+                RQRotationType::Matrix => {
+                    if meta.rotate_mat.is_none() {
+                        return Err(Error::invalid_input(
+                            "use the fast rotation for distributed builds",
+                        ));
+                    }
+                }
+            }
+            return Ok(Self {
+                metadata: meta.clone(),
+            });
+        }
+
         let q = match data.as_fixed_size_list().value_type() {
             DataType::Float16 => Self::new_with_rotation::<Float16Type>(
                 params.num_bits,
@@ -578,6 +618,124 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("vector dimension must be divisible by 8 for IVF_RQ"),
+            "{}",
+            err
+        );
+    }
+
+    fn sample_fsl(n: usize, dim: usize) -> FixedSizeListArray {
+        let values: Vec<f32> = (0..n * dim).map(|i| ((i * 31 % 17) as f32) - 8.0).collect();
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
+    }
+
+    fn quantized_codes(q: &RabitQuantizer, data: &FixedSizeListArray) -> Vec<u8> {
+        use arrow::datatypes::UInt8Type;
+        q.quantize(data)
+            .unwrap()
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn test_shared_fast_rotation_gives_identical_codes() {
+        let dim = 32;
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Fast);
+        let json = serde_json::to_string(&seed.metadata(None)).unwrap();
+        let meta: RabitQuantizationMetadata = serde_json::from_str(&json).unwrap();
+
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Fast,
+            rotation: Some(meta),
+        };
+        let data = sample_fsl(8, dim as usize);
+        let q_a = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+        let q_b = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+
+        assert_eq!(
+            quantized_codes(&q_a, &data),
+            quantized_codes(&q_b, &data),
+            "shared rotation must yield identical codes"
+        );
+    }
+
+    #[test]
+    fn test_unpinned_rotation_gives_different_codes() {
+        let dim = 32;
+        let params = RQBuildParams::new(1);
+        let data = sample_fsl(8, dim as usize);
+        let q_a = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+        let q_b = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+
+        assert_ne!(
+            quantized_codes(&q_a, &data),
+            quantized_codes(&q_b, &data),
+            "independent unpinned rotations must yield different codes"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_rotation_with_mismatched_code_dim() {
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, 16, RQRotationType::Fast);
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Fast,
+            rotation: Some(seed.metadata(None)),
+        };
+        let data = sample_fsl(4, 32);
+        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match build params"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_fast_rotation_with_bad_signs_length() {
+        let dim = 16;
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Fast);
+        let mut meta = seed.metadata(None);
+        // Corrupt the signs to the wrong length (valid would be 4 * ceil(16/8) = 8).
+        meta.fast_rotation_signs = Some(vec![0u8; 7]);
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Fast,
+            rotation: Some(meta),
+        };
+        let data = sample_fsl(4, dim as usize);
+        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        assert!(err.to_string().contains("signs length"), "{}", err);
+    }
+
+    #[test]
+    fn test_matrix_rotation_lost_through_json_is_rejected() {
+        let dim = 16;
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Matrix);
+        let meta = seed.metadata(None);
+        assert!(meta.rotate_mat.is_some());
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: RabitQuantizationMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rotation_type, RQRotationType::Matrix);
+        assert!(
+            parsed.rotate_mat.is_none(),
+            "matrix is expected to be dropped by JSON serialization"
+        );
+
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Matrix,
+            rotation: Some(parsed),
+        };
+        let data = sample_fsl(4, dim as usize);
+        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fast rotation for distributed builds"),
             "{}",
             err
         );
