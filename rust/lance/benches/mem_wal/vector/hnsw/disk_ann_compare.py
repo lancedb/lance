@@ -146,9 +146,10 @@ def run_lance(base, rows, corpus, queries, gt):
     vecs = pa.FixedSizeListArray.from_arrays(pa.array(corpus.reshape(-1), type=pa.float32()), DIM)
     tbl = pa.table({"id": pa.array(np.arange(rows, dtype=np.int64)), "vec": vecs})
     ds = lance.write_dataset(tbl, uri, mode="overwrite")
-    nlist = max(1, int(np.sqrt(rows)))
+    # The flushed memtable index is a SINGLE-partition HNSW+SQ, so model it with
+    # num_partitions=1 (nprobes=1); ef is the search knob, like DiskANN/FAISS.
     t = time.perf_counter()
-    ds.create_index("vec", "IVF_HNSW_SQ", metric="cosine", num_partitions=nlist,
+    ds.create_index("vec", "IVF_HNSW_SQ", metric="cosine", num_partitions=1,
                     m=20, ef_construction=150)
     build_s = time.perf_counter() - t
     ds = lance.dataset(uri, index_cache_size_bytes=48 * 1024**3)
@@ -156,10 +157,10 @@ def run_lance(base, rows, corpus, queries, gt):
     def make_q(ef):
         def q(v):
             return ds.to_table(nearest={"column": "vec", "q": v, "k": K,
-                                        "nprobes": nlist, "ef": ef},
+                                        "nprobes": 1, "ef": ef},
                                columns=["id"]).column("id").to_numpy()
         return q
-    return {"build_s": build_s, "nlist": nlist, "sweep": sweep("lance", make_q, None, queries, gt)}
+    return {"build_s": build_s, "nlist": 1, "sweep": sweep("lance", make_q, None, queries, gt)}
 
 
 def run_faiss(base, rows, corpus, queries, gt):
