@@ -3137,9 +3137,7 @@ impl<'a> PostingCursor<'a> {
 
     /// Current doc id, or `None` once the list is exhausted.
     fn doc(&self) -> Option<u32> {
-        if self.cur.is_none() {
-            return None;
-        }
+        self.cur?;
         self.docs.get(self.i).copied()
     }
 
