@@ -3089,6 +3089,15 @@ impl Partition {
         if lanes.is_empty() {
             return;
         }
+        if std::env::var_os("FTS_WAND").is_some() {
+            self.wand_loop(lanes, scorer, topk);
+        } else {
+            self.maxscore_loop(lanes, scorer, topk);
+        }
+    }
+
+    /// Classic block-max WAND pivot loop (see [`Self::wand_into`]).
+    fn wand_loop(&self, mut lanes: Vec<WandLane>, scorer: &MemBM25Scorer, topk: &mut TopK) {
         loop {
             // Lanes are kept non-exhausted; the cached `doc` avoids per-iteration
             // `cursor.doc()` calls in the sort / pivot / contributor scan.
@@ -3159,6 +3168,79 @@ impl Partition {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    /// MaxScore top-k over an OR query. Terms are sorted by their max
+    /// contribution (`ub`) ascending; the longest prefix whose `ub` sum can't
+    /// reach the current threshold is "non-essential" — a doc matching only
+    /// those can't enter the top-k, so candidates are generated from the
+    /// "essential" suffix alone (iterating fewer lists than WAND) and the
+    /// non-essential lists are only probed per candidate, highest-`ub` first,
+    /// with an early exit once the remaining bound can't beat the threshold.
+    /// Exact: same bounds as WAND, just a different traversal.
+    fn maxscore_loop(&self, mut lanes: Vec<WandLane>, scorer: &MemBM25Scorer, topk: &mut TopK) {
+        // Fixed ascending-`ub` order so the non-essential prefix is well-defined.
+        lanes.sort_by(|a, b| a.ub.partial_cmp(&b.ub).unwrap_or(std::cmp::Ordering::Equal));
+        loop {
+            let theta = topk.threshold();
+            // Non-essential prefix [0..ne): cumulative `ub` sum <= theta.
+            let mut ne = 0;
+            let mut cum = 0.0f32;
+            while ne < lanes.len() && cum + lanes[ne].ub <= theta {
+                cum += lanes[ne].ub;
+                ne += 1;
+            }
+            if ne == lanes.len() {
+                break; // no remaining doc can reach theta
+            }
+            // Candidate: min current doc among the essential lanes.
+            let mut cand: Option<u32> = None;
+            for l in &lanes[ne..] {
+                if let Some(d) = l.doc {
+                    cand = Some(cand.map_or(d, |c| c.min(d)));
+                }
+            }
+            let Some(cand) = cand else {
+                break; // essential lanes exhausted
+            };
+            let dl = self.docs.num_tokens(cand);
+            let mut score = 0.0f32;
+            for l in lanes[ne..].iter_mut() {
+                if l.doc == Some(cand) {
+                    score += l.qw * scorer.doc_weight(l.cursor.freq(), dl);
+                }
+            }
+            // Probe non-essential lanes high-`ub` first; stop once even the max
+            // remaining contribution can't lift the score past theta.
+            let mut rem = cum;
+            let mut alive = true;
+            for i in (0..ne).rev() {
+                if score + rem <= theta {
+                    alive = false;
+                    break;
+                }
+                rem -= lanes[i].ub;
+                lanes[i].cursor.skip_to(cand);
+                lanes[i].doc = lanes[i].cursor.doc();
+                if lanes[i].doc == Some(cand) {
+                    score += lanes[i].qw * scorer.doc_weight(lanes[i].cursor.freq(), dl);
+                }
+            }
+            if alive {
+                topk.offer(score, self.docs.row_id(cand));
+            }
+            // Advance the essential lanes that were positioned at the candidate.
+            for l in lanes[ne..].iter_mut() {
+                if l.doc == Some(cand) {
+                    l.cursor.advance();
+                    l.doc = l.cursor.doc();
+                }
+            }
+            lanes.retain(|l| l.doc.is_some());
+            if lanes.is_empty() {
+                break;
             }
         }
     }
