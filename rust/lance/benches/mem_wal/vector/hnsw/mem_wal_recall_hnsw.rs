@@ -565,9 +565,14 @@ async fn run_checkpoint(
                     query_parallelism: 1,
                     dist_q_c: 0.0,
                 };
+                // IVFIndex::search is intentionally unimplemented (top-level does
+                // partition-aware search); replicate the ANN exec node: pick the
+                // closest partition then search it. Single-partition flushed gen.
                 let t = Instant::now();
+                let (parts, _) = vidx.find_partitions(&query)?;
+                let pid = parts.value(0) as usize;
                 let batch = vidx
-                    .search(&query, Arc::new(NoFilter), &NoOpMetricsCollector)
+                    .search_in_partition(pid, &query, Arc::new(NoFilter), &NoOpMetricsCollector)
                     .await?;
                 lat.push(t.elapsed().as_micros());
                 let mut hits = 0usize;
