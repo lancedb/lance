@@ -69,15 +69,6 @@ use rustc_hash::FxHashMap;
 
 use super::RowPosition;
 
-thread_local! {
-    /// Diagnostic (FTS_WAND_STATS): full doc scorings done by the top-k path.
-    static SCORED: Cell<u64> = const { Cell::new(0) };
-    /// Diagnostic: WAND control-loop iterations.
-    static ITERS: Cell<u64> = const { Cell::new(0) };
-    /// Diagnostic: posting blocks decoded.
-    static DECODED: Cell<u64> = const { Cell::new(0) };
-}
-
 // ============================================================================
 // Public types preserved from previous API
 // ============================================================================
@@ -1321,12 +1312,6 @@ impl FtsMemIndex {
         }
         match limit {
             Some(k) if k > 0 => {
-                let stats = std::env::var_os("FTS_WAND_STATS").is_some();
-                if stats {
-                    SCORED.with(|c| c.set(0));
-                    ITERS.with(|c| c.set(0));
-                    DECODED.with(|c| c.set(0));
-                }
                 let mut topk = TopK::new(k);
                 // Scan the block-max partitions first to warm the shared
                 // threshold, then the (un-skippable) tail last — so the tail
@@ -1344,22 +1329,6 @@ impl FtsMemIndex {
                     for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer, theta) {
                         topk.offer(e.score, e.row_position);
                     }
-                }
-                if stats {
-                    let union: usize = st
-                        .partitions
-                        .iter()
-                        .map(|p| tokens.iter().map(|t| p.token_df(t)).sum::<usize>())
-                        .sum();
-                    eprintln!(
-                        "WAND tokens={} k={} scored={} iters={} decoded_blocks={} union_postings={}",
-                        tokens.len(),
-                        k,
-                        SCORED.with(|c| c.get()),
-                        ITERS.with(|c| c.get()),
-                        DECODED.with(|c| c.get()),
-                        union,
-                    );
                 }
                 topk.into_entries()
             }
@@ -3083,7 +3052,6 @@ impl Partition {
                 let score = qw * scorer.doc_weight(freqs[i], dl);
                 topk.offer(score, self.docs.row_id(doc));
             }
-            SCORED.with(|c| c.set(c.get() + n as u64));
         }
     }
 
@@ -3122,7 +3090,6 @@ impl Partition {
             return;
         }
         loop {
-            ITERS.with(|c| c.set(c.get() + 1));
             // Lanes are kept non-exhausted; the cached `doc` avoids per-iteration
             // `cursor.doc()` calls in the sort / pivot / contributor scan.
             lanes.sort_unstable_by_key(|l| l.doc.unwrap());
@@ -3178,7 +3145,6 @@ impl Partition {
                     }
                 }
                 topk.offer(score, self.docs.row_id(pivot_doc));
-                SCORED.with(|c| c.set(c.get() + 1));
                 lanes.retain(|l| l.doc.is_some());
                 if lanes.is_empty() {
                     break;
@@ -3421,7 +3387,6 @@ impl<'a> PostingCursor<'a> {
         );
         self.decoded = true;
         self.prefix_valid = false;
-        DECODED.with(|c| c.set(c.get() + 1));
     }
 
     /// Move to the next block (parse + decode it), or exhaust.
