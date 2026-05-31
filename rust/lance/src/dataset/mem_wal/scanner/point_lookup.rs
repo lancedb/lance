@@ -691,11 +691,7 @@ fn gather_rows(
     let stored = batch_store
         .get(batch_idx)
         .ok_or_else(|| lance_core::Error::internal("point-lookup: gather batch missing"))?;
-    // Copy the matched rows into fresh buffers via `take` (not a zero-copy
-    // `slice`): a slice shares the source column's buffer `Arc`, and under
-    // concurrency that refcount churns; `take` produces owned columns with no
-    // shared-buffer refcount.
-    let indices = arrow_array::UInt32Array::from(rows.to_vec());
+    let indices = (rows.len() > 1).then(|| arrow_array::UInt32Array::from(rows.to_vec()));
     // Borrow the stored schema once (no `Arc` clone): `schema()` clones the
     // shared schema `Arc`, and under concurrency that refcount cache line
     // ping-pongs across cores. `schema_ref()` borrows it.
@@ -711,7 +707,14 @@ fn gather_rows(
                 ))
             })?;
             let col = stored.data.column(idx);
-            arrow_select::take::take(col.as_ref(), &indices, None).map_err(lance_core::Error::from)
+            // Single row: zero-copy `slice` (the common point-lookup case, and
+            // measurably faster than `take` — copying regressed single-thread
+            // ~30% with no N-thread gain). Multiple rows: one vectorized `take`.
+            match &indices {
+                None => Ok(col.slice(rows[0] as usize, 1)),
+                Some(idxs) => arrow_select::take::take(col.as_ref(), idxs, None)
+                    .map_err(lance_core::Error::from),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(target.clone(), cols)?)
