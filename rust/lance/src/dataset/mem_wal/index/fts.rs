@@ -45,6 +45,7 @@
 //! into one builder. The on-disk format is unchanged from Lance's existing
 //! inverted index.
 
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
@@ -3206,6 +3207,12 @@ struct PostingCursor<'a> {
     i: usize,
     /// SIMD bit-(un)packer for full 128-doc blocks.
     bp: BitPacker4x,
+    /// Memoized `(df_offset, block_ub)` for the current block. The bound is
+    /// constant within a block and `query_weight`/`scorer` are fixed for the
+    /// cursor's life, so OR's per-pivot `current_block_ub` calls are O(1) after
+    /// the first; keyed by `df_offset` (unique per block) so it self-invalidates
+    /// when the block changes — no reset needed at the block-advance sites.
+    ub_cache: Cell<Option<(u32, f32)>>,
 }
 
 impl<'a> PostingCursor<'a> {
@@ -3225,6 +3232,7 @@ impl<'a> PostingCursor<'a> {
             pos_scratch: Vec::new(),
             i: 0,
             bp: BitPacker4x::new(),
+            ub_cache: Cell::new(None),
         };
         if let Some(bm) = cursor.cur {
             cursor.decode(bm);
@@ -3290,9 +3298,19 @@ impl<'a> PostingCursor<'a> {
     }
 
     /// The current block's per-doc BM25 upper bound from its impacts frontier
-    /// (0 when exhausted). See [`BlockMeta::block_ub`].
+    /// (0 when exhausted), memoized per block. See [`BlockMeta::block_ub`].
     fn current_block_ub(&self, scorer: &MemBM25Scorer, qw: f32) -> f32 {
-        self.cur.map_or(0.0, |b| b.block_ub(scorer, qw))
+        let Some(b) = self.cur else {
+            return 0.0;
+        };
+        if let Some((off, v)) = self.ub_cache.get()
+            && off == b.df_offset
+        {
+            return v;
+        }
+        let v = b.block_ub(scorer, qw);
+        self.ub_cache.set(Some((b.df_offset, v)));
+        v
     }
 
     /// `doc()` under a `&mut` receiver — for use as a loop condition while the
