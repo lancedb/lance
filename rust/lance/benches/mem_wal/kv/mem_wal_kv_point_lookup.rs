@@ -552,6 +552,12 @@ struct Args {
     engine: Engine,
     key_type: KeyType,
     storage: Storage,
+    /// Number of flushed generations below the single active MemTable (Lance) /
+    /// immutable SSTs below the active memtable (RocksDB). 0 = the existing
+    /// single-tier behavior. >0 builds a full LSM: rows are split into
+    /// `generations+1` parts, the first `generations` are flushed to on-disk
+    /// generations/SSTs and the last stays active; lookups traverse the tiers.
+    generations: usize,
     lance_read_mode: LanceReadMode,
     /// When > 0, the read phase measures **batch get** of this many keys per
     /// call (Lance: one vectorized BTree gather; RocksDB: `multi_get`) instead
@@ -584,6 +590,7 @@ impl Default for Args {
             engine: Engine::Both,
             key_type: KeyType::Int,
             storage: Storage::Active,
+            generations: 0,
             lance_read_mode: LanceReadMode::Plan,
             batch_get: 0,
             uri: String::new(),
@@ -641,6 +648,7 @@ fn parse_args() -> Result<Args> {
             "--storage" => {
                 args.storage = Storage::parse(&value).map_err(lance_core::Error::invalid_input)?
             }
+            "--generations" => args.generations = parse_val(&flag, &value)?,
             "--lance-read-mode" => {
                 args.lance_read_mode =
                     LanceReadMode::parse(&value).map_err(lance_core::Error::invalid_input)?
@@ -783,26 +791,53 @@ async fn run_lance(
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
     // --- write phase ---
+    // LSM: split rows into `generations+1` parts; seal+flush after each of the
+    // first `generations` parts (each becomes an on-disk generation) and leave
+    // the last part in the active MemTable.
+    let gens = args.generations;
+    let part = (insert_order.len() / (gens + 1)).max(1);
     let cpu0 = process_cpu_secs();
     let t_write = Instant::now();
     let mut lo = 0usize;
-    while lo < insert_order.len() {
-        let hi = (lo + args.batch_rows).min(insert_order.len());
-        let batch = make_batch(
-            schema.clone(),
-            &insert_order[lo..hi],
-            args.value_size,
-            key_type,
-        );
-        writer.put(vec![batch]).await?;
-        lo = hi;
+    for g in 0..=gens {
+        let part_end = if g < gens {
+            ((g + 1) * part).min(insert_order.len())
+        } else {
+            insert_order.len()
+        };
+        while lo < part_end {
+            let hi = (lo + args.batch_rows).min(part_end);
+            let batch =
+                make_batch(schema.clone(), &insert_order[lo..hi], args.value_size, key_type);
+            writer.put(vec![batch]).await?;
+            lo = hi;
+        }
+        if g < gens {
+            writer.force_seal_active().await?;
+            for _ in 0..600 {
+                let n = writer
+                    .manifest()
+                    .await?
+                    .map(|m| m.flushed_generations.len())
+                    .unwrap_or(0);
+                if n > g {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
     }
     let write_s = t_write.elapsed().as_secs_f64();
     let write_cpu_s = process_cpu_secs() - cpu0;
     let write_rows_per_s = args.rows as f64 / write_s.max(1e-9);
     let rss_after_load_mb = sampler.peak_mb();
+    let n_gens = writer
+        .manifest()
+        .await?
+        .map(|m| m.flushed_generations.len())
+        .unwrap_or(0);
     println!(
-        "[lance] wrote {} rows in {:.2}s = {:.0} rows/s (cpu {:.2}s)",
+        "[lance] wrote {} rows in {:.2}s = {:.0} rows/s (cpu {:.2}s, flushed_gens={n_gens}+active)",
         args.rows, write_s, write_rows_per_s, write_cpu_s
     );
 
@@ -973,6 +1008,13 @@ async fn run_lance(
             peak_rss_mb,
             rss_after_load_mb,
         });
+    }
+
+    // Cold mode: drop the OS page cache so the on-disk generations are read
+    // from NVMe (the active MemTable stays in memory either way).
+    if args.cold {
+        drop_page_cache();
+        println!("[lance] dropped page cache (cold reads from NVMe)");
     }
 
     // --- read phase: single-thread latency + hit/miss accounting ---
@@ -1418,18 +1460,34 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     wo.disable_wal(args.rocksdb_disable_wal);
 
     // --- write phase ---
+    // LSM: split into `generations+1` parts; flush each of the first
+    // `generations` parts to its own SST (compaction off → they stay separate
+    // L0 SSTs); the last part stays in the active memtable.
+    let gens = args.generations;
+    let part = (insert_order.len() / (gens + 1)).max(1);
     let cpu0 = process_cpu_secs();
     let t_write = Instant::now();
     let mut lo = 0usize;
-    while lo < insert_order.len() {
-        let hi = (lo + args.batch_rows).min(insert_order.len());
-        let mut wb = WriteBatch::default();
-        for &k in &insert_order[lo..hi] {
-            wb.put(rocks_key(k, key_type), make_value(k, args.value_size));
+    for g in 0..=gens {
+        let part_end = if g < gens {
+            ((g + 1) * part).min(insert_order.len())
+        } else {
+            insert_order.len()
+        };
+        while lo < part_end {
+            let hi = (lo + args.batch_rows).min(part_end);
+            let mut wb = WriteBatch::default();
+            for &k in &insert_order[lo..hi] {
+                wb.put(rocks_key(k, key_type), make_value(k, args.value_size));
+            }
+            db.write_opt(wb, &wo)
+                .map_err(|e| lance_core::Error::io(format!("rocksdb write: {e}")))?;
+            lo = hi;
         }
-        db.write_opt(wb, &wo)
-            .map_err(|e| lance_core::Error::io(format!("rocksdb write: {e}")))?;
-        lo = hi;
+        if g < gens {
+            db.flush()
+                .map_err(|e| lance_core::Error::io(format!("rocksdb flush gen: {e}")))?;
+        }
     }
     let write_s = t_write.elapsed().as_secs_f64();
     let write_cpu_s = process_cpu_secs() - cpu0;
@@ -1444,23 +1502,23 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
         write_buf >> 20
     );
 
-    // `--storage flushed`: flush the memtable to a single on-disk SST (auto
-    // compaction is off, so it stays one SST). Reads then go to the SST via the
-    // block cache + bloom, matching the Lance flushed-generation comparison.
-    if args.storage == Storage::Flushed {
+    // Single-tier `--storage flushed` (no extra generations): flush the active
+    // to one SST (compact to one if cold). With generations>0 the per-chunk
+    // flushes already produced N separate L0 SSTs + the active memtable.
+    if gens == 0 && args.storage == Storage::Flushed {
         db.flush()
             .map_err(|e| lance_core::Error::io(format!("rocksdb flush: {e}")))?;
-        // Cold (larger-than-RAM): writes produced many L0 SSTs; compact them
-        // into one so reads aren't a fan-out over hundreds of SSTs.
         if args.cold {
             db.compact_range::<&[u8], &[u8]>(None, None);
         }
+    }
+    if args.storage == Storage::Flushed || gens > 0 {
         let n_sst = db
             .property_int_value("rocksdb.num-files-at-level0")
             .ok()
             .flatten()
             .unwrap_or(0);
-        println!("[rocksdb] flushed memtable to SST (L0 files={n_sst})");
+        println!("[rocksdb] {n_sst} L0 SSTs + active memtable");
     }
 
     // Cold mode: drop the OS page cache so reads hit NVMe.
@@ -1705,9 +1763,10 @@ fn print_comparison(results: &[EngineResult]) {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_kv_point_lookup engine={:?} storage={} key_type={} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
+        "bench=mem_wal_kv_point_lookup engine={:?} storage={} generations={} key_type={} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
         args.engine,
         args.storage.as_str(),
+        args.generations,
         args.key_type.as_str(),
         args.lance_read_mode.as_str(),
         args.batch_get,
