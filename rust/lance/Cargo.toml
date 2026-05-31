@@ -48,10 +48,10 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
-# Only used by the `mem_wal_kv_point_lookup` benchmark, gated behind the
-# `bench-rocksdb` feature. Off by default so normal builds / `cargo test`
-# never compile the bundled librocksdb C++ sources.
-rocksdb = { version = "0.23", optional = true, default-features = false }
+# Only used by the (disabled) `mem_wal_kv_point_lookup` benchmark's RocksDB arm.
+# Commented out so CI's all-features build never compiles the bundled librocksdb
+# C++ sources (needs libclang). Uncomment with the bench target + feature to run.
+# rocksdb = { version = "0.23", optional = true, default-features = false }
 crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
@@ -158,8 +158,9 @@ huggingface = ["lance-io/huggingface"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
-# Compile the RocksDB comparison arm of the mem_wal_kv_point_lookup bench.
-bench-rocksdb = ["dep:rocksdb"]
+# Compile the RocksDB comparison arm of the (disabled) mem_wal_kv_point_lookup
+# bench. Commented out so it stays out of CI's all-features build.
+# bench-rocksdb = ["dep:rocksdb"]
 
 [[bin]]
 name = "lq"
@@ -269,10 +270,14 @@ name = "mem_wal_fts_read_bench"
 path = "benches/mem_wal/fts/mem_wal_fts_read_bench.rs"
 harness = false
 
-[[bench]]
-name = "mem_wal_kv_point_lookup"
-path = "benches/mem_wal/kv/mem_wal_kv_point_lookup.rs"
-harness = false
+# MemTable KV point-lookup benchmark (Lance vs RocksDB). Disabled as a build
+# target: it needs the optional `rocksdb` dep (bundled librocksdb C++, needs
+# libclang) which CI's all-features build can't compile. To run it, uncomment
+# this entry plus the `rocksdb` dependency and the `bench-rocksdb` feature.
+# [[bench]]
+# name = "mem_wal_kv_point_lookup"
+# path = "benches/mem_wal/kv/mem_wal_kv_point_lookup.rs"
+# harness = false
 
 [[bench]]
 name = "manifest_commit"
