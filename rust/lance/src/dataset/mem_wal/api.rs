@@ -701,7 +701,8 @@ impl DatasetMemWalExt for Dataset {
                         .get(index_name)
                         .cloned();
                     let vector_config =
-                        load_vector_index_config(self, index_name, &index_meta, hnsw_params).await?;
+                        load_vector_index_config(self, index_name, &index_meta, hnsw_params)
+                            .await?;
                     index_configs.push(vector_config);
                 }
                 _ => {

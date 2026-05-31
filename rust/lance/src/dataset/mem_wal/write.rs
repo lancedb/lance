@@ -4556,10 +4556,7 @@ mod shard_writer_tests {
         let err = dataset
             .initialize_mem_wal()
             .maintained_indexes(["vector_idx"])
-            .maintained_index_hnsw_params(
-                "missing_idx",
-                HnswBuildParams::default().num_edges(7),
-            )
+            .maintained_index_hnsw_params("missing_idx", HnswBuildParams::default().num_edges(7))
             .execute()
             .await
             .expect_err("override on a non-maintained index must be rejected");

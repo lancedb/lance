@@ -232,8 +232,9 @@ impl LevelLinks {
     }
 
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
-        self.published
-            .store(Arc::new(ranked.iter().map(|point| point.id).collect::<Vec<_>>()));
+        self.published.store(Arc::new(
+            ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
+        ));
     }
 }
 

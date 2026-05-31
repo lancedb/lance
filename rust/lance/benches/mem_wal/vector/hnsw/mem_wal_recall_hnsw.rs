@@ -35,9 +35,9 @@ use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::ROW_ID;
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::prefilter::NoFilter;
 use lance_index::vector::Query;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -303,7 +303,15 @@ async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::
     }
     let base_batch = make_batch(0, &base_vec, schema.clone());
     let reader = RecordBatchIterator::new(std::iter::once(Ok(base_batch)), schema.clone());
-    let mut dataset = Dataset::write(reader, uri, Some(WriteParams { data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2), ..Default::default() })).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     let ivf = IvfBuildParams::new(16);
     let pq = PQBuildParams::new(16, 8);
     let params = VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf, pq);
@@ -448,7 +456,9 @@ async fn run_checkpoint(
                 std::io::stdout().flush().ok();
             }
             if waited > 6000 {
-                return Err(lance_core::Error::io(format!("flush timed out for cp={cp}")));
+                return Err(lance_core::Error::io(format!(
+                    "flush timed out for cp={cp}"
+                )));
             }
         };
         println!(
