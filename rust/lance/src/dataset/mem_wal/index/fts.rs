@@ -2882,6 +2882,8 @@ impl Partition {
                 pos_to_doc.insert(rp, doc_id);
             }
         }
+        let timing = std::env::var_os("FTS_FREEZE_TIMING").is_some();
+        let t_collect = std::time::Instant::now();
         let mut entries: Vec<(Arc<str>, Vec<(u32, u32, Vec<u32>)>)> = Vec::new();
         for entry in tail.terms.iter() {
             let slice = entry.value().load();
@@ -2907,6 +2909,20 @@ impl Partition {
             }
             docs_for_term.sort_by_key(|(d, _, _)| *d);
             entries.push((entry.key().clone(), docs_for_term));
+        }
+        if timing {
+            let n_terms = entries.len();
+            let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
+            let t_build = std::time::Instant::now();
+            let part = build_partition(entries, docs);
+            eprintln!(
+                "FREEZE timing: collect={:.1}ms build={:.1}ms terms={} docs={}",
+                collect_ms,
+                t_build.elapsed().as_secs_f64() * 1e3,
+                n_terms,
+                snap.cumulative_doc_count,
+            );
+            return Some(part);
         }
         Some(build_partition(entries, docs))
     }
