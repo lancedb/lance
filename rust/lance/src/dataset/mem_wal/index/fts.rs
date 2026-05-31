@@ -2548,10 +2548,6 @@ struct PostingRef {
     block_count: u32,
     /// number of docs (postings) for the term.
     doc_count: u32,
-    /// largest frequency / smallest doc length over the whole term: the WAND
-    /// per-term upper bound is `query_weight * doc_weight(max_freq, min_dl)`.
-    max_freq: u32,
-    min_dl: u32,
 }
 
 /// Forward-sequential parser over a term's blocks in `block_bytes`. The cursor
@@ -2709,8 +2705,6 @@ fn build_partition(
         // widths, position offsets accumulate the stored per-block byte length.
         put_varint(&mut block_bytes, doc_freq_data.len() as u64);
         put_varint(&mut block_bytes, pos_data.len() as u64);
-        let mut term_max_freq = 0u32;
-        let mut term_min_dl = u32::MAX;
         let mut block_count = 0u32;
         let mut prev_last_doc = 0u32;
         for chunk in docs_for_term.chunks(POSTING_BLOCK) {
@@ -2731,7 +2725,6 @@ fn build_partition(
             // A doc's position count equals its frequency, so no count is
             // stored — doc `i`'s slice is found from the freq prefix sum.
             let mut pos_deltas: Vec<u32> = Vec::new();
-            let mut blk_min_dl = u32::MAX;
             let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(chunk.len());
             for &(d, f, ref positions) in chunk {
                 let mut prev_p = 0u32;
@@ -2739,11 +2732,8 @@ fn build_partition(
                     pos_deltas.push(p - prev_p);
                     prev_p = p;
                 }
-                let dl = docs.num_tokens(d);
-                blk_min_dl = blk_min_dl.min(dl);
-                pairs.push((f, dl));
+                pairs.push((f, docs.num_tokens(d)));
             }
-            term_min_dl = term_min_dl.min(blk_min_dl);
             let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
             bitpack_put(&mut pos_data, &pos_deltas, pos_width);
             // Emit the block's varint metadata record.
@@ -2771,15 +2761,12 @@ fn build_partition(
             }
             prev_last_doc = last_doc;
             block_count += 1;
-            term_max_freq = term_max_freq.max(blk_max_freq);
         }
         let term_id = postings.len() as u64;
         postings.push(PostingRef {
             meta_offset,
             block_count,
             doc_count,
-            max_freq: term_max_freq,
-            min_dl: term_min_dl.max(1),
         });
         term_builder
             .insert(term.as_bytes(), term_id)
@@ -2846,6 +2833,19 @@ impl Partition {
             out[id as usize] = Arc::from(std::str::from_utf8(key).expect("utf8 term"));
         }
         out
+    }
+
+    /// Exact upper bound on a term's BM25 contribution to any doc: the max over
+    /// its per-block impact frontiers. Walks block metadata (no payload decode),
+    /// so it is cheap relative to scoring; used as the MaxScore lane bound.
+    fn term_ub(&self, term_id: u32, scorer: &MemBM25Scorer, qw: f32) -> f32 {
+        let pref = self.postings[term_id as usize];
+        let mut reader = BlockReader::new(self, &pref);
+        let mut ub = 0.0f32;
+        while let Some(bm) = reader.next_meta() {
+            ub = ub.max(bm.block_ub(scorer, qw));
+        }
+        ub
     }
 
     /// Number of docs in this partition containing `token`.
@@ -3071,14 +3071,17 @@ impl Partition {
         let mut lanes: Vec<WandLane> = Vec::with_capacity(tokens.len());
         for token in tokens {
             if let Some(id) = self.term_id(token) {
-                let pref = &self.postings[id as usize];
                 let qw = scorer.query_weight(token);
                 let cursor = PostingCursor::new(self, id);
                 let doc = cursor.doc();
                 lanes.push(WandLane {
                     cursor,
                     qw,
-                    ub: qw * scorer.doc_weight(pref.max_freq, pref.min_dl),
+                    // Exact term max contribution (tightest sound bound): the
+                    // max over the term's per-block impact frontiers. A loose
+                    // `doc_weight(max_freq, min_dl)` would over-bound and keep
+                    // terms "essential" longer, shrinking MaxScore's prune.
+                    ub: self.term_ub(id, scorer, qw),
                     doc,
                 });
             }
