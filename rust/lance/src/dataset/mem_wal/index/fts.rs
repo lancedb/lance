@@ -3126,6 +3126,29 @@ impl Partition {
             let Some(cand) = cand else {
                 break; // essential lanes exhausted
             };
+            // Block-max pre-check: bound `cand` by the essential lanes' current
+            // *block* max (tighter than their term `ub`) plus the full
+            // non-essential `ub`. If it can't beat theta, skip `cand` without
+            // the per-doc scoring or the non-essential probes (block walks).
+            let mut block_bound = cum;
+            for l in &lanes[ne..] {
+                if l.doc == Some(cand) {
+                    block_bound += l.cursor.block_ub(scorer, l.qw);
+                }
+            }
+            if block_bound <= theta {
+                for l in lanes[ne..].iter_mut() {
+                    if l.doc == Some(cand) {
+                        l.cursor.advance();
+                        l.doc = l.cursor.doc();
+                    }
+                }
+                lanes.retain(|l| l.doc.is_some());
+                if lanes.is_empty() {
+                    break;
+                }
+                continue;
+            }
             let dl = self.docs.num_tokens(cand);
             let mut score = 0.0f32;
             for l in lanes[ne..].iter_mut() {
@@ -3415,6 +3438,12 @@ impl<'a> PostingCursor<'a> {
     fn doc(&self) -> Option<u32> {
         self.cur?;
         self.docs.get(self.i).copied()
+    }
+
+    /// `qw * doc_weight` upper bound over the current block's impact frontier
+    /// (0 when exhausted). See [`BlockMeta::block_ub`].
+    fn block_ub(&self, scorer: &MemBM25Scorer, qw: f32) -> f32 {
+        self.cur.map_or(0.0, |b| b.block_ub(scorer, qw))
     }
 
     /// `doc()` under a `&mut` receiver — for use as a loop condition while the
