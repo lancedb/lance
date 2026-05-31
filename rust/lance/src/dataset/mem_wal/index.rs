@@ -14,6 +14,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::type_complexity)]
 
+mod arena_skiplist;
 mod btree;
 mod fts;
 mod hnsw;

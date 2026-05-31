@@ -3,18 +3,26 @@
 
 //! In-memory BTree index for scalar fields.
 //!
-//! Provides O(log n) lookups and range queries using crossbeam-skiplist.
-//! Used for primary key lookups and scalar column filtering.
+//! Provides O(log n) lookups and range queries. Used for primary key lookups
+//! and scalar column filtering.
+//!
+//! Backed by [`super::arena_skiplist`] — a single-writer, lock-free-read
+//! skiplist with no epoch reclamation. Reads (the point-lookup hot path and
+//! scans) take no lock and no epoch pin; writes go through an (uncontended,
+//! since the MemTable serializes them) `Mutex` that enforces the single-writer
+//! invariant the skiplist requires.
+
+use std::sync::Mutex;
 
 use arrow_array::types::*;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
-use crossbeam_skiplist::SkipMap;
 use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 use lance_index::scalar::btree::OrderableScalarValue;
 
 use super::RowPosition;
+use super::arena_skiplist::{SkipListReader, SkipListWriter, new_skiplist};
 
 /// Composite key for BTree index.
 ///
@@ -45,26 +53,42 @@ impl Ord for IndexKey {
 
 /// In-memory BTree index for scalar fields.
 ///
-/// Represents the in-memory portion of Lance's on-disk BTree index.
-/// Implemented using crossbeam-skiplist for concurrent access with O(log n) operations.
-#[derive(Debug)]
+/// Represents the in-memory portion of Lance's on-disk BTree index. Keys
+/// `(scalar_value, row_position)` are sorted by value then row_position, so the
+/// newest version of a value is the entry with the largest row_position. Point
+/// lookups seek-and-stop (see [`Self::get_newest_visible`]); range queries scan.
+///
+/// Reads go through `reader` (lock-free, no epoch pin). Writes go through
+/// `writer` under a `Mutex` enforcing the skiplist's single-writer invariant;
+/// the MemTable already serializes writes, so the lock is uncontended.
 pub struct BTreeMemIndex {
-    /// Ordered map: (scalar_value, row_position) -> (). Keys are sorted by
-    /// value then row_position, so the newest version of a value is the entry
-    /// with the largest row_position. Point lookups seek-and-stop on this
-    /// (see [`Self::get_newest_visible`]); range queries scan it.
-    lookup: SkipMap<IndexKey, ()>,
+    /// Lock-free reader over the shared skiplist (point lookups, scans).
+    reader: SkipListReader<IndexKey>,
+    /// Single writer, guarded to uphold the single-writer invariant.
+    writer: Mutex<SkipListWriter<IndexKey>>,
     /// Field ID this index is built on.
     field_id: i32,
     /// Column name (for Arrow batch lookups).
     column_name: String,
 }
 
+impl std::fmt::Debug for BTreeMemIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BTreeMemIndex")
+            .field("field_id", &self.field_id)
+            .field("column_name", &self.column_name)
+            .field("len", &self.reader.len())
+            .finish()
+    }
+}
+
 impl BTreeMemIndex {
     /// Create a new BTree index for the given field.
     pub fn new(field_id: i32, column_name: String) -> Self {
+        let (writer, reader) = new_skiplist::<IndexKey>();
         Self {
-            lookup: SkipMap::new(),
+            reader,
+            writer: Mutex::new(writer),
             field_id,
             column_name,
         }
@@ -72,13 +96,10 @@ impl BTreeMemIndex {
 
     /// Index one (value, row_position) into the ordered skiplist.
     fn add(&self, value: OrderableScalarValue, row_position: RowPosition) {
-        self.lookup.insert(
-            IndexKey {
-                value,
-                row_position,
-            },
-            (),
-        );
+        self.writer.lock().unwrap().insert(IndexKey {
+            value,
+            row_position,
+        });
     }
 
     /// The newest row position for `value` that is visible at `max_visible_row`
@@ -95,11 +116,11 @@ impl BTreeMemIndex {
             value: OrderableScalarValue(value.clone()),
             row_position: max_visible_row,
         };
-        let entry = self
-            .lookup
-            .upper_bound(std::ops::Bound::Included(&target))?;
-        let key = entry.key();
-        (key.value.0 == *value).then_some(key.row_position)
+        self.reader
+            .upper_bound_with(&target, |key| {
+                (key.value.0 == *value).then_some(key.row_position)
+            })
+            .flatten()
     }
 
     /// Get the field ID this index is built on.
@@ -205,31 +226,30 @@ impl BTreeMemIndex {
 
     /// Look up row positions for an exact value.
     pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
-        let orderable = OrderableScalarValue(value.clone());
         let start = IndexKey {
-            value: orderable.clone(),
+            value: OrderableScalarValue(value.clone()),
             row_position: 0,
         };
-        let end = IndexKey {
-            value: orderable,
-            row_position: u64::MAX,
-        };
-
-        // Range scan: all entries with the same value
-        self.lookup
-            .range(start..=end)
-            .map(|entry| entry.key().row_position)
-            .collect()
+        // Scan from the first entry for this value, stopping when the value
+        // changes — all entries with the same value, in row_position order.
+        let mut positions = Vec::new();
+        for key in self.reader.range_from(&start) {
+            if key.value.0 != *value {
+                break;
+            }
+            positions.push(key.row_position);
+        }
+        positions
     }
 
     /// Get the number of entries (not unique values).
     pub fn len(&self) -> usize {
-        self.lookup.len()
+        self.reader.len()
     }
 
     /// Check if the index is empty.
     pub fn is_empty(&self) -> bool {
-        self.lookup.is_empty()
+        self.reader.is_empty()
     }
 
     /// Get the column name.
@@ -241,8 +261,7 @@ impl BTreeMemIndex {
     pub fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
         let mut result: Vec<(OrderableScalarValue, Vec<RowPosition>)> = Vec::new();
 
-        for entry in self.lookup.iter() {
-            let key = entry.key();
+        for key in self.reader.iter() {
             if let Some(last) = result.last_mut()
                 && last.0 == key.value
             {
@@ -259,9 +278,7 @@ impl BTreeMemIndex {
     ///
     /// Returns None if the index is empty.
     pub fn data_type(&self) -> Option<arrow_schema::DataType> {
-        self.lookup
-            .front()
-            .map(|entry| entry.key().value.0.data_type())
+        self.reader.front_with(|key| key.value.0.data_type())
     }
 
     /// Export the index data as sorted RecordBatches for BTree index training.
@@ -271,13 +288,10 @@ impl BTreeMemIndex {
         use lance_index::scalar::registry::VALUE_COLUMN_NAME;
         use std::sync::Arc;
 
-        if self.lookup.is_empty() {
+        // Get the data type from the first key (None ⇒ empty index).
+        let Some(data_type) = self.reader.front_with(|key| key.value.0.data_type()) else {
             return Ok(vec![]);
-        }
-
-        // Get the data type from the first key
-        let first_entry = self.lookup.front().unwrap();
-        let data_type = first_entry.key().value.0.data_type();
+        };
 
         // Create schema for training data
         let schema = Arc::new(Schema::new(vec![
@@ -289,8 +303,7 @@ impl BTreeMemIndex {
         let mut values: Vec<ScalarValue> = Vec::with_capacity(batch_size);
         let mut row_ids: Vec<u64> = Vec::with_capacity(batch_size);
 
-        for entry in self.lookup.iter() {
-            let key = entry.key();
+        for key in self.reader.iter() {
             values.push(key.value.0.clone());
             row_ids.push(key.row_position);
 
