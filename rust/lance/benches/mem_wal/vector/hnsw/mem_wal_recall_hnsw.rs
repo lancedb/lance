@@ -439,13 +439,73 @@ async fn run_checkpoint(
         );
         std::io::stdout().flush().ok();
         writer.close().await?;
+
+        // Item 4: open the flushed generation directly from its dataset path and
+        // benchmark its on-disk IVF_HNSW_SQ read in Rust (single-thread per-query
+        // latency + recall vs brute force), sweeping ef. nprobes=1 (single part).
+        let gen_uri = format!("file://{}", gen_path);
+        let gen_ds = Dataset::open(&gen_uri).await?;
+        // Precompute brute-force ground truth once per query (corpus indices).
+        let gt_sets: Vec<std::collections::HashSet<i64>> = (0..num_queries)
+            .map(|q| {
+                let q_vec = &queries[q * DIM..(q + 1) * DIM];
+                brute_force_top_k(corpus, cp, q_vec, k)
+                    .iter()
+                    .map(|(_, id)| *id)
+                    .collect()
+            })
+            .collect();
+        let efs = [16usize, 64, 256];
+        let mut best: Option<(usize, f64, u128, u128)> = None;
+        for &ef in &efs {
+            let mut recall_sum = 0.0f64;
+            let mut lat: Vec<u128> = Vec::with_capacity(num_queries);
+            for q in 0..num_queries {
+                let q_vec = &queries[q * DIM..(q + 1) * DIM];
+                let bf_set = &gt_sets[q];
+                let q_arr = Float32Array::from(q_vec.to_vec());
+                let mut scanner = gen_ds.scan();
+                scanner.nearest(VECTOR_COL, &q_arr, k)?;
+                scanner.nprobs(1);
+                scanner.ef(ef);
+                let h_t = Instant::now();
+                let batches: Vec<RecordBatch> =
+                    scanner.try_into_stream().await?.try_collect().await?;
+                lat.push(h_t.elapsed().as_micros());
+                let mut hits = 0usize;
+                for b in &batches {
+                    if let Some(c) = b.column_by_name("id") {
+                        let col = c.as_primitive::<arrow_array::types::Int64Type>();
+                        for i in 0..col.len() {
+                            if bf_set.contains(&(col.value(i) - id_offset)) {
+                                hits += 1;
+                            }
+                        }
+                    }
+                }
+                recall_sum += hits as f64 / k as f64;
+            }
+            lat.sort();
+            let median_q = lat[lat.len() / 2];
+            let p99_q = lat[lat.len() * 99 / 100];
+            let mean_recall = recall_sum / num_queries as f64;
+            println!(
+                "FLUSHED_READ cp={} ef={} mean_recall={:.4} median_us={} p99_us={}",
+                cp, ef, mean_recall, median_q, p99_q
+            );
+            std::io::stdout().flush().ok();
+            if mean_recall >= 0.95 && best.is_none() {
+                best = Some((ef, mean_recall, median_q, p99_q));
+            }
+        }
+        let (_, mr, med, p99) = best.unwrap_or((0, 0.0, 0, 0));
         return Ok(CheckpointResult {
             rows: cp,
             write_wall,
-            mean_recall: 0.0,
+            mean_recall: mr,
             min_recall: 0.0,
-            median_query_us: 0,
-            p99_query_us: 0,
+            median_query_us: med,
+            p99_query_us: p99,
             bf_total: Duration::ZERO,
             hnsw_total: Duration::ZERO,
         });
