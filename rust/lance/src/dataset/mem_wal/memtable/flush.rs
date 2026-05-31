@@ -838,7 +838,31 @@ impl MemTableFlusher {
             .get(lance_index::vector::hnsw::builder::HNSW_METADATA_KEY)
             .cloned()
             .unwrap_or_default();
-        let index_schema: ArrowSchema = HNSW::schema().as_ref().clone();
+        // Force fullzip structural encoding for the graph's List<u32>/List<f32>
+        // columns. The HNSW graph has dense level-0 neighbor lists followed by
+        // many empty higher-level lists; the v2.x miniblock List codec mis-decodes
+        // the row count for that shape at scale (the locally-sparse empty block is
+        // missed by the global levels-per-value average), and at 2.1 it also
+        // overflows the 32 KiB miniblock cap. Fullzip round-trips it correctly.
+        let fullzip_meta = std::collections::HashMap::from([(
+            lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_string(),
+            lance_encoding::constants::STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
+        let index_schema: ArrowSchema = {
+            let base = HNSW::schema();
+            let fields = base
+                .fields()
+                .iter()
+                .map(|f| {
+                    if matches!(f.data_type(), arrow_schema::DataType::List(_)) {
+                        Arc::new(f.as_ref().clone().with_metadata(fullzip_meta.clone()))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            ArrowSchema::new(fields)
+        };
         let index_path = index_dir.clone().join(INDEX_FILE_NAME);
         let mut index_writer = FileWriter::try_new(
             self.object_store.create(&index_path).await?,
