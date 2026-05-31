@@ -576,6 +576,13 @@ struct Args {
     /// the read phase (both engines). Use with a `--rows`×`--value-size` larger
     /// than RAM. Only affects the `--storage flushed` path.
     cold: bool,
+    /// Prewarm all flushed generations (open + warm indexes) into the dataset
+    /// session before the read phase, via `DatasetMemWalExt::prewarm_mem_wal`.
+    /// Default on. `--prewarm false` disables it to measure the lazy-warm
+    /// baseline (the flushed cache is still set, so each generation is opened
+    /// on its first gen-key lookup instead of up front). Only affects the Lance
+    /// `--storage active` LSM path.
+    prewarm: bool,
     output: Option<PathBuf>,
 }
 
@@ -598,6 +605,7 @@ impl Default for Args {
             seed: 0x5EED,
             rocksdb_disable_wal: false,
             cold: false,
+            prewarm: true,
             output: None,
         }
     }
@@ -650,6 +658,7 @@ fn parse_args() -> Result<Args> {
                 args.storage = Storage::parse(&value).map_err(lance_core::Error::invalid_input)?
             }
             "--generations" => args.generations = parse_val(&flag, &value)?,
+            "--prewarm" => args.prewarm = parse_val(&flag, &value)?,
             "--lance-read-mode" => {
                 args.lance_read_mode =
                     LanceReadMode::parse(&value).map_err(lance_core::Error::invalid_input)?
@@ -864,9 +873,11 @@ async fn run_lance(
     // this, each plan-path lookup pays a fresh manifest read + Dataset open — a
     // fixed per-lookup cost independent of generation count.
     let flushed_cache = Arc::new(FlushedMemTableCache::new((gens as u64).max(1)));
-    dataset
-        .prewarm_mem_wal(std::slice::from_ref(&shard_snapshot), Some(&flushed_cache))
-        .await?;
+    if args.prewarm {
+        dataset
+            .prewarm_mem_wal(std::slice::from_ref(&shard_snapshot), Some(&flushed_cache))
+            .await?;
+    }
     let planner = Arc::new(
         LsmPointLookupPlanner::new(collector, vec![KEY_COL.to_string()], arrow_schema)
             .with_session(dataset.session())
@@ -1891,10 +1902,11 @@ fn print_comparison(results: &[EngineResult]) {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_kv_point_lookup engine={:?} storage={} generations={} key_type={} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
+        "bench=mem_wal_kv_point_lookup engine={:?} storage={} generations={} prewarm={} key_type={} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
         args.engine,
         args.storage.as_str(),
         args.generations,
+        args.prewarm,
         args.key_type.as_str(),
         args.lance_read_mode.as_str(),
         args.batch_get,
