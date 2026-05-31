@@ -2937,20 +2937,17 @@ impl Partition {
             };
             let pivot_doc = lanes[pivot].cursor.doc().unwrap();
             if lanes[0].cursor.doc().unwrap() == pivot_doc {
-                // Block-max prune: bound pivot_doc's score with each contributing
-                // lane's *current-block* max (tighter than the term-level `ub`)
-                // where its block covers pivot_doc, the term bound otherwise.
-                // Sound — lanes after `pivot` are past pivot_doc, so cannot
-                // contribute. If the bound can't beat theta, skip pivot_doc.
-                let block_ub: f32 = lanes[..=pivot]
+                // Block-max prune: bound pivot_doc's score by the sum of each
+                // contributing lane's *current-block* max (tighter than the
+                // term-level `ub`). The contributing lanes are exactly those
+                // positioned at pivot_doc — the same set the scoring loop below
+                // sums. They must all be included: ties at pivot_doc can sort a
+                // contributing lane *after* `pivot`, and omitting it would
+                // under-bound the score and unsoundly skip a true top-k doc.
+                let block_ub: f32 = lanes
                     .iter()
-                    .map(|l| {
-                        if l.cursor.current_block_covers(pivot_doc) {
-                            l.cursor.current_block_ub(scorer, l.qw)
-                        } else {
-                            l.ub
-                        }
-                    })
+                    .filter(|l| l.cursor.doc() == Some(pivot_doc))
+                    .map(|l| l.cursor.current_block_ub(scorer, l.qw))
                     .sum();
                 if block_ub <= theta {
                     for l in lanes.iter_mut() {
@@ -3222,12 +3219,6 @@ impl<'a> PostingCursor<'a> {
     fn doc(&self) -> Option<u32> {
         self.cur?;
         self.docs.get(self.i).copied()
-    }
-
-    /// Whether the current block's doc range covers `doc`.
-    fn current_block_covers(&self, doc: u32) -> bool {
-        self.cur
-            .is_some_and(|b| b.first_doc <= doc && doc <= b.last_doc)
     }
 
     /// `query_weight * doc_weight(block.max_freq, block.min_dl)` — the current
@@ -4604,7 +4595,109 @@ mod tests {
                 let want: Vec<f32> = exhaustive.iter().take(k).map(|e| e.score).collect();
                 assert_eq!(got.len(), want.len(), "k={k} tail_skip={tail_skip}");
                 for (g, w) in got.iter().zip(&want) {
-                    assert!((g - w).abs() < 1e-4, "k={k} tail_skip={tail_skip}: {g} vs {w}");
+                    assert!(
+                        (g - w).abs() < 1e-4,
+                        "k={k} tail_skip={tail_skip}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_term_wand_prune_keeps_multi_match_docs() {
+        // Regression: the block-max prune must bound a pivot doc by *every* lane
+        // positioned at it (the same set the scorer sums), not just lanes up to
+        // the pivot index. A doc matching several query terms is high-scoring
+        // but has contributing lanes that can sort *after* the pivot; bounding
+        // only `lanes[..=pivot]` under-counts its score and unsoundly skips it,
+        // dropping true top-k results (silent recall loss on OR queries).
+        //
+        // Needs a corpus rich in multi-term-match docs across frozen partitions
+        // (so block-max applies) with a warm threshold — a small fixed corpus
+        // never exercises the faulty branch.
+        let schema = create_test_schema();
+        // A 12-word vocab with Zipfian inclusion + skewed per-term frequencies:
+        // query terms have very different df/idf and per-doc tf, so a contributing
+        // lane's `ub` can be small enough to sort it *after* the pivot. Generated
+        // from a deterministic LCG so the case is reproducible without `rand`.
+        let vocab: Vec<String> = (0..12).map(|i| format!("w{i}")).collect();
+        let make_batch = |start: i32, count: i32| -> RecordBatch {
+            let ids: Vec<i32> = (start..start + count).collect();
+            let texts: Vec<String> = (start..start + count)
+                .map(|i| {
+                    let mut rng = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let mut next = || {
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (rng >> 33) as u32
+                    };
+                    let mut words: Vec<&str> = Vec::new();
+                    for (j, w) in vocab.iter().enumerate() {
+                        // Rarer words (higher j) included less often; when present,
+                        // a skewed term frequency (larger for low j).
+                        if next() % (j as u32 + 2) == 0 {
+                            let reps = 1 + (next() % (8u32.saturating_sub(j as u32 / 2).max(1)));
+                            for _ in 0..reps {
+                                words.push(w);
+                            }
+                        }
+                    }
+                    if words.is_empty() {
+                        words.push(&vocab[0]);
+                    }
+                    words.join(" ")
+                })
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(texts)),
+                ],
+            )
+            .unwrap()
+        };
+
+        // 40 freezes of 100 docs (threshold 250) => multiple multi-block
+        // partitions (so a block's max_freq differs from the partition max,
+        // making the block bound straddle the threshold) plus a live tail.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(250);
+        for b in 0..40 {
+            index
+                .insert(&make_batch(b * 100, 100), (b * 100) as u64)
+                .unwrap();
+        }
+        assert!(index.state.load_full().partitions.len() >= 2);
+
+        // Sweep every common+common and common+rare pair/triple so the lanes have
+        // a wide spread of upper bounds — the condition that exposes the prune.
+        let mut queries: Vec<String> = Vec::new();
+        for a in 0..6 {
+            for b in (a + 1)..8 {
+                queries.push(format!("w{a} w{b}"));
+                for c in (b + 1)..10 {
+                    queries.push(format!("w{a} w{b} w{c}"));
+                }
+            }
+        }
+        for query_text in &queries {
+            let query = FtsQueryExpr::match_query(query_text.as_str());
+            let mut exhaustive = index.search_query(&query);
+            exhaustive.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            for k in [1usize, 5, 10, 25] {
+                let limited = index.search_with_options(&query, SearchOptions::new().with_limit(k));
+                let mut got: Vec<f32> = limited.iter().map(|e| e.score).collect();
+                got.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let want: Vec<f32> = exhaustive.iter().take(k).map(|e| e.score).collect();
+                assert_eq!(got.len(), want.len(), "q={query_text:?} k={k}");
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(
+                        (g - w).abs() < 1e-4,
+                        "q={query_text:?} k={k}: WAND returned {g}, exhaustive top-k has {w} \
+                         (block-max prune dropped a higher-scoring multi-term-match doc)"
+                    );
                 }
             }
         }
