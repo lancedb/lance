@@ -820,8 +820,8 @@ impl Backend {
 
 /// In-memory BTree index for scalar fields.
 ///
-/// The backing [`Backend`] is selected lazily on first insert from the column's
-/// Arrow type: compact [`FixedKey`] for fixed-width integers, fat
+/// The backing `Backend` is selected lazily on first insert from the column's
+/// Arrow type: a compact `FixedKey` for fixed-width integers, fat
 /// `OrderableScalarValue` for everything else. Before the first insert the index
 /// is empty (all reads return empty / `None`).
 pub struct BTreeMemIndex {
