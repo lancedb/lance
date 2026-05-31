@@ -31,6 +31,12 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+// Optional scalable allocator to A/B per-lookup alloc/free contention under the
+// N-thread read load (enable with `--features bench-mimalloc`).
+#[cfg(feature = "bench-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

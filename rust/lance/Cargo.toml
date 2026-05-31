@@ -52,6 +52,9 @@ clap = { version = "4.1.1", features = ["derive"], optional = true }
 # `bench-rocksdb` feature. Off by default so normal builds / `cargo test`
 # never compile the bundled librocksdb C++ sources.
 rocksdb = { version = "0.23", optional = true, default-features = false }
+# Only used to A/B a scalable global allocator for the KV benchmark, behind the
+# `bench-mimalloc` feature. Off by default.
+mimalloc = { version = "0.1", optional = true }
 crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
@@ -160,6 +163,7 @@ geo = ["lance-datafusion/geo", "lance-index/geo"]
 slow_tests = []
 # Compile the RocksDB comparison arm of the mem_wal_kv_point_lookup bench.
 bench-rocksdb = ["dep:rocksdb"]
+bench-mimalloc = ["dep:mimalloc"]
 
 [[bin]]
 name = "lq"
