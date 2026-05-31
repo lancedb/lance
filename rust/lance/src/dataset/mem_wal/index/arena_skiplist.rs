@@ -397,11 +397,6 @@ impl<K: Ord> SkipListReader<K> {
     pub fn len(&self) -> usize {
         self.core.len()
     }
-
-    /// Whether the index has no entries.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 /// Forward iterator over keys in ascending order. Yields `&K` borrowed from the
@@ -445,13 +440,11 @@ mod tests {
         }
         assert_eq!(collect(&r), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(r.len(), 10);
-        assert!(!r.is_empty());
     }
 
     #[test]
     fn test_empty() {
         let (_w, r) = new_skiplist::<i64>();
-        assert!(r.is_empty());
         assert_eq!(r.len(), 0);
         assert_eq!(collect(&r), Vec::<i64>::new());
         assert_eq!(r.upper_bound_with(&5, |k| *k), None);

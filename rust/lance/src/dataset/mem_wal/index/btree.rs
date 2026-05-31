@@ -9,10 +9,17 @@
 //! Backed by [`super::arena_skiplist`] — a single-writer, lock-free-read
 //! skiplist with no epoch reclamation. Reads (the point-lookup hot path and
 //! scans) take no lock and no epoch pin; writes go through an (uncontended,
-//! since the MemTable serializes them) `Mutex` that enforces the single-writer
-//! invariant the skiplist requires.
+//! since the MemTable serializes them) `Mutex`.
+//!
+//! Two backends, chosen lazily by column type on first insert:
+//! - [`FixedIntBackend`] for fixed-width integers/dates. The skiplist key is a
+//!   compact [`FixedKey`] `{ order-preserving u64, position }` (~24B node) — the
+//!   value is *not* stored; it is decoded from the key at flush. Small nodes
+//!   match RocksDB's cache behavior on the bottom-level walk.
+//! - [`ScalarBackend`] for everything else: the original `OrderableScalarValue`
+//!   key (fat node, but handles arbitrary scalar types).
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use arrow_array::types::*;
 use arrow_array::{Array, RecordBatch};
@@ -24,7 +31,7 @@ use lance_index::scalar::btree::OrderableScalarValue;
 use super::RowPosition;
 use super::arena_skiplist::{SkipListReader, SkipListWriter, new_skiplist};
 
-/// Composite key for BTree index.
+/// Composite key for the scalar (fallback) backend.
 ///
 /// By combining (scalar_value, row_position), each entry is unique.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,50 +58,265 @@ impl Ord for IndexKey {
     }
 }
 
-/// In-memory BTree index for scalar fields.
-///
-/// Represents the in-memory portion of Lance's on-disk BTree index. Keys
-/// `(scalar_value, row_position)` are sorted by value then row_position, so the
-/// newest version of a value is the entry with the largest row_position. Point
-/// lookups seek-and-stop (see [`Self::get_newest_visible`]); range queries scan.
-///
-/// Reads go through `reader` (lock-free, no epoch pin). Writes go through
-/// `writer` under a `Mutex` enforcing the skiplist's single-writer invariant;
-/// the MemTable already serializes writes, so the lock is uncontended.
-pub struct BTreeMemIndex {
-    /// Lock-free reader over the shared skiplist (point lookups, scans).
-    reader: SkipListReader<IndexKey>,
-    /// Single writer, guarded to uphold the single-writer invariant.
-    writer: Mutex<SkipListWriter<IndexKey>>,
-    /// Field ID this index is built on.
-    field_id: i32,
-    /// Column name (for Arrow batch lookups).
-    column_name: String,
+/// Compact key for the fixed-width-integer backend: an order-preserving `u64`
+/// encoding of the value plus the row position. Sorts by `(enc, position)` —
+/// identical ordering to `(value, position)` because `enc` is order-preserving.
+/// 16 bytes, so a node is ~24B (vs ~72B for the `OrderableScalarValue` node).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FixedKey {
+    enc: u64,
+    position: RowPosition,
 }
 
-impl std::fmt::Debug for BTreeMemIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BTreeMemIndex")
-            .field("field_id", &self.field_id)
-            .field("column_name", &self.column_name)
-            .field("len", &self.reader.len())
-            .finish()
+/// Sign-flip a signed integer to an order-preserving unsigned key.
+#[inline]
+fn encode_signed(v: i64) -> u64 {
+    (v as u64) ^ (1u64 << 63)
+}
+
+#[inline]
+fn decode_signed(enc: u64) -> i64 {
+    (enc ^ (1u64 << 63)) as i64
+}
+
+/// Whether `dt` is handled by the compact fixed-width-integer backend.
+fn is_fixed_int(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+            | DataType::Date64
+    )
+}
+
+/// Order-preserving `u64` encoding of a fixed-int `ScalarValue`, or `None` if
+/// the value is null or not a fixed-int type.
+fn encode_scalar(value: &ScalarValue) -> Option<u64> {
+    Some(match value {
+        ScalarValue::Int8(Some(v)) => encode_signed(*v as i64),
+        ScalarValue::Int16(Some(v)) => encode_signed(*v as i64),
+        ScalarValue::Int32(Some(v)) => encode_signed(*v as i64),
+        ScalarValue::Int64(Some(v)) => encode_signed(*v),
+        ScalarValue::UInt8(Some(v)) => *v as u64,
+        ScalarValue::UInt16(Some(v)) => *v as u64,
+        ScalarValue::UInt32(Some(v)) => *v as u64,
+        ScalarValue::UInt64(Some(v)) => *v,
+        ScalarValue::Date32(Some(v)) => encode_signed(*v as i64),
+        ScalarValue::Date64(Some(v)) => encode_signed(*v),
+        _ => return None,
+    })
+}
+
+/// Decode a fixed-int `enc` back to its typed `ScalarValue` for `data_type`.
+fn decode_enc(enc: u64, data_type: &DataType) -> ScalarValue {
+    match data_type {
+        DataType::Int8 => ScalarValue::Int8(Some(decode_signed(enc) as i8)),
+        DataType::Int16 => ScalarValue::Int16(Some(decode_signed(enc) as i16)),
+        DataType::Int32 => ScalarValue::Int32(Some(decode_signed(enc) as i32)),
+        DataType::Int64 => ScalarValue::Int64(Some(decode_signed(enc))),
+        DataType::UInt8 => ScalarValue::UInt8(Some(enc as u8)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(enc as u16)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(enc as u32)),
+        DataType::UInt64 => ScalarValue::UInt64(Some(enc)),
+        DataType::Date32 => ScalarValue::Date32(Some(decode_signed(enc) as i32)),
+        DataType::Date64 => ScalarValue::Date64(Some(decode_signed(enc))),
+        other => unreachable!("decode_enc on non-fixed-int type {other:?}"),
     }
 }
 
-impl BTreeMemIndex {
-    /// Create a new BTree index for the given field.
-    pub fn new(field_id: i32, column_name: String) -> Self {
+/// The typed null `ScalarValue` for a fixed-int `data_type`.
+fn null_scalar(data_type: &DataType) -> ScalarValue {
+    match data_type {
+        DataType::Int8 => ScalarValue::Int8(None),
+        DataType::Int16 => ScalarValue::Int16(None),
+        DataType::Int32 => ScalarValue::Int32(None),
+        DataType::Int64 => ScalarValue::Int64(None),
+        DataType::UInt8 => ScalarValue::UInt8(None),
+        DataType::UInt16 => ScalarValue::UInt16(None),
+        DataType::UInt32 => ScalarValue::UInt32(None),
+        DataType::UInt64 => ScalarValue::UInt64(None),
+        DataType::Date32 => ScalarValue::Date32(None),
+        DataType::Date64 => ScalarValue::Date64(None),
+        other => unreachable!("null_scalar on non-fixed-int type {other:?}"),
+    }
+}
+
+/// Compact backend for fixed-width integers / dates. The skiplist holds only
+/// non-null entries as [`FixedKey`]; nulls are tracked separately (they never
+/// appear in concrete point lookups and sort first at flush).
+struct FixedIntBackend {
+    reader: SkipListReader<FixedKey>,
+    writer: Mutex<SkipListWriter<FixedKey>>,
+    /// Row positions whose value is null (rare; not on the hot path).
+    null_positions: Mutex<Vec<RowPosition>>,
+    data_type: DataType,
+}
+
+impl FixedIntBackend {
+    fn new(data_type: DataType) -> Self {
+        let (writer, reader) = new_skiplist::<FixedKey>();
+        Self {
+            reader,
+            writer: Mutex::new(writer),
+            null_positions: Mutex::new(Vec::new()),
+            data_type,
+        }
+    }
+
+    fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
+        macro_rules! insert_int {
+            ($array_type:ty, $to_i64:expr) => {{
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<arrow_array::PrimitiveArray<$array_type>>()
+                    .unwrap();
+                let mut writer = self.writer.lock().unwrap();
+                let mut nulls: Vec<RowPosition> = Vec::new();
+                for (row_idx, value) in typed.iter().enumerate() {
+                    let position = row_offset + row_idx as u64;
+                    match value {
+                        Some(v) => writer.insert(FixedKey {
+                            enc: $to_i64(v),
+                            position,
+                        }),
+                        None => nulls.push(position),
+                    }
+                }
+                drop(writer);
+                if !nulls.is_empty() {
+                    self.null_positions.lock().unwrap().extend(nulls);
+                }
+            }};
+        }
+
+        match array.data_type() {
+            DataType::Int8 => insert_int!(Int8Type, |v: i8| encode_signed(v as i64)),
+            DataType::Int16 => insert_int!(Int16Type, |v: i16| encode_signed(v as i64)),
+            DataType::Int32 => insert_int!(Int32Type, |v: i32| encode_signed(v as i64)),
+            DataType::Int64 => insert_int!(Int64Type, encode_signed),
+            DataType::UInt8 => insert_int!(UInt8Type, |v: u8| v as u64),
+            DataType::UInt16 => insert_int!(UInt16Type, |v: u16| v as u64),
+            DataType::UInt32 => insert_int!(UInt32Type, |v: u32| v as u64),
+            DataType::UInt64 => insert_int!(UInt64Type, |v: u64| v),
+            DataType::Date32 => insert_int!(Date32Type, |v: i32| encode_signed(v as i64)),
+            DataType::Date64 => insert_int!(Date64Type, encode_signed),
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "FixedIntBackend received non-fixed-int array {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn get_newest_visible(
+        &self,
+        value: &ScalarValue,
+        max_visible_row: RowPosition,
+    ) -> Option<RowPosition> {
+        // Concrete value lookups never hit nulls. A null query falls back to
+        // the newest visible null position.
+        let Some(enc) = encode_scalar(value) else {
+            if value.is_null() {
+                return self
+                    .null_positions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .filter(|p| *p <= max_visible_row)
+                    .max();
+            }
+            return None;
+        };
+        let target = FixedKey {
+            enc,
+            position: max_visible_row,
+        };
+        self.reader
+            .upper_bound_with(&target, |key| (key.enc == enc).then_some(key.position))
+            .flatten()
+    }
+
+    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+        let Some(enc) = encode_scalar(value) else {
+            if value.is_null() {
+                return self.null_positions.lock().unwrap().clone();
+            }
+            return Vec::new();
+        };
+        let start = FixedKey { enc, position: 0 };
+        let mut positions = Vec::new();
+        for key in self.reader.range_from(&start) {
+            if key.enc != enc {
+                break;
+            }
+            positions.push(key.position);
+        }
+        positions
+    }
+
+    fn len(&self) -> usize {
+        self.reader.len() + self.null_positions.lock().unwrap().len()
+    }
+
+    fn data_type(&self) -> DataType {
+        self.data_type.clone()
+    }
+
+    fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
+        let mut result: Vec<(OrderableScalarValue, Vec<RowPosition>)> = Vec::new();
+
+        // Nulls sort first (None < Some), matching OrderableScalarValue order.
+        let nulls = self.null_positions.lock().unwrap();
+        if !nulls.is_empty() {
+            let mut positions = nulls.clone();
+            positions.sort_unstable();
+            result.push((
+                OrderableScalarValue(null_scalar(&self.data_type)),
+                positions,
+            ));
+        }
+        drop(nulls);
+
+        let mut cur_enc: Option<u64> = None;
+        for key in self.reader.iter() {
+            if cur_enc == Some(key.enc) {
+                result.last_mut().unwrap().1.push(key.position);
+            } else {
+                cur_enc = Some(key.enc);
+                result.push((
+                    OrderableScalarValue(decode_enc(key.enc, &self.data_type)),
+                    vec![key.position],
+                ));
+            }
+        }
+        result
+    }
+}
+
+/// Fallback backend for arbitrary scalar types, keyed by `OrderableScalarValue`.
+struct ScalarBackend {
+    reader: SkipListReader<IndexKey>,
+    writer: Mutex<SkipListWriter<IndexKey>>,
+}
+
+impl ScalarBackend {
+    fn new() -> Self {
         let (writer, reader) = new_skiplist::<IndexKey>();
         Self {
             reader,
             writer: Mutex::new(writer),
-            field_id,
-            column_name,
         }
     }
 
-    /// Index one (value, row_position) into the ordered skiplist.
     fn add(&self, value: OrderableScalarValue, row_position: RowPosition) {
         self.writer.lock().unwrap().insert(IndexKey {
             value,
@@ -102,47 +324,6 @@ impl BTreeMemIndex {
         });
     }
 
-    /// The newest row position for `value` that is visible at `max_visible_row`
-    /// (inclusive), or `None` if the value has no visible row. A single
-    /// **seek-and-stop**: the largest key ≤ `(value, max_visible_row)` is, when
-    /// its value matches, exactly the newest visible position — no range
-    /// collect, no allocation. This is the point-lookup hot path.
-    pub fn get_newest_visible(
-        &self,
-        value: &ScalarValue,
-        max_visible_row: RowPosition,
-    ) -> Option<RowPosition> {
-        let target = IndexKey {
-            value: OrderableScalarValue(value.clone()),
-            row_position: max_visible_row,
-        };
-        self.reader
-            .upper_bound_with(&target, |key| {
-                (key.value.0 == *value).then_some(key.row_position)
-            })
-            .flatten()
-    }
-
-    /// Get the field ID this index is built on.
-    pub fn field_id(&self) -> i32 {
-        self.field_id
-    }
-
-    /// Insert rows from a batch into the index.
-    pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
-        let col_idx = batch
-            .schema()
-            .column_with_name(&self.column_name)
-            .map(|(idx, _)| idx)
-            .ok_or_else(|| {
-                Error::invalid_input(format!("Column '{}' not found in batch", self.column_name))
-            })?;
-
-        let column = batch.column(col_idx);
-        self.insert_array(column.as_ref(), row_offset)
-    }
-
-    /// Insert values from an Arrow array into the index.
     fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
         macro_rules! insert_primitive {
             ($array_type:ty, $scalar_variant:ident) => {{
@@ -224,14 +405,27 @@ impl BTreeMemIndex {
         Ok(())
     }
 
-    /// Look up row positions for an exact value.
-    pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+    fn get_newest_visible(
+        &self,
+        value: &ScalarValue,
+        max_visible_row: RowPosition,
+    ) -> Option<RowPosition> {
+        let target = IndexKey {
+            value: OrderableScalarValue(value.clone()),
+            row_position: max_visible_row,
+        };
+        self.reader
+            .upper_bound_with(&target, |key| {
+                (key.value.0 == *value).then_some(key.row_position)
+            })
+            .flatten()
+    }
+
+    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
         let start = IndexKey {
             value: OrderableScalarValue(value.clone()),
             row_position: 0,
         };
-        // Scan from the first entry for this value, stopping when the value
-        // changes — all entries with the same value, in row_position order.
         let mut positions = Vec::new();
         for key in self.reader.range_from(&start) {
             if key.value.0 != *value {
@@ -242,25 +436,16 @@ impl BTreeMemIndex {
         positions
     }
 
-    /// Get the number of entries (not unique values).
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.reader.len()
     }
 
-    /// Check if the index is empty.
-    pub fn is_empty(&self) -> bool {
-        self.reader.is_empty()
+    fn data_type(&self) -> Option<DataType> {
+        self.reader.front_with(|key| key.value.0.data_type())
     }
 
-    /// Get the column name.
-    pub fn column_name(&self) -> &str {
-        &self.column_name
-    }
-
-    /// Get a snapshot of all entries grouped by value in sorted order.
-    pub fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
+    fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
         let mut result: Vec<(OrderableScalarValue, Vec<RowPosition>)> = Vec::new();
-
         for key in self.reader.iter() {
             if let Some(last) = result.last_mut()
                 && last.0 == key.value
@@ -270,15 +455,168 @@ impl BTreeMemIndex {
             }
             result.push((key.value.clone(), vec![key.row_position]));
         }
-
         result
+    }
+}
+
+/// The chosen backend for a `BTreeMemIndex`, selected by column type.
+enum Backend {
+    FixedInt(FixedIntBackend),
+    Scalar(ScalarBackend),
+}
+
+impl Backend {
+    fn for_type(data_type: &DataType) -> Self {
+        if is_fixed_int(data_type) {
+            Self::FixedInt(FixedIntBackend::new(data_type.clone()))
+        } else {
+            Self::Scalar(ScalarBackend::new())
+        }
+    }
+
+    fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
+        match self {
+            Self::FixedInt(b) => b.insert_array(array, row_offset),
+            Self::Scalar(b) => b.insert_array(array, row_offset),
+        }
+    }
+
+    fn get_newest_visible(&self, value: &ScalarValue, max: RowPosition) -> Option<RowPosition> {
+        match self {
+            Self::FixedInt(b) => b.get_newest_visible(value, max),
+            Self::Scalar(b) => b.get_newest_visible(value, max),
+        }
+    }
+
+    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+        match self {
+            Self::FixedInt(b) => b.get(value),
+            Self::Scalar(b) => b.get(value),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::FixedInt(b) => b.len(),
+            Self::Scalar(b) => b.len(),
+        }
+    }
+
+    fn data_type(&self) -> Option<DataType> {
+        match self {
+            Self::FixedInt(b) => Some(b.data_type()),
+            Self::Scalar(b) => b.data_type(),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
+        match self {
+            Self::FixedInt(b) => b.snapshot(),
+            Self::Scalar(b) => b.snapshot(),
+        }
+    }
+}
+
+/// In-memory BTree index for scalar fields.
+///
+/// The backing [`Backend`] is selected lazily on first insert from the column's
+/// Arrow type: compact [`FixedKey`] for fixed-width integers, fat
+/// `OrderableScalarValue` for everything else. Before the first insert the index
+/// is empty (all reads return empty / `None`).
+pub struct BTreeMemIndex {
+    backend: OnceLock<Backend>,
+    /// Field ID this index is built on.
+    field_id: i32,
+    /// Column name (for Arrow batch lookups).
+    column_name: String,
+}
+
+impl std::fmt::Debug for BTreeMemIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BTreeMemIndex")
+            .field("field_id", &self.field_id)
+            .field("column_name", &self.column_name)
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl BTreeMemIndex {
+    /// Create a new BTree index for the given field.
+    pub fn new(field_id: i32, column_name: String) -> Self {
+        Self {
+            backend: OnceLock::new(),
+            field_id,
+            column_name,
+        }
+    }
+
+    /// The newest row position for `value` that is visible at `max_visible_row`
+    /// (inclusive), or `None` if the value has no visible row. A single
+    /// **seek-and-stop** on the backing skiplist — no range collect, no
+    /// allocation. This is the point-lookup hot path.
+    pub fn get_newest_visible(
+        &self,
+        value: &ScalarValue,
+        max_visible_row: RowPosition,
+    ) -> Option<RowPosition> {
+        self.backend
+            .get()?
+            .get_newest_visible(value, max_visible_row)
+    }
+
+    /// Get the field ID this index is built on.
+    pub fn field_id(&self) -> i32 {
+        self.field_id
+    }
+
+    /// Insert rows from a batch into the index.
+    pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+        let col_idx = batch
+            .schema()
+            .column_with_name(&self.column_name)
+            .map(|(idx, _)| idx)
+            .ok_or_else(|| {
+                Error::invalid_input(format!("Column '{}' not found in batch", self.column_name))
+            })?;
+
+        let column = batch.column(col_idx);
+        let backend = self
+            .backend
+            .get_or_init(|| Backend::for_type(column.data_type()));
+        backend.insert_array(column.as_ref(), row_offset)
+    }
+
+    /// Look up row positions for an exact value.
+    pub fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+        self.backend.get().map(|b| b.get(value)).unwrap_or_default()
+    }
+
+    /// Get the number of entries (not unique values).
+    pub fn len(&self) -> usize {
+        self.backend.get().map(|b| b.len()).unwrap_or(0)
+    }
+
+    /// Check if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get the column name.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+
+    /// Get a snapshot of all entries grouped by value in sorted order.
+    pub fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
+        self.backend.get().map(|b| b.snapshot()).unwrap_or_default()
     }
 
     /// Get the data type of the indexed column.
     ///
     /// Returns None if the index is empty.
     pub fn data_type(&self) -> Option<arrow_schema::DataType> {
-        self.reader.front_with(|key| key.value.0.data_type())
+        self.backend.get().and_then(|b| b.data_type())
     }
 
     /// Export the index data as sorted RecordBatches for BTree index training.
@@ -288,12 +626,12 @@ impl BTreeMemIndex {
         use lance_index::scalar::registry::VALUE_COLUMN_NAME;
         use std::sync::Arc;
 
-        // Get the data type from the first key (None ⇒ empty index).
-        let Some(data_type) = self.reader.front_with(|key| key.value.0.data_type()) else {
+        let snapshot = self.snapshot();
+        if snapshot.is_empty() {
             return Ok(vec![]);
-        };
+        }
 
-        // Create schema for training data
+        let data_type = snapshot[0].0.0.data_type();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, data_type, true),
             Field::new(ROW_ID, DataType::UInt64, false),
@@ -303,47 +641,41 @@ impl BTreeMemIndex {
         let mut values: Vec<ScalarValue> = Vec::with_capacity(batch_size);
         let mut row_ids: Vec<u64> = Vec::with_capacity(batch_size);
 
-        for key in self.reader.iter() {
-            values.push(key.value.0.clone());
-            row_ids.push(key.row_position);
-
-            if values.len() >= batch_size {
-                // Build and emit a batch
-                let batch = self.build_training_batch(&schema, &values, &row_ids)?;
-                batches.push(batch);
-                values.clear();
-                row_ids.clear();
+        // Expand each (value, [positions]) group into one row per position, in
+        // sorted (value, position) order.
+        for (value, positions) in &snapshot {
+            for position in positions {
+                values.push(value.0.clone());
+                row_ids.push(*position);
+                if values.len() >= batch_size {
+                    batches.push(build_training_batch(&schema, &values, &row_ids)?);
+                    values.clear();
+                    row_ids.clear();
+                }
             }
         }
-
-        // Emit any remaining data
         if !values.is_empty() {
-            let batch = self.build_training_batch(&schema, &values, &row_ids)?;
-            batches.push(batch);
+            batches.push(build_training_batch(&schema, &values, &row_ids)?);
         }
 
         Ok(batches)
     }
+}
 
-    /// Build a single training batch from values and row IDs.
-    fn build_training_batch(
-        &self,
-        schema: &std::sync::Arc<arrow_schema::Schema>,
-        values: &[ScalarValue],
-        row_ids: &[u64],
-    ) -> Result<RecordBatch> {
-        use arrow_array::UInt64Array;
-        use std::sync::Arc;
+/// Build a single training batch from values and row IDs.
+fn build_training_batch(
+    schema: &std::sync::Arc<arrow_schema::Schema>,
+    values: &[ScalarValue],
+    row_ids: &[u64],
+) -> Result<RecordBatch> {
+    use arrow_array::UInt64Array;
+    use std::sync::Arc;
 
-        // Convert ScalarValues to Arrow array
-        let value_array = ScalarValue::iter_to_array(values.iter().cloned())?;
+    let value_array = ScalarValue::iter_to_array(values.iter().cloned())?;
+    let row_id_array = Arc::new(UInt64Array::from(row_ids.to_vec()));
 
-        // Create row_id array
-        let row_id_array = Arc::new(UInt64Array::from(row_ids.to_vec()));
-
-        RecordBatch::try_new(schema.clone(), vec![value_array, row_id_array])
-            .map_err(|e| Error::io(format!("Failed to create training batch: {}", e)))
-    }
+    RecordBatch::try_new(schema.clone(), vec![value_array, row_id_array])
+        .map_err(|e| Error::io(format!("Failed to create training batch: {}", e)))
 }
 
 /// Configuration for a BTree scalar index.
@@ -360,7 +692,7 @@ pub struct BTreeIndexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{Int32Array, Int64Array, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use std::sync::Arc;
 
@@ -388,31 +720,20 @@ mod tests {
         let index = BTreeMemIndex::new(0, "id".to_string());
 
         let batch = create_test_batch(&schema, 0);
-        // row_offset = 0 for first batch
         index.insert(&batch, 0).unwrap();
 
         assert_eq!(index.len(), 3);
-
-        // Row positions are 0, 1, 2 for the first batch
-        let result = index.get(&ScalarValue::Int32(Some(0)));
-        assert!(!result.is_empty());
-        assert_eq!(result, vec![0]);
-
-        let result = index.get(&ScalarValue::Int32(Some(1)));
-        assert!(!result.is_empty());
-        assert_eq!(result, vec![1]);
+        assert_eq!(index.get(&ScalarValue::Int32(Some(0))), vec![0]);
+        assert_eq!(index.get(&ScalarValue::Int32(Some(1))), vec![1]);
     }
 
     #[test]
     fn test_btree_get_newest_visible_seek_and_stop() {
         let schema = create_test_schema();
         let index = BTreeMemIndex::new(0, "id".to_string());
-        // ids 0,1,2 at positions 0,1,2 ...
         index.insert(&create_test_batch(&schema, 0), 0).unwrap();
-        // ... then the same ids again at positions 3,4,5 (an update).
         index.insert(&create_test_batch(&schema, 0), 3).unwrap();
 
-        // With everything visible, the newest (largest) position wins.
         assert_eq!(
             index.get_newest_visible(&ScalarValue::Int32(Some(0)), 5),
             Some(3)
@@ -421,13 +742,12 @@ mod tests {
             index.get_newest_visible(&ScalarValue::Int32(Some(1)), 5),
             Some(4)
         );
-        // Visibility watermark below the newest update → returns the older
-        // visible version, not the invisible newer one.
+        // Visibility watermark below the newest update.
         assert_eq!(
             index.get_newest_visible(&ScalarValue::Int32(Some(0)), 2),
             Some(0)
         );
-        // Watermark below every version of the key → no visible row.
+        // Watermark below every version.
         assert_eq!(
             index.get_newest_visible(&ScalarValue::Int32(Some(1)), 0),
             None
@@ -437,31 +757,125 @@ mod tests {
             index.get_newest_visible(&ScalarValue::Int32(Some(999)), 5),
             None
         );
-        // The ordered range scan still returns every position.
         let mut all = index.get(&ScalarValue::Int32(Some(0)));
         all.sort_unstable();
         assert_eq!(all, vec![0, 3]);
     }
 
     #[test]
+    fn test_fixed_int_signed_ordering_negatives() {
+        // Negative + positive i64 keys must sort correctly via the encoding.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "k",
+            DataType::Int64,
+            true,
+        )]));
+        let index = BTreeMemIndex::new(0, "k".to_string());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![
+                Some(5),
+                Some(-3),
+                Some(i64::MIN),
+                Some(i64::MAX),
+                Some(0),
+            ]))],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        // snapshot is value-sorted; decode round-trips.
+        let snap = index.snapshot();
+        let values: Vec<i64> = snap
+            .iter()
+            .map(|(v, _)| match v.0 {
+                ScalarValue::Int64(Some(x)) => x,
+                _ => panic!("unexpected"),
+            })
+            .collect();
+        assert_eq!(values, vec![i64::MIN, -3, 0, 5, i64::MAX]);
+        assert_eq!(index.get(&ScalarValue::Int64(Some(-3))), vec![1]);
+        assert_eq!(
+            index.get_newest_visible(&ScalarValue::Int64(Some(i64::MIN)), 10),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_fixed_int_unsigned() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "k",
+            DataType::UInt32,
+            false,
+        )]));
+        let index = BTreeMemIndex::new(0, "k".to_string());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt32Array::from(vec![10u32, 4_000_000_000, 1]))],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        let snap = index.snapshot();
+        let values: Vec<u32> = snap
+            .iter()
+            .map(|(v, _)| match v.0 {
+                ScalarValue::UInt32(Some(x)) => x,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(values, vec![1, 10, 4_000_000_000]);
+        assert_eq!(
+            index.get(&ScalarValue::UInt32(Some(4_000_000_000))),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_fixed_int_nulls() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "k",
+            DataType::Int32,
+            true,
+        )]));
+        let index = BTreeMemIndex::new(0, "k".to_string());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![
+                Some(7),
+                None,
+                Some(3),
+                None,
+            ]))],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        assert_eq!(index.len(), 4);
+        // Nulls sort first.
+        let snap = index.snapshot();
+        assert_eq!(snap[0].0.0, ScalarValue::Int32(None));
+        assert_eq!(snap[0].1, vec![1, 3]);
+        assert_eq!(snap[1].0.0, ScalarValue::Int32(Some(3)));
+        assert_eq!(snap[2].0.0, ScalarValue::Int32(Some(7)));
+        // Null lookup returns null positions.
+        let mut nulls = index.get(&ScalarValue::Int32(None));
+        nulls.sort_unstable();
+        assert_eq!(nulls, vec![1, 3]);
+        assert_eq!(
+            index.get_newest_visible(&ScalarValue::Int32(None), 10),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn test_btree_index_multiple_batches() {
         let schema = create_test_schema();
         let index = BTreeMemIndex::new(0, "id".to_string());
-
-        let batch1 = create_test_batch(&schema, 0);
-        let batch2 = create_test_batch(&schema, 10);
-
-        // First batch: rows 0-2
-        index.insert(&batch1, 0).unwrap();
-        // Second batch: rows 3-5 (row_offset = 3 since batch1 had 3 rows)
-        index.insert(&batch2, 3).unwrap();
+        index.insert(&create_test_batch(&schema, 0), 0).unwrap();
+        index.insert(&create_test_batch(&schema, 10), 3).unwrap();
 
         assert_eq!(index.len(), 6);
-
-        // Value 10 is at row position 3 (first row of second batch)
-        let result = index.get(&ScalarValue::Int32(Some(10)));
-        assert!(!result.is_empty());
-        assert_eq!(result, vec![3]);
+        assert_eq!(index.get(&ScalarValue::Int32(Some(10))), vec![3]);
     }
 
     #[test]
@@ -471,67 +885,74 @@ mod tests {
 
         let schema = create_test_schema();
         let index = BTreeMemIndex::new(0, "id".to_string());
+        index.insert(&create_test_batch(&schema, 0), 0).unwrap();
+        index.insert(&create_test_batch(&schema, 10), 3).unwrap();
 
-        let batch1 = create_test_batch(&schema, 0); // ids: 0, 1, 2
-        let batch2 = create_test_batch(&schema, 10); // ids: 10, 11, 12
-
-        index.insert(&batch1, 0).unwrap(); // row positions 0, 1, 2
-        index.insert(&batch2, 3).unwrap(); // row positions 3, 4, 5
-
-        // Export as training batches (batch_size = 100 to get all in one batch)
         let batches = index.to_training_batches(100).unwrap();
         assert_eq!(batches.len(), 1);
-
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 6);
-
-        // Check schema
         assert_eq!(batch.schema().field(0).name(), VALUE_COLUMN_NAME);
         assert_eq!(batch.schema().field(1).name(), ROW_ID);
 
-        // Data should be sorted by value (0, 1, 2, 10, 11, 12)
         let values = batch
             .column_by_name(VALUE_COLUMN_NAME)
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(values.value(0), 0);
-        assert_eq!(values.value(1), 1);
-        assert_eq!(values.value(2), 2);
-        assert_eq!(values.value(3), 10);
-        assert_eq!(values.value(4), 11);
-        assert_eq!(values.value(5), 12);
-
-        // Check row IDs match positions
+        assert_eq!(
+            (0..6).map(|i| values.value(i)).collect::<Vec<_>>(),
+            vec![0, 1, 2, 10, 11, 12]
+        );
         let row_ids = batch
             .column_by_name(ROW_ID)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
-        assert_eq!(row_ids.value(0), 0); // id=0 -> row 0
-        assert_eq!(row_ids.value(1), 1); // id=1 -> row 1
-        assert_eq!(row_ids.value(2), 2); // id=2 -> row 2
-        assert_eq!(row_ids.value(3), 3); // id=10 -> row 3
-        assert_eq!(row_ids.value(4), 4); // id=11 -> row 4
-        assert_eq!(row_ids.value(5), 5); // id=12 -> row 5
+        assert_eq!(
+            (0..6).map(|i| row_ids.value(i)).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
     }
 
     #[test]
     fn test_btree_index_snapshot() {
         let schema = create_test_schema();
         let index = BTreeMemIndex::new(0, "id".to_string());
-
-        let batch = create_test_batch(&schema, 0);
-        index.insert(&batch, 0).unwrap();
+        index.insert(&create_test_batch(&schema, 0), 0).unwrap();
 
         let snapshot = index.snapshot();
         assert_eq!(snapshot.len(), 3);
-
-        // Snapshot should be in sorted order
         assert_eq!(snapshot[0].0.0, ScalarValue::Int32(Some(0)));
         assert_eq!(snapshot[1].0.0, ScalarValue::Int32(Some(1)));
         assert_eq!(snapshot[2].0.0, ScalarValue::Int32(Some(2)));
+    }
+
+    #[test]
+    fn test_scalar_backend_strings() {
+        // Utf8 routes to the scalar backend (Stage A); verify it still works.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            true,
+        )]));
+        let index = BTreeMemIndex::new(0, "s".to_string());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                "delta", "alpha", "charlie",
+            ]))],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        assert_eq!(
+            index.get_newest_visible(&ScalarValue::Utf8(Some("alpha".to_string())), 10),
+            Some(1)
+        );
+        let snap = index.snapshot();
+        assert_eq!(snap[0].0.0, ScalarValue::Utf8(Some("alpha".to_string())));
+        assert_eq!(snap[2].0.0, ScalarValue::Utf8(Some("delta".to_string())));
     }
 }
