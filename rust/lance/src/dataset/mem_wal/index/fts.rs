@@ -2689,107 +2689,6 @@ fn block_impacts(pairs: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
     frontier
 }
 
-/// One term's self-contained compressed posting list, produced independently
-/// (and in parallel) before sequential assembly. `df`/`pos`/`blocks` carry only
-/// relative/derived offsets, so they concatenate directly; the two absolute
-/// term-level offsets are written during assembly.
-struct TermBlob {
-    /// VByte(doc-id gaps) then VByte(freqs) per block.
-    df: Vec<u8>,
-    /// bit-packed position deltas per block.
-    pos: Vec<u8>,
-    /// per-block varint metadata (excluding the two absolute term-level offsets).
-    blocks: Vec<u8>,
-    block_count: u32,
-    doc_count: u32,
-    max_freq: u32,
-    min_dl: u32,
-}
-
-/// Encode one term's blocks into a [`TermBlob`]. All offsets emitted here are
-/// relative to this term (per-block doc/freq offsets are derived from widths;
-/// the position offset is stored as a per-block byte length), so the blobs can
-/// be concatenated across terms without rewriting.
-fn encode_term(
-    docs_for_term: &[(u32, u32, Vec<u32>)],
-    docs: &DocSet,
-    bp: &BitPacker4x,
-) -> TermBlob {
-    let mut df: Vec<u8> = Vec::new();
-    let mut pos: Vec<u8> = Vec::new();
-    let mut blocks: Vec<u8> = Vec::new();
-    let mut term_max_freq = 0u32;
-    let mut term_min_dl = u32::MAX;
-    let mut block_count = 0u32;
-    let mut prev_last_doc = 0u32;
-    for chunk in docs_for_term.chunks(POSTING_BLOCK) {
-        let pos_offset_before = pos.len();
-        let first_doc = chunk[0].0;
-        let last_doc = chunk[chunk.len() - 1].0;
-        // doc ids: bit-pack consecutive gaps from `first_doc` (width tracks the
-        // largest gap, not the block span — much tighter for dense terms).
-        let docs_block: Vec<u32> = chunk.iter().map(|&(d, _, _)| d).collect();
-        let doc_width = doc_block_width(bp, &docs_block, first_doc);
-        pack_doc_block(bp, &mut df, &docs_block, first_doc, doc_width);
-        // frequencies: bit-pack at a fixed block width.
-        let blk_max_freq = chunk.iter().map(|&(_, f, _)| f).max().unwrap_or(0);
-        let freq_width = bit_width(blk_max_freq);
-        let freqs: Vec<u32> = chunk.iter().map(|&(_, f, _)| f).collect();
-        pack_block(bp, &mut df, &freqs, freq_width);
-        // positions: one bit-packed delta stream for the whole block. A doc's
-        // position count equals its frequency, so no count is stored — doc `i`'s
-        // slice is found from the freq prefix sum.
-        let mut pos_deltas: Vec<u32> = Vec::new();
-        let mut blk_min_dl = u32::MAX;
-        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(chunk.len());
-        for &(d, f, ref positions) in chunk {
-            let mut prev_p = 0u32;
-            for &p in positions {
-                pos_deltas.push(p - prev_p);
-                prev_p = p;
-            }
-            let dl = docs.num_tokens(d);
-            blk_min_dl = blk_min_dl.min(dl);
-            pairs.push((f, dl));
-        }
-        term_min_dl = term_min_dl.min(blk_min_dl);
-        let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
-        bitpack_put(&mut pos, &pos_deltas, pos_width);
-        // Emit the block's varint metadata record.
-        let first_field = if block_count == 0 {
-            first_doc
-        } else {
-            first_doc - prev_last_doc
-        };
-        put_varint(&mut blocks, first_field as u64);
-        put_varint(&mut blocks, (last_doc - first_doc) as u64);
-        blocks.push(doc_width);
-        blocks.push(freq_width);
-        blocks.push(pos_width);
-        put_varint(&mut blocks, (pos.len() - pos_offset_before) as u64);
-        // Block-max impacts: the Pareto (freq, dl) frontier, as a count then
-        // that many varint pairs (read back by `BlockReader::next_meta`).
-        let impacts = block_impacts(&mut pairs);
-        put_varint(&mut blocks, impacts.len() as u64);
-        for (f, d) in impacts {
-            put_varint(&mut blocks, f as u64);
-            put_varint(&mut blocks, d as u64);
-        }
-        prev_last_doc = last_doc;
-        block_count += 1;
-        term_max_freq = term_max_freq.max(blk_max_freq);
-    }
-    TermBlob {
-        df,
-        pos,
-        blocks,
-        block_count,
-        doc_count: docs_for_term.len() as u32,
-        max_freq: term_max_freq,
-        min_dl: term_min_dl.max(1),
-    }
-}
-
 /// Build a partition from `(term, sorted (doc, freq, positions))` entries.
 /// Each term's docs must already be sorted ascending by doc id.
 fn build_partition(
@@ -2797,38 +2696,91 @@ fn build_partition(
     docs: DocSet,
 ) -> Partition {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    // Encode each term's self-contained blobs in parallel (order preserved), then
-    // stitch them sequentially — the heavy bit-packing parallelizes; assembly is
-    // cheap concatenation + FST build.
-    let blobs: Vec<(Arc<str>, TermBlob)> = entries
-        .into_par_iter()
-        .map(|(term, docs_for_term)| {
-            let bp = BitPacker4x::new();
-            let blob = encode_term(&docs_for_term, &docs, &bp);
-            (term, blob)
-        })
-        .collect();
+    let bp = BitPacker4x::new();
     // Terms are inserted in sorted order; the FST value is the dense term id.
     let mut term_builder = fst::MapBuilder::memory();
-    let mut postings = Vec::with_capacity(blobs.len());
+    let mut postings = Vec::with_capacity(entries.len());
     let mut block_bytes: Vec<u8> = Vec::new();
     let mut doc_freq_data: Vec<u8> = Vec::new();
     let mut pos_data: Vec<u8> = Vec::new();
-    for (term, blob) in blobs {
-        let term_id = postings.len() as u64;
+    for (term, docs_for_term) in entries {
+        let doc_count = docs_for_term.len() as u32;
         let meta_offset = block_bytes.len() as u32;
-        // Term-level absolute start offsets, then the term's relative block bytes.
+        // Term-level start offsets; per-block doc/freq offsets are derived from
+        // widths, position offsets accumulate the stored per-block byte length.
         put_varint(&mut block_bytes, doc_freq_data.len() as u64);
         put_varint(&mut block_bytes, pos_data.len() as u64);
-        block_bytes.extend_from_slice(&blob.blocks);
-        doc_freq_data.extend_from_slice(&blob.df);
-        pos_data.extend_from_slice(&blob.pos);
+        let mut term_max_freq = 0u32;
+        let mut term_min_dl = u32::MAX;
+        let mut block_count = 0u32;
+        let mut prev_last_doc = 0u32;
+        for chunk in docs_for_term.chunks(POSTING_BLOCK) {
+            let pos_offset_before = pos_data.len();
+            let first_doc = chunk[0].0;
+            let last_doc = chunk[chunk.len() - 1].0;
+            // doc ids: bit-pack consecutive gaps from `first_doc` (width tracks
+            // the largest gap, not the block span — much tighter for dense terms).
+            let docs_block: Vec<u32> = chunk.iter().map(|&(d, _, _)| d).collect();
+            let doc_width = doc_block_width(&bp, &docs_block, first_doc);
+            pack_doc_block(&bp, &mut doc_freq_data, &docs_block, first_doc, doc_width);
+            // frequencies: bit-pack at a fixed block width.
+            let blk_max_freq = chunk.iter().map(|&(_, f, _)| f).max().unwrap_or(0);
+            let freq_width = bit_width(blk_max_freq);
+            let freqs: Vec<u32> = chunk.iter().map(|&(_, f, _)| f).collect();
+            pack_block(&bp, &mut doc_freq_data, &freqs, freq_width);
+            // positions: one bit-packed delta stream for the whole block.
+            // A doc's position count equals its frequency, so no count is
+            // stored — doc `i`'s slice is found from the freq prefix sum.
+            let mut pos_deltas: Vec<u32> = Vec::new();
+            let mut blk_min_dl = u32::MAX;
+            let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(chunk.len());
+            for &(d, f, ref positions) in chunk {
+                let mut prev_p = 0u32;
+                for &p in positions {
+                    pos_deltas.push(p - prev_p);
+                    prev_p = p;
+                }
+                let dl = docs.num_tokens(d);
+                blk_min_dl = blk_min_dl.min(dl);
+                pairs.push((f, dl));
+            }
+            term_min_dl = term_min_dl.min(blk_min_dl);
+            let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
+            bitpack_put(&mut pos_data, &pos_deltas, pos_width);
+            // Emit the block's varint metadata record.
+            let first_field = if block_count == 0 {
+                first_doc
+            } else {
+                first_doc - prev_last_doc
+            };
+            put_varint(&mut block_bytes, first_field as u64);
+            put_varint(&mut block_bytes, (last_doc - first_doc) as u64);
+            block_bytes.push(doc_width);
+            block_bytes.push(freq_width);
+            block_bytes.push(pos_width);
+            put_varint(
+                &mut block_bytes,
+                (pos_data.len() - pos_offset_before) as u64,
+            );
+            // Block-max impacts: the Pareto (freq, dl) frontier, as a count then
+            // that many varint pairs (read back by `BlockReader::next_meta`).
+            let impacts = block_impacts(&mut pairs);
+            put_varint(&mut block_bytes, impacts.len() as u64);
+            for (f, d) in impacts {
+                put_varint(&mut block_bytes, f as u64);
+                put_varint(&mut block_bytes, d as u64);
+            }
+            prev_last_doc = last_doc;
+            block_count += 1;
+            term_max_freq = term_max_freq.max(blk_max_freq);
+        }
+        let term_id = postings.len() as u64;
         postings.push(PostingRef {
             meta_offset,
-            block_count: blob.block_count,
-            doc_count: blob.doc_count,
-            max_freq: blob.max_freq,
-            min_dl: blob.min_dl,
+            block_count,
+            doc_count,
+            max_freq: term_max_freq,
+            min_dl: term_min_dl.max(1),
         });
         term_builder
             .insert(term.as_bytes(), term_id)
