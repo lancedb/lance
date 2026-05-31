@@ -11,11 +11,15 @@
 //! scans) take no lock and no epoch pin; writes go through an (uncontended,
 //! since the MemTable serializes them) `Mutex`.
 //!
-//! Two backends, chosen lazily by column type on first insert:
-//! - [`FixedIntBackend`] for fixed-width integers/dates. The skiplist key is a
-//!   compact [`FixedKey`] `{ order-preserving u64, position }` (~24B node) — the
-//!   value is *not* stored; it is decoded from the key at flush. Small nodes
-//!   match RocksDB's cache behavior on the bottom-level walk.
+//! Three backends, chosen lazily by column type on first insert. The compact
+//! backends store only a small comparable key + the row position (not the fat
+//! value) so nodes are RocksDB-sized; the value is decoded from the key at
+//! flush. Small nodes match RocksDB's cache behavior on the bottom-level walk.
+//! - [`FixedIntBackend`] for fixed-width integers/dates: key is a compact
+//!   [`FixedKey`] `{ order-preserving u64, position }` (~24B node).
+//! - [`BytesBackend`] for strings / binary / `FixedSizeBinary` (UUID): key is
+//!   [`BytesKey`] with the bytes stored inline for small values (UUID, short
+//!   keys) and boxed only for long ones.
 //! - [`ScalarBackend`] for everything else: the original `OrderableScalarValue`
 //!   key (fat node, but handles arbitrary scalar types).
 
@@ -145,6 +149,137 @@ fn null_scalar(data_type: &DataType) -> ScalarValue {
         DataType::Date32 => ScalarValue::Date32(None),
         DataType::Date64 => ScalarValue::Date64(None),
         other => unreachable!("null_scalar on non-fixed-int type {other:?}"),
+    }
+}
+
+/// Max key length stored inline in [`InlineBytes`]. 23 covers a 16-byte UUID
+/// (`FixedSizeBinary(16)`) and short string/binary primary keys, keeping the
+/// node a single allocation (no second cache miss on the seek).
+const INLINE_CAP: usize = 23;
+
+/// A byte key that lives inline in the node for small values and spills to the
+/// heap only for long ones — so the common cases (UUID, short string PKs) get
+/// the small-node win, and long keys still work (with the usual boxed penalty).
+enum InlineBytes {
+    Inline { len: u8, buf: [u8; INLINE_CAP] },
+    Heap(Box<[u8]>),
+}
+
+impl InlineBytes {
+    fn new(bytes: &[u8]) -> Self {
+        if bytes.len() <= INLINE_CAP {
+            let mut buf = [0u8; INLINE_CAP];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Self::Inline {
+                len: bytes.len() as u8,
+                buf,
+            }
+        } else {
+            Self::Heap(bytes.into())
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, buf } => &buf[..*len as usize],
+            Self::Heap(b) => b,
+        }
+    }
+}
+
+impl PartialEq for InlineBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+impl Eq for InlineBytes {}
+impl PartialOrd for InlineBytes {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for InlineBytes {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+/// Compact key for the byte backend: an order-preserving inline byte key plus
+/// the row position. Sorts by `(bytes, position)` — lexicographic byte order is
+/// the natural order for strings, binary, and `FixedSizeBinary`/UUID.
+struct BytesKey {
+    bytes: InlineBytes,
+    position: RowPosition,
+}
+
+impl PartialEq for BytesKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.position == other.position && self.bytes == other.bytes
+    }
+}
+impl Eq for BytesKey {}
+impl PartialOrd for BytesKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BytesKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bytes
+            .cmp(&other.bytes)
+            .then(self.position.cmp(&other.position))
+    }
+}
+
+/// Whether `dt` is handled by the compact byte backend (strings / binary /
+/// fixed-size binary, including UUID).
+fn is_bytes_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+/// The order-preserving key bytes for a byte-typed `ScalarValue`, or `None` if
+/// null or not a byte type. Strings encode as their UTF-8 bytes.
+fn value_bytes(value: &ScalarValue) -> Option<&[u8]> {
+    match value {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.as_bytes()),
+        ScalarValue::Binary(Some(b))
+        | ScalarValue::LargeBinary(Some(b))
+        | ScalarValue::FixedSizeBinary(_, Some(b)) => Some(b.as_slice()),
+        _ => None,
+    }
+}
+
+/// Decode key bytes back to a typed `ScalarValue` for `data_type`.
+fn decode_bytes(bytes: &[u8], data_type: &DataType) -> ScalarValue {
+    match data_type {
+        DataType::Utf8 => ScalarValue::Utf8(Some(String::from_utf8_lossy(bytes).into_owned())),
+        DataType::LargeUtf8 => {
+            ScalarValue::LargeUtf8(Some(String::from_utf8_lossy(bytes).into_owned()))
+        }
+        DataType::Binary => ScalarValue::Binary(Some(bytes.to_vec())),
+        DataType::LargeBinary => ScalarValue::LargeBinary(Some(bytes.to_vec())),
+        DataType::FixedSizeBinary(n) => ScalarValue::FixedSizeBinary(*n, Some(bytes.to_vec())),
+        other => unreachable!("decode_bytes on non-byte type {other:?}"),
+    }
+}
+
+/// The typed null `ScalarValue` for a byte `data_type`.
+fn null_bytes_scalar(data_type: &DataType) -> ScalarValue {
+    match data_type {
+        DataType::Utf8 => ScalarValue::Utf8(None),
+        DataType::LargeUtf8 => ScalarValue::LargeUtf8(None),
+        DataType::Binary => ScalarValue::Binary(None),
+        DataType::LargeBinary => ScalarValue::LargeBinary(None),
+        DataType::FixedSizeBinary(n) => ScalarValue::FixedSizeBinary(*n, None),
+        other => unreachable!("null_bytes_scalar on non-byte type {other:?}"),
     }
 }
 
@@ -294,6 +429,163 @@ impl FixedIntBackend {
                 cur_enc = Some(key.enc);
                 result.push((
                     OrderableScalarValue(decode_enc(key.enc, &self.data_type)),
+                    vec![key.position],
+                ));
+            }
+        }
+        result
+    }
+}
+
+/// Compact backend for byte-typed columns (strings / binary / `FixedSizeBinary`
+/// / UUID). The skiplist holds non-null entries as [`BytesKey`] (key bytes
+/// inline for small values); nulls are tracked separately and sort first.
+struct BytesBackend {
+    reader: SkipListReader<BytesKey>,
+    writer: Mutex<SkipListWriter<BytesKey>>,
+    null_positions: Mutex<Vec<RowPosition>>,
+    data_type: DataType,
+}
+
+impl BytesBackend {
+    fn new(data_type: DataType) -> Self {
+        let (writer, reader) = new_skiplist::<BytesKey>();
+        Self {
+            reader,
+            writer: Mutex::new(writer),
+            null_positions: Mutex::new(Vec::new()),
+            data_type,
+        }
+    }
+
+    fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
+        // Append (position, key bytes) for each row; nulls go to the side list.
+        // `$v => $to_bytes` extracts the key bytes from each non-null value
+        // inline (no closure, so the borrow ties directly to the row value).
+        macro_rules! insert_bytes {
+            ($array_type:ty, $v:ident => $to_bytes:expr) => {{
+                let typed = array.as_any().downcast_ref::<$array_type>().unwrap();
+                let mut writer = self.writer.lock().unwrap();
+                let mut nulls: Vec<RowPosition> = Vec::new();
+                for row_idx in 0..typed.len() {
+                    let position = row_offset + row_idx as u64;
+                    if typed.is_null(row_idx) {
+                        nulls.push(position);
+                    } else {
+                        let $v = typed.value(row_idx);
+                        let bytes: &[u8] = $to_bytes;
+                        writer.insert(BytesKey {
+                            bytes: InlineBytes::new(bytes),
+                            position,
+                        });
+                    }
+                }
+                drop(writer);
+                if !nulls.is_empty() {
+                    self.null_positions.lock().unwrap().extend(nulls);
+                }
+            }};
+        }
+
+        match array.data_type() {
+            DataType::Utf8 => insert_bytes!(arrow_array::StringArray, v => v.as_bytes()),
+            DataType::LargeUtf8 => insert_bytes!(arrow_array::LargeStringArray, v => v.as_bytes()),
+            DataType::Binary => insert_bytes!(arrow_array::BinaryArray, v => v),
+            DataType::LargeBinary => insert_bytes!(arrow_array::LargeBinaryArray, v => v),
+            DataType::FixedSizeBinary(_) => {
+                insert_bytes!(arrow_array::FixedSizeBinaryArray, v => v)
+            }
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "BytesBackend received non-byte array {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn get_newest_visible(
+        &self,
+        value: &ScalarValue,
+        max_visible_row: RowPosition,
+    ) -> Option<RowPosition> {
+        let Some(bytes) = value_bytes(value) else {
+            if value.is_null() {
+                return self
+                    .null_positions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .filter(|p| *p <= max_visible_row)
+                    .max();
+            }
+            return None;
+        };
+        let target = BytesKey {
+            bytes: InlineBytes::new(bytes),
+            position: max_visible_row,
+        };
+        self.reader
+            .upper_bound_with(&target, |key| {
+                (key.bytes.as_slice() == bytes).then_some(key.position)
+            })
+            .flatten()
+    }
+
+    fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
+        let Some(bytes) = value_bytes(value) else {
+            if value.is_null() {
+                return self.null_positions.lock().unwrap().clone();
+            }
+            return Vec::new();
+        };
+        let start = BytesKey {
+            bytes: InlineBytes::new(bytes),
+            position: 0,
+        };
+        let mut positions = Vec::new();
+        for key in self.reader.range_from(&start) {
+            if key.bytes.as_slice() != bytes {
+                break;
+            }
+            positions.push(key.position);
+        }
+        positions
+    }
+
+    fn len(&self) -> usize {
+        self.reader.len() + self.null_positions.lock().unwrap().len()
+    }
+
+    fn data_type(&self) -> DataType {
+        self.data_type.clone()
+    }
+
+    fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
+        let mut result: Vec<(OrderableScalarValue, Vec<RowPosition>)> = Vec::new();
+
+        // Nulls sort first (None < Some).
+        let nulls = self.null_positions.lock().unwrap();
+        if !nulls.is_empty() {
+            let mut positions = nulls.clone();
+            positions.sort_unstable();
+            result.push((
+                OrderableScalarValue(null_bytes_scalar(&self.data_type)),
+                positions,
+            ));
+        }
+        drop(nulls);
+
+        let mut cur: Option<Vec<u8>> = None;
+        for key in self.reader.iter() {
+            let bytes = key.bytes.as_slice();
+            if cur.as_deref() == Some(bytes) {
+                result.last_mut().unwrap().1.push(key.position);
+            } else {
+                cur = Some(bytes.to_vec());
+                result.push((
+                    OrderableScalarValue(decode_bytes(bytes, &self.data_type)),
                     vec![key.position],
                 ));
             }
@@ -462,6 +754,7 @@ impl ScalarBackend {
 /// The chosen backend for a `BTreeMemIndex`, selected by column type.
 enum Backend {
     FixedInt(FixedIntBackend),
+    Bytes(BytesBackend),
     Scalar(ScalarBackend),
 }
 
@@ -469,6 +762,8 @@ impl Backend {
     fn for_type(data_type: &DataType) -> Self {
         if is_fixed_int(data_type) {
             Self::FixedInt(FixedIntBackend::new(data_type.clone()))
+        } else if is_bytes_type(data_type) {
+            Self::Bytes(BytesBackend::new(data_type.clone()))
         } else {
             Self::Scalar(ScalarBackend::new())
         }
@@ -477,6 +772,7 @@ impl Backend {
     fn insert_array(&self, array: &dyn Array, row_offset: u64) -> Result<()> {
         match self {
             Self::FixedInt(b) => b.insert_array(array, row_offset),
+            Self::Bytes(b) => b.insert_array(array, row_offset),
             Self::Scalar(b) => b.insert_array(array, row_offset),
         }
     }
@@ -484,6 +780,7 @@ impl Backend {
     fn get_newest_visible(&self, value: &ScalarValue, max: RowPosition) -> Option<RowPosition> {
         match self {
             Self::FixedInt(b) => b.get_newest_visible(value, max),
+            Self::Bytes(b) => b.get_newest_visible(value, max),
             Self::Scalar(b) => b.get_newest_visible(value, max),
         }
     }
@@ -491,6 +788,7 @@ impl Backend {
     fn get(&self, value: &ScalarValue) -> Vec<RowPosition> {
         match self {
             Self::FixedInt(b) => b.get(value),
+            Self::Bytes(b) => b.get(value),
             Self::Scalar(b) => b.get(value),
         }
     }
@@ -498,6 +796,7 @@ impl Backend {
     fn len(&self) -> usize {
         match self {
             Self::FixedInt(b) => b.len(),
+            Self::Bytes(b) => b.len(),
             Self::Scalar(b) => b.len(),
         }
     }
@@ -505,6 +804,7 @@ impl Backend {
     fn data_type(&self) -> Option<DataType> {
         match self {
             Self::FixedInt(b) => Some(b.data_type()),
+            Self::Bytes(b) => Some(b.data_type()),
             Self::Scalar(b) => b.data_type(),
         }
     }
@@ -512,6 +812,7 @@ impl Backend {
     fn snapshot(&self) -> Vec<(OrderableScalarValue, Vec<RowPosition>)> {
         match self {
             Self::FixedInt(b) => b.snapshot(),
+            Self::Bytes(b) => b.snapshot(),
             Self::Scalar(b) => b.snapshot(),
         }
     }
@@ -931,28 +1232,84 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_backend_strings() {
-        // Utf8 routes to the scalar backend (Stage A); verify it still works.
+    fn test_bytes_backend_strings() {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "s",
             DataType::Utf8,
             true,
         )]));
         let index = BTreeMemIndex::new(0, "s".to_string());
+        // Mix short (inline) and a long (> INLINE_CAP, heap) key; include a null.
+        let long = "z".repeat(64);
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from(vec![
-                "delta", "alpha", "charlie",
+                Some("delta"),
+                Some("alpha"),
+                None,
+                Some(long.as_str()),
+                Some("alpha"), // duplicate value, newer position
             ]))],
         )
         .unwrap();
         index.insert(&batch, 0).unwrap();
+
+        // Newest visible position for a duplicated value.
         assert_eq!(
             index.get_newest_visible(&ScalarValue::Utf8(Some("alpha".to_string())), 10),
+            Some(4)
+        );
+        // Visibility watermark hides the newer duplicate.
+        assert_eq!(
+            index.get_newest_visible(&ScalarValue::Utf8(Some("alpha".to_string())), 3),
             Some(1)
         );
+        // Long (heap) key round-trips.
+        assert_eq!(
+            index.get_newest_visible(&ScalarValue::Utf8(Some(long.clone())), 10),
+            Some(3)
+        );
+        // snapshot: null first, then lexicographic order; decode round-trips.
         let snap = index.snapshot();
-        assert_eq!(snap[0].0.0, ScalarValue::Utf8(Some("alpha".to_string())));
+        assert_eq!(snap[0].0.0, ScalarValue::Utf8(None));
+        assert_eq!(snap[0].1, vec![2]);
+        assert_eq!(snap[1].0.0, ScalarValue::Utf8(Some("alpha".to_string())));
+        assert_eq!(snap[1].1, vec![1, 4]);
         assert_eq!(snap[2].0.0, ScalarValue::Utf8(Some("delta".to_string())));
+        assert_eq!(snap[3].0.0, ScalarValue::Utf8(Some(long)));
+    }
+
+    #[test]
+    fn test_bytes_backend_fixed_size_binary_uuid() {
+        // UUIDs are FixedSizeBinary(16); verify the compact byte backend.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::FixedSizeBinary(16),
+            false,
+        )]));
+        let index = BTreeMemIndex::new(0, "id".to_string());
+        let a = [0x11u8; 16];
+        let b = [0x22u8; 16];
+        let c = [0xAAu8; 16];
+        let values = vec![c.to_vec(), a.to_vec(), b.to_vec()];
+        let arr = arrow_array::FixedSizeBinaryArray::try_from_iter(values.into_iter()).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        // Point lookup by UUID bytes.
+        assert_eq!(
+            index.get_newest_visible(&ScalarValue::FixedSizeBinary(16, Some(a.to_vec())), 10),
+            Some(1)
+        );
+        // snapshot is byte-sorted: a (0x11) < b (0x22) < c (0xAA).
+        let snap = index.snapshot();
+        let order: Vec<Vec<u8>> = snap
+            .iter()
+            .map(|(v, _)| match &v.0 {
+                ScalarValue::FixedSizeBinary(16, Some(bytes)) => bytes.clone(),
+                _ => panic!("unexpected"),
+            })
+            .collect();
+        assert_eq!(order, vec![a.to_vec(), b.to_vec(), c.to_vec()]);
     }
 }
