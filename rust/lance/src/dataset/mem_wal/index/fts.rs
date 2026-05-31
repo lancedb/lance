@@ -530,18 +530,84 @@ impl BatchMeta {
     }
 }
 
+/// Size of a sealed batch block. Small enough that copying the partial tail
+/// block on append stays cheap; large enough that sealing (which clones the
+/// block-pointer vec) is rare.
+const BATCH_BLOCK: usize = 64;
+
+/// Append-only, structurally-shared log of visible batch metadata. Sealed full
+/// blocks are immutable and shared across snapshots; only the current partial
+/// block is copied on append, so publishing a batch is amortized O(1) (instead
+/// of copying every batch pointer per publish — O(batches²) per generation)
+/// while keeping O(1) index for `batch_for`.
+#[derive(Debug, Clone)]
+struct BatchLog {
+    /// Immutable full blocks (each `BATCH_BLOCK` long), shared across snapshots.
+    sealed: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
+    /// The current partial block (`< BATCH_BLOCK` entries).
+    tail: Arc<[Arc<BatchMeta>]>,
+    len: usize,
+}
+
+impl BatchLog {
+    fn empty() -> Self {
+        Self {
+            sealed: Arc::new(Vec::new()),
+            tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
+            len: 0,
+        }
+    }
+
+    /// A new log with `meta` appended; shares every sealed block with `self`,
+    /// copying only the partial tail block.
+    fn pushed(&self, meta: Arc<BatchMeta>) -> Self {
+        let mut tail: Vec<Arc<BatchMeta>> = self.tail.to_vec();
+        tail.push(meta);
+        if tail.len() == BATCH_BLOCK {
+            let mut sealed = (*self.sealed).clone();
+            sealed.push(Arc::from(tail.into_boxed_slice()));
+            Self {
+                sealed: Arc::new(sealed),
+                tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
+                len: self.len + 1,
+            }
+        } else {
+            Self {
+                sealed: Arc::clone(&self.sealed),
+                tail: Arc::from(tail.into_boxed_slice()),
+                len: self.len + 1,
+            }
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<&Arc<BatchMeta>> {
+        let block = i / BATCH_BLOCK;
+        let off = i % BATCH_BLOCK;
+        match self.sealed.get(block) {
+            Some(b) => b.get(off),
+            None if block == self.sealed.len() => self.tail.get(off),
+            None => None,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Arc<BatchMeta>> {
+        self.sealed
+            .iter()
+            .flat_map(|b| b.iter())
+            .chain(self.tail.iter())
+    }
+}
+
 /// Atomic snapshot of the visible state. Replaced via `ArcSwap` after each
 /// batch is fully linked.
 #[derive(Debug)]
 struct Snapshot {
     /// Number of batches visible to readers. `0` means empty index.
     visible_count: usize,
-    /// Visible-batch metadata, written to in publish order. Always
-    /// `batches.len() == visible_count` for any snapshot the writer has
-    /// stored (each `publish_batch` appends a single entry and bumps
-    /// `visible_count` by one). The slice is kept exactly the visible
-    /// length so readers can iterate it directly without re-bounding.
-    batches: Arc<[Arc<BatchMeta>]>,
+    /// Visible-batch metadata in publish order. `batches.len() ==
+    /// visible_count` for any snapshot the writer has stored (each publish
+    /// appends one entry and bumps `visible_count`).
+    batches: BatchLog,
     /// `Σ batches[i].rows` for `i < visible_count`.
     cumulative_doc_count: u64,
     /// `Σ batches[i].doc_lengths.iter().sum()` for `i < visible_count`.
@@ -552,24 +618,21 @@ impl Snapshot {
     fn empty() -> Arc<Self> {
         Arc::new(Self {
             visible_count: 0,
-            batches: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
+            batches: BatchLog::empty(),
             cumulative_doc_count: 0,
             cumulative_total_tokens: 0,
         })
     }
 
     fn batch_for(&self, batch_position: usize) -> Option<&Arc<BatchMeta>> {
-        // The fast path assumes batch_position equals the index in
-        // `batches` (true when callers use the no-arg `insert()` and let
-        // the index assign sequential positions). When callers pass
-        // explicit positions to `insert_with_batch_position`, those
-        // positions can be sparse / out of order, so we fall back to a
-        // linear search through visible batches.
+        // Fast path: batch_position equals the index (true when callers use the
+        // no-arg `insert()` and let the index assign sequential positions). With
+        // explicit, possibly sparse positions, fall back to a linear search.
         self.batches
             .get(batch_position)
             .filter(|m| m.batch_position == batch_position)
             .or_else(|| {
-                self.batches[..self.visible_count]
+                self.batches
                     .iter()
                     .find(|m| m.batch_position == batch_position)
             })
@@ -743,12 +806,9 @@ impl TailIndex {
             rows,
         });
         let cur = self.snapshot.load();
-        let mut batches: Vec<Arc<BatchMeta>> = Vec::with_capacity(cur.batches.len() + 1);
-        batches.extend(cur.batches.iter().cloned());
-        batches.push(new_meta);
         self.snapshot.store(Arc::new(Snapshot {
             visible_count: cur.visible_count + 1,
-            batches: Arc::from(batches.into_boxed_slice()),
+            batches: cur.batches.pushed(new_meta),
             cumulative_doc_count: cur.cumulative_doc_count + rows as u64,
             cumulative_total_tokens: cur.cumulative_total_tokens + total_tokens,
         }));
@@ -1886,9 +1946,7 @@ fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {
 }
 
 fn lookup_dl(snap: &Snapshot, row_position: u64) -> Option<u32> {
-    snap.batches[..snap.visible_count]
-        .iter()
-        .find_map(|b| b.dl(row_position))
+    snap.batches.iter().find_map(|b| b.dl(row_position))
 }
 
 fn find_doc_in_chunks(
