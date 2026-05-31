@@ -69,6 +69,11 @@ use rustc_hash::FxHashMap;
 
 use super::RowPosition;
 
+thread_local! {
+    /// Diagnostic (FTS_WAND_STATS): full doc scorings done by the top-k path.
+    static SCORED: Cell<u64> = const { Cell::new(0) };
+}
+
 // ============================================================================
 // Public types preserved from previous API
 // ============================================================================
@@ -1312,6 +1317,10 @@ impl FtsMemIndex {
         }
         match limit {
             Some(k) if k > 0 => {
+                let stats = std::env::var_os("FTS_WAND_STATS").is_some();
+                if stats {
+                    SCORED.with(|c| c.set(0));
+                }
                 let mut topk = TopK::new(k);
                 // Scan the block-max partitions first to warm the shared
                 // threshold, then the (un-skippable) tail last — so the tail
@@ -1329,6 +1338,20 @@ impl FtsMemIndex {
                     for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer, theta) {
                         topk.offer(e.score, e.row_position);
                     }
+                }
+                if stats {
+                    let union: usize = st
+                        .partitions
+                        .iter()
+                        .map(|p| tokens.iter().map(|t| p.token_df(t)).sum::<usize>())
+                        .sum();
+                    eprintln!(
+                        "WAND tokens={} k={} scored={} union_postings={}",
+                        tokens.len(),
+                        k,
+                        SCORED.with(|c| c.get()),
+                        union,
+                    );
                 }
                 topk.into_entries()
             }
@@ -3052,6 +3075,7 @@ impl Partition {
                 let score = qw * scorer.doc_weight(freqs[i], dl);
                 topk.offer(score, self.docs.row_id(doc));
             }
+            SCORED.with(|c| c.set(c.get() + n as u64));
         }
     }
 
@@ -3137,6 +3161,7 @@ impl Partition {
                     }
                 }
                 topk.offer(score, self.docs.row_id(pivot_doc));
+                SCORED.with(|c| c.set(c.get() + 1));
             } else {
                 // A lane before the pivot trails pivot_doc; skip it forward.
                 lanes[0].cursor.skip_to(pivot_doc);
