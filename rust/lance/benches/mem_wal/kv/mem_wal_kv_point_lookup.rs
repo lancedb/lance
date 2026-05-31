@@ -147,7 +147,7 @@ fn build_queries(rows: usize, queries: usize, miss_ratio: f64, seed: u64) -> Vec
 /// machinery — it is the lower bound on how fast the current MemTable index
 /// can answer a point lookup. Single-active-memtable only (the bench never
 /// flushes), `KEY_COL` BTree assumed present.
-fn fast_lookup(active: &InMemoryMemTableRef, key: i64) -> Option<RecordBatch> {
+fn fast_lookup(active: &InMemoryMemTableRef, key: i64, key_type: KeyType) -> Option<RecordBatch> {
     use arrow_array::Array;
 
     let btree = active.index_store.get_btree_by_column(KEY_COL)?;
@@ -170,7 +170,7 @@ fn fast_lookup(active: &InMemoryMemTableRef, key: i64) -> Option<RecordBatch> {
     let max_visible_row = visible_end - 1;
 
     // Newest visible row position for this key — seek-and-stop on the skiplist.
-    let pos = btree.get_newest_visible(&ScalarValue::Int64(Some(key)), max_visible_row)?;
+    let pos = btree.get_newest_visible(&key_scalar(key, key_type), max_visible_row)?;
 
     // Map the global position to (batch, row) and slice one row.
     let mut start: u64 = 0;
@@ -192,7 +192,7 @@ fn fast_lookup(active: &InMemoryMemTableRef, key: i64) -> Option<RecordBatch> {
 /// overhead across the whole batch and uses Arrow's columnar gather — the
 /// shape where the batch system should beat row-at-a-time point lookups.
 /// Returns the found rows (missing keys omitted).
-fn fast_lookup_batch(active: &InMemoryMemTableRef, keys: &[i64]) -> RecordBatch {
+fn fast_lookup_batch(active: &InMemoryMemTableRef, keys: &[i64], key_type: KeyType) -> RecordBatch {
     use arrow_array::UInt32Array;
     use arrow_select::concat::concat_batches;
     use arrow_select::take::take;
@@ -213,7 +213,7 @@ fn fast_lookup_batch(active: &InMemoryMemTableRef, keys: &[i64]) -> RecordBatch 
     // Group target rows by their owning batch so each batch is gathered once.
     let mut by_batch: HashMap<usize, Vec<u32>> = HashMap::new();
     for &k in keys {
-        let Some(pos) = btree.get_newest_visible(&ScalarValue::Int64(Some(k)), visible_end - 1)
+        let Some(pos) = btree.get_newest_visible(&key_scalar(k, key_type), visible_end - 1)
         else {
             continue;
         };
@@ -460,6 +460,61 @@ impl Engine {
     }
 }
 
+/// Key column type. `Int` exercises the Lance `FixedKey` backend (8-byte key);
+/// `Uuid` stores `FixedSizeBinary(16)` and exercises the `BytesKey` backend.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum KeyType {
+    Int,
+    Uuid,
+}
+
+impl KeyType {
+    fn parse(v: &str) -> std::result::Result<Self, String> {
+        match v {
+            "int" | "i64" => Ok(Self::Int),
+            "uuid" => Ok(Self::Uuid),
+            _ => Err(format!("unknown key-type '{v}', expected int|uuid")),
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Int => "int",
+            Self::Uuid => "uuid",
+        }
+    }
+    fn arrow_type(self) -> DataType {
+        match self {
+            Self::Int => DataType::Int64,
+            Self::Uuid => DataType::FixedSizeBinary(16),
+        }
+    }
+}
+
+/// Deterministic 16-byte UUID for a logical key: a scrambled high half (so keys
+/// scatter across the byte space like real UUIDs) plus the key in the low half
+/// (so distinct keys never collide). Same key → same bytes, so lookups resolve.
+fn uuid_bytes(key: i64) -> [u8; 16] {
+    let mut rng = SplitMix64::new((key as u64) ^ 0xA5A5_5A5A_DEAD_BEEF);
+    *Uuid::from_u64_pair(rng.next_u64(), key as u64).as_bytes()
+}
+
+/// The Lance lookup key (`ScalarValue`) for a logical key under `key_type`.
+fn key_scalar(key: i64, key_type: KeyType) -> ScalarValue {
+    match key_type {
+        KeyType::Int => ScalarValue::Int64(Some(key)),
+        KeyType::Uuid => ScalarValue::FixedSizeBinary(16, Some(uuid_bytes(key).to_vec())),
+    }
+}
+
+/// The RocksDB key bytes for a logical key under `key_type`.
+#[cfg(feature = "bench-rocksdb")]
+fn rocks_key(key: i64, key_type: KeyType) -> Vec<u8> {
+    match key_type {
+        KeyType::Int => key.to_be_bytes().to_vec(),
+        KeyType::Uuid => uuid_bytes(key).to_vec(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     rows: usize,
@@ -469,6 +524,7 @@ struct Args {
     threads: usize,
     batch_rows: usize,
     engine: Engine,
+    key_type: KeyType,
     lance_read_mode: LanceReadMode,
     /// When > 0, the read phase measures **batch get** of this many keys per
     /// call (Lance: one vectorized BTree gather; RocksDB: `multi_get`) instead
@@ -493,6 +549,7 @@ impl Default for Args {
             threads: 8,
             batch_rows: 1_000,
             engine: Engine::Both,
+            key_type: KeyType::Int,
             lance_read_mode: LanceReadMode::Plan,
             batch_get: 0,
             uri: String::new(),
@@ -539,6 +596,9 @@ fn parse_args() -> Result<Args> {
             "--engine" => {
                 args.engine = Engine::parse(&value).map_err(lance_core::Error::invalid_input)?
             }
+            "--key-type" => {
+                args.key_type = KeyType::parse(&value).map_err(lance_core::Error::invalid_input)?
+            }
             "--lance-read-mode" => {
                 args.lance_read_mode =
                     LanceReadMode::parse(&value).map_err(lance_core::Error::invalid_input)?
@@ -576,20 +636,32 @@ fn parse_args() -> Result<Args> {
 // Schema / batch helpers (Lance)
 // ----------------------------------------------------------------------
 
-fn make_schema() -> Arc<ArrowSchema> {
+fn make_schema(key_type: KeyType) -> Arc<ArrowSchema> {
     let mut id_meta = HashMap::new();
     id_meta.insert(
         "lance-schema:unenforced-primary-key".to_string(),
         "true".to_string(),
     );
     Arc::new(ArrowSchema::new(vec![
-        Field::new(KEY_COL, DataType::Int64, false).with_metadata(id_meta),
+        Field::new(KEY_COL, key_type.arrow_type(), false).with_metadata(id_meta),
         Field::new(VALUE_COL, DataType::Utf8, true),
     ]))
 }
 
-fn make_batch(schema: Arc<ArrowSchema>, keys: &[i64], value_size: usize) -> RecordBatch {
-    let ids = Int64Array::from_iter_values(keys.iter().copied());
+fn make_batch(
+    schema: Arc<ArrowSchema>,
+    keys: &[i64],
+    value_size: usize,
+    key_type: KeyType,
+) -> RecordBatch {
+    use arrow_array::Array;
+    let id_arr: Arc<dyn Array> = match key_type {
+        KeyType::Int => Arc::new(Int64Array::from_iter_values(keys.iter().copied())),
+        KeyType::Uuid => Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_iter(keys.iter().map(|k| uuid_bytes(*k)))
+                .unwrap(),
+        ),
+    };
     let values: Vec<String> = keys
         .iter()
         .map(|k| {
@@ -598,7 +670,7 @@ fn make_batch(schema: Arc<ArrowSchema>, keys: &[i64], value_size: usize) -> Reco
         })
         .collect();
     let value_arr = StringArray::from_iter_values(values);
-    RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(value_arr)]).unwrap()
+    RecordBatch::try_new(schema, vec![id_arr, Arc::new(value_arr)]).unwrap()
 }
 
 // ----------------------------------------------------------------------
@@ -611,13 +683,14 @@ async fn run_lance(
     queries: &[(i64, bool)],
 ) -> Result<EngineResult> {
     let sampler = RssSampler::start();
-    let schema = make_schema();
+    let key_type = args.key_type;
+    let schema = make_schema(key_type);
 
     // 1-row sentinel base dataset (id = -1) so the lookup path is effectively
     // MemTable-only: query keys are 0..rows, never in the base table. The
     // base only ever contributes a 1-row scan on the miss path.
     let base_uri = format!("{}/base", args.uri.trim_end_matches('/'));
-    let sentinel = make_batch(schema.clone(), &[-1], args.value_size);
+    let sentinel = make_batch(schema.clone(), &[-1], args.value_size, key_type);
     let reader = RecordBatchIterator::new([Ok(sentinel)], schema.clone());
     let mut dataset = Dataset::write(reader, &base_uri, Some(WriteParams::default())).await?;
 
@@ -673,7 +746,7 @@ async fn run_lance(
     let mut lo = 0usize;
     while lo < insert_order.len() {
         let hi = (lo + args.batch_rows).min(insert_order.len());
-        let batch = make_batch(schema.clone(), &insert_order[lo..hi], args.value_size);
+        let batch = make_batch(schema.clone(), &insert_order[lo..hi], args.value_size, key_type);
         writer.put(vec![batch]).await?;
         lo = hi;
     }
@@ -714,18 +787,18 @@ async fn run_lance(
         let n = match args.lance_read_mode {
             LanceReadMode::Plan => {
                 let plan = planner
-                    .plan_lookup(&[ScalarValue::Int64(Some(probe))], None)
+                    .plan_lookup(&[key_scalar(probe, key_type)], None)
                     .await?;
                 let ctx = SessionContext::new();
                 let batches: Vec<RecordBatch> =
                     plan.execute(0, ctx.task_ctx())?.try_collect().await?;
                 batches.iter().map(|b| b.num_rows()).sum::<usize>()
             }
-            LanceReadMode::Fast => fast_lookup(&active, probe)
+            LanceReadMode::Fast => fast_lookup(&active, probe, key_type)
                 .map(|b| b.num_rows())
                 .unwrap_or(0),
             LanceReadMode::Api => planner
-                .lookup(&[ScalarValue::Int64(Some(probe))], None)
+                .lookup(&[key_scalar(probe, key_type)], None)
                 .await?
                 .map(|b| b.num_rows())
                 .unwrap_or(0),
@@ -745,7 +818,7 @@ async fn run_lance(
         // use the bench's direct `fast_lookup_batch`. Both gather columnar.
         let use_api = matches!(args.lance_read_mode, LanceReadMode::Api);
         let to_scalars = |chunk: &[i64]| -> Vec<ScalarValue> {
-            chunk.iter().map(|k| ScalarValue::Int64(Some(*k))).collect()
+            chunk.iter().map(|k| key_scalar(*k, key_type)).collect()
         };
         let cpu1 = process_cpu_secs();
         let mut latencies_us = Vec::with_capacity(hit_keys.len().div_ceil(bg));
@@ -759,7 +832,7 @@ async fn run_lance(
                     .await?
                     .num_rows()
             } else {
-                fast_lookup_batch(&active, chunk).num_rows()
+                fast_lookup_batch(&active, chunk, key_type).num_rows()
             };
             latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
             found_total += n;
@@ -790,7 +863,7 @@ async fn run_lance(
                             let hi = (lo + bg).min(keys.len());
                             let scalars: Vec<ScalarValue> = keys[lo..hi]
                                 .iter()
-                                .map(|k| ScalarValue::Int64(Some(*k)))
+                                .map(|k| key_scalar(*k, key_type))
                                 .collect();
                             std::hint::black_box(
                                 planner.lookup_many(&scalars, None).await.unwrap(),
@@ -813,7 +886,7 @@ async fn run_lance(
                         while ci < nchunks {
                             let lo = ci * bg;
                             let hi = (lo + bg).min(keys.len());
-                            std::hint::black_box(fast_lookup_batch(&active, &keys[lo..hi]));
+                            std::hint::black_box(fast_lookup_batch(&active, &keys[lo..hi], key_type));
                             ci += threads;
                         }
                     }));
@@ -864,15 +937,15 @@ async fn run_lance(
         let n = match args.lance_read_mode {
             LanceReadMode::Plan => {
                 let plan = planner
-                    .plan_lookup(&[ScalarValue::Int64(Some(key))], None)
+                    .plan_lookup(&[key_scalar(key, key_type)], None)
                     .await?;
                 let batches: Vec<RecordBatch> =
                     plan.execute(0, task_ctx.clone())?.try_collect().await?;
                 batches.iter().map(|b| b.num_rows()).sum::<usize>()
             }
-            LanceReadMode::Fast => fast_lookup(&active, key).map(|b| b.num_rows()).unwrap_or(0),
+            LanceReadMode::Fast => fast_lookup(&active, key, key_type).map(|b| b.num_rows()).unwrap_or(0),
             LanceReadMode::Api => planner
-                .lookup(&[ScalarValue::Int64(Some(key))], None)
+                .lookup(&[key_scalar(key, key_type)], None)
                 .await?
                 .map(|b| b.num_rows())
                 .unwrap_or(0),
@@ -906,7 +979,7 @@ async fn run_lance(
             handles.push(std::thread::spawn(move || {
                 let mut i = shard;
                 while i < keys.len() {
-                    std::hint::black_box(fast_lookup(&active, keys[i]));
+                    std::hint::black_box(fast_lookup(&active, keys[i], key_type));
                     i += threads;
                 }
             }));
@@ -934,14 +1007,14 @@ async fn run_lance(
                         LanceReadMode::Api => {
                             std::hint::black_box(
                                 planner
-                                    .lookup(&[ScalarValue::Int64(Some(keys[i]))], None)
+                                    .lookup(&[key_scalar(keys[i], key_type)], None)
                                     .await
                                     .unwrap(),
                             );
                         }
                         _ => {
                             let plan = planner
-                                .plan_lookup(&[ScalarValue::Int64(Some(keys[i]))], None)
+                                .plan_lookup(&[key_scalar(keys[i], key_type)], None)
                                 .await
                                 .unwrap();
                             let _b: Vec<RecordBatch> = plan
@@ -1018,6 +1091,7 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     use rocksdb::{DB, Options, WriteBatch, WriteOptions};
 
     let sampler = RssSampler::start();
+    let key_type = args.key_type;
     let db_path = format!("{}/rocksdb", args.uri.trim_end_matches('/'));
     let _ = std::fs::remove_dir_all(&db_path);
     // RocksDB's create_if_missing creates the DB dir but not missing parents;
@@ -1055,7 +1129,7 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
         let hi = (lo + args.batch_rows).min(insert_order.len());
         let mut wb = WriteBatch::default();
         for &k in &insert_order[lo..hi] {
-            wb.put(k.to_be_bytes(), make_value(k, args.value_size));
+            wb.put(rocks_key(k, key_type), make_value(k, args.value_size));
         }
         db.write_opt(wb, &wo)
             .map_err(|e| lance_core::Error::io(format!("rocksdb write: {e}")))?;
@@ -1083,7 +1157,7 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
             .map(|(k, _)| *k)
             .collect();
         let multiget = |db: &DB, chunk: &[i64]| -> usize {
-            db.multi_get(chunk.iter().map(|k| k.to_be_bytes()))
+            db.multi_get(chunk.iter().map(|k| rocks_key(*k, key_type)))
                 .into_iter()
                 .filter(|r| matches!(r, Ok(Some(_))))
                 .count()
@@ -1121,7 +1195,7 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
                         let lo = ci * bg;
                         let hi = (lo + bg).min(keys.len());
                         std::hint::black_box(
-                            db.multi_get(keys[lo..hi].iter().map(|k| k.to_be_bytes())),
+                            db.multi_get(keys[lo..hi].iter().map(|k| rocks_key(*k, key_type))),
                         );
                         ci += threads;
                     }
@@ -1169,7 +1243,7 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     for &(key, expect_hit) in queries {
         let t0 = Instant::now();
         let got = db
-            .get(key.to_be_bytes())
+            .get(rocks_key(key, key_type))
             .map_err(|e| lance_core::Error::io(format!("rocksdb get: {e}")))?;
         latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
         if expect_hit {
@@ -1197,7 +1271,7 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
             handles.push(std::thread::spawn(move || {
                 let mut i = shard;
                 while i < keys.len() {
-                    let _ = db.get(keys[i].to_be_bytes()).unwrap();
+                    let _ = db.get(rocks_key(keys[i], key_type)).unwrap();
                     i += threads;
                 }
             }));
@@ -1310,8 +1384,9 @@ fn print_comparison(results: &[EngineResult]) {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_kv_point_lookup engine={:?} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
+        "bench=mem_wal_kv_point_lookup engine={:?} key_type={} lance_read_mode={} batch_get={} rows={} value_size={} queries={} miss_ratio={} threads={} batch_rows={} uri={}",
         args.engine,
+        args.key_type.as_str(),
         args.lance_read_mode.as_str(),
         args.batch_get,
         args.rows,
