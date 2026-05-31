@@ -48,6 +48,7 @@ use lance::dataset::mem_wal::scanner::{
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
+use lance::index::DatasetIndexInternalExt;
 use lance_core::Result;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
@@ -1127,8 +1128,9 @@ async fn run_lance(
 // Lance flushed (on-disk) engine
 // ----------------------------------------------------------------------
 
-/// One indexed point lookup against the flushed dataset: filter `id = key` on
-/// the on-disk BTree scalar index, returning the matched row count.
+/// One indexed point lookup via the **DataFusion** path: `scan().filter("id =
+/// key")` parses + plans + executes a query per lookup (uses the on-disk BTree
+/// index). Returns the matched row count.
 async fn flushed_probe(dataset: &Dataset, key: i64) -> Result<usize> {
     use futures::StreamExt;
     let mut scanner = dataset.scan();
@@ -1139,6 +1141,45 @@ async fn flushed_probe(dataset: &Dataset, key: i64) -> Result<usize> {
         n += batch?.num_rows();
     }
     Ok(n)
+}
+
+/// One point lookup via the **direct** path: search the on-disk BTree scalar
+/// index for the row id, then `take` that row — bypassing DataFusion plan
+/// construction. Diagnostic for how much of the flushed read cost is the plan.
+async fn flushed_probe_direct(
+    dataset: &Dataset,
+    scalar_index: &Arc<dyn lance_index::scalar::ScalarIndex>,
+    key: i64,
+) -> Result<usize> {
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::SargableQuery;
+    let query = SargableQuery::Equals(ScalarValue::Int64(Some(key)));
+    let result = scalar_index.search(&query, &NoOpMetricsCollector).await?;
+    let true_rows = result.row_addrs().true_rows();
+    let Some(rid) = true_rows
+        .row_addrs()
+        .and_then(|mut it| it.next())
+        .map(u64::from)
+    else {
+        return Ok(0);
+    };
+    let batch = dataset.take_rows(&[rid], dataset.schema().clone()).await?;
+    Ok(batch.num_rows())
+}
+
+/// Dispatch a flushed point lookup: `direct` = on-disk BTree index search + take
+/// (no DataFusion); otherwise the DataFusion `scan().filter()` path.
+async fn flushed_lookup(
+    dataset: &Dataset,
+    scalar_index: &Arc<dyn lance_index::scalar::ScalarIndex>,
+    key: i64,
+    direct: bool,
+) -> Result<usize> {
+    if direct {
+        flushed_probe_direct(dataset, scalar_index, key).await
+    } else {
+        flushed_probe(dataset, key).await
+    }
 }
 
 /// Flushed Lance: write all rows as one on-disk Lance dataset with a BTree
@@ -1189,9 +1230,33 @@ async fn run_lance_flushed(
     );
     let dataset = Arc::new(dataset);
 
+    // `plan` = DataFusion scan().filter(); `fast`/`api` = direct BTree index
+    // search + take (no DataFusion). Open the on-disk index once for the latter.
+    let direct = args.lance_read_mode != LanceReadMode::Plan;
+    let scalar_index: Arc<dyn lance_index::scalar::ScalarIndex> = {
+        use lance_index::metrics::NoOpMetricsCollector;
+        let indices = dataset.load_indices().await?;
+        let uuid = indices
+            .iter()
+            .find(|i| i.name == BTREE_INDEX_NAME)
+            .map(|i| i.uuid.to_string())
+            .ok_or_else(|| lance_core::Error::internal("flushed: btree index not found"))?;
+        dataset
+            .open_scalar_index(KEY_COL, &uuid, &NoOpMetricsCollector)
+            .await?
+    };
+    println!(
+        "[lance] flushed read path = {}",
+        if direct {
+            "direct btree-index search + take"
+        } else {
+            "datafusion scan().filter()"
+        }
+    );
+
     // warmup + correctness: a hit resolves to exactly one row via the index.
     if let Some((probe, _)) = queries.iter().find(|(_, h)| *h) {
-        let n = flushed_probe(&dataset, *probe).await?;
+        let n = flushed_lookup(&dataset, &scalar_index, *probe, direct).await?;
         assert_eq!(n, 1, "flushed warmup lookup for key {probe} returned {n}");
     }
 
@@ -1203,7 +1268,7 @@ async fn run_lance_flushed(
     let t_read = Instant::now();
     for &(key, expect_hit) in queries {
         let t0 = Instant::now();
-        let n = flushed_probe(&dataset, key).await?;
+        let n = flushed_lookup(&dataset, &scalar_index, key, direct).await?;
         latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
         if expect_hit {
             assert_eq!(n, 1, "expected hit for key {key}, got {n}");
@@ -1227,12 +1292,13 @@ async fn run_lance_flushed(
         let mut handles = Vec::with_capacity(args.threads);
         for shard in 0..args.threads {
             let dataset = dataset.clone();
+            let scalar_index = scalar_index.clone();
             let keys = keys.clone();
             let threads = args.threads;
             handles.push(tokio::spawn(async move {
                 let mut i = shard;
                 while i < keys.len() {
-                    let _ = flushed_probe(&dataset, keys[i]).await;
+                    let _ = flushed_lookup(&dataset, &scalar_index, keys[i], direct).await;
                     i += threads;
                 }
             }));
