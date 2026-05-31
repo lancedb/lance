@@ -621,9 +621,9 @@ enum ProbePos {
 }
 
 /// Resolve the `(batch_idx, row)` of a key's newest *visible* row in one
-/// in-memory memtable via the O(1) equality hash (`BTreeMemIndex::get_eq`),
-/// honoring the MVCC watermark, falling back to the ordered range scan only
-/// when the newest write isn't visible yet. No materialization.
+/// in-memory memtable via a seek-and-stop on the ordered skiplist
+/// (`BTreeMemIndex::get_newest_visible`), honoring the MVCC watermark. No
+/// materialization.
 fn probe_position(
     batch_store: &BatchStore,
     index_store: &IndexStore,

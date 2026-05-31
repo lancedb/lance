@@ -289,10 +289,8 @@ impl IndexStore {
         Ok(registry)
     }
 
-    /// Add a BTree/scalar index (implemented using skip-list for better
-    /// concurrency). Builds the equality hash by default — this is a low-level
-    /// / test helper; the production memtable path goes through
-    /// [`Self::from_configs`], which gates the hash on the primary key.
+    /// Add a BTree/scalar index (skip-list backed). Low-level / test helper;
+    /// the production memtable path goes through [`Self::from_configs`].
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.btree_indexes
             .insert(name, BTreeMemIndex::new(field_id, column));
