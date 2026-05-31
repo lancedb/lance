@@ -426,7 +426,11 @@ async fn run_checkpoint(
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             waited += 1;
-            if waited > 1200 {
+            if waited.is_multiple_of(50) {
+                println!("  ... waiting for flush cp={cp} ({}s)", waited / 10);
+                std::io::stdout().flush().ok();
+            }
+            if waited > 6000 {
                 return Err(lance_core::Error::io(format!("flush timed out for cp={cp}")));
             }
         };
