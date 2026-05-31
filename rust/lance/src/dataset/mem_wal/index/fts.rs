@@ -441,29 +441,68 @@ impl TermChunk {
 /// Append-only list of `TermChunk`s for a single term, replaced atomically
 /// via `ArcSwap`.
 #[derive(Debug, Default)]
+/// One term's tail postings as a persistent singly-linked list of chunks,
+/// newest first. Appending shares the existing list (the new head points at the
+/// old slice), so a reader holding an older `Arc<TermSlice>` keeps a consistent
+/// view while the writer extends it — and append is O(1) instead of the O(n)
+/// copy-per-append that made tail inserts quadratic in batches-per-generation.
+/// Order is newest-first; every consumer either sorts by doc id or is
+/// order-agnostic.
 struct TermSlice {
-    chunks: Vec<Arc<TermChunk>>,
+    /// This node's chunk; `None` only for the empty root.
+    chunk: Option<Arc<TermChunk>>,
+    /// The slice before this chunk was appended (older chunks).
+    prev: Option<Arc<Self>>,
 }
 
 impl TermSlice {
     fn empty() -> Arc<Self> {
-        Arc::new(Self { chunks: Vec::new() })
+        Arc::new(Self {
+            chunk: None,
+            prev: None,
+        })
     }
 
-    /// Returns a fresh `Arc<TermSlice>` containing all current chunks plus the
-    /// new one. The previous slice is left unchanged so any reader holding
-    /// it continues to see a consistent state.
-    fn with_chunk_appended(&self, chunk: Arc<TermChunk>) -> Arc<Self> {
-        let mut chunks = Vec::with_capacity(self.chunks.len() + 1);
-        chunks.extend(self.chunks.iter().cloned());
-        chunks.push(chunk);
-        Arc::new(Self { chunks })
+    /// O(1) append: a fresh head holding `chunk` and linking to `prev`. `prev`
+    /// is left unchanged so any reader holding it sees a consistent state.
+    fn push(prev: Arc<Self>, chunk: Arc<TermChunk>) -> Arc<Self> {
+        Arc::new(Self {
+            chunk: Some(chunk),
+            prev: Some(prev),
+        })
+    }
+
+    /// Iterate the term's chunks, newest first.
+    fn chunks(&self) -> TermChunkIter<'_> {
+        TermChunkIter { cur: Some(self) }
     }
 
     fn memory_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.chunks.capacity() * std::mem::size_of::<Arc<TermChunk>>()
-            + self.chunks.iter().map(|c| c.memory_size()).sum::<usize>()
+        // Each node: the struct itself plus its chunk's payload.
+        self.chunks()
+            .map(|c| std::mem::size_of::<Self>() + c.memory_size())
+            .sum::<usize>()
+            + std::mem::size_of::<Self>() // empty root node
+    }
+}
+
+/// Newest-first iterator over a [`TermSlice`] cons-list.
+struct TermChunkIter<'a> {
+    cur: Option<&'a TermSlice>,
+}
+
+impl<'a> Iterator for TermChunkIter<'a> {
+    type Item = &'a Arc<TermChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Walk links; the empty root has no chunk and ends iteration.
+        while let Some(node) = self.cur {
+            self.cur = node.prev.as_deref();
+            if let Some(chunk) = &node.chunk {
+                return Some(chunk);
+            }
+        }
+        None
     }
 }
 
@@ -693,8 +732,8 @@ impl TailIndex {
                     .value()
                     .clone()
             });
-            let cur = slot.load();
-            slot.store(cur.with_chunk_appended(chunk));
+            let cur = slot.load_full();
+            slot.store(TermSlice::push(cur, chunk));
         }
         drop(cache);
         let new_meta = Arc::new(BatchMeta {
@@ -890,8 +929,7 @@ impl FtsMemIndex {
             .map(|e| {
                 e.value()
                     .load()
-                    .chunks
-                    .iter()
+                    .chunks()
                     .filter(|c| c.batch_position < visible)
                     .map(|c| c.doc_count())
                     .sum::<usize>()
@@ -1670,7 +1708,7 @@ impl FtsMemIndex {
             let token: &Arc<str> = entry.key();
             let slice = entry.value().load();
             let bucket = term_postings.entry(token.to_string()).or_default();
-            for chunk in &slice.chunks {
+            for chunk in slice.chunks() {
                 if chunk.batch_position >= tail_snap.visible_count {
                     continue;
                 }
@@ -1844,10 +1882,7 @@ fn extract_texts(column: &dyn Array) -> Result<Vec<TextOpt<'_>>> {
 }
 
 fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {
-    slice
-        .chunks
-        .iter()
-        .any(|c| c.batch_position < visible_count)
+    slice.chunks().any(|c| c.batch_position < visible_count)
 }
 
 fn lookup_dl(snap: &Snapshot, row_position: u64) -> Option<u32> {
@@ -1920,8 +1955,7 @@ fn tail_token_df(
         Some(e) => e
             .value()
             .load()
-            .chunks
-            .iter()
+            .chunks()
             .filter(|c| c.batch_position < visible_count)
             .map(|c| c.doc_count())
             .sum(),
@@ -1954,8 +1988,7 @@ fn score_terms(
         }
         let slice = entry.value().load_full();
         let max_freq = slice
-            .chunks
-            .iter()
+            .chunks()
             .filter(|c| c.batch_position < snap.visible_count)
             .map(|c| c.max_freq)
             .max()
@@ -1968,7 +2001,7 @@ fn score_terms(
     }
     let mut doc_scores: HashMap<RowPosition, f32> = HashMap::new();
     for (qw, slice) in tail_terms {
-        for chunk in &slice.chunks {
+        for chunk in slice.chunks() {
             if chunk.batch_position >= snap.visible_count {
                 continue;
             }
@@ -2007,8 +2040,7 @@ fn phrase_search_tail(
             Some(entry) => {
                 let slice = entry.value().load_full();
                 let visible: Vec<Arc<TermChunk>> = slice
-                    .chunks
-                    .iter()
+                    .chunks()
                     .filter(|c| c.batch_position < snap.visible_count)
                     .cloned()
                     .collect();
@@ -2796,7 +2828,7 @@ impl Partition {
         for entry in tail.terms.iter() {
             let slice = entry.value().load();
             let mut docs_for_term: Vec<(u32, u32, Vec<u32>)> = Vec::new();
-            for chunk in &slice.chunks {
+            for chunk in slice.chunks() {
                 if chunk.batch_position >= snap.visible_count {
                     continue;
                 }
@@ -4658,8 +4690,8 @@ mod tests {
         let dominates = |a: (u32, u32), b: (u32, u32)| a.0 >= b.0 && a.1 <= b.1;
         let cases: Vec<Vec<(u32, u32)>> = vec![
             vec![(3, 10), (1, 5), (2, 8), (5, 20), (1, 4)],
-            vec![(1, 100); 5],          // all identical => single frontier point
-            vec![(9, 2)],               // single doc
+            vec![(1, 100); 5], // all identical => single frontier point
+            vec![(9, 2)],      // single doc
             vec![(1, 9), (2, 8), (3, 7), (4, 6), (5, 5)], // fully Pareto-optimal
         ];
         for input in cases {
@@ -4677,7 +4709,10 @@ mod tests {
             // Tightness: no frontier pair dominates another.
             for (i, &a) in frontier.iter().enumerate() {
                 for (j, &b) in frontier.iter().enumerate() {
-                    assert!(i == j || !dominates(a, b), "frontier not minimal: {frontier:?}");
+                    assert!(
+                        i == j || !dominates(a, b),
+                        "frontier not minimal: {frontier:?}"
+                    );
                 }
             }
         }
