@@ -900,7 +900,7 @@ impl FtsMemIndex {
         for p in st.partitions.iter() {
             terms += p.term_fst.as_fst().as_bytes().len();
             postings += p.postings.len() * std::mem::size_of::<PostingRef>();
-            blocks += p.block_meta.len() * std::mem::size_of::<BlockMeta>();
+            blocks += p.block_bytes.len();
             df += p.doc_freq_data.len();
             pos += p.pos_data.len();
             docs += p.docs.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
@@ -2112,6 +2112,35 @@ fn block_len(doc_count: u32, b: u32) -> usize {
     (doc_count as usize - b as usize * POSTING_BLOCK).min(POSTING_BLOCK)
 }
 
+/// Append `v` as an unsigned LEB128 varint.
+fn put_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Read an unsigned LEB128 varint from `buf` at `*pos`, advancing `*pos`.
+fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
+    let mut v = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = buf[*pos];
+        *pos += 1;
+        v |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    v
+}
+
 /// Bit width needed to represent `v` (0 for `v == 0`).
 fn bit_width(v: u32) -> u8 {
     (32 - v.leading_zeros()) as u8
@@ -2311,6 +2340,10 @@ fn bitpack_read_at(buf: &[u8], base: usize, s: usize, n: usize, width: u8, out: 
 
 /// Per-128-doc-block metadata — enough to skip and score-bound a block
 /// without decoding its payload.
+/// One block's metadata, parsed on demand from the varint `block_bytes` stream
+/// by [`BlockReader`]. `df_offset`/`pos_offset`/`n` are reconstructed by the
+/// reader (the doc/freq offset is derived from per-block widths; the position
+/// offset accumulates the stored per-block byte length), so they are not stored.
 #[derive(Clone, Copy)]
 struct BlockMeta {
     /// first / last doc id in the block (block doc ids are ascending).
@@ -2320,24 +2353,26 @@ struct BlockMeta {
     df_offset: u32,
     /// start offset of the block's position payload in `pos_data`.
     pos_offset: u32,
-    /// bit width of the packed doc-id deltas (from `first_doc`) and freqs.
+    /// number of docs in this block.
+    n: usize,
+    /// bit width of the packed doc-id gaps and freqs.
     doc_width: u8,
     freq_width: u8,
     /// bit width of the packed position deltas.
     pos_width: u8,
-    /// Block-local BM25 score bound inputs: the largest frequency and the
-    /// smallest doc length in the block. `doc_weight(max_freq, min_dl)` is the
-    /// block's per-doc upper bound, used to skip whole non-competitive blocks
-    /// in the single-term top-k scan (block-max WAND).
+    /// Block-local BM25 score bound inputs (largest freq, smallest doc length):
+    /// `doc_weight(max_freq, min_dl)` bounds every doc's score in the block,
+    /// used to skip non-competitive blocks (block-max WAND).
     max_freq: u32,
     min_dl: u32,
 }
 
-/// Per-term locator into a partition's shared posting buffers.
+/// Per-term locator. The term's per-block metadata lives in the partition's
+/// `block_bytes` varint stream starting at `meta_offset`.
 #[derive(Clone, Copy)]
 struct PostingRef {
-    /// index of the term's first block in `block_meta`.
-    block_start: u32,
+    /// byte offset of the term's metadata in `block_bytes`.
+    meta_offset: u32,
     /// number of blocks the term spans.
     block_count: u32,
     /// number of docs (postings) for the term.
@@ -2346,6 +2381,79 @@ struct PostingRef {
     /// per-term upper bound is `query_weight * doc_weight(max_freq, min_dl)`.
     max_freq: u32,
     min_dl: u32,
+}
+
+/// Forward-sequential parser over a term's blocks in `block_bytes`. The cursor
+/// only ever moves forward (new -> block 0; advance -> next; skip_to walks
+/// forward), so block metadata is parsed on demand instead of being stored as a
+/// 32-byte struct per block.
+struct BlockReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    doc_count: u32,
+    block_count: u32,
+    block_idx: u32,
+    prev_last_doc: u32,
+    df_offset: usize,
+    pos_offset: usize,
+}
+
+impl<'a> BlockReader<'a> {
+    fn new(part: &'a Partition, pref: &PostingRef) -> Self {
+        let mut pos = pref.meta_offset as usize;
+        let df_offset = read_varint(&part.block_bytes, &mut pos) as usize;
+        let pos_offset = read_varint(&part.block_bytes, &mut pos) as usize;
+        Self {
+            bytes: &part.block_bytes,
+            pos,
+            doc_count: pref.doc_count,
+            block_count: pref.block_count,
+            block_idx: 0,
+            prev_last_doc: 0,
+            df_offset,
+            pos_offset,
+        }
+    }
+
+    /// Parse the next block's metadata (without decoding its payload), advancing
+    /// the derived doc/freq and position offsets. `None` once exhausted.
+    fn next_meta(&mut self) -> Option<BlockMeta> {
+        if self.block_idx >= self.block_count {
+            return None;
+        }
+        let n = block_len(self.doc_count, self.block_idx);
+        let first_field = read_varint(self.bytes, &mut self.pos) as u32;
+        let first_doc = if self.block_idx == 0 {
+            first_field
+        } else {
+            self.prev_last_doc + first_field
+        };
+        let last_doc = first_doc + read_varint(self.bytes, &mut self.pos) as u32;
+        let doc_width = self.bytes[self.pos];
+        let freq_width = self.bytes[self.pos + 1];
+        let pos_width = self.bytes[self.pos + 2];
+        self.pos += 3;
+        let pos_bytes = read_varint(self.bytes, &mut self.pos) as usize;
+        let max_freq = read_varint(self.bytes, &mut self.pos) as u32;
+        let min_dl = read_varint(self.bytes, &mut self.pos) as u32;
+        let bm = BlockMeta {
+            first_doc,
+            last_doc,
+            df_offset: self.df_offset as u32,
+            pos_offset: self.pos_offset as u32,
+            n,
+            doc_width,
+            freq_width,
+            pos_width,
+            max_freq,
+            min_dl,
+        };
+        self.df_offset += bitpack_len(n, doc_width) + bitpack_len(n, freq_width);
+        self.pos_offset += pos_bytes;
+        self.prev_last_doc = last_doc;
+        self.block_idx += 1;
+        Some(bm)
+    }
 }
 
 /// An immutable, frozen FTS partition. Posting lists are byte-compressed
@@ -2359,8 +2467,9 @@ struct Partition {
     term_fst: Map<Vec<u8>>,
     /// per term, indexed by the FST's term id.
     postings: Box<[PostingRef]>,
-    /// per-block metadata for every term's blocks, concatenated.
-    block_meta: Box<[BlockMeta]>,
+    /// per-term, per-block metadata as a varint stream (see [`BlockReader`]) —
+    /// replaces a 32-byte `BlockMeta` struct per block.
+    block_bytes: Box<[u8]>,
     /// VByte(doc-id gaps) then VByte(freqs) for every block, concatenated.
     doc_freq_data: Box<[u8]>,
     /// per doc per block: VByte(count) then VByte(delta positions), concatenated.
@@ -2380,17 +2489,22 @@ fn build_partition(
     // Terms are inserted in sorted order; the FST value is the dense term id.
     let mut term_builder = fst::MapBuilder::memory();
     let mut postings = Vec::with_capacity(entries.len());
-    let mut block_meta: Vec<BlockMeta> = Vec::new();
+    let mut block_bytes: Vec<u8> = Vec::new();
     let mut doc_freq_data: Vec<u8> = Vec::new();
     let mut pos_data: Vec<u8> = Vec::new();
     for (term, docs_for_term) in entries {
         let doc_count = docs_for_term.len() as u32;
-        let block_start = block_meta.len() as u32;
+        let meta_offset = block_bytes.len() as u32;
+        // Term-level start offsets; per-block doc/freq offsets are derived from
+        // widths, position offsets accumulate the stored per-block byte length.
+        put_varint(&mut block_bytes, doc_freq_data.len() as u64);
+        put_varint(&mut block_bytes, pos_data.len() as u64);
         let mut term_max_freq = 0u32;
         let mut term_min_dl = u32::MAX;
+        let mut block_count = 0u32;
+        let mut prev_last_doc = 0u32;
         for chunk in docs_for_term.chunks(POSTING_BLOCK) {
-            let df_offset = doc_freq_data.len() as u32;
-            let pos_offset = pos_data.len() as u32;
+            let pos_offset_before = pos_data.len();
             let first_doc = chunk[0].0;
             let last_doc = chunk[chunk.len() - 1].0;
             // doc ids: bit-pack consecutive gaps from `first_doc` (width tracks
@@ -2419,23 +2533,31 @@ fn build_partition(
             term_min_dl = term_min_dl.min(blk_min_dl);
             let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
             bitpack_put(&mut pos_data, &pos_deltas, pos_width);
-            block_meta.push(BlockMeta {
-                first_doc,
-                last_doc,
-                df_offset,
-                pos_offset,
-                doc_width,
-                freq_width,
-                pos_width,
-                max_freq: blk_max_freq,
-                min_dl: blk_min_dl.max(1),
-            });
+            // Emit the block's varint metadata record.
+            let first_field = if block_count == 0 {
+                first_doc
+            } else {
+                first_doc - prev_last_doc
+            };
+            put_varint(&mut block_bytes, first_field as u64);
+            put_varint(&mut block_bytes, (last_doc - first_doc) as u64);
+            block_bytes.push(doc_width);
+            block_bytes.push(freq_width);
+            block_bytes.push(pos_width);
+            put_varint(
+                &mut block_bytes,
+                (pos_data.len() - pos_offset_before) as u64,
+            );
+            put_varint(&mut block_bytes, blk_max_freq as u64);
+            put_varint(&mut block_bytes, blk_min_dl.max(1) as u64);
+            prev_last_doc = last_doc;
+            block_count += 1;
             term_max_freq = term_max_freq.max(blk_max_freq);
         }
         let term_id = postings.len() as u64;
         postings.push(PostingRef {
-            block_start,
-            block_count: block_meta.len() as u32 - block_start,
+            meta_offset,
+            block_count,
             doc_count,
             max_freq: term_max_freq,
             min_dl: term_min_dl.max(1),
@@ -2449,7 +2571,7 @@ fn build_partition(
     Partition {
         term_fst,
         postings: postings.into_boxed_slice(),
-        block_meta: block_meta.into_boxed_slice(),
+        block_bytes: block_bytes.into_boxed_slice(),
         doc_freq_data: doc_freq_data.into_boxed_slice(),
         pos_data: pos_data.into_boxed_slice(),
         docs,
@@ -2518,7 +2640,7 @@ impl Partition {
         std::mem::size_of::<Self>()
             + self.term_fst.as_fst().as_bytes().len()
             + self.postings.len() * std::mem::size_of::<PostingRef>()
-            + self.block_meta.len() * std::mem::size_of::<BlockMeta>()
+            + self.block_bytes.len()
             + self.doc_freq_data.len()
             + self.pos_data.len()
             + self.docs.len() * (std::mem::size_of::<u64>() + 2 * std::mem::size_of::<u32>())
@@ -2668,13 +2790,13 @@ impl Partition {
         let bp = BitPacker4x::new();
         let mut docs: Vec<u32> = Vec::new();
         let mut freqs: Vec<u32> = Vec::new();
-        for block in 0..pref.block_count {
-            let bm = self.block_meta[(pref.block_start + block) as usize];
+        let mut reader = BlockReader::new(self, &pref);
+        while let Some(bm) = reader.next_meta() {
             let block_ub = qw * scorer.doc_weight(bm.max_freq, bm.min_dl);
             if block_ub <= topk.threshold() {
                 continue; // no doc in this block can enter the top-k
             }
-            let n = block_len(pref.doc_count, block);
+            let n = bm.n;
             let df_start = bm.df_offset as usize;
             unpack_doc_block(
                 &bp,
@@ -2916,18 +3038,20 @@ struct WandLane<'a> {
 /// without decoding them.
 struct PostingCursor<'a> {
     part: &'a Partition,
-    pref: PostingRef,
-    /// 0-based block index within the term; `== block_count` once exhausted.
-    block: u32,
-    /// the block decoded into `docs`/`freqs` (`u32::MAX` = none).
-    decoded: u32,
+    /// Forward-only parser over the term's block metadata.
+    reader: BlockReader<'a>,
+    /// Metadata of the block currently decoded into `docs`/`freqs`, or `None`
+    /// when the posting list is exhausted.
+    cur: Option<BlockMeta>,
+    /// Whether `docs`/`freqs` hold `cur`'s payload (false while `skip_to` walks
+    /// past whole blocks without decoding them).
+    decoded: bool,
     docs: Vec<u32>,
     freqs: Vec<u32>,
-    /// freq prefix sum of the decoded block (`len == freqs.len() + 1`); the
-    /// block it was computed for is `prefix_block`. Indexes the position
-    /// stream for random per-doc access.
+    /// freq prefix sum of the current block (`len == freqs.len() + 1`), indexing
+    /// the position stream for random per-doc access. Valid when `prefix_valid`.
     prefix: Vec<u32>,
-    prefix_block: u32,
+    prefix_valid: bool,
     /// scratch for the most recently decoded doc's positions.
     pos_scratch: Vec<u32>,
     /// index within the current block.
@@ -2939,58 +3063,66 @@ struct PostingCursor<'a> {
 impl<'a> PostingCursor<'a> {
     fn new(part: &'a Partition, term_id: u32) -> Self {
         let pref = part.postings[term_id as usize];
+        let mut reader = BlockReader::new(part, &pref);
+        let cur = reader.next_meta();
         let mut cursor = Self {
             part,
-            pref,
-            block: 0,
-            decoded: u32::MAX,
+            reader,
+            cur,
+            decoded: false,
             docs: Vec::new(),
             freqs: Vec::new(),
             prefix: Vec::new(),
-            prefix_block: u32::MAX,
+            prefix_valid: false,
             pos_scratch: Vec::new(),
             i: 0,
             bp: BitPacker4x::new(),
         };
-        if pref.block_count > 0 {
-            cursor.decode_doc_freq(0);
+        if let Some(bm) = cursor.cur {
+            cursor.decode(bm);
         }
         cursor
     }
 
-    fn decode_doc_freq(&mut self, block: u32) {
-        if self.decoded == block {
-            return;
-        }
-        let bm = self.part.block_meta[(self.pref.block_start + block) as usize];
-        let n = block_len(self.pref.doc_count, block);
-        // doc ids: consecutive gaps from `first_doc` (see `pack_doc_block`).
+    /// Decode the doc ids + freqs of block `bm` into `docs`/`freqs`.
+    fn decode(&mut self, bm: BlockMeta) {
         let df_start = bm.df_offset as usize;
         unpack_doc_block(
             &self.bp,
             &self.part.doc_freq_data,
             df_start,
-            n,
+            bm.n,
             bm.doc_width,
             bm.first_doc,
             &mut self.docs,
         );
-        // frequencies follow the doc-id block.
-        let freq_start = df_start + bitpack_len(n, bm.doc_width);
+        let freq_start = df_start + bitpack_len(bm.n, bm.doc_width);
         unpack_block(
             &self.bp,
             &self.part.doc_freq_data,
             freq_start,
-            n,
+            bm.n,
             bm.freq_width,
             &mut self.freqs,
         );
-        self.decoded = block;
+        self.decoded = true;
+        self.prefix_valid = false;
+    }
+
+    /// Move to the next block (parse + decode it), or exhaust.
+    fn next_block(&mut self) {
+        self.cur = self.reader.next_meta();
+        self.i = 0;
+        self.prefix_valid = false;
+        self.decoded = false;
+        if let Some(bm) = self.cur {
+            self.decode(bm);
+        }
     }
 
     /// Ensure `prefix` holds the freq prefix sum of the current block.
     fn ensure_prefix(&mut self) {
-        if self.prefix_block == self.block {
+        if self.prefix_valid {
             return;
         }
         self.prefix.clear();
@@ -3000,12 +3132,12 @@ impl<'a> PostingCursor<'a> {
             sum += f;
             self.prefix.push(sum);
         }
-        self.prefix_block = self.block;
+        self.prefix_valid = true;
     }
 
     /// Current doc id, or `None` once the list is exhausted.
     fn doc(&self) -> Option<u32> {
-        if self.block >= self.pref.block_count {
+        if self.cur.is_none() {
             return None;
         }
         self.docs.get(self.i).copied()
@@ -3026,7 +3158,7 @@ impl<'a> PostingCursor<'a> {
     /// document only (random access into the block's position stream).
     fn positions(&mut self) -> &[u32] {
         self.ensure_prefix();
-        let bm = self.part.block_meta[(self.pref.block_start + self.block) as usize];
+        let bm = self.cur.expect("positions() on exhausted cursor");
         let s = self.prefix[self.i] as usize;
         let n = self.prefix[self.i + 1] as usize - s;
         self.pos_scratch.clear();
@@ -3051,34 +3183,34 @@ impl<'a> PostingCursor<'a> {
     fn advance(&mut self) {
         self.i += 1;
         if self.i >= self.docs.len() {
-            self.block += 1;
-            self.i = 0;
-            if self.block < self.pref.block_count {
-                self.decode_doc_freq(self.block);
-            }
+            self.next_block();
         }
     }
 
     /// Advance to the first posting with `doc_id >= target` (or exhaust),
-    /// skipping whole blocks via `BlockMeta` without decoding them.
+    /// skipping whole blocks via their `last_doc` without decoding them.
     fn skip_to(&mut self, target: u32) {
         if self.doc().is_some_and(|d| d >= target) {
             return;
         }
-        while self.block < self.pref.block_count {
-            let bm = self.part.block_meta[(self.pref.block_start + self.block) as usize];
+        loop {
+            let Some(bm) = self.cur else {
+                return; // exhausted
+            };
             if bm.last_doc >= target {
-                break;
+                if !self.decoded {
+                    self.decode(bm);
+                }
+                // `last_doc >= target`, so this block holds a doc >= target.
+                self.i += self.docs[self.i..].partition_point(|&d| d < target);
+                return;
             }
-            self.block += 1;
+            // Whole block precedes `target`; skip it without decoding.
+            self.cur = self.reader.next_meta();
             self.i = 0;
+            self.decoded = false;
+            self.prefix_valid = false;
         }
-        if self.block >= self.pref.block_count {
-            return;
-        }
-        self.decode_doc_freq(self.block);
-        // `last_doc >= target`, so this block holds a doc >= target.
-        self.i += self.docs[self.i..].partition_point(|&d| d < target);
     }
 }
 
