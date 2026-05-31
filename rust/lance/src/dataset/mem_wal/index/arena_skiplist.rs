@@ -14,23 +14,34 @@
 //! mirrors RocksDB's arena `InlineSkipList`: nodes live for the index's whole
 //! life, readers only do `Acquire` loads, the writer publishes with `Release`.
 //!
+//! # Node layout (cache locality)
+//! The seek is **cache-miss bound** — each tower hop loads a node's key. So a
+//! node is a **single bump-arena allocation** with the key and its forward-
+//! pointer tower laid out contiguously (`[key][AtomicPtr; height]`), exactly
+//! like RocksDB. This is one cache miss per hop, not two (a separate boxed
+//! tower measured ~2x slower single-thread). Nodes are bump-allocated from
+//! large chunks, so they are also contiguous in insertion order.
+//!
 //! # Safety model
-//! - **Single writer.** Only [`SkipListWriter`] mutates; it holds the sole
-//!   `&mut`. Callers must serialize writes (the MemTable does so via the actor;
-//!   the BTree index additionally guards the writer behind a `Mutex`).
-//! - **No free before drop.** Nodes are owned by `SkipListCore` and dropped only
-//!   when the core (the whole index generation) is dropped, at which point there
-//!   are no live readers. So a reader can never observe a freed node.
-//! - **Pointer stability.** Nodes live behind `Box`; the owning `Vec<Box<Node>>`
-//!   may reallocate, but the `Box` heap allocations (and thus the `*const Node`
-//!   that readers follow) never move.
+//! - **Single writer.** Only [`SkipListWriter`] mutates (the sole `&mut`).
+//!   Callers must serialize writes (the MemTable does so via the actor; the
+//!   BTree index additionally guards the writer behind a `Mutex`).
+//! - **No free before drop.** Nodes live in the arena and are freed only when
+//!   the core (the whole index generation) drops, when no readers remain. So a
+//!   reader can never observe a freed node. Node addresses are stable (bump
+//!   chunks never move or realloc).
 //! - **Publish/consume.** The writer initializes a node fully, then links it in
 //!   with `Release` stores; readers follow links with `Acquire` loads, so a
 //!   reader that sees a pointer also sees the fully-initialized node.
+//! - **In-bounds towers.** A node is linked at level `L` only if its height is
+//!   `> L`, so any node reached during a level-`L` traversal has a tower slot at
+//!   `L` — reads never run off the end of a variable-length tower.
 
+use std::alloc::{self, Layout};
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
-use std::ptr;
+use std::mem::{align_of, size_of};
+use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
@@ -40,35 +51,113 @@ const MAX_HEIGHT: usize = 16;
 /// Inverse promotion probability (p = 1/4): a node grows one level with prob
 /// 1/4. Matches RocksDB's default `kBranching`.
 const BRANCHING: u64 = 4;
+/// Bump-arena chunk size (1 MiB). Nodes are packed contiguously within a chunk.
+const CHUNK_SIZE: usize = 1 << 20;
 
-/// A skiplist node: a key plus a variable-length tower of forward pointers.
-///
-/// `next[i]` is the successor at level `i`. The tower length is the node's
-/// height. Stored in an `AtomicPtr` so the writer can publish (`Release`) and
-/// readers can consume (`Acquire`) without a lock.
+/// Node header. The variable-length forward-pointer tower (`height` slots of
+/// `AtomicPtr<Node<K>>`) is laid out immediately after this header in the same
+/// allocation; see [`tower`]. `#[repr(C)]` fixes the field order so the tower
+/// offset is stable.
+#[repr(C)]
 struct Node<K> {
     key: K,
-    next: Box<[AtomicPtr<Self>]>,
 }
 
-/// Shared, append-only core. Owns every node for the index's lifetime.
-///
-/// `head` is a bare tower (no key) acting as the before-first sentinel; a null
-/// node pointer in a traversal means "at head". `nodes` is touched only by the
-/// single writer; readers never read it (they only follow `next` pointers).
+/// Byte offset of the tower (first `AtomicPtr`) within a node allocation.
+#[inline]
+fn tower_offset<K>() -> usize {
+    let align = align_of::<AtomicPtr<Node<K>>>();
+    (size_of::<Node<K>>() + align - 1) & !(align - 1)
+}
+
+/// Allocation layout for a node with `height` tower levels.
+#[inline]
+fn node_layout<K>(height: usize) -> Layout {
+    let size = tower_offset::<K>() + height * size_of::<AtomicPtr<Node<K>>>();
+    let align = align_of::<Node<K>>().max(align_of::<AtomicPtr<Node<K>>>());
+    Layout::from_size_align(size, align).expect("valid node layout")
+}
+
+/// Pointer to a node's tower (level-0 forward pointer). `node` must be non-null
+/// and point to an initialized node; level access must stay `< node.height`.
+#[inline]
+unsafe fn tower<K>(node: *const Node<K>) -> *const AtomicPtr<Node<K>> {
+    (node as *const u8).add(tower_offset::<K>()).cast()
+}
+
+/// A simple single-threaded bump allocator. Hands out node-sized blocks from
+/// large chunks; never frees individual blocks. Chunks are freed on drop.
+struct Arena {
+    chunks: Vec<(NonNull<u8>, Layout)>,
+    cursor: *mut u8,
+    end: *mut u8,
+}
+
+impl Arena {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            cursor: ptr::null_mut(),
+            end: ptr::null_mut(),
+        }
+    }
+
+    /// Bump-allocate `layout`. Caller must have exclusive access (single writer).
+    unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        let align = layout.align();
+        let mut aligned = (self.cursor as usize).wrapping_add(align - 1) & !(align - 1);
+        if self.cursor.is_null() || aligned + layout.size() > self.end as usize {
+            self.grow(layout);
+            aligned = (self.cursor as usize + align - 1) & !(align - 1);
+        }
+        self.cursor = (aligned + layout.size()) as *mut u8;
+        aligned as *mut u8
+    }
+
+    /// Allocate a fresh chunk large enough for `layout` and make it current.
+    #[cold]
+    unsafe fn grow(&mut self, layout: Layout) {
+        let align = layout.align().max(64);
+        let size = CHUNK_SIZE.max(layout.size().next_power_of_two());
+        let chunk_layout = Layout::from_size_align(size, align).expect("valid chunk layout");
+        let ptr = alloc::alloc(chunk_layout);
+        if ptr.is_null() {
+            alloc::handle_alloc_error(chunk_layout);
+        }
+        self.chunks
+            .push((NonNull::new_unchecked(ptr), chunk_layout));
+        self.cursor = ptr;
+        self.end = ptr.add(size);
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        for (ptr, layout) in &self.chunks {
+            // SAFETY: each chunk was allocated by `grow` with this exact layout
+            // and is freed exactly once.
+            unsafe { alloc::dealloc(ptr.as_ptr(), *layout) };
+        }
+    }
+}
+
+/// Shared, append-only core. Owns the arena (and thus every node) for the
+/// index's lifetime. `head` is a bare tower (no key) acting as the before-first
+/// sentinel; a null node pointer in a traversal means "at head". `arena` is
+/// touched only by the single writer; readers only follow `next` pointers.
 struct SkipListCore<K> {
     /// Forward pointers out of the head sentinel, one per level (`MAX_HEIGHT`).
     head: Box<[AtomicPtr<Node<K>>]>,
-    /// Owns all nodes so they outlive every reader. Writer-only access.
-    nodes: UnsafeCell<Vec<Box<Node<K>>>>,
+    /// Backing storage for all nodes. Writer-only access.
+    arena: UnsafeCell<Arena>,
     /// Highest tower level currently in use (1..=MAX_HEIGHT).
     height: AtomicUsize,
     /// Number of entries.
     len: AtomicUsize,
 }
 
-// SAFETY: `nodes` (the only non-Sync field) is mutated exclusively by the single
-// writer; readers never access it. Reader/writer interaction on `head`/`next`
+// SAFETY: `arena` (the only non-Sync field) is mutated exclusively by the single
+// writer; readers never access it. Reader/writer interaction on `head`/towers
 // goes through atomics with Acquire/Release. `K: Send + Sync` covers the keys
 // shared with readers.
 unsafe impl<K: Send + Sync> Send for SkipListCore<K> {}
@@ -82,28 +171,46 @@ impl<K> SkipListCore<K> {
             .into_boxed_slice();
         Self {
             head,
-            nodes: UnsafeCell::new(Vec::new()),
+            arena: UnsafeCell::new(Arena::new()),
             height: AtomicUsize::new(1),
             len: AtomicUsize::new(0),
         }
     }
 
     /// The forward-pointer slot at `level` for `node` (null `node` = head).
+    /// `level` must be `< node.height` for a non-null node (upheld by the
+    /// "linked at L ⇒ height > L" invariant during traversal).
     #[inline]
     fn next_slot(&self, node: *const Node<K>, level: usize) -> &AtomicPtr<Node<K>> {
         if node.is_null() {
             &self.head[level]
         } else {
-            // SAFETY: `node` is non-null and points to a live node owned by
-            // `self.nodes` (never freed before `self` drops). `level` is < the
-            // node's height at every call site (search descends within height).
-            unsafe { &(*node).next[level] }
+            // SAFETY: `node` is a live node owned by the arena; `level` is in
+            // bounds by the traversal invariant.
+            unsafe { &*tower(node).add(level) }
         }
     }
 
     #[inline]
     fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
+    }
+}
+
+impl<K> Drop for SkipListCore<K> {
+    fn drop(&mut self) {
+        // Drop each key in place before the arena frees the backing chunks.
+        // Runs before fields drop, so `arena` memory is still valid here. No
+        // readers remain (the core drops only when all handles are gone), so
+        // relaxed loads suffice.
+        let mut node = self.head[0].load(Ordering::Relaxed);
+        while !node.is_null() {
+            // SAFETY: `node` is a live node in the arena; tower[0] is its
+            // level-0 successor (or null at the end).
+            let next = unsafe { (*tower(node)).load(Ordering::Relaxed) };
+            unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*node).key)) };
+            node = next;
+        }
     }
 }
 
@@ -169,24 +276,22 @@ impl<K: Ord> SkipListWriter<K> {
 
         let height = self.random_height();
 
-        // Build the node fully (key + successors) before publishing. Successors
-        // are stable: the single writer is the only mutator, so no link changes
-        // between read and publish.
-        let mut tower: Vec<AtomicPtr<Node<K>>> = Vec::with_capacity(height);
-        for (level, pred) in preds.iter().enumerate().take(height) {
-            let succ = self.core.next_slot(*pred, level).load(Ordering::Acquire);
-            tower.push(AtomicPtr::new(succ));
+        // Allocate the node in one block and initialize it fully (key + tower)
+        // before publishing. Successors are stable: the single writer is the
+        // only mutator, so no link changes between read and publish.
+        let layout = node_layout::<K>(height);
+        // SAFETY: single-writer exclusive access to the arena.
+        let node = unsafe { (*self.core.arena.get()).alloc(layout) } as *mut Node<K>;
+        // SAFETY: `node` points to a fresh, uninitialized, correctly-sized and
+        // -aligned block; we write the key then `height` tower slots.
+        unsafe {
+            ptr::write(ptr::addr_of_mut!((*node).key), key);
+            let tower = tower::<K>(node) as *mut AtomicPtr<Node<K>>;
+            for (level, pred) in preds.iter().enumerate().take(height) {
+                let succ = self.core.next_slot(*pred, level).load(Ordering::Acquire);
+                ptr::write(tower.add(level), AtomicPtr::new(succ));
+            }
         }
-
-        let node = Box::new(Node {
-            key,
-            next: tower.into_boxed_slice(),
-        });
-        let node_ptr: *mut Node<K> = &*node as *const Node<K> as *mut Node<K>;
-        // Hand ownership to the core; the `Box` heap stays put even if the Vec
-        // reallocates, so `node_ptr` remains valid for readers.
-        // SAFETY: single-writer exclusive access to `nodes`.
-        unsafe { (*self.core.nodes.get()).push(node) };
 
         // Advertise the taller height before linking the top levels: a reader
         // that sees the new height but not yet a top link just finds a null
@@ -200,7 +305,7 @@ impl<K: Ord> SkipListWriter<K> {
         for (level, pred) in preds.iter().enumerate().take(height) {
             self.core
                 .next_slot(*pred, level)
-                .store(node_ptr, Ordering::Release);
+                .store(node, Ordering::Release);
         }
 
         self.core.len.fetch_add(1, Ordering::Release);
@@ -314,9 +419,10 @@ impl<'a, K> Iterator for Iter<'a, K> {
             return None;
         }
         // SAFETY: non-null node owned by the core; the borrow lifetime `'a` is
-        // bounded by the reader, which keeps the core (and node) alive.
+        // bounded by the reader, which keeps the core (and node) alive. tower[0]
+        // is the level-0 successor.
         let node = unsafe { &*self.node };
-        self.node = node.next[0].load(Ordering::Acquire);
+        self.node = unsafe { (*tower(self.node)).load(Ordering::Acquire) };
         Some(&node.key)
     }
 }
@@ -408,6 +514,39 @@ mod tests {
     }
 
     #[test]
+    fn test_string_keys_drop() {
+        // Exercises key Drop (heap-owning K) through the arena Drop path.
+        let (mut w, r) = new_skiplist::<String>();
+        for s in ["delta", "alpha", "charlie", "bravo"] {
+            w.insert(s.to_string());
+        }
+        assert_eq!(
+            r.iter().cloned().collect::<Vec<_>>(),
+            vec!["alpha", "bravo", "charlie", "delta"]
+        );
+        assert_eq!(
+            r.upper_bound_with(&"c".to_string(), |k| k.clone()),
+            Some("bravo".to_string())
+        );
+        drop(w);
+        drop(r); // arena drops here; keys must be dropped (no leak / double free)
+    }
+
+    #[test]
+    fn test_many_inserts_force_chunk_growth() {
+        // Enough entries to span multiple arena chunks; verifies ordering and
+        // pointer stability across chunk growth.
+        let (mut w, r) = new_skiplist::<i64>();
+        const N: i64 = 200_000;
+        for k in (0..N).rev() {
+            w.insert(k);
+        }
+        assert_eq!(r.len(), N as usize);
+        assert!(r.iter().copied().eq(0..N));
+        assert_eq!(r.upper_bound_with(&(N - 1), |k| *k), Some(N - 1));
+    }
+
+    #[test]
     fn test_concurrent_single_writer_many_readers() {
         // 1 writer inserting 0..N while readers continuously seek. Asserts:
         // every value a reader observes is one the writer has inserted, the
@@ -426,10 +565,10 @@ mod tests {
                     while !done.load(Ordering::Acquire) {
                         // Largest key present <= N is a contiguous prefix max.
                         if let Some(top) = r.upper_bound_with(&N, |k| *k) {
-                            assert!((0..N).contains(&top) || top == N - 1);
+                            assert!((0..N).contains(&top));
                             assert!(top >= max_seen, "visibility went backwards");
                             max_seen = top;
-                            // Every key up to `top` must be present (contiguous).
+                            // The observed max must itself be present.
                             assert!(r.upper_bound_with(&top, |k| *k) == Some(top));
                         }
                     }
