@@ -72,6 +72,10 @@ use super::RowPosition;
 thread_local! {
     /// Diagnostic (FTS_WAND_STATS): full doc scorings done by the top-k path.
     static SCORED: Cell<u64> = const { Cell::new(0) };
+    /// Diagnostic: WAND control-loop iterations.
+    static ITERS: Cell<u64> = const { Cell::new(0) };
+    /// Diagnostic: posting blocks decoded.
+    static DECODED: Cell<u64> = const { Cell::new(0) };
 }
 
 // ============================================================================
@@ -1320,6 +1324,8 @@ impl FtsMemIndex {
                 let stats = std::env::var_os("FTS_WAND_STATS").is_some();
                 if stats {
                     SCORED.with(|c| c.set(0));
+                    ITERS.with(|c| c.set(0));
+                    DECODED.with(|c| c.set(0));
                 }
                 let mut topk = TopK::new(k);
                 // Scan the block-max partitions first to warm the shared
@@ -1346,10 +1352,12 @@ impl FtsMemIndex {
                         .map(|p| tokens.iter().map(|t| p.token_df(t)).sum::<usize>())
                         .sum();
                     eprintln!(
-                        "WAND tokens={} k={} scored={} union_postings={}",
+                        "WAND tokens={} k={} scored={} iters={} decoded_blocks={} union_postings={}",
                         tokens.len(),
                         k,
                         SCORED.with(|c| c.get()),
+                        ITERS.with(|c| c.get()),
+                        DECODED.with(|c| c.get()),
                         union,
                     );
                 }
@@ -3110,6 +3118,7 @@ impl Partition {
             return;
         }
         loop {
+            ITERS.with(|c| c.set(c.get() + 1));
             lanes.retain(|l| l.cursor.doc().is_some());
             if lanes.is_empty() {
                 break;
@@ -3389,6 +3398,7 @@ impl<'a> PostingCursor<'a> {
         );
         self.decoded = true;
         self.prefix_valid = false;
+        DECODED.with(|c| c.set(c.get() + 1));
     }
 
     /// Move to the next block (parse + decode it), or exhaust.
