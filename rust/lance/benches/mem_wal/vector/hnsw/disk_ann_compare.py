@@ -164,6 +164,7 @@ def run_lance(base, rows, corpus, queries, gt):
 
 
 def run_faiss(base, rows, corpus, queries, gt):
+    # Full-precision HNSW reference (shows what no quantization buys).
     import faiss
     index = faiss.IndexHNSWFlat(DIM, 32, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = 200
@@ -178,6 +179,30 @@ def run_faiss(base, rows, corpus, queries, gt):
             return index.search(v.reshape(1, -1), K)[1][0]
         return q
     return {"build_s": build_s, "sweep": sweep("faiss", make_q, None, queries, gt)}
+
+
+def run_faiss_sq(base, rows, corpus, queries, gt):
+    # HNSW + 8-bit scalar quantization — apples-to-apples with Lance IVF_HNSW_SQ.
+    import faiss
+    try:
+        index = faiss.IndexHNSWSQ(DIM, faiss.ScalarQuantizer.QT_8bit, 32,
+                                  faiss.METRIC_INNER_PRODUCT)
+    except Exception:
+        # Fall back to L2; on unit-normalized vectors L2 ranking == cosine.
+        index = faiss.IndexHNSWSQ(DIM, faiss.ScalarQuantizer.QT_8bit, 32)
+    index.hnsw.efConstruction = 200
+    t = time.perf_counter()
+    index.train(corpus)
+    index.add(corpus)
+    build_s = time.perf_counter() - t
+    faiss.write_index(index, os.path.join(base, f"faiss_sq_{rows}.index"))
+
+    def make_q(ef):
+        def q(v):
+            index.hnsw.efSearch = ef
+            return index.search(v.reshape(1, -1), K)[1][0]
+        return q
+    return {"build_s": build_s, "sweep": sweep("faiss_sq", make_q, None, queries, gt)}
 
 
 def run_diskann(base, rows, corpus, queries, gt):
@@ -207,7 +232,8 @@ def cmd_run(args):
     queries = np.load(os.path.join(d, "queries.npy"))
     gt = np.load(os.path.join(d, "gt.npy"))
     print(f"=== {args.system} rows={args.rows} corpus={len(corpus)} ===", flush=True)
-    fn = {"lance": run_lance, "faiss": run_faiss, "diskann": run_diskann}[args.system]
+    fn = {"lance": run_lance, "faiss": run_faiss, "faiss_sq": run_faiss_sq,
+          "diskann": run_diskann}[args.system]
     res = fn(args.base, args.rows, corpus, queries, gt)
     res["rows"] = args.rows
     res["system"] = args.system
