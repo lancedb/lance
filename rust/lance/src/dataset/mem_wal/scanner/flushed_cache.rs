@@ -148,7 +148,7 @@ impl std::fmt::Debug for FlushedMemTableCache {
 /// - `cache` absent: cold open via [`DatasetBuilder`]. Passing `session`
 ///   still reuses the shared index / metadata caches; `None`/`None`
 ///   reproduces the original per-query cold-open behavior exactly.
-pub(super) async fn open_flushed_dataset(
+pub async fn open_flushed_dataset(
     path: &str,
     session: Option<&Arc<Session>>,
     cache: Option<&Arc<FlushedMemTableCache>>,

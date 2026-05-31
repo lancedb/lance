@@ -855,20 +855,23 @@ async fn run_lance(
     // Keep a handle to the active MemTable for the direct fast path before
     // the collector takes ownership of the refs.
     let active = Arc::new(in_memory_refs.active.clone());
-    let collector = LsmDataSourceCollector::new(dataset.clone(), vec![shard_snapshot])
+    let collector = LsmDataSourceCollector::new(dataset.clone(), vec![shard_snapshot.clone()])
         .with_in_memory_memtables(shard_id, in_memory_refs);
-    // Thread the dataset session + a flushed-dataset cache into the planner and
-    // prewarm every flushed generation, so gen-key lookups never re-open a
-    // generation per query (the equivalent of RocksDB keeping its DB + SSTs
-    // resident). Without this, each plan-path lookup pays a fresh manifest read
-    // + Dataset open — a fixed per-lookup cost independent of generation count.
+    // Thread the dataset session + a flushed-dataset cache into the planner, and
+    // prewarm every flushed generation (open + warm its indexes) up front via
+    // the general MemWAL API, so gen-key lookups never re-open a generation per
+    // query (the equivalent of RocksDB keeping its DB + SSTs resident). Without
+    // this, each plan-path lookup pays a fresh manifest read + Dataset open — a
+    // fixed per-lookup cost independent of generation count.
     let flushed_cache = Arc::new(FlushedMemTableCache::new((gens as u64).max(1)));
+    dataset
+        .prewarm_mem_wal(std::slice::from_ref(&shard_snapshot), Some(&flushed_cache))
+        .await?;
     let planner = Arc::new(
         LsmPointLookupPlanner::new(collector, vec![KEY_COL.to_string()], arrow_schema)
             .with_session(dataset.session())
             .with_flushed_cache(flushed_cache),
     );
-    planner.prewarm().await?;
 
     // Warmup + correctness: a hit key must resolve to exactly one row under
     // whichever read mode we're timing.
