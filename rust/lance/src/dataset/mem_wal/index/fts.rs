@@ -3186,9 +3186,11 @@ impl Partition {
             .map(|&id| PostingCursor::new(self, id))
             .collect();
         let mut results = Vec::new();
+        // Reused across candidate docs to avoid per-doc allocation (the hot
+        // phrase cost when the rarest term still has a high doc count).
+        let mut all_positions: Vec<Vec<u32>> = vec![Vec::new(); tokens.len()];
+        let mut freqs = vec![0u32; tokens.len()];
         while let Some(doc) = cursors[rarest].cursor_doc() {
-            let mut all_positions: Vec<Vec<u32>> = vec![Vec::new(); tokens.len()];
-            let mut freqs = vec![0u32; tokens.len()];
             let mut present = true;
             for ti in 0..tokens.len() {
                 if ti != rarest {
@@ -3196,7 +3198,8 @@ impl Partition {
                 }
                 if cursors[ti].doc() == Some(doc) {
                     freqs[ti] = cursors[ti].freq();
-                    all_positions[ti] = cursors[ti].positions().to_vec();
+                    all_positions[ti].clear();
+                    all_positions[ti].extend_from_slice(cursors[ti].positions());
                 } else {
                     present = false;
                     break;
