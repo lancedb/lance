@@ -18,8 +18,8 @@ use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;
 
 use super::exec::{
-    BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
-    MemTableScanExec, VectorIndexExec,
+    BTreeIndexExec, FtsIndexExec, MEMWAL_ROW_POSITION_COLUMN, MemTableBruteForceVectorExec,
+    MemTableDedupScanExec, MemTableScanExec, VectorIndexExec,
 };
 use crate::dataset::mem_wal::scanner::exec::validate_pk_types;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -277,11 +277,11 @@ pub struct MemTableScanner {
     use_index: bool,
     batch_size: Option<usize>,
     /// Whether to include _rowid column in output.
-    /// In MemTable, _rowid is the row_position (global row offset).
     with_row_id: bool,
     /// Whether to include _rowaddr column in output.
-    /// Same value as _rowid but named for compatibility with LSM scanner.
     with_row_address: bool,
+    /// Whether to include the internal BatchStore row position column.
+    with_row_position: bool,
 }
 
 impl MemTableScanner {
@@ -316,13 +316,15 @@ impl MemTableScanner {
             batch_size: None,
             with_row_id: false,
             with_row_address: false,
+            with_row_position: false,
         }
     }
 
     /// Project only the specified columns.
     ///
     /// Special columns:
-    /// - `_rowid`: Returns the row position (global row offset in MemTable)
+    /// - `_rowid`: Included as nullable UInt64. Active memtable rows have no
+    ///   real Lance row id, so values are NULL.
     pub fn project(&mut self, columns: &[&str]) -> &mut Self {
         // Check if _rowid is requested in projection
         let mut filtered_columns = Vec::new();
@@ -342,7 +344,7 @@ impl MemTableScanner {
 
     /// Include the _rowid column in output.
     ///
-    /// In MemTable, _rowid is the row_position (global row offset).
+    /// Active memtable rows have no real Lance row id, so values are NULL.
     pub fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
         self
@@ -350,10 +352,18 @@ impl MemTableScanner {
 
     /// Include the _rowaddr column in output.
     ///
-    /// Same value as _rowid but named for compatibility with LSM scanner.
-    /// Used when scanning MemTable as part of a unified LSM scan.
+    /// Active memtable rows have no real Lance row address, so values are NULL.
     pub fn with_row_address(&mut self) -> &mut Self {
         self.with_row_address = true;
+        self
+    }
+
+    /// Include the internal BatchStore row position column.
+    ///
+    /// This is for LSM-internal dedup / ordering only. It is not a Lance row id,
+    /// row address, or public system column.
+    pub(crate) fn with_internal_row_position(&mut self) -> &mut Self {
+        self.with_row_position = true;
         self
     }
 
@@ -700,6 +710,14 @@ impl MemTableScanner {
             fields.push(Field::new(ROW_ADDRESS_COLUMN, DataType::UInt64, true));
         }
 
+        if self.with_row_position {
+            fields.push(Field::new(
+                MEMWAL_ROW_POSITION_COLUMN,
+                DataType::UInt64,
+                true,
+            ));
+        }
+
         Arc::new(arrow_schema::Schema::new(fields))
     }
 
@@ -768,6 +786,7 @@ impl MemTableScanner {
             self.schema.clone(),
             self.with_row_id,
             self.with_row_address,
+            self.with_row_position,
             filter_predicate,
             filter_expr,
         );
@@ -830,6 +849,7 @@ impl MemTableScanner {
             pk_indices,
             self.with_row_id,
             self.with_row_address,
+            self.with_row_position,
             filter_predicate,
             filter_expr,
         )))
@@ -859,6 +879,7 @@ impl MemTableScanner {
             self.output_schema(),
             self.with_row_id,
             self.with_row_address,
+            self.with_row_position,
         )?;
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
@@ -886,6 +907,7 @@ impl MemTableScanner {
                 projection_indices,
                 base_schema,
                 self.with_row_id,
+                self.with_row_position,
             )?)
         } else {
             Arc::new(MemTableBruteForceVectorExec::new(
@@ -895,6 +917,7 @@ impl MemTableScanner {
                 projection_indices,
                 base_schema,
                 self.with_row_id,
+                self.with_row_position,
             )?)
         };
         self.apply_post_index_ops(exec).await
@@ -920,6 +943,7 @@ impl MemTableScanner {
             projection_indices,
             self.base_output_schema(),
             self.with_row_id,
+            self.with_row_position,
         )?;
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
@@ -1223,7 +1247,7 @@ mod tests {
         assert_eq!(output_schema.field(2).name(), "_rowid");
         assert_eq!(output_schema.field(2).data_type(), &DataType::UInt64);
 
-        // Verify data includes correct row IDs
+        // Verify data includes nullable row IDs
         let result = scanner.try_into_batch().await.unwrap();
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.schema().field(2).name(), "_rowid");
@@ -1234,9 +1258,9 @@ mod tests {
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
         assert_eq!(row_ids.len(), 10);
-        // Row IDs should be 0-9 for a single batch
+        // Active memtable rows do not have stable Lance row IDs yet.
         for i in 0..10 {
-            assert_eq!(row_ids.value(i), i as u64);
+            assert!(row_ids.is_null(i));
         }
     }
 
@@ -1284,9 +1308,9 @@ mod tests {
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
 
-        // Row IDs should be 0-9 across both batches
+        // Active memtable rows do not have stable Lance row IDs yet.
         for i in 0..10 {
-            assert_eq!(row_ids.value(i), i as u64);
+            assert!(row_ids.is_null(i));
         }
     }
 
@@ -1440,7 +1464,7 @@ mod tests {
         assert_eq!(output_schema.field(2).name(), "_rowaddr");
         assert_eq!(output_schema.field(2).data_type(), &DataType::UInt64);
 
-        // Verify data includes correct row addresses
+        // Verify data includes nullable row addresses
         let result = scanner.try_into_batch().await.unwrap();
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.schema().field(2).name(), "_rowaddr");
@@ -1451,9 +1475,9 @@ mod tests {
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
         assert_eq!(row_addrs.len(), 10);
-        // Row addresses should be 0-9 for a single batch
+        // Active memtable rows do not have row addresses yet.
         for i in 0..10 {
-            assert_eq!(row_addrs.value(i), i as u64);
+            assert!(row_addrs.is_null(i));
         }
     }
 
@@ -1512,10 +1536,10 @@ mod tests {
             .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
 
-        // Both should have the same values
+        // Active memtable rows do not have stable row IDs or row addresses yet.
         for i in 0..5 {
-            assert_eq!(row_ids.value(i), i as u64);
-            assert_eq!(row_addrs.value(i), i as u64);
+            assert!(row_ids.is_null(i));
+            assert!(row_addrs.is_null(i));
         }
     }
 

@@ -37,4 +37,5 @@ mod builder;
 mod exec;
 
 pub use builder::MemTableScanner;
+pub(crate) use exec::MEMWAL_ROW_POSITION_COLUMN;
 pub use exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};

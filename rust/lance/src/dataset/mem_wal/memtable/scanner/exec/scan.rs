@@ -43,10 +43,12 @@ pub struct MemTableScanExec {
     source_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    /// Whether to include _rowid column (row position) in output.
+    /// Whether to include _rowid column in output.
     with_row_id: bool,
-    /// Whether to include _rowaddr column (row position, same as _rowid but different name).
+    /// Whether to include _rowaddr column in output.
     with_row_address: bool,
+    /// Whether to include the internal BatchStore row position column.
+    with_row_position: bool,
     /// Optional filter predicate (physical expression).
     filter_predicate: Option<PhysicalExprRef>,
     /// Original filter expression for display purposes.
@@ -77,7 +79,7 @@ impl MemTableScanExec {
     /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
-    /// * `with_row_id` - Whether to include _rowid column (row position)
+    /// * `with_row_id` - Whether to include _rowid column
     pub fn new(
         batch_store: Arc<BatchStore>,
         max_visible_batch_position: usize,
@@ -93,6 +95,7 @@ impl MemTableScanExec {
             output_schema,
             with_row_id,
             false, // with_row_address
+            false, // with_row_position
             None,
             None,
         )
@@ -107,8 +110,8 @@ impl MemTableScanExec {
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `source_schema` - Schema of source data (before projection), used for filter evaluation
-    /// * `with_row_id` - Whether to include _rowid column (row position)
-    /// * `with_row_address` - Whether to include _rowaddr column (row position, for LSM scanner)
+    /// * `with_row_id` - Whether to include _rowid column
+    /// * `with_row_address` - Whether to include _rowaddr column
     /// * `filter_predicate` - Optional physical expression for filtering
     /// * `filter_expr` - Optional logical expression for display
     #[allow(clippy::too_many_arguments)]
@@ -120,6 +123,7 @@ impl MemTableScanExec {
         source_schema: SchemaRef,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_position: bool,
         filter_predicate: Option<PhysicalExprRef>,
         filter_expr: Option<Expr>,
     ) -> Self {
@@ -140,6 +144,7 @@ impl MemTableScanExec {
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
             with_row_address,
+            with_row_position,
             filter_predicate,
             filter_expr,
         }
@@ -233,10 +238,10 @@ impl ExecutionPlan for MemTableScanExec {
         let source_schema = self.source_schema.clone();
         let with_row_id = self.with_row_id;
         let with_row_address = self.with_row_address;
+        let with_row_position = self.with_row_position;
         let filter_predicate = self.filter_predicate.clone();
 
-        // We need row offsets if either _rowid or _rowaddr is requested
-        let need_row_offsets = with_row_id || with_row_address;
+        let need_row_offsets = with_row_position;
 
         let projected_batches: Vec<DataFusionResult<RecordBatch>> = batches_with_offsets
             .into_iter()
@@ -311,13 +316,25 @@ impl ExecutionPlan for MemTableScanExec {
                         filtered_batch.columns().to_vec()
                     };
 
-                // Add _rowid column if requested
+                // Add _rowid column if requested. Active memtable rows do not
+                // have real Lance row ids.
                 if with_row_id {
-                    columns.push(Arc::new(UInt64Array::from(filtered_row_offsets.clone())));
+                    let row_id_col = UInt64Array::from_iter(
+                        std::iter::repeat_n(None, filtered_batch.num_rows()),
+                    );
+                    columns.push(Arc::new(row_id_col));
                 }
 
-                // Add _rowaddr column if requested (same value as _rowid, different name)
+                // Add _rowaddr column if requested. Active memtable rows do not
+                // have real row addresses.
                 if with_row_address {
+                    let row_addr_col = UInt64Array::from_iter(
+                        std::iter::repeat_n(None, filtered_batch.num_rows()),
+                    );
+                    columns.push(Arc::new(row_addr_col));
+                }
+
+                if with_row_position {
                     columns.push(Arc::new(UInt64Array::from(filtered_row_offsets)));
                 }
 
@@ -365,7 +382,7 @@ impl ExecutionPlan for MemTableScanExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{Array, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
 
@@ -521,24 +538,24 @@ mod tests {
 
         assert_eq!(batches.len(), 2);
 
-        // First batch should have row_ids 0-4
+        // Public active memtable scans cannot expose BatchStore row positions
+        // as stable Lance row IDs.
         let row_ids_1 = batches[0]
             .column(2)
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(row_ids_1.len(), 5);
-        assert_eq!(row_ids_1.value(0), 0);
-        assert_eq!(row_ids_1.value(4), 4);
+        assert!(row_ids_1.is_null(0));
+        assert!(row_ids_1.is_null(4));
 
-        // Second batch should have row_ids 5-7
         let row_ids_2 = batches[1]
             .column(2)
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(row_ids_2.len(), 3);
-        assert_eq!(row_ids_2.value(0), 5);
-        assert_eq!(row_ids_2.value(2), 7);
+        assert!(row_ids_2.is_null(0));
+        assert!(row_ids_2.is_null(2));
     }
 }

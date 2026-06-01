@@ -54,6 +54,7 @@ pub struct MemTableDedupScanExec {
     metrics: ExecutionPlanMetricsSet,
     with_row_id: bool,
     with_row_address: bool,
+    with_row_position: bool,
     filter_predicate: Option<PhysicalExprRef>,
     /// Original filter expression, for display only.
     filter_expr: Option<Expr>,
@@ -85,6 +86,7 @@ impl MemTableDedupScanExec {
         pk_indices: Vec<usize>,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_position: bool,
         filter_predicate: Option<PhysicalExprRef>,
         filter_expr: Option<Expr>,
     ) -> Self {
@@ -105,6 +107,7 @@ impl MemTableDedupScanExec {
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
             with_row_address,
+            with_row_position,
             filter_predicate,
             filter_expr,
         }
@@ -195,9 +198,10 @@ impl ExecutionPlan for MemTableDedupScanExec {
         let schema = self.output_schema.clone();
         let with_row_id = self.with_row_id;
         let with_row_address = self.with_row_address;
+        let with_row_position = self.with_row_position;
         let filter_predicate = self.filter_predicate.clone();
         let pk_indices = self.pk_indices.clone();
-        let need_row_offsets = with_row_id || with_row_address;
+        let need_row_offsets = with_row_position;
 
         // Cross-batch seen-set: first time a PK hash is seen (newest-first) wins.
         let mut seen: HashSet<u64> = HashSet::new();
@@ -261,9 +265,16 @@ impl ExecutionPlan for MemTableDedupScanExec {
                 emitted.columns().to_vec()
             };
             if with_row_id {
-                columns.push(Arc::new(UInt64Array::from(filtered_offsets.clone())));
+                let row_id_col =
+                    UInt64Array::from_iter(std::iter::repeat_n(None, emitted.num_rows()));
+                columns.push(Arc::new(row_id_col));
             }
             if with_row_address {
+                let row_addr_col =
+                    UInt64Array::from_iter(std::iter::repeat_n(None, emitted.num_rows()));
+                columns.push(Arc::new(row_addr_col));
+            }
+            if with_row_position {
                 columns.push(Arc::new(UInt64Array::from(filtered_offsets)));
             }
 
@@ -304,6 +315,7 @@ impl ExecutionPlan for MemTableDedupScanExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::memtable::scanner::MEMWAL_ROW_POSITION_COLUMN;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::col;
@@ -327,6 +339,7 @@ mod tests {
                 DataType::UInt64,
                 true,
             ),
+            Field::new(MEMWAL_ROW_POSITION_COLUMN, DataType::UInt64, true),
         ]))
     }
 
@@ -344,7 +357,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Run the exec and collect (id -> (value, rowaddr)).
+    /// Run the exec and collect (id -> (value, internal row position)).
     async fn run(
         store: Arc<BatchStore>,
         max_visible: usize,
@@ -364,6 +377,7 @@ mod tests {
             vec![0],
             false,
             true,
+            true,
             filter_predicate,
             filter_expr,
         );
@@ -375,9 +389,14 @@ mod tests {
             let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             let values = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
             let addrs = b.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+            let positions = b.column(3).as_any().downcast_ref::<UInt64Array>().unwrap();
             for i in 0..b.num_rows() {
+                assert!(
+                    addrs.is_null(i),
+                    "public _rowaddr must not expose active memtable row position"
+                );
                 let value = (!values.is_null(i)).then(|| values.value(i));
-                let prev = out.insert(ids.value(i), (value, addrs.value(i)));
+                let prev = out.insert(ids.value(i), (value, positions.value(i)));
                 assert!(prev.is_none(), "duplicate PK {} in output", ids.value(i));
             }
         }

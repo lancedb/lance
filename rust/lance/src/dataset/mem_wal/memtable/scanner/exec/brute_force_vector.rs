@@ -53,6 +53,7 @@ pub struct MemTableBruteForceVectorExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     with_row_id: bool,
+    with_row_position: bool,
 }
 
 impl Debug for MemTableBruteForceVectorExec {
@@ -80,6 +81,7 @@ impl MemTableBruteForceVectorExec {
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
+        with_row_position: bool,
     ) -> Result<Self> {
         let mut fields: Vec<Field> = base_schema
             .fields()
@@ -89,6 +91,13 @@ impl MemTableBruteForceVectorExec {
         fields.push(Field::new(DISTANCE_COLUMN, DataType::Float32, true));
         if with_row_id {
             fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
+        }
+        if with_row_position {
+            fields.push(Field::new(
+                super::MEMWAL_ROW_POSITION_COLUMN,
+                DataType::UInt64,
+                true,
+            ));
         }
         let output_schema = Arc::new(Schema::new(fields));
 
@@ -108,6 +117,7 @@ impl MemTableBruteForceVectorExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
+            with_row_position,
         })
     }
 
@@ -305,6 +315,12 @@ impl MemTableBruteForceVectorExec {
                 };
 
                 if self.with_row_id {
+                    let row_id_col =
+                        UInt64Array::from_iter(std::iter::repeat_n(None, rows_with_dist.len()));
+                    final_columns.push(Arc::new(row_id_col));
+                }
+
+                if self.with_row_position {
                     final_columns.push(Arc::new(UInt64Array::from(row_positions)));
                 }
 
@@ -407,6 +423,7 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::memtable::scanner::MEMWAL_ROW_POSITION_COLUMN;
     use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::common::collect;
@@ -484,6 +501,7 @@ mod tests {
                 None,
                 schema,
                 false,
+                false,
             )
             .expect("ctor"),
         );
@@ -518,7 +536,7 @@ mod tests {
         let store = Arc::new(BatchStore::with_capacity(4));
         let query = query_for([0.5, 0.5], 10);
         let exec = Arc::new(
-            MemTableBruteForceVectorExec::new(store, query, usize::MAX, None, schema, false)
+            MemTableBruteForceVectorExec::new(store, query, usize::MAX, None, schema, false, false)
                 .expect("ctor"),
         );
         let out_schema = exec.schema();
@@ -543,7 +561,7 @@ mod tests {
         let query = query_for([0.0, 0.0], 4);
         let exec = Arc::new(
             MemTableBruteForceVectorExec::new(
-                store, query, /* max_visible_batch_position = */ 0, None, schema, false,
+                store, query, /* max_visible_batch_position = */ 0, None, schema, false, false,
             )
             .expect("ctor"),
         );
@@ -576,7 +594,7 @@ mod tests {
         query.distance_lower_bound = Some(1.0);
         query.distance_upper_bound = Some(5.0);
         let exec = Arc::new(
-            MemTableBruteForceVectorExec::new(store, query, usize::MAX, None, schema, false)
+            MemTableBruteForceVectorExec::new(store, query, usize::MAX, None, schema, false, false)
                 .expect("ctor"),
         );
         let out = execute_to_batches(exec).await;
@@ -595,7 +613,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn populates_row_id_when_requested() {
+    async fn populates_internal_row_position_when_requested() {
+        let schema = make_schema();
+        let batch = make_batch(
+            schema.clone(),
+            &[10, 11, 12],
+            &[[3.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+        );
+        let store = store_with_batches(vec![batch]);
+        let query = query_for([0.0, 0.0], 3);
+        let exec = Arc::new(
+            MemTableBruteForceVectorExec::new(
+                store,
+                query,
+                usize::MAX,
+                None,
+                schema,
+                /* with_row_id = */ false,
+                /* with_row_position = */ true,
+            )
+            .expect("ctor"),
+        );
+        let out_schema = exec.schema();
+        assert!(
+            out_schema
+                .field_with_name(MEMWAL_ROW_POSITION_COLUMN)
+                .is_ok()
+        );
+
+        let out = execute_to_batches(exec).await;
+        let mut pairs: Vec<(i32, u64)> = Vec::new();
+        for batch in &out {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<arrow_array::types::Int32Type>();
+            let row_positions = batch
+                .column_by_name(MEMWAL_ROW_POSITION_COLUMN)
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>();
+            for i in 0..batch.num_rows() {
+                pairs.push((ids.value(i), row_positions.value(i)));
+            }
+        }
+        // Row offsets are insert-order: id=10 -> 0, id=11 -> 1, id=12 -> 2.
+        pairs.sort_by_key(|(id, _)| *id);
+        assert_eq!(pairs, vec![(10, 0), (11, 1), (12, 2)]);
+    }
+
+    #[tokio::test]
+    async fn public_row_id_is_null() {
         let schema = make_schema();
         let batch = make_batch(
             schema.clone(),
@@ -612,29 +679,17 @@ mod tests {
                 None,
                 schema,
                 /* with_row_id = */ true,
+                /* with_row_position = */ false,
             )
             .expect("ctor"),
         );
-        let out_schema = exec.schema();
-        assert!(out_schema.field_with_name(lance_core::ROW_ID).is_ok());
 
         let out = execute_to_batches(exec).await;
-        let mut pairs: Vec<(i32, u64)> = Vec::new();
         for batch in &out {
-            let ids = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_primitive::<arrow_array::types::Int32Type>();
-            let rowids = batch
-                .column_by_name(lance_core::ROW_ID)
-                .unwrap()
-                .as_primitive::<arrow_array::types::UInt64Type>();
+            let rowids = batch.column_by_name(lance_core::ROW_ID).unwrap();
             for i in 0..batch.num_rows() {
-                pairs.push((ids.value(i), rowids.value(i)));
+                assert!(rowids.is_null(i));
             }
         }
-        // Row offsets are insert-order: id=10 → 0, id=11 → 1, id=12 → 2.
-        pairs.sort_by_key(|(id, _)| *id);
-        assert_eq!(pairs, vec![(10, 0), (11, 1), (12, 2)]);
     }
 }

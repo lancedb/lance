@@ -24,8 +24,8 @@ use super::exec::{
 };
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
-    build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
-    wants_row_address, wants_row_id,
+    build_scanner_projection, canonical_output_schema, project_to_canonical, wants_row_address,
+    wants_row_id,
 };
 use crate::session::Session;
 
@@ -273,32 +273,27 @@ impl LsmPointLookupPlanner {
                 schema,
                 ..
             } => {
-                use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+                use crate::dataset::mem_wal::memtable::scanner::{
+                    MEMWAL_ROW_POSITION_COLUMN, MemTableScanner,
+                };
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.filter_expr(filter.clone());
-                // Expose `_rowid` (the BatchStore row offset, monotonic with
-                // insert order) so we can pick the most recently inserted
-                // duplicate below. Without this, a `FilterExec → LIMIT 1`
-                // over insert-ordered scan would return the *oldest* of
-                // multiple rows sharing the target primary key.
-                scanner.with_row_id();
+                // Expose the BatchStore row position as an internal column
+                // so we can pick the most recently inserted duplicate below.
+                scanner.with_internal_row_position();
                 let raw = scanner.create_plan().await?;
-                // Within the active memtable, larger `_rowid` = newer
+                // Within the active memtable, larger row position = newer
                 // insert. After dedup there is exactly one row per PK.
                 let deduped: Arc<dyn ExecutionPlan> = Arc::new(WithinSourceDedupExec::new(
                     raw,
                     self.pk_columns.clone(),
-                    lance_core::ROW_ID,
-                    DedupDirection::KeepMaxRowAddr,
+                    MEMWAL_ROW_POSITION_COLUMN,
+                    DedupDirection::KeepMax,
                 ));
-                // Per-source `_rowid` would collide with the base table's;
-                // NULL it before canonicalization (the value is internal to
-                // this arm). project_to_canonical drops it entirely when
-                // the user didn't request `_rowid` in the projection.
-                null_columns(deduped, &[lance_core::ROW_ID])?
+                deduped
             }
         };
         project_to_canonical(scan, &target)
@@ -658,7 +653,7 @@ mod tests {
         // memtable must return the *newest* row. The bug was that
         // `FilterExec → LIMIT 1` over an insert-ordered scan returned the
         // first (oldest) match. `WithinSourceDedupExec` collapses by PK,
-        // keeping the row with the largest `_rowid` (insert order).
+        // keeping the row with the largest internal row position.
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use futures::TryStreamExt;
@@ -674,7 +669,7 @@ mod tests {
         index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
 
         // Two writes to pk=1, then an unrelated pk=2. The "new" row goes
-        // *second* so its `_rowid` is larger.
+        // *second* so its internal row position is larger.
         let b_old = create_test_batch(&schema, &[1], "old");
         let b_new = create_test_batch(&schema, &[1], "new");
         let b_other = create_test_batch(&schema, &[2], "two");
@@ -719,6 +714,15 @@ mod tests {
 
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1, "expected exactly one row for pk=1");
+        assert!(
+            batches[0]
+                .schema()
+                .field_with_name(
+                    crate::dataset::mem_wal::memtable::scanner::MEMWAL_ROW_POSITION_COLUMN
+                )
+                .is_err(),
+            "internal row position column leaked into point lookup output"
+        );
         let name_col = batches[0].column_by_name("name").unwrap();
         let name_arr = name_col.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(

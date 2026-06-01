@@ -38,10 +38,12 @@ pub struct BTreeIndexExec {
     metrics: ExecutionPlanMetricsSet,
     /// Column name of the indexed field.
     column: String,
-    /// Whether to include _rowid column (row position) in output.
+    /// Whether to include _rowid column in output.
     with_row_id: bool,
-    /// Whether to include _rowaddr column (same as row position) in output.
+    /// Whether to include _rowaddr column in output.
     with_row_address: bool,
+    /// Whether to include the internal BatchStore row position column.
+    with_row_position: bool,
 }
 
 impl Debug for BTreeIndexExec {
@@ -70,8 +72,8 @@ impl BTreeIndexExec {
     /// * `max_visible_batch_position` - MVCC visibility sequence number
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
-    /// * `with_row_id` - Whether to include _rowid column (row position)
-    /// * `with_row_address` - Whether to include _rowaddr column (same as row position)
+    /// * `with_row_id` - Whether to include _rowid column
+    /// * `with_row_address` - Whether to include _rowaddr column
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_store: Arc<BatchStore>,
@@ -82,6 +84,7 @@ impl BTreeIndexExec {
         output_schema: SchemaRef,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_position: bool,
     ) -> Result<Self> {
         // Verify the index exists for this column
         let column = predicate.column().to_string();
@@ -111,6 +114,7 @@ impl BTreeIndexExec {
             column,
             with_row_id,
             with_row_address,
+            with_row_position,
         })
     }
 
@@ -267,13 +271,25 @@ impl BTreeIndexExec {
                         columns
                     };
 
-                // Add _rowid column if requested
+                // Add _rowid column if requested. Active memtable rows do not
+                // have real Lance row ids.
                 if self.with_row_id {
-                    final_columns.push(Arc::new(UInt64Array::from(row_positions.clone())));
+                    let row_id_col = UInt64Array::from_iter(
+                        std::iter::repeat_n(None, rows_with_positions.len()),
+                    );
+                    final_columns.push(Arc::new(row_id_col));
                 }
 
-                // Add _rowaddr column if requested (same value as row position)
+                // Add _rowaddr column if requested. Active memtable rows do not
+                // have real row addresses.
                 if self.with_row_address {
+                    let row_addr_col = UInt64Array::from_iter(
+                        std::iter::repeat_n(None, rows_with_positions.len()),
+                    );
+                    final_columns.push(Arc::new(row_addr_col));
+                }
+
+                if self.with_row_position {
                     final_columns.push(Arc::new(UInt64Array::from(row_positions)));
                 }
 
@@ -383,7 +399,7 @@ impl ExecutionPlan for BTreeIndexExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{Array, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::ScalarValue;
     use futures::TryStreamExt;
@@ -439,6 +455,7 @@ mod tests {
             schema,
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -481,6 +498,7 @@ mod tests {
             0,
             None,
             schema,
+            false,
             false,
             false,
         )
@@ -528,6 +546,7 @@ mod tests {
             schema.clone(),
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -546,6 +565,7 @@ mod tests {
             1,
             None,
             schema,
+            false,
             false,
             false,
         )
@@ -597,6 +617,7 @@ mod tests {
             schema_with_rowid.clone(),
             true,
             false,
+            false,
         )
         .unwrap();
 
@@ -613,7 +634,8 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
 
-        // Verify _rowid column is present and has correct value
+        // Verify _rowid column is present but not populated with the internal
+        // BatchStore row position unless explicitly requested.
         let batch = &batches[0];
         assert_eq!(batch.num_columns(), 3);
         assert_eq!(batch.schema().field(2).name(), "_rowid");
@@ -623,7 +645,7 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        assert_eq!(row_ids.value(0), 5); // Row position for id=5 is 5
+        assert!(row_ids.is_null(0));
     }
 
     #[tokio::test]
@@ -661,6 +683,7 @@ mod tests {
                 schema.clone(),
                 false,
                 false,
+                false,
             )
             .unwrap(),
         );
@@ -688,6 +711,7 @@ mod tests {
                 None,
                 schema_with_rowid,
                 true,
+                false,
                 false,
             )
             .unwrap(),

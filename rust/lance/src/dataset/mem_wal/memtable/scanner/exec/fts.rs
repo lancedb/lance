@@ -52,8 +52,10 @@ pub struct FtsIndexExec {
     batch_ranges: Vec<BatchRange>,
     /// Maximum visible row position based on max_visible_batch_position (None if nothing visible).
     max_visible_row: Option<u64>,
-    /// Whether to include _rowid column (row position) in output.
+    /// Whether to include _rowid column in output.
     with_row_id: bool,
+    /// Whether to include the internal BatchStore row position column.
+    with_row_position: bool,
 }
 
 impl Debug for FtsIndexExec {
@@ -81,7 +83,8 @@ impl FtsIndexExec {
     /// * `max_visible_batch_position` - MVCC visibility sequence number
     /// * `projection` - Optional column indices to project
     /// * `base_schema` - Schema before adding score column (and _rowid if with_row_id)
-    /// * `with_row_id` - Whether to include _rowid column (row position)
+    /// * `with_row_id` - Whether to include _rowid column
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
@@ -90,6 +93,7 @@ impl FtsIndexExec {
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
+        with_row_position: bool,
     ) -> Result<Self> {
         // Verify the index exists for this column
         let column = &query.column;
@@ -114,6 +118,13 @@ impl FtsIndexExec {
         fields.push(Field::new(SCORE_COLUMN, DataType::Float32, true));
         if with_row_id {
             fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
+        }
+        if with_row_position {
+            fields.push(Field::new(
+                super::MEMWAL_ROW_POSITION_COLUMN,
+                DataType::UInt64,
+                true,
+            ));
         }
         let output_schema = Arc::new(Schema::new(fields));
 
@@ -162,6 +173,7 @@ impl FtsIndexExec {
             batch_ranges,
             max_visible_row,
             with_row_id,
+            with_row_position,
         })
     }
 
@@ -300,6 +312,8 @@ impl FtsIndexExec {
             }
         }
 
+        let num_rows = all_scores.len();
+
         // Add score column
         final_columns.push(Arc::new(Float32Array::from(all_scores)));
 
@@ -316,8 +330,14 @@ impl FtsIndexExec {
             final_columns
         };
 
-        // Add _rowid column if requested
+        // Add _rowid column if requested. Active memtable rows do not have
+        // real Lance row ids.
         if self.with_row_id {
+            let row_id_col = UInt64Array::from_iter(std::iter::repeat_n(None, num_rows));
+            projected_columns.push(Arc::new(row_id_col));
+        }
+
+        if self.with_row_position {
             projected_columns.push(Arc::new(UInt64Array::from(all_row_positions)));
         }
 
@@ -469,7 +489,8 @@ mod tests {
 
         let query = FtsQuery::match_query("text", "hello");
 
-        let exec = FtsIndexExec::new(batch_store, indexes, query, 0, None, schema, false).unwrap();
+        let exec =
+            FtsIndexExec::new(batch_store, indexes, query, 0, None, schema, false, false).unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -514,6 +535,7 @@ mod tests {
             None,
             schema.clone(),
             false,
+            false,
         )
         .unwrap();
 
@@ -525,7 +547,8 @@ mod tests {
         assert_eq!(total_rows, 2); // "hello" in batch1 docs 0 and 2
 
         // Query with max_visible=1 should see both batches
-        let exec = FtsIndexExec::new(batch_store, indexes, query, 1, None, schema, false).unwrap();
+        let exec =
+            FtsIndexExec::new(batch_store, indexes, query, 1, None, schema, false, false).unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();

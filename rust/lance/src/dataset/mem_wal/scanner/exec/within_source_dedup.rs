@@ -6,10 +6,10 @@
 //!
 //! In MemWAL/LSM mode the same primary key can be written multiple times into
 //! the same memtable. The active memtable stores rows in insert order (larger
-//! `_rowaddr` = newer), while flushed memtables are reverse-written so that
-//! within a flushed file the smallest `_rowid` is the newest insert (see
-//! `memtable/flush.rs:152` and `hnsw/storage.rs:307`). Point lookup uses this
-//! node to collapse such duplicates *within a single source* so that the
+//! internal row position = newer), while flushed memtables are reverse-written
+//! so that within a flushed file the smallest `_rowid` is the newest insert
+//! (see `memtable/flush.rs:152` and `hnsw/storage.rs:307`). Point lookup uses
+//! this node to collapse such duplicates *within a single source* so that the
 //! downstream `CoalesceFirstExec` / `LIMIT` sees at most one row per primary
 //! key per source.
 
@@ -33,31 +33,29 @@ use futures::{Stream, StreamExt, ready};
 
 use super::pk::{compute_pk_hash, resolve_pk_indices};
 
-/// Among rows that share a primary key, which row-address extreme identifies
-/// the newest insert to keep. The kept row is always the freshest; only the
-/// row address (`_rowaddr`/`_rowid`) used to find it differs by source.
+/// Among rows that share a primary key, which ordering-column extreme
+/// identifies the newest insert to keep. The kept row is always the freshest;
+/// only the ordering column differs by source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupDirection {
-    /// Keep the row with the largest row-address value (active memtable: larger
-    /// `_rowaddr` = inserted later).
-    KeepMaxRowAddr,
-    /// Keep the row with the smallest row-address value (flushed memtable under
-    /// reverse-write: smaller `_rowid` = inserted later).
-    KeepMinRowAddr,
+    /// Keep the row with the largest ordering value.
+    KeepMax,
+    /// Keep the row with the smallest ordering value.
+    KeepMin,
 }
 
 /// Deduplicates rows from a single source by primary key, keeping the row
-/// whose `row_addr_column` value wins per [`DedupDirection`].
+/// whose `ordering_column` value wins per [`DedupDirection`].
 ///
 /// # Required columns
 ///
 /// The input must expose:
 /// - All `pk_columns`
-/// - `row_addr_column` of `UInt64` type
+/// - `ordering_column` of `UInt64` type
 ///
 /// The output schema is unchanged from the input. Callers that need to hide
-/// the row-address column from downstream consumers should compose this node
-/// with `project_to_canonical` or `null_columns`.
+/// the ordering column from downstream consumers should compose this node with
+/// `project_to_canonical` or `null_columns`.
 ///
 /// # Performance
 ///
@@ -68,7 +66,7 @@ pub enum DedupDirection {
 pub struct WithinSourceDedupExec {
     input: Arc<dyn ExecutionPlan>,
     pk_columns: Vec<String>,
-    row_addr_column: String,
+    ordering_column: String,
     direction: DedupDirection,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -78,7 +76,7 @@ impl WithinSourceDedupExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         pk_columns: Vec<String>,
-        row_addr_column: impl Into<String>,
+        ordering_column: impl Into<String>,
         direction: DedupDirection,
     ) -> Self {
         let schema = input.schema();
@@ -91,7 +89,7 @@ impl WithinSourceDedupExec {
         Self {
             input,
             pk_columns,
-            row_addr_column: row_addr_column.into(),
+            ordering_column: ordering_column.into(),
             direction,
             schema,
             properties,
@@ -102,8 +100,8 @@ impl WithinSourceDedupExec {
         &self.pk_columns
     }
 
-    pub fn row_addr_column(&self) -> &str {
-        &self.row_addr_column
+    pub fn ordering_column(&self) -> &str {
+        &self.ordering_column
     }
 
     pub fn direction(&self) -> DedupDirection {
@@ -119,9 +117,9 @@ impl DisplayAs for WithinSourceDedupExec {
             | DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "WithinSourceDedupExec: pk=[{}], row_addr={}, direction={:?}",
+                    "WithinSourceDedupExec: pk=[{}], ordering={}, direction={:?}",
                     self.pk_columns.join(", "),
-                    self.row_addr_column,
+                    self.ordering_column,
                     self.direction,
                 )
             }
@@ -162,7 +160,7 @@ impl ExecutionPlan for WithinSourceDedupExec {
         Ok(Arc::new(Self::new(
             children[0].clone(),
             self.pk_columns.clone(),
-            self.row_addr_column.clone(),
+            self.ordering_column.clone(),
             self.direction,
         )))
     }
@@ -176,7 +174,7 @@ impl ExecutionPlan for WithinSourceDedupExec {
         Ok(Box::pin(WithinSourceDedupStream {
             input: input_stream,
             pk_columns: self.pk_columns.clone(),
-            row_addr_column: self.row_addr_column.clone(),
+            ordering_column: self.ordering_column.clone(),
             direction: self.direction,
             schema: self.schema.clone(),
             winners: HashMap::new(),
@@ -189,13 +187,13 @@ impl ExecutionPlan for WithinSourceDedupExec {
 /// have to keep the source batch alive after we've picked the winner.
 struct Winner {
     batch: RecordBatch,
-    row_addr: u64,
+    ordering_value: u64,
 }
 
 struct WithinSourceDedupStream {
     input: SendableRecordBatchStream,
     pk_columns: Vec<String>,
-    row_addr_column: String,
+    ordering_column: String,
     direction: DedupDirection,
     schema: SchemaRef,
     winners: HashMap<u64, Winner>,
@@ -208,38 +206,38 @@ impl WithinSourceDedupStream {
             return Ok(());
         }
         let pk_indices = resolve_pk_indices(&batch, &self.pk_columns)?;
-        let row_addr_array = batch
-            .column_by_name(&self.row_addr_column)
+        let ordering_array = batch
+            .column_by_name(&self.ordering_column)
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Internal(format!(
-                    "Row-address column '{}' not found in batch",
-                    self.row_addr_column
+                    "Ordering column '{}' not found in batch",
+                    self.ordering_column
                 ))
             })?
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Internal(format!(
-                    "Row-address column '{}' is not UInt64",
-                    self.row_addr_column
+                    "Ordering column '{}' is not UInt64",
+                    self.ordering_column
                 ))
             })?;
 
         for row_idx in 0..batch.num_rows() {
-            if row_addr_array.is_null(row_idx) {
-                // A NULL row address can't be ordered against a real one. Skip
-                // rather than guess — callers should always project a real
-                // row-address column for dedup-eligible sources.
+            if ordering_array.is_null(row_idx) {
+                // A NULL ordering value can't be ordered against a real one.
+                // Skip rather than guess — callers should always project a
+                // real ordering column for dedup-eligible sources.
                 continue;
             }
-            let row_addr = row_addr_array.value(row_idx);
+            let ordering_value = ordering_array.value(row_idx);
             let pk_hash = compute_pk_hash(&batch, &pk_indices, row_idx);
 
             let take_row = match self.winners.get(&pk_hash) {
                 None => true,
                 Some(existing) => match self.direction {
-                    DedupDirection::KeepMaxRowAddr => row_addr > existing.row_addr,
-                    DedupDirection::KeepMinRowAddr => row_addr < existing.row_addr,
+                    DedupDirection::KeepMax => ordering_value > existing.ordering_value,
+                    DedupDirection::KeepMin => ordering_value < existing.ordering_value,
                 },
             };
 
@@ -249,7 +247,7 @@ impl WithinSourceDedupStream {
                     pk_hash,
                     Winner {
                         batch: single,
-                        row_addr,
+                        ordering_value,
                     },
                 );
             }
@@ -316,11 +314,11 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("_distance", DataType::Float32, true),
-            Field::new("_row_addr", DataType::UInt64, true),
+            Field::new("_ordering", DataType::UInt64, true),
         ]))
     }
 
-    fn batch(ids: &[i32], names: &[&str], distances: &[f32], row_addr: &[u64]) -> RecordBatch {
+    fn batch(ids: &[i32], names: &[&str], distances: &[f32], ordering: &[u64]) -> RecordBatch {
         let schema = create_test_schema();
         RecordBatch::try_new(
             schema,
@@ -328,7 +326,7 @@ mod tests {
                 Arc::new(Int32Array::from(ids.to_vec())),
                 Arc::new(StringArray::from(names.to_vec())),
                 Arc::new(Float32Array::from(distances.to_vec())),
-                Arc::new(UInt64Array::from(row_addr.to_vec())),
+                Arc::new(UInt64Array::from(ordering.to_vec())),
             ],
         )
         .unwrap()
@@ -338,7 +336,7 @@ mod tests {
         let schema = create_test_schema();
         let input = TestMemoryExec::try_new_exec(&[batches], schema, None).unwrap();
         let exec =
-            WithinSourceDedupExec::new(input, vec!["id".to_string()], "_row_addr", direction);
+            WithinSourceDedupExec::new(input, vec!["id".to_string()], "_ordering", direction);
         let ctx = SessionContext::new();
         let stream = exec.execute(0, ctx.task_ctx()).unwrap();
         stream.try_collect().await.unwrap()
@@ -359,15 +357,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_max_picks_largest_row_addr() {
-        // Active-memtable case: same pk inserted twice; newer = larger _rowaddr.
+    async fn keep_max_picks_largest_ordering_value() {
+        // Active-memtable case: same pk inserted twice; newer = larger ordering value.
         let b1 = batch(
             &[1, 1, 2],
             &["old", "new", "two"],
             &[0.1, 0.2, 0.3],
             &[10, 99, 5],
         );
-        let out = run(vec![b1], DedupDirection::KeepMaxRowAddr).await;
+        let out = run(vec![b1], DedupDirection::KeepMax).await;
         let rows = extract(&out);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (1, "new".to_string(), 99));
@@ -375,15 +373,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_min_picks_smallest_row_addr() {
-        // Flushed-memtable case under reverse-write: newer = smaller _rowid.
+    async fn keep_min_picks_smallest_ordering_value() {
+        // Flushed-memtable case under reverse-write: newer = smaller ordering value.
         let b1 = batch(
             &[1, 1, 2],
             &["old", "new", "two"],
             &[0.1, 0.2, 0.3],
             &[99, 10, 5],
         );
-        let out = run(vec![b1], DedupDirection::KeepMinRowAddr).await;
+        let out = run(vec![b1], DedupDirection::KeepMin).await;
         let rows = extract(&out);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (1, "new".to_string(), 10));
@@ -394,7 +392,7 @@ mod tests {
     async fn dedup_across_batches() {
         let b1 = batch(&[1, 2], &["a", "b"], &[0.1, 0.2], &[1, 1]);
         let b2 = batch(&[1, 3], &["a_new", "c"], &[0.5, 0.4], &[7, 1]);
-        let out = run(vec![b1, b2], DedupDirection::KeepMaxRowAddr).await;
+        let out = run(vec![b1, b2], DedupDirection::KeepMax).await;
         let rows = extract(&out);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], (1, "a_new".to_string(), 7));
@@ -404,13 +402,13 @@ mod tests {
 
     #[tokio::test]
     async fn empty_input() {
-        let out = run(vec![], DedupDirection::KeepMaxRowAddr).await;
+        let out = run(vec![], DedupDirection::KeepMax).await;
         let total: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 0);
     }
 
     #[tokio::test]
-    async fn null_row_addr_skipped() {
+    async fn null_ordering_value_skipped() {
         // Rows with NULL row address can't be ordered — they're dropped so they
         // don't accidentally become winners against real values.
         let schema = create_test_schema();
@@ -424,7 +422,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let out = run(vec![b], DedupDirection::KeepMaxRowAddr).await;
+        let out = run(vec![b], DedupDirection::KeepMax).await;
         let rows = extract(&out);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], (1, "real".to_string(), 5));

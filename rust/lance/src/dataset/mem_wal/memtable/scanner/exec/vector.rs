@@ -40,8 +40,10 @@ pub struct VectorIndexExec {
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    /// Whether to include _rowid column (row position) in output.
+    /// Whether to include _rowid column in output.
     with_row_id: bool,
+    /// Whether to include the internal BatchStore row position column.
+    with_row_position: bool,
 }
 
 impl Debug for VectorIndexExec {
@@ -79,7 +81,8 @@ impl VectorIndexExec {
     /// * `max_visible_batch_position` - MVCC visibility sequence number
     /// * `projection` - Optional column indices to project
     /// * `base_schema` - Schema after projection (will add _distance column, and _rowid if with_row_id)
-    /// * `with_row_id` - Whether to include _rowid column (row position)
+    /// * `with_row_id` - Whether to include _rowid column
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
@@ -88,6 +91,7 @@ impl VectorIndexExec {
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
+        with_row_position: bool,
     ) -> Result<Self> {
         let column = &query.column;
         if indexes.get_hnsw_by_column(column).is_none() {
@@ -106,6 +110,13 @@ impl VectorIndexExec {
         fields.push(Field::new(DISTANCE_COLUMN, DataType::Float32, true));
         if with_row_id {
             fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
+        }
+        if with_row_position {
+            fields.push(Field::new(
+                super::MEMWAL_ROW_POSITION_COLUMN,
+                DataType::UInt64,
+                true,
+            ));
         }
         let output_schema = Arc::new(Schema::new(fields));
 
@@ -126,6 +137,7 @@ impl VectorIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
+            with_row_position,
         })
     }
 
@@ -262,8 +274,15 @@ impl VectorIndexExec {
                     columns
                 };
 
-                // Add _rowid column if requested
+                // Add _rowid column if requested. Active memtable rows do not
+                // have real Lance row ids.
                 if self.with_row_id {
+                    let row_id_col =
+                        UInt64Array::from_iter(std::iter::repeat_n(None, rows_with_dist.len()));
+                    final_columns.push(Arc::new(row_id_col));
+                }
+
+                if self.with_row_position {
                     final_columns.push(Arc::new(UInt64Array::from(row_positions)));
                 }
 

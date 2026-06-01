@@ -54,7 +54,7 @@ use crate::session::Session;
 ///       UnionExec
 ///         ProjectionExec (canonical output schema)
 ///           SortExec(_distance, fetch=k)
-///             WithinSourceDedupExec: KeepMaxRowAddr           (active)
+///             WithinSourceDedupExec: KeepMax                  (active)
 ///               KNNExec: active memtable, fetch=ceil(k*overfetch)
 ///         ProjectionExec (canonical output schema)
 ///           ProjectionExec (null_columns _rowid)
@@ -260,17 +260,17 @@ impl LsmVectorSearchPlanner {
             // Make each source independently newest-per-PK before the union:
             //  * active: the append-only HNSW returns one node per inserted
             //    version, so collapse duplicate PKs to the newest insert
-            //    (KeepMaxRowAddr on `_rowid`) and re-sort by distance. This
-            //    stays probabilistic — a fresh version evicted from the
-            //    over-fetched top-k still leaks.
+            //    (KeepMax on the internal row position) and re-sort by
+            //    distance. This stays probabilistic — a fresh version evicted
+            //    from the over-fetched top-k still leaks.
             //  * flushed/base: drop cross-gen superseded rows via the
             //    block-list (within-gen is handled by the flushed DV).
             let knn = if is_active {
                 let deduped: Arc<dyn ExecutionPlan> = Arc::new(WithinSourceDedupExec::new(
                     knn,
                     self.pk_columns.clone(),
-                    lance_core::ROW_ID,
-                    DedupDirection::KeepMaxRowAddr,
+                    crate::dataset::mem_wal::memtable::scanner::MEMWAL_ROW_POSITION_COLUMN,
+                    DedupDirection::KeepMax,
                 ));
                 sort_by_distance(deduped, k)?
             } else {
@@ -284,10 +284,10 @@ impl LsmVectorSearchPlanner {
                     None => knn,
                 }
             };
-            // Lance's `fast_search()` and the active scan both produce a
-            // per-source `_rowid` that would collide with base row ids in the
-            // canonical output, so NULL it on non-base arms. The base arm keeps
-            // its real `_rowid` to drive the post-rerank take.
+            // Lance's `fast_search()` produces per-source `_rowid` values that
+            // would collide with base row ids in the canonical output, so NULL
+            // them on non-base arms. The base arm keeps its real `_rowid` to
+            // drive the post-rerank take.
             let after_null = if is_base {
                 knn
             } else {
@@ -435,14 +435,10 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-                // Expose `_rowid` (BatchStore row offset, monotonic with
-                // insert order) so [`WithinSourceDedupExec`] can collapse
-                // duplicate-PK rows to the newest insert. The value is
-                // per-source and NULL'd before reaching the canonical merge.
-                // (VectorIndexExec only plumbs `with_row_id`, not
-                // `with_row_address`, but the two yield identical values
-                // for an active memtable so either would work.)
-                scanner.with_row_id();
+                // Expose the BatchStore row position as an internal column
+                // so [`WithinSourceDedupExec`] can collapse duplicate-PK rows
+                // to the newest insert.
+                scanner.with_internal_row_position();
                 let query_arr: Arc<dyn Array> = Arc::new(query_vector.clone());
                 scanner.nearest(&self.vector_column, query_arr, k);
                 scanner.nprobes(nprobes);
@@ -1021,7 +1017,11 @@ mod tests {
 
         let out_schema = batches[0].schema();
         assert!(out_schema.field_with_name(DISTANCE_COLUMN).is_ok());
-        for internal in [super::super::exec::MEMTABLE_GEN_COLUMN, "_freshness"] {
+        for internal in [
+            super::super::exec::MEMTABLE_GEN_COLUMN,
+            crate::dataset::mem_wal::memtable::scanner::MEMWAL_ROW_POSITION_COLUMN,
+            "_freshness",
+        ] {
             assert!(
                 out_schema.field_with_name(internal).is_err(),
                 "`{}` leaked into output: {:?}",
