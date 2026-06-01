@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    ops::Bound,
-    sync::{Arc, LazyLock},
-};
+use std::{ops::Bound, sync::Arc};
 
-use arrow::array::BinaryBuilder;
-use arrow_array::{Array, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
@@ -26,8 +21,7 @@ use super::{
 use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use lance_select::{NullableRowAddrMask, RowAddrMask};
-use roaring::RoaringBitmap;
+use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -1293,80 +1287,14 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-/// When we evaluate a scalar index query we return a batch with three columns and two rows
-///
-/// The first column has the block list and allow list
-/// The second column tells if the result is least/exact/more (we repeat the discriminant twice)
-/// The third column has the fragments covered bitmap in the first row and null in the second row
-pub static INDEX_EXPR_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new("result".to_string(), DataType::Binary, true),
-        Field::new("discriminant".to_string(), DataType::UInt32, true),
-        Field::new("fragments_covered".to_string(), DataType::Binary, true),
-    ]))
-});
-
-// `IndexExprResult` and `NullableIndexExprResult` themselves live in the
-// `lance-select` crate so that benchmarks and downstream consumers can
-// depend on the mask substrate without pulling in all of `lance-index`.
-// The wire-format helpers below stay here, where the `INDEX_EXPR_RESULT_SCHEMA`
-// constant they reference is defined.
-pub use lance_select::{IndexExprResult, NullableIndexExprResult};
-
 impl From<SearchResult> for NullableIndexExprResult {
     fn from(result: SearchResult) -> Self {
         match result {
-            SearchResult::Exact(mask) => Self::Exact(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtMost(mask) => Self::AtMost(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtLeast(mask) => Self::AtLeast(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::Exact(mask) => Self::exact(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtMost(mask) => Self::at_most(NullableRowAddrMask::AllowList(mask)),
+            SearchResult::AtLeast(mask) => Self::at_least(NullableRowAddrMask::AllowList(mask)),
         }
     }
-}
-
-/// Parse an `IndexExprResult` from its serialized `(mask, discriminant)`
-/// representation. Counterpart to [`serialize_index_expr_result`].
-pub fn index_expr_result_from_parts(
-    mask: RowAddrMask,
-    discriminant: u32,
-) -> Result<IndexExprResult> {
-    match discriminant {
-        0 => Ok(IndexExprResult::Exact(mask)),
-        1 => Ok(IndexExprResult::AtMost(mask)),
-        2 => Ok(IndexExprResult::AtLeast(mask)),
-        _ => Err(Error::invalid_input_source(
-            format!("Invalid IndexExprResult discriminant: {}", discriminant).into(),
-        )),
-    }
-}
-
-/// Serialize an `IndexExprResult` plus its applicable-fragments bitmap
-/// into the `INDEX_EXPR_RESULT_SCHEMA` record-batch layout used to hand
-/// scalar-index results to the read planner.
-#[instrument(skip_all)]
-pub fn serialize_index_expr_result(
-    result: &IndexExprResult,
-    fragments_covered_by_result: &RoaringBitmap,
-) -> Result<RecordBatch> {
-    let row_addr_mask = result.row_addr_mask();
-    let row_addr_mask_arr = row_addr_mask.into_arrow()?;
-    let discriminant = result.discriminant();
-    let discriminant_arr =
-        Arc::new(UInt32Array::from(vec![discriminant, discriminant])) as Arc<dyn Array>;
-    let mut fragments_covered_builder = BinaryBuilder::new();
-    let fragments_covered_bytes_len = fragments_covered_by_result.serialized_size();
-    let mut fragments_covered_bytes = Vec::with_capacity(fragments_covered_bytes_len);
-    fragments_covered_by_result.serialize_into(&mut fragments_covered_bytes)?;
-    fragments_covered_builder.append_value(fragments_covered_bytes);
-    fragments_covered_builder.append_null();
-    let fragments_covered_arr = Arc::new(fragments_covered_builder.finish()) as Arc<dyn Array>;
-    Ok(RecordBatch::try_new(
-        INDEX_EXPR_RESULT_SCHEMA.clone(),
-        vec![
-            Arc::new(row_addr_mask_arr),
-            Arc::new(discriminant_arr),
-            Arc::new(fragments_covered_arr),
-        ],
-    )?)
 }
 
 impl ScalarIndexExpr {
@@ -2023,11 +1951,14 @@ impl PlannerIndexExt for Planner {
 mod tests {
     use std::collections::HashMap;
 
+    use arrow_array::Array;
     use arrow_schema::{Field, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
+    use lance_select::result::IndexExprResultWireFormat;
+    use roaring::RoaringBitmap;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -2572,55 +2503,42 @@ mod tests {
     async fn test_not_flips_certainty() {
         use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
 
-        // Test that NOT flips certainty for inexact index results
-        // This tests the implementation in evaluate_impl for Self::Not
-
-        // Helper function that mimics the NOT logic we just fixed
-        fn apply_not(result: NullableIndexExprResult) -> NullableIndexExprResult {
-            match result {
-                NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
-                NullableIndexExprResult::AtMost(mask) => NullableIndexExprResult::AtLeast(!mask),
-                NullableIndexExprResult::AtLeast(mask) => NullableIndexExprResult::AtMost(!mask),
-            }
-        }
+        // Test that NOT flips certainty for inexact index results.
+        // Under the {lower, upper} form, `!{l, u} = {!u, !l}`, which
+        // preserves the AtMost ↔ AtLeast swap and leaves Exact as Exact.
 
         // AtMost: superset of matches (e.g., bloom filter says "might be in [1,2]")
-        let at_most = NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
+        let at_most = NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtMost) should be AtLeast (definitely NOT in [1,2], might be elsewhere)
-        assert!(matches!(
-            apply_not(at_most),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!((!at_most).is_at_least());
 
         // AtLeast: subset of matches (e.g., definitely in [1,2], might be more)
-        let at_least = NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
+        let at_least = NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
         // NOT(AtLeast) should be AtMost (might NOT be in [1,2], definitely elsewhere)
-        assert!(matches!(
-            apply_not(at_least),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!((!at_least).is_at_most());
 
         // Exact should stay Exact
-        let exact = NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(
+        let exact = NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(
             NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[1, 2]), RowAddrTreeMap::new()),
         ));
-        assert!(matches!(
-            apply_not(exact),
-            NullableIndexExprResult::Exact(_)
-        ));
+        assert!((!exact).is_exact());
     }
 
     #[tokio::test]
     async fn test_and_or_preserve_certainty() {
         use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
 
-        // Test that AND/OR correctly propagate certainty
+        // Test that AND/OR correctly propagate certainty under the
+        // {lower, upper} algebra. Each binary op is elementwise on the
+        // endpoints, so degenerate shapes (Exact / AtMost / AtLeast)
+        // combine into a result that lands in one of those same shapes
+        // in every case exercised below.
         let make_at_most = || {
-            NullableIndexExprResult::AtMost(NullableRowAddrMask::AllowList(
+            NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(
                 NullableRowAddrSet::new(
                     RowAddrTreeMap::from_iter(&[1, 2, 3]),
                     RowAddrTreeMap::new(),
@@ -2629,7 +2547,7 @@ mod tests {
         };
 
         let make_at_least = || {
-            NullableIndexExprResult::AtLeast(NullableRowAddrMask::AllowList(
+            NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(
                 NullableRowAddrSet::new(
                     RowAddrTreeMap::from_iter(&[2, 3, 4]),
                     RowAddrTreeMap::new(),
@@ -2638,59 +2556,87 @@ mod tests {
         };
 
         let make_exact = || {
-            NullableIndexExprResult::Exact(NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
                 RowAddrTreeMap::from_iter(&[1, 2]),
                 RowAddrTreeMap::new(),
             )))
         };
 
         // AtMost & AtMost → AtMost
-        assert!(matches!(
-            make_at_most() & make_at_most(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!((make_at_most() & make_at_most()).is_at_most());
 
         // AtLeast & AtLeast → AtLeast
-        assert!(matches!(
-            make_at_least() & make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!((make_at_least() & make_at_least()).is_at_least());
 
-        // AtMost & AtLeast → AtMost (superset remains superset)
-        assert!(matches!(
-            make_at_most() & make_at_least(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        // AtMost & AtLeast → AtMost (the lower side stays empty)
+        assert!((make_at_most() & make_at_least()).is_at_most());
 
         // AtMost | AtMost → AtMost
-        assert!(matches!(
-            make_at_most() | make_at_most(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!((make_at_most() | make_at_most()).is_at_most());
 
         // AtLeast | AtLeast → AtLeast
-        assert!(matches!(
-            make_at_least() | make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!((make_at_least() | make_at_least()).is_at_least());
 
-        // AtMost | AtLeast → AtLeast (subset coverage guaranteed)
-        assert!(matches!(
-            make_at_most() | make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        // AtMost | AtLeast → AtLeast (upper stays universe)
+        assert!((make_at_most() | make_at_least()).is_at_least());
 
         // Exact & AtMost → AtMost
-        assert!(matches!(
-            make_exact() & make_at_most(),
-            NullableIndexExprResult::AtMost(_)
-        ));
+        assert!((make_exact() & make_at_most()).is_at_most());
 
         // Exact | AtLeast → AtLeast
-        assert!(matches!(
-            make_exact() | make_at_least(),
-            NullableIndexExprResult::AtLeast(_)
-        ));
+        assert!((make_exact() | make_at_least()).is_at_least());
+    }
+
+    /// The whole point of the `{lower, upper}` representation is that it
+    /// can express a Refined result — a non-empty `lower` strictly inside
+    /// a non-universe `upper` — which the old enum couldn't. This test
+    /// constructs one through the algebra and verifies the endpoints.
+    #[tokio::test]
+    async fn test_refined_result_constructed_through_algebra() {
+        use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
+
+        let allow_set = |rows: &[u64]| {
+            NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(rows),
+                RowAddrTreeMap::new(),
+            ))
+        };
+
+        // AtLeast({1,2}) & Exact({1,2,3}) is Refined, because:
+        //   lower = {1,2} ∩ {1,2,3} = {1,2}        (non-empty)
+        //   upper = universe ∩ {1,2,3} = {1,2,3}   (not universe)
+        //   lower ≠ upper                          (not Exact)
+        let at_least_12 = NullableIndexExprResult::at_least(allow_set(&[1, 2]));
+        let exact_123 = NullableIndexExprResult::exact(allow_set(&[1, 2, 3]));
+        let refined = at_least_12 & exact_123;
+
+        // None of the shape predicates should fire — that's what makes
+        // this a Refined result.
+        assert!(
+            !refined.is_exact(),
+            "Refined must not be classified as Exact"
+        );
+        assert!(
+            !refined.is_at_most(),
+            "Refined must not be classified as AtMost"
+        );
+        assert!(
+            !refined.is_at_least(),
+            "Refined must not be classified as AtLeast"
+        );
+
+        // Check the actual endpoints.
+        assert_eq!(refined.lower, allow_set(&[1, 2]));
+        assert_eq!(refined.upper, allow_set(&[1, 2, 3]));
+
+        // NOT swaps the endpoints, preserving the Refined shape.
+        let negated = !refined;
+        assert!(!negated.is_exact());
+        assert!(!negated.is_at_most());
+        assert!(!negated.is_at_least());
+        // !{l, u} = {!u, !l}. AllowList → BlockList.
+        assert!(matches!(negated.lower, NullableRowAddrMask::BlockList(_)));
+        assert!(matches!(negated.upper, NullableRowAddrMask::BlockList(_)));
     }
 
     #[test]
@@ -3008,5 +2954,156 @@ mod tests {
                 "starts_with and LIKE 'prefix%' should produce identical queries"
             );
         }
+    }
+
+    #[test]
+    fn test_serialize_index_expr_result_round_trip() {
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        for format in [
+            IndexExprResultWireFormat::TwoMask,
+            IndexExprResultWireFormat::ThreeVariant,
+        ] {
+            let mut addrs = RowAddrTreeMap::new();
+            addrs.insert_range(0..5);
+            addrs.insert_range(100..103);
+
+            let mut fragments_covered = RoaringBitmap::new();
+            fragments_covered.insert(0);
+            fragments_covered.insert(7);
+
+            let cases = [
+                (
+                    "exact",
+                    IndexExprResult::exact(RowAddrMask::from_allowed(addrs.clone())),
+                ),
+                (
+                    "at_most",
+                    IndexExprResult::at_most(RowAddrMask::from_allowed(addrs.clone())),
+                ),
+                (
+                    "at_least",
+                    IndexExprResult::at_least(RowAddrMask::from_allowed(addrs)),
+                ),
+            ];
+
+            for (label, original) in cases {
+                let batch = original.serialize(&fragments_covered, format).unwrap();
+                assert_eq!(
+                    batch.schema(),
+                    *format.schema(),
+                    "format {format:?}, case {label}"
+                );
+                assert_eq!(batch.num_rows(), 2, "format {format:?}, case {label}");
+
+                let (round_tripped, round_tripped_frags) =
+                    IndexExprResult::deserialize(&batch).unwrap();
+                assert_eq!(
+                    round_tripped.lower, original.lower,
+                    "format {format:?}, case {label}: lower"
+                );
+                assert_eq!(
+                    round_tripped.upper, original.upper,
+                    "format {format:?}, case {label}: upper"
+                );
+                assert_eq!(
+                    round_tripped_frags, fragments_covered,
+                    "format {format:?}, case {label}: frags"
+                );
+                assert_eq!(
+                    round_tripped.is_exact(),
+                    original.is_exact(),
+                    "format {format:?}, case {label}"
+                );
+                assert_eq!(
+                    round_tripped.is_at_most(),
+                    original.is_at_most(),
+                    "format {format:?}, case {label}"
+                );
+                assert_eq!(
+                    round_tripped.is_at_least(),
+                    original.is_at_least(),
+                    "format {format:?}, case {label}"
+                );
+            }
+        }
+    }
+
+    /// Exact results encode `upper` as a fully-null column on the wire — the
+    /// payload only needs to ship once. `RowAddrMask::into_arrow` never
+    /// produces a fully-null array (it always sets exactly one of the two
+    /// rows), so the sentinel can't collide with a real mask. This pins
+    /// both halves: exact ⇒ upper fully null, non-exact ⇒ upper carries the
+    /// real mask.
+    #[test]
+    fn test_serialize_omits_upper_when_exact() {
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(0u64..5));
+        let fragments_covered = RoaringBitmap::from_iter([0u32]);
+
+        use arrow::array::AsArray;
+
+        // Exact: upper column must be fully null on the wire.
+        let exact_batch = IndexExprResult::exact(mask.clone())
+            .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
+            .unwrap();
+        let exact_upper = exact_batch.column(1).as_binary::<i32>();
+        assert!(exact_upper.is_null(0) && exact_upper.is_null(1));
+
+        // Non-exact (at_most): upper column must carry the upper mask, so at
+        // least one row is non-null (`AllowList(mask)` puts the payload at
+        // row 1).
+        let at_most_batch = IndexExprResult::at_most(mask.clone())
+            .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
+            .unwrap();
+        let at_most_upper = at_most_batch.column(1).as_binary::<i32>();
+        assert!(!(at_most_upper.is_null(0) && at_most_upper.is_null(1)));
+
+        // Non-exact (at_least): upper = all_rows, which `into_arrow`
+        // encodes as `BlockList(empty)` — row 0 holds the empty-tree bytes,
+        // row 1 is null. Round-trip must preserve `is_at_least`.
+        let at_least_batch = IndexExprResult::at_least(mask)
+            .serialize(&fragments_covered, IndexExprResultWireFormat::TwoMask)
+            .unwrap();
+        let at_least_upper = at_least_batch.column(1).as_binary::<i32>();
+        assert!(!at_least_upper.is_null(0));
+        let (round_tripped, _) = IndexExprResult::deserialize(&at_least_batch).unwrap();
+        assert!(round_tripped.is_at_least());
+        assert!(!round_tripped.is_exact());
+    }
+
+    /// A refined `IndexExprResult` (`lower` strictly inside a non-universe
+    /// `upper`) has no legacy three-shape encoding. The serializer
+    /// must not error in that case — it must degrade to `AtMost(upper)` so
+    /// older read planners still see a valid superset and recheck.
+    #[test]
+    fn test_three_variant_serialize_refined_degrades_to_at_most() {
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        let lower_addrs = RowAddrTreeMap::from_iter(0u64..3);
+        let upper_addrs = RowAddrTreeMap::from_iter(0u64..10);
+        let refined = IndexExprResult::new(
+            RowAddrMask::from_allowed(lower_addrs),
+            RowAddrMask::from_allowed(upper_addrs.clone()),
+        );
+        assert!(!refined.is_exact() && !refined.is_at_most() && !refined.is_at_least());
+
+        let fragments_covered = RoaringBitmap::from_iter([0u32, 1]);
+
+        let batch = refined
+            .serialize(&fragments_covered, IndexExprResultWireFormat::ThreeVariant)
+            .unwrap();
+        assert_eq!(
+            batch.schema(),
+            *IndexExprResultWireFormat::ThreeVariant.schema()
+        );
+
+        // Discriminant 1 == AtMost; the round-tripped result carries the
+        // original `upper` as the AtMost mask (empty lower, upper = upper).
+        let (round_tripped, round_tripped_frags) = IndexExprResult::deserialize(&batch).unwrap();
+        assert!(round_tripped.is_at_most());
+        assert_eq!(round_tripped.upper, RowAddrMask::from_allowed(upper_addrs));
+        assert_eq!(round_tripped_frags, fragments_covered);
     }
 }

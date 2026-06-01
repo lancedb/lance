@@ -694,27 +694,6 @@ def test_unindexed_full_text_search_on_empty_index(tmp_path):
     assert results.num_rows == 1
 
 
-def test_default_fts_tokenizer_handles_unspaced_multilingual_text(tmp_path):
-    data = pa.table(
-        {
-            "id": [0, 1],
-            "text": ["Hello, こんにちは世界!", "Hello, こんにちは!"],
-        }
-    )
-    ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index(
-        "text",
-        index_type="INVERTED",
-        stem=False,
-        remove_stop_words=False,
-        ascii_folding=False,
-    )
-
-    results = ds.to_table(full_text_query="世界")
-
-    assert results["id"].to_pylist() == [0]
-
-
 def test_full_text_search_without_index(dataset):
     row = dataset.take(indices=[0], columns=["doc"])
     query_text = row.column(0)[0].as_py()
@@ -999,7 +978,7 @@ def test_fts_stats(dataset):
     params = stats["params"]
 
     assert params["with_position"] is False
-    assert params["base_tokenizer"] == "icu"
+    assert params["base_tokenizer"] == "simple"
     assert params["language"] == "English"
     assert params["max_token_length"] == 40
     assert params["lower_case"] is True
@@ -1469,7 +1448,7 @@ def test_fts_deleted_rows_with_stable_row_ids(tmp_path):
     # Regression test: stable-row-id prefiltering must not leak deleted rows.
     data = pa.table(
         {
-            "text": [f"dup {i}" for i in range(200)],
+            "text": [f"dup_{i}" for i in range(200)],
             "category": [["A", "B", "C", "D", "E"][i % 5] for i in range(200)],
         }
     )
@@ -4691,7 +4670,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     details = indices[0].details
     assert details is not None and len(details) > 0
     assert details["lance_tokenizer"] is None
-    assert details["base_tokenizer"] == "icu"
+    assert details["base_tokenizer"] == "simple"
     assert details["language"] == "English"
     assert not details["with_position"]
     assert details["max_token_length"] == 40

@@ -14,7 +14,9 @@ description = "Row-selection masks and index-result algebra for Lance"
 [dependencies]
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
 byteorder = { workspace = true }
+tracing = { workspace = true }
 bytes = { workspace = true }
 deepsize = { workspace = true }
 itertools = { workspace = true }

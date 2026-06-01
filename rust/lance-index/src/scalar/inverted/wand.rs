@@ -446,25 +446,27 @@ struct HeadPosting {
     // Iterators that are already positioned on or after the next candidate doc.
     // The heap is ordered by smallest doc id so the top element determines
     // the next target doc to consider.
+    doc_id: u64,
     posting: Box<PostingIterator>,
 }
 
 impl HeadPosting {
     fn new(posting: Box<PostingIterator>) -> Self {
-        Self { posting }
+        let doc_id = posting
+            .doc()
+            .map(|doc| doc.doc_id())
+            .unwrap_or(TERMINATED_DOC_ID);
+        Self { doc_id, posting }
     }
 
     fn doc_id(&self) -> u64 {
-        self.posting
-            .doc()
-            .map(|doc| doc.doc_id())
-            .unwrap_or(TERMINATED_DOC_ID)
+        self.doc_id
     }
 }
 
 impl PartialEq for HeadPosting {
     fn eq(&self, other: &Self) -> bool {
-        self.doc_id() == other.doc_id()
+        self.doc_id == other.doc_id
             && self.posting.approximate_upper_bound().to_bits()
                 == other.posting.approximate_upper_bound().to_bits()
             && self.posting.token_id == other.posting.token_id
@@ -483,8 +485,8 @@ impl PartialOrd for HeadPosting {
 impl Ord for HeadPosting {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         other
-            .doc_id()
-            .cmp(&self.doc_id())
+            .doc_id
+            .cmp(&self.doc_id)
             .then_with(|| {
                 self.posting
                     .approximate_upper_bound()
@@ -900,7 +902,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         Ok(None)
     }
-
     fn next_and_candidate(&mut self) -> Option<DocInfo> {
         if self.lead.len() < self.num_terms {
             return None;
