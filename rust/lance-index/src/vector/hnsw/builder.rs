@@ -56,7 +56,7 @@ pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
     /// max level ofm
     pub max_level: u16,

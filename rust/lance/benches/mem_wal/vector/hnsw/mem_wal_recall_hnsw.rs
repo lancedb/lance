@@ -324,23 +324,11 @@ async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::
             true,
         )
         .await?;
-    // Optionally override the maintained HNSW index's graph degree `m` (and
-    // ef_construction) so we can run matched-`m` comparisons vs FAISS. m=0 keeps
-    // the library default (m=20).
-    let hnsw_m = env_usize("BENCH_HNSW_M", 0);
-    let mut init = dataset
+    dataset
         .initialize_mem_wal()
-        .maintained_indexes([VECTOR_INDEX_NAME]);
-    if hnsw_m > 0 {
-        let efc = env_usize("BENCH_HNSW_EFC", 200);
-        init = init.maintained_index_hnsw_params(
-            VECTOR_INDEX_NAME,
-            HnswBuildParams::default()
-                .num_edges(hnsw_m)
-                .ef_construction(efc),
-        );
-    }
-    init.execute().await?;
+        .maintained_indexes([VECTOR_INDEX_NAME])
+        .execute()
+        .await?;
     Ok(())
 }
 
@@ -381,6 +369,20 @@ async fn run_checkpoint(
     let shard_id = Uuid::new_v4();
     let row_size_estimate = DIM * 4 + 8;
     let total_batches_max = cp.div_ceil(1000);
+    // Optionally override the maintained HNSW index's graph degree `m` (and
+    // ef_construction) on the writer config so we can run matched-`m`
+    // comparisons vs FAISS. m=0 keeps the library default (m=20).
+    let mut hnsw_params = std::collections::HashMap::new();
+    let hnsw_m = env_usize("BENCH_HNSW_M", 0);
+    if hnsw_m > 0 {
+        let efc = env_usize("BENCH_HNSW_EFC", 200);
+        hnsw_params.insert(
+            VECTOR_INDEX_NAME.to_string(),
+            HnswBuildParams::default()
+                .num_edges(hnsw_m)
+                .ef_construction(efc),
+        );
+    }
     let writer_config = ShardWriterConfig {
         shard_id,
         shard_spec_id: 0,
@@ -391,6 +393,7 @@ async fn run_checkpoint(
         max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
         max_wal_flush_interval: Some(Duration::from_millis(200)),
         max_unflushed_memtable_bytes: usize::MAX / 2,
+        hnsw_params,
         ..ShardWriterConfig::default()
     };
     let writer = dataset

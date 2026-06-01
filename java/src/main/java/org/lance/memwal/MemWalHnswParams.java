@@ -17,7 +17,7 @@ import com.google.common.base.Preconditions;
 
 /**
  * HNSW build parameters for a maintained vector index, used with {@link
- * InitializeMemWalParams#withMaintainedHnswParams}.
+ * ShardWriterConfig#withHnswParams}.
  *
  * <p>Defaults match the Lance defaults; override only the fields you need. {@code m} is the graph
  * degree (level 0 retains {@code 2*m}), equivalent to FAISS's {@code M}.

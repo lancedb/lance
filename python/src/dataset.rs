@@ -173,7 +173,8 @@ fn writer_config_from_kwargs(
     async_index_interval_ms: Option<u64>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
-) -> Option<lance::dataset::mem_wal::ShardWriterConfig> {
+    hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
+) -> PyResult<Option<lance::dataset::mem_wal::ShardWriterConfig>> {
     use std::time::Duration;
 
     let mut config = lance::dataset::mem_wal::ShardWriterConfig::default();
@@ -230,7 +231,30 @@ fn writer_config_from_kwargs(
         config = config.with_stats_log_interval(stats_log_interval_from_millis(v));
         any = true;
     }
-    any.then_some(config)
+    if let Some(overrides) = hnsw_params {
+        // {index_name: {param: value}} -> HnswBuildParams, rejecting unknown
+        // keys so typos surface instead of being silently ignored.
+        for (index_name, params) in overrides {
+            let mut build = HnswBuildParams::default();
+            for (key, value) in params {
+                match key.as_str() {
+                    "m" => build = build.num_edges(value as usize),
+                    "ef_construction" => build = build.ef_construction(value as usize),
+                    "max_level" => build = build.max_level(value as u16),
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "unknown HNSW build param '{}' for index '{}'; \
+                             expected one of 'm', 'ef_construction', 'max_level'",
+                            other, index_name
+                        )));
+                    }
+                }
+            }
+            config = config.with_hnsw_params(index_name, build);
+            any = true;
+        }
+    }
+    Ok(any.then_some(config))
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -3157,7 +3181,6 @@ impl Dataset {
     #[pyo3(signature=(
         *,
         maintained_indexes=None,
-        maintained_hnsw_params=None,
         bucket_column=None,
         num_buckets=None,
         identity_column=None,
@@ -3175,12 +3198,12 @@ impl Dataset {
         async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
+        hnsw_params=None,
     ))]
     fn initialize_mem_wal(
         &mut self,
         py: Python<'_>,
         maintained_indexes: Option<Vec<String>>,
-        maintained_hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
         bucket_column: Option<String>,
         num_buckets: Option<u32>,
         identity_column: Option<String>,
@@ -3198,6 +3221,7 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
+        hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
     ) -> PyResult<()> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3234,32 +3258,9 @@ impl Dataset {
             async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
-        );
+            hnsw_params,
+        )?;
         let maintained_indexes = maintained_indexes.unwrap_or_default();
-
-        // Translate the {index_name: {param: value}} dict into HnswBuildParams,
-        // rejecting unknown keys so typos surface instead of being ignored.
-        let mut hnsw_overrides: Vec<(String, HnswBuildParams)> = Vec::new();
-        if let Some(overrides) = maintained_hnsw_params {
-            for (index_name, params) in overrides {
-                let mut build = HnswBuildParams::default();
-                for (key, value) in params {
-                    match key.as_str() {
-                        "m" => build = build.num_edges(value as usize),
-                        "ef_construction" => build = build.ef_construction(value as usize),
-                        "max_level" => build = build.max_level(value as u16),
-                        other => {
-                            return Err(PyValueError::new_err(format!(
-                                "unknown HNSW build param '{}' for index '{}'; \
-                                 expected one of 'm', 'ef_construction', 'max_level'",
-                                other, index_name
-                            )));
-                        }
-                    }
-                }
-                hnsw_overrides.push((index_name, build));
-            }
-        }
 
         let mut ds = Arc::clone(&self.ds);
         let new_ds = rt()
@@ -3274,9 +3275,6 @@ impl Dataset {
                     builder = builder.unsharded();
                 }
                 builder = builder.maintained_indexes(maintained_indexes);
-                for (index_name, params) in hnsw_overrides {
-                    builder = builder.maintained_index_hnsw_params(index_name, params);
-                }
                 if let Some(config) = writer_config {
                     builder = builder.writer_config_defaults(config);
                 }
@@ -3308,16 +3306,6 @@ impl Dataset {
         dict.set_item("num_shards", details.num_shards)?;
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
-
-        let hnsw_params = PyDict::new(py);
-        for (index_name, params) in &details.maintained_hnsw_params {
-            let inner = PyDict::new(py);
-            inner.set_item("m", params.m as u32)?;
-            inner.set_item("ef_construction", params.ef_construction as u32)?;
-            inner.set_item("max_level", params.max_level as u32)?;
-            hnsw_params.set_item(index_name, inner)?;
-        }
-        dict.set_item("maintained_hnsw_params", hnsw_params)?;
 
         let specs = PyList::empty(py);
         for spec in &details.sharding_specs {
@@ -3361,6 +3349,7 @@ impl Dataset {
         async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
+        hnsw_params=None,
     ))]
     fn mem_wal_writer(
         &self,
@@ -3379,6 +3368,7 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
+        hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
     ) -> PyResult<crate::mem_wal::PyShardWriter> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3399,7 +3389,8 @@ impl Dataset {
             async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
-        )
+            hnsw_params,
+        )?
         .unwrap_or_default();
 
         let ds = self.ds.clone();

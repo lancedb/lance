@@ -29,7 +29,6 @@ import java.util.Optional;
  */
 public class InitializeMemWalParams {
   private List<String> maintainedIndexes = Collections.emptyList();
-  private List<MemWalHnswParams> maintainedHnswParams = Collections.emptyList();
   private Optional<String> bucketColumn = Optional.empty();
   private Optional<Integer> numBuckets = Optional.empty();
   private Optional<String> identityColumn = Optional.empty();
@@ -40,17 +39,6 @@ public class InitializeMemWalParams {
   public InitializeMemWalParams withMaintainedIndexes(List<String> maintainedIndexes) {
     Preconditions.checkNotNull(maintainedIndexes, "maintainedIndexes must not be null");
     this.maintainedIndexes = maintainedIndexes;
-    return this;
-  }
-
-  /**
-   * Per-index HNSW build-parameter overrides for maintained vector indexes. Each {@link
-   * MemWalHnswParams#indexName} must also appear in {@link #withMaintainedIndexes}.
-   */
-  public InitializeMemWalParams withMaintainedHnswParams(
-      List<MemWalHnswParams> maintainedHnswParams) {
-    Preconditions.checkNotNull(maintainedHnswParams, "maintainedHnswParams must not be null");
-    this.maintainedHnswParams = maintainedHnswParams;
     return this;
   }
 
@@ -84,10 +72,6 @@ public class InitializeMemWalParams {
 
   public List<String> maintainedIndexes() {
     return maintainedIndexes;
-  }
-
-  public List<MemWalHnswParams> maintainedHnswParams() {
-    return maintainedHnswParams;
   }
 
   public Optional<String> bucketColumn() {

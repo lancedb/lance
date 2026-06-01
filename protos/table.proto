@@ -681,32 +681,6 @@ message MemWalIndexDetails {
   // still override any value at runtime in its own ShardWriterConfig
   // (which is not persisted).
   map<string, string> writer_config_defaults = 11;
-
-  // Per-index HNSW build parameters for maintained vector indexes.
-  //
-  // When a maintained vector index is materialized in a MemTable, these
-  // parameters control the in-memory HNSW graph (and, on flush, the on-disk
-  // graph serialized from it). An index without an entry here uses the default
-  // build parameters. Each index_name must appear in maintained_indexes.
-  repeated MemWalHnswParams maintained_hnsw_params = 12;
-}
-
-// HNSW build parameters for a maintained vector index, overriding the defaults
-// used when the index is materialized in a MemTable.
-message MemWalHnswParams {
-  // Name of the maintained vector index these params apply to.
-  string index_name = 1;
-
-  // HNSW graph degree: max neighbors retained per node on upper levels.
-  // Level 0 retains 2*m. Higher m raises recall-per-ef at higher build cost,
-  // memory, and per-query traversal cost. Equivalent to FAISS's M.
-  uint32 m = 2;
-
-  // Beam width (candidate list size) used while inserting nodes at build time.
-  uint32 ef_construction = 3;
-
-  // Maximum number of graph levels.
-  uint32 max_level = 4;
 }
 
 // Sharding spec definition.
