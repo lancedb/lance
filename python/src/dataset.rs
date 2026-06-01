@@ -33,6 +33,7 @@ use pyo3::{
     pyclass,
     types::{IntoPyDict, PyDict},
 };
+use uuid::Uuid;
 
 use lance::dataset::AutoCleanupParams;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
@@ -1106,7 +1107,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1124,6 +1125,7 @@ impl Dataset {
         fragment_readahead: Option<usize>,
         scan_in_order: Option<bool>,
         fragments: Option<Vec<FileFragment>>,
+        index_segments: Option<Vec<String>>,
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
         use_stats: Option<bool>,
@@ -1300,6 +1302,22 @@ impl Dataset {
                 })
                 .collect();
             scanner.with_fragments(fragments);
+        }
+
+        if let Some(index_segments) = index_segments {
+            let index_segments = index_segments
+                .into_iter()
+                .map(|segment| {
+                    Uuid::parse_str(&segment).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "invalid index segment uuid '{segment}': {err}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            scanner
+                .with_index_segments(index_segments)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
         if let Some(scan_stats_callback) = scan_stats_callback {
@@ -4298,6 +4316,16 @@ fn prepare_vector_index_params(
             pq_params.max_iters = max_iters;
         }
 
+        if let Some(streaming_sample_rate) = kwargs.get_item("streaming_sample_rate")? {
+            ivf_params.streaming_sample_rate = Some(streaming_sample_rate.extract()?);
+        }
+        if let Some(streaming_coreset_rate) = kwargs.get_item("streaming_coreset_rate")? {
+            ivf_params.streaming_coreset_rate = Some(streaming_coreset_rate.extract()?);
+        }
+        if let Some(streaming_refine_passes) = kwargs.get_item("streaming_refine_passes")? {
+            ivf_params.streaming_refine_passes = streaming_refine_passes.extract()?;
+        }
+
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
             ivf_params.num_partitions = Some(n.extract()?)
@@ -4319,17 +4347,27 @@ fn prepare_vector_index_params(
                 ));
             }
 
+            let centroid_type = match column_type {
+                DataType::List(field)
+                    if matches!(field.data_type(), DataType::FixedSizeList(_, _)) =>
+                {
+                    field.data_type()
+                }
+                _ => column_type,
+            };
+
             // It's important that the centroids are the same data type
             // as the vectors that will be indexed.
             let mut centroids: Arc<dyn Array> = batch.column(0).clone();
-            if centroids.data_type() != column_type {
-                centroids = cast_with_options(centroids.as_ref(), column_type, &Default::default())
-                    .map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Failed to cast centroids to column type: {}",
-                            e
-                        ))
-                    })?;
+            if centroids.data_type() != centroid_type {
+                centroids =
+                    cast_with_options(centroids.as_ref(), centroid_type, &Default::default())
+                        .map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "Failed to cast centroids to vector type: {}",
+                                e
+                            ))
+                        })?;
             }
             let centroids = as_fixed_size_list_array(centroids.as_ref());
 

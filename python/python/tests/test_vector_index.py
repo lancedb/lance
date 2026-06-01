@@ -9,6 +9,7 @@ import shutil
 import string
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -1055,6 +1056,18 @@ def test_create_ivf_rq_skip_transpose():
     )
     stats = ds.stats.index_stats("vector_idx")
     assert stats["indices"][0]["sub_index"]["packed"] is False
+
+
+def test_create_ivf_rq_rejects_unsupported_num_bits():
+    ds = lance.write_dataset(create_table(), "memory://")
+
+    with pytest.raises(NotImplementedError, match="only num_bits=1 is supported"):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=2,
+        )
 
 
 def test_create_ivf_rq_requires_dim_divisible_by_8():
@@ -2224,6 +2237,24 @@ def test_prewarm_index(tmp_path):
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
+
+
+def test_scanner_rejects_unknown_index_segments(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
+
+    with pytest.raises(
+        ValueError, match="with_index_segments referenced unknown index segments"
+    ):
+        dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128).astype(np.float32),
+                "k": 10,
+            },
+            index_segments=[uuid.uuid4()],
+        ).to_table()
 
 
 def test_vector_index_distance_range(tmp_path):

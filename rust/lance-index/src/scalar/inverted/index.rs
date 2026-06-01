@@ -1066,6 +1066,7 @@ impl ScalarIndex for InvertedIndex {
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         let mut params = self.params.clone();
         if params.base_tokenizer.is_empty() {
+            // Empty tokenizer metadata only appears in legacy simple-tokenizer indexes.
             params.base_tokenizer = "simple".to_string();
         }
 

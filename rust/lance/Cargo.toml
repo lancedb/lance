@@ -180,6 +180,10 @@ name = "ivf_pq"
 harness = false
 
 [[bench]]
+name = "streaming_ivf_training"
+harness = false
+
+[[bench]]
 name = "take"
 harness = false
 
@@ -256,6 +260,11 @@ harness = false
 [[bench]]
 name = "mem_wal_fts_bench"
 path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
+harness = false
+
+[[bench]]
+name = "mem_wal_fts_read_bench"
+path = "benches/mem_wal/fts/mem_wal_fts_read_bench.rs"
 harness = false
 
 [[bench]]

@@ -1841,6 +1841,9 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         #[allow(deprecated)]
         retrain: false, // Don't retrain since we have centroids
         sample_rate: 256, // Default
+        streaming_sample_rate: None,
+        streaming_coreset_rate: None,
+        streaming_refine_passes: 0,
         precomputed_partitions_file: None,
         precomputed_shuffle_buffers: None,
         shuffle_partition_batches: 1024 * 10, // Default

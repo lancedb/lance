@@ -21,8 +21,10 @@ use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, pack_codes,
+    rabit_binary_code_field,
 };
 use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
+use crate::vector::bq::validate_supported_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
 use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel as IvfStorageModel};
 use crate::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
@@ -297,17 +299,9 @@ pub async fn init_writer_for_rq(
     rq_meta: &RabitQuantizationMetadata,
     format_version: LanceFileVersion,
 ) -> Result<FileWriter> {
-    let num_bytes = (rq_meta.code_dim as usize).div_ceil(u8::BITS as usize);
     let arrow_schema = ArrowSchema::new(vec![
         (*ROW_ID_FIELD).clone(),
-        Field::new(
-            RABIT_CODE_COLUMN,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, true)),
-                num_bytes as i32,
-            ),
-            true,
-        ),
+        rabit_binary_code_field(rq_meta.rotated_dim()),
         ADD_FACTORS_FIELD.clone(),
         SCALE_FACTORS_FIELD.clone(),
     ]);
@@ -988,12 +982,14 @@ pub async fn merge_partial_vector_auxiliary_files(
                     let rotate_mat_bytes = reader.read_global_buffer(buf_idx).await?;
                     rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
                 }
+                validate_supported_rq_num_bits(rq_meta_parsed.num_bits)?;
 
-                let d0 = (rq_meta_parsed.code_dim as usize)
-                    .checked_div(rq_meta_parsed.num_bits as usize)
-                    .ok_or_else(|| {
-                        Error::index("Invalid RQ metadata: num_bits is zero".to_string())
-                    })?;
+                let d0 = rq_meta_parsed.rotated_dim();
+                if d0 == 0 {
+                    return Err(Error::index(
+                        "Invalid RQ metadata: rotated dimension is zero".to_string(),
+                    ));
+                }
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim
                     && dprev != d0
@@ -2367,6 +2363,7 @@ mod tests {
         assert!(merged_rq_meta.packed);
 
         let mut total_rows = 0usize;
+        let mut checked_code_width = false;
         let mut stream = reader
             .read_stream(
                 lance_io::ReadBatchParams::RangeFull,
@@ -2377,8 +2374,19 @@ mod tests {
             .await
             .unwrap();
         while let Some(batch) = stream.next().await {
-            total_rows += batch.unwrap().num_rows();
+            let batch = batch.unwrap();
+            if !checked_code_width {
+                let schema = batch.schema();
+                let code_field = schema.field_with_name(RABIT_CODE_COLUMN).unwrap();
+                let DataType::FixedSizeList(_, code_bytes) = code_field.data_type() else {
+                    panic!("RQ code field should be FixedSizeList");
+                };
+                assert_eq!(*code_bytes, rq_meta.binary_code_bytes() as i32);
+                checked_code_width = true;
+            }
+            total_rows += batch.num_rows();
         }
+        assert!(checked_code_width);
         let expected_total: usize = expected_lengths.iter().map(|v| *v as usize).sum();
         assert_eq!(total_rows, expected_total);
     }

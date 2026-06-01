@@ -435,4 +435,32 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn test_resolve_utf8view_literal_against_utf8_column() {
+        // Simulates DataFusion 43+ producing a Utf8View literal (e.g. from md5())
+        // being compared against a Utf8 column stored in Lance.
+        let arrow_schema = ArrowSchema::new(vec![Field::new("hash", DataType::Utf8, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column("hash".to_string().into())),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                ScalarValue::Utf8View(Some("abc".to_string())),
+                None,
+            )),
+        });
+
+        let resolved = resolve_expr(&expr, &schema).unwrap();
+        match resolved {
+            Expr::BinaryExpr(be) => {
+                assert_eq!(
+                    be.right.as_ref(),
+                    &Expr::Literal(ScalarValue::Utf8(Some("abc".to_string())), None)
+                )
+            }
+            _ => unreachable!("Expected BinaryExpr"),
+        }
+    }
 }

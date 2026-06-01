@@ -218,11 +218,19 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
         ScalarValue::Utf8(val) => match ty {
             DataType::Utf8 => Some(value.clone()),
             DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(val.clone())),
+            DataType::Utf8View => Some(ScalarValue::Utf8View(val.clone())),
             _ => None,
         },
         ScalarValue::LargeUtf8(val) => match ty {
             DataType::Utf8 => Some(ScalarValue::Utf8(val.clone())),
             DataType::LargeUtf8 => Some(value.clone()),
+            DataType::Utf8View => Some(ScalarValue::Utf8View(val.clone())),
+            _ => None,
+        },
+        ScalarValue::Utf8View(val) => match ty {
+            DataType::Utf8 => Some(ScalarValue::Utf8(val.clone())),
+            DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(val.clone())),
+            DataType::Utf8View => Some(value.clone()),
             _ => None,
         },
         ScalarValue::Boolean(_) => match ty {
@@ -408,6 +416,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
         ScalarValue::Binary(value) => match ty {
             DataType::Binary => Some(ScalarValue::Binary(value.clone())),
             DataType::LargeBinary => Some(ScalarValue::LargeBinary(value.clone())),
+            DataType::BinaryView => Some(ScalarValue::BinaryView(value.clone())),
             DataType::FixedSizeBinary(len) => {
                 if let Some(value) = value {
                     if value.len() == *len as usize {
@@ -419,6 +428,12 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
                     None
                 }
             }
+            _ => None,
+        },
+        ScalarValue::BinaryView(val) => match ty {
+            DataType::Binary => Some(ScalarValue::Binary(val.clone())),
+            DataType::LargeBinary => Some(ScalarValue::LargeBinary(val.clone())),
+            DataType::BinaryView => Some(value.clone()),
             _ => None,
         },
         _ => None,
@@ -701,6 +716,63 @@ mod tests {
                 &DataType::Time64(TimeUnit::Nanosecond),
             ),
             Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
+        );
+    }
+
+    #[test]
+    fn test_string_view_coerce() {
+        // Utf8 <-> Utf8View
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8(Some("hi".into())), &DataType::Utf8View),
+            Some(ScalarValue::Utf8View(Some("hi".into())))
+        );
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8View(Some("hi".into())), &DataType::Utf8),
+            Some(ScalarValue::Utf8(Some("hi".into())))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Utf8View(Some("hi".into())),
+                &DataType::LargeUtf8
+            ),
+            Some(ScalarValue::LargeUtf8(Some("hi".into())))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::LargeUtf8(Some("hi".into())),
+                &DataType::Utf8View
+            ),
+            Some(ScalarValue::Utf8View(Some("hi".into())))
+        );
+        // identity
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Utf8View(Some("hi".into())),
+                &DataType::Utf8View
+            ),
+            Some(ScalarValue::Utf8View(Some("hi".into())))
+        );
+        // Binary <-> BinaryView
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Binary(Some(vec![1, 2, 3])),
+                &DataType::BinaryView
+            ),
+            Some(ScalarValue::BinaryView(Some(vec![1, 2, 3])))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::BinaryView(Some(vec![1, 2, 3])),
+                &DataType::Binary
+            ),
+            Some(ScalarValue::Binary(Some(vec![1, 2, 3])))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::BinaryView(Some(vec![1, 2, 3])),
+                &DataType::BinaryView
+            ),
+            Some(ScalarValue::BinaryView(Some(vec![1, 2, 3])))
         );
     }
 }

@@ -63,7 +63,21 @@ use tracing::{debug, warn};
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
-        source.to_string().contains("retries, max_retries")
+        let message = source.to_string();
+        let lowercase = message.to_ascii_lowercase();
+        lowercase.contains("retries, max_retries")
+            || lowercase.contains("serverbusy")
+            || lowercase.contains("server busy")
+            || lowercase.contains("egress is over the account limit")
+            || lowercase.contains("http 429")
+            || lowercase.contains("status code: 429")
+            || lowercase.contains("429 too many requests")
+            || lowercase.contains("too many requests")
+            || lowercase.contains("slowdown")
+            || lowercase.contains("please reduce your request rate")
+            || lowercase.contains("rate limit")
+            || lowercase.contains("throttling")
+            || lowercase.contains("throttled")
     } else {
         false
     }
@@ -83,7 +97,7 @@ pub struct AimdThrottleConfig {
     pub write: AimdConfig,
     /// AIMD configuration for delete operations.
     pub delete: AimdConfig,
-    /// AIMD configuration for list operations (list_with_delimiter).
+    /// AIMD configuration for list operations.
     pub list: AimdConfig,
     /// Maximum tokens that can accumulate for bursts (shared across all categories).
     pub burst_capacity: u32,
@@ -557,11 +571,11 @@ impl MultipartUpload for ThrottledMultipartUpload {
 /// - **read**: `get`, `get_opts`, `get_range`, `get_ranges`, `head`
 /// - **write**: `put`, `put_opts`, `put_multipart`, `put_multipart_opts`, `copy`, `copy_if_not_exists`, `rename`, `rename_if_not_exists`
 /// - **delete**: `delete`
-/// - **list**: `list_with_delimiter`
+/// - **list**: `list`, `list_with_offset`, `list_with_delimiter`
 ///
-/// Streaming operations (`list`, `list_with_offset`, `delete_stream`) do not acquire tokens,
-/// but observe each yielded item and feed the result back to the AIMD controller so it can
-/// adjust the rate for other operations in the same category.
+/// Streaming list operations acquire a token before starting the underlying list stream.
+/// Streaming operations also observe each yielded item and feed the result back to the
+/// AIMD controller so it can adjust the rate for other operations in the same category.
 ///
 /// This is not perfect but probably as close as we can get without moving the throttle into
 /// the object_store crate itself.
@@ -691,13 +705,19 @@ impl ObjectStore for AimdThrottledStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let throttle = Arc::clone(&self.list);
-        self.target
-            .list(prefix)
-            .map(move |item| {
-                throttle.observe_outcome(&item);
-                item
-            })
-            .boxed()
+        let throttle_for_start = Arc::clone(&throttle);
+        let target = Arc::clone(&self.target);
+        let prefix = prefix.cloned();
+        futures::stream::once(async move {
+            throttle_for_start.acquire_token().await;
+            target.list(prefix.as_ref())
+        })
+        .flatten()
+        .map(move |item| {
+            throttle.observe_outcome(&item);
+            item
+        })
+        .boxed()
     }
 
     fn list_with_offset(
@@ -706,13 +726,20 @@ impl ObjectStore for AimdThrottledStore {
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
         let throttle = Arc::clone(&self.list);
-        self.target
-            .list_with_offset(prefix, offset)
-            .map(move |item| {
-                throttle.observe_outcome(&item);
-                item
-            })
-            .boxed()
+        let throttle_for_start = Arc::clone(&throttle);
+        let target = Arc::clone(&self.target);
+        let prefix = prefix.cloned();
+        let offset = offset.clone();
+        futures::stream::once(async move {
+            throttle_for_start.acquire_token().await;
+            target.list_with_offset(prefix.as_ref(), &offset)
+        })
+        .flatten()
+        .map(move |item| {
+            throttle.observe_outcome(&item);
+            item
+        })
+        .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
@@ -740,7 +767,7 @@ mod tests {
     use object_store::memory::InMemory;
     use rstest::rstest;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     const THROTTLE_ERROR_RESPONSE: &str = "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s - Server returned non-2xx status code: 503: x-ms-request-id: azure-request-id";
 
@@ -760,8 +787,10 @@ mod tests {
     #[case::not_found("Object not found", false)]
     #[case::permission_denied("Access denied", false)]
     #[case::timeout("Connection timed out", false)]
-    #[case::http_429_without_retries("HTTP 429 Too Many Requests", false)]
-    #[case::slowdown_without_retries("SlowDown: Please reduce your request rate", false)]
+    #[case::http_429_without_retries("HTTP 429 Too Many Requests", true)]
+    #[case::slowdown_without_retries("SlowDown: Please reduce your request rate", true)]
+    #[case::azure_server_busy("Code: ServerBusy", true)]
+    #[case::azure_egress_limit("Message: Egress is over the account limit", true)]
     fn test_is_throttle_error(#[case] msg: &str, #[case] expected: bool) {
         let err = make_generic_error(msg);
         assert_eq!(
@@ -1049,6 +1078,173 @@ mod tests {
             new_rate,
             initial_rate
         );
+    }
+
+    struct CountingListStartStore {
+        inner: InMemory,
+        list_calls: AtomicUsize,
+        offset_calls: AtomicUsize,
+    }
+
+    impl Default for CountingListStartStore {
+        fn default() -> Self {
+            Self {
+                inner: InMemory::new(),
+                list_calls: AtomicUsize::new(0),
+                offset_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CountingListStartStore {
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
+        }
+
+        fn offset_calls(&self) -> usize {
+            self.offset_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Display for CountingListStartStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingListStartStore")
+        }
+    }
+
+    impl Debug for CountingListStartStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CountingListStartStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingListStartStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.offset_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    fn list_start_throttle_config() -> AimdThrottleConfig {
+        AimdThrottleConfig::default()
+            .with_burst_capacity(0)
+            .with_list_aimd(AimdConfig::default().with_initial_rate(50.0))
+    }
+
+    #[tokio::test]
+    async fn test_list_acquires_token_before_starting_underlying_stream() {
+        let store = Arc::new(CountingListStartStore::default());
+        store
+            .put(
+                &Path::from("prefix/file.txt"),
+                PutPayload::from_static(b"data"),
+            )
+            .await
+            .unwrap();
+        let throttled = AimdThrottledStore::new(
+            store.clone() as Arc<dyn ObjectStore>,
+            list_start_throttle_config(),
+        )
+        .unwrap();
+
+        let mut stream = throttled.list(Some(&Path::from("prefix")));
+        assert_eq!(store.list_calls(), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), stream.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(store.list_calls(), 0);
+
+        let item = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.location, Path::from("prefix/file.txt"));
+        assert_eq!(store.list_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_with_offset_acquires_token_before_starting_underlying_stream() {
+        let store = Arc::new(CountingListStartStore::default());
+        store
+            .put(&Path::from("prefix/b"), PutPayload::from_static(b"data"))
+            .await
+            .unwrap();
+        let throttled = AimdThrottledStore::new(
+            store.clone() as Arc<dyn ObjectStore>,
+            list_start_throttle_config(),
+        )
+        .unwrap();
+
+        let mut stream =
+            throttled.list_with_offset(Some(&Path::from("prefix")), &Path::from("prefix/a"));
+        assert_eq!(store.offset_calls(), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), stream.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(store.offset_calls(), 0);
+
+        let item = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.location, Path::from("prefix/b"));
+        assert_eq!(store.offset_calls(), 1);
     }
 
     #[tokio::test]

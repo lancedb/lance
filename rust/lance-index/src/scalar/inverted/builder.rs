@@ -1695,7 +1695,7 @@ async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Re
                     part_metadata_files.push(file_name.to_string());
                 }
             }
-            Err(_) => continue,
+            Err(err) => return Err(err),
         }
     }
 
@@ -1955,12 +1955,21 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::stream;
+    use futures::stream::{self, BoxStream};
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as OSResult,
+    };
     use std::any::Any;
+    use std::fmt::{Display, Formatter};
+    use std::ops::Range;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1972,6 +1981,121 @@ mod tests {
         let docs = Arc::new(StringArray::from(vec![Some(doc)]));
         let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
         RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
+    }
+
+    struct FailingListObjectStore {
+        inner: InMemory,
+    }
+
+    impl Default for FailingListObjectStore {
+        fn default() -> Self {
+            Self {
+                inner: InMemory::new(),
+            }
+        }
+    }
+
+    impl Display for FailingListObjectStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingListObjectStore")
+        }
+    }
+
+    impl Debug for FailingListObjectStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FailingListObjectStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for FailingListObjectStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            stream::iter(vec![Err(object_store::Error::Generic {
+                store: "failing-list",
+                source: "boom listing metadata".into(),
+            })])
+            .boxed()
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_metadata_files_propagates_list_error() -> Result<()> {
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(FailingListObjectStore::default());
+
+        let err = list_metadata_files(&object_store, &Path::from("index"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("boom listing metadata"),
+            "expected original list error, got: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_metadata_files_empty_directory_returns_no_files_error() -> Result<()> {
+        let object_store = ObjectStore::memory();
+
+        let err = list_metadata_files(&object_store, &Path::from("empty-index"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("No partition metadata files found"),
+            "expected empty-directory error, got: {err}"
+        );
+        Ok(())
     }
 
     #[derive(Debug, Default, Clone)]
