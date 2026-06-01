@@ -24,10 +24,10 @@ use futures::{
     stream::{self, StreamExt},
 };
 use lance::dataset::index::LanceIndexStoreExt;
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, TransactionBuilder};
 use lance::dataset::{
-    InsertBuilder, ManifestWriteConfig, ReadParams, WhenMatched, WriteMode, WriteParams,
-    builder::DatasetBuilder, write_manifest_file,
+    CommitBuilder, InsertBuilder, ManifestWriteConfig, ReadParams, WhenMatched, WriteMode,
+    WriteParams, builder::DatasetBuilder, write_manifest_file,
 };
 use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
@@ -54,7 +54,7 @@ use lance_namespace::models::{
     TableVersion,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_table::format::{IndexMetadata, Manifest};
+use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::CommitError;
 use object_store::{Error as ObjectStoreError, path::Path};
 use roaring::RoaringBitmap;
@@ -69,7 +69,6 @@ use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
 const MANIFEST_TABLE_NAME: &str = "__manifest";
-const SHARDED_MANIFEST_TABLE_PREFIX: &str = "__manifest_shard";
 const DELIMITER: &str = "$";
 /// Bounded concurrency for per-table `_versions/` probes when filtering declared tables.
 /// Higher values reduce latency but increase burst load against the object store.
@@ -86,6 +85,7 @@ const METADATA_INDEX_NAME: &str = "metadata_fts";
 // commit retry budget so multi-process namespace writes can make progress.
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
 const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
+const MANIFEST_FRAGMENT_SHARD_MARKER_ROWS_PER_FILE: usize = 1;
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,7 +483,7 @@ struct DeleteObjectMutation {
 }
 
 impl ManifestStreamMutation for DeleteObjectMutation {
-    type Output = ();
+    type Output = bool;
 
     fn process_existing_row(
         &mut self,
@@ -517,9 +517,9 @@ impl ManifestStreamMutation for DeleteObjectMutation {
 
     fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
         if self.deleted {
-            CopyOnWriteMutation::updated(())
+            CopyOnWriteMutation::updated(true)
         } else {
-            CopyOnWriteMutation::unchanged(())
+            CopyOnWriteMutation::unchanged(false)
         }
     }
 }
@@ -782,6 +782,10 @@ pub struct ManifestNamespace {
     /// Number of retries for commit operations on the manifest table.
     /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
     commit_retries: Option<u32>,
+    /// When set, the single `__manifest` table is partitioned into this many
+    /// Lance fragments and each manifest mutation rewrites only the routed
+    /// fragment.
+    manifest_fragment_shard_count: Option<usize>,
     /// Serialize manifest mutations within a single namespace instance so concurrent
     /// create/drop calls do not compete with each other on the same in-memory snapshot.
     manifest_mutation_lock: Arc<Mutex<()>>,
@@ -797,6 +801,10 @@ impl std::fmt::Debug for ManifestNamespace {
             .field(
                 "inline_optimization_enabled",
                 &self.inline_optimization_enabled,
+            )
+            .field(
+                "manifest_fragment_shard_count",
+                &self.manifest_fragment_shard_count,
             )
             .finish()
     }
@@ -887,6 +895,7 @@ impl ManifestNamespace {
             inline_optimization_enabled,
             commit_retries,
             table_version_storage_enabled,
+            None,
         )
         .await
     }
@@ -907,6 +916,7 @@ impl ManifestNamespace {
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
         table_version_storage_enabled: bool,
+        manifest_fragment_shard_count: Option<usize>,
     ) -> Result<Self> {
         let manifest_dataset = Self::ensure_manifest_table_up_to_date(
             &root,
@@ -914,6 +924,7 @@ impl ManifestNamespace {
             &storage_options,
             session.clone(),
             table_version_storage_enabled,
+            manifest_fragment_shard_count,
         )
         .await?;
 
@@ -928,6 +939,7 @@ impl ManifestNamespace {
             dir_listing_enabled,
             inline_optimization_enabled,
             commit_retries,
+            manifest_fragment_shard_count,
             manifest_mutation_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -957,6 +969,58 @@ impl ManifestNamespace {
             let name = parts[parts.len() - 1].to_string();
             (namespace, name)
         }
+    }
+
+    fn stable_hash(value: &str) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn table_version_table_id(version_object_id: &str) -> &str {
+        version_object_id
+            .rsplit_once(DELIMITER)
+            .map(|(table_id, _)| table_id)
+            .unwrap_or(version_object_id)
+    }
+
+    fn table_version_table_id_if_version_object_id(object_id: &str) -> Option<&str> {
+        let (table_id, version) = object_id.rsplit_once(DELIMITER)?;
+        if version.len() == 20 && version.bytes().all(|byte| byte.is_ascii_digit()) {
+            Some(table_id)
+        } else {
+            None
+        }
+    }
+
+    fn shard_key_for_entry(entry: &ManifestEntry) -> &str {
+        match entry.object_type {
+            ObjectType::TableVersion => Self::table_version_table_id(&entry.object_id),
+            _ => &entry.object_id,
+        }
+    }
+
+    fn shard_index_for_key(shard_count: usize, key: &str) -> usize {
+        Self::stable_hash(key) as usize % shard_count
+    }
+
+    fn shard_count(&self) -> Option<usize> {
+        self.manifest_fragment_shard_count
+    }
+
+    fn delete_shard_indices_for_object_id(&self, object_id: &str) -> Option<Vec<usize>> {
+        let shard_count = self.shard_count()?;
+        let mut shard_indices = vec![Self::shard_index_for_key(shard_count, object_id)];
+        if let Some(table_id) = Self::table_version_table_id_if_version_object_id(object_id) {
+            let table_shard_index = Self::shard_index_for_key(shard_count, table_id);
+            if !shard_indices.contains(&table_shard_index) {
+                shard_indices.push(table_shard_index);
+            }
+        }
+        Some(shard_indices)
     }
 
     /// Split an object ID (vec of strings) into namespace and table name
@@ -1106,6 +1170,38 @@ impl ManifestNamespace {
         ]))
     }
 
+    fn shard_marker_object_id(shard_index: usize) -> String {
+        format!("__manifest_shard_marker_{:06}", shard_index)
+    }
+
+    fn manifest_shard_marker_batch(
+        schema: Arc<ArrowSchema>,
+        shard_index: usize,
+    ) -> Result<RecordBatch> {
+        let metadata_array = Arc::new(
+            JsonArray::try_from_iter([None::<&str>])
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to encode shard marker metadata: {}", e),
+                    })
+                })?
+                .into_inner(),
+        );
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Self::shard_marker_object_id(
+                    shard_index,
+                )])),
+                Arc::new(StringArray::from(vec![ObjectType::TableVersion.as_str()])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+                metadata_array,
+            ],
+        )
+        .map_err(Into::into)
+    }
+
     /// Get a scanner for the manifest dataset
     async fn manifest_scanner(&self) -> Result<Scanner> {
         let dataset_guard = self.manifest_dataset.get().await?;
@@ -1219,11 +1315,30 @@ impl ManifestNamespace {
     }
 
     async fn manifest_projected_stream(dataset: &Dataset) -> Result<SendableRecordBatchStream> {
+        Self::manifest_projected_stream_for_fragments(dataset, None).await
+    }
+
+    async fn manifest_projected_stream_for_fragments(
+        dataset: &Dataset,
+        fragments: Option<Vec<Fragment>>,
+    ) -> Result<SendableRecordBatchStream> {
         // Use the dataset's own schema so that old datasets with Utf8 metadata
         // (instead of JSON/LargeBinary) stream correctly. The downstream
         // rewrite path (metadata_column_values) handles both column types.
         let schema = Self::projected_schema(dataset)?;
+        if fragments
+            .as_ref()
+            .is_some_and(|fragments| fragments.iter().all(|fragment| fragment.files.is_empty()))
+        {
+            return Ok(Box::pin(DatafusionRecordBatchStreamAdapter::new(
+                schema.clone(),
+                stream::empty(),
+            )));
+        }
         let mut scanner = dataset.scan();
+        if let Some(fragments) = fragments {
+            scanner.with_fragments(fragments);
+        }
         scanner
             .project(&["object_id", "object_type", "location", "metadata"])
             .map_err(|e| {
@@ -1875,6 +1990,146 @@ impl ManifestNamespace {
         }
     }
 
+    fn manifest_shard_fragment(dataset: &Dataset, shard_index: usize) -> Result<Fragment> {
+        let mut fragments = dataset.manifest().fragments.iter().collect::<Vec<_>>();
+        fragments.sort_by_key(|fragment| fragment.id);
+        fragments
+            .get(shard_index)
+            .map(|fragment| (*fragment).clone())
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Manifest shard fragment {} is missing from __manifest",
+                        shard_index
+                    ),
+                })
+            })
+    }
+
+    fn all_manifest_field_ids(dataset: &Dataset) -> Vec<u32> {
+        dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.id as u32)
+            .collect()
+    }
+
+    async fn rewrite_manifest_shard<M, F>(
+        &self,
+        shard_index: usize,
+        operation: &str,
+        mut make_mutation: F,
+    ) -> Result<M::Output>
+    where
+        M: ManifestStreamMutation + 'static,
+        F: FnMut() -> M,
+    {
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
+        let max_retries = self.manifest_rewrite_commit_retries();
+        let mut retries = 0;
+
+        loop {
+            let dataset_guard = if retries == 0 {
+                self.manifest_dataset.get_cached().await
+            } else {
+                self.manifest_dataset.get_refreshed().await?
+            };
+            let dataset = Arc::new(dataset_guard.clone());
+            drop(dataset_guard);
+
+            let old_fragment = Self::manifest_shard_fragment(&dataset, shard_index)?;
+            let source = Self::manifest_projected_stream_for_fragments(
+                &dataset,
+                Some(vec![old_fragment.clone()]),
+            )
+            .await?;
+            let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(make_mutation())));
+            let output_stream = Self::manifest_rewrite_output_stream(source, shared.clone());
+            let write_params = WriteParams {
+                mode: WriteMode::Append,
+                session: self.session.clone(),
+                max_rows_per_file: u32::MAX as usize,
+                skip_auto_cleanup: true,
+                ..WriteParams::default()
+            };
+
+            let transaction = match InsertBuilder::new(dataset.clone())
+                .with_params(&write_params)
+                .execute_uncommitted_stream(output_stream)
+                .await
+            {
+                Ok(transaction) => transaction,
+                Err(err) => {
+                    if let Some(stream_err) = Self::take_manifest_rewrite_error(&shared)? {
+                        return Err(stream_err);
+                    }
+                    return Err(convert_lance_commit_error(&err, operation, None));
+                }
+            };
+
+            let (mutation, _index_data) = Self::take_manifest_rewrite_result(&shared)?;
+            if !mutation.has_changes {
+                return Ok(mutation.result);
+            }
+
+            let Operation::Append { mut fragments } = transaction.operation else {
+                return Err(NamespaceError::Internal {
+                    message: "Manifest shard rewrite transaction is not an append".to_string(),
+                }
+                .into());
+            };
+            if fragments.len() != 1 {
+                return Err(NamespaceError::Internal {
+                    message: format!(
+                        "Manifest shard rewrite expected one replacement fragment, got {}",
+                        fragments.len()
+                    ),
+                }
+                .into());
+            }
+
+            let mut replacement_fragment = fragments.remove(0);
+            replacement_fragment.id = old_fragment.id;
+            let fields_modified = Self::all_manifest_field_ids(&dataset);
+            let update = Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![replacement_fragment],
+                new_fragments: vec![],
+                fields_modified,
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            };
+            let transaction = TransactionBuilder::new(dataset.manifest().version, update).build();
+            let result = CommitBuilder::new(dataset.clone())
+                .with_max_retries(max_retries)
+                .with_skip_auto_cleanup(true)
+                .execute(transaction)
+                .await;
+
+            match result {
+                Ok(new_dataset) => {
+                    self.manifest_dataset.set_latest(new_dataset).await;
+                    return Ok(mutation.result);
+                }
+                Err(LanceError::CommitConflict { .. })
+                | Err(LanceError::RetryableCommitConflict { .. })
+                | Err(LanceError::TooMuchWriteContention { .. })
+                | Err(LanceError::IncompatibleTransaction { .. })
+                    if retries < max_retries =>
+                {
+                    retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(retries)))
+                        .await;
+                }
+                Err(err) => return Err(convert_lance_commit_error(&err, operation, None)),
+            }
+        }
+    }
+
     /// Check if the manifest contains an object with the given ID
     pub(crate) async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
         let escaped_id = object_id.replace('\'', "''");
@@ -1905,28 +2160,6 @@ impl ManifestNamespace {
         })?;
 
         Ok(count > 0)
-    }
-
-    pub(crate) async fn count_objects_with_prefix(&self, object_id_prefix: &str) -> Result<u64> {
-        let escaped_prefix = object_id_prefix.replace('\'', "''");
-        let filter = format!("starts_with(object_id, '{}')", escaped_prefix);
-        let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {:?}", e),
-            })
-        })?;
-        scanner.project::<&str>(&[]).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {:?}", e),
-            })
-        })?;
-        scanner.with_row_id();
-        scanner.count_rows().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to count rows: {:?}", e),
-            })
-        })
     }
 
     /// Query the manifest for a table with the given object ID
@@ -2142,6 +2375,25 @@ impl ManifestNamespace {
             return Ok(());
         }
 
+        if let Some(shard_count) = self.shard_count() {
+            let mut grouped: HashMap<usize, Vec<ManifestEntry>> = HashMap::new();
+            for entry in entries {
+                let shard_index =
+                    Self::shard_index_for_key(shard_count, Self::shard_key_for_entry(&entry));
+                grouped.entry(shard_index).or_default().push(entry);
+            }
+
+            for (shard_index, entries) in grouped {
+                self.rewrite_manifest_shard(
+                    shard_index,
+                    "Failed to overwrite manifest shard",
+                    || UpsertManifestMutation::new(entries.clone(), when_matched.clone()),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
         self.rewrite_manifest("Failed to overwrite manifest", || {
             UpsertManifestMutation::new(entries.clone(), when_matched.clone())
         })
@@ -2151,11 +2403,30 @@ impl ManifestNamespace {
     /// Delete an entry from the manifest table
     pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
         let object_id = object_id.to_string();
+        if let Some(shard_indices) = self.delete_shard_indices_for_object_id(&object_id) {
+            for shard_index in shard_indices {
+                let deleted = self
+                    .rewrite_manifest_shard(
+                        shard_index,
+                        "Failed to delete from manifest shard",
+                        || DeleteObjectMutation {
+                            object_id: object_id.clone(),
+                            deleted: false,
+                        },
+                    )
+                    .await?;
+                if deleted {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
         self.rewrite_manifest("Failed to delete from manifest", || DeleteObjectMutation {
             object_id: object_id.clone(),
             deleted: false,
         })
         .await
+        .map(|_| ())
     }
 
     /// Query the manifest for all versions of a table, sorted by version.
@@ -2271,6 +2542,34 @@ impl ManifestNamespace {
     }
 
     async fn delete_table_version_rows_by_object_ids(&self, object_ids: &[String]) -> Result<i64> {
+        if let Some(shard_count) = self.shard_count() {
+            let mut grouped: HashMap<usize, Vec<String>> = HashMap::new();
+            for object_id in object_ids {
+                let shard_index =
+                    Self::shard_index_for_key(shard_count, Self::table_version_table_id(object_id));
+                grouped
+                    .entry(shard_index)
+                    .or_default()
+                    .push(object_id.clone());
+            }
+
+            let mut deleted = 0;
+            for (shard_index, object_ids) in grouped {
+                let object_ids = object_ids.into_iter().collect::<HashSet<_>>();
+                deleted += self
+                    .rewrite_manifest_shard(
+                        shard_index,
+                        "Failed to delete table versions from manifest shard",
+                        || DeleteTableVersionsMutation {
+                            target: DeleteTableVersionsTarget::ObjectIds(object_ids.clone()),
+                            deleted_count: 0,
+                        },
+                    )
+                    .await?;
+            }
+            return Ok(deleted);
+        }
+
         let object_ids = object_ids.iter().cloned().collect::<HashSet<_>>();
         self.rewrite_manifest("Failed to delete table versions from manifest", || {
             DeleteTableVersionsMutation {
@@ -2304,6 +2603,50 @@ impl ManifestNamespace {
         &self,
         table_ranges: &[(String, Vec<(i64, i64)>)],
     ) -> Result<i64> {
+        if let Some(shard_count) = self.shard_count() {
+            let mut grouped: HashMap<usize, Vec<TableVersionRangeRequest>> = HashMap::new();
+            for (object_id, ranges) in table_ranges {
+                let shard_index = Self::shard_index_for_key(shard_count, object_id);
+                grouped
+                    .entry(shard_index)
+                    .or_default()
+                    .push((object_id.clone(), ranges.clone()));
+            }
+
+            let mut deleted = 0;
+            for (shard_index, table_ranges) in grouped {
+                let targets = table_ranges
+                    .iter()
+                    .filter_map(|(object_id, ranges)| {
+                        let ranges = Self::normalize_table_version_ranges(ranges);
+                        if ranges.is_empty() {
+                            None
+                        } else {
+                            Some(DeleteTableVersionRangeTarget {
+                                object_id_prefix: Self::build_version_object_id_prefix(object_id),
+                                ranges,
+                            })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if targets.is_empty() {
+                    continue;
+                }
+
+                deleted += self
+                    .rewrite_manifest_shard(
+                        shard_index,
+                        "Failed to delete table versions from manifest shard",
+                        || DeleteTableVersionsMutation {
+                            target: DeleteTableVersionsTarget::Ranges(targets.clone()),
+                            deleted_count: 0,
+                        },
+                    )
+                    .await?;
+            }
+            return Ok(deleted);
+        }
+
         let targets = table_ranges
             .iter()
             .filter_map(|(object_id, ranges)| {
@@ -2584,7 +2927,15 @@ impl ManifestNamespace {
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
         table_version_storage_enabled: bool,
+        manifest_fragment_shard_count: Option<usize>,
     ) -> Result<DatasetConsistencyWrapper> {
+        if matches!(manifest_fragment_shard_count, Some(0)) {
+            return Err(NamespaceError::InvalidInput {
+                message: "manifest_shard_count must be greater than 0".to_string(),
+            }
+            .into());
+        }
+
         let manifest_path = format!("{}/{}", root, manifest_table_name);
         log::debug!("Attempting to load manifest from {}", manifest_path);
         let store_options = ObjectStoreParams {
@@ -2607,6 +2958,20 @@ impl ManifestNamespace {
             .load()
             .await;
         if let Ok(mut dataset) = dataset_result {
+            if let Some(shard_count) = manifest_fragment_shard_count
+                && dataset.manifest().fragments.len() != shard_count
+            {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Existing {} table has {} fragments but manifest_shard_count is {}",
+                        manifest_table_name,
+                        dataset.manifest().fragments.len(),
+                        shard_count
+                    ),
+                }
+                .into());
+            }
+
             // Check if the object_id field has primary key metadata, migrate if not
             let needs_pk_migration = dataset
                 .schema()
@@ -2667,8 +3032,19 @@ impl ManifestNamespace {
         } else {
             log::info!("Creating new manifest table at {}", manifest_path);
             let schema = Self::manifest_schema();
-            let empty_batch = RecordBatch::new_empty(schema.clone());
-            let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+            let batches = if let Some(shard_count) = manifest_fragment_shard_count {
+                let mut batches = Vec::with_capacity(shard_count);
+                for shard_index in 0..shard_count {
+                    batches.push(Self::manifest_shard_marker_batch(
+                        schema.clone(),
+                        shard_index,
+                    )?);
+                }
+                batches
+            } else {
+                vec![RecordBatch::new_empty(schema.clone())]
+            };
+            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
             let store_params = ObjectStoreParams {
                 storage_options_accessor: storage_options.as_ref().map(|opts| {
@@ -2683,6 +3059,7 @@ impl ManifestNamespace {
             let write_params = WriteParams {
                 session: session.clone(),
                 store_params: Some(store_params),
+                max_rows_per_file: MANIFEST_FRAGMENT_SHARD_MARKER_ROWS_PER_FILE,
                 ..Default::default()
             };
 
@@ -2791,21 +3168,18 @@ impl ManifestNamespace {
     }
 }
 
-/// Manifest-backed catalog split across multiple Lance manifest tables.
-///
-/// Each shard is itself a [`ManifestNamespace`]. Catalog objects are routed by a
-/// stable hash of their object id so writes can fan out across independent
-/// manifest Lance tables.
+/// Manifest-backed catalog split across fragments of one Lance manifest table.
 pub struct ShardedManifestNamespace {
     root: String,
-    shards: Vec<Arc<ManifestNamespace>>,
+    manifest: ManifestNamespace,
+    shard_count: usize,
 }
 
 impl std::fmt::Debug for ShardedManifestNamespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardedManifestNamespace")
             .field("root", &self.root)
-            .field("shard_count", &self.shards.len())
+            .field("shard_count", &self.shard_count)
             .finish()
     }
 }
@@ -2831,231 +3205,43 @@ impl ShardedManifestNamespace {
             .into());
         }
 
-        Self::ensure_base_shards(
-            &root,
-            &storage_options,
-            session.clone(),
-            object_store.clone(),
-            base_path.clone(),
+        let manifest = ManifestNamespace::from_directory_with_manifest_table(
+            root.clone(),
+            MANIFEST_TABLE_NAME.to_string(),
+            storage_options,
+            session,
+            object_store,
+            base_path,
             dir_listing_enabled,
             inline_optimization_enabled,
             commit_retries,
             table_version_storage_enabled,
-            shard_count,
+            Some(shard_count),
         )
         .await?;
 
-        let shards = Self::open_shards(
-            &root,
-            &storage_options,
-            session.clone(),
-            object_store.clone(),
-            base_path.clone(),
-            dir_listing_enabled,
-            inline_optimization_enabled,
-            commit_retries,
-            table_version_storage_enabled,
+        Ok(Self {
+            root,
+            manifest,
             shard_count,
-        )
-        .await?;
-
-        Ok(Self { root, shards })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_base_shards(
-        root: &str,
-        storage_options: &Option<HashMap<String, String>>,
-        session: Option<Arc<Session>>,
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        dir_listing_enabled: bool,
-        inline_optimization_enabled: bool,
-        commit_retries: Option<u32>,
-        table_version_storage_enabled: bool,
-        shard_count: usize,
-    ) -> Result<()> {
-        for shard_index in 0..shard_count {
-            ManifestNamespace::from_directory_with_manifest_table(
-                root.to_string(),
-                Self::shard_table_name(shard_index),
-                storage_options.clone(),
-                session.clone(),
-                object_store.clone(),
-                base_path.clone(),
-                dir_listing_enabled,
-                inline_optimization_enabled,
-                commit_retries,
-                table_version_storage_enabled,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn open_shards(
-        root: &str,
-        storage_options: &Option<HashMap<String, String>>,
-        session: Option<Arc<Session>>,
-        object_store: Arc<ObjectStore>,
-        base_path: Path,
-        dir_listing_enabled: bool,
-        inline_optimization_enabled: bool,
-        commit_retries: Option<u32>,
-        table_version_storage_enabled: bool,
-        shard_count: usize,
-    ) -> Result<Vec<Arc<ManifestNamespace>>> {
-        let mut shards = Vec::with_capacity(shard_count);
-        for shard_index in 0..shard_count {
-            let shard = ManifestNamespace::from_directory_with_manifest_table(
-                root.to_string(),
-                Self::shard_table_name(shard_index),
-                storage_options.clone(),
-                session.clone(),
-                object_store.clone(),
-                base_path.clone(),
-                dir_listing_enabled,
-                inline_optimization_enabled,
-                commit_retries,
-                table_version_storage_enabled,
-            )
-            .await?;
-            shards.push(Arc::new(shard));
-        }
-        Ok(shards)
-    }
-
-    fn shard_table_name(shard_index: usize) -> String {
-        format!("{}_{:06}", SHARDED_MANIFEST_TABLE_PREFIX, shard_index)
-    }
-
-    fn stable_hash(value: &str) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in value.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
-    }
-
-    fn table_version_table_id(version_object_id: &str) -> &str {
-        version_object_id
-            .rsplit_once(DELIMITER)
-            .map(|(table_id, _)| table_id)
-            .unwrap_or(version_object_id)
-    }
-
-    fn shard_key_for_entry(entry: &ManifestEntry) -> &str {
-        match entry.object_type {
-            ObjectType::TableVersion => Self::table_version_table_id(&entry.object_id),
-            _ => &entry.object_id,
-        }
-    }
-
-    fn shard_index_for_key(&self, key: &str) -> usize {
-        Self::stable_hash(key) as usize % self.shards.len()
-    }
-
-    fn shard_for_object_id(&self, object_id: &str) -> &ManifestNamespace {
-        self.shards[self.shard_index_for_key(object_id)].as_ref()
-    }
-
-    fn shard_for_table_id(&self, table_id: &[String]) -> &ManifestNamespace {
-        let object_id = ManifestNamespace::str_object_id(table_id);
-        self.shard_for_object_id(&object_id)
-    }
-
-    fn apply_pagination(
-        names: &mut Vec<String>,
-        page_token: Option<String>,
-        limit: Option<i32>,
-    ) -> Option<String> {
-        names.sort();
-        names.dedup();
-
-        if let Some(start_after) = page_token {
-            if let Some(index) = names
-                .iter()
-                .position(|name| name.as_str() > start_after.as_str())
-            {
-                names.drain(0..index);
-            } else {
-                names.clear();
-            }
-        }
-
-        if let Some(limit) = limit
-            && limit >= 0
-        {
-            let limit = limit as usize;
-            if names.len() > limit {
-                let next_page_token = if limit > 0 {
-                    Some(names[limit - 1].clone())
-                } else {
-                    None
-                };
-                names.truncate(limit);
-                return next_page_token;
-            }
-        }
-
-        None
-    }
-
-    async fn validate_namespace_levels_exist(&self, namespace_path: &[String]) -> Result<()> {
-        for i in 1..=namespace_path.len() {
-            let partial_path = &namespace_path[..i];
-            let object_id = partial_path.join(DELIMITER);
-            if !self
-                .shard_for_object_id(&object_id)
-                .manifest_contains_object(&object_id)
-                .await?
-            {
-                return Err(NamespaceError::NamespaceNotFound {
-                    message: format!("parent namespace '{}'", object_id),
-                }
-                .into());
-            }
-        }
-        Ok(())
+        })
     }
 
     pub async fn list_manifest_table_locations(&self) -> Result<HashSet<String>> {
-        let mut locations = HashSet::new();
-        for shard in &self.shards {
-            locations.extend(shard.list_manifest_table_locations().await?);
-        }
-        Ok(locations)
+        self.manifest.list_manifest_table_locations().await
     }
 
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
-        let object_id = ManifestNamespace::build_object_id(&[], name);
-        self.shard_for_object_id(&object_id)
-            .insert_into_manifest(object_id, ObjectType::Table, Some(location))
-            .await
+        self.manifest.register_table(name, location).await
     }
 
     pub async fn insert_into_manifest_with_metadata(
         &self,
         entries: Vec<ManifestEntry>,
     ) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let mut grouped: HashMap<usize, Vec<ManifestEntry>> = HashMap::new();
-        for entry in entries {
-            let shard_index = self.shard_index_for_key(Self::shard_key_for_entry(&entry));
-            grouped.entry(shard_index).or_default().push(entry);
-        }
-
-        for (shard_index, entries) in grouped {
-            self.shards[shard_index]
-                .insert_into_manifest_with_metadata(entries)
-                .await?;
-        }
-        Ok(())
+        self.manifest
+            .insert_into_manifest_with_metadata(entries)
+            .await
     }
 
     pub async fn query_table_versions(
@@ -3064,7 +3250,7 @@ impl ShardedManifestNamespace {
         descending: bool,
         limit: Option<i32>,
     ) -> Result<Vec<(i64, String)>> {
-        self.shard_for_object_id(object_id)
+        self.manifest
             .query_table_versions(object_id, descending, limit)
             .await
     }
@@ -3075,7 +3261,7 @@ impl ShardedManifestNamespace {
         descending: bool,
         limit: Option<i32>,
     ) -> Result<ListTableVersionsResponse> {
-        self.shard_for_table_id(table_id)
+        self.manifest
             .list_table_versions(table_id, descending, limit)
             .await
     }
@@ -3085,7 +3271,7 @@ impl ShardedManifestNamespace {
         table_id: &[String],
         version: i64,
     ) -> Result<DescribeTableVersionResponse> {
-        self.shard_for_table_id(table_id)
+        self.manifest
             .describe_table_version(table_id, version)
             .await
     }
@@ -3094,22 +3280,9 @@ impl ShardedManifestNamespace {
         &self,
         table_ranges: &[(String, Vec<(i64, i64)>)],
     ) -> Result<i64> {
-        let mut grouped: HashMap<usize, Vec<TableVersionRangeRequest>> = HashMap::new();
-        for (object_id, ranges) in table_ranges {
-            let shard_index = self.shard_index_for_key(object_id);
-            grouped
-                .entry(shard_index)
-                .or_default()
-                .push((object_id.clone(), ranges.clone()));
-        }
-
-        let mut deleted = 0;
-        for (shard_index, ranges) in grouped {
-            deleted += self.shards[shard_index]
-                .batch_delete_table_versions_by_ranges(&ranges)
-                .await?;
-        }
-        Ok(deleted)
+        self.manifest
+            .batch_delete_table_versions_by_ranges(table_ranges)
+            .await
     }
 }
 
@@ -3120,41 +3293,15 @@ impl LanceNamespace for ShardedManifestNamespace {
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
-        let mut all_tables = Vec::new();
-        for shard in &self.shards {
-            let mut shard_request = request.clone();
-            shard_request.limit = None;
-            shard_request.page_token = None;
-            all_tables.extend(shard.list_tables(shard_request).await?.tables);
-        }
-
-        let next_page_token =
-            Self::apply_pagination(&mut all_tables, request.page_token, request.limit);
-        let mut response = ListTablesResponse::new(all_tables);
-        response.page_token = next_page_token;
-        Ok(response)
+        self.manifest.list_tables(request).await
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
-        let table_id = request.id.clone().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Table ID is required".to_string(),
-            })
-        })?;
-        self.shard_for_table_id(&table_id)
-            .describe_table(request)
-            .await
+        self.manifest.describe_table(request).await
     }
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
-        let table_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Table ID is required".to_string(),
-            })
-        })?;
-        self.shard_for_table_id(table_id)
-            .table_exists(request)
-            .await
+        self.manifest.table_exists(request).await
     }
 
     async fn create_table(
@@ -3162,194 +3309,55 @@ impl LanceNamespace for ShardedManifestNamespace {
         request: CreateTableRequest,
         data: Bytes,
     ) -> Result<CreateTableResponse> {
-        let table_id = request.id.clone().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Table ID is required".to_string(),
-            })
-        })?;
-        self.shard_for_table_id(&table_id)
-            .create_table(request, data)
-            .await
+        self.manifest.create_table(request, data).await
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
-        let table_id = request.id.clone().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Table ID is required".to_string(),
-            })
-        })?;
-        self.shard_for_table_id(&table_id).drop_table(request).await
+        self.manifest.drop_table(request).await
     }
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Table ID is required".to_string(),
-            })
-        })?;
-        self.shard_for_table_id(table_id)
-            .declare_table(request)
-            .await
+        self.manifest.declare_table(request).await
     }
 
     async fn register_table(&self, request: RegisterTableRequest) -> Result<RegisterTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Table ID is required".to_string(),
-            })
-        })?;
-        LanceNamespace::register_table(self.shard_for_table_id(table_id), request).await
+        <ManifestNamespace as LanceNamespace>::register_table(&self.manifest, request).await
     }
 
     async fn deregister_table(
         &self,
         request: DeregisterTableRequest,
     ) -> Result<DeregisterTableResponse> {
-        let table_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Table ID is required".to_string(),
-            })
-        })?;
-        self.shard_for_table_id(table_id)
-            .deregister_table(request)
-            .await
+        self.manifest.deregister_table(request).await
     }
 
     async fn list_namespaces(
         &self,
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
-        let mut all_namespaces = Vec::new();
-        for shard in &self.shards {
-            let mut shard_request = request.clone();
-            shard_request.limit = None;
-            shard_request.page_token = None;
-            all_namespaces.extend(shard.list_namespaces(shard_request).await?.namespaces);
-        }
-
-        let next_page_token =
-            Self::apply_pagination(&mut all_namespaces, request.page_token, request.limit);
-        let mut response = ListNamespacesResponse::new(all_namespaces);
-        response.page_token = next_page_token;
-        Ok(response)
+        self.manifest.list_namespaces(request).await
     }
 
     async fn describe_namespace(
         &self,
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Namespace ID is required".to_string(),
-            })
-        })?;
-        if namespace_id.is_empty() {
-            return Ok(DescribeNamespaceResponse {
-                properties: Some(HashMap::new()),
-            });
-        }
-        let object_id = namespace_id.join(DELIMITER);
-        self.shard_for_object_id(&object_id)
-            .describe_namespace(request)
-            .await
+        self.manifest.describe_namespace(request).await
     }
 
     async fn create_namespace(
         &self,
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Namespace ID is required".to_string(),
-            })
-        })?;
-        if namespace_id.is_empty() {
-            return Err(NamespaceError::NamespaceAlreadyExists {
-                message: "root namespace".to_string(),
-            }
-            .into());
-        }
-        if namespace_id.len() > 1 {
-            self.validate_namespace_levels_exist(&namespace_id[..namespace_id.len() - 1])
-                .await?;
-        }
-        let object_id = namespace_id.join(DELIMITER);
-        let shard = self.shard_for_object_id(&object_id);
-        if shard.manifest_contains_object(&object_id).await? {
-            return Err(NamespaceError::NamespaceAlreadyExists { message: object_id }.into());
-        }
-        let metadata = ManifestNamespace::serialize_metadata(
-            request.properties.as_ref(),
-            "namespace",
-            &object_id,
-        )?;
-        shard
-            .insert_into_manifest_with_metadata(vec![ManifestEntry {
-                object_id,
-                object_type: ObjectType::Namespace,
-                location: None,
-                metadata,
-            }])
-            .await?;
-        Ok(CreateNamespaceResponse {
-            properties: request.properties,
-            ..Default::default()
-        })
+        self.manifest.create_namespace(request).await
     }
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Namespace ID is required".to_string(),
-            })
-        })?;
-        if namespace_id.is_empty() {
-            return Err(NamespaceError::InvalidInput {
-                message: "Root namespace cannot be dropped".to_string(),
-            }
-            .into());
-        }
-        let object_id = namespace_id.join(DELIMITER);
-        let shard = self.shard_for_object_id(&object_id);
-        if !shard.manifest_contains_object(&object_id).await? {
-            return Err(NamespaceError::NamespaceNotFound { message: object_id }.into());
-        }
-
-        let prefix = format!("{}{}", object_id, DELIMITER);
-        let mut child_count = 0;
-        for shard in &self.shards {
-            child_count += shard.count_objects_with_prefix(&prefix).await?;
-        }
-        if child_count > 0 {
-            return Err(NamespaceError::NamespaceNotEmpty {
-                message: format!("'{}' (contains {} child objects)", object_id, child_count),
-            }
-            .into());
-        }
-
-        shard.delete_from_manifest(&object_id).await?;
-        Ok(DropNamespaceResponse::default())
+        self.manifest.drop_namespace(request).await
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
-        let namespace_id = request.id.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Namespace ID is required".to_string(),
-            })
-        })?;
-        if namespace_id.is_empty() {
-            return Ok(());
-        }
-        let object_id = namespace_id.join(DELIMITER);
-        if self
-            .shard_for_object_id(&object_id)
-            .manifest_contains_object(&object_id)
-            .await?
-        {
-            Ok(())
-        } else {
-            Err(NamespaceError::NamespaceNotFound { message: object_id }.into())
-        }
+        self.manifest.namespace_exists(request).await
     }
 }
 
@@ -4326,6 +4334,8 @@ mod tests {
     use rstest::rstest;
     use std::collections::HashMap;
 
+    use crate::dir::ManifestCatalog;
+
     fn create_test_ipc_data() -> Vec<u8> {
         use arrow::array::{Int32Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -4619,6 +4629,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(versions, vec![(1, String::new())]);
+    }
+
+    #[tokio::test]
+    async fn test_sharded_manifest_direct_delete_table_version_routes_to_table_shard() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_shard_count(4)
+            .build()
+            .await
+            .unwrap();
+        let table_object_id = "table";
+        let version_object_id = ManifestNamespace::build_version_object_id(table_object_id, 1);
+        let manifest_ns = namespace.manifest_ns.as_ref().unwrap();
+        manifest_ns
+            .insert_into_manifest_with_metadata(vec![super::ManifestEntry {
+                object_id: version_object_id.clone(),
+                object_type: super::ObjectType::TableVersion,
+                location: None,
+                metadata: None,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest_ns
+                .query_table_versions(table_object_id, false, None)
+                .await
+                .unwrap(),
+            vec![(1, String::new())]
+        );
+
+        let ManifestCatalog::Sharded(sharded) = manifest_ns.as_ref() else {
+            panic!("expected sharded manifest catalog");
+        };
+        sharded
+            .manifest
+            .delete_from_manifest(&version_object_id)
+            .await
+            .unwrap();
+
+        assert!(
+            manifest_ns
+                .query_table_versions(table_object_id, false, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

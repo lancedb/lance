@@ -192,7 +192,8 @@ pub struct DirectoryNamespaceBuilder {
     /// When true, table versions are stored in the `__manifest` table instead of
     /// relying on Lance's native version management.
     table_version_storage_enabled: bool,
-    /// Number of manifest shards. Zero means the legacy single `__manifest` table.
+    /// Number of manifest fragments used as shards. Zero means a single-fragment
+    /// `__manifest` table.
     manifest_shard_count: usize,
     /// When true, enables migration mode where the namespace checks the manifest first
     /// before falling back to directory listing for root-level tables. When false (default),
@@ -347,8 +348,8 @@ impl DirectoryNamespaceBuilder {
 
     /// Configure the number of manifest shards.
     ///
-    /// A value of 0 keeps the legacy single `__manifest` table. Values greater
-    /// than 0 enable sharded manifest mode.
+    /// A value of 0 keeps a single-fragment `__manifest` table. Values greater
+    /// than 0 use one `__manifest` table with that many fragments.
     pub fn manifest_shard_count(mut self, shard_count: usize) -> Self {
         self.manifest_shard_count = shard_count;
         self
@@ -4592,6 +4593,31 @@ mod tests {
             .unwrap()
     }
 
+    async fn load_sharded_manifest(temp_path: &str) -> Dataset {
+        DatasetBuilder::from_uri(format!("{}/__manifest", temp_path))
+            .load()
+            .await
+            .unwrap()
+    }
+
+    fn fragment_data_files(dataset: &Dataset) -> HashMap<u64, Vec<String>> {
+        dataset
+            .manifest()
+            .fragments
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.id,
+                    fragment
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_sharded_manifest_table_operations() {
         let temp_dir = TempStdDir::default();
@@ -4600,6 +4626,10 @@ mod tests {
 
         create_scalar_table(&namespace, "alpha").await;
         create_scalar_table(&namespace, "beta").await;
+
+        let before = load_sharded_manifest(temp_path).await;
+        assert_eq!(before.count_fragments(), 4);
+        let before_files = fragment_data_files(&before);
 
         let response = namespace
             .list_tables(ListTablesRequest {
@@ -4625,9 +4655,29 @@ mod tests {
             .unwrap();
         assert_eq!(describe.table.as_deref(), Some("alpha"));
 
+        create_scalar_table(&namespace, "gamma").await;
+        let after = load_sharded_manifest(temp_path).await;
+        assert_eq!(after.count_fragments(), 4);
+        let after_files = fragment_data_files(&after);
+        let changed_fragments = before_files
+            .iter()
+            .filter(|(fragment_id, before_files)| {
+                after_files
+                    .get(fragment_id)
+                    .is_some_and(|after_files| after_files != *before_files)
+            })
+            .count();
+        assert_eq!(
+            changed_fragments, 1,
+            "each sharded manifest write should replace one fragment"
+        );
+
         for shard_index in 0..4 {
             let shard_uri = format!("{}/__manifest_shard_{:06}", temp_path, shard_index);
-            DatasetBuilder::from_uri(shard_uri).load().await.unwrap();
+            assert!(
+                DatasetBuilder::from_uri(shard_uri).load().await.is_err(),
+                "sharded manifest mode should not create separate manifest tables"
+            );
         }
     }
 
