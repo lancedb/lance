@@ -5020,9 +5020,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.7.7"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6369eee4682fb11edf538388b43c61ce288b8302fe89bb40944d7daa7faaae99"
+checksum = "3eefb02ded2c3d4b6b60669bb74822d9fa628e144fc748c79ee31f13f566e87b"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
