@@ -254,4 +254,4 @@ def _target_partition_size_to_num_partitions(
     if target_partition_size is None:
         target_partition_size = 8192
     num_partitions = num_rows // target_partition_size
-    return max(1, num_partitions, 4096)
+    return min(max(1, num_partitions), 4096)
