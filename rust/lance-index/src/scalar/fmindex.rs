@@ -1197,14 +1197,13 @@ impl FMIndexScalarIndex {
         let files = store.list_files_with_sizes().await?;
         let mut pfiles: Vec<(u64, String)> = Vec::new();
         for f in &files {
-            if let Some(id_str) = f
+            if let Some(id) = f
                 .path
                 .strip_prefix("part_")
                 .and_then(|r| r.strip_suffix("_fmindex.lance"))
+                .and_then(|s| s.parse::<u64>().ok())
             {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    pfiles.push((id, f.path.clone()));
-                }
+                pfiles.push((id, f.path.clone()));
             }
         }
         if pfiles.is_empty() {
