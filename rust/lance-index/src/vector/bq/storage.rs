@@ -1418,12 +1418,12 @@ mod tests {
         assert_eq!(*bin_code_bytes, 16);
 
         assert!(rabit_ex_code_field(128, 1).unwrap().is_none());
-        let ex_field = rabit_ex_code_field(128, 4).unwrap().unwrap();
+        let ex_field = rabit_ex_code_field(128, 9).unwrap().unwrap();
         assert_eq!(ex_field.name(), RABIT_EX_CODE_COLUMN);
         let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
             panic!("ex-code field should be FixedSizeList");
         };
-        assert_eq!(*ex_code_bytes, 48);
+        assert_eq!(*ex_code_bytes, 128);
     }
 
     fn make_test_codes(num_vectors: usize, code_dim: i32) -> FixedSizeListArray {
@@ -1573,9 +1573,9 @@ mod tests {
     fn test_try_from_batch_accepts_multi_bit_rq_split_codes() {
         let original_codes = make_test_codes(50, 64);
         let code_dim = original_codes.value_length() as usize * 8;
-        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 4);
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 9);
         let mut metadata = make_test_metadata(code_dim);
-        metadata.num_bits = 4;
+        metadata.num_bits = 9;
 
         let storage = RabitQuantizationStorage::try_from_batch(
             make_test_batch_with_ex(original_codes, ex_codes),
@@ -1591,7 +1591,7 @@ mod tests {
             stored_batch[RABIT_EX_CODE_COLUMN]
                 .as_fixed_size_list()
                 .value_length(),
-            24
+            64
         );
     }
 
@@ -1633,9 +1633,9 @@ mod tests {
     fn test_remap_preserves_multi_bit_rq_split_columns() {
         let original_codes = make_test_codes(50, 64);
         let code_dim = original_codes.value_length() as usize * 8;
-        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 4);
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 9);
         let mut metadata = make_test_metadata(code_dim);
-        metadata.num_bits = 4;
+        metadata.num_bits = 9;
         let storage = RabitQuantizationStorage::try_from_batch(
             make_test_batch_with_ex(original_codes.clone(), ex_codes),
             &metadata,
@@ -1663,7 +1663,7 @@ mod tests {
             remapped_batch[RABIT_EX_CODE_COLUMN]
                 .as_fixed_size_list()
                 .value_length(),
-            24
+            64
         );
         assert_eq!(
             &remapped_batch[EX_ADD_FACTORS_COLUMN]

@@ -22,7 +22,7 @@ pub mod storage;
 pub mod transform;
 
 pub const RABIT_MIN_NUM_BITS: u8 = 1;
-pub const RABIT_MAX_NUM_BITS: u8 = 8;
+pub const RABIT_MAX_NUM_BITS: u8 = 9;
 pub const RABIT_BINARY_NUM_BITS: u8 = 1;
 
 #[derive(Clone, Default)]
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn test_rabit_num_bits_validation() {
         validate_rq_num_bits(1).unwrap();
-        validate_rq_num_bits(8).unwrap();
+        validate_rq_num_bits(9).unwrap();
 
         let err = validate_rq_num_bits(0).unwrap_err();
         assert!(
@@ -236,7 +236,7 @@ mod tests {
             err
         );
 
-        let err = validate_rq_num_bits(9).unwrap_err();
+        let err = validate_rq_num_bits(10).unwrap_err();
         assert!(
             err.to_string().contains("IVF_RQ num_bits must be in"),
             "{}",
@@ -244,19 +244,20 @@ mod tests {
         );
 
         validate_supported_rq_num_bits(1).unwrap();
-        validate_supported_rq_num_bits(8).unwrap();
+        validate_supported_rq_num_bits(9).unwrap();
     }
 
     #[test]
     fn test_rabit_split_code_byte_sizing() {
         assert_eq!(rabit_ex_bits(1).unwrap(), 0);
-        assert_eq!(rabit_ex_bits(8).unwrap(), 7);
+        assert_eq!(rabit_ex_bits(9).unwrap(), 8);
 
         assert_eq!(rabit_binary_code_bytes(128), 16);
         assert_eq!(rabit_binary_code_bytes(129), 17);
 
         assert_eq!(rabit_ex_code_bytes(128, 0).unwrap(), 0);
         assert_eq!(rabit_ex_code_bytes(128, 3).unwrap(), 48);
+        assert_eq!(rabit_ex_code_bytes(128, 8).unwrap(), 128);
         assert_eq!(rabit_ex_code_bytes(129, 3).unwrap(), 49);
     }
 }

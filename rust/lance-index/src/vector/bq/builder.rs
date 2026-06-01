@@ -842,7 +842,7 @@ mod tests {
             let quantizer = RabitQuantizer::build(
                 &fsl,
                 DistanceType::L2,
-                &RQBuildParams::with_rotation_type(2, rotation_type),
+                &RQBuildParams::with_rotation_type(9, rotation_type),
             )
             .unwrap();
             let quantized = quantizer.quantize_split(&fsl).unwrap();
@@ -857,12 +857,12 @@ mod tests {
                     .unwrap()
                     .as_fixed_size_list()
                     .value_length(),
-                4
+                32
             );
         }
 
         let err =
-            RabitQuantizer::build(&fsl, DistanceType::L2, &RQBuildParams::new(9)).unwrap_err();
+            RabitQuantizer::build(&fsl, DistanceType::L2, &RQBuildParams::new(10)).unwrap_err();
         assert!(
             err.to_string().contains("IVF_RQ num_bits must be in"),
             "{}",

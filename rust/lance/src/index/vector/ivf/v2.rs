@@ -4018,7 +4018,7 @@ mod tests {
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(4);
-        let rq_params = RQBuildParams::with_rotation_type(4, RQRotationType::Fast);
+        let rq_params = RQBuildParams::with_rotation_type(9, RQRotationType::Fast);
         let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
@@ -4031,7 +4031,7 @@ mod tests {
         let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
         let index_uuid = indices[0].uuid.to_string();
         let rq_meta = get_rq_metadata(&dataset, scheduler.clone(), &index_uuid).await;
-        assert_eq!(rq_meta.num_bits, 4);
+        assert_eq!(rq_meta.num_bits, 9);
 
         let reader = open_rq_aux_reader(&dataset, scheduler, &index_uuid).await;
         let schema = reader.schema();
@@ -4039,7 +4039,7 @@ mod tests {
         let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
             panic!("RQ ex-code field should be FixedSizeList");
         };
-        assert_eq!(ex_code_bytes, 12);
+        assert_eq!(ex_code_bytes, 32);
         assert!(schema.field(EX_ADD_FACTORS_COLUMN).is_some());
         assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
 

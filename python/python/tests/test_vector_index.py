@@ -1065,10 +1065,10 @@ def test_create_ivf_rq_multi_bit_gates_search():
         "vector",
         index_type="IVF_RQ",
         num_partitions=4,
-        num_bits=4,
+        num_bits=9,
     )
     stats = ds.stats.index_stats("vector_idx")
-    assert stats["indices"][0]["sub_index"]["num_bits"] == 4
+    assert stats["indices"][0]["sub_index"]["num_bits"] == 9
 
     with pytest.raises(pa.ArrowInvalid, match="num_bits>1 search is not supported"):
         ds.to_table(
