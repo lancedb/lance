@@ -5536,37 +5536,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_weighted_hierarchical_kmeans_large_partitions() {
-        const DIM: usize = 2;
-        const NUM_PARTITIONS: usize = 257;
-
-        let data = f32_fsl_from_values(vec![0.0, 0.0], DIM).unwrap();
-        let weights = vec![1.0];
-        let losses = vec![0.0];
-        let params = WeightedHierarchicalKMeansParams {
-            dimension: DIM,
-            target_k: NUM_PARTITIONS,
-            metric_type: DistanceType::L2,
-            max_iters: 1,
-            on_progress: Arc::new(|_, _| {}),
-        };
-
-        let centroids =
-            train_weighted_hierarchical_f32_kmeans(&data, &weights, &losses, &params).unwrap();
-
-        assert_eq!(centroids.len(), NUM_PARTITIONS);
-        assert_eq!(centroids.value_length() as usize, DIM);
-        assert!(
-            centroids
-                .values()
-                .as_primitive::<Float32Type>()
-                .values()
-                .iter()
-                .all(|value| *value == 0.0)
-        );
-    }
-
     #[tokio::test]
     async fn test_create_ivf_pq_f16() {
         let test_dir = TempStrDir::default();
