@@ -363,11 +363,11 @@ fn train_pq_model<'py>(
 /// Distributed IVF_RQ builds must pin a single rotation across all workers so that
 /// independently built per-fragment segments rotate vectors identically and their
 /// binary codes remain comparable when merged. A driver calls this once and broadcasts
-/// the resulting string to every `create_index_uncommitted(..., rq_rotation=...)` call.
+/// the resulting string to every `create_index_uncommitted(..., rabitq_model=...)` call.
 ///
-/// Only the "fast" rotation is supported since its sign vector is JSON-serializable, whereas
-/// the "matrix" rotation stores a dense matrix in a binary buffer that is dropped by the
-/// JSON wire format. `dtype` is accepted for API symmetry but does not affect the fast
+/// The rotation is always the "fast" rotation since its sign vector is JSON-serializable,
+/// whereas the "matrix" rotation stores a dense matrix in a binary buffer that is dropped by
+/// the JSON wire format. `dtype` is accepted for API symmetry but does not affect the fast
 /// rotation.
 ///
 /// # Example (Python)
@@ -375,25 +375,20 @@ fn train_pq_model<'py>(
 /// ```python
 /// from lance.lance import indices
 ///
-/// # Mint one rotation and broadcast `rot` to every worker.
-/// rot = indices.build_rq_rotation(dimension=128, num_bits=1)
+/// # Mint one model and broadcast `model` to every worker.
+/// model = indices.build_rq_model(dimension=128, num_bits=1)
 /// seg = ds.create_index_uncommitted(
 ///     column="vector",
 ///     index_type="IVF_RQ",
 ///     num_partitions=256,
 ///     ivf_centroids=centroids,
-///     rq_rotation=rot,
+///     rabitq_model=model,
 ///     fragment_ids=my_fragments,
 /// )
 /// ```
 #[pyfunction]
-#[pyo3(signature = (dimension, num_bits=1, rotation_type="fast", dtype="float32"))]
-pub fn build_rq_rotation(
-    dimension: usize,
-    num_bits: u8,
-    rotation_type: &str,
-    dtype: &str,
-) -> PyResult<String> {
+#[pyo3(signature = (dimension, num_bits=1, dtype="float32"))]
+pub fn build_rq_model(dimension: usize, num_bits: u8, dtype: &str) -> PyResult<String> {
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
     use lance_index::vector::bq::builder::RabitQuantizer;
     use lance_index::vector::bq::RQRotationType;
@@ -404,21 +399,8 @@ pub fn build_rq_rotation(
             "dimension must be divisible by 8 for IVF_RQ",
         ));
     }
-    let rotation = match rotation_type.to_lowercase().as_str() {
-        "fast" => RQRotationType::Fast,
-        "matrix" => {
-            return Err(PyValueError::new_err(
-                "matrix rotation cannot be serialized to JSON for distributed builds; \
-                 use rotation_type='fast'",
-            ));
-        }
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown rotation_type: {other}; expected 'fast'"
-            )));
-        }
-    };
     let dim = dimension as i32;
+    let rotation = RQRotationType::Fast;
     let quantizer = match dtype.to_lowercase().as_str() {
         "float16" => RabitQuantizer::new_with_rotation::<Float16Type>(num_bits, dim, rotation),
         "float32" => RabitQuantizer::new_with_rotation::<Float32Type>(num_bits, dim, rotation),
@@ -428,7 +410,7 @@ pub fn build_rq_rotation(
         }
     };
     serde_json::to_string(&quantizer.metadata(None))
-        .map_err(|e| PyValueError::new_err(format!("failed to serialize RQ rotation: {e}")))
+        .map_err(|e| PyValueError::new_err(format!("failed to serialize RQ model: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -825,7 +807,7 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
-    indices.add_wrapped(wrap_pyfunction!(build_rq_rotation))?;
+    indices.add_wrapped(wrap_pyfunction!(build_rq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;

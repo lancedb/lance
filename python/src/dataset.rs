@@ -4440,10 +4440,10 @@ fn prepare_vector_index_params(
             pq_params.codebook = Some(codebook.values().clone())
         };
 
-        if let Some(r) = kwargs.get_item("rq_rotation")? {
+        if let Some(r) = kwargs.get_item("rabitq_model")? {
             let json: String = r.extract()?;
             let meta: RabitQuantizationMetadata = serde_json::from_str(&json)
-                .map_err(|e| PyValueError::new_err(format!("Invalid rq_rotation JSON: {e}")))?;
+                .map_err(|e| PyValueError::new_err(format!("Invalid rabitq_model JSON: {e}")))?;
             rq_params.rotation = Some(meta);
         };
 

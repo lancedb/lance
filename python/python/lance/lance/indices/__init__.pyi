@@ -67,10 +67,9 @@ def transform_vectors(
     pq_codebook: pa.Array,
     dst_uri: str,
 ): ...
-def build_rq_rotation(
+def build_rq_model(
     dimension: int,
     num_bits: int = 1,
-    rotation_type: str = "fast",
     dtype: str = "float32",
 ) -> str: ...
 

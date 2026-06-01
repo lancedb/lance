@@ -3037,8 +3037,8 @@ def test_commit_existing_index_segments_accepts_index_metadata(tmp_path):
 
 def test_distributed_ivf_rq_shared_rotation(tmp_path):
     """Two IVF_RQ segments built on separate fragments with one shared RaBitQ rotation
-    merge into a single committed, queryable index. The shared ``rq_rotation`` (from
-    ``lance.lance.indices.build_rq_rotation``) is what makes the independently built
+    merge into a single committed, queryable index. The shared ``rabitq_model`` (from
+    ``lance.lance.indices.build_rq_model``) is what makes the independently built
     segments mergeable."""
     from lance.lance import indices
 
@@ -3054,14 +3054,14 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
         distance_type="l2",
         sample_rate=8,
     )
-    rq_rotation = indices.build_rq_rotation(dimension=dim, num_bits=1)
+    rabitq_model = indices.build_rq_model(dimension=dim, num_bits=1)
     base_kwargs = {
         "column": "vector",
         "index_type": "IVF_RQ",
         "num_partitions": 2,
         "num_bits": 1,
         "ivf_centroids": ivf_model.centroids,
-        "rq_rotation": rq_rotation,
+        "rabitq_model": rabitq_model,
     }
     first = ds.create_index_uncommitted(
         **base_kwargs,
