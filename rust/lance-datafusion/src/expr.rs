@@ -18,10 +18,12 @@ const MS_PER_DAY: i64 = 86400000;
 // need to do that literal coercion ourselves.
 pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarValue> {
     // A dictionary target coerces the value to the dictionary's value type and
-    // re-wraps it as a dictionary literal. Nulls keep their untyped form,
-    // matching the existing `ScalarValue::Null` behavior for all targets.
+    // re-wraps it as a dictionary literal. Only an untyped `ScalarValue::Null`
+    // keeps its untyped form, matching the behavior for all other targets; a
+    // *typed* null (e.g. `Utf8(None)`) is coerced and wrapped like any other
+    // value so it produces a `Dictionary(..)` literal that matches the column.
     if let DataType::Dictionary(key_type, value_type) = ty {
-        if value.is_null() {
+        if matches!(value, ScalarValue::Null) {
             return Some(value.clone());
         }
         let inner = safe_coerce_scalar(value, value_type)?;
@@ -786,9 +788,9 @@ mod tests {
                 &DataType::BinaryView
             ),
             Some(ScalarValue::BinaryView(Some(vec![1, 2, 3])))
-            );
+        );
     }
-    
+
     #[test]
     fn test_dictionary_coerce() {
         let dict_ty = DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
@@ -841,11 +843,35 @@ mod tests {
             ))
         );
 
-        // Null literals keep their untyped form, matching the behavior for all
-        // other target types.
+        // An untyped null keeps its untyped form for a dictionary target, just
+        // like for every other target type.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Null, &dict_ty),
+            Some(ScalarValue::Null)
+        );
+
+        // A *typed* null (e.g. an API-built `Utf8(None)` literal, or an IN value
+        // already typed as Utf8) is still wrapped in the dictionary type so it
+        // matches the dictionary column. Returning a bare `Utf8(None)` here would
+        // leave `resolve_value` with a literal whose type does not line up with
+        // the column, breaking planning/evaluation the same way non-null strings
+        // used to break.
         assert_eq!(
             safe_coerce_scalar(&ScalarValue::Utf8(None), &dict_ty),
-            Some(ScalarValue::Utf8(None))
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(None)),
+            ))
+        );
+
+        // The inner null is coerced through to the dictionary value type as well,
+        // so a LargeUtf8 typed null lands as a Utf8 null inside the dictionary.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::LargeUtf8(None), &dict_ty),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(None)),
+            ))
         );
 
         // A value that cannot be coerced to the dictionary value type fails.
