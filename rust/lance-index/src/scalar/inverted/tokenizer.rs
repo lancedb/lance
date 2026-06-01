@@ -45,7 +45,7 @@ pub struct InvertedIndexParams {
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
-    /// `icu` is recommended for most cases and is the default value
+    /// `simple` is recommended for most cases and the default value
     pub(crate) base_tokenizer: String,
 
     /// language for stemming and stop words
@@ -184,7 +184,7 @@ fn default_max_ngram_length() -> u32 {
 
 impl Default for InvertedIndexParams {
     fn default() -> Self {
-        Self::new("icu".to_owned(), Language::English)
+        Self::new("simple".to_owned(), Language::English)
     }
 }
 
@@ -192,11 +192,11 @@ impl InvertedIndexParams {
     /// Create a new `InvertedIndexParams` with the given base tokenizer and language.
     ///
     /// The `base_tokenizer` can be one of the following:
-    /// - `icu`: ICU dictionary-based word segmentation, default
-    /// - `simple`: splits tokens on whitespace and punctuation
+    /// - `simple`: splits tokens on whitespace and punctuation, default
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
     /// - `ngram`: N-Gram tokenizer
+    /// - `icu`: ICU dictionary-based word segmentation
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
@@ -443,22 +443,6 @@ mod tests {
     use lance_tokenizer::TokenStream;
 
     #[test]
-    fn test_default_uses_icu_tokenizer() {
-        assert_eq!(InvertedIndexParams::default().base_tokenizer, "icu");
-    }
-
-    #[test]
-    fn test_missing_details_base_tokenizer_uses_legacy_simple_default() {
-        let mut details =
-            crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
-        details.base_tokenizer = None;
-
-        let params = InvertedIndexParams::try_from(&details).unwrap();
-
-        assert_eq!(params.base_tokenizer, "simple");
-    }
-
-    #[test]
     fn test_build_only_fields_are_not_serialized() {
         let params = InvertedIndexParams::default()
             .memory_limit_mb(4096)
@@ -509,6 +493,7 @@ mod tests {
     #[test]
     fn test_build_icu_tokenizer() {
         let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer("icu".to_string())
             .stem(false)
             .remove_stop_words(false)
             .build()
