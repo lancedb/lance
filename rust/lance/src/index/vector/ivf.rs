@@ -2762,7 +2762,7 @@ fn streaming_ivf_progress_interval() -> u64 {
 }
 
 fn should_report_streaming_ivf_progress(total: u64, interval: u64) -> bool {
-    total == 1 || total % interval.max(1) == 0
+    total == 1 || total.is_multiple_of(interval.max(1))
 }
 
 fn split_ranges_by_row_count(ranges: &[Range<u64>], max_rows: usize) -> Vec<Range<u64>> {
@@ -3736,6 +3736,14 @@ impl PartialOrd for WeightedCluster {
     }
 }
 
+struct WeightedHierarchicalKMeansParams {
+    dimension: usize,
+    target_k: usize,
+    metric_type: MetricType,
+    max_iters: usize,
+    on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
+}
+
 fn weighted_subset(
     data_values: &[f32],
     weights: &[f64],
@@ -3762,11 +3770,7 @@ fn train_weighted_hierarchical_f32_kmeans(
     data: &FixedSizeListArray,
     weights: &[f64],
     losses: &[f64],
-    dimension: usize,
-    target_k: usize,
-    metric_type: MetricType,
-    max_iters: usize,
-    on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
+    params: &WeightedHierarchicalKMeansParams,
 ) -> Result<FixedSizeListArray> {
     if data.len() == 0 {
         return Err(Error::index("empty weighted coreset"));
@@ -3780,6 +3784,10 @@ fn train_weighted_hierarchical_f32_kmeans(
         )));
     }
 
+    let dimension = params.dimension;
+    let target_k = params.target_k;
+    let metric_type = params.metric_type;
+    let max_iters = params.max_iters;
     let initial_k = 16_usize.min(target_k).min(data.len()).max(1);
     let initial = train_weighted_f32_kmeans(
         data,
@@ -3788,7 +3796,7 @@ fn train_weighted_hierarchical_f32_kmeans(
         initial_k,
         metric_type,
         max_iters,
-        on_progress.clone(),
+        params.on_progress.clone(),
     )?;
 
     let centroids = initial.centroids;
@@ -3840,7 +3848,7 @@ fn train_weighted_hierarchical_f32_kmeans(
             cluster_k,
             metric_type,
             max_iters.min(20),
-            on_progress.clone(),
+            params.on_progress.clone(),
         )?;
 
         let mut assignments = vec![Vec::new(); cluster_k];
@@ -4046,15 +4054,18 @@ async fn train_streaming_coreset_ivf_model(
 
     let coreset_len = coreset.len();
     let (coreset_data, coreset_weights, coreset_losses) = coreset.into_fsl_parts(dimension)?;
+    let weighted_hierarchical_params = WeightedHierarchicalKMeansParams {
+        dimension,
+        target_k: num_partitions,
+        metric_type: DistanceType::L2,
+        max_iters: params.max_iters,
+        on_progress: on_progress.clone(),
+    };
     let mut centroids = train_weighted_hierarchical_f32_kmeans(
         &coreset_data,
         &coreset_weights,
         &coreset_losses,
-        dimension,
-        num_partitions,
-        DistanceType::L2,
-        params.max_iters,
-        on_progress.clone(),
+        &weighted_hierarchical_params,
     )?;
     let refine_iters = 3;
     if refine_iters > 0 {
