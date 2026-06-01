@@ -1197,11 +1197,13 @@ impl FMIndexScalarIndex {
         let files = store.list_files_with_sizes().await?;
         let mut pfiles: Vec<(u64, String)> = Vec::new();
         for f in &files {
-            if let Some(rest) = f.path.strip_prefix("part_") {
-                if let Some(id_str) = rest.strip_suffix("_fmindex.lance") {
-                    if let Ok(id) = id_str.parse::<u64>() {
-                        pfiles.push((id, f.path.clone()));
-                    }
+            if let Some(id_str) = f
+                .path
+                .strip_prefix("part_")
+                .and_then(|r| r.strip_suffix("_fmindex.lance"))
+            {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    pfiles.push((id, f.path.clone()));
                 }
             }
         }
@@ -1403,7 +1405,7 @@ fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(Error::invalid_input("invalid hex length"));
     }
     (0..s.len())
@@ -1418,9 +1420,9 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 /// Write an FM-Index partition to storage.
 ///
 /// Layout:
-///   1. Wavelet block rows (BWT nodes)
-///   2. SA sample blocks (packed u64 in LargeBinary)
-///   Metadata: c_table, huffman_codes, tree_topology, row_ids, doc_start_positions
+///   - Wavelet block rows (BWT nodes)
+///   - SA sample blocks (packed u64 in LargeBinary)
+///   - Metadata: c_table, huffman_codes, tree_topology, row_ids, doc_start_positions
 async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> Result<()> {
     let schema = Arc::new(arrow_schema::Schema::new(vec![
         Field::new("node_id", DataType::UInt32, false),
@@ -1774,8 +1776,8 @@ mod tests {
             .collect();
         let wavelet = HuffmanWaveletTree::build(&bwt);
 
-        for i in 0..n.min(500) {
-            assert_eq!(wavelet.access(i), bwt[i], "access mismatch at {i}");
+        for (i, &expected) in bwt.iter().enumerate().take(n.min(500)) {
+            assert_eq!(wavelet.access(i), expected, "access mismatch at {i}");
         }
     }
 
@@ -1791,10 +1793,10 @@ mod tests {
         // Test huffman codes roundtrip
         let hc_bytes = fm.serialize_huffman_codes();
         let hc = FMIndex::deserialize_huffman_codes(&hc_bytes);
-        for i in 0..256 {
-            assert_eq!(hc[i].bits, fm.wavelet.codes[i].bits);
-            assert_eq!(hc[i].length, fm.wavelet.codes[i].length);
-            assert_eq!(hc[i].node_path, fm.wavelet.codes[i].node_path);
+        for (i, (loaded, original)) in hc.iter().zip(fm.wavelet.codes.iter()).enumerate() {
+            assert_eq!(loaded.bits, original.bits, "bits mismatch at {i}");
+            assert_eq!(loaded.length, original.length, "length mismatch at {i}");
+            assert_eq!(loaded.node_path, original.node_path, "path mismatch at {i}");
         }
 
         // Test tree topology roundtrip
