@@ -32,8 +32,8 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_core::{Error, Result};
+use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::instrument;
@@ -414,8 +414,9 @@ mod tests {
     use datafusion::physical_planner::create_aggregate_expr_and_maybe_filter;
     use datafusion::scalar::ScalarValue;
     use futures::TryStreamExt;
-    use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use lance_select::result::IndexExprResultWireFormat;
     use lance_datagen::gen_batch;
     use lance_index::IndexType;
     use lance_index::scalar::{
@@ -559,6 +560,7 @@ mod tests {
         let prefilter: Arc<dyn ExecutionPlan> = Arc::new(ScalarIndexExec::new(
             fixture.dataset.clone(),
             prefilter_expr,
+            IndexExprResultWireFormat::default(),
         ));
 
         let plan = CountFromMaskExec::try_new(
@@ -592,6 +594,7 @@ mod tests {
         let prefilter: Arc<dyn ExecutionPlan> = Arc::new(ScalarIndexExec::new(
             fixture.dataset.clone(),
             prefilter_expr,
+            IndexExprResultWireFormat::default(),
         ));
 
         let plan = CountFromMaskExec::try_new(
@@ -613,8 +616,8 @@ mod tests {
         let dataset = Arc::new(dataset);
 
         let schema = input_schema();
-        let plan = CountFromMaskExec::try_new(dataset, vec![count_star_expr(&schema)], None)
-            .unwrap();
+        let plan =
+            CountFromMaskExec::try_new(dataset, vec![count_star_expr(&schema)], None).unwrap();
         let count = run(plan).await;
         assert_eq!(count, 30);
     }

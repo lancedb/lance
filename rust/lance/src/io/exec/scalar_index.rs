@@ -889,6 +889,7 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
             needs_recheck: false,
+            fragment_bitmap: None,
         });
 
         let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
