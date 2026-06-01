@@ -937,15 +937,19 @@ impl LazyFMIndex {
     #[inline]
     fn locate(&self, mut pos: usize) -> usize {
         let mut steps = 0;
-        while !pos.is_multiple_of(SA_SAMPLE_RATE) {
+        let n = self.wavelet.len;
+        loop {
+            if pos.is_multiple_of(SA_SAMPLE_RATE) && (pos / SA_SAMPLE_RATE) < self.sa_samples.len()
+            {
+                return (self.sa_samples[pos / SA_SAMPLE_RATE] as usize + steps) % n;
+            }
             let c = self.wavelet.access(pos);
             pos = self.c_table[c as usize] + self.wavelet.rank(c, pos);
             steps += 1;
-            if steps > self.wavelet.len {
-                return self.sa_samples[0] as usize;
+            if steps >= n {
+                return 0;
             }
         }
-        self.sa_samples[pos / SA_SAMPLE_RATE] as usize + steps
     }
 
     #[inline]
@@ -1601,6 +1605,12 @@ impl ScalarIndexPlugin for FMIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::cache::LanceCache;
+    use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
+    use std::sync::Arc;
+
+    use crate::scalar::lance_format::LanceIndexStore;
 
     #[test]
     fn test_fmindex_build_and_search() {
@@ -1727,9 +1737,6 @@ mod tests {
         let total = wavelet_size + sa_size;
 
         let ratio = total as f64 / text_size as f64;
-        println!(
-            "text={text_size}, wavelet={wavelet_size}, sa_samples={sa_size}, total={total}, ratio={ratio:.2}"
-        );
         assert!(
             ratio < 1.5,
             "index should be much smaller than text, got ratio={ratio:.2}"
@@ -1752,6 +1759,7 @@ mod tests {
             concat.extend_from_slice(text);
             concat.push(SENTINEL_BYTE);
         }
+        concat.push(0x00);
         let sa = build_suffix_array(&concat);
         let n = concat.len();
         let bwt: Vec<u8> = sa
@@ -1769,5 +1777,364 @@ mod tests {
         for i in 0..n.min(500) {
             assert_eq!(wavelet.access(i), bwt[i], "access mismatch at {i}");
         }
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let texts: Vec<(u64, &[u8])> = vec![
+            (10, b"alpha beta gamma"),
+            (20, b"beta gamma delta"),
+            (30, b"gamma delta epsilon"),
+        ];
+        let fm = FMIndex::build(&texts).unwrap();
+
+        // Test huffman codes roundtrip
+        let hc_bytes = fm.serialize_huffman_codes();
+        let hc = FMIndex::deserialize_huffman_codes(&hc_bytes);
+        for i in 0..256 {
+            assert_eq!(hc[i].bits, fm.wavelet.codes[i].bits);
+            assert_eq!(hc[i].length, fm.wavelet.codes[i].length);
+            assert_eq!(hc[i].node_path, fm.wavelet.codes[i].node_path);
+        }
+
+        // Test tree topology roundtrip
+        let topo_bytes = fm.serialize_tree_topology();
+        let topo = FMIndex::deserialize_tree_topology(&topo_bytes);
+        assert_eq!(topo.len(), fm.wavelet.children.len());
+
+        // Test c_table roundtrip
+        let ct_bytes = fm.serialize_c_table();
+        let ct = FMIndex::deserialize_c_table(&ct_bytes);
+        assert_eq!(ct, fm.c_table);
+    }
+
+    #[test]
+    fn test_hex_roundtrip() {
+        let data = vec![0u8, 1, 127, 255, 42];
+        let encoded = hex_encode(&data);
+        let decoded = hex_decode(&encoded).unwrap();
+        assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn test_sentinel_sanitization() {
+        // Text containing \xFF should be sanitized to space
+        let texts: Vec<(u64, &[u8])> = vec![(0, b"hello\xFFworld")];
+        let fm = FMIndex::build(&texts).unwrap();
+        // The \xFF is replaced with space during collect_texts, but here we test build directly
+        // which doesn't sanitize. The search should still work.
+        let r = fm.search(b"hello");
+        assert!(r.contains(0));
+    }
+
+    #[test]
+    fn test_wavelet_rank_pair_consistency() {
+        let docs: Vec<Vec<u8>> = (0..30)
+            .map(|i| format!("doc {i} with repeated words hello world test data").into_bytes())
+            .collect();
+        let texts: Vec<(u64, &[u8])> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i as u64, d.as_slice()))
+            .collect();
+        let fm = FMIndex::build(&texts).unwrap();
+
+        let n = fm.wavelet.len;
+        for b in [b'a', b'e', b' ', SENTINEL_BYTE] {
+            for &(lo, hi) in &[(0usize, 1usize), (0, n), (n / 4, n / 2)] {
+                if lo >= n || hi > n || lo >= hi {
+                    continue;
+                }
+                let (pl, ph) = fm.wavelet.rank_pair(b, lo, hi);
+                let rl = fm.wavelet.rank(b, lo);
+                let rh = fm.wavelet.rank(b, hi);
+                assert_eq!(pl, rl, "rank_pair lo mismatch for b={b} [{lo},{hi})");
+                assert_eq!(ph, rh, "rank_pair hi mismatch for b={b} [{lo},{hi})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_sa_sampling() {
+        // Test with enough documents to have multiple SA sample points
+        let docs: Vec<Vec<u8>> = (0..50)
+            .map(|i| {
+                format!(
+                    "document number {} with lots of text to ensure we have enough bytes for multiple SA samples across the suffix array positions",
+                    i
+                )
+                .into_bytes()
+            })
+            .collect();
+        let texts: Vec<(u64, &[u8])> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i as u64, d.as_slice()))
+            .collect();
+        let fm = FMIndex::build(&texts).unwrap();
+
+        assert!(fm.sa_samples.len() > 1, "should have multiple SA samples");
+        assert_eq!(fm.search(b"document number 25").len(), 1);
+        assert_eq!(fm.search(b"document number").len(), 50);
+        assert_eq!(fm.search(b"nonexistent pattern").len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_and_load_roundtrip() {
+        let texts: Vec<(u64, &[u8])> = vec![
+            (0, b"hello world foo bar"),
+            (1, b"hello rust baz qux"),
+            (2, b"goodbye world quux"),
+        ];
+        let fm = FMIndex::build(&texts).unwrap();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Write
+        write_fmindex(&fm, store.as_ref(), &fmindex_partition_path(0))
+            .await
+            .unwrap();
+
+        // Load
+        let part =
+            FMIndexScalarIndex::load_partition(store.as_ref(), &fmindex_partition_path(0), 0)
+                .await
+                .unwrap();
+
+        // Verify search results match
+        let r = part.fm.search(b"hello");
+        assert!(r.contains(0));
+        assert!(r.contains(1));
+        assert!(!r.contains(2));
+
+        let r = part.fm.search(b"world");
+        assert!(r.contains(0));
+        assert!(!r.contains(1));
+        assert!(r.contains(2));
+
+        assert!(part.fm.search(b"xyz").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_partitioned_write_and_load() {
+        let docs: Vec<Vec<u8>> = (0..30)
+            .map(|i| format!("document {i} hello world test data").into_bytes())
+            .collect();
+        let texts: Vec<(u64, Vec<u8>)> = docs
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (i as u64, d))
+            .collect();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_partitioned_fmindex(&texts, store.as_ref())
+            .await
+            .unwrap();
+
+        let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Search across partitions
+        let r = index
+            .search(
+                &TextQuery::StringContains("hello world".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(30));
+            }
+            _ => panic!("expected exact result"),
+        }
+
+        let r = index
+            .search(
+                &TextQuery::StringContains("document 15".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(1));
+            }
+            _ => panic!("expected exact result"),
+        }
+
+        let r = index
+            .search(
+                &TextQuery::StringContains("nonexistent".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(0));
+            }
+            _ => panic!("expected exact result"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_plugin_train_and_load() {
+        use arrow_array::{StringArray, UInt64Array};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::stream;
+        use lance_core::ROW_ID;
+
+        let docs = vec!["hello world", "hello rust", "goodbye world"];
+        let row_ids: Vec<u64> = vec![0, 1, 2];
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                crate::scalar::registry::VALUE_COLUMN_NAME,
+                DataType::Utf8,
+                false,
+            ),
+            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(docs)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let req = FMIndexPlugin
+            .new_training_request("", &arrow_schema::Field::new("val", DataType::Utf8, false))
+            .unwrap();
+        let created = FMIndexPlugin
+            .train_index(
+                Box::pin(stream),
+                store.as_ref(),
+                req,
+                None,
+                Arc::new(crate::progress::NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+
+        let index = FMIndexPlugin
+            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let r = index
+            .search(
+                &TextQuery::StringContains("hello".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(2));
+            }
+            _ => panic!("expected exact result"),
+        }
+    }
+
+    #[test]
+    fn test_build_wavelet_batch() {
+        let texts: Vec<(u64, &[u8])> = vec![(0, b"hello world"), (1, b"test data")];
+        let fm = FMIndex::build(&texts).unwrap();
+        let batch = fm.build_wavelet_batch().unwrap();
+        assert!(batch.num_rows() > 0);
+        assert_eq!(batch.num_columns(), 6);
+    }
+
+    #[test]
+    fn test_extract_text_bytes_types() {
+        use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
+
+        let utf8 = StringArray::from(vec!["hello"]);
+        assert_eq!(
+            extract_text_bytes(&utf8, 0).unwrap(),
+            Some(b"hello".to_vec())
+        );
+
+        let large_utf8 = LargeStringArray::from(vec!["world"]);
+        assert_eq!(
+            extract_text_bytes(&large_utf8, 0).unwrap(),
+            Some(b"world".to_vec())
+        );
+
+        let binary = BinaryArray::from(vec![b"bytes" as &[u8]]);
+        assert_eq!(
+            extract_text_bytes(&binary, 0).unwrap(),
+            Some(b"bytes".to_vec())
+        );
+
+        let large_binary = LargeBinaryArray::from(vec![b"large" as &[u8]]);
+        assert_eq!(
+            extract_text_bytes(&large_binary, 0).unwrap(),
+            Some(b"large".to_vec())
+        );
+
+        // Null handling
+        let nullable = StringArray::from(vec![None::<&str>]);
+        assert_eq!(extract_text_bytes(&nullable, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn test_fmindex_statistics() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let docs: Vec<Vec<u8>> = (0..10).map(|i| format!("doc {i}").into_bytes()).collect();
+            let texts: Vec<(u64, Vec<u8>)> = docs
+                .into_iter()
+                .enumerate()
+                .map(|(i, d)| (i as u64, d))
+                .collect();
+
+            let tempdir = tempfile::tempdir().unwrap();
+            let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+            let store = Arc::new(LanceIndexStore::new(
+                Arc::new(ObjectStore::local()),
+                index_dir,
+                Arc::new(LanceCache::no_cache()),
+            ));
+
+            write_partitioned_fmindex(&texts, store.as_ref())
+                .await
+                .unwrap();
+            let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+
+            let stats = index.statistics().unwrap();
+            assert_eq!(stats["type"], "FMIndex");
+            assert_eq!(stats["total_docs"], 10);
+            assert!(stats["total_bwt_len"].as_u64().unwrap() > 0);
+        });
     }
 }
