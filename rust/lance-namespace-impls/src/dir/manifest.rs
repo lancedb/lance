@@ -1208,6 +1208,22 @@ impl ManifestNamespace {
         Ok(dataset_guard.scan())
     }
 
+    async fn manifest_scanner_for_shard(&self, shard_index: usize) -> Result<Scanner> {
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let fragment = Self::manifest_shard_fragment(&dataset_guard, shard_index)?;
+        let mut scanner = dataset_guard.scan();
+        scanner.with_fragments(vec![fragment]);
+        Ok(scanner)
+    }
+
+    async fn manifest_scanner_for_shard_key(&self, shard_key: &str) -> Result<Scanner> {
+        let Some(shard_count) = self.shard_count() else {
+            return self.manifest_scanner().await;
+        };
+        let shard_index = Self::shard_index_for_key(shard_count, shard_key);
+        self.manifest_scanner_for_shard(shard_index).await
+    }
+
     /// Helper to execute a scanner and collect results into a Vec
     async fn execute_scanner(scanner: Scanner) -> Result<Vec<RecordBatch>> {
         let mut stream = scanner.try_into_stream().await.map_err(|e| {
@@ -2130,13 +2146,15 @@ impl ManifestNamespace {
         }
     }
 
-    /// Check if the manifest contains an object with the given ID
-    pub(crate) async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
+    async fn manifest_contains_object_in_shard(
+        &self,
+        object_id: &str,
+        shard_key: &str,
+    ) -> Result<bool> {
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}'", escaped_id);
 
-        let dataset_guard = self.manifest_dataset.get().await?;
-        let mut scanner = dataset_guard.scan();
+        let mut scanner = self.manifest_scanner_for_shard_key(shard_key).await?;
 
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
@@ -2162,11 +2180,36 @@ impl ManifestNamespace {
         Ok(count > 0)
     }
 
+    /// Check if the manifest contains an object with the given ID
+    pub(crate) async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
+        let Some(shard_count) = self.shard_count() else {
+            return self
+                .manifest_contains_object_in_shard(object_id, object_id)
+                .await;
+        };
+
+        if self
+            .manifest_contains_object_in_shard(object_id, object_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        if let Some(table_id) = Self::table_version_table_id_if_version_object_id(object_id)
+            && Self::shard_index_for_key(shard_count, table_id)
+                != Self::shard_index_for_key(shard_count, object_id)
+        {
+            return self
+                .manifest_contains_object_in_shard(object_id, table_id)
+                .await;
+        }
+        Ok(false)
+    }
+
     /// Query the manifest for a table with the given object ID
     async fn query_manifest_for_table(&self, object_id: &str) -> Result<Option<TableInfo>> {
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}' AND object_type = 'table'", escaped_id);
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self.manifest_scanner_for_shard_key(object_id).await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
@@ -2450,7 +2493,7 @@ impl ManifestNamespace {
             "object_type = 'table_version' AND starts_with(object_id, '{}{}')",
             escaped_id, DELIMITER
         );
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self.manifest_scanner_for_shard_key(object_id).await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
@@ -2517,7 +2560,9 @@ impl ManifestNamespace {
             "object_id = '{}' AND object_type = 'table_version'",
             escaped_id
         );
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self
+            .manifest_scanner_for_shard_key(Self::table_version_table_id(version_object_id))
+            .await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
@@ -2850,7 +2895,7 @@ impl ManifestNamespace {
     async fn query_manifest_for_namespace(&self, object_id: &str) -> Result<Option<NamespaceInfo>> {
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}' AND object_type = 'namespace'", escaped_id);
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self.manifest_scanner_for_shard_key(object_id).await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
