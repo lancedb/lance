@@ -1305,25 +1305,25 @@ impl ScalarIndexExpr {
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
     #[async_recursion]
-    async fn evaluate_impl(
+    pub async fn evaluate_nullable(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_impl(index_loader, metrics).await?;
+                let result = inner.evaluate_nullable(index_loader, metrics).await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
-                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
+                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
-                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
+                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1344,7 +1344,7 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_impl(index_loader, metrics)
+            .evaluate_nullable(index_loader, metrics)
             .await?
             .drop_nulls())
     }

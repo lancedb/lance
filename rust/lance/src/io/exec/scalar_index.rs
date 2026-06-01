@@ -120,8 +120,14 @@ impl ScalarIndexExec {
         &self.expr
     }
 
+    /// Return the wire format used when serializing this exec's
+    /// [`IndexExprResult`](lance_select::result::IndexExprResult) output.
+    pub fn result_format(&self) -> IndexExprResultWireFormat {
+        self.result_format
+    }
+
     #[async_recursion]
-    async fn fragments_covered_by_index_query(
+    pub async fn fragments_covered_by_index_query(
         index_expr: &ScalarIndexExpr,
         dataset: &Dataset,
     ) -> Result<RoaringBitmap> {

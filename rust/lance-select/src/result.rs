@@ -99,6 +99,18 @@ impl NullableIndexExprResult {
         }
     }
 
+    /// Construct a non-exact interval result — `lower` rows are guaranteed
+    /// TRUE and `upper` rows may be TRUE, with NULL state preserved at both
+    /// endpoints. Use [`Self::exact`] when the two endpoints are known to be
+    /// the same answer.
+    pub fn new(lower: NullableRowAddrMask, upper: NullableRowAddrMask) -> Self {
+        Self {
+            lower,
+            upper,
+            exact: false,
+        }
+    }
+
     /// True if the result is exact — the answer is precisely the lower
     /// (== upper) mask.
     ///
