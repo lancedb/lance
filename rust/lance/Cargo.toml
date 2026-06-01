@@ -115,6 +115,7 @@ lance-io = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.11.7"
 tempfile.workspace = true
+walkdir = "2"
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }

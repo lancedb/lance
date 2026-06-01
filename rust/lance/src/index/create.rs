@@ -221,6 +221,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::BTree
                 | IndexType::Inverted
                 | IndexType::NGram
+                | IndexType::FMIndex
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
