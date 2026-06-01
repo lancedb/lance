@@ -430,6 +430,18 @@ impl LazyRankBitVec {
         }
     }
 
+    /// Pre-load all blocks into memory. Call this before sync rank/access operations
+    /// to avoid the need for `block_in_place` during queries.
+    async fn load_all_blocks(&self) -> Result<()> {
+        for (idx, lock) in self.blocks.iter().enumerate() {
+            if lock.get().is_none() {
+                let words = self.load_block(idx).await?;
+                let _ = lock.set(words);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     fn ensure_block(&self, idx: usize) -> &[u64] {
         self.blocks[idx].get_or_init(|| {
@@ -521,6 +533,14 @@ impl std::fmt::Debug for LazyHuffmanWaveletTree {
 }
 
 impl LazyHuffmanWaveletTree {
+    /// Pre-load all wavelet tree blocks into memory.
+    async fn load_all(&self) -> Result<()> {
+        for node in &self.nodes {
+            node.load_all_blocks().await?;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn access(&self, mut pos: usize) -> u8 {
         if self.nodes.is_empty() {
@@ -708,6 +728,7 @@ impl FMIndex {
             pos = self.c_table[c as usize] + self.wavelet.rank(c, pos);
             steps += 1;
             if steps >= n {
+                log::warn!("FM-Index SA locate exceeded {n} steps, possible index corruption");
                 return 0;
             }
         }
@@ -859,7 +880,6 @@ impl FMIndex {
         let mut words_b: Vec<Vec<u8>> = Vec::new();
         let mut pr_b = Vec::new();
         let mut bl_b = Vec::new();
-        let mut nz_b = Vec::new();
 
         for (i, node) in self.wavelet.nodes.iter().enumerate() {
             let mut pr: u64 = 0;
@@ -869,7 +889,6 @@ impl FMIndex {
                 words_b.push(Vec::new());
                 pr_b.push(0u64);
                 bl_b.push(node.len as u64);
-                nz_b.push(0u64);
             } else {
                 for (bi, chunk) in node.words.chunks(BLOCK_WORDS).enumerate() {
                     nid_b.push(i as u32);
@@ -877,20 +896,12 @@ impl FMIndex {
                     words_b.push(Self::u64_to_bytes(chunk));
                     pr_b.push(pr);
                     bl_b.push(node.len as u64);
-                    nz_b.push(0u64);
                     pr += chunk.iter().map(|w| w.count_ones() as u64).sum::<u64>();
                 }
             }
         }
         let refs: Vec<&[u8]> = words_b.iter().map(|v| v.as_slice()).collect();
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("node_id", DataType::UInt32, false),
-            Field::new("block_id", DataType::UInt32, false),
-            Field::new("words", DataType::LargeBinary, false),
-            Field::new("prefix_rank", DataType::UInt64, false),
-            Field::new("bit_len", DataType::UInt64, false),
-            Field::new("num_zeros", DataType::UInt64, false),
-        ]));
+        let schema = Arc::new(Self::block_schema());
         Ok(RecordBatch::try_new(
             schema,
             vec![
@@ -899,9 +910,18 @@ impl FMIndex {
                 Arc::new(LargeBinaryArray::from(refs)),
                 Arc::new(UInt64Array::from(pr_b)),
                 Arc::new(UInt64Array::from(bl_b)),
-                Arc::new(UInt64Array::from(nz_b)),
             ],
         )?)
+    }
+
+    fn block_schema() -> arrow_schema::Schema {
+        arrow_schema::Schema::new(vec![
+            Field::new("node_id", DataType::UInt32, false),
+            Field::new("block_id", DataType::UInt32, false),
+            Field::new("words", DataType::LargeBinary, false),
+            Field::new("prefix_rank", DataType::UInt64, false),
+            Field::new("bit_len", DataType::UInt64, false),
+        ])
     }
 }
 
@@ -917,6 +937,11 @@ struct LazyFMIndex {
 }
 
 impl LazyFMIndex {
+    /// Pre-load all wavelet tree blocks before sync search operations.
+    async fn prewarm(&self) -> Result<()> {
+        self.wavelet.load_all().await
+    }
+
     fn backward_search(&self, pattern: &[u8]) -> (usize, usize) {
         if pattern.is_empty() || self.wavelet.len == 0 {
             return (0, 0);
@@ -947,6 +972,7 @@ impl LazyFMIndex {
             pos = self.c_table[c as usize] + self.wavelet.rank(c, pos);
             steps += 1;
             if steps >= n {
+                log::warn!("FM-Index SA locate exceeded {n} steps, possible index corruption");
                 return 0;
             }
         }
@@ -1275,6 +1301,7 @@ impl ScalarIndex for FMIndexScalarIndex {
                 use lance_select::RowAddrTreeMap;
                 let mut tree = RowAddrTreeMap::new();
                 for p in &self.partitions {
+                    p.fm.prewarm().await?;
                     for rid in p.fm.search(pb).iter() {
                         tree.insert(rid as u64);
                     }
@@ -1423,14 +1450,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 ///   - SA sample blocks (packed u64 in LargeBinary)
 ///   - Metadata: c_table, huffman_codes, tree_topology, row_ids, doc_start_positions
 async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> Result<()> {
-    let schema = Arc::new(arrow_schema::Schema::new(vec![
-        Field::new("node_id", DataType::UInt32, false),
-        Field::new("block_id", DataType::UInt32, false),
-        Field::new("words", DataType::LargeBinary, false),
-        Field::new("prefix_rank", DataType::UInt64, false),
-        Field::new("bit_len", DataType::UInt64, false),
-        Field::new("num_zeros", DataType::UInt64, false),
-    ]));
+    let schema = Arc::new(FMIndex::block_schema());
 
     let mut writer = store.new_index_file(filename, schema.clone()).await?;
 
@@ -1440,21 +1460,18 @@ async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> 
     writer.write_record_batch(wb).await?;
 
     // 2. SA samples packed as binary blocks
-    let sa_bytes_per_block = BLOCK_WORDS * 8; // 32KB
-    let u64s_per_block = sa_bytes_per_block / 8; // 4096 u64s per block
+    let u64s_per_block = BLOCK_WORDS; // 4096 u64s per block = 32KB
     let mut sa_nid = Vec::new();
     let mut sa_bid = Vec::new();
     let mut sa_words: Vec<Vec<u8>> = Vec::new();
     let mut sa_pr = Vec::new();
     let mut sa_bl = Vec::new();
-    let mut sa_nz = Vec::new();
     for (bi, chunk) in fm.sa_samples.chunks(u64s_per_block).enumerate() {
-        sa_nid.push(u32::MAX); // marker for SA samples
+        sa_nid.push(u32::MAX);
         sa_bid.push(bi as u32);
         sa_words.push(FMIndex::u64_to_bytes(chunk));
         sa_pr.push(0u64);
         sa_bl.push(fm.sa_samples.len() as u64);
-        sa_nz.push(0u64);
     }
     let num_sa_blocks = sa_nid.len();
     if num_sa_blocks > 0 {
@@ -1468,7 +1485,6 @@ async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> 
                     Arc::new(arrow_array::LargeBinaryArray::from(refs)),
                     Arc::new(arrow_array::UInt64Array::from(sa_pr)),
                     Arc::new(arrow_array::UInt64Array::from(sa_bl)),
-                    Arc::new(arrow_array::UInt64Array::from(sa_nz)),
                 ],
             )?)
             .await?;
@@ -2068,7 +2084,7 @@ mod tests {
         let fm = FMIndex::build(&texts).unwrap();
         let batch = fm.build_wavelet_batch().unwrap();
         assert!(batch.num_rows() > 0);
-        assert_eq!(batch.num_columns(), 6);
+        assert_eq!(batch.num_columns(), 5);
     }
 
     #[test]
