@@ -85,7 +85,6 @@ geo-traits.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
 test-log.workspace = true
-walkdir = "2"
 rstest.workspace = true
 chrono.workspace = true
 

@@ -4525,7 +4525,6 @@ dependencies = [
  "tracking-allocator",
  "url",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
@@ -4878,7 +4877,6 @@ dependencies = [
  "tracing",
  "twox-hash",
  "uuid",
- "walkdir",
 ]
 
 [[package]]
