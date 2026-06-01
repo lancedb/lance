@@ -5437,43 +5437,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_build_ivf_model_streaming_training_large_partitions() {
-        let test_dir = TempStrDir::default();
-        let uri = format!("{}/ds", test_dir.as_str());
-        let reader = gen_batch()
-            .col("id", array::step::<UInt64Type>())
-            .col("vector", array::rand_vec::<Float32Type>(8.into()))
-            .into_reader_rows(RowCount::from(640), BatchCount::from(2));
-        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
-
-        let mut params = IvfBuildParams::new(320);
-        params.sample_rate = 2;
-        params.streaming_sample_rate = Some(1);
-        params.max_iters = 1;
-
-        let ivf_model = build_ivf_model(
-            &dataset,
-            "vector",
-            8,
-            MetricType::L2,
-            &params,
-            None,
-            lance_index::progress::noop_progress(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(ivf_model.num_partitions(), 320);
-        assert_eq!(ivf_model.dimension(), 8);
-        assert!(ivf_model.loss().is_none());
-        assert!(
-            compute_test_ivf_loss(&dataset, "vector", &ivf_model)
-                .await
-                .is_finite()
-        );
-    }
-
     #[test]
     fn test_fixed_training_ranges_are_sorted_and_bounded() {
         let ranges = generate_fixed_training_ranges(10_000, 1_234, 1_024, 16);
@@ -5570,6 +5533,37 @@ mod tests {
             (centroids[0] - centroids[1]).abs() > 10.0,
             "weighted kmeans++ should seed distant coreset regions, got {:?}",
             centroids
+        );
+    }
+
+    #[test]
+    fn test_weighted_hierarchical_kmeans_large_partitions() {
+        const DIM: usize = 2;
+        const NUM_PARTITIONS: usize = 257;
+
+        let data = f32_fsl_from_values(vec![0.0, 0.0], DIM).unwrap();
+        let weights = vec![1.0];
+        let losses = vec![0.0];
+        let params = WeightedHierarchicalKMeansParams {
+            dimension: DIM,
+            target_k: NUM_PARTITIONS,
+            metric_type: DistanceType::L2,
+            max_iters: 1,
+            on_progress: Arc::new(|_, _| {}),
+        };
+
+        let centroids =
+            train_weighted_hierarchical_f32_kmeans(&data, &weights, &losses, &params).unwrap();
+
+        assert_eq!(centroids.len(), NUM_PARTITIONS);
+        assert_eq!(centroids.value_length() as usize, DIM);
+        assert!(
+            centroids
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|value| *value == 0.0)
         );
     }
 
