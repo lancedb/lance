@@ -20,6 +20,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Self,
     Sequence,
@@ -563,6 +564,8 @@ def _write_fragments(
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List[Any]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -580,6 +583,8 @@ def _write_fragments_transaction(
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List[Any]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...

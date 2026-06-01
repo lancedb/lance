@@ -2554,7 +2554,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3715,7 +3715,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3829,7 +3829,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrayref",
  "paste",
@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3873,7 +3873,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3905,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -3923,7 +3923,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -3989,7 +3989,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4003,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4072,7 +4072,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jni"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4150,7 +4150,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4166,7 +4166,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4178,7 +4178,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4236,7 +4236,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4274,7 +4274,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.2.0-beta.2"
+version = "7.2.0-beta.3"
 dependencies = [
  "icu_segmenter",
  "rust-stemmers",
@@ -5485,7 +5485,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -5504,7 +5504,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

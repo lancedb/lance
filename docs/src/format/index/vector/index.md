@@ -249,6 +249,7 @@ For **RabitQ (RQ)**:
 | --------------------- | ---- | ---------------------------------------------------- |
 | `rotate_mat_position` | u32  | Position of the rotation matrix in the global buffer |
 | `num_bits`            | u8   | Number of bits per dimension (currently always 1)    |
+| `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code   |
 | `packed`              | bool | Whether codes are packed for optimized computation   |
 
 #### Lance File Global Buffer
@@ -272,7 +273,10 @@ to rotate vectors before binary quantization:
 %%% proto.message.Tensor %%%
 ```
 
-The rotation matrix has shape `[code_dim, code_dim]` where `code_dim = dimension * num_bits`.
+The rotation matrix has shape `[code_dim, code_dim]` where `code_dim` is the rotated vector
+dimension. Current IVF_RQ stores the 1-bit binary code in `_rabit_codes`; future multi-bit support
+will store the remaining `num_bits - 1` ex-code bits separately instead of widening this binary
+code path.
 
 ## Appendices
 

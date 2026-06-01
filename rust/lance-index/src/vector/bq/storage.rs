@@ -11,7 +11,7 @@ use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt8Type, UInt64T
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
@@ -37,17 +37,47 @@ use serde::{Deserialize, Serialize};
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
-use crate::vector::bq::RQRotationType;
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
 use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
+use crate::vector::bq::{
+    RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
+    validate_supported_rq_num_bits,
+};
 use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{DistCalculator, QueryResidual, VectorStore};
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
+pub const RABIT_EX_CODE_COLUMN: &str = "_rabit_ex_codes";
 pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
+
+pub fn rabit_binary_code_field(rotated_dim: usize) -> Field {
+    Field::new(
+        RABIT_CODE_COLUMN,
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::UInt8, true)),
+            rabit_binary_code_bytes(rotated_dim) as i32,
+        ),
+        true,
+    )
+}
+
+pub fn rabit_ex_code_field(rotated_dim: usize, num_bits: u8) -> Result<Option<Field>> {
+    let ex_bits = rabit_ex_bits(num_bits)?;
+    if ex_bits == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Field::new(
+        RABIT_EX_CODE_COLUMN,
+        DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::UInt8, true)),
+            rabit_ex_code_bytes(rotated_dim, ex_bits)? as i32,
+        ),
+        true,
+    )))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RabitQuantizationMetadata {
@@ -68,6 +98,23 @@ pub struct RabitQuantizationMetadata {
     pub packed: bool,
 }
 
+impl RabitQuantizationMetadata {
+    pub fn rotated_dim(&self) -> usize {
+        if self.code_dim > 0 {
+            self.code_dim as usize
+        } else {
+            self.rotate_mat
+                .as_ref()
+                .map(|rotate_mat| rotate_mat.len())
+                .unwrap_or(0)
+        }
+    }
+
+    pub fn binary_code_bytes(&self) -> usize {
+        rabit_binary_code_bytes(self.rotated_dim())
+    }
+}
+
 fn default_rotation_type_compat() -> RQRotationType {
     // Older metadata does not have this field and always used dense matrices.
     RQRotationType::Matrix
@@ -75,14 +122,7 @@ fn default_rotation_type_compat() -> RQRotationType {
 
 impl RabitQuantizationMetadata {
     fn code_dim(&self) -> usize {
-        if self.code_dim > 0 {
-            self.code_dim as usize
-        } else {
-            self.rotate_mat
-                .as_ref()
-                .map(|rotate_mat| rotate_mat.len())
-                .unwrap_or_default()
-        }
+        self.rotated_dim()
     }
 
     fn rotate_vector_with_residual_into(
@@ -451,10 +491,7 @@ fn copy_subtract_f32(lhs: &[f32], rhs: &[f32], output: &mut [f32]) {
 
 pub struct RabitDistCalculator<'a> {
     dim: usize,
-    // num_bits is the number of bits per dimension,
-    // it's always 1 for now
-    num_bits: u8,
-    // n * d * num_bits / 8 bytes
+    // n * d / 8 binary-code bytes
     codes: &'a [u8],
     // this is a flattened 2D array of size d/4 * 16,
     // we split the query codes into d/4 chunks, each chunk is with 4 elements,
@@ -482,7 +519,6 @@ impl<'a> RabitDistCalculator<'a> {
     ) -> Self {
         Self {
             dim,
-            num_bits,
             codes,
             dist_table,
             add_factors,
@@ -582,7 +618,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
     #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
         let id = id as usize;
-        let code_len = self.dim * (self.num_bits as usize) / u8::BITS as usize;
+        let code_len = rabit_binary_code_bytes(self.dim);
         let num_vectors = self.codes.len() / code_len;
         let dist =
             compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
@@ -615,7 +651,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
     ) {
-        let code_len = self.dim * (self.num_bits as usize) / u8::BITS as usize;
+        let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
         if n == 0 {
             dists.clear();
@@ -714,7 +750,7 @@ impl VectorStore for RabitQuantizationStorage {
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
         let sum_q = rotated_qr.into_iter().sum();
 
-        self.distance_calculator_from_parts(qr.len(), dist_q_c, Cow::Owned(dist_table), sum_q)
+        self.distance_calculator_from_parts(code_dim, dist_q_c, Cow::Owned(dist_table), sum_q)
     }
 
     // qr = (q-c)
@@ -750,7 +786,7 @@ impl VectorStore for RabitQuantizationStorage {
         };
 
         self.distance_calculator_from_parts(
-            qr.len(),
+            code_dim,
             dist_q_c,
             Cow::Borrowed(&f32_scratch[code_dim..code_dim + dist_table_len]),
             sum_q,
@@ -923,8 +959,19 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         _fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        validate_supported_rq_num_bits(metadata.num_bits)?;
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+        let expected_code_bytes = metadata.binary_code_bytes();
+        if expected_code_bytes > 0 && codes.value_length() as usize != expected_code_bytes {
+            return Err(Error::invalid_input(format!(
+                "RabitQ code byte width mismatch: column {} has {} bytes, metadata rotated_dim={} requires {} bytes",
+                RABIT_CODE_COLUMN,
+                codes.value_length(),
+                metadata.rotated_dim(),
+                expected_code_bytes
+            )));
+        }
         let add_factors = batch[ADD_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
@@ -1312,6 +1359,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_rabit_split_code_fields() {
+        let bin_field = rabit_binary_code_field(128);
+        let DataType::FixedSizeList(_, bin_code_bytes) = bin_field.data_type() else {
+            panic!("binary code field should be FixedSizeList");
+        };
+        assert_eq!(*bin_code_bytes, 16);
+
+        assert!(rabit_ex_code_field(128, 1).unwrap().is_none());
+        let ex_field = rabit_ex_code_field(128, 4).unwrap().unwrap();
+        assert_eq!(ex_field.name(), RABIT_EX_CODE_COLUMN);
+        let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
+            panic!("ex-code field should be FixedSizeList");
+        };
+        assert_eq!(*ex_code_bytes, 48);
+    }
+
     fn make_test_codes(num_vectors: usize, code_dim: i32) -> FixedSizeListArray {
         let quantizer =
             RabitQuantizer::new_with_rotation::<Float32Type>(1, code_dim, RQRotationType::Fast);
@@ -1383,6 +1447,26 @@ mod tests {
         let stored_codes = stored_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
         let expected_codes = pack_codes(&original_codes);
         assert_codes_eq(stored_codes, &expected_codes);
+    }
+
+    #[test]
+    fn test_try_from_batch_rejects_unsupported_rq_num_bits() {
+        let original_codes = make_test_codes(50, 64);
+        let mut metadata = make_test_metadata(original_codes.value_length() as usize * 8);
+        metadata.num_bits = 2;
+
+        let err = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(original_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("only num_bits=1 is supported"),
+            "{}",
+            err
+        );
     }
 
     #[test]

@@ -6938,9 +6938,10 @@ def write_dataset(
           Lance-managed storage using the normal inline / packed / dedicated
           thresholds.
     allow_external_blob_outside_bases: bool, default False
-        If False, external blob URIs must map to the dataset root or a registered
-        base path. If True, external blob URIs outside registered bases are allowed.
-        This option only applies when ``external_blob_mode="reference"``.
+        If False, external blob URIs must map to a registered non-dataset-root
+        base path. If True, external blob URIs outside registered bases are
+        allowed. Only valid when ``external_blob_mode="reference"``. Setting
+        this to True with ``"ingest"`` mode raises an error.
     blob_pack_file_size_threshold: optional, int, default None
         Maximum size in bytes for blob v2 pack (.blob) sidecar files. When a pack
         file reaches this size, a new one is started. If not set, defaults to 1 GiB.
