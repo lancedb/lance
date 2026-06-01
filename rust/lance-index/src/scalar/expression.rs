@@ -22,6 +22,7 @@ use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
+use roaring::RoaringBitmap;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
