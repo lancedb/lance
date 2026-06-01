@@ -28,10 +28,13 @@ I/O.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import lance
 import pyarrow as pa
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 # --------------------------------------------------------------------------
