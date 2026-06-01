@@ -415,14 +415,14 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_select::{RowAddrMask, RowAddrTreeMap};
-    use lance_select::result::IndexExprResultWireFormat;
     use lance_datagen::gen_batch;
     use lance_index::IndexType;
     use lance_index::scalar::{
         SargableQuery, ScalarIndexParams,
         expression::{ScalarIndexExpr, ScalarIndexSearch},
     };
+    use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
 
     use super::*;
     use crate::Dataset;
