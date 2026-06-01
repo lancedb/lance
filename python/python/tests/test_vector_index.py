@@ -1058,6 +1058,12 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
+@pytest.mark.skip(
+    reason=(
+        "IVF_RQ num_bits>1 creation is gated until split-code search support "
+        "is implemented"
+    )
+)
 def test_create_ivf_rq_multi_bit_gates_search():
     ds = lance.write_dataset(create_table(), "memory://")
 

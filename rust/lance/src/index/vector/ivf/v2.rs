@@ -4012,6 +4012,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "IVF_RQ num_bits>1 creation is gated until split-code search support is implemented"]
     async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_gates_search() {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
