@@ -3107,11 +3107,9 @@ class LanceDataset(pa.dataset.Dataset):
             ``[1, num_compute_cpus]``. If unset, Lance uses ``num_compute_cpus``
             workers unless ``LANCE_FTS_NUM_SHARDS`` is set. This parameter is
             only used for the current build and is not persisted with the index.
-        base_tokenizer: str, default "icu"
+        base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:
-            * "icu": Unicode word segmentation with dictionary support for CJK and
-              other scripts.
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.

@@ -1307,9 +1307,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.62"
+version = "1.2.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1dce859f0832a7d088c4f1119888ab94ef4b5d6795d1ce05afb7fe159d79f98"
+checksum = "556e016178bb5662a08681bbe0f00f8e17631781a4dfc8c45e466e4b185ec27f"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -3144,7 +3144,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3755,9 +3755,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.10.0"
+version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb92f162bf56536459fc83c79b974bb12837acfed43d6bc370a7916d0ae15ecc"
+checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4427,7 +4427,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4529,7 +4529,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4577,7 +4577,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrayref",
  "paste",
@@ -4586,7 +4586,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4623,7 +4623,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4656,7 +4656,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4676,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4721,7 +4721,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4747,7 +4747,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4787,7 +4787,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4801,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4880,7 +4880,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4929,7 +4929,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4950,7 +4950,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4962,7 +4962,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4978,7 +4978,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5034,7 +5034,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5051,7 +5051,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5098,7 +5098,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5107,7 +5107,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5118,7 +5118,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "icu_segmenter",
  "jieba-rs",
@@ -5130,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "7.2.0-beta.1"
+version = "7.2.0-beta.2"
 dependencies = [
  "clap",
  "lance-core",
@@ -7796,15 +7796,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scc"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
-dependencies = [
- "sdd",
-]
-
-[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7883,12 +7874,6 @@ dependencies = [
  "salsa20",
  "sha2 0.10.9",
 ]
-
-[[package]]
-name = "sdd"
-version = "3.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "security-framework"
@@ -8089,24 +8074,23 @@ dependencies = [
 
 [[package]]
 name = "serial_test"
-version = "3.4.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
+checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
 dependencies = [
  "futures-executor",
  "futures-util",
  "log",
  "once_cell",
  "parking_lot",
- "scc",
  "serial_test_derive",
 ]
 
 [[package]]
 name = "serial_test_derive"
-version = "3.4.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a7d91949b85b0d2fb687445e448b40d322b6b3e4af6b44a29b21d9a5f33e6d9"
+checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8178,9 +8162,9 @@ dependencies = [
 
 [[package]]
 name = "shlex"
-version = "1.3.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "signal-hook-registry"
@@ -8256,18 +8240,18 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "snafu"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1d4bced6a69f90b2056c03dcff2c4737f98d6fb9e0853493996e1d253ca29c6"
+checksum = "d1a012328be2e3f5d5f6f3218147ca02588cea4cb865e876849ab6debcf36522"
 dependencies = [
  "snafu-derive",
 ]
 
 [[package]]
 name = "snafu-derive"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54254b8531cafa275c5e096f62d48c81435d1015405a91198ddb11e967301d40"
+checksum = "5f103c50866b8743da9429b8a581d81a27c2d3a9c4ac7df8f8571c1dd7896eda"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -8637,9 +8621,9 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-log"
-version = "0.2.20"
+version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f46bf474f0a4afebf92f076d54fd5e63423d9438b8c278a3d2ccb0f47f7cdb3"
+checksum = "9b9c218384242b5c89b68303ab6f6fc53a312d923f0c14dc6bb860c6aeee40f1"
 dependencies = [
  "env_logger",
  "test-log-macros",
@@ -8648,9 +8632,9 @@ dependencies = [
 
 [[package]]
 name = "test-log-core"
-version = "0.2.20"
+version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37d4d41320b48bc4a211a9021678fcc0c99569b594ea31c93735b8e517102b4c"
+checksum = "c26ef8b00e4d382e59f6a8ddb3cd790b3a5bb29f21a358a9a69ea2f29f13f27b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8659,9 +8643,9 @@ dependencies = [
 
 [[package]]
 name = "test-log-macros"
-version = "0.2.20"
+version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9beb9249a81e430dffd42400a49019bcf548444f1968ff23080a625de0d4d320"
+checksum = "944ad38adcbb71eaa682c56bceeb079e4ca82b4b3edc2a0fde5cb297b77dac8d"
 dependencies = [
  "syn 2.0.117",
  "test-log-core",
@@ -9163,9 +9147,9 @@ dependencies = [
 
 [[package]]
 name = "typenum"
-version = "1.20.0"
+version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "typewit"
@@ -9362,9 +9346,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.23.1"
+version = "1.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
+checksum = "d258b83ceec21034727ecee8c382cfa6c3e133699b0742c64571814fb420c9f7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -10314,18 +10298,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.49"
+version = "0.8.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bce33a6288fa3f072a8c2c7d0f2fdbb90e28298f0135c1f99b96c3db2efcc60b"
+checksum = "3b065d4f0e55f82fae73202e189638116a87c55ab6b8e6c2721e13dd9d854ad1"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.49"
+version = "0.8.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd425244944f4ab65ccff928e7323354c5a018c75838362fdce749dfad2ee1e"
+checksum = "0b631b19d36a892ab55420c92dbc83ccd79274f25be714855d3074aa71cab639"
 dependencies = [
  "proc-macro2",
  "quote",
