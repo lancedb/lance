@@ -107,6 +107,14 @@ impl ScalarIndexExec {
         }
     }
 
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn expr(&self) -> &ScalarIndexExpr {
+        &self.expr
+    }
+
     #[async_recursion]
     async fn fragments_covered_by_index_query(
         index_expr: &ScalarIndexExpr,
