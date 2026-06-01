@@ -60,15 +60,13 @@ def _make_dataset(tmp_path: Path) -> lance.LanceDataset:
 def _filtered_count_plan(dataset: lance.LanceDataset, filter: str) -> str:
     """Return the ``analyze_plan(count_rows=True)`` output for a filtered
     ``COUNT(*)`` — the same plan ``count_rows(filter=…)`` actually executes."""
-    return dataset.scanner(
-        columns=[], with_row_id=True, filter=filter
-    ).analyze_plan(count_rows=True)
+    return dataset.scanner(columns=[], with_row_id=True, filter=filter).analyze_plan(
+        count_rows=True
+    )
 
 
 def _assert_pushdown_fired(plan: str) -> None:
-    assert "CountFromMask" in plan, (
-        f"expected CountFromMaskExec in plan, got:\n{plan}"
-    )
+    assert "CountFromMask" in plan, f"expected CountFromMaskExec in plan, got:\n{plan}"
 
 
 def _assert_no_column_scan(plan: str) -> None:
