@@ -37,6 +37,7 @@ mod collector;
 mod data_source;
 pub mod exec;
 mod flushed_cache;
+mod fts_search;
 mod planner;
 mod point_lookup;
 mod projection;
@@ -48,6 +49,7 @@ pub use collector::{
 };
 pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
 pub use flushed_cache::FlushedMemTableCache;
+pub use fts_search::{LsmFtsSearchPlanner, SCORE_COLUMN};
 pub use point_lookup::LsmPointLookupPlanner;
 pub use projection::DISTANCE_COLUMN;
 pub use vector_search::LsmVectorSearchPlanner;

@@ -1303,6 +1303,23 @@ mod tests {
     }
 
     #[test]
+    fn test_view_types_stored_as_lance_base_types() {
+        let field = Field::try_from(&ArrowField::new("s", DataType::Utf8View, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Utf8);
+        assert_eq!(
+            LogicalType::try_from(&DataType::Utf8View).unwrap().0,
+            "string"
+        );
+
+        let field = Field::try_from(&ArrowField::new("b", DataType::BinaryView, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Binary);
+        assert_eq!(
+            LogicalType::try_from(&DataType::BinaryView).unwrap().0,
+            "binary"
+        );
+    }
+
+    #[test]
     fn test_nested_types() {
         assert_eq!(
             LogicalType::try_from(&DataType::List(Arc::new(ArrowField::new(

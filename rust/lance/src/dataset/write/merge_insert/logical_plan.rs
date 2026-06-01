@@ -102,6 +102,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             crate::dataset::WhenMatched::DoNothing => "DoNothing",
             crate::dataset::WhenMatched::UpdateAll => "UpdateAll",
             crate::dataset::WhenMatched::UpdateIf(_) => "UpdateIf",
+            crate::dataset::WhenMatched::UpdateIfExpr(_) => "UpdateIfExpr",
             crate::dataset::WhenMatched::Fail => "Fail",
             crate::dataset::WhenMatched::Delete => "Delete",
         };

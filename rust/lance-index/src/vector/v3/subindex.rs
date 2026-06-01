@@ -11,7 +11,7 @@ use lance_core::{Error, Result};
 
 use crate::metrics::MetricsCollector;
 use crate::vector::graph::OrderedNode;
-use crate::vector::storage::VectorStore;
+use crate::vector::storage::{QueryResidual, QueryScratch, VectorStore};
 use crate::vector::{flat, hnsw};
 use crate::{prefilter::PreFilter, vector::Query};
 /// A sub index for IVF index
@@ -47,6 +47,22 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
 
+    /// Search the sub-index, reusing scratch buffers owned by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_scratch(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        _residual: Option<QueryResidual<'_>>,
+        _scratch: &mut QueryScratch,
+    ) -> Result<RecordBatch> {
+        self.search(query, k, params, storage, prefilter, metrics)
+    }
+
     /// Return true if this sub-index can accumulate candidates into a caller-owned heap.
     fn supports_global_topk_heap() -> bool {
         false
@@ -78,9 +94,8 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
         heap: &mut BinaryHeap<OrderedNode<u64>>,
-        _distance_scratch: &mut Vec<f32>,
-        _u16_scratch: &mut Vec<u16>,
-        _u8_scratch: &mut Vec<u8>,
+        _residual: Option<QueryResidual<'_>>,
+        _scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         self.accumulate_topk(query, k, params, storage, prefilter, heap, metrics)

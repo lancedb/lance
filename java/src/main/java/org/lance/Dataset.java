@@ -40,6 +40,8 @@ import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceSchema;
 import org.lance.schema.SqlExpressions;
+import org.lance.update.UpdateParams;
+import org.lance.update.UpdateResult;
 import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -2026,6 +2028,44 @@ public class Dataset implements Closeable {
 
   private native MergeInsertResult nativeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Update column values for rows matching an optional predicate.
+   *
+   * <p>This is similar to SQL's {@code UPDATE} statement: the entries of {@link
+   * UpdateParams#updates()} map target column names to SQL expressions evaluated for every row that
+   * satisfies {@link UpdateParams#whereClause()}. If no predicate is provided, every row is
+   * updated.
+   *
+   * <p>The predicate may reference dataset columns as well as the system columns {@code _rowid},
+   * {@code _rowaddr}, and {@code _rowoffset}, allowing rows to be targeted by stable row id (e.g.
+   * {@code "_rowid IN (1, 2, 3)"}).
+   *
+   * <p>This call does not mutate the current {@code Dataset} instance: it still references the
+   * pre-update version. Callers should close this {@code Dataset} and switch to {@link
+   * UpdateResult#getDataset()}, which holds the newly committed version.
+   *
+   * @param params update parameters
+   * @return UpdateResult containing the new committed Dataset and the number of rows updated.
+   */
+  public UpdateResult update(UpdateParams params) {
+    Preconditions.checkNotNull(params, "params must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      UpdateResult result = nativeUpdate(params);
+
+      Dataset newDataset = result.getDataset();
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+
+      return result;
+    }
+  }
+
+  private native UpdateResult nativeUpdate(UpdateParams params);
 
   /**
    * Initialize MemWAL on this dataset.

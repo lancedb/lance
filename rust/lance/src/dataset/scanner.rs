@@ -5706,6 +5706,56 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_limit_with_scalar_index_and_refine_filter() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("topic", DataType::Int32, false),
+            ArrowField::new("is_night", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(1, 20))),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..20).map(|i| if i < 10 { 0 } else { 1 }),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["topic"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let actual = dataset
+            .scan()
+            .filter("topic = 1 AND is_night = 1")
+            .unwrap()
+            .limit(Some(10), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(actual.num_rows(), 10);
+        let ids = actual
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values();
+        assert_eq!(ids, &(10..20).collect::<Vec<_>>());
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_limit_cancel() {
         // If there is a filter and a limit and we can't use the index to satisfy

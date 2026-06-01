@@ -556,12 +556,21 @@ impl DatasetMemWalExt for Dataset {
         // Load index configs for each maintained index
         let mut index_configs = Vec::new();
         for index_name in maintained_indexes {
-            let index_meta = self.load_index_by_name(index_name).await?.ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "Index '{}' from maintained_indexes not found on dataset",
-                    index_name
-                ))
-            })?;
+            // A maintained index can split into multiple physical segments
+            // (e.g. `optimize_indices(append)` deltas), which the singular
+            // `load_index_by_name` rejects. Every segment carries the same
+            // type and params, so take the first match.
+            let index_meta = self
+                .load_indices_by_name(index_name)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Index '{}' from maintained_indexes not found on dataset",
+                        index_name
+                    ))
+                })?;
 
             // Detect index type and create appropriate config
             let type_url = index_meta

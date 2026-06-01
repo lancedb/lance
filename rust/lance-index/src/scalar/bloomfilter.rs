@@ -20,6 +20,7 @@ use arrow_array::{Array, UInt64Array};
 mod as_bytes;
 pub mod sbbf;
 use arrow_schema::{DataType, Field};
+use lance_arrow_stats::StatisticsAccumulator;
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;
@@ -647,7 +648,7 @@ impl BloomFilterIndexBuilder {
 struct BloomFilterProcessor {
     params: BloomFilterIndexBuilderParams,
     sbbf: Option<Sbbf>,
-    cur_zone_has_null: bool,
+    statistics: Option<StatisticsAccumulator>,
 }
 
 impl BloomFilterProcessor {
@@ -655,7 +656,7 @@ impl BloomFilterProcessor {
         let mut processor = Self {
             params,
             sbbf: None,
-            cur_zone_has_null: false,
+            statistics: None,
         };
         processor.reset()?;
         Ok(processor)
@@ -743,6 +744,11 @@ impl ZoneProcessor for BloomFilterProcessor {
         let sbbf = self.sbbf.as_mut().ok_or_else(|| {
             Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
+
+        let statistics = self
+            .statistics
+            .get_or_insert_with(|| StatisticsAccumulator::new(array.data_type()));
+        statistics.update(array)?;
 
         let has_null = match array.data_type() {
             // Signed integers
@@ -946,7 +952,7 @@ impl ZoneProcessor for BloomFilterProcessor {
         };
 
         // Update the current zone's null tracking
-        self.cur_zone_has_null = self.cur_zone_has_null || has_null;
+        debug_assert_eq!(has_null, array.null_count() > 0);
         Ok(())
     }
 
@@ -954,16 +960,21 @@ impl ZoneProcessor for BloomFilterProcessor {
         let bloom_filter = self.sbbf.as_ref().ok_or_else(|| {
             Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
+        let has_null = self
+            .statistics
+            .as_ref()
+            .map(|statistics| statistics.statistics().null_count > 0)
+            .unwrap_or(false);
         Ok(BloomFilterStatistics {
             bound,
-            has_null: self.cur_zone_has_null,
+            has_null,
             bloom_filter: bloom_filter.clone(),
         })
     }
 
     fn reset(&mut self) -> Result<()> {
         self.sbbf = Some(Self::build_filter(&self.params)?);
-        self.cur_zone_has_null = false;
+        self.statistics = None;
         Ok(())
     }
 }
