@@ -76,7 +76,7 @@ struct RankBitVec {
 impl RankBitVec {
     fn new(len: usize) -> Self {
         Self {
-            words: vec![0u64; (len + 63) / 64],
+            words: vec![0u64; len.div_ceil(64)],
             superblocks: Vec::new(),
             len,
         }
@@ -93,7 +93,7 @@ impl RankBitVec {
     }
 
     fn build_rank_index(&mut self) {
-        let num_sb = (self.words.len() + WORDS_PER_SUPERBLOCK - 1) / WORDS_PER_SUPERBLOCK + 1;
+        let num_sb = self.words.len().div_ceil(WORDS_PER_SUPERBLOCK) + 1;
         self.superblocks = Vec::with_capacity(num_sb);
         let mut cum = 0u32;
         for (i, chunk) in self.words.chunks(WORDS_PER_SUPERBLOCK).enumerate() {
@@ -159,10 +159,7 @@ struct HuffmanWaveletTree {
 #[derive(Debug)]
 enum HuffNode {
     Leaf(u8),
-    Internal {
-        left: Box<HuffNode>,
-        right: Box<HuffNode>,
-    },
+    Internal { left: Box<Self>, right: Box<Self> },
 }
 
 impl PartialEq for HuffNode {
@@ -475,8 +472,8 @@ impl LazyRankBitVec {
         let block = self.ensure_block(bi);
         let wi = local / 64;
         let bit = local % 64;
-        for i in 0..wi {
-            count += block[i].count_ones() as usize;
+        for w in &block[..wi] {
+            count += w.count_ones() as usize;
         }
         if bit > 0 {
             count += (block[wi] & ((1u64 << bit) - 1)).count_ones() as usize;
@@ -703,7 +700,8 @@ impl FMIndex {
         let mut steps = 0;
         let n = self.wavelet.len;
         loop {
-            if pos % SA_SAMPLE_RATE == 0 && (pos / SA_SAMPLE_RATE) < self.sa_samples.len() {
+            if pos.is_multiple_of(SA_SAMPLE_RATE) && (pos / SA_SAMPLE_RATE) < self.sa_samples.len()
+            {
                 return (self.sa_samples[pos / SA_SAMPLE_RATE] as usize + steps) % n;
             }
             let c = self.wavelet.access(pos);
@@ -939,7 +937,7 @@ impl LazyFMIndex {
     #[inline]
     fn locate(&self, mut pos: usize) -> usize {
         let mut steps = 0;
-        while pos % SA_SAMPLE_RATE != 0 {
+        while !pos.is_multiple_of(SA_SAMPLE_RATE) {
             let c = self.wavelet.access(pos);
             pos = self.c_table[c as usize] + self.wavelet.rank(c, pos);
             steps += 1;
@@ -973,6 +971,7 @@ impl LazyFMIndex {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn from_reader(
         reader: Arc<dyn crate::scalar::IndexReader>,
         num_bwt_nodes: usize,
@@ -1169,7 +1168,7 @@ impl FMIndexScalarIndex {
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
             .collect();
 
-        let fm = LazyFMIndex::from_reader(
+        let fm = Box::pin(LazyFMIndex::from_reader(
             reader,
             num_bwt_nodes,
             huffman_codes,
@@ -1181,7 +1180,7 @@ impl FMIndexScalarIndex {
             sa_samples_len,
             row_ids,
             doc_start_positions,
-        )
+        ))
         .await?;
         Ok(FMIndexPartition { id: pid, fm })
     }
