@@ -248,8 +248,7 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     //    branch, prefilter feeds in directly.
     // 3. Prefilter + index covers a strict subset: split into pushdown over
     //    indexed fragments + parallel scan over unindexed fragments.
-    let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage
-    {
+    let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage {
         None => {
             // No prefilter at all (verified above): nothing to restrict.
             let exec = CountFromMaskExec::try_new_restricted(
@@ -388,38 +387,37 @@ fn strip_row_preserving_wrappers(plan: &Arc<dyn ExecutionPlan>) -> Option<&Filte
         if let Some(filtered_read) = current.as_any().downcast_ref::<FilteredReadExec>() {
             return Some(filtered_read);
         }
-        let next: &Arc<dyn ExecutionPlan> = if let Some(inner) =
-            current.as_any().downcast_ref::<RepartitionExec>()
-        {
-            inner.input()
-        } else if let Some(inner) = {
-            #[allow(deprecated)]
-            current.as_any().downcast_ref::<CoalesceBatchesExec>()
-        } {
-            inner.input()
-        } else if let Some(inner) = current.as_any().downcast_ref::<CoalescePartitionsExec>() {
-            inner.input()
-        } else if let Some(proj) = current.as_any().downcast_ref::<ProjectionExec>() {
-            // Only walk through projections that are row-preserving: every
-            // output expression is a direct column reference back to the
-            // input. (Empty projections trivially qualify — DataFusion uses
-            // one when a `COUNT(*)`'s argument no longer needs any actual
-            // columns.)
-            let input_schema = proj.input().schema();
-            let identity = proj.expr().iter().all(|projection_expr| {
-                projection_expr
-                    .expr
-                    .as_any()
-                    .downcast_ref::<Column>()
-                    .is_some_and(|c| c.name() == input_schema.field(c.index()).name())
-            });
-            if !identity {
+        let next: &Arc<dyn ExecutionPlan> =
+            if let Some(inner) = current.as_any().downcast_ref::<RepartitionExec>() {
+                inner.input()
+            } else if let Some(inner) = {
+                #[allow(deprecated)]
+                current.as_any().downcast_ref::<CoalesceBatchesExec>()
+            } {
+                inner.input()
+            } else if let Some(inner) = current.as_any().downcast_ref::<CoalescePartitionsExec>() {
+                inner.input()
+            } else if let Some(proj) = current.as_any().downcast_ref::<ProjectionExec>() {
+                // Only walk through projections that are row-preserving: every
+                // output expression is a direct column reference back to the
+                // input. (Empty projections trivially qualify — DataFusion uses
+                // one when a `COUNT(*)`'s argument no longer needs any actual
+                // columns.)
+                let input_schema = proj.input().schema();
+                let identity = proj.expr().iter().all(|projection_expr| {
+                    projection_expr
+                        .expr
+                        .as_any()
+                        .downcast_ref::<Column>()
+                        .is_some_and(|c| c.name() == input_schema.field(c.index()).name())
+                });
+                if !identity {
+                    return None;
+                }
+                proj.input()
+            } else {
                 return None;
-            }
-            proj.input()
-        } else {
-            return None;
-        };
+            };
         current = next.as_ref();
     }
 }
