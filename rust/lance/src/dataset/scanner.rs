@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use datafusion::config::ConfigOptions;
+use lance_select::result::IndexExprResultWireFormat;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -65,10 +66,8 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
-use lance_index::scalar::expression::{
-    INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt, serialize_index_expr_result,
-};
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
@@ -77,7 +76,7 @@ use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use tracing::{Span, info_span, instrument};
@@ -106,7 +105,10 @@ use crate::io::exec::{
     },
     project,
 };
-use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
+use crate::io::exec::{
+    AddRowOffsetExec, LANCE_RELATIONAL_ALGEBRA_VERSION, LanceFilterExec, LanceScanConfig,
+    get_physical_optimizer,
+};
 use crate::{Error, Result};
 use crate::{
     datatypes::Schema,
@@ -824,6 +826,9 @@ pub struct Scanner {
 
     aggregate: Option<Aggregate>,
 
+    /// Which version of the relational algebra to use when generating the physical plan
+    relational_algebra_version: u32,
+
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
     // There are two behaviors we are moving away from:
@@ -1047,6 +1052,7 @@ impl Scanner {
             legacy_with_row_id: false,
             explicit_projection: false,
             autoproject_scoring_columns: true,
+            relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
         };
         scanner.apply_blob_handling();
         scanner
@@ -2795,6 +2801,15 @@ impl Scanner {
         })
     }
 
+    fn index_expr_result_format(&self) -> IndexExprResultWireFormat {
+        if self.relational_algebra_version > 1 {
+            IndexExprResultWireFormat::TwoMask
+        } else {
+            // In version 1 we used the legacy three-variant format for index expr results
+            IndexExprResultWireFormat::ThreeVariant
+        }
+    }
+
     // Helper function for filtered_read
     //
     // Do not call this directly, use filtered_read instead
@@ -2842,9 +2857,13 @@ impl Scanner {
             read_options = read_options.with_only_indexed_fragments();
         }
 
+        let result_format = self.index_expr_result_format();
         let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(self.dataset.clone(), index_query))
-                as Arc<dyn ExecutionPlan>
+            Arc::new(ScalarIndexExec::new(
+                self.dataset.clone(),
+                index_query,
+                result_format,
+            )) as Arc<dyn ExecutionPlan>
         });
 
         Ok(Arc::new(FilteredReadExec::try_new(
@@ -2899,14 +2918,13 @@ impl Scanner {
     fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
         let row_addrs = RowAddrTreeMap::from_iter(u64s);
         let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
-        let index_result = IndexExprResult::Exact(row_addr_mask);
+        let index_result = IndexExprResult::exact(row_addr_mask);
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
-        let batch = serialize_index_expr_result(&index_result, &fragments_covered)?;
+        let format = self.index_expr_result_format();
+        let batch = index_result.serialize(&fragments_covered, format)?;
+        let schema = batch.schema();
         let stream = futures::stream::once(async move { Ok(batch) });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
-            INDEX_EXPR_RESULT_SCHEMA.clone(),
-            stream,
-        ));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
         Ok(Arc::new(OneShotExec::new(stream)))
     }
 
@@ -4728,13 +4746,14 @@ impl Scanner {
 
             if missing_frags.is_empty() || self.fast_search {
                 log::trace!("prefilter entirely satisfied by exact index search");
+                let result_format = self.index_expr_result_format();
                 // We can only avoid materializing the index for a prefilter if:
                 // 1. The search is indexed
                 // 2. The index search is an exact search with no recheck or refine
                 // 3. The indices cover at least the same fragments as the vector index,
                 //    unless fast_search allows skipping uncovered fragments.
                 return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
-                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone()),
+                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone(), result_format),
                 )));
             } else {
                 log::trace!("exact index search did not cover all fragments");
@@ -5704,6 +5723,56 @@ mod test {
         assert_eq!(actual.num_rows(), 2);
         assert_eq!(actual, full_data);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_limit_with_scalar_index_and_refine_filter() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("topic", DataType::Int32, false),
+            ArrowField::new("is_night", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(1, 20))),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..20).map(|i| if i < 10 { 0 } else { 1 }),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["topic"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let actual = dataset
+            .scan()
+            .filter("topic = 1 AND is_night = 1")
+            .unwrap()
+            .limit(Some(10), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(actual.num_rows(), 10);
+        let ids = actual
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values();
+        assert_eq!(ids, &(10..20).collect::<Vec<_>>());
     }
 
     #[test_log::test(tokio::test)]

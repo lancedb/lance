@@ -10,7 +10,7 @@ use arrow::datatypes::DataType;
 use arrow_array::new_empty_array;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
 use lance_linalg::distance::DistanceType;
@@ -261,6 +261,44 @@ fn infer_vector_element_type_impl(
     }
 }
 
+async fn count_rows(dataset: &Dataset, fragment_ids: Option<&[u32]>) -> Result<usize> {
+    match fragment_ids {
+        None => dataset.count_rows(None).await,
+        Some(fragment_ids) => {
+            let sorted_ids: Vec<u32>;
+            let sorted_fragment_ids = if fragment_ids.windows(2).all(|w| w[0] <= w[1]) {
+                fragment_ids
+            } else {
+                sorted_ids = {
+                    let mut v = fragment_ids.to_vec();
+                    v.sort_unstable();
+                    v
+                };
+                &sorted_ids
+            };
+            let fragments = dataset.get_frags_from_ordered_ids(sorted_fragment_ids);
+            let valid_fragments = fragments
+                .into_iter()
+                .enumerate()
+                .map(|(i, frag)| {
+                    frag.ok_or_else(|| {
+                        Error::index(format!(
+                            "Unexpectedly missing fragment {}",
+                            sorted_fragment_ids[i]
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let cnts = stream::iter(valid_fragments)
+                .map(|f| async move { f.count_rows(None).await })
+                .buffer_unordered(16)
+                .try_collect::<Vec<usize>>()
+                .await?;
+            Ok(cnts.iter().sum::<usize>())
+        }
+    }
+}
+
 /// Maybe sample training data from dataset, specified by column name.
 ///
 /// Returns a [FixedSizeListArray], containing the training dataset.
@@ -271,13 +309,7 @@ pub async fn maybe_sample_training_data(
     sample_size_hint: usize,
     fragment_ids: Option<&[u32]>,
 ) -> Result<FixedSizeListArray> {
-    let num_rows = if let Some(fragment_ids) = fragment_ids {
-        let mut scanner = dataset.scan();
-        scanner.with_fragments(resolve_scan_fragments(dataset, fragment_ids)?);
-        scanner.count_rows().await? as usize
-    } else {
-        dataset.count_rows(None).await?
-    };
+    let num_rows = count_rows(dataset, fragment_ids).await?;
 
     let vector_field = dataset.schema().field(column).ok_or(Error::index(format!(
         "Sample training data: column {} does not exist in schema",
@@ -1223,5 +1255,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1030);
+    }
+
+    // Creates a dataset with three fragments holding 100, 200, and 150 rows.
+    async fn make_three_fragment_dataset() -> Dataset {
+        use arrow_array::{RecordBatch, RecordBatchIterator};
+        use arrow_schema::Schema as ArrowSchema;
+
+        let schema = Arc::new(ArrowSchema::new(vec![arrow_schema::Field::new(
+            "x",
+            arrow_schema::DataType::Float32,
+            false,
+        )]));
+
+        let make_batch = |n: usize| -> RecordBatch {
+            let arr: ArrayRef = Arc::new(Float32Array::from_iter_values((0..n).map(|i| i as f32)));
+            RecordBatch::try_new(schema.clone(), vec![arr]).unwrap()
+        };
+
+        let mut dataset = InsertBuilder::new("memory://test_count_rows_util")
+            .execute(vec![make_batch(100)])
+            .await
+            .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(make_batch(200))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(make_batch(150))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_count_rows_none() {
+        let dataset = make_three_fragment_dataset().await;
+        assert_eq!(dataset.get_fragments().len(), 3);
+        assert_eq!(count_rows(&dataset, None).await.unwrap(), 450);
+    }
+
+    #[tokio::test]
+    async fn test_count_rows_sorted_fragment_ids() {
+        let dataset = make_three_fragment_dataset().await;
+        let ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        // Skip the middle fragment (200 rows); expect 100 + 150 = 250.
+        let result = count_rows(&dataset, Some(&[ids[0], ids[2]])).await.unwrap();
+        assert_eq!(result, 250);
+    }
+
+    #[tokio::test]
+    async fn test_count_rows_unsorted_fragment_ids() {
+        let dataset = make_three_fragment_dataset().await;
+        let ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        // Pass the same two fragments in reverse (unsorted) order; result must match.
+        let result = count_rows(&dataset, Some(&[ids[2], ids[0]])).await.unwrap();
+        assert_eq!(result, 250);
     }
 }

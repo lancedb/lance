@@ -21,8 +21,10 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+mod failing_store;
 mod throttle_store;
 
+pub use failing_store::FailingProxyStore;
 pub use throttle_store::ThrottledStoreWrapper;
 
 /// A dataset generator that can generate random layouts. This is used to test

@@ -1009,6 +1009,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
+        index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
         full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
@@ -1135,6 +1136,11 @@ class LanceDataset(pa.dataset.Dataset):
         fragments: iterable of LanceFragment, default None
             If specified, only scan these fragments. If scan_in_order is True, then
             the fragments will be scanned in the order given.
+        index_segments: iterable of str or uuid.UUID, default None
+            If specified, restrict vector index search to these index segment UUIDs.
+            Only supported for vector search. If fragments is also specified, rows
+            from those fragments not covered by the selected index segments will be
+            searched with flat KNN.
         prefilter: bool, default False
             If True then the filter will be applied before the vector query is run.
             This will generate more correct results but it may be a more costly
@@ -1263,6 +1269,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.fragment_readahead, fragment_readahead)
         setopt(builder.scan_in_order, scan_in_order)
         setopt(builder.with_fragments, fragments)
+        setopt(builder.with_index_segments, index_segments)
         setopt(builder.late_materialization, late_materialization)
         setopt(builder.blob_handling, blob_handling)
         setopt(builder.with_row_id, with_row_id)
@@ -3294,6 +3301,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        streaming_sample_rate: Optional[int] = None,
+        streaming_coreset_rate: Optional[int] = None,
+        streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         require_commit: bool = True,
         **kwargs,
@@ -3505,6 +3515,12 @@ class LanceDataset(pa.dataset.Dataset):
                 kwargs["num_partitions"] = num_partitions
             if target_partition_size is not None:
                 kwargs["target_partition_size"] = target_partition_size
+            if streaming_sample_rate is not None:
+                kwargs["streaming_sample_rate"] = streaming_sample_rate
+            if streaming_coreset_rate is not None:
+                kwargs["streaming_coreset_rate"] = streaming_coreset_rate
+            if streaming_refine_passes is not None:
+                kwargs["streaming_refine_passes"] = streaming_refine_passes
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -3666,6 +3682,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        streaming_sample_rate: Optional[int] = None,
+        streaming_coreset_rate: Optional[int] = None,
+        streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
@@ -3754,6 +3773,19 @@ class LanceDataset(pa.dataset.Dataset):
             The target partition size. If set, the number of partitions will be computed
             based on the target partition size.
             Otherwise, the target partition size will be set by index type.
+        streaming_sample_rate : int, optional
+            If set below ``sample_rate``, IVF kmeans trains incrementally and samples
+            at most ``num_partitions * streaming_sample_rate`` vectors per step. For
+            ``num_partitions > 256``, chunks are compressed into a weighted coreset
+            and final centroids are trained with weighted hierarchical kmeans.
+        streaming_coreset_rate : int, optional
+            If set, controls the final weighted coreset budget independently from
+            ``streaming_sample_rate``. The budget is
+            ``num_partitions * streaming_coreset_rate``.
+        streaming_refine_passes : int, optional
+            Number of extra streaming Lloyd refinement passes to run after streaming
+            coreset training. Each pass loads at most
+            ``num_partitions * streaming_sample_rate`` raw vectors at a time.
         kwargs :
             Parameters passed to the index building process.
 
@@ -3875,6 +3907,9 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_ids=fragment_ids,
             index_uuid=index_uuid,
             target_partition_size=target_partition_size,
+            streaming_sample_rate=streaming_sample_rate,
+            streaming_coreset_rate=streaming_coreset_rate,
+            streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             require_commit=True,
             **kwargs,
@@ -3909,6 +3944,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        streaming_sample_rate: Optional[int] = None,
+        streaming_coreset_rate: Optional[int] = None,
+        streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         **kwargs,
     ) -> Index:
@@ -3964,6 +4002,9 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_ids=fragment_ids,
             index_uuid=index_uuid,
             target_partition_size=target_partition_size,
+            streaming_sample_rate=streaming_sample_rate,
+            streaming_coreset_rate=streaming_coreset_rate,
+            streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             require_commit=False,
             **kwargs,
@@ -5700,6 +5741,7 @@ class ScannerBuilder:
         self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
         self._fragments = None
+        self._index_segments = None
         self._with_row_id = False
         self._with_row_address = False
         self._use_stats = True
@@ -5984,6 +6026,24 @@ class ScannerBuilder:
         self._fragments = fragments
         return self
 
+    def with_index_segments(
+        self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
+    ) -> ScannerBuilder:
+        if index_segments is not None:
+            segment_ids = []
+            for segment_id in index_segments:
+                if isinstance(segment_id, (str, uuid.UUID)):
+                    segment_ids.append(str(segment_id))
+                else:
+                    raise TypeError(
+                        "index_segments must be an iterable of str or uuid.UUID. "
+                        f"Got {type(segment_id)} instead."
+                    )
+            index_segments = segment_ids
+
+        self._index_segments = index_segments
+        return self
+
     def nearest(
         self,
         column: str,
@@ -6161,6 +6221,7 @@ class ScannerBuilder:
             self._fragment_readahead,
             self._scan_in_order,
             self._fragments,
+            self._index_segments,
             self._with_row_id,
             self._with_row_address,
             self._use_stats,
@@ -6911,9 +6972,10 @@ def write_dataset(
           Lance-managed storage using the normal inline / packed / dedicated
           thresholds.
     allow_external_blob_outside_bases: bool, default False
-        If False, external blob URIs must map to the dataset root or a registered
-        base path. If True, external blob URIs outside registered bases are allowed.
-        This option only applies when ``external_blob_mode="reference"``.
+        If False, external blob URIs must map to a registered non-dataset-root
+        base path. If True, external blob URIs outside registered bases are
+        allowed. Only valid when ``external_blob_mode="reference"``. Setting
+        this to True with ``"ingest"`` mode raises an error.
     blob_pack_file_size_threshold: optional, int, default None
         Maximum size in bytes for blob v2 pack (.blob) sidecar files. When a pack
         file reaches this size, a new one is started. If not set, defaults to 1 GiB.

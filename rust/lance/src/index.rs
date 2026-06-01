@@ -664,7 +664,6 @@ impl IndexDescriptionImpl {
         }
 
         let details = IndexDetails(index_details.clone());
-        let mut rows_indexed = 0;
 
         let index_type = if details.is_vector() {
             derive_vector_index_type(index_details)
@@ -682,18 +681,42 @@ impl IndexDescriptionImpl {
                 .unwrap_or_else(|_| "Unknown".to_string())
         };
 
+        let mut fragment_rows = HashMap::with_capacity(dataset.manifest.fragments.len());
+        for fragment in dataset.iter_fragments() {
+            fragment_rows.insert(
+                fragment.id as u32,
+                fragment_logical_rows_from_metadata(fragment)?,
+            );
+        }
+        let mut rows_indexed = 0;
+        let mut indexed_fragment_refs = 0u64;
+        let mut missing_fragment_refs = 0u64;
+
         for shard in &segments {
             let fragment_bitmap = shard
             .fragment_bitmap
             .as_ref()
             .ok_or_else(|| Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()))?;
 
-            for fragment in dataset.get_fragments() {
-                if fragment_bitmap.contains(fragment.id() as u32) {
-                    rows_indexed += fragment.fast_logical_rows()? as u64;
+            indexed_fragment_refs += fragment_bitmap.len();
+            for fragment_id in fragment_bitmap.iter() {
+                if let Some(fragment_rows) = fragment_rows.get(&fragment_id) {
+                    rows_indexed += *fragment_rows;
+                } else {
+                    missing_fragment_refs += 1;
                 }
             }
         }
+        tracing::debug!(
+            index_name = name.as_str(),
+            index_type = index_type.as_str(),
+            segment_count = segments.len(),
+            dataset_fragment_count = fragment_rows.len(),
+            indexed_fragment_refs,
+            missing_fragment_refs,
+            rows_indexed,
+            "described index row coverage from fragment metadata"
+        );
 
         Ok(Self {
             name,
@@ -704,6 +727,15 @@ impl IndexDescriptionImpl {
             rows_indexed,
         })
     }
+}
+
+fn fragment_logical_rows_from_metadata(fragment: &Fragment) -> Result<u64> {
+    fragment.num_rows().map(|rows| rows as u64).ok_or_else(|| {
+        Error::internal(format!(
+            "Index description requires physical row count and deletion count in fragment metadata. To add this, make a write to this dataset using this library version. Fragment id: {}",
+            fragment.id
+        ))
+    })
 }
 
 impl IndexDescription for IndexDescriptionImpl {
@@ -6884,11 +6916,144 @@ mod tests {
 
         let desc = &descriptions[0];
         assert_eq!(desc.name(), "test_idx");
+        assert_eq!(desc.rows_indexed(), 4);
 
         // Verify total_size_bytes is available
         let total_size = desc.total_size_bytes();
         assert!(total_size.is_some(), "total_size_bytes should be Some");
         assert!(total_size.unwrap() > 0, "Total size should be positive");
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_rows_indexed_multi_fragment() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("values", array::rand_utf8(ByteCount::from(8), false))
+            .into_reader_rows(RowCount::from(10), BatchCount::from(3));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 3);
+
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("multi_frag_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].name(), "multi_frag_idx");
+        assert_eq!(
+            descriptions[0].rows_indexed(),
+            30,
+            "rows_indexed should sum logical rows across all indexed fragments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_rows_indexed_with_deletions() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("values", array::rand_utf8(ByteCount::from(8), false))
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset.delete("id >= 15").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 15);
+
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("deleted_rows_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].name(), "deleted_rows_idx");
+        assert_eq!(
+            descriptions[0].rows_indexed(),
+            15,
+            "rows_indexed should use logical rows (physical_rows - num_deleted_rows)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_rows_indexed_stale_bitmap_fragment() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(10), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let stale_segment = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32, 1_u32, 999_u32],
+            b"stale-bitmap-segment",
+        )
+        .await;
+
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&stale_segment)],
+            )
+            .await
+            .unwrap();
+
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].name(), "vector_idx");
+        assert_eq!(
+            descriptions[0].rows_indexed(),
+            20,
+            "stale bitmap entries for missing fragments should be skipped without failing"
+        );
     }
 
     /// Helper to assert that all indices have file sizes populated

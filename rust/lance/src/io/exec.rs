@@ -37,3 +37,19 @@ pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;
+
+/// Declares which vesrion of the relational algebra we are producing
+///
+/// In order to enable plan pushdown (executing parts of the physical plan on different nodes)
+/// we must treat the physical plan serialization and the inputs and outputs of phyical plan
+/// nodes as part of the public API surface.
+///
+/// We should attempt to handle as many versions as possible on read paths.  This variable
+/// controls which versions we support producing.
+///
+/// This includes changes to the proto serialization of physical plan nodes themselves or
+/// changes to the format of the inputs or outputs of the nodes.
+///
+/// This does not include changes to the behavior of the nodes unless that behavior is a change
+/// in semantic meaning.
+pub const LANCE_RELATIONAL_ALGEBRA_VERSION: u32 = 1;

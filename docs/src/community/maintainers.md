@@ -59,14 +59,19 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PPMC Member           |
 | ChanChan Mao           | ccmao1130            | LanceDB           |                     |                                                 |
 | Lu Qiu                 | LuQQiu               | LanceDB           | ✓                   | Alluxio PMC Member                              |
+| Dan Rammer             | hamersaw             | LanceDB           | ✓                   |                                                 |
 | Rong Rong              | walterddr            | Google DeepMind   |                     | Apache Pinot PMC Member, Apache Flink Committer |
 | Nat Roth               | nrothGIT             | Meta AI           |                     |                                                 |
 | Kevin Shaffer-Morrison | kevinshaffermorrison | AWS               |                     |                                                 |
 | Noah Shpak             | noahshpak            | Thinking Machines |                     |                                                 |
+| Chunxu Tang            | ChunxuTang           | Google            |                     | PrestoDB Committer                              |
 | Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                 |
-| Beinan Wang            | beinan               | Uber              |                     | Alluxio PMC Member, Presto TSC Member           |
+| Beinan Wang            | beinan               | Microsoft AI      |                     | Alluxio PMC Member, Presto TSC Member           |
 | Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                 |
-| Jinglun                | wojiaodoubao         | Bytedance         |                     | Apache Hadoop Committer                         |
+| Yang Jie               | LuciferYang          | Baidu Inc.        |                     |                                                 |
+| Jianjian Xie           | jja725               | Uber              |                     |                                                 |
+| Zhang Yue              | zhangyue19921010     | ByteDance         |                     |                                                 |
+| Jinglun                | wojiaodoubao         | ByteDance         |                     | Apache Hadoop Committer                         |
 
 ## Becoming a Maintainer
 
