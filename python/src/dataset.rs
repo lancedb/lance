@@ -4316,6 +4316,16 @@ fn prepare_vector_index_params(
             pq_params.max_iters = max_iters;
         }
 
+        if let Some(streaming_sample_rate) = kwargs.get_item("streaming_sample_rate")? {
+            ivf_params.streaming_sample_rate = Some(streaming_sample_rate.extract()?);
+        }
+        if let Some(streaming_coreset_rate) = kwargs.get_item("streaming_coreset_rate")? {
+            ivf_params.streaming_coreset_rate = Some(streaming_coreset_rate.extract()?);
+        }
+        if let Some(streaming_refine_passes) = kwargs.get_item("streaming_refine_passes")? {
+            ivf_params.streaming_refine_passes = streaming_refine_passes.extract()?;
+        }
+
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
             ivf_params.num_partitions = Some(n.extract()?)

@@ -180,6 +180,10 @@ name = "ivf_pq"
 harness = false
 
 [[bench]]
+name = "streaming_ivf_training"
+harness = false
+
+[[bench]]
 name = "take"
 harness = false
 
