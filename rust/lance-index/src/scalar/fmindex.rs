@@ -72,6 +72,7 @@ struct RankBitVec {
     len: usize,
 }
 
+#[allow(dead_code)]
 impl RankBitVec {
     fn new(len: usize) -> Self {
         Self {
@@ -181,6 +182,7 @@ impl Ord for HuffNode {
     }
 }
 
+#[allow(dead_code)]
 impl HuffmanWaveletTree {
     fn build(data: &[u8]) -> Self {
         let n = data.len();
@@ -621,8 +623,8 @@ impl DeepSizeOf for FMIndex {
     }
 }
 
-impl FMIndex {
-    fn build(texts: &[(u64, &[u8])]) -> Result<Self> {
+#[allow(dead_code)]
+impl FMIndex {    fn build(texts: &[(u64, &[u8])]) -> Result<Self> {
         if texts.is_empty() {
             return Ok(Self {
                 wavelet: HuffmanWaveletTree {
