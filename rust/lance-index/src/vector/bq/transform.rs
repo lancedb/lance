@@ -14,7 +14,7 @@ use lance_linalg::distance::{DistanceType, norm_squared_fsl};
 use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
-use crate::vector::bq::storage::RABIT_CODE_COLUMN;
+use crate::vector::bq::storage::{RABIT_CODE_COLUMN, RABIT_EX_CODE_COLUMN};
 use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
 use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
@@ -79,7 +79,11 @@ impl Debug for RQTransformer {
 impl Transformer for RQTransformer {
     #[instrument(name = "RQTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if batch.column_by_name(RABIT_CODE_COLUMN).is_some() {
+        let has_split_codes = self.rq.num_bits() == 1
+            || (batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
+                && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
+                && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
+        if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
             return Ok(batch.clone());
         }
 
@@ -117,8 +121,8 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let rq_codes = self.rq.quantize(&residual_vectors)?;
-        let codes_fsl = rq_codes.as_fixed_size_list();
+        let rq_codes = self.rq.quantize_split(residual_vectors)?;
+        let codes_fsl = rq_codes.binary_codes.as_fixed_size_list();
 
         let ip_rq_res = match residual_vectors.value_type() {
             DataType::Float16 => Float32Array::from(
@@ -195,15 +199,160 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let batch = batch.try_with_column(self.rq.field(), Arc::new(rq_codes))?;
-        let batch = batch
-            .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?
-            .drop_column(CENTROID_DIST_COLUMN)?;
-        let batch = batch.try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
+        let batch = batch.try_with_column(self.rq.field(), rq_codes.binary_codes)?;
+        let batch = batch.try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?;
+        let mut batch =
+            batch.try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
+
+        if let (Some(ex_codes), Some(ex_res_dot_dists)) =
+            (rq_codes.ex_codes, rq_codes.ex_res_dot_dists)
+        {
+            let ex_add_factors = batch[ADD_FACTORS_COLUMN]
+                .as_primitive::<Float32Type>()
+                .clone();
+            let ex_scale_factors = match self.distance_type {
+                DistanceType::L2 => Float32Array::from_iter_values(
+                    res_norm_square
+                        .values()
+                        .iter()
+                        .zip(ex_res_dot_dists.iter())
+                        .map(|(res_norm_square, ex_res_dot)| {
+                            (-2.0 * res_norm_square)
+                                .div_checked(*ex_res_dot)
+                                .unwrap_or_default()
+                        }),
+                ),
+                DistanceType::Dot => Float32Array::from_iter_values(
+                    res_norm_square
+                        .values()
+                        .iter()
+                        .zip(ex_res_dot_dists.iter())
+                        .map(|(res_norm_square, ex_res_dot)| {
+                            -res_norm_square.div_checked(*ex_res_dot).unwrap_or_default()
+                        }),
+                ),
+                _ => {
+                    return Err(Error::index(format!(
+                        "RQ Transform: distance type {} not supported",
+                        self.distance_type
+                    )));
+                }
+            };
+            batch = batch
+                .try_with_column(
+                    crate::vector::bq::storage::rabit_ex_code_field(
+                        self.rq.dim(),
+                        self.rq.num_bits(),
+                    )?
+                    .expect("ex-code field should exist for num_bits > 1"),
+                    ex_codes,
+                )?
+                .try_with_column(EX_ADD_FACTORS_FIELD.clone(), Arc::new(ex_add_factors))?
+                .try_with_column(EX_SCALE_FACTORS_FIELD.clone(), Arc::new(ex_scale_factors))?;
+        }
 
         let batch = batch
             .drop_column(&self.vector_column)?
             .drop_column(CENTROID_DIST_COLUMN)?;
         Ok(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Float32Type, UInt8Type};
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::distance::DistanceType;
+
+    use crate::vector::bq::RQRotationType;
+    use crate::vector::bq::builder::RabitQuantizer;
+    use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
+    use crate::vector::transform::Transformer;
+    use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
+
+    use super::{
+        ADD_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, RQTransformer,
+    };
+
+    #[test]
+    fn test_rq_transformer_writes_multi_bit_ex_factors() {
+        let rq = RabitQuantizer::new_with_rotation::<Float32Type>(4, 8, RQRotationType::Fast);
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap();
+        let transformer = RQTransformer::new(rq.clone(), DistanceType::L2, centroids, "vector");
+
+        let residual_vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                1.0, -2.0, 3.0, -4.0, 1.5, -2.5, 3.5, -4.5, 0.5, -1.0, 1.5, -2.0, 2.5, -3.0, 3.5,
+                -4.0,
+            ]),
+            8,
+        )
+        .unwrap();
+        let res_norm_square = Float32Array::from(vec![73.0f32, 47.0]);
+        let batch = RecordBatch::try_from_iter(vec![
+            ("vector", Arc::new(residual_vectors.clone()) as ArrayRef),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(vec![0, 0])) as ArrayRef,
+            ),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(res_norm_square.clone()) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+
+        let transformed = transformer.transform(&batch).unwrap();
+        assert!(transformed.column_by_name(RABIT_EX_CODE_COLUMN).is_some());
+        assert_eq!(
+            transformed[RABIT_EX_CODE_COLUMN]
+                .as_fixed_size_list()
+                .value_length(),
+            3
+        );
+        assert!(
+            transformed[RABIT_EX_CODE_COLUMN]
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>()
+                .values()
+                .iter()
+                .any(|value| *value != 0)
+        );
+        assert_eq!(
+            transformed[EX_ADD_FACTORS_COLUMN]
+                .as_primitive::<Float32Type>()
+                .values(),
+            res_norm_square.values()
+        );
+
+        let expected_ex_dots = rq
+            .quantize_split(&residual_vectors)
+            .unwrap()
+            .ex_res_dot_dists
+            .unwrap();
+        let ex_scale_factors = transformed[EX_SCALE_FACTORS_COLUMN].as_primitive::<Float32Type>();
+        for ((actual, norm), ex_dot) in ex_scale_factors
+            .values()
+            .iter()
+            .zip(res_norm_square.values())
+            .zip(expected_ex_dots)
+        {
+            let expected = if ex_dot == 0.0 {
+                0.0
+            } else {
+                -2.0 * norm / ex_dot
+            };
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        assert!(transformed.column_by_name("vector").is_none());
+        assert!(transformed.column_by_name(CENTROID_DIST_COLUMN).is_none());
+        assert!(transformed.column_by_name(ADD_FACTORS_COLUMN).is_some());
     }
 }

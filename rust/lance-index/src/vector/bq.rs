@@ -121,14 +121,7 @@ pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
 }
 
 pub fn validate_supported_rq_num_bits(num_bits: u8) -> Result<()> {
-    validate_rq_num_bits(num_bits)?;
-    if num_bits != RABIT_BINARY_NUM_BITS {
-        return Err(Error::not_supported(format!(
-            "IVF_RQ num_bits={} is not supported yet; only num_bits=1 is supported",
-            num_bits
-        )));
-    }
-    Ok(())
+    validate_rq_num_bits(num_bits)
 }
 
 pub fn rabit_ex_bits(num_bits: u8) -> Result<u8> {
@@ -250,12 +243,8 @@ mod tests {
             err
         );
 
-        let err = validate_supported_rq_num_bits(2).unwrap_err();
-        assert!(
-            err.to_string().contains("only num_bits=1 is supported"),
-            "{}",
-            err
-        );
+        validate_supported_rq_num_bits(1).unwrap();
+        validate_supported_rq_num_bits(8).unwrap();
     }
 
     #[test]
