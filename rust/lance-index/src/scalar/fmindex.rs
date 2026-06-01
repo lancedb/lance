@@ -624,7 +624,8 @@ impl DeepSizeOf for FMIndex {
 }
 
 #[allow(dead_code)]
-impl FMIndex {    fn build(texts: &[(u64, &[u8])]) -> Result<Self> {
+impl FMIndex {
+    fn build(texts: &[(u64, &[u8])]) -> Result<Self> {
         if texts.is_empty() {
             return Ok(Self {
                 wavelet: HuffmanWaveletTree {
