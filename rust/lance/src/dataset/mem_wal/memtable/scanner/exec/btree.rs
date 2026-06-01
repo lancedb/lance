@@ -274,18 +274,20 @@ impl BTreeIndexExec {
                 // Add _rowid column if requested. Active memtable rows do not
                 // have real Lance row ids.
                 if self.with_row_id {
-                    let row_id_col = UInt64Array::from_iter(
-                        std::iter::repeat_n(None, rows_with_positions.len()),
-                    );
+                    let row_id_col = UInt64Array::from_iter(std::iter::repeat_n(
+                        None,
+                        rows_with_positions.len(),
+                    ));
                     final_columns.push(Arc::new(row_id_col));
                 }
 
                 // Add _rowaddr column if requested. Active memtable rows do not
                 // have real row addresses.
                 if self.with_row_address {
-                    let row_addr_col = UInt64Array::from_iter(
-                        std::iter::repeat_n(None, rows_with_positions.len()),
-                    );
+                    let row_addr_col = UInt64Array::from_iter(std::iter::repeat_n(
+                        None,
+                        rows_with_positions.len(),
+                    ));
                     final_columns.push(Arc::new(row_addr_col));
                 }
 
