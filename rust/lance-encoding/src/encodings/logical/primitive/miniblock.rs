@@ -31,6 +31,15 @@ fn parse_max_miniblock_values() -> u64 {
 pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> =
     std::sync::LazyLock::new(parse_max_miniblock_values);
 
+/// Maximum number of rep/def levels the structural planner should place into
+/// a single mini-block chunk.
+pub fn max_repdef_levels_per_chunk(bits_per_level: u64) -> u64 {
+    debug_assert!(bits_per_level > 0);
+    const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
+    let budgeted_levels = REPDEF_BUDGET_BITS / bits_per_level;
+    budgeted_levels.min(u16::MAX as u64)
+}
+
 /// Page data that has been compressed into a series of chunks put into
 /// a single buffer.
 #[derive(Debug)]

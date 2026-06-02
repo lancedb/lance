@@ -90,7 +90,7 @@ ds.create_scalar_index(
     index_type="INVERTED",
     name="text_idx",              # Optional index name (if omitted, default is "text_idx")
     with_position=False,          # Set True to enable phrase queries (stores token positions)
-    base_tokenizer="icu",         # Tokenizer: "icu" (default), "simple" (whitespace+punct), "whitespace", or "raw"
+    base_tokenizer="simple",      # Tokenizer: "simple" (whitespace+punct), "icu", "whitespace", or "raw" (no tokenization)
     language="English",           # Language used for stemming + stop words (only used if `stem` or `remove_stop_words` is True)
     max_token_length=40,          # Drop tokens longer than this length
     lower_case=True,              # Lowercase text before tokenization
@@ -103,13 +103,13 @@ ds.create_scalar_index(
 
 ### Tokenizer Options
 
-- **icu**: Unicode word segmentation with built-in ICU dictionaries (default)
 - **simple**: Splits tokens on whitespace and punctuation
 - **whitespace**: Splits tokens only on whitespace
 - **raw**: No tokenization (useful for exact matching)
 
 Lance also supports multilingual tokenization:
 
+- **icu**: Unicode word segmentation with built-in ICU dictionaries
 - **jieba/default**: Chinese text tokenization using Jieba
 - **lindera/ipadic**: Japanese text tokenization using Lindera with IPAdic dictionary
 - **lindera/ko-dic**: Korean text tokenization using Lindera with Ko-dic dictionary

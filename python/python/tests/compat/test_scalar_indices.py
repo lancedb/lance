@@ -320,9 +320,7 @@ class FtsIndex(UpgradeDowngradeTest):
             max_rows_per_file=100,
             data_storage_version=safe_data_storage_version(self.compat_version),
         )
-        dataset.create_scalar_index(
-            "text", "INVERTED", with_position=True, base_tokenizer="simple"
-        )
+        dataset.create_scalar_index("text", "INVERTED", with_position=True)
 
     def check_read(self):
         """Verify FTS index can be queried."""

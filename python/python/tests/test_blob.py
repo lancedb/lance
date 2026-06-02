@@ -13,6 +13,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
 
@@ -27,6 +28,21 @@ def _blob_row_addresses(dataset):
         .column("_rowaddr")
         .to_pylist()
     )
+
+
+def _commit_blob_fragments(dataset_uri, schema, fragments, initial_bases=None):
+    operation = lance.LanceOperation.Overwrite(
+        schema,
+        fragments,
+        initial_bases=initial_bases,
+    )
+    return lance.LanceDataset.commit(dataset_uri, operation)
+
+
+def _external_blob_table(blob_path, payload=b"hello"):
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path.write_bytes(payload)
+    return pa.table({"blob": lance.blob_array([blob_path.as_uri()])})
 
 
 def _out_of_order_blob_selection(dataset_with_blobs, selection_kind):
@@ -586,6 +602,155 @@ def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp
         lance.write_dataset(
             table,
             tmp_path / "test_ds_v2_external_ingest_invalid",
+            data_storage_version="2.2",
+            external_blob_mode="ingest",
+            allow_external_blob_outside_bases=True,
+        )
+
+
+def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+
+    table = _external_blob_table(blob_path)
+    with pytest.raises(OSError, match="outside registered external bases"):
+        write_fragments(
+            table,
+            tmp_path / "test_fragments_v2_external_denied",
+            data_storage_version="2.2",
+            external_blob_mode="reference",
+        )
+
+
+def test_blob_extension_write_fragments_external_outside_base_allowed(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_v2_external_allowed"
+
+    table = _external_blob_table(blob_path)
+    fragments = write_fragments(
+        table,
+        dataset_uri,
+        data_storage_version="2.2",
+        external_blob_mode="reference",
+        allow_external_blob_outside_bases=True,
+    )
+    ds = _commit_blob_fragments(dataset_uri, table.schema, fragments)
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_transaction_external_outside_base_allowed(
+    tmp_path,
+):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_transaction_v2_external_allowed"
+
+    table = _external_blob_table(blob_path)
+    transaction = write_fragments(
+        table,
+        dataset_uri,
+        mode="create",
+        return_transaction=True,
+        data_storage_version="2.2",
+        external_blob_mode="reference",
+        allow_external_blob_outside_bases=True,
+    )
+    ds = lance.LanceDataset.commit(dataset_uri, transaction)
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_external_registered_base(tmp_path):
+    external_base = tmp_path / "external_base"
+    blob_path = external_base / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_v2_external_registered_base"
+
+    table = _external_blob_table(blob_path)
+    initial_bases = [DatasetBasePath(external_base.as_uri(), name="external", id=1)]
+    fragments = write_fragments(
+        table,
+        dataset_uri,
+        mode="create",
+        data_storage_version="2.2",
+        external_blob_mode="reference",
+        initial_bases=initial_bases,
+    )
+    ds = _commit_blob_fragments(
+        dataset_uri,
+        table.schema,
+        fragments,
+        initial_bases=initial_bases,
+    )
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_external_ingest(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_v2_external_ingest"
+
+    table = _external_blob_table(blob_path)
+    fragments = write_fragments(
+        table,
+        dataset_uri,
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+    ds = _commit_blob_fragments(dataset_uri, table.schema, fragments)
+
+    blob_path.unlink()
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_transaction_external_ingest(tmp_path):
+    blob_path = tmp_path / "external_blob.bin"
+    dataset_uri = tmp_path / "test_fragments_transaction_v2_external_ingest"
+
+    table = _external_blob_table(blob_path)
+    transaction = write_fragments(
+        table,
+        dataset_uri,
+        mode="create",
+        return_transaction=True,
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+    ds = lance.LanceDataset.commit(dataset_uri, transaction)
+
+    blob_path.unlink()
+
+    blob = ds.take_blobs("blob", indices=[0])[0]
+    assert blob.size() == 5
+    with blob as f:
+        assert f.read() == b"hello"
+
+
+def test_blob_extension_write_fragments_external_ingest_rejects_reference_only_options(
+    tmp_path,
+):
+    blob_path = tmp_path / "external_blob.bin"
+    message = (
+        "allow_external_blob_outside_bases only applies when "
+        'external_blob_mode="reference"'
+    )
+
+    table = _external_blob_table(blob_path)
+    with pytest.raises(OSError, match=message):
+        write_fragments(
+            table,
+            tmp_path / "test_fragments_v2_external_ingest_invalid",
             data_storage_version="2.2",
             external_blob_mode="ingest",
             allow_external_blob_outside_bases=True,

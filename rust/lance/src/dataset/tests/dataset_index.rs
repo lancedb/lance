@@ -959,7 +959,7 @@ async fn test_fts_unindexed_data_with_stop_words() {
         .unwrap();
 
     // Append unindexed rows with a term not in the index
-    let unindexed: Vec<String> = (0..10).map(|i| format!("hello {i}")).collect();
+    let unindexed: Vec<String> = (0..10).map(|i| format!("hello_{i}")).collect();
     let text_col = StringArray::from(unindexed);
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
@@ -3176,7 +3176,6 @@ async fn test_sql_contains_tokens() {
             IndexType::Inverted,
             None,
             &InvertedIndexParams::default()
-                .base_tokenizer("simple".to_string())
                 .max_token_length(None)
                 .stem(false),
             true,

@@ -4202,6 +4202,16 @@ fn prepare_vector_index_params(
             pq_params.max_iters = max_iters;
         }
 
+        if let Some(streaming_sample_rate) = kwargs.get_item("streaming_sample_rate")? {
+            ivf_params.streaming_sample_rate = Some(streaming_sample_rate.extract()?);
+        }
+        if let Some(streaming_coreset_rate) = kwargs.get_item("streaming_coreset_rate")? {
+            ivf_params.streaming_coreset_rate = Some(streaming_coreset_rate.extract()?);
+        }
+        if let Some(streaming_refine_passes) = kwargs.get_item("streaming_refine_passes")? {
+            ivf_params.streaming_refine_passes = streaming_refine_passes.extract()?;
+        }
+
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
             ivf_params.num_partitions = Some(n.extract()?)
@@ -4223,17 +4233,27 @@ fn prepare_vector_index_params(
                 ));
             }
 
+            let centroid_type = match column_type {
+                DataType::List(field)
+                    if matches!(field.data_type(), DataType::FixedSizeList(_, _)) =>
+                {
+                    field.data_type()
+                }
+                _ => column_type,
+            };
+
             // It's important that the centroids are the same data type
             // as the vectors that will be indexed.
             let mut centroids: Arc<dyn Array> = batch.column(0).clone();
-            if centroids.data_type() != column_type {
-                centroids = cast_with_options(centroids.as_ref(), column_type, &Default::default())
-                    .map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Failed to cast centroids to column type: {}",
-                            e
-                        ))
-                    })?;
+            if centroids.data_type() != centroid_type {
+                centroids =
+                    cast_with_options(centroids.as_ref(), centroid_type, &Default::default())
+                        .map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "Failed to cast centroids to vector type: {}",
+                                e
+                            ))
+                        })?;
             }
             let centroids = as_fixed_size_list_array(centroids.as_ref());
 

@@ -147,6 +147,65 @@ impl LsmDataSourceCollector {
         &self.in_memory_memtables
     }
 
+    /// Whether the collector has any on-disk source (base table or a flushed
+    /// generation). The point-lookup fast path uses this to decide, after
+    /// missing every in-memory memtable, between "definitely absent" (`false`)
+    /// and "must consult disk via the plan path" (`true`). Cheap: no allocation.
+    pub fn has_on_disk_sources(&self) -> bool {
+        self.base_table.is_some()
+            || self
+                .shard_snapshots
+                .iter()
+                .any(|s| !s.flushed_generations.is_empty())
+    }
+
+    /// The in-memory memtables (active + frozen across all shards) as
+    /// references, **newest generation first**. Used by batch point lookups
+    /// that probe many keys against the same set of memtables; clones no
+    /// `Arc`s. Empty when there are no in-memory memtables.
+    pub fn in_memory_refs_newest_first(&self) -> Vec<&InMemoryMemTableRef> {
+        let mut refs: Vec<&InMemoryMemTableRef> = Vec::new();
+        for mems in self.in_memory_memtables.values() {
+            refs.push(&mems.active);
+            refs.extend(mems.frozen.iter());
+        }
+        refs.sort_by_key(|m| std::cmp::Reverse(m.generation));
+        refs
+    }
+
+    /// Visit the in-memory memtables (active + frozen) **newest generation
+    /// first** by reference, calling `f` until it returns `Some`; returns that
+    /// value (or `None` if every memtable was visited without one).
+    ///
+    /// Unlike [`Self::collect`], this clones no `Arc`s and — in the common
+    /// single-shard, single-active case — allocates nothing, so concurrent
+    /// readers don't contend on source refcounts. Generation-DESC order makes
+    /// a re-write in the active memtable win over a stale frozen row.
+    pub fn find_in_memory_newest_first<T>(
+        &self,
+        mut f: impl FnMut(&InMemoryMemTableRef) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        // Hot path: one shard, only the active memtable → no Vec, no sort.
+        if self.in_memory_memtables.len() == 1 {
+            let mems = self.in_memory_memtables.values().next().unwrap();
+            if mems.frozen.is_empty() {
+                return f(&mems.active);
+            }
+        }
+        let mut refs: Vec<&InMemoryMemTableRef> = Vec::new();
+        for mems in self.in_memory_memtables.values() {
+            refs.push(&mems.active);
+            refs.extend(mems.frozen.iter());
+        }
+        refs.sort_by_key(|m| std::cmp::Reverse(m.generation));
+        for m in refs {
+            if let Some(v) = f(m)? {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
     /// A shard's in-memory memtables (active + frozen-awaiting-flush) as
     /// scan sources, in **ascending generation order**. The planner relies
     /// on this: it reverses sources to generation-DESC so the newest row

@@ -1058,6 +1058,18 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
+def test_create_ivf_rq_rejects_unsupported_num_bits():
+    ds = lance.write_dataset(create_table(), "memory://")
+
+    with pytest.raises(NotImplementedError, match="only num_bits=1 is supported"):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=2,
+        )
+
+
 def test_create_ivf_rq_requires_dim_divisible_by_8():
     vectors = np.zeros((1000, 30), dtype=np.float32).tolist()
     tbl = pa.Table.from_pydict(

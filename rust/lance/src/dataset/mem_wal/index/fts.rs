@@ -56,12 +56,15 @@ use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewA
 use arrow_schema::DataType;
 use bitpacking::{BitPacker, BitPacker4x};
 use crossbeam_skiplist::SkipMap;
+use fst::{Map, Streamer};
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::Operator;
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_tokenizer::TokenStream;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use super::RowPosition;
 
@@ -144,6 +147,18 @@ pub struct SearchOptions {
     pub wand_factor: f32,
     /// Maximum number of results to return. None means unlimited.
     pub limit: Option<usize>,
+    /// Whether to also search the mutable tail (rows written since the last
+    /// freeze). `true` (default) is read-your-writes: every completed batch is
+    /// visible, at the cost of scanning the un-indexed tail on each query.
+    /// `false` searches only the immutable frozen partitions — the Lucene
+    /// model (a reader sees only flushed segments), which removes the tail
+    /// scan from the hot path. Trades read-recency for query latency.
+    pub include_tail: bool,
+    /// Whether to skip the whole tail scan when its score upper bound cannot
+    /// beat the current top-k threshold (block-max-style tail pruning). `true`
+    /// (default) prunes; `false` always scans the visible tail. Only affects
+    /// top-k term queries; exposed mainly to A/B the optimization.
+    pub tail_skip: bool,
 }
 
 impl Default for SearchOptions {
@@ -151,6 +166,8 @@ impl Default for SearchOptions {
         Self {
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
+            include_tail: true,
+            tail_skip: true,
         }
     }
 }
@@ -169,6 +186,18 @@ impl SearchOptions {
     /// Set the maximum number of results to return.
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Set whether to search the mutable tail (see [`Self::include_tail`]).
+    pub fn with_include_tail(mut self, include_tail: bool) -> Self {
+        self.include_tail = include_tail;
+        self
+    }
+
+    /// Set whether to prune the tail scan by score bound (see [`Self::tail_skip`]).
+    pub fn with_tail_skip(mut self, tail_skip: bool) -> Self {
+        self.tail_skip = tail_skip;
         self
     }
 }
@@ -363,18 +392,6 @@ struct Positions {
 }
 
 impl Positions {
-    fn empty() -> Self {
-        Self {
-            offsets: vec![0],
-            data: Vec::new(),
-        }
-    }
-
-    fn push_doc(&mut self, positions: &[u32]) {
-        self.data.extend_from_slice(positions);
-        self.offsets.push(self.data.len() as u32);
-    }
-
     fn doc_positions(&self, doc_idx: usize) -> &[u32] {
         let start = self.offsets[doc_idx] as usize;
         let end = self.offsets[doc_idx + 1] as usize;
@@ -396,6 +413,10 @@ struct TermChunk {
     batch_position: usize,
     row_positions: Vec<u64>,
     frequencies: Vec<u32>,
+    /// Largest frequency in the chunk; `doc_weight(max_freq, 1)` bounds any
+    /// doc's tf-component, used to skip the whole tail scan when it cannot beat
+    /// the top-k threshold.
+    max_freq: u32,
     /// Per-doc token positions. Always `Some` in the current
     /// implementation (the writer tracks positions unconditionally so
     /// in-memory phrase queries work even when `params.has_positions()`
@@ -420,29 +441,68 @@ impl TermChunk {
 /// Append-only list of `TermChunk`s for a single term, replaced atomically
 /// via `ArcSwap`.
 #[derive(Debug, Default)]
+/// One term's tail postings as a persistent singly-linked list of chunks,
+/// newest first. Appending shares the existing list (the new head points at the
+/// old slice), so a reader holding an older `Arc<TermSlice>` keeps a consistent
+/// view while the writer extends it — and append is O(1) instead of the O(n)
+/// copy-per-append that made tail inserts quadratic in batches-per-generation.
+/// Order is newest-first; every consumer either sorts by doc id or is
+/// order-agnostic.
 struct TermSlice {
-    chunks: Vec<Arc<TermChunk>>,
+    /// This node's chunk; `None` only for the empty root.
+    chunk: Option<Arc<TermChunk>>,
+    /// The slice before this chunk was appended (older chunks).
+    prev: Option<Arc<Self>>,
 }
 
 impl TermSlice {
     fn empty() -> Arc<Self> {
-        Arc::new(Self { chunks: Vec::new() })
+        Arc::new(Self {
+            chunk: None,
+            prev: None,
+        })
     }
 
-    /// Returns a fresh `Arc<TermSlice>` containing all current chunks plus the
-    /// new one. The previous slice is left unchanged so any reader holding
-    /// it continues to see a consistent state.
-    fn with_chunk_appended(&self, chunk: Arc<TermChunk>) -> Arc<Self> {
-        let mut chunks = Vec::with_capacity(self.chunks.len() + 1);
-        chunks.extend(self.chunks.iter().cloned());
-        chunks.push(chunk);
-        Arc::new(Self { chunks })
+    /// O(1) append: a fresh head holding `chunk` and linking to `prev`. `prev`
+    /// is left unchanged so any reader holding it sees a consistent state.
+    fn push(prev: Arc<Self>, chunk: Arc<TermChunk>) -> Arc<Self> {
+        Arc::new(Self {
+            chunk: Some(chunk),
+            prev: Some(prev),
+        })
+    }
+
+    /// Iterate the term's chunks, newest first.
+    fn chunks(&self) -> TermChunkIter<'_> {
+        TermChunkIter { cur: Some(self) }
     }
 
     fn memory_size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.chunks.capacity() * std::mem::size_of::<Arc<TermChunk>>()
-            + self.chunks.iter().map(|c| c.memory_size()).sum::<usize>()
+        // Each node: the struct itself plus its chunk's payload.
+        self.chunks()
+            .map(|c| std::mem::size_of::<Self>() + c.memory_size())
+            .sum::<usize>()
+            + std::mem::size_of::<Self>() // empty root node
+    }
+}
+
+/// Newest-first iterator over a [`TermSlice`] cons-list.
+struct TermChunkIter<'a> {
+    cur: Option<&'a TermSlice>,
+}
+
+impl<'a> Iterator for TermChunkIter<'a> {
+    type Item = &'a Arc<TermChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Walk links; the empty root has no chunk and ends iteration.
+        while let Some(node) = self.cur {
+            self.cur = node.prev.as_deref();
+            if let Some(chunk) = &node.chunk {
+                return Some(chunk);
+            }
+        }
+        None
     }
 }
 
@@ -470,18 +530,84 @@ impl BatchMeta {
     }
 }
 
+/// Size of a sealed batch block. Small enough that copying the partial tail
+/// block on append stays cheap; large enough that sealing (which clones the
+/// block-pointer vec) is rare.
+const BATCH_BLOCK: usize = 64;
+
+/// Append-only, structurally-shared log of visible batch metadata. Sealed full
+/// blocks are immutable and shared across snapshots; only the current partial
+/// block is copied on append, so publishing a batch is amortized O(1) (instead
+/// of copying every batch pointer per publish — O(batches²) per generation)
+/// while keeping O(1) index for `batch_for`.
+#[derive(Debug, Clone)]
+struct BatchLog {
+    /// Immutable full blocks (each `BATCH_BLOCK` long), shared across snapshots.
+    sealed: Arc<Vec<Arc<[Arc<BatchMeta>]>>>,
+    /// The current partial block (`< BATCH_BLOCK` entries).
+    tail: Arc<[Arc<BatchMeta>]>,
+    len: usize,
+}
+
+impl BatchLog {
+    fn empty() -> Self {
+        Self {
+            sealed: Arc::new(Vec::new()),
+            tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
+            len: 0,
+        }
+    }
+
+    /// A new log with `meta` appended; shares every sealed block with `self`,
+    /// copying only the partial tail block.
+    fn pushed(&self, meta: Arc<BatchMeta>) -> Self {
+        let mut tail: Vec<Arc<BatchMeta>> = self.tail.to_vec();
+        tail.push(meta);
+        if tail.len() == BATCH_BLOCK {
+            let mut sealed = (*self.sealed).clone();
+            sealed.push(Arc::from(tail.into_boxed_slice()));
+            Self {
+                sealed: Arc::new(sealed),
+                tail: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
+                len: self.len + 1,
+            }
+        } else {
+            Self {
+                sealed: Arc::clone(&self.sealed),
+                tail: Arc::from(tail.into_boxed_slice()),
+                len: self.len + 1,
+            }
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<&Arc<BatchMeta>> {
+        let block = i / BATCH_BLOCK;
+        let off = i % BATCH_BLOCK;
+        match self.sealed.get(block) {
+            Some(b) => b.get(off),
+            None if block == self.sealed.len() => self.tail.get(off),
+            None => None,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Arc<BatchMeta>> {
+        self.sealed
+            .iter()
+            .flat_map(|b| b.iter())
+            .chain(self.tail.iter())
+    }
+}
+
 /// Atomic snapshot of the visible state. Replaced via `ArcSwap` after each
 /// batch is fully linked.
 #[derive(Debug)]
 struct Snapshot {
     /// Number of batches visible to readers. `0` means empty index.
     visible_count: usize,
-    /// Visible-batch metadata, written to in publish order. Always
-    /// `batches.len() == visible_count` for any snapshot the writer has
-    /// stored (each `publish_batch` appends a single entry and bumps
-    /// `visible_count` by one). The slice is kept exactly the visible
-    /// length so readers can iterate it directly without re-bounding.
-    batches: Arc<[Arc<BatchMeta>]>,
+    /// Visible-batch metadata in publish order. `batches.len() ==
+    /// visible_count` for any snapshot the writer has stored (each publish
+    /// appends one entry and bumps `visible_count`).
+    batches: BatchLog,
     /// `Σ batches[i].rows` for `i < visible_count`.
     cumulative_doc_count: u64,
     /// `Σ batches[i].doc_lengths.iter().sum()` for `i < visible_count`.
@@ -492,24 +618,21 @@ impl Snapshot {
     fn empty() -> Arc<Self> {
         Arc::new(Self {
             visible_count: 0,
-            batches: Arc::from(Vec::<Arc<BatchMeta>>::new().into_boxed_slice()),
+            batches: BatchLog::empty(),
             cumulative_doc_count: 0,
             cumulative_total_tokens: 0,
         })
     }
 
     fn batch_for(&self, batch_position: usize) -> Option<&Arc<BatchMeta>> {
-        // The fast path assumes batch_position equals the index in
-        // `batches` (true when callers use the no-arg `insert()` and let
-        // the index assign sequential positions). When callers pass
-        // explicit positions to `insert_with_batch_position`, those
-        // positions can be sparse / out of order, so we fall back to a
-        // linear search through visible batches.
+        // Fast path: batch_position equals the index (true when callers use the
+        // no-arg `insert()` and let the index assign sequential positions). With
+        // explicit, possibly sparse positions, fall back to a linear search.
         self.batches
             .get(batch_position)
             .filter(|m| m.batch_position == batch_position)
             .or_else(|| {
-                self.batches[..self.visible_count]
+                self.batches
                     .iter()
                     .find(|m| m.batch_position == batch_position)
             })
@@ -603,13 +726,19 @@ impl<'a> Drop for PooledTokenizer<'a> {
 struct TailIndex {
     /// Per-term posting slices. `Arc<str>` interns the term so a single
     /// allocation backs every chunk that mentions it.
-    terms: SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     /// Atomically-swapped visibility snapshot.
     snapshot: ArcSwap<Snapshot>,
     /// Strictly-monotonic, dense, 0-based batch position counter. Dense
     /// positions are required by the `batch_position < visible_count`
     /// visibility filter; the tail therefore assigns its own.
     next_batch_position: AtomicUsize,
+    /// Writer-only fast path: term -> its posting slot. Only a term's *first*
+    /// appearance in this tail generation pays the sorted `SkipMap` lookup;
+    /// later batches reuse the cached handle, so the per-batch cost is a flat
+    /// hash probe instead of a skiplist search. Reset implicitly when the tail
+    /// is replaced on freeze. Uncontended — the single writer holds it briefly.
+    writer_term_cache: Mutex<FxHashMap<Arc<str>, Arc<ArcSwap<TermSlice>>>>,
 }
 
 impl TailIndex {
@@ -618,6 +747,7 @@ impl TailIndex {
             terms: SkipMap::new(),
             snapshot: ArcSwap::from(Snapshot::empty()),
             next_batch_position: AtomicUsize::new(0),
+            writer_term_cache: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -639,6 +769,7 @@ impl TailIndex {
     }
 
     /// Install one batch's term chunks then publish a new visibility snapshot.
+    #[allow(clippy::too_many_arguments)] // one batch's fields, threaded together
     fn append_batch(
         &self,
         batch_position: usize,
@@ -646,16 +777,28 @@ impl TailIndex {
         rows: u32,
         doc_lengths: Vec<u32>,
         total_tokens: u64,
-        term_builders: HashMap<Arc<str>, BatchTermBuilder>,
+        term_builders: FxHashMap<Arc<str>, BatchTermBuilder>,
+        with_position: bool,
     ) {
+        let mut cache = self
+            .writer_term_cache
+            .lock()
+            .expect("writer term cache poisoned — single-writer invariant violated");
         for (term, builder) in term_builders {
-            let chunk = builder.build(batch_position);
-            let entry = self
-                .terms
-                .get_or_insert_with(term, TermSlice::empty_arc_swap);
-            let cur = entry.value().load();
-            entry.value().store(cur.with_chunk_appended(chunk));
+            let chunk = builder.build(batch_position, with_position);
+            // First sight of the term this generation populates the SkipMap
+            // (so readers can find it) and caches the slot; later batches hit
+            // only the cache.
+            let slot = cache.entry(term).or_insert_with_key(|term| {
+                self.terms
+                    .get_or_insert_with(term.clone(), TermSlice::empty_arc_swap)
+                    .value()
+                    .clone()
+            });
+            let cur = slot.load_full();
+            slot.store(TermSlice::push(cur, chunk));
         }
+        drop(cache);
         let new_meta = Arc::new(BatchMeta {
             batch_position,
             row_offset,
@@ -663,12 +806,9 @@ impl TailIndex {
             rows,
         });
         let cur = self.snapshot.load();
-        let mut batches: Vec<Arc<BatchMeta>> = Vec::with_capacity(cur.batches.len() + 1);
-        batches.extend(cur.batches.iter().cloned());
-        batches.push(new_meta);
         self.snapshot.store(Arc::new(Snapshot {
             visible_count: cur.visible_count + 1,
-            batches: Arc::from(batches.into_boxed_slice()),
+            batches: cur.batches.pushed(new_meta),
             cumulative_doc_count: cur.cumulative_doc_count + rows as u64,
             cumulative_total_tokens: cur.cumulative_total_tokens + total_tokens,
         }));
@@ -709,24 +849,6 @@ impl IndexState {
     }
 }
 
-/// Deduplicates term `Arc<str>`s across partitions: a term that appears in
-/// many partitions is then backed by a single string allocation.
-#[derive(Default)]
-struct TermInterner {
-    seen: Mutex<HashSet<Arc<str>>>,
-}
-
-impl TermInterner {
-    fn intern(&self, term: &Arc<str>) -> Arc<str> {
-        let mut seen = self.seen.lock().expect("term interner poisoned");
-        if let Some(existing) = seen.get(term.as_ref()) {
-            return existing.clone();
-        }
-        seen.insert(term.clone());
-        term.clone()
-    }
-}
-
 /// In-memory full-text search index. See module docs for the concurrency
 /// model and visibility contract.
 pub struct FtsMemIndex {
@@ -743,11 +865,24 @@ pub struct FtsMemIndex {
     /// between freezes; the whole state is swapped on freeze.
     state: ArcSwap<IndexState>,
 
-    /// Shared term-string interner for frozen partitions.
-    term_interner: TermInterner,
-
     /// The tail freezes into a partition once it reaches this many docs.
     freeze_threshold_rows: usize,
+
+    /// Background tiered-merge slot. `None` = idle; `Some` with `result: None`
+    /// = a merge is running on a worker thread; `Some` with `result: Some` =
+    /// the merged partition is ready for the writer to install. Only the
+    /// writer mutates `state`; the worker is read-only and just fills `result`,
+    /// so the single-writer / lock-free-reader contract is preserved.
+    merge: Arc<Mutex<Option<PendingMerge>>>,
+}
+
+/// A tiered merge dispatched to a background worker.
+struct PendingMerge {
+    /// `Arc::as_ptr` of each source partition, for identity-matching the
+    /// merged-away partitions when the writer installs the result.
+    sources: Vec<usize>,
+    /// Filled by the worker when the merge completes.
+    result: Option<Arc<Partition>>,
 }
 
 impl std::fmt::Debug for FtsMemIndex {
@@ -774,9 +909,18 @@ impl FtsMemIndex {
     const DEFAULT_FREEZE_THRESHOLD_ROWS: usize = 50_000;
 
     /// Hard cap on live partitions: when a freeze would exceed it, all
-    /// partitions are merged into one. With the default freeze threshold this
-    /// only triggers past ~1.6M docs.
+    /// partitions are merged into one synchronously. This is only a safety net;
+    /// the background tiered merge normally keeps the count far below it.
     const MAX_PARTITIONS: usize = 32;
+
+    /// Background tiered-merge factor: once a size tier (partitions bucketed by
+    /// `floor(log2(doc_count))`) accumulates this many partitions, they are
+    /// merged into one larger partition off the writer thread. Mirrors Lucene's
+    /// tiered merge — it bounds the live partition count to ~`O(log n)` (so
+    /// per-query overhead and posting fragmentation stay low) while amortizing
+    /// total merge work, and runs in the background so write throughput is
+    /// unaffected.
+    const MERGE_FACTOR: usize = 8;
 
     /// Create a new FTS index for the given field with default parameters.
     pub fn new(field_id: i32, column_name: String) -> Self {
@@ -795,15 +939,16 @@ impl FtsMemIndex {
             tokenizer_pool: Arc::new(pool),
             writer_tokenizer: Mutex::new(writer_tokenizer),
             state: ArcSwap::from(IndexState::empty()),
-            term_interner: TermInterner::default(),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
+            merge: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Override the tail freeze threshold. Used by tests to exercise the
-    /// multi-partition path with small inputs.
-    #[cfg(test)]
-    fn with_freeze_threshold_rows(mut self, rows: usize) -> Self {
+    /// Override the tail freeze threshold (docs) — the analogue of Lucene's
+    /// `ramBufferSizeMB`. Larger keeps more rows in the un-indexed mutable tail
+    /// (cheaper writes, costlier read-your-writes scans); smaller freezes into
+    /// block-max-searchable partitions sooner.
+    pub fn with_freeze_threshold_rows(mut self, rows: usize) -> Self {
         self.freeze_threshold_rows = rows.max(1);
         self
     }
@@ -844,8 +989,7 @@ impl FtsMemIndex {
             .map(|e| {
                 e.value()
                     .load()
-                    .chunks
-                    .iter()
+                    .chunks()
                     .filter(|c| c.batch_position < visible)
                     .map(|c| c.doc_count())
                     .sum::<usize>()
@@ -861,6 +1005,31 @@ impl FtsMemIndex {
         total += st.partitions.iter().map(|p| p.memory_size()).sum::<usize>();
         total += st.tail.memory_size();
         total
+    }
+
+    /// Component memory breakdown (bytes), for diagnostics:
+    /// `(num_partitions, term_strings, postings_meta, block_meta, doc_freq, pos, docs, tail)`.
+    pub fn memory_breakdown(&self) -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        let st = self.state.load_full();
+        let (mut terms, mut postings, mut blocks, mut df, mut pos, mut docs) = (0, 0, 0, 0, 0, 0);
+        for p in st.partitions.iter() {
+            terms += p.term_fst.as_fst().as_bytes().len();
+            postings += p.postings.len() * std::mem::size_of::<PostingRef>();
+            blocks += p.block_bytes.len();
+            df += p.doc_freq_data.len();
+            pos += p.pos_data.len();
+            docs += p.docs.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
+        }
+        (
+            st.partitions.len(),
+            terms,
+            postings,
+            blocks,
+            df,
+            pos,
+            docs,
+            st.tail.memory_size(),
+        )
     }
 
     // ------------------------------------------------------------------
@@ -901,7 +1070,8 @@ impl FtsMemIndex {
                 batch.num_rows() as u32,
                 vec![0; batch.num_rows()],
                 0,
-                HashMap::new(),
+                FxHashMap::default(),
+                self.params.has_positions(),
             );
             return Ok(());
         };
@@ -916,30 +1086,35 @@ impl FtsMemIndex {
             .expect("writer tokenizer poisoned — single-writer invariant violated");
         let tokenizer: &mut dyn LanceTokenizer = tok_guard.as_mut();
 
-        // Per-term builders (frequency + per-doc positions, indexed by
-        // local doc index in this batch).
-        let mut term_builders: HashMap<Arc<str>, BatchTermBuilder> = HashMap::new();
+        // Per-term postings for this batch. Tokens are appended directly
+        // (`observe`) as they stream out of the tokenizer, avoiding the
+        // per-document map and per-`(term, doc)` `Vec` allocation that
+        // dominated insert cost. `FxHashMap` skips SipHash on the hot lookup.
+        let mut term_builders: FxHashMap<Arc<str>, BatchTermBuilder> = FxHashMap::default();
         let mut doc_lengths: Vec<u32> = Vec::with_capacity(batch.num_rows());
         let mut total_tokens: u64 = 0;
 
         for (local_doc_idx, text_opt) in texts.iter().enumerate() {
-            // Track each doc's position even for null/missing rows so the
+            // Track each doc's token count even for null/missing rows so the
             // dense `doc_lengths` array stays aligned with `row_offset + i`.
             let mut doc_token_count: u32 = 0;
-            // term -> (frequency, positions). Keyed by `String` so we only
-            // pay the `Arc<str>` allocation once per unique term per doc,
-            // when transferring to `term_builders` below.
-            let mut per_doc: HashMap<String, (u32, Vec<u32>)> = HashMap::new();
+            let row_position = row_offset + local_doc_idx as u64;
 
             if let Some(text) = text_opt {
                 let mut stream = tokenizer.token_stream_for_doc(text);
                 let mut position: u32 = 0;
                 while let Some(tok) = stream.next() {
-                    let entry = per_doc
-                        .entry(tok.text.clone())
-                        .or_insert_with(|| (0, Vec::new()));
-                    entry.0 += 1;
-                    entry.1.push(position);
+                    let term = tok.text.as_str();
+                    // One hash lookup per token: extend the term's builder, or
+                    // intern its `Arc<str>` once on first sight this batch.
+                    if let Some(builder) = term_builders.get_mut(term) {
+                        builder.observe(row_position, position);
+                    } else {
+                        term_builders.insert(
+                            Arc::<str>::from(term),
+                            BatchTermBuilder::with_first(row_position, position),
+                        );
+                    }
                     position += 1;
                     doc_token_count += 1;
                 }
@@ -947,23 +1122,6 @@ impl FtsMemIndex {
 
             doc_lengths.push(doc_token_count);
             total_tokens += doc_token_count as u64;
-
-            let row_position = row_offset + local_doc_idx as u64;
-            for (term, (freq, positions)) in per_doc {
-                // Reuse an interned `Arc<str>` if we've already seen the
-                // term in this batch. The first occurrence pays the
-                // allocation; subsequent occurrences clone the Arc.
-                let term_arc: Arc<str> =
-                    if let Some((existing, _)) = term_builders.get_key_value(term.as_str()) {
-                        Arc::clone(existing)
-                    } else {
-                        Arc::<str>::from(term.as_str())
-                    };
-                let builder = term_builders
-                    .entry(term_arc)
-                    .or_insert_with(BatchTermBuilder::new);
-                builder.push_doc(row_position, freq, positions);
-            }
         }
 
         // Drop the tokenizer guard before publishing so we don't hold it
@@ -977,6 +1135,7 @@ impl FtsMemIndex {
             doc_lengths,
             total_tokens,
             term_builders,
+            self.params.has_positions(),
         );
 
         if st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
@@ -989,11 +1148,13 @@ impl FtsMemIndex {
     /// fresh empty tail. Only the writer calls this; readers snapshotting the
     /// old `IndexState` keep a consistent view across the freeze.
     fn freeze(&self, st: &IndexState) {
-        let Some(partition) = Partition::from_tail(&st.tail, &self.term_interner) else {
+        let Some(partition) = Partition::from_tail(&st.tail) else {
             return;
         };
         let mut partitions: Vec<Arc<Partition>> = st.partitions.iter().cloned().collect();
         partitions.push(Arc::new(partition));
+        // Fold in any completed background merge before re-evaluating tiers.
+        self.install_pending_merge(&mut partitions);
         if partitions.len() > Self::MAX_PARTITIONS {
             partitions = vec![Arc::new(Partition::merge(&partitions))];
         }
@@ -1001,6 +1162,67 @@ impl FtsMemIndex {
             partitions: Arc::from(partitions.into_boxed_slice()),
             tail: TailIndex::new(),
         }));
+        // Kick off a background merge if a size tier is now over-full.
+        self.maybe_start_merge();
+    }
+
+    /// Install a completed background merge into `partitions` (in place):
+    /// drop the merged-away source partitions and append the merged one.
+    /// No-op while a merge is still running or none is pending.
+    fn install_pending_merge(&self, partitions: &mut Vec<Arc<Partition>>) {
+        let mut guard = self.merge.lock().expect("merge slot poisoned");
+        let Some(pending) = guard.as_ref() else {
+            return;
+        };
+        let Some(merged) = pending.result.clone() else {
+            return; // still running
+        };
+        let sources: HashSet<usize> = pending.sources.iter().copied().collect();
+        // Install only if every source is still live. If a synchronous
+        // `MAX_PARTITIONS` collapse merged the sources away while this merge
+        // ran, the merged docs are already present — appending it would
+        // double-count, so discard the stale result instead.
+        let present = partitions
+            .iter()
+            .filter(|p| sources.contains(&(Arc::as_ptr(p) as usize)))
+            .count();
+        if present == sources.len() {
+            partitions.retain(|p| !sources.contains(&(Arc::as_ptr(p) as usize)));
+            partitions.push(merged);
+        }
+        *guard = None;
+    }
+
+    /// If no merge is in flight and some size tier holds at least
+    /// `MERGE_FACTOR` partitions, dispatch their merge to a background thread.
+    fn maybe_start_merge(&self) {
+        let mut guard = self.merge.lock().expect("merge slot poisoned");
+        if guard.is_some() {
+            return; // one merge at a time
+        }
+        let partitions = self.state.load();
+        let Some(group) = select_merge_group(&partitions.partitions, Self::MERGE_FACTOR) else {
+            return;
+        };
+        let sources: Vec<usize> = group.iter().map(|p| Arc::as_ptr(p) as usize).collect();
+        *guard = Some(PendingMerge {
+            sources,
+            result: None,
+        });
+        drop(guard);
+        let slot = Arc::clone(&self.merge);
+        // Read-only merge off the writer thread; the writer installs the result
+        // on a later freeze. The worker shares ownership of `slot` (and, via
+        // `group`, the source partitions), so it is safe even if the index is
+        // dropped mid-merge.
+        std::thread::spawn(move || {
+            let merged = Arc::new(Partition::merge(&group));
+            if let Ok(mut g) = slot.lock()
+                && let Some(p) = g.as_mut()
+            {
+                p.result = Some(merged);
+            }
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1015,7 +1237,7 @@ impl FtsMemIndex {
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(term);
-        self.search_match(&st, &tokens, None)
+        self.search_match(&st, &tokens, None, true, true)
     }
 
     /// Search for documents containing an exact phrase, optionally allowing
@@ -1023,7 +1245,18 @@ impl FtsMemIndex {
     pub fn search_phrase(&self, phrase: &str, slop: u32) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(phrase);
-        self.search_phrase_tokens(&st, &tokens, slop)
+        self.search_phrase_tokens(&st, &tokens, slop, true)
+    }
+
+    /// Freeze the current mutable tail into an immutable partition, so a
+    /// subsequent `include_tail = false` search sees all rows written so far
+    /// (the analogue of a Lucene commit/flush before opening a reader). No-op
+    /// when the tail is empty. Writer-side: callers hold the single-writer role.
+    pub fn flush(&self) {
+        let st = self.state.load_full();
+        if st.tail.visible_count() > 0 {
+            self.freeze(&st);
+        }
     }
 
     /// Expand a term to fuzzy matches within the specified edit distance.
@@ -1036,7 +1269,7 @@ impl FtsMemIndex {
         max_expansions: usize,
     ) -> Vec<(String, u32)> {
         let st = self.state.load_full();
-        self.expand_fuzzy_term(&st, term, max_distance, max_expansions)
+        self.expand_fuzzy_term(&st, term, max_distance, max_expansions, true)
     }
 
     /// Search for documents using fuzzy matching on each query token.
@@ -1048,7 +1281,7 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(query);
-        self.search_fuzzy_tokens(&st, &tokens, fuzziness, max_expansions)
+        self.search_fuzzy_tokens(&st, &tokens, fuzziness, max_expansions, true)
     }
 
     /// BM25 OR-search over the query tokens, scored with one corpus-wide
@@ -1062,6 +1295,8 @@ impl FtsMemIndex {
         st: &IndexState,
         tokens: &[String],
         limit: Option<usize>,
+        include_tail: bool,
+        tail_skip: bool,
     ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1069,22 +1304,30 @@ impl FtsMemIndex {
         // Snapshot the tail once so the scorer's stats and the scanned tail
         // postings are from the same visibility point.
         let tail_snap = st.tail.snapshot();
-        let scorer = build_scorer(st, &tail_snap, tokens);
+        let scan_tail = include_tail && tail_snap.visible_count > 0;
+        let scorer = build_scorer(st, &tail_snap, tokens, include_tail);
         if scorer.num_docs() == 0 {
             return Vec::new();
         }
         match limit {
             Some(k) if k > 0 => {
                 let mut topk = TopK::new(k);
-                // Scan the tail first so the shared threshold is warm before
-                // the partition WANDs run.
-                if tail_snap.visible_count > 0 {
-                    for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer) {
+                // Scan the block-max partitions first to warm the shared
+                // threshold, then the (un-skippable) tail last — so the tail
+                // scan can be skipped wholesale when its score bound can't beat
+                // the threshold. `tail_skip = false` forces a full tail scan.
+                for p in st.partitions.iter() {
+                    p.or_topk_into(tokens, &scorer, &mut topk);
+                }
+                if scan_tail {
+                    let theta = if tail_skip {
+                        topk.threshold()
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+                    for e in score_terms(&tail_snap, &st.tail.terms, tokens, &scorer, theta) {
                         topk.offer(e.score, e.row_position);
                     }
-                }
-                for p in st.partitions.iter() {
-                    p.wand_into(tokens, &scorer, &mut topk);
                 }
                 topk.into_entries()
             }
@@ -1093,24 +1336,43 @@ impl FtsMemIndex {
                 for p in st.partitions.iter() {
                     results.extend(p.search_match(tokens, Operator::Or, &scorer));
                 }
-                if tail_snap.visible_count > 0 {
-                    results.extend(score_terms(&tail_snap, &st.tail.terms, tokens, &scorer));
+                if scan_tail {
+                    results.extend(score_terms(
+                        &tail_snap,
+                        &st.tail.terms,
+                        tokens,
+                        &scorer,
+                        f32::NEG_INFINITY,
+                    ));
                 }
                 results
             }
         }
     }
 
-    fn search_phrase_tokens(&self, st: &IndexState, tokens: &[String], slop: u32) -> Vec<FtsEntry> {
+    fn search_phrase_tokens(
+        &self,
+        st: &IndexState,
+        tokens: &[String],
+        slop: u32,
+        include_tail: bool,
+    ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
         }
         if tokens.len() == 1 {
             // A single-token phrase reduces to a regular term search.
-            return self.search_match(st, tokens, None);
+            return self.search_match(st, tokens, None, include_tail, true);
+        }
+        // A multi-token phrase needs token positions; without them (the index
+        // was built `with_position = false`) phrase search is unsupported, as
+        // on disk and in Lucene (`DOCS_AND_FREQS`).
+        if !self.params.has_positions() {
+            return Vec::new();
         }
         let tail_snap = st.tail.snapshot();
-        let scorer = build_scorer(st, &tail_snap, tokens);
+        let scan_tail = include_tail && tail_snap.visible_count > 0;
+        let scorer = build_scorer(st, &tail_snap, tokens, include_tail);
         if scorer.num_docs() == 0 {
             return Vec::new();
         }
@@ -1118,7 +1380,7 @@ impl FtsMemIndex {
         for p in st.partitions.iter() {
             results.extend(p.search_phrase(tokens, slop, &scorer));
         }
-        if tail_snap.visible_count > 0 {
+        if scan_tail {
             results.extend(phrase_search_tail(
                 &tail_snap,
                 &st.tail.terms,
@@ -1136,6 +1398,7 @@ impl FtsMemIndex {
         tokens: &[String],
         fuzziness: Option<u32>,
         max_expansions: usize,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
         if tokens.is_empty() {
             return Vec::new();
@@ -1144,7 +1407,9 @@ impl FtsMemIndex {
         let mut seen: HashSet<String> = HashSet::new();
         for tok in tokens {
             let max_dist = fuzziness.unwrap_or_else(|| auto_fuzziness(tok));
-            for (matched, _) in self.expand_fuzzy_term(st, tok, max_dist, max_expansions) {
+            for (matched, _) in
+                self.expand_fuzzy_term(st, tok, max_dist, max_expansions, include_tail)
+            {
                 if seen.insert(matched.clone()) {
                     expanded.push(matched);
                 }
@@ -1153,26 +1418,28 @@ impl FtsMemIndex {
         if expanded.is_empty() {
             return Vec::new();
         }
-        self.search_match(st, &expanded, None)
+        self.search_match(st, &expanded, None, include_tail, true)
     }
 
-    /// Expand `term` against the term dictionaries of every partition and the
-    /// visible tail.
+    /// Expand `term` against the term dictionaries of every partition (and the
+    /// visible tail, when `include_tail`).
     fn expand_fuzzy_term(
         &self,
         st: &IndexState,
         term: &str,
         max_distance: u32,
         max_expansions: usize,
+        include_tail: bool,
     ) -> Vec<(String, u32)> {
         let tail_snap = st.tail.snapshot();
         if max_distance == 0 {
-            let in_tail = st
-                .tail
-                .terms
-                .get(term)
-                .map(|e| has_visible_chunk(&e.value().load(), tail_snap.visible_count))
-                .unwrap_or(false);
+            let in_tail = include_tail
+                && st
+                    .tail
+                    .terms
+                    .get(term)
+                    .map(|e| has_visible_chunk(&e.value().load(), tail_snap.visible_count))
+                    .unwrap_or(false);
             let in_partition = st.partitions.iter().any(|p| p.contains_token(term));
             return if in_tail || in_partition {
                 vec![(term.to_string(), 0)]
@@ -1183,7 +1450,7 @@ impl FtsMemIndex {
         let mut matches: Vec<(String, u32)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for entry in st.tail.terms.iter() {
-            if !has_visible_chunk(&entry.value().load(), tail_snap.visible_count) {
+            if !include_tail || !has_visible_chunk(&entry.value().load(), tail_snap.visible_count) {
                 continue;
             }
             let key: &Arc<str> = entry.key();
@@ -1193,8 +1460,8 @@ impl FtsMemIndex {
             }
         }
         for p in st.partitions.iter() {
-            for key in p.tokens() {
-                let dist = levenshtein_distance(term, key);
+            for key in p.collect_terms() {
+                let dist = levenshtein_distance(term, key.as_ref());
                 if dist <= max_distance && seen.insert(key.to_string()) {
                     matches.push((key.to_string(), dist));
                 }
@@ -1213,28 +1480,32 @@ impl FtsMemIndex {
     /// per-batch monotonic visibility contract for compound queries.
     pub fn search_query(&self, query: &FtsQueryExpr) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        self.search_query_with_state(query, &st, None)
+        self.search_query_with_state(query, &st, None, true, true)
     }
 
     /// `limit` is the caller's top-k, threaded down so a top-level `Match`
     /// leaf can prune with WAND. Compound branches (`Boolean`/`Boost`) need
     /// their children's full result sets, so they pass `None` downward.
+    /// `include_tail` selects read-your-writes vs immutable-only (see
+    /// [`SearchOptions::include_tail`]) and is threaded uniformly to every leaf.
     fn search_query_with_state(
         &self,
         query: &FtsQueryExpr,
         st: &IndexState,
         limit: Option<usize>,
+        include_tail: bool,
+        tail_skip: bool,
     ) -> Vec<FtsEntry> {
         match query {
             FtsQueryExpr::Match { query, boost } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_match(st, &tokens, limit);
+                let mut results = self.search_match(st, &tokens, limit, include_tail, tail_skip);
                 apply_boost(&mut results, *boost);
                 results
             }
             FtsQueryExpr::Phrase { query, slop, boost } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_phrase_tokens(st, &tokens, *slop);
+                let mut results = self.search_phrase_tokens(st, &tokens, *slop, include_tail);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1245,8 +1516,13 @@ impl FtsMemIndex {
                 boost,
             } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results =
-                    self.search_fuzzy_tokens(st, &tokens, *fuzziness, *max_expansions);
+                let mut results = self.search_fuzzy_tokens(
+                    st,
+                    &tokens,
+                    *fuzziness,
+                    *max_expansions,
+                    include_tail,
+                );
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -1254,12 +1530,18 @@ impl FtsMemIndex {
                 must,
                 should,
                 must_not,
-            } => self.search_boolean(must, should, must_not, st),
+            } => self.search_boolean(must, should, must_not, st, include_tail),
             FtsQueryExpr::Boost {
                 positive,
                 negative,
                 negative_boost,
-            } => self.search_boost(positive, negative.as_deref(), *negative_boost, st),
+            } => self.search_boost(
+                positive,
+                negative.as_deref(),
+                *negative_boost,
+                st,
+                include_tail,
+            ),
         }
     }
 
@@ -1270,7 +1552,13 @@ impl FtsMemIndex {
         options: SearchOptions,
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let mut results = self.search_query_with_state(query, &st, options.limit);
+        let mut results = self.search_query_with_state(
+            query,
+            &st,
+            options.limit,
+            options.include_tail,
+            options.tail_skip,
+        );
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1300,12 +1588,13 @@ impl FtsMemIndex {
         negative: Option<&FtsQueryExpr>,
         negative_boost: f32,
         st: &IndexState,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
-        let mut results = self.search_query_with_state(positive, st, None);
+        let mut results = self.search_query_with_state(positive, st, None, include_tail, true);
         let Some(neg) = negative else {
             return results;
         };
-        let negative_results = self.search_query_with_state(neg, st, None);
+        let negative_results = self.search_query_with_state(neg, st, None, include_tail, true);
         let negative_set: HashSet<RowPosition> = negative_results
             .into_iter()
             .map(|e| e.row_position)
@@ -1324,29 +1613,31 @@ impl FtsMemIndex {
         should: &[FtsQueryExpr],
         must_not: &[FtsQueryExpr],
         st: &IndexState,
+        include_tail: bool,
     ) -> Vec<FtsEntry> {
         let excluded: HashSet<RowPosition> = must_not
             .iter()
-            .flat_map(|q| self.search_query_with_state(q, st, None))
+            .flat_map(|q| self.search_query_with_state(q, st, None, include_tail, true))
             .map(|e| e.row_position)
             .collect();
 
         let mut result_map: HashMap<RowPosition, f32> = if must.is_empty() {
             let mut map: HashMap<RowPosition, f32> = HashMap::new();
             for q in should {
-                for entry in self.search_query_with_state(q, st, None) {
+                for entry in self.search_query_with_state(q, st, None, include_tail, true) {
                     *map.entry(entry.row_position).or_default() += entry.score;
                 }
             }
             map
         } else {
-            let first_results = self.search_query_with_state(&must[0], st, None);
+            let first_results =
+                self.search_query_with_state(&must[0], st, None, include_tail, true);
             let mut map: HashMap<RowPosition, f32> = first_results
                 .into_iter()
                 .map(|e| (e.row_position, e.score))
                 .collect();
             for q in must.iter().skip(1) {
-                let results = self.search_query_with_state(q, st, None);
+                let results = self.search_query_with_state(q, st, None, include_tail, true);
                 let result_set: HashMap<RowPosition, f32> = results
                     .into_iter()
                     .map(|e| (e.row_position, e.score))
@@ -1357,7 +1648,7 @@ impl FtsMemIndex {
                     .collect();
             }
             for q in should {
-                for entry in self.search_query_with_state(q, st, None) {
+                for entry in self.search_query_with_state(q, st, None, include_tail, true) {
                     if let Some(score) = map.get_mut(&entry.row_position) {
                         *score += entry.score;
                     }
@@ -1455,10 +1746,9 @@ impl FtsMemIndex {
         // Step 3: merge per-term postings across every partition and the tail.
         let mut term_postings: HashMap<String, Vec<(u32, u32, Option<Vec<u32>>)>> = HashMap::new();
         for p in st.partitions.iter() {
-            for term_id in 0..p.terms.len() as u32 {
-                let bucket = term_postings
-                    .entry(p.terms[term_id as usize].to_string())
-                    .or_default();
+            for (term_id, term) in p.collect_terms().into_iter().enumerate() {
+                let term_id = term_id as u32;
+                let bucket = term_postings.entry(term.to_string()).or_default();
                 let mut cursor = PostingCursor::new(p, term_id);
                 while let Some(local_doc) = cursor.doc() {
                     let row_pos = p.docs.row_id(local_doc);
@@ -1478,7 +1768,7 @@ impl FtsMemIndex {
             let token: &Arc<str> = entry.key();
             let slice = entry.value().load();
             let bucket = term_postings.entry(token.to_string()).or_default();
-            for chunk in &slice.chunks {
+            for chunk in slice.chunks() {
                 if chunk.batch_position >= tail_snap.visible_count {
                     continue;
                 }
@@ -1540,48 +1830,75 @@ impl FtsMemIndex {
 // ============================================================================
 
 impl TermSlice {
-    fn empty_arc_swap() -> ArcSwap<Self> {
-        ArcSwap::from(Self::empty())
+    fn empty_arc_swap() -> Arc<ArcSwap<Self>> {
+        Arc::new(ArcSwap::from(Self::empty()))
     }
 }
 
-/// Helper used during insert to accumulate a single batch's contribution to
-/// one term.
+/// Accumulates one batch's postings for a single term in a flat,
+/// allocation-light layout. Tokens are appended directly as they stream out
+/// of the tokenizer (`observe`), so there is no intermediate per-document map
+/// or per-`(term, doc)` `Vec` — the dominant insert-path allocation cost.
+///
+/// `row_positions[i]`/`frequencies[i]` describe the i-th document this term
+/// appears in (documents are observed in ascending row order, so
+/// `row_positions` is sorted). `pos_data` is every position concatenated in
+/// document order; document `i`'s slice is delimited by the `frequencies`
+/// prefix sum, materialized into a CSR `Positions` at `build`.
 struct BatchTermBuilder {
     row_positions: Vec<u64>,
     frequencies: Vec<u32>,
-    positions: Vec<Vec<u32>>,
+    pos_data: Vec<u32>,
 }
 
 impl BatchTermBuilder {
-    fn new() -> Self {
+    /// Start a builder seeded with the term's first observed occurrence.
+    fn with_first(row_position: u64, position: u32) -> Self {
         Self {
-            row_positions: Vec::new(),
-            frequencies: Vec::new(),
-            positions: Vec::new(),
+            row_positions: vec![row_position],
+            frequencies: vec![1],
+            pos_data: vec![position],
         }
     }
 
-    fn push_doc(&mut self, row_position: u64, frequency: u32, positions: Vec<u32>) {
-        self.row_positions.push(row_position);
-        self.frequencies.push(frequency);
-        self.positions.push(positions);
+    /// Record one token occurrence of this term at `position` in document
+    /// `row_position`. Documents must be observed in non-decreasing row order.
+    fn observe(&mut self, row_position: u64, position: u32) {
+        if self.row_positions.last().copied() != Some(row_position) {
+            self.row_positions.push(row_position);
+            self.frequencies.push(0);
+        }
+        *self.frequencies.last_mut().expect("seeded on construction") += 1;
+        self.pos_data.push(position);
     }
 
-    /// Always materializes the per-doc positions: in-memory phrase queries
-    /// rely on them regardless of `params.has_positions()`. The flush path
-    /// consults `params.has_positions()` and emits a `Count` recorder
-    /// instead of `Position` when positions should not be persisted.
-    fn build(self, batch_position: usize) -> Arc<TermChunk> {
-        let mut p = Positions::empty();
-        for doc in &self.positions {
-            p.push_doc(doc);
-        }
+    /// Freeze the accumulated postings into a `TermChunk`. Positions are stored
+    /// only when `with_position` (the column's FTS index config) is set — the
+    /// same contract as the on-disk format and Lucene's
+    /// `DOCS_AND_FREQS_AND_POSITIONS` vs `DOCS_AND_FREQS`. Without positions,
+    /// term/BM25 search works but phrase search is unsupported.
+    fn build(self, batch_position: usize, with_position: bool) -> Arc<TermChunk> {
+        let positions = with_position.then(|| {
+            // CSR offsets are the frequency prefix sum.
+            let mut offsets = Vec::with_capacity(self.frequencies.len() + 1);
+            offsets.push(0u32);
+            let mut acc = 0u32;
+            for &f in &self.frequencies {
+                acc += f;
+                offsets.push(acc);
+            }
+            Positions {
+                offsets,
+                data: self.pos_data,
+            }
+        });
+        let max_freq = self.frequencies.iter().copied().max().unwrap_or(0);
         Arc::new(TermChunk {
             batch_position,
             row_positions: self.row_positions,
             frequencies: self.frequencies,
-            positions: Some(p),
+            max_freq,
+            positions,
         })
     }
 }
@@ -1625,16 +1942,11 @@ fn extract_texts(column: &dyn Array) -> Result<Vec<TextOpt<'_>>> {
 }
 
 fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {
-    slice
-        .chunks
-        .iter()
-        .any(|c| c.batch_position < visible_count)
+    slice.chunks().any(|c| c.batch_position < visible_count)
 }
 
 fn lookup_dl(snap: &Snapshot, row_position: u64) -> Option<u32> {
-    snap.batches[..snap.visible_count]
-        .iter()
-        .find_map(|b| b.dl(row_position))
+    snap.batches.iter().find_map(|b| b.dl(row_position))
 }
 
 fn find_doc_in_chunks(
@@ -1649,14 +1961,26 @@ fn find_doc_in_chunks(
     None
 }
 
-/// Build a corpus-wide BM25 scorer over every partition and the tail, for the
-/// (deduplicated) set of query tokens. A single scorer makes partition-WAND
-/// scores and tail-scan scores directly comparable. `tail_snap` must be the
-/// *same* tail snapshot the caller scans, so the scorer's stats and the
-/// scanned postings stay mutually consistent.
-fn build_scorer(st: &IndexState, tail_snap: &Snapshot, tokens: &[String]) -> MemBM25Scorer {
-    let mut total_tokens = tail_snap.cumulative_total_tokens;
-    let mut num_docs = tail_snap.cumulative_doc_count as usize;
+/// Build a corpus-wide BM25 scorer for the (deduplicated) query tokens. A
+/// single scorer makes partition-WAND scores and tail-scan scores directly
+/// comparable. The corpus stats span exactly what the caller searches: the
+/// frozen partitions always, plus the tail when `include_tail` is set (in
+/// which case `tail_snap` must be the *same* snapshot the caller scans, so the
+/// stats and the scanned postings stay mutually consistent).
+fn build_scorer(
+    st: &IndexState,
+    tail_snap: &Snapshot,
+    tokens: &[String],
+    include_tail: bool,
+) -> MemBM25Scorer {
+    let (mut total_tokens, mut num_docs) = if include_tail {
+        (
+            tail_snap.cumulative_total_tokens,
+            tail_snap.cumulative_doc_count as usize,
+        )
+    } else {
+        (0, 0)
+    };
     for p in st.partitions.iter() {
         total_tokens += p.total_tokens();
         num_docs += p.doc_count();
@@ -1666,7 +1990,11 @@ fn build_scorer(st: &IndexState, tail_snap: &Snapshot, tokens: &[String]) -> Mem
         if token_docs.contains_key(token) {
             continue;
         }
-        let mut df = tail_token_df(&st.tail.terms, token, tail_snap.visible_count);
+        let mut df = if include_tail {
+            tail_token_df(&st.tail.terms, token, tail_snap.visible_count)
+        } else {
+            0
+        };
         for p in st.partitions.iter() {
             df += p.token_df(token);
         }
@@ -1677,7 +2005,7 @@ fn build_scorer(st: &IndexState, tail_snap: &Snapshot, tokens: &[String]) -> Mem
 
 /// Number of visible tail docs containing `token`.
 fn tail_token_df(
-    terms: &SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     token: &str,
     visible_count: usize,
 ) -> usize {
@@ -1685,8 +2013,7 @@ fn tail_token_df(
         Some(e) => e
             .value()
             .load()
-            .chunks
-            .iter()
+            .chunks()
             .filter(|c| c.batch_position < visible_count)
             .map(|c| c.doc_count())
             .sum(),
@@ -1698,11 +2025,17 @@ fn tail_token_df(
 /// contribution per document. Uses the shared corpus-wide `scorer`.
 fn score_terms(
     snap: &Snapshot,
-    terms: &SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     tokens: &[String],
     scorer: &MemBM25Scorer,
+    theta: f32,
 ) -> Vec<FtsEntry> {
-    let mut doc_scores: HashMap<RowPosition, f32> = HashMap::new();
+    // Per-token tail data + its score upper bound (max freq over visible chunks,
+    // scored at the most generous doc length of 1). If even the sum of those
+    // bounds cannot beat the current top-k threshold, no tail doc can enter the
+    // results, so skip the whole tail scan. Sound: `doc_weight` is monotone.
+    let mut tail_ub = 0.0f32;
+    let mut tail_terms: Vec<(f32, Arc<TermSlice>)> = Vec::with_capacity(tokens.len());
     for token in tokens {
         let Some(entry) = terms.get(token.as_str()) else {
             continue;
@@ -1712,7 +2045,21 @@ fn score_terms(
             continue;
         }
         let slice = entry.value().load_full();
-        for chunk in &slice.chunks {
+        let max_freq = slice
+            .chunks()
+            .filter(|c| c.batch_position < snap.visible_count)
+            .map(|c| c.max_freq)
+            .max()
+            .unwrap_or(0);
+        tail_ub += qw * scorer.doc_weight(max_freq, 1);
+        tail_terms.push((qw, slice));
+    }
+    if tail_ub <= theta {
+        return Vec::new();
+    }
+    let mut doc_scores: HashMap<RowPosition, f32> = HashMap::new();
+    for (qw, slice) in tail_terms {
+        for chunk in slice.chunks() {
             if chunk.batch_position >= snap.visible_count {
                 continue;
             }
@@ -1739,7 +2086,7 @@ fn score_terms(
 /// `tokens.len() >= 2` here. Scored with the shared corpus-wide `scorer`.
 fn phrase_search_tail(
     snap: &Snapshot,
-    terms: &SkipMap<Arc<str>, ArcSwap<TermSlice>>,
+    terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     tokens: &[String],
     slop: u32,
     scorer: &MemBM25Scorer,
@@ -1751,8 +2098,7 @@ fn phrase_search_tail(
             Some(entry) => {
                 let slice = entry.value().load_full();
                 let visible: Vec<Arc<TermChunk>> = slice
-                    .chunks
-                    .iter()
+                    .chunks()
                     .filter(|c| c.batch_position < snap.visible_count)
                     .cloned()
                     .collect();
@@ -1917,6 +2263,35 @@ fn block_len(doc_count: u32, b: u32) -> usize {
     (doc_count as usize - b as usize * POSTING_BLOCK).min(POSTING_BLOCK)
 }
 
+/// Append `v` as an unsigned LEB128 varint.
+fn put_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Read an unsigned LEB128 varint from `buf` at `*pos`, advancing `*pos`.
+fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
+    let mut v = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = buf[*pos];
+        *pos += 1;
+        v |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    v
+}
+
 /// Bit width needed to represent `v` (0 for `v == 0`).
 fn bit_width(v: u32) -> u8 {
     (32 - v.leading_zeros()) as u8
@@ -2013,6 +2388,72 @@ fn unpack_block(
     }
 }
 
+/// Bit width for a block of ascending doc ids encoded as consecutive gaps from
+/// `first` (`docs[0] == first`, so the leading gap is 0). This is far smaller
+/// than a frame-of-reference width (`bit_width(last - first)`) for dense terms —
+/// the width tracks the largest gap, not the block's span.
+fn doc_block_width(bp: &BitPacker4x, docs: &[u32], first: u32) -> u8 {
+    if docs.len() == POSTING_BLOCK {
+        let mut input = [0u32; POSTING_BLOCK];
+        input.copy_from_slice(docs);
+        bp.num_bits_sorted(first, &input)
+    } else {
+        let mut prev = first;
+        let mut max_gap = 0u32;
+        for &d in docs {
+            max_gap = max_gap.max(d - prev);
+            prev = d;
+        }
+        bit_width(max_gap)
+    }
+}
+
+/// Pack ascending doc ids as consecutive gaps from `first`: SIMD
+/// `compress_sorted` for a full block, scalar gaps otherwise.
+fn pack_doc_block(bp: &BitPacker4x, buf: &mut Vec<u8>, docs: &[u32], first: u32, width: u8) {
+    if docs.len() == POSTING_BLOCK && width > 0 {
+        let mut input = [0u32; POSTING_BLOCK];
+        input.copy_from_slice(docs);
+        let mut out = [0u8; POSTING_BLOCK * 4];
+        let n = bp.compress_sorted(first, &input, &mut out, width);
+        buf.extend_from_slice(&out[..n]);
+    } else {
+        let mut gaps: Vec<u32> = Vec::with_capacity(docs.len());
+        let mut prev = first;
+        for &d in docs {
+            gaps.push(d - prev);
+            prev = d;
+        }
+        bitpack_put(buf, &gaps, width);
+    }
+}
+
+/// Inverse of `pack_doc_block`: reconstruct ascending doc ids into `out`.
+fn unpack_doc_block(
+    bp: &BitPacker4x,
+    buf: &[u8],
+    start: usize,
+    n: usize,
+    width: u8,
+    first: u32,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    if n == POSTING_BLOCK && width > 0 {
+        let mut decoded = [0u32; POSTING_BLOCK];
+        let bytes = bitpack_len(POSTING_BLOCK, width);
+        bp.decompress_sorted(first, &buf[start..start + bytes], &mut decoded, width);
+        out.extend_from_slice(&decoded);
+    } else {
+        bitpack_get(buf, start, n, width, out); // gaps
+        let mut acc = first;
+        for g in out.iter_mut() {
+            acc += *g;
+            *g = acc;
+        }
+    }
+}
+
 /// Random-access read of `n` width-`width` values at logical index `s` from a
 /// bit-packed stream whose first value starts at byte `base` of `buf`. Used to
 /// decode one document's positions without touching the rest of the block.
@@ -2050,8 +2491,12 @@ fn bitpack_read_at(buf: &[u8], base: usize, s: usize, n: usize, width: u8, out: 
 
 /// Per-128-doc-block metadata — enough to skip and score-bound a block
 /// without decoding its payload.
+/// One block's metadata, parsed on demand from the varint `block_bytes` stream
+/// by [`BlockReader`]. `df_offset`/`pos_offset`/`n` are reconstructed by the
+/// reader (the doc/freq offset is derived from per-block widths; the position
+/// offset accumulates the stored per-block byte length), so they are not stored.
 #[derive(Clone, Copy)]
-struct BlockMeta {
+struct BlockMeta<'a> {
     /// first / last doc id in the block (block doc ids are ascending).
     first_doc: u32,
     last_doc: u32,
@@ -2059,45 +2504,184 @@ struct BlockMeta {
     df_offset: u32,
     /// start offset of the block's position payload in `pos_data`.
     pos_offset: u32,
-    /// bit width of the packed doc-id deltas (from `first_doc`) and freqs.
+    /// number of docs in this block.
+    n: usize,
+    /// bit width of the packed doc-id gaps and freqs.
     doc_width: u8,
     freq_width: u8,
     /// bit width of the packed position deltas.
     pos_width: u8,
+    /// Block-local BM25 "impacts": the Pareto `(freq, dl)` frontier of the
+    /// block's docs (no doc dominated by another with both higher freq and
+    /// shorter length), stored as `impacts_len` varint pairs. Because
+    /// `doc_weight` rises with freq and falls with dl, the block's max score is
+    /// `max` over this frontier — a tight (exact) bound used to skip
+    /// non-competitive blocks (block-max WAND). A loose single `(max_freq,
+    /// min_dl)` pair would inflate the bound and defeat skipping.
+    impacts: &'a [u8],
+    impacts_len: u32,
 }
 
-/// Per-term locator into a partition's shared posting buffers.
+impl BlockMeta<'_> {
+    /// Tight block-max BM25 bound: `qw * max_d doc_weight(freq_d, dl_d)` over the
+    /// block, evaluated at the Pareto frontier (the only docs that can be the max
+    /// for any `avgdl`). Sound: every block doc is dominated by a frontier point.
+    fn block_ub(&self, scorer: &MemBM25Scorer, qw: f32) -> f32 {
+        let mut pos = 0usize;
+        let mut best = 0.0f32;
+        for _ in 0..self.impacts_len {
+            let freq = read_varint(self.impacts, &mut pos) as u32;
+            let dl = read_varint(self.impacts, &mut pos) as u32;
+            best = best.max(scorer.doc_weight(freq, dl));
+        }
+        qw * best
+    }
+}
+
+/// Per-term locator. The term's per-block metadata lives in the partition's
+/// `block_bytes` varint stream starting at `meta_offset`.
 #[derive(Clone, Copy)]
 struct PostingRef {
-    /// index of the term's first block in `block_meta`.
-    block_start: u32,
+    /// byte offset of the term's metadata in `block_bytes`.
+    meta_offset: u32,
     /// number of blocks the term spans.
     block_count: u32,
     /// number of docs (postings) for the term.
     doc_count: u32,
-    /// largest frequency / smallest doc length over the whole term: the WAND
-    /// per-term upper bound is `query_weight * doc_weight(max_freq, min_dl)`.
-    max_freq: u32,
-    min_dl: u32,
+}
+
+/// Forward-sequential parser over a term's blocks in `block_bytes`. The cursor
+/// only ever moves forward (new -> block 0; advance -> next; skip_to walks
+/// forward), so block metadata is parsed on demand instead of being stored as a
+/// 32-byte struct per block.
+struct BlockReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    doc_count: u32,
+    block_count: u32,
+    block_idx: u32,
+    prev_last_doc: u32,
+    df_offset: usize,
+    pos_offset: usize,
+}
+
+impl<'a> BlockReader<'a> {
+    fn new(part: &'a Partition, pref: &PostingRef) -> Self {
+        let mut pos = pref.meta_offset as usize;
+        let df_offset = read_varint(&part.block_bytes, &mut pos) as usize;
+        let pos_offset = read_varint(&part.block_bytes, &mut pos) as usize;
+        Self {
+            bytes: &part.block_bytes,
+            pos,
+            doc_count: pref.doc_count,
+            block_count: pref.block_count,
+            block_idx: 0,
+            prev_last_doc: 0,
+            df_offset,
+            pos_offset,
+        }
+    }
+
+    /// Parse the next block's metadata (without decoding its payload), advancing
+    /// the derived doc/freq and position offsets. `None` once exhausted.
+    fn next_meta(&mut self) -> Option<BlockMeta<'a>> {
+        if self.block_idx >= self.block_count {
+            return None;
+        }
+        let n = block_len(self.doc_count, self.block_idx);
+        let first_field = read_varint(self.bytes, &mut self.pos) as u32;
+        let first_doc = if self.block_idx == 0 {
+            first_field
+        } else {
+            self.prev_last_doc + first_field
+        };
+        let last_doc = first_doc + read_varint(self.bytes, &mut self.pos) as u32;
+        let doc_width = self.bytes[self.pos];
+        let freq_width = self.bytes[self.pos + 1];
+        let pos_width = self.bytes[self.pos + 2];
+        self.pos += 3;
+        let pos_bytes = read_varint(self.bytes, &mut self.pos) as usize;
+        // Pareto `(freq, dl)` frontier: a count followed by that many varint
+        // pairs. Capture the pair bytes as a slice and skip past them.
+        let impacts_len = read_varint(self.bytes, &mut self.pos) as u32;
+        let impacts_start = self.pos;
+        for _ in 0..impacts_len {
+            read_varint(self.bytes, &mut self.pos);
+            read_varint(self.bytes, &mut self.pos);
+        }
+        let bm = BlockMeta {
+            first_doc,
+            last_doc,
+            df_offset: self.df_offset as u32,
+            pos_offset: self.pos_offset as u32,
+            n,
+            doc_width,
+            freq_width,
+            pos_width,
+            impacts: &self.bytes[impacts_start..self.pos],
+            impacts_len,
+        };
+        self.df_offset += bitpack_len(n, doc_width) + bitpack_len(n, freq_width);
+        self.pos_offset += pos_bytes;
+        self.prev_last_doc = last_doc;
+        self.block_idx += 1;
+        Some(bm)
+    }
 }
 
 /// An immutable, frozen FTS partition. Posting lists are byte-compressed
 /// (VByte + delta, 128-doc blocks) into three shared buffers, so per-term
 /// overhead is one `PostingRef`. See `compress-fts-partition-memory/DESIGN.md`.
 struct Partition {
-    /// term texts, sorted; the index is the local term id. Interned, so the
-    /// string bytes are shared across partitions.
-    terms: Box<[Arc<str>]>,
-    /// per term, parallel to `terms`.
+    /// Term dictionary: a compact FST mapping each term's bytes to its local
+    /// term id (0-based, dense, in sorted order). Replaces a sorted
+    /// `Box<[Arc<str>]>` searched by binary search; smaller (prefix-shared, no
+    /// per-term pointers) with O(term length) lookup.
+    term_fst: Map<Vec<u8>>,
+    /// per term, indexed by the FST's term id.
     postings: Box<[PostingRef]>,
-    /// per-block metadata for every term's blocks, concatenated.
-    block_meta: Box<[BlockMeta]>,
+    /// per-term, per-block metadata as a varint stream (see [`BlockReader`]) —
+    /// replaces a 32-byte `BlockMeta` struct per block.
+    block_bytes: Box<[u8]>,
     /// VByte(doc-id gaps) then VByte(freqs) for every block, concatenated.
     doc_freq_data: Box<[u8]>,
     /// per doc per block: VByte(count) then VByte(delta positions), concatenated.
     pos_data: Box<[u8]>,
     /// local doc id -> (MemTable row position, token count).
     docs: DocSet,
+}
+
+/// Maximum stored `(freq, dl)` impacts per block. The frontier can't exceed the
+/// number of distinct freqs in a block, so it is naturally small; beyond this a
+/// block falls back to the single loose `(max_freq, min_dl)` point (still a sound
+/// bound), capping storage for rare high-freq-variance blocks.
+const MAX_BLOCK_IMPACTS: usize = 16;
+
+/// Pareto `(freq, dl)` frontier of a block's docs: the points not dominated by
+/// another with both `freq' >= freq` and `dl' <= dl`. Since `doc_weight` rises
+/// with freq and falls with dl, the block's max BM25 score for ANY `avgdl` is
+/// reached on this frontier — so `max` over it is a tight (exact) block bound.
+/// `pairs` is sorted in place.
+fn block_impacts(pairs: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
+    // dl ascending, then freq descending: sweep keeping a running max freq; a
+    // point joins the frontier iff its freq exceeds every point with a
+    // smaller-or-equal dl seen so far (each added point has a strictly larger
+    // freq, so |frontier| <= distinct freqs).
+    pairs.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    let mut frontier: Vec<(u32, u32)> = Vec::new();
+    let mut max_f = 0u32;
+    for &(f, d) in pairs.iter() {
+        if frontier.is_empty() || f > max_f {
+            frontier.push((f, d.max(1)));
+            max_f = f;
+        }
+    }
+    if frontier.len() > MAX_BLOCK_IMPACTS {
+        let max_freq = frontier.iter().map(|&(f, _)| f).max().unwrap_or(0);
+        let min_dl = frontier.iter().map(|&(_, d)| d).min().unwrap_or(1).max(1);
+        return vec![(max_freq, min_dl)];
+    }
+    frontier
 }
 
 /// Build a partition from `(term, sorted (doc, freq, positions))` entries.
@@ -2108,25 +2692,30 @@ fn build_partition(
 ) -> Partition {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let bp = BitPacker4x::new();
-    let mut terms = Vec::with_capacity(entries.len());
+    // Terms are inserted in sorted order; the FST value is the dense term id.
+    let mut term_builder = fst::MapBuilder::memory();
     let mut postings = Vec::with_capacity(entries.len());
-    let mut block_meta: Vec<BlockMeta> = Vec::new();
+    let mut block_bytes: Vec<u8> = Vec::new();
     let mut doc_freq_data: Vec<u8> = Vec::new();
     let mut pos_data: Vec<u8> = Vec::new();
     for (term, docs_for_term) in entries {
         let doc_count = docs_for_term.len() as u32;
-        let block_start = block_meta.len() as u32;
-        let mut term_max_freq = 0u32;
-        let mut term_min_dl = u32::MAX;
+        let meta_offset = block_bytes.len() as u32;
+        // Term-level start offsets; per-block doc/freq offsets are derived from
+        // widths, position offsets accumulate the stored per-block byte length.
+        put_varint(&mut block_bytes, doc_freq_data.len() as u64);
+        put_varint(&mut block_bytes, pos_data.len() as u64);
+        let mut block_count = 0u32;
+        let mut prev_last_doc = 0u32;
         for chunk in docs_for_term.chunks(POSTING_BLOCK) {
-            let df_offset = doc_freq_data.len() as u32;
-            let pos_offset = pos_data.len() as u32;
+            let pos_offset_before = pos_data.len();
             let first_doc = chunk[0].0;
             let last_doc = chunk[chunk.len() - 1].0;
-            // doc ids: bit-pack `doc - first_doc` at a fixed block width.
-            let doc_width = bit_width(last_doc - first_doc);
-            let doc_deltas: Vec<u32> = chunk.iter().map(|&(d, _, _)| d - first_doc).collect();
-            pack_block(&bp, &mut doc_freq_data, &doc_deltas, doc_width);
+            // doc ids: bit-pack consecutive gaps from `first_doc` (width tracks
+            // the largest gap, not the block span — much tighter for dense terms).
+            let docs_block: Vec<u32> = chunk.iter().map(|&(d, _, _)| d).collect();
+            let doc_width = doc_block_width(&bp, &docs_block, first_doc);
+            pack_doc_block(&bp, &mut doc_freq_data, &docs_block, first_doc, doc_width);
             // frequencies: bit-pack at a fixed block width.
             let blk_max_freq = chunk.iter().map(|&(_, f, _)| f).max().unwrap_or(0);
             let freq_width = bit_width(blk_max_freq);
@@ -2136,44 +2725,81 @@ fn build_partition(
             // A doc's position count equals its frequency, so no count is
             // stored — doc `i`'s slice is found from the freq prefix sum.
             let mut pos_deltas: Vec<u32> = Vec::new();
-            for &(d, _, ref positions) in chunk {
+            let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(chunk.len());
+            for &(d, f, ref positions) in chunk {
                 let mut prev_p = 0u32;
                 for &p in positions {
                     pos_deltas.push(p - prev_p);
                     prev_p = p;
                 }
-                term_min_dl = term_min_dl.min(docs.num_tokens(d));
+                pairs.push((f, docs.num_tokens(d)));
             }
             let pos_width = bit_width(pos_deltas.iter().copied().max().unwrap_or(0));
             bitpack_put(&mut pos_data, &pos_deltas, pos_width);
-            block_meta.push(BlockMeta {
-                first_doc,
-                last_doc,
-                df_offset,
-                pos_offset,
-                doc_width,
-                freq_width,
-                pos_width,
-            });
-            term_max_freq = term_max_freq.max(blk_max_freq);
+            // Emit the block's varint metadata record.
+            let first_field = if block_count == 0 {
+                first_doc
+            } else {
+                first_doc - prev_last_doc
+            };
+            put_varint(&mut block_bytes, first_field as u64);
+            put_varint(&mut block_bytes, (last_doc - first_doc) as u64);
+            block_bytes.push(doc_width);
+            block_bytes.push(freq_width);
+            block_bytes.push(pos_width);
+            put_varint(
+                &mut block_bytes,
+                (pos_data.len() - pos_offset_before) as u64,
+            );
+            // Block-max impacts: the Pareto (freq, dl) frontier, as a count then
+            // that many varint pairs (read back by `BlockReader::next_meta`).
+            let impacts = block_impacts(&mut pairs);
+            put_varint(&mut block_bytes, impacts.len() as u64);
+            for (f, d) in impacts {
+                put_varint(&mut block_bytes, f as u64);
+                put_varint(&mut block_bytes, d as u64);
+            }
+            prev_last_doc = last_doc;
+            block_count += 1;
         }
+        let term_id = postings.len() as u64;
         postings.push(PostingRef {
-            block_start,
-            block_count: block_meta.len() as u32 - block_start,
+            meta_offset,
+            block_count,
             doc_count,
-            max_freq: term_max_freq,
-            min_dl: term_min_dl.max(1),
         });
-        terms.push(term);
+        term_builder
+            .insert(term.as_bytes(), term_id)
+            .expect("terms inserted in sorted, unique order");
     }
+    let term_fst =
+        Map::new(term_builder.into_inner().expect("fst build")).expect("valid fst bytes");
     Partition {
-        terms: terms.into_boxed_slice(),
+        term_fst,
         postings: postings.into_boxed_slice(),
-        block_meta: block_meta.into_boxed_slice(),
+        block_bytes: block_bytes.into_boxed_slice(),
         doc_freq_data: doc_freq_data.into_boxed_slice(),
         pos_data: pos_data.into_boxed_slice(),
         docs,
     }
+}
+
+/// Pick a size tier (partitions bucketed by `floor(log2(doc_count))`) holding
+/// at least `factor` partitions and return its members to merge. Prefers the
+/// smallest such tier, so a merge fuses similarly-sized partitions and total
+/// merge work stays amortized (a partition is re-merged only as it climbs
+/// tiers). `None` when no tier is over-full.
+fn select_merge_group(partitions: &[Arc<Partition>], factor: usize) -> Option<Vec<Arc<Partition>>> {
+    let mut buckets: HashMap<u32, Vec<Arc<Partition>>> = HashMap::new();
+    for p in partitions {
+        let tier = u64::BITS - (p.doc_count().max(1) as u64).leading_zeros();
+        buckets.entry(tier).or_default().push(p.clone());
+    }
+    buckets
+        .into_iter()
+        .filter(|(_, g)| g.len() >= factor)
+        .min_by_key(|(tier, _)| *tier)
+        .map(|(_, g)| g)
 }
 
 impl Partition {
@@ -2189,20 +2815,37 @@ impl Partition {
         self.postings.iter().map(|p| p.doc_count as usize).sum()
     }
 
-    /// Local term id of `token`, via binary search over the sorted `terms`.
+    /// Local term id of `token`, via the FST term dictionary.
     fn term_id(&self, token: &str) -> Option<u32> {
-        self.terms
-            .binary_search_by(|t| t.as_ref().cmp(token))
-            .ok()
-            .map(|i| i as u32)
+        self.term_fst.get(token.as_bytes()).map(|v| v as u32)
     }
 
     fn contains_token(&self, token: &str) -> bool {
         self.term_id(token).is_some()
     }
 
-    fn tokens(&self) -> impl Iterator<Item = &Arc<str>> {
-        self.terms.iter()
+    /// All terms, indexed by term id (recovered from the FST). Used by the
+    /// flush, merge, and fuzzy-expansion paths; not on the hot search path.
+    fn collect_terms(&self) -> Vec<Arc<str>> {
+        let mut out: Vec<Arc<str>> = vec![Arc::from(""); self.term_fst.len()];
+        let mut stream = self.term_fst.stream();
+        while let Some((key, id)) = stream.next() {
+            out[id as usize] = Arc::from(std::str::from_utf8(key).expect("utf8 term"));
+        }
+        out
+    }
+
+    /// Exact upper bound on a term's BM25 contribution to any doc: the max over
+    /// its per-block impact frontiers. Walks block metadata (no payload decode),
+    /// so it is cheap relative to scoring; used as the MaxScore lane bound.
+    fn term_ub(&self, term_id: u32, scorer: &MemBM25Scorer, qw: f32) -> f32 {
+        let pref = self.postings[term_id as usize];
+        let mut reader = BlockReader::new(self, &pref);
+        let mut ub = 0.0f32;
+        while let Some(bm) = reader.next_meta() {
+            ub = ub.max(bm.block_ub(scorer, qw));
+        }
+        ub
     }
 
     /// Number of docs in this partition containing `token`.
@@ -2214,22 +2857,17 @@ impl Partition {
 
     fn memory_size(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self
-                .terms
-                .iter()
-                .map(|t| std::mem::size_of::<Arc<str>>() + t.len())
-                .sum::<usize>()
+            + self.term_fst.as_fst().as_bytes().len()
             + self.postings.len() * std::mem::size_of::<PostingRef>()
-            + self.block_meta.len() * std::mem::size_of::<BlockMeta>()
+            + self.block_bytes.len()
             + self.doc_freq_data.len()
             + self.pos_data.len()
             + self.docs.len() * (std::mem::size_of::<u64>() + 2 * std::mem::size_of::<u32>())
     }
 
     /// Freeze the visible contents of `tail` into a new partition. Returns
-    /// `None` if the tail has no visible docs. Terms are interned so their
-    /// bytes are shared with other partitions.
-    fn from_tail(tail: &TailIndex, interner: &TermInterner) -> Option<Self> {
+    /// `None` if the tail has no visible docs.
+    fn from_tail(tail: &TailIndex) -> Option<Self> {
         let snap = tail.snapshot();
         if snap.visible_count == 0 {
             return None;
@@ -2244,32 +2882,42 @@ impl Partition {
                 pos_to_doc.insert(rp, doc_id);
             }
         }
-        let mut entries: Vec<(Arc<str>, Vec<(u32, u32, Vec<u32>)>)> = Vec::new();
-        for entry in tail.terms.iter() {
-            let slice = entry.value().load();
-            let mut docs_for_term: Vec<(u32, u32, Vec<u32>)> = Vec::new();
-            for chunk in &slice.chunks {
-                if chunk.batch_position >= snap.visible_count {
-                    continue;
-                }
-                for (i, rp) in chunk.row_positions.iter().enumerate() {
-                    let Some(&doc_id) = pos_to_doc.get(rp) else {
+        // Snapshot the term slices (a cheap sequential skip-list walk of Arc
+        // clones), then build each term's sorted posting list in parallel — the
+        // per-term work (chunk traversal + sort) dominates the freeze and is
+        // independent across terms. `pos_to_doc`/`snap` are shared read-only.
+        let term_slices: Vec<(Arc<str>, Arc<TermSlice>)> = tail
+            .terms
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load_full()))
+            .collect();
+        let entries: Vec<(Arc<str>, Vec<(u32, u32, Vec<u32>)>)> = term_slices
+            .into_par_iter()
+            .filter_map(|(key, slice)| {
+                let mut docs_for_term: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+                for chunk in slice.chunks() {
+                    if chunk.batch_position >= snap.visible_count {
                         continue;
-                    };
-                    let pos = chunk
-                        .positions
-                        .as_ref()
-                        .map(|p| p.doc_positions(i).to_vec())
-                        .unwrap_or_default();
-                    docs_for_term.push((doc_id, chunk.frequencies[i], pos));
+                    }
+                    for (i, rp) in chunk.row_positions.iter().enumerate() {
+                        let Some(&doc_id) = pos_to_doc.get(rp) else {
+                            continue;
+                        };
+                        let pos = chunk
+                            .positions
+                            .as_ref()
+                            .map(|p| p.doc_positions(i).to_vec())
+                            .unwrap_or_default();
+                        docs_for_term.push((doc_id, chunk.frequencies[i], pos));
+                    }
                 }
-            }
-            if docs_for_term.is_empty() {
-                continue;
-            }
-            docs_for_term.sort_by_key(|(d, _, _)| *d);
-            entries.push((interner.intern(entry.key()), docs_for_term));
-        }
+                if docs_for_term.is_empty() {
+                    return None;
+                }
+                docs_for_term.sort_by_key(|(d, _, _)| *d);
+                Some((key, docs_for_term))
+            })
+            .collect();
         Some(build_partition(entries, docs))
     }
 
@@ -2283,8 +2931,10 @@ impl Partition {
             for (rp, nt) in p.docs.iter() {
                 docs.append(*rp, *nt);
             }
-            for term_id in 0..p.terms.len() as u32 {
-                let bucket = merged.entry(p.terms[term_id as usize].clone()).or_default();
+            let terms = p.collect_terms();
+            for (term_id, term) in terms.into_iter().enumerate() {
+                let term_id = term_id as u32;
+                let bucket = merged.entry(term).or_default();
                 let mut cursor = PostingCursor::new(p, term_id);
                 while let Some(doc) = cursor.doc() {
                     let positions = cursor.positions().to_vec();
@@ -2298,7 +2948,7 @@ impl Partition {
     }
 
     /// Exact O(matches) BM25 OR/AND-search of the partition by direct posting
-    /// scan. The pruned top-k path is `wand_into`; this is the unbounded and
+    /// scan. The pruned top-k path is `or_topk_into`; this is the unbounded and
     /// AND path. Scored with `scorer`, so scores match `score_terms`.
     fn search_match(
         &self,
@@ -2357,63 +3007,161 @@ impl Partition {
         results
     }
 
-    /// WAND top-k over an OR query, contributing into the caller's shared
-    /// [`TopK`]. Exact: each term's `(max_freq, min_dl)` gives a sound score
-    /// upper bound, so docs that provably cannot beat the shared threshold
-    /// are skipped. Because the threshold is shared across all partitions and
-    /// the tail, a partition processed late prunes against an already-warm
-    /// threshold instead of cold-starting.
-    fn wand_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
+    /// Single-term top-k with block-max skipping. For each 128-doc block, the
+    /// per-block upper bound `qw * doc_weight(block.max_freq, block.min_dl)`
+    /// bounds every doc's score in the block; when the top-k heap is full and
+    /// that bound cannot beat the current k-th score, the block is skipped
+    /// without decoding. This keeps cost ~O(competitive blocks) instead of
+    /// O(df), the gap behind term-query latency scaling with corpus size.
+    /// Exactness is preserved: the bound is sound, so no top-k doc is dropped.
+    fn score_single_into(&self, term_id: u32, qw: f32, scorer: &MemBM25Scorer, topk: &mut TopK) {
+        let pref = self.postings[term_id as usize];
+        let bp = BitPacker4x::new();
+        let mut docs: Vec<u32> = Vec::new();
+        let mut freqs: Vec<u32> = Vec::new();
+        let mut reader = BlockReader::new(self, &pref);
+        while let Some(bm) = reader.next_meta() {
+            let block_ub = bm.block_ub(scorer, qw);
+            if block_ub <= topk.threshold() {
+                continue; // no doc in this block can enter the top-k
+            }
+            let n = bm.n;
+            let df_start = bm.df_offset as usize;
+            unpack_doc_block(
+                &bp,
+                &self.doc_freq_data,
+                df_start,
+                n,
+                bm.doc_width,
+                bm.first_doc,
+                &mut docs,
+            );
+            let freq_start = df_start + bitpack_len(n, bm.doc_width);
+            unpack_block(
+                &bp,
+                &self.doc_freq_data,
+                freq_start,
+                n,
+                bm.freq_width,
+                &mut freqs,
+            );
+            for i in 0..n {
+                let doc = docs[i];
+                let dl = self.docs.num_tokens(doc);
+                let score = qw * scorer.doc_weight(freqs[i], dl);
+                topk.offer(score, self.docs.row_id(doc));
+            }
+        }
+    }
+
+    /// Top-k OR over the query tokens, contributing into the caller's shared
+    /// [`TopK`]. Single-term uses block-max skipping; multi-term uses MaxScore
+    /// (see [`Self::maxscore_loop`]). Exact, and because the threshold is shared
+    /// across all partitions and the tail, a partition processed late prunes
+    /// against an already-warm threshold instead of cold-starting.
+    fn or_topk_into(&self, tokens: &[String], scorer: &MemBM25Scorer, topk: &mut TopK) {
+        // Single-term top-k: block-max skip. Multi-term: MaxScore below.
+        if tokens.len() == 1 {
+            if let Some(id) = self.term_id(&tokens[0]) {
+                let qw = scorer.query_weight(&tokens[0]);
+                self.score_single_into(id, qw, scorer, topk);
+            }
+            return;
+        }
         let mut lanes: Vec<WandLane> = Vec::with_capacity(tokens.len());
         for token in tokens {
             if let Some(id) = self.term_id(token) {
-                let pref = &self.postings[id as usize];
                 let qw = scorer.query_weight(token);
+                let cursor = PostingCursor::new(self, id);
+                let doc = cursor.doc();
                 lanes.push(WandLane {
-                    cursor: PostingCursor::new(self, id),
+                    cursor,
                     qw,
-                    ub: qw * scorer.doc_weight(pref.max_freq, pref.min_dl),
+                    // Exact term max contribution (tightest sound bound): the
+                    // max over the term's per-block impact frontiers. A loose
+                    // `doc_weight(max_freq, min_dl)` would over-bound and keep
+                    // terms "essential" longer, shrinking MaxScore's prune.
+                    ub: self.term_ub(id, scorer, qw),
+                    doc,
                 });
             }
         }
+        lanes.retain(|l| l.doc.is_some());
         if lanes.is_empty() {
             return;
         }
+        self.maxscore_loop(lanes, scorer, topk);
+    }
+
+    /// MaxScore top-k over an OR query. Terms are sorted by their max
+    /// contribution (`ub`) ascending; the longest prefix whose `ub` sum can't
+    /// reach the current threshold is "non-essential" — a doc matching only
+    /// those can't enter the top-k, so candidates are generated from the
+    /// "essential" suffix alone (iterating fewer lists than WAND) and the
+    /// non-essential lists are only probed per candidate, highest-`ub` first,
+    /// with an early exit once the remaining bound can't beat the threshold.
+    /// Exact: same bounds as WAND, just a different traversal.
+    fn maxscore_loop(&self, mut lanes: Vec<WandLane>, scorer: &MemBM25Scorer, topk: &mut TopK) {
+        // Fixed ascending-`ub` order so the non-essential prefix is well-defined.
+        lanes.sort_by(|a, b| a.ub.partial_cmp(&b.ub).unwrap_or(std::cmp::Ordering::Equal));
         loop {
-            lanes.retain(|l| l.cursor.doc().is_some());
-            if lanes.is_empty() {
-                break;
-            }
-            lanes.sort_by_key(|l| l.cursor.doc().unwrap());
             let theta = topk.threshold();
-            // Pivot: first lane whose cumulative upper bound exceeds theta.
-            let mut acc = 0.0f32;
-            let mut pivot = None;
-            for (i, l) in lanes.iter().enumerate() {
-                acc += l.ub;
-                if acc > theta {
-                    pivot = Some(i);
+            // Non-essential prefix [0..ne): cumulative `ub` sum <= theta.
+            let mut ne = 0;
+            let mut cum = 0.0f32;
+            while ne < lanes.len() && cum + lanes[ne].ub <= theta {
+                cum += lanes[ne].ub;
+                ne += 1;
+            }
+            if ne == lanes.len() {
+                break; // no remaining doc can reach theta
+            }
+            // Candidate: min current doc among the essential lanes.
+            let mut cand: Option<u32> = None;
+            for l in &lanes[ne..] {
+                if let Some(d) = l.doc {
+                    cand = Some(cand.map_or(d, |c| c.min(d)));
+                }
+            }
+            let Some(cand) = cand else {
+                break; // essential lanes exhausted
+            };
+            let dl = self.docs.num_tokens(cand);
+            let mut score = 0.0f32;
+            for l in lanes[ne..].iter_mut() {
+                if l.doc == Some(cand) {
+                    score += l.qw * scorer.doc_weight(l.cursor.freq(), dl);
+                }
+            }
+            // Probe non-essential lanes high-`ub` first; stop once even the max
+            // remaining contribution can't lift the score past theta.
+            let mut rem = cum;
+            let mut alive = true;
+            for i in (0..ne).rev() {
+                if score + rem <= theta {
+                    alive = false;
                     break;
                 }
-            }
-            let Some(pivot) = pivot else {
-                break; // no remaining doc can reach theta
-            };
-            let pivot_doc = lanes[pivot].cursor.doc().unwrap();
-            if lanes[0].cursor.doc().unwrap() == pivot_doc {
-                // Every lane positioned at pivot_doc contributes; score it.
-                let dl = self.docs.num_tokens(pivot_doc);
-                let mut score = 0.0f32;
-                for l in lanes.iter_mut() {
-                    if l.cursor.doc() == Some(pivot_doc) {
-                        score += l.qw * scorer.doc_weight(l.cursor.freq(), dl);
-                        l.cursor.advance();
-                    }
+                rem -= lanes[i].ub;
+                lanes[i].cursor.skip_to(cand);
+                lanes[i].doc = lanes[i].cursor.doc();
+                if lanes[i].doc == Some(cand) {
+                    score += lanes[i].qw * scorer.doc_weight(lanes[i].cursor.freq(), dl);
                 }
-                topk.offer(score, self.docs.row_id(pivot_doc));
-            } else {
-                // A lane before the pivot trails pivot_doc; skip it forward.
-                lanes[0].cursor.skip_to(pivot_doc);
+            }
+            if alive {
+                topk.offer(score, self.docs.row_id(cand));
+            }
+            // Advance the essential lanes that were positioned at the candidate.
+            for l in lanes[ne..].iter_mut() {
+                if l.doc == Some(cand) {
+                    l.cursor.advance();
+                    l.doc = l.cursor.doc();
+                }
+            }
+            lanes.retain(|l| l.doc.is_some());
+            if lanes.is_empty() {
+                break;
             }
         }
     }
@@ -2438,9 +3186,11 @@ impl Partition {
             .map(|&id| PostingCursor::new(self, id))
             .collect();
         let mut results = Vec::new();
+        // Reused across candidate docs to avoid per-doc allocation (the hot
+        // phrase cost when the rarest term still has a high doc count).
+        let mut all_positions: Vec<Vec<u32>> = vec![Vec::new(); tokens.len()];
+        let mut freqs = vec![0u32; tokens.len()];
         while let Some(doc) = cursors[rarest].cursor_doc() {
-            let mut all_positions: Vec<Vec<u32>> = vec![Vec::new(); tokens.len()];
-            let mut freqs = vec![0u32; tokens.len()];
             let mut present = true;
             for ti in 0..tokens.len() {
                 if ti != rarest {
@@ -2448,7 +3198,8 @@ impl Partition {
                 }
                 if cursors[ti].doc() == Some(doc) {
                     freqs[ti] = cursors[ti].freq();
-                    all_positions[ti] = cursors[ti].positions().to_vec();
+                    all_positions[ti].clear();
+                    all_positions[ti].extend_from_slice(cursors[ti].positions());
                 } else {
                     present = false;
                     break;
@@ -2555,6 +3306,10 @@ struct WandLane<'a> {
     qw: f32,
     /// Upper bound on this term's contribution to any doc's score.
     ub: f32,
+    /// Cached `cursor.doc()`, refreshed only when the lane moves. The WAND loop
+    /// reads this field (not `cursor.doc()`) in its per-iteration retain / sort /
+    /// pivot, which dominates OR latency (~20 iterations per scored doc).
+    doc: Option<u32>,
 }
 
 /// A decoding cursor over one term's compressed posting list. Decodes a
@@ -2562,18 +3317,20 @@ struct WandLane<'a> {
 /// without decoding them.
 struct PostingCursor<'a> {
     part: &'a Partition,
-    pref: PostingRef,
-    /// 0-based block index within the term; `== block_count` once exhausted.
-    block: u32,
-    /// the block decoded into `docs`/`freqs` (`u32::MAX` = none).
-    decoded: u32,
+    /// Forward-only parser over the term's block metadata.
+    reader: BlockReader<'a>,
+    /// Metadata of the block currently decoded into `docs`/`freqs`, or `None`
+    /// when the posting list is exhausted.
+    cur: Option<BlockMeta<'a>>,
+    /// Whether `docs`/`freqs` hold `cur`'s payload (false while `skip_to` walks
+    /// past whole blocks without decoding them).
+    decoded: bool,
     docs: Vec<u32>,
     freqs: Vec<u32>,
-    /// freq prefix sum of the decoded block (`len == freqs.len() + 1`); the
-    /// block it was computed for is `prefix_block`. Indexes the position
-    /// stream for random per-doc access.
+    /// freq prefix sum of the current block (`len == freqs.len() + 1`), indexing
+    /// the position stream for random per-doc access. Valid when `prefix_valid`.
     prefix: Vec<u32>,
-    prefix_block: u32,
+    prefix_valid: bool,
     /// scratch for the most recently decoded doc's positions.
     pos_scratch: Vec<u32>,
     /// index within the current block.
@@ -2585,61 +3342,66 @@ struct PostingCursor<'a> {
 impl<'a> PostingCursor<'a> {
     fn new(part: &'a Partition, term_id: u32) -> Self {
         let pref = part.postings[term_id as usize];
+        let mut reader = BlockReader::new(part, &pref);
+        let cur = reader.next_meta();
         let mut cursor = Self {
             part,
-            pref,
-            block: 0,
-            decoded: u32::MAX,
+            reader,
+            cur,
+            decoded: false,
             docs: Vec::new(),
             freqs: Vec::new(),
             prefix: Vec::new(),
-            prefix_block: u32::MAX,
+            prefix_valid: false,
             pos_scratch: Vec::new(),
             i: 0,
             bp: BitPacker4x::new(),
         };
-        if pref.block_count > 0 {
-            cursor.decode_doc_freq(0);
+        if let Some(bm) = cursor.cur {
+            cursor.decode(bm);
         }
         cursor
     }
 
-    fn decode_doc_freq(&mut self, block: u32) {
-        if self.decoded == block {
-            return;
-        }
-        let bm = self.part.block_meta[(self.pref.block_start + block) as usize];
-        let n = block_len(self.pref.doc_count, block);
-        self.docs.clear();
-        // doc ids: bit-packed `doc - first_doc`.
+    /// Decode the doc ids + freqs of block `bm` into `docs`/`freqs`.
+    fn decode(&mut self, bm: BlockMeta<'a>) {
         let df_start = bm.df_offset as usize;
-        unpack_block(
+        unpack_doc_block(
             &self.bp,
             &self.part.doc_freq_data,
             df_start,
-            n,
+            bm.n,
             bm.doc_width,
+            bm.first_doc,
             &mut self.docs,
         );
-        for d in &mut self.docs {
-            *d += bm.first_doc;
-        }
-        // frequencies follow the doc-id block.
-        let freq_start = df_start + bitpack_len(n, bm.doc_width);
+        let freq_start = df_start + bitpack_len(bm.n, bm.doc_width);
         unpack_block(
             &self.bp,
             &self.part.doc_freq_data,
             freq_start,
-            n,
+            bm.n,
             bm.freq_width,
             &mut self.freqs,
         );
-        self.decoded = block;
+        self.decoded = true;
+        self.prefix_valid = false;
+    }
+
+    /// Move to the next block (parse + decode it), or exhaust.
+    fn next_block(&mut self) {
+        self.cur = self.reader.next_meta();
+        self.i = 0;
+        self.prefix_valid = false;
+        self.decoded = false;
+        if let Some(bm) = self.cur {
+            self.decode(bm);
+        }
     }
 
     /// Ensure `prefix` holds the freq prefix sum of the current block.
     fn ensure_prefix(&mut self) {
-        if self.prefix_block == self.block {
+        if self.prefix_valid {
             return;
         }
         self.prefix.clear();
@@ -2649,14 +3411,12 @@ impl<'a> PostingCursor<'a> {
             sum += f;
             self.prefix.push(sum);
         }
-        self.prefix_block = self.block;
+        self.prefix_valid = true;
     }
 
     /// Current doc id, or `None` once the list is exhausted.
     fn doc(&self) -> Option<u32> {
-        if self.block >= self.pref.block_count {
-            return None;
-        }
+        self.cur?;
         self.docs.get(self.i).copied()
     }
 
@@ -2675,7 +3435,7 @@ impl<'a> PostingCursor<'a> {
     /// document only (random access into the block's position stream).
     fn positions(&mut self) -> &[u32] {
         self.ensure_prefix();
-        let bm = self.part.block_meta[(self.pref.block_start + self.block) as usize];
+        let bm = self.cur.expect("positions() on exhausted cursor");
         let s = self.prefix[self.i] as usize;
         let n = self.prefix[self.i + 1] as usize - s;
         self.pos_scratch.clear();
@@ -2700,34 +3460,34 @@ impl<'a> PostingCursor<'a> {
     fn advance(&mut self) {
         self.i += 1;
         if self.i >= self.docs.len() {
-            self.block += 1;
-            self.i = 0;
-            if self.block < self.pref.block_count {
-                self.decode_doc_freq(self.block);
-            }
+            self.next_block();
         }
     }
 
     /// Advance to the first posting with `doc_id >= target` (or exhaust),
-    /// skipping whole blocks via `BlockMeta` without decoding them.
+    /// skipping whole blocks via their `last_doc` without decoding them.
     fn skip_to(&mut self, target: u32) {
         if self.doc().is_some_and(|d| d >= target) {
             return;
         }
-        while self.block < self.pref.block_count {
-            let bm = self.part.block_meta[(self.pref.block_start + self.block) as usize];
+        loop {
+            let Some(bm) = self.cur else {
+                return; // exhausted
+            };
             if bm.last_doc >= target {
-                break;
+                if !self.decoded {
+                    self.decode(bm);
+                }
+                // `last_doc >= target`, so this block holds a doc >= target.
+                self.i += self.docs[self.i..].partition_point(|&d| d < target);
+                return;
             }
-            self.block += 1;
+            // Whole block precedes `target`; skip it without decoding.
+            self.cur = self.reader.next_meta();
             self.i = 0;
+            self.decoded = false;
+            self.prefix_valid = false;
         }
-        if self.block >= self.pref.block_count {
-            return;
-        }
-        self.decode_doc_freq(self.block);
-        // `last_doc >= target`, so this block holds a doc >= target.
-        self.i += self.docs[self.i..].partition_point(|&d| d < target);
     }
 }
 
@@ -2748,6 +3508,17 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("description", DataType::Utf8, true),
         ]))
+    }
+
+    /// A position-enabled index — required for phrase search. The default
+    /// `InvertedIndexParams` (`with_position = false`) indexes no positions, so
+    /// phrase tests must opt in, mirroring the on-disk / Lucene contract.
+    fn position_index(field_id: i32, column: &str) -> FtsMemIndex {
+        FtsMemIndex::with_params(
+            field_id,
+            column.to_string(),
+            InvertedIndexParams::default().with_position(true),
+        )
     }
 
     fn create_test_batch(schema: &ArrowSchema) -> RecordBatch {
@@ -2809,7 +3580,7 @@ mod tests {
     #[test]
     fn test_phrase_search_exact_match() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -2819,7 +3590,7 @@ mod tests {
         assert_eq!(entries[0].row_position, 0);
 
         let batch2 = create_test_batch(&schema);
-        let index2 = FtsMemIndex::new(1, "description".to_string());
+        let index2 = position_index(1, "description");
         index2.insert(&batch2, 0).unwrap();
 
         let entries = index2.search_phrase("hello world", 0);
@@ -2834,7 +3605,7 @@ mod tests {
     #[test]
     fn test_phrase_search_with_slop() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -2862,7 +3633,7 @@ mod tests {
     #[test]
     fn test_phrase_search_no_match() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -2884,7 +3655,7 @@ mod tests {
     #[test]
     fn test_phrase_search_single_token() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_phrase_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -2904,6 +3675,32 @@ mod tests {
 
         let entries = index.search_phrase("", 0);
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_without_positions_disables_phrase_and_skips_storage() {
+        // Default params (`with_position = false`): the index stores no token
+        // positions, so term/BM25 search works but phrase search does not — the
+        // same contract as the on-disk format and Lucene `DOCS_AND_FREQS`.
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(1);
+        index.insert(&create_test_batch(&schema), 0).unwrap();
+
+        assert_eq!(index.search("hello").len(), 2);
+        assert!(
+            index.search_phrase("hello world", 0).is_empty(),
+            "phrase search requires positions"
+        );
+        // The frozen partition stored no positions.
+        let (_, _, _, _, _, pos, _, _) = index.memory_breakdown();
+        assert_eq!(pos, 0, "no positions stored when with_position = false");
+
+        // With positions enabled the same phrase matches.
+        let with_pos = position_index(1, "description").with_freeze_threshold_rows(1);
+        with_pos.insert(&create_test_batch(&schema), 0).unwrap();
+        assert_eq!(with_pos.search_phrase("hello world", 0).len(), 1);
+        let (_, _, _, _, _, pos2, _, _) = with_pos.memory_breakdown();
+        assert!(pos2 > 0, "positions stored when with_position = true");
     }
 
     fn create_boolean_test_batch(schema: &ArrowSchema) -> RecordBatch {
@@ -3044,7 +3841,7 @@ mod tests {
     #[test]
     fn test_boolean_nested_phrase() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_boolean_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3076,7 +3873,7 @@ mod tests {
     #[test]
     fn test_search_query_phrase() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string());
+        let index = position_index(1, "description");
 
         let batch = create_test_batch(&schema);
         index.insert(&batch, 0).unwrap();
@@ -3625,7 +4422,7 @@ mod tests {
         // every token's position constraint holds, any returned entry
         // implicitly proves both tokens were visible together.
         let schema = create_test_schema();
-        let index = Arc::new(FtsMemIndex::new(1, "description".to_string()));
+        let index = Arc::new(position_index(1, "description"));
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut readers = Vec::new();
@@ -3804,12 +4601,12 @@ mod tests {
         let tail_snap = st.tail.snapshot();
         let apple = index.tokenize_for_search("apple").pop().unwrap();
         // "apple" is present -> an OR search over it matches.
-        let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple));
+        let or_scorer = build_scorer(&st, &tail_snap, std::slice::from_ref(&apple), true);
         let or_hits = p.search_match(std::slice::from_ref(&apple), Operator::Or, &or_scorer);
         assert_eq!(or_hits.len(), 3);
         // Adding an absent term to an AND query short-circuits to nothing.
         let and_tokens = vec![apple, "definitely_missing".to_string()];
-        let and_scorer = build_scorer(&st, &tail_snap, &and_tokens);
+        let and_scorer = build_scorer(&st, &tail_snap, &and_tokens, true);
         let and_hits = p.search_match(&and_tokens, Operator::And, &and_scorer);
         assert!(and_hits.is_empty());
     }
@@ -3891,7 +4688,7 @@ mod tests {
     #[test]
     fn test_phrase_across_partitions() {
         let schema = create_test_schema();
-        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(3);
+        let index = position_index(1, "description").with_freeze_threshold_rows(3);
         // Each batch has "hello world" at its row_offset row.
         for i in 0..4 {
             index
@@ -3929,6 +4726,244 @@ mod tests {
         assert_eq!(index.doc_count(), 120);
         // Merge must preserve every posting: "hello" hits 2 docs per batch.
         assert_eq!(index.search("hello").len(), 80);
+        for e in index.search("hello") {
+            assert!(e.score.is_finite() && e.score > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_include_tail_option_and_flush() {
+        let schema = create_test_schema();
+        // threshold 5 with 3-row batches: batch@0 stays in tail; batch@100
+        // pushes the tail to 6 and freezes both; batch@200 stays in the tail.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(5);
+        index.insert(&create_test_batch(&schema), 0).unwrap();
+        index.insert(&create_test_batch(&schema), 100).unwrap();
+        index.insert(&create_test_batch(&schema), 200).unwrap();
+        let immutable = SearchOptions::new().with_include_tail(false);
+        let match_hello = FtsQueryExpr::match_query("hello");
+
+        // Read-your-writes (default) sees all three batches (2 "hello"/batch).
+        assert_eq!(index.search("hello").len(), 6);
+        // Immutable-only sees only the two frozen batches.
+        assert_eq!(
+            index
+                .search_with_options(&match_hello, immutable.clone())
+                .len(),
+            4
+        );
+        // Flushing the tail makes it immutable; immutable-only now sees all.
+        index.flush();
+        assert_eq!(index.search_with_options(&match_hello, immutable).len(), 6);
+        assert_eq!(index.search("hello").len(), 6);
+    }
+
+    #[test]
+    fn test_block_impacts_frontier_is_tight_and_sound() {
+        // The Pareto (freq, dl) frontier must dominate every input pair (sound
+        // upper bound) and contain no dominated pair (minimal/tight).
+        let dominates = |a: (u32, u32), b: (u32, u32)| a.0 >= b.0 && a.1 <= b.1;
+        let cases: Vec<Vec<(u32, u32)>> = vec![
+            vec![(3, 10), (1, 5), (2, 8), (5, 20), (1, 4)],
+            vec![(1, 100); 5], // all identical => single frontier point
+            vec![(9, 2)],      // single doc
+            vec![(1, 9), (2, 8), (3, 7), (4, 6), (5, 5)], // fully Pareto-optimal
+        ];
+        for input in cases {
+            let mut pairs = input.clone();
+            let frontier = block_impacts(&mut pairs);
+            assert!(!frontier.is_empty());
+            // Soundness: every input pair is dominated by some frontier pair.
+            for &p in &input {
+                let dl = (p.0, p.1.max(1));
+                assert!(
+                    frontier.iter().any(|&f| dominates(f, dl)),
+                    "{p:?} not dominated by frontier {frontier:?}"
+                );
+            }
+            // Tightness: no frontier pair dominates another.
+            for (i, &a) in frontier.iter().enumerate() {
+                for (j, &b) in frontier.iter().enumerate() {
+                    assert!(
+                        i == j || !dominates(a, b),
+                        "frontier not minimal: {frontier:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_term_wand_and_tail_skip_match_exhaustive() {
+        // Multi-term OR across frozen partitions + a non-empty tail. The
+        // block-max-pruned WAND (limited) + tail-skip must return the same
+        // top-k scores as the exhaustive (unlimited) scan.
+        let schema = create_test_schema();
+        // threshold 5 with 3-row batches leaves the last batch in the tail.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(5);
+        for i in 0..5 {
+            index
+                .insert(&create_test_batch(&schema), (i * 100) as u64)
+                .unwrap();
+        }
+        let query = FtsQueryExpr::match_query("hello world");
+        let mut exhaustive = index.search_query(&query);
+        exhaustive.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        for k in [1usize, 3, 10] {
+            // Tail-skip is only an optimization: pruning the tail (default) and
+            // forcing a full tail scan must both equal the exhaustive top-k.
+            for tail_skip in [true, false] {
+                let limited = index.search_with_options(
+                    &query,
+                    SearchOptions::new().with_limit(k).with_tail_skip(tail_skip),
+                );
+                let mut got: Vec<f32> = limited.iter().map(|e| e.score).collect();
+                got.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let want: Vec<f32> = exhaustive.iter().take(k).map(|e| e.score).collect();
+                assert_eq!(got.len(), want.len(), "k={k} tail_skip={tail_skip}");
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(
+                        (g - w).abs() < 1e-4,
+                        "k={k} tail_skip={tail_skip}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_term_wand_prune_keeps_multi_match_docs() {
+        // Regression: the block-max prune must bound a pivot doc by *every* lane
+        // positioned at it (the same set the scorer sums), not just lanes up to
+        // the pivot index. A doc matching several query terms is high-scoring
+        // but has contributing lanes that can sort *after* the pivot; bounding
+        // only `lanes[..=pivot]` under-counts its score and unsoundly skips it,
+        // dropping true top-k results (silent recall loss on OR queries).
+        //
+        // Needs a corpus rich in multi-term-match docs across frozen partitions
+        // (so block-max applies) with a warm threshold — a small fixed corpus
+        // never exercises the faulty branch.
+        let schema = create_test_schema();
+        // A 12-word vocab with Zipfian inclusion + skewed per-term frequencies:
+        // query terms have very different df/idf and per-doc tf, so a contributing
+        // lane's `ub` can be small enough to sort it *after* the pivot. Generated
+        // from a deterministic LCG so the case is reproducible without `rand`.
+        let vocab: Vec<String> = (0..12).map(|i| format!("w{i}")).collect();
+        let make_batch = |start: i32, count: i32| -> RecordBatch {
+            let ids: Vec<i32> = (start..start + count).collect();
+            let texts: Vec<String> = (start..start + count)
+                .map(|i| {
+                    let mut rng = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let mut next = || {
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (rng >> 33) as u32
+                    };
+                    let mut words: Vec<&str> = Vec::new();
+                    for (j, w) in vocab.iter().enumerate() {
+                        // Rarer words (higher j) included less often; when present,
+                        // a skewed term frequency (larger for low j).
+                        if next() % (j as u32 + 2) == 0 {
+                            let reps = 1 + (next() % (8u32.saturating_sub(j as u32 / 2).max(1)));
+                            for _ in 0..reps {
+                                words.push(w);
+                            }
+                        }
+                    }
+                    if words.is_empty() {
+                        words.push(&vocab[0]);
+                    }
+                    words.join(" ")
+                })
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(texts)),
+                ],
+            )
+            .unwrap()
+        };
+
+        // 40 freezes of 100 docs (threshold 250) => multiple multi-block
+        // partitions (so a block's max_freq differs from the partition max,
+        // making the block bound straddle the threshold) plus a live tail.
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(250);
+        for b in 0..40 {
+            index
+                .insert(&make_batch(b * 100, 100), (b * 100) as u64)
+                .unwrap();
+        }
+        assert!(index.state.load_full().partitions.len() >= 2);
+
+        // Sweep every common+common and common+rare pair/triple so the lanes have
+        // a wide spread of upper bounds — the condition that exposes the prune.
+        let mut queries: Vec<String> = Vec::new();
+        for a in 0..6 {
+            for b in (a + 1)..8 {
+                queries.push(format!("w{a} w{b}"));
+                for c in (b + 1)..10 {
+                    queries.push(format!("w{a} w{b} w{c}"));
+                }
+            }
+        }
+        for query_text in &queries {
+            let query = FtsQueryExpr::match_query(query_text.as_str());
+            let mut exhaustive = index.search_query(&query);
+            exhaustive.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            for k in [1usize, 5, 10, 25] {
+                let limited = index.search_with_options(&query, SearchOptions::new().with_limit(k));
+                let mut got: Vec<f32> = limited.iter().map(|e| e.score).collect();
+                got.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let want: Vec<f32> = exhaustive.iter().take(k).map(|e| e.score).collect();
+                assert_eq!(got.len(), want.len(), "q={query_text:?} k={k}");
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(
+                        (g - w).abs() < 1e-4,
+                        "q={query_text:?} k={k}: WAND returned {g}, exhaustive top-k has {w} \
+                         (block-max prune dropped a higher-scoring multi-term-match doc)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_background_tiered_merge_reduces_partition_count() {
+        // 16 single-batch freezes (freeze_threshold_rows = 1) make 16 tiny
+        // same-tier partitions. The tiered merge (MERGE_FACTOR = 8) runs in the
+        // background and the writer installs it on a later freeze. Total inserts
+        // stay below MAX_PARTITIONS (32), so any reduction is from the tier
+        // merge — not the synchronous safety-net collapse.
+        let schema = create_test_schema();
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(1);
+        for i in 0..16 {
+            index
+                .insert(&create_test_batch(&schema), (i * 100) as u64)
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut total = 16u64;
+        while index.state.load().partitions.len() >= 16
+            && total < 30
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            index
+                .insert(&create_test_batch(&schema), total * 100)
+                .unwrap();
+            total += 1;
+        }
+        let parts = index.state.load().partitions.len();
+        assert!(
+            parts < 16,
+            "background tier merge should reduce partitions below 16, got {parts}"
+        );
+        // Merge is doc-preserving: counts are exact regardless of timing.
+        assert_eq!(index.doc_count(), total as usize * 3);
+        assert_eq!(index.search("hello").len(), total as usize * 2);
         for e in index.search("hello") {
             assert!(e.score.is_finite() && e.score > 0.0);
         }

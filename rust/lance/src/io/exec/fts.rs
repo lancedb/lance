@@ -38,7 +38,6 @@ use super::utils::{IndexMetrics, InstrumentedChildInputStream, build_prefilter};
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
-use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -149,16 +148,11 @@ async fn search_segments(
         .unzip())
 }
 
-/// Fall back to the default base tokenizer when no on-disk FTS segment exists.
+/// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
 fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
-    InvertedIndexParams::default()
-        .max_token_length(None)
-        .lower_case(false)
-        .stem(false)
-        .remove_stop_words(false)
-        .ascii_folding(false)
-        .build()
-        .expect("default FTS tokenizer should build")
+    Box::new(TextTokenizer::new(
+        TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+    ))
 }
 
 pub struct FtsIndexMetrics {

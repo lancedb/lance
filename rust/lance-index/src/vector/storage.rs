@@ -16,7 +16,14 @@ use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+
+use crossbeam_queue::ArrayQueue;
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
@@ -52,14 +59,186 @@ pub trait DistCalculator {
         _u16_scratch: &mut Vec<u16>,
         _u8_scratch: &mut Vec<u8>,
     ) {
-        dists.clear();
-        dists.extend(self.distance_all(k_hint));
+        *dists = self.distance_all(k_hint);
     }
 
     fn prefetch(&self, _id: u32) {}
 }
 
 pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
+
+#[derive(Debug)]
+pub struct QueryScratch {
+    pub distances: Vec<f32>,
+    pub query_f32: Vec<f32>,
+    pub u16: Vec<u16>,
+    pub u8: Vec<u8>,
+}
+
+impl QueryScratch {
+    pub const fn new() -> Self {
+        Self {
+            distances: Vec::new(),
+            query_f32: Vec::new(),
+            u16: Vec::new(),
+            u8: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(capacity: QueryScratchCapacity) -> Self {
+        Self {
+            distances: vec![0.0; capacity.distances],
+            query_f32: vec![0.0; capacity.query_f32],
+            u16: vec![0; capacity.u16],
+            u8: vec![0; capacity.u8],
+        }
+    }
+}
+
+impl Default for QueryScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeepSizeOf for QueryScratch {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.distances.capacity() * size_of::<f32>()
+            + self.query_f32.capacity() * size_of::<f32>()
+            + self.u16.capacity() * size_of::<u16>()
+            + self.u8.capacity() * size_of::<u8>()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryScratchCapacity {
+    pub distances: usize,
+    pub query_f32: usize,
+    pub u16: usize,
+    pub u8: usize,
+}
+
+impl QueryScratchCapacity {
+    pub const fn new(distances: usize, query_f32: usize, u16: usize, u8: usize) -> Self {
+        Self {
+            distances,
+            query_f32,
+            u16,
+            u8,
+        }
+    }
+
+    fn deep_size_bytes(&self) -> usize {
+        self.distances * size_of::<f32>()
+            + self.query_f32 * size_of::<f32>()
+            + self.u16 * size_of::<u16>()
+            + self.u8 * size_of::<u8>()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum QueryResidual<'a> {
+    Centroid(&'a dyn arrow_array::Array),
+}
+
+#[derive(Debug)]
+pub struct QueryScratchPool {
+    scratches: ArrayQueue<QueryScratch>,
+    scratch_capacity: QueryScratchCapacity,
+}
+
+impl QueryScratchPool {
+    pub fn new(size: usize) -> Self {
+        Self::with_capacity(size, QueryScratchCapacity::default())
+    }
+
+    pub fn with_capacity(size: usize, capacity: QueryScratchCapacity) -> Self {
+        let size = size.max(1);
+        let scratches = ArrayQueue::new(size);
+        for _ in 0..size {
+            scratches
+                .push(QueryScratch::with_capacity(capacity))
+                .expect("query scratch pool should have spare capacity during initialization");
+        }
+        Self {
+            scratches,
+            scratch_capacity: capacity,
+        }
+    }
+
+    pub fn scratch(&self) -> QueryScratchGuard<'_> {
+        let (scratch, pooled) = if let Some(scratch) = self.scratches.pop() {
+            (scratch, true)
+        } else {
+            (QueryScratch::with_capacity(self.scratch_capacity), false)
+        };
+        QueryScratchGuard {
+            pool: self,
+            scratch: Some(scratch),
+            pooled,
+        }
+    }
+
+    pub fn with_scratch<T>(&self, f: impl FnOnce(&mut QueryScratch) -> T) -> T {
+        let mut scratch = self.scratch();
+        f(&mut scratch)
+    }
+}
+
+pub struct QueryScratchGuard<'a> {
+    pool: &'a QueryScratchPool,
+    scratch: Option<QueryScratch>,
+    pooled: bool,
+}
+
+impl Deref for QueryScratchGuard<'_> {
+    type Target = QueryScratch;
+
+    fn deref(&self) -> &Self::Target {
+        self.scratch
+            .as_ref()
+            .expect("query scratch guard should hold scratch")
+    }
+}
+
+impl DerefMut for QueryScratchGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.scratch
+            .as_mut()
+            .expect("query scratch guard should hold scratch")
+    }
+}
+
+impl Drop for QueryScratchGuard<'_> {
+    fn drop(&mut self) {
+        if !self.pooled {
+            return;
+        }
+        if let Some(scratch) = self.scratch.take() {
+            match self.pool.scratches.push(scratch) {
+                Ok(()) => {}
+                Err(_) => unreachable!("query scratch pool should not exceed its capacity"),
+            }
+        }
+    }
+}
+
+impl DeepSizeOf for QueryScratchPool {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        let mut total = self.scratches.capacity() * size_of::<QueryScratch>();
+        let mut scratches = Vec::new();
+        while let Some(scratch) = self.scratches.pop() {
+            total += scratch.deep_size_of_children(context);
+            scratches.push(scratch);
+        }
+        let checked_out = self.scratches.capacity().saturating_sub(scratches.len());
+        total += checked_out * self.scratch_capacity.deep_size_bytes();
+        for scratch in scratches {
+            let _ = self.scratches.push(scratch);
+        }
+        total
+    }
+}
 
 /// Vector Storage is the abstraction to store the vectors.
 ///
@@ -109,6 +288,18 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_>;
+
+    /// Create a [DistCalculator], reusing caller-owned scratch for query-time
+    /// precomputed state when the storage supports it.
+    fn dist_calculator_with_scratch<'a>(
+        &'a self,
+        query: ArrayRef,
+        dist_q_c: f32,
+        _residual: Option<QueryResidual<'_>>,
+        _f32_scratch: &'a mut Vec<f32>,
+    ) -> Self::DistanceCalculator<'a> {
+        self.dist_calculator(query, dist_q_c)
+    }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
 
@@ -334,5 +525,111 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             self.distance_type,
             self.frag_reuse_index.clone(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueryScratchCapacity, QueryScratchPool};
+    use deepsize::DeepSizeOf;
+
+    #[test]
+    fn test_query_scratch_pool_reuses_buffers() {
+        let pool = QueryScratchPool::new(1);
+        let first_ptrs = pool.with_scratch(|scratch| {
+            scratch.query_f32.clear();
+            scratch.query_f32.resize(16, 1.0);
+            scratch.distances.clear();
+            scratch.distances.resize(8, 2.0);
+            scratch.u16.clear();
+            scratch.u16.resize(4, 3);
+            scratch.u8.clear();
+            scratch.u8.resize(2, 4);
+            (
+                scratch.query_f32.as_ptr(),
+                scratch.distances.as_ptr(),
+                scratch.u16.as_ptr(),
+                scratch.u8.as_ptr(),
+            )
+        });
+
+        let second_ptrs = pool.with_scratch(|scratch| {
+            assert_eq!(scratch.query_f32.len(), 16);
+            assert!(scratch.query_f32.iter().all(|value| *value == 1.0));
+            assert_eq!(scratch.distances.len(), 8);
+            assert!(scratch.distances.iter().all(|value| *value == 2.0));
+            assert_eq!(scratch.u16.len(), 4);
+            assert!(scratch.u16.iter().all(|value| *value == 3));
+            assert_eq!(scratch.u8.len(), 2);
+            assert!(scratch.u8.iter().all(|value| *value == 4));
+            (
+                scratch.query_f32.as_ptr(),
+                scratch.distances.as_ptr(),
+                scratch.u16.as_ptr(),
+                scratch.u8.as_ptr(),
+            )
+        });
+
+        assert_eq!(first_ptrs, second_ptrs);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_is_pool_owned() {
+        let first_pool = QueryScratchPool::new(1);
+        let second_pool = QueryScratchPool::new(1);
+
+        let first_ptr = first_pool.with_scratch(|scratch| {
+            scratch.query_f32.resize(16, 1.0);
+            scratch.query_f32.as_ptr()
+        });
+        let second_ptr = second_pool.with_scratch(|scratch| {
+            scratch.query_f32.resize(16, 1.0);
+            scratch.query_f32.as_ptr()
+        });
+
+        assert_ne!(first_ptr, second_ptr);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_uses_temporary_scratch_when_empty() {
+        let pool = QueryScratchPool::with_capacity(1, QueryScratchCapacity::new(8, 16, 4, 2));
+        let pooled = pool.scratch();
+        assert!(pooled.pooled);
+
+        let temporary = pool.scratch();
+        assert!(!temporary.pooled);
+        assert_eq!(temporary.distances.len(), 8);
+        assert_eq!(temporary.query_f32.len(), 16);
+        assert_eq!(temporary.u16.len(), 4);
+        assert_eq!(temporary.u8.len(), 2);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_deep_size_includes_buffer_capacity() {
+        let empty_size = QueryScratchPool::new(1).deep_size_of();
+        let pool = QueryScratchPool::with_capacity(1, QueryScratchCapacity::new(8, 16, 4, 2));
+
+        assert!(pool.deep_size_of() > empty_size);
+
+        let idle_size = pool.deep_size_of();
+        let _checked_out = pool.scratch();
+
+        assert_eq!(pool.deep_size_of(), idle_size);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_initializes_buffer_capacity() {
+        let pool = QueryScratchPool::with_capacity(1, QueryScratchCapacity::new(8, 16, 4, 2));
+
+        pool.with_scratch(|scratch| {
+            assert_eq!(scratch.distances.len(), 8);
+            assert_eq!(scratch.distances.capacity(), 8);
+            assert_eq!(scratch.query_f32.len(), 16);
+            assert_eq!(scratch.query_f32.capacity(), 16);
+            assert_eq!(scratch.u16.len(), 4);
+            assert_eq!(scratch.u16.capacity(), 4);
+            assert_eq!(scratch.u8.len(), 2);
+            assert_eq!(scratch.u8.capacity(), 2);
+        });
     }
 }
