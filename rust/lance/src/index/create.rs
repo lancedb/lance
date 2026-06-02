@@ -8,7 +8,8 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, build_index_metadata_from_segments,
+        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
+        build_index_metadata_from_segments,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
