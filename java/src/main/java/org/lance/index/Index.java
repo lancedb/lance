@@ -37,6 +37,7 @@ public class Index {
   private final Instant createdAt;
   private final Integer baseId;
   private final IndexType indexType;
+  private final Long segmentSeq;
 
   private Index(
       UUID uuid,
@@ -48,7 +49,8 @@ public class Index {
       int indexVersion,
       Instant createdAt,
       Integer baseId,
-      IndexType indexType) {
+      IndexType indexType,
+      Long segmentSeq) {
     this.uuid = uuid;
     this.fields = fields;
     this.name = name;
@@ -59,6 +61,7 @@ public class Index {
     this.createdAt = createdAt;
     this.baseId = baseId;
     this.indexType = indexType;
+    this.segmentSeq = segmentSeq;
   }
 
   public UUID uuid() {
@@ -131,6 +134,15 @@ public class Index {
     return indexType;
   }
 
+  /**
+   * Dataset-wide monotonically increasing sequence for this physical index segment.
+   *
+   * @return the segment sequence, if present
+   */
+  public Optional<Long> segmentSeq() {
+    return Optional.ofNullable(segmentSeq);
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -145,7 +157,8 @@ public class Index {
         && Arrays.equals(indexDetails, index.indexDetails)
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
-        && indexType == index.indexType;
+        && indexType == index.indexType
+        && Objects.equals(segmentSeq, index.segmentSeq);
   }
 
   @Override
@@ -160,7 +173,8 @@ public class Index {
             createdAt,
             baseId,
             fragments,
-            indexType);
+            indexType,
+            segmentSeq);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -176,6 +190,7 @@ public class Index {
         .add("indexType", indexType)
         .add("createdAt", createdAt)
         .add("baseId", baseId)
+        .add("segmentSeq", segmentSeq)
         .toString();
   }
 
@@ -200,6 +215,7 @@ public class Index {
     private Instant createdAt;
     private Integer baseId;
     private IndexType indexType;
+    private Long segmentSeq;
 
     private Builder() {}
 
@@ -253,6 +269,11 @@ public class Index {
       return this;
     }
 
+    public Builder segmentSeq(Long segmentSeq) {
+      this.segmentSeq = segmentSeq;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -264,7 +285,8 @@ public class Index {
           indexVersion,
           createdAt,
           baseId,
-          indexType);
+          indexType,
+          segmentSeq);
     }
   }
 }

@@ -29,6 +29,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -100,6 +101,12 @@ public class VectorIndexTest {
                 TestVectorDataset.vectorColumnName,
                 List.of(firstSegment, secondSegment));
         assertEquals(2, committed.size());
+        assertEquals(
+            List.of(1L, 2L),
+            committed.stream()
+                .map(index -> index.segmentSeq().orElseThrow())
+                .sorted()
+                .collect(Collectors.toList()));
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
     }

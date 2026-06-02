@@ -86,6 +86,10 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             .getattr("files")?
             .extract::<Option<Vec<PyLance<IndexFile>>>>()?
             .map(|v| v.into_iter().map(|f| f.0).collect());
+        let segment_seq = match ob.getattr("segment_seq") {
+            Ok(segment_seq) => segment_seq.extract()?,
+            Err(_) => None,
+        };
         let index_details = match ob.getattr("index_details") {
             Ok(details) => details
                 .extract::<Option<(String, Vec<u8>)>>()?
@@ -104,6 +108,7 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            segment_seq,
         }))
     }
 }
@@ -146,6 +151,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             .index_details
             .as_ref()
             .map(|details| (details.type_url.clone(), details.value.clone()));
+        let segment_seq = self.0.segment_seq;
 
         let cls = namespace
             .getattr("Index")
@@ -161,6 +167,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             base_id,
             files,
             index_details,
+            segment_seq,
         ))
     }
 }

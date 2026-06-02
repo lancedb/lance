@@ -490,6 +490,7 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: created_index.files,
+            segment_seq: None,
         })
     }
 

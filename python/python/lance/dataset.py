@@ -5370,6 +5370,7 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    segment_seq: Optional[int] = None
 
 
 class IndexInformation(TypedDict):

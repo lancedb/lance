@@ -73,6 +73,7 @@ class IndexSegmentDescription:
     created_at: Optional[datetime]
     size_bytes: Optional[int]
     base_id: Optional[int]
+    segment_seq: Optional[int]
 
     def __repr__(self) -> str: ...
 

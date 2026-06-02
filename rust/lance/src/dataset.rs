@@ -122,7 +122,7 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
+use lance_table::feature_flags::{FLAG_INDEX_SEGMENT_SEQ, apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -3330,6 +3330,12 @@ impl ManifestWriteConfig {
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_auto_set_feature_flags(mut self, auto_set_feature_flags: bool) -> Self {
+        self.auto_set_feature_flags = auto_set_feature_flags;
+        self
+    }
 }
 
 /// Commit a manifest file and create a copy at the latest manifest path.
@@ -3354,6 +3360,12 @@ pub(crate) async fn write_manifest_file(
             use_stable_row_ids,
             config.disable_transaction_file,
         )?;
+        if indices
+            .as_ref()
+            .is_some_and(|indices| indices.iter().any(|idx| idx.segment_seq.is_some()))
+        {
+            manifest.writer_feature_flags |= FLAG_INDEX_SEGMENT_SEQ;
+        }
     }
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));

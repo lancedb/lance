@@ -20,8 +20,10 @@ pub const FLAG_TABLE_CONFIG: u64 = 8;
 pub const FLAG_BASE_PATHS: u64 = 16;
 /// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
 pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
+/// Index segment metadata uses segment_seq and writers must preserve monotonic assignment.
+pub const FLAG_INDEX_SEGMENT_SEQ: u64 = 64;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 64;
+pub const FLAG_UNKNOWN: u64 = 128;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -103,6 +105,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_INDEX_SEGMENT_SEQ));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -120,12 +123,15 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_INDEX_SEGMENT_SEQ));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
                 | super::FLAG_BASE_PATHS
+                | super::FLAG_DISABLE_TRANSACTION_FILE
+                | super::FLAG_INDEX_SEGMENT_SEQ
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
     }

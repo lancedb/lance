@@ -2387,6 +2387,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         };
         let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], None));
         prefilter.wait_for_ready().await.unwrap();

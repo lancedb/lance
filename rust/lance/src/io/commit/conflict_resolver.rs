@@ -7,7 +7,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{Operation, Transaction},
+    dataset::transaction::{Operation, Transaction, assign_index_segment_seqs_for_new_indices},
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
@@ -35,6 +35,26 @@ pub struct TransactionRebase<'a> {
     /// Merged generations from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
     conflicting_mem_wal_merged_gens: Vec<MergedGeneration>,
+}
+
+fn create_index_segments_are_rebasable(
+    new_index: &IndexMetadata,
+    created_index: &IndexMetadata,
+) -> bool {
+    if new_index.fields != created_index.fields {
+        return false;
+    }
+
+    if new_index.index_details.as_deref() != created_index.index_details.as_deref() {
+        return false;
+    }
+
+    match (&new_index.fragment_bitmap, &created_index.fragment_bitmap) {
+        (Some(new_fragments), Some(created_fragments)) => {
+            new_fragments.is_disjoint(created_fragments)
+        }
+        _ => false,
+    }
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -522,7 +542,10 @@ impl<'a> TransactionRebase<'a> {
                         .any(|new_index| {
                             created_indices
                                 .iter()
-                                .any(|created_index| created_index.name == new_index.name)
+                                .filter(|created_index| created_index.name == new_index.name)
+                                .any(|created_index| {
+                                    !create_index_segments_are_rebasable(new_index, created_index)
+                                })
                         });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
@@ -1581,6 +1604,13 @@ impl<'a> TransactionRebase<'a> {
                 }
             }
 
+            let current_indices = dataset.load_indices().await?;
+            assign_index_segment_seqs_for_new_indices(
+                current_indices.as_ref(),
+                removed_indices,
+                new_indices,
+            );
+
             Ok(self.transaction)
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -2216,6 +2246,7 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            segment_seq: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -2706,6 +2737,48 @@ mod tests {
     }
 
     #[test]
+    fn test_create_index_segments_require_matching_details() {
+        let details = Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.test.IndexDetails".to_string(),
+            value: vec![1],
+        });
+        let index0 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some([0].into_iter().collect()),
+            index_details: Some(details.clone()),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            segment_seq: None,
+        };
+        let same_details = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fragment_bitmap: Some([1].into_iter().collect()),
+            index_details: Some(details),
+            ..index0.clone()
+        };
+        let different_details = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fragment_bitmap: Some([2].into_iter().collect()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.test.IndexDetails".to_string(),
+                value: vec![2],
+            })),
+            ..index0.clone()
+        };
+
+        assert!(create_index_segments_are_rebasable(&index0, &same_details));
+        assert!(!create_index_segments_are_rebasable(
+            &index0,
+            &different_details
+        ));
+    }
+
+    #[test]
     fn test_create_index_conflicts_only_on_same_name() {
         let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -2718,6 +2791,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -2784,6 +2858,7 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        segment_seq: None,
                     }],
                     removed_indices: vec![],
                 },

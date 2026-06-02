@@ -926,6 +926,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -948,6 +949,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -968,6 +970,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -1009,6 +1012,7 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                segment_seq: None,
             };
 
             let metric = metric_type_from_index_metadata(&index);

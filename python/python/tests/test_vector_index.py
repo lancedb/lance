@@ -3100,6 +3100,9 @@ def test_commit_existing_index_segments_accepts_uncommitted_vector_segments(tmp_
 
     assert len(segments) == 2
     ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
+    desc = next(desc for desc in ds.describe_indices() if desc.name == "vector_idx")
+    segment_seqs = sorted(segment.segment_seq for segment in desc.segments)
+    assert segment_seqs == [1, 2]
 
     q = np.random.rand(128).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})

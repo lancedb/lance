@@ -195,6 +195,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            segment_seq: None,
         });
     }
 
@@ -1377,6 +1378,7 @@ impl DatasetIndexExt for Dataset {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.
                 files: res.files,
+                segment_seq: None,
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
@@ -2553,7 +2555,7 @@ mod tests {
     use super::*;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{ManifestWriteConfig, WriteMode, WriteParams, write_manifest_file};
     use crate::index::vector::VectorIndexParams;
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
@@ -2582,6 +2584,7 @@ mod tests {
     };
     use lance_io::{assert_io_eq, assert_io_lt};
     use lance_linalg::distance::{DistanceType, MetricType};
+    use lance_table::feature_flags::FLAG_INDEX_SEGMENT_SEQ;
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
@@ -2619,6 +2622,7 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+            segment_seq: None,
         }
     }
 
@@ -6571,6 +6575,385 @@ mod tests {
                 .all(|idx| idx.files.as_ref().is_some_and(|files| !files.is_empty())),
             "committed segment metadata should capture on-disk file info"
         );
+        let mut segment_seqs = committed
+            .iter()
+            .map(|idx| idx.segment_seq)
+            .collect::<Vec<_>>();
+        segment_seqs.sort();
+        assert_eq!(segment_seqs, vec![Some(1), Some(2)]);
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
+            0
+        );
+
+        let replacement = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"replacement",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&replacement)],
+            )
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let segment_seq_by_uuid = committed
+            .iter()
+            .map(|idx| (idx.uuid, idx.segment_seq))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(segment_seq_by_uuid.get(&seg0.uuid), Some(&Some(1)));
+        assert!(!segment_seq_by_uuid.contains_key(&seg1.uuid));
+        assert_eq!(segment_seq_by_uuid.get(&replacement.uuid), Some(&Some(3)));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rebase_assigns_next_segment_seq() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stale_dataset = dataset.clone();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"seg1",
+        )
+        .await;
+
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg0)],
+            )
+            .await
+            .unwrap();
+
+        stale_dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg1)],
+            )
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let segment_seq_by_uuid = committed
+            .iter()
+            .map(|idx| (idx.uuid, idx.segment_seq))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(segment_seq_by_uuid.get(&seg0.uuid), Some(&Some(1)));
+        assert_eq!(segment_seq_by_uuid.get(&seg1.uuid), Some(&Some(2)));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_sequence_is_scoped_to_index_name() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let other_seg0 = write_vector_segment_metadata(
+            &dataset,
+            "other_vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"other-seg0",
+        )
+        .await;
+
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg0)],
+            )
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(
+                "other_vector_idx",
+                "vector",
+                vec![segment_from_metadata(&other_seg0)],
+            )
+            .await
+            .unwrap();
+
+        let vector_idx = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let other_vector_idx = dataset
+            .load_indices_by_name("other_vector_idx")
+            .await
+            .unwrap();
+        assert_eq!(vector_idx[0].segment_seq, Some(1));
+        assert_eq!(other_vector_idx[0].segment_seq, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_backfills_legacy_segment_seq() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"seg1",
+        )
+        .await;
+
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
+            )
+            .await
+            .unwrap();
+
+        let mut legacy_manifest = dataset.manifest.as_ref().clone();
+        legacy_manifest.version += 1;
+        legacy_manifest.writer_feature_flags &= !FLAG_INDEX_SEGMENT_SEQ;
+        legacy_manifest.transaction_section = None;
+        legacy_manifest.transaction_file = None;
+        let mut legacy_indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        for index in &mut legacy_indices {
+            index.segment_seq = None;
+        }
+        write_manifest_file(
+            dataset.object_store.as_ref(),
+            dataset.commit_handler.as_ref(),
+            &dataset.base,
+            &mut legacy_manifest,
+            Some(legacy_indices),
+            &ManifestWriteConfig::default().with_auto_set_feature_flags(false),
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .iter()
+                .all(|idx| idx.segment_seq.is_none())
+        );
+
+        let replacement = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"replacement",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&replacement)],
+            )
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let segment_seq_by_uuid = committed
+            .iter()
+            .map(|idx| (idx.uuid, idx.segment_seq))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(segment_seq_by_uuid.get(&seg0.uuid), Some(&Some(1)));
+        assert!(!segment_seq_by_uuid.contains_key(&seg1.uuid));
+        assert_eq!(segment_seq_by_uuid.get(&replacement.uuid), Some(&Some(3)));
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_index_metadata_refresh_preserves_segment_seq() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let segment = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&segment)],
+            )
+            .await
+            .unwrap();
+
+        let original = dataset.load_indices_by_name("vector_idx").await.unwrap()[0].clone();
+        assert_eq!(original.segment_seq, Some(1));
+
+        let mut refreshed = original.clone();
+        refreshed.segment_seq = None;
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![refreshed],
+                removed_indices: vec![original],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let refreshed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(refreshed[0].segment_seq, Some(1));
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
+            0
+        );
     }
 
     #[tokio::test]
@@ -6730,6 +7113,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            segment_seq: None,
         };
 
         let err = dataset

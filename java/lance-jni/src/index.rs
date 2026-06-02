@@ -124,6 +124,11 @@ impl IntoJava for &IndexMetadata {
         } else {
             JObject::null()
         };
+        let segment_seq = if let Some(seq) = self.segment_seq {
+            env.new_object("java/lang/Long", "(J)V", &[JValue::Long(seq as i64)])?
+        } else {
+            JObject::null()
+        };
 
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
@@ -131,7 +136,7 @@ impl IntoJava for &IndexMetadata {
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;Ljava/lang/Long;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -143,6 +148,7 @@ impl IntoJava for &IndexMetadata {
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
                 JValue::Object(&index_type),
+                JValue::Object(&segment_seq),
             ],
         )?)
     }

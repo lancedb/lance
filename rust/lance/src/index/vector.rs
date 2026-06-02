@@ -1825,6 +1825,7 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
+        segment_seq: None,
     };
 
     let transaction = Transaction::new(

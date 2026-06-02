@@ -24,7 +24,7 @@ use lance_core::datatypes::{
 };
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::mem_wal::MergedGeneration;
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
@@ -1582,6 +1582,96 @@ pub fn translate_config_updates(
     }
 }
 
+fn assign_index_segment_seqs(
+    indices: &mut [IndexMetadata],
+    new_index_uuids: &HashSet<Uuid>,
+    sequence_baseline_indices: &[IndexMetadata],
+) {
+    let has_new_indices = !new_index_uuids.is_empty();
+    let mut next_seq_by_name = HashMap::<String, u64>::new();
+    for index in sequence_baseline_indices {
+        if let Some(segment_seq) = index.segment_seq {
+            let next_seq = next_seq_by_name.entry(index.name.clone()).or_insert(1);
+            *next_seq = (*next_seq).max(segment_seq + 1);
+        }
+    }
+    let mut segment_seq_by_uuid = HashMap::new();
+
+    for index in sequence_baseline_indices {
+        if let Some(segment_seq) = index.segment_seq {
+            segment_seq_by_uuid.insert(index.uuid, segment_seq);
+        } else if has_new_indices {
+            let next_seq = next_seq_by_name.entry(index.name.clone()).or_insert(1);
+            segment_seq_by_uuid.insert(index.uuid, *next_seq);
+            *next_seq += 1;
+        }
+    }
+
+    for index in indices
+        .iter_mut()
+        .filter(|idx| !new_index_uuids.contains(&idx.uuid) && idx.segment_seq.is_none())
+    {
+        if let Some(segment_seq) = segment_seq_by_uuid.get(&index.uuid) {
+            index.segment_seq = Some(*segment_seq);
+        } else if has_new_indices {
+            let next_seq = next_seq_by_name.entry(index.name.clone()).or_insert(1);
+            index.segment_seq = Some(*next_seq);
+            *next_seq += 1;
+        }
+    }
+
+    for index in indices
+        .iter_mut()
+        .filter(|idx| new_index_uuids.contains(&idx.uuid))
+    {
+        let next_seq = next_seq_by_name.entry(index.name.clone()).or_insert(1);
+        index.segment_seq = Some(*next_seq);
+        *next_seq += 1;
+    }
+}
+
+pub(crate) fn assign_index_segment_seqs_for_new_indices(
+    current_indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+    new_indices: &mut [IndexMetadata],
+) {
+    if new_indices.is_empty() {
+        return;
+    }
+
+    let removed_uuids = removed_indices
+        .iter()
+        .map(|idx| idx.uuid)
+        .collect::<HashSet<_>>();
+    let all_new_uuids = new_indices
+        .iter()
+        .map(|idx| idx.uuid)
+        .collect::<HashSet<_>>();
+    let new_uuids = new_indices
+        .iter()
+        .map(|idx| idx.uuid)
+        .filter(|uuid| !removed_uuids.contains(uuid))
+        .collect::<HashSet<_>>();
+    let mut final_indices = current_indices
+        .iter()
+        .filter(|idx| !removed_uuids.contains(&idx.uuid) && !all_new_uuids.contains(&idx.uuid))
+        .cloned()
+        .collect::<Vec<_>>();
+    final_indices.extend(new_indices.iter().cloned());
+
+    assign_index_segment_seqs(&mut final_indices, &new_uuids, current_indices);
+
+    let assigned = final_indices
+        .into_iter()
+        .filter(|idx| all_new_uuids.contains(&idx.uuid))
+        .map(|idx| (idx.uuid, idx.segment_seq))
+        .collect::<HashMap<_, _>>();
+
+    for index in new_indices {
+        index.segment_seq = assigned.get(&index.uuid).copied().flatten();
+    }
+}
+
 /// Helper function to translate old-style schema metadata to new UpdateMap format
 pub fn translate_schema_metadata_updates(
     schema_metadata: &std::collections::HashMap<String, String>,
@@ -1834,6 +1924,8 @@ impl Transaction {
         };
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
+        let segment_seq_baseline_indices = final_indices.clone();
+        let mut new_index_uuids_for_segment_seq = HashSet::new();
 
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already or
@@ -2031,11 +2123,23 @@ impl Transaction {
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
                 if !merged_generations.is_empty() {
+                    let old_mem_wal_id = final_indices
+                        .iter()
+                        .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                        .map(|idx| idx.uuid);
                     update_mem_wal_index_merged_generations(
                         &mut final_indices,
                         current_manifest.map_or(1, |m| m.version + 1),
                         merged_generations.clone(),
                     )?;
+                    if let Some(new_mem_wal_id) = final_indices
+                        .iter()
+                        .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                        .map(|idx| idx.uuid)
+                        && Some(new_mem_wal_id) != old_mem_wal_id
+                    {
+                        new_index_uuids_for_segment_seq.insert(new_mem_wal_id);
+                    }
                 }
             }
             Operation::Overwrite { fragments, .. } => {
@@ -2081,10 +2185,17 @@ impl Transaction {
                     }
                 } else {
                     Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                    new_index_uuids_for_segment_seq.extend(
+                        rewritten_indices
+                            .iter()
+                            .filter(|idx| idx.new_id != idx.old_id)
+                            .map(|idx| idx.new_id),
+                    );
                 }
 
                 if let Some(frag_reuse_index) = frag_reuse_index {
                     final_indices.retain(|idx| idx.name != frag_reuse_index.name);
+                    new_index_uuids_for_segment_seq.insert(frag_reuse_index.uuid);
                     final_indices.push(frag_reuse_index.clone());
                 }
             }
@@ -2101,6 +2212,11 @@ impl Transaction {
                     .iter()
                     .map(|new_index| new_index.uuid)
                     .collect::<HashSet<_>>();
+                let new_uuids_to_assign = new_uuids
+                    .difference(&removed_uuids)
+                    .copied()
+                    .collect::<HashSet<_>>();
+                new_index_uuids_for_segment_seq.extend(new_uuids_to_assign);
                 final_indices.retain(|existing_index| {
                     !removed_uuids.contains(&existing_index.uuid)
                         && !new_uuids.contains(&existing_index.uuid)
@@ -2301,11 +2417,23 @@ impl Transaction {
                 );
             }
             Operation::UpdateMemWalState { merged_generations } => {
+                let old_mem_wal_id = final_indices
+                    .iter()
+                    .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                    .map(|idx| idx.uuid);
                 update_mem_wal_index_merged_generations(
                     &mut final_indices,
                     current_manifest.map_or(1, |m| m.version + 1),
                     merged_generations.clone(),
                 )?;
+                if let Some(new_mem_wal_id) = final_indices
+                    .iter()
+                    .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+                    .map(|idx| idx.uuid)
+                    && Some(new_mem_wal_id) != old_mem_wal_id
+                {
+                    new_index_uuids_for_segment_seq.insert(new_mem_wal_id);
+                }
             }
             Operation::UpdateBases { .. } => {
                 // UpdateBases operation doesn't modify fragments or indices
@@ -2313,6 +2441,12 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
         };
+
+        assign_index_segment_seqs(
+            &mut final_indices,
+            &new_index_uuids_for_segment_seq,
+            &segment_seq_baseline_indices,
+        );
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
@@ -2808,6 +2942,9 @@ impl Transaction {
                 groups,
             )?);
             index.uuid = rewritten_index.new_id;
+            if rewritten_index.new_id != rewritten_index.old_id {
+                index.segment_seq = None;
+            }
             // Update file sizes to match the new index files. When not available
             // (e.g., from older writers), clear the old file sizes to avoid
             // using stale sizes from the pre-remap index.
@@ -3872,6 +4009,7 @@ mod tests {
             created_at: Some(Utc::now()),
             base_id: None,
             files: None,
+            segment_seq: None,
         }
     }
 
@@ -4379,6 +4517,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         }
     }
 
@@ -4401,6 +4540,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         }
     }
 

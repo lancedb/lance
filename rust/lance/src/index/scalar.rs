@@ -713,6 +713,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         }
     }
 

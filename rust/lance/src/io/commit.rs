@@ -30,6 +30,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
+use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
     WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
@@ -784,6 +785,15 @@ pub(crate) async fn do_commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, ManifestLocation)> {
+    if !can_write_dataset(dataset.manifest.writer_feature_flags) {
+        let message = format!(
+            "This dataset cannot be written by this version of Lance. \
+             Please upgrade Lance to write to this dataset.\n Flags: {}",
+            dataset.manifest.writer_feature_flags
+        );
+        return Err(Error::not_supported_source(message.into()));
+    }
+
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = if !write_config.disable_transaction_file() {
@@ -924,6 +934,15 @@ pub(crate) async fn commit_transaction(
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
+    if !can_write_dataset(dataset.manifest.writer_feature_flags) {
+        let message = format!(
+            "This dataset cannot be written by this version of Lance. \
+             Please upgrade Lance to write to this dataset.\n Flags: {}",
+            dataset.manifest.writer_feature_flags
+        );
+        return Err(Error::not_supported_source(message.into()));
+    }
+
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();

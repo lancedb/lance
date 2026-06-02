@@ -203,6 +203,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
                 Ok(DateTime::from_timestamp(seconds, nanos).unwrap())
             })?;
         let base_id = env.get_optional_u32_from_method(self, "baseId")?;
+        let segment_seq = env.get_optional_u64_from_method(self, "segmentSeq")?;
 
         Ok(IndexMetadata {
             uuid,
@@ -215,6 +216,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files: None,
+            segment_seq,
         })
     }
 }

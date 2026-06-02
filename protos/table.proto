@@ -113,6 +113,8 @@ message Manifest {
   // * 2: row ids are stable and stored as part of the fragment metadata.
   // * 4: use v2 format (deprecated)
   // * 8: table config is present
+  // * 16: dataset uses multiple base paths
+  // * 32: transaction files are disabled
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -123,6 +125,9 @@ message Manifest {
   //
   // The flag identities are the same as for reader_feature_flags, but the values of
   // reader_feature_flags and writer_feature_flags are not required to be identical.
+  //
+  // Writer-only flags:
+  // * 64: index segments use segment_seq
   uint64 writer_feature_flags = 10;
 
   // The highest fragment ID that has been used so far.
@@ -286,6 +291,14 @@ message IndexMetadata {
   // of index sizes without extra IO.
   // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
+
+  // Monotonically increasing sequence number for this index segment, scoped to
+  // the index name.
+  //
+  // Starts at 1 for each index name. Missing means the segment was written
+  // before this feature or is uncommitted metadata that has not reached the
+  // commit layer yet.
+  optional uint64 segment_seq = 11;
 }
 
 // Metadata about a single file within an index segment.

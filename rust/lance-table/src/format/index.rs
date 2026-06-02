@@ -76,6 +76,12 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// Monotonically increasing sequence for this physical segment within its index name.
+    ///
+    /// This is None for legacy segments and uncommitted segment metadata. The commit
+    /// layer assigns it before a segment is written to a manifest.
+    pub segment_seq: Option<u64>,
 }
 
 impl IndexMetadata {
@@ -132,6 +138,7 @@ impl DeepSizeOf for IndexMetadata {
                 .map(|fragment_bitmap| fragment_bitmap.serialized_size())
                 .unwrap_or(0)
             + self.files.deep_size_of_children(context)
+            + self.segment_seq.deep_size_of_children(context)
     }
 }
 
@@ -178,6 +185,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
+            segment_seq: proto.segment_seq,
         })
     }
 }
@@ -222,6 +230,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            segment_seq: idx.segment_seq,
         }
     }
 }
@@ -319,6 +328,7 @@ mod tests {
                     path: "index.idx".to_string(),
                     size_bytes: 1024,
                 }]),
+                segment_seq: Some(1),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -331,6 +341,7 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                segment_seq: None,
             },
         ];
 

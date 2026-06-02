@@ -138,6 +138,7 @@ pub(crate) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: created_index.files,
+        segment_seq: None,
         ..segments[0].clone()
     })
 }

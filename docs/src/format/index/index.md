@@ -96,13 +96,15 @@ Index segments are created and updated through a transactional process:
    directory, where `{UUID}` is a newly generated unique identifier.
 
 2. **Prepare the metadata**: Create an `IndexMetadata` message with:
-   - `uuid`: The newly generated UUID
-   - `name`: The index name (must match existing segments if adding to an existing index)
-   - `fields`: The column(s) being indexed
-   - `fragment_bitmap`: The set of fragment IDs covered by this segment
-   - `index_details`: Index-specific configuration and parameters
-   - `version`: The format version of this index type
-   - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
+    - `uuid`: The newly generated UUID
+    - `name`: The index name (must match existing segments if adding to an existing index)
+    - `fields`: The column(s) being indexed
+    - `fragment_bitmap`: The set of fragment IDs covered by this segment
+    - `index_details`: Index-specific configuration and parameters
+    - `version`: The format version of this index type
+    - `segment_seq`: The sequence assigned when the physical segment is committed, scoped to the
+      index name
+    - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
 
 3. **Commit the transaction**: Write a new manifest that includes the new index segment
    in its `IndexSection`. This is done atomically using the same transaction mechanism
@@ -151,6 +153,10 @@ The `IndexMetadata` message contains important information about the index segme
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
+- `segment_seq`: the monotonically increasing sequence number assigned when the physical segment is
+  committed. The sequence is scoped to the index name and starts at 1 for each index name. Missing
+  means the segment was written before `segment_seq` existed or the metadata has not reached the
+  commit layer yet.
 
 <details>
   <summary>Full protobuf definitions</summary>

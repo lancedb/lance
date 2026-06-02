@@ -542,6 +542,7 @@ async fn do_load_shuffled_vectors(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        segment_seq: None,
     };
     let segment = IndexSegment::new(
         metadata.uuid,
@@ -637,6 +638,8 @@ pub struct PyIndexSegmentDescription {
     /// The id of the dataset base path that stores this segment
     /// (None when the segment is stored in the dataset's default base path)
     pub base_id: Option<i64>,
+    /// Monotonically increasing sequence for this segment within its index name
+    pub segment_seq: Option<u64>,
 }
 
 impl PyIndexSegmentDescription {
@@ -656,19 +659,21 @@ impl PyIndexSegmentDescription {
             created_at: segment.created_at,
             size_bytes,
             base_id: segment.base_id.map(|id| id as i64),
+            segment_seq: segment.segment_seq,
         }
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, segment_seq={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
             self.fragment_ids,
             self.index_version,
             self.created_at,
             self.size_bytes,
-            self.base_id
+            self.base_id,
+            self.segment_seq
         )
     }
 }
