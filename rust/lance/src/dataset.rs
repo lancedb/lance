@@ -43,7 +43,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, IndexSection, Manifest,
+    RowIdMeta, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -122,7 +123,10 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{FLAG_INDEX_SEGMENT_SEQ, apply_feature_flags, can_read_dataset};
+use lance_table::feature_flags::{
+    FLAG_INDEX_SEGMENT_SEQ, FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER, apply_feature_flags,
+    can_read_dataset,
+};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -657,12 +661,10 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-            let mut indices: Vec<IndexMetadata> = section
-                .indices
-                .into_iter()
-                .map(IndexMetadata::try_from)
-                .collect::<Result<Vec<_>>>()?;
+            let section = IndexSection::try_from(lance_table::format::pb::IndexSection::decode(
+                message_data,
+            )?)?;
+            let mut indices = section.indices;
             retain_supported_indices(&mut indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
@@ -3345,7 +3347,7 @@ pub(crate) async fn write_manifest_file(
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     manifest: &mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
+    index_section: Option<IndexSection>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     mut transaction: Option<&Transaction>,
@@ -3360,11 +3362,21 @@ pub(crate) async fn write_manifest_file(
             use_stable_row_ids,
             config.disable_transaction_file,
         )?;
-        if indices
-            .as_ref()
-            .is_some_and(|indices| indices.iter().any(|idx| idx.segment_seq.is_some()))
-        {
-            manifest.writer_feature_flags |= FLAG_INDEX_SEGMENT_SEQ;
+        if let Some(index_section) = index_section.as_ref() {
+            if index_section
+                .indices
+                .iter()
+                .any(|idx| idx.segment_seq.is_some())
+            {
+                manifest.writer_feature_flags |= FLAG_INDEX_SEGMENT_SEQ;
+            }
+            if index_section
+                .logical_indexes
+                .iter()
+                .any(|idx| idx.max_segment_seq.is_some())
+            {
+                manifest.writer_feature_flags |= FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER;
+            }
         }
     }
 
@@ -3375,7 +3387,7 @@ pub(crate) async fn write_manifest_file(
     commit_handler
         .commit(
             manifest,
-            indices,
+            index_section,
             base_path,
             object_store,
             write_manifest_file_to_path,

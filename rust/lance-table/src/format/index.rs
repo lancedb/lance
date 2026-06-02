@@ -26,6 +26,45 @@ pub struct IndexFile {
     pub size_bytes: u64,
 }
 
+/// Metadata about one logical index name.
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+pub struct LogicalIndexMetadata {
+    /// Logical index name.
+    pub index_name: String,
+
+    /// Highest segment_seq assigned for this logical index.
+    pub max_segment_seq: Option<u64>,
+}
+
+/// Index section metadata.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IndexSection {
+    /// Physical index segments.
+    pub indices: Vec<IndexMetadata>,
+
+    /// Logical index metadata, including per-index high-water marks.
+    pub logical_indexes: Vec<LogicalIndexMetadata>,
+}
+
+impl IndexSection {
+    pub fn new(indices: Vec<IndexMetadata>) -> Self {
+        Self {
+            indices,
+            logical_indexes: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty() && self.logical_indexes.is_empty()
+    }
+}
+
+impl From<Vec<IndexMetadata>> for IndexSection {
+    fn from(indices: Vec<IndexMetadata>) -> Self {
+        Self::new(indices)
+    }
+}
+
 /// Index metadata
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexMetadata {
@@ -235,10 +274,64 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
     }
 }
 
+impl From<&LogicalIndexMetadata> for pb::LogicalIndexMetadata {
+    fn from(metadata: &LogicalIndexMetadata) -> Self {
+        Self {
+            index_name: metadata.index_name.clone(),
+            max_segment_seq: metadata.max_segment_seq,
+        }
+    }
+}
+
+impl From<pb::LogicalIndexMetadata> for LogicalIndexMetadata {
+    fn from(proto: pb::LogicalIndexMetadata) -> Self {
+        Self {
+            index_name: proto.index_name,
+            max_segment_seq: proto.max_segment_seq,
+        }
+    }
+}
+
+impl From<&IndexSection> for pb::IndexSection {
+    fn from(section: &IndexSection) -> Self {
+        Self {
+            indices: section
+                .indices
+                .iter()
+                .map(pb::IndexMetadata::from)
+                .collect(),
+            logical_indexes: section
+                .logical_indexes
+                .iter()
+                .map(pb::LogicalIndexMetadata::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<pb::IndexSection> for IndexSection {
+    type Error = Error;
+
+    fn try_from(proto: pb::IndexSection) -> Result<Self> {
+        Ok(Self {
+            indices: proto
+                .indices
+                .into_iter()
+                .map(IndexMetadata::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            logical_indexes: proto
+                .logical_indexes
+                .into_iter()
+                .map(LogicalIndexMetadata::from)
+                .collect(),
+        })
+    }
+}
+
 /// Returns a [`CacheCodec`](lance_core::cache::CacheCodec) for `Vec<IndexMetadata>`.
 ///
-/// Uses `pb::IndexSection` (which wraps `repeated IndexMetadata`) as the wire
-/// format, reusing the existing `TryFrom`/`From` conversions.
+/// Uses `pb::IndexSection` as the wire format, but only caches the physical
+/// `IndexMetadata` entries.
 ///
 /// Uses [`CacheCodec::new`](lance_core::cache::CacheCodec::new) because the
 /// orphan rule prevents `impl CacheCodecImpl for Vec<IndexMetadata>`.
@@ -254,6 +347,7 @@ fn serialize_index_metadata(
         .expect("index_metadata_codec: wrong type (this is a bug in the cache layer)");
     let section = pb::IndexSection {
         indices: vec.iter().map(pb::IndexMetadata::from).collect(),
+        logical_indexes: Vec::new(),
     };
     writer.write_all(&section.encode_to_vec())?;
     Ok(())
@@ -374,6 +468,38 @@ mod tests {
             assert_eq!(orig.index_version, rec.index_version);
             assert_eq!(orig.base_id, rec.base_id);
             assert_eq!(orig.files, rec.files);
+            assert_eq!(orig.segment_seq, rec.segment_seq);
         }
+    }
+
+    #[test]
+    fn test_index_section_roundtrip_preserves_logical_metadata() {
+        use prost::Message;
+
+        let section = IndexSection {
+            indices: vec![IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "my_index".to_string(),
+                fields: vec![0],
+                dataset_version: 42,
+                fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2, 3])),
+                index_details: None,
+                index_version: 1,
+                created_at: None,
+                base_id: None,
+                files: None,
+                segment_seq: Some(7),
+            }],
+            logical_indexes: vec![LogicalIndexMetadata {
+                index_name: "my_index".to_string(),
+                max_segment_seq: Some(9),
+            }],
+        };
+
+        let encoded = pb::IndexSection::from(&section).encode_to_vec();
+        let decoded = pb::IndexSection::decode(encoded.as_slice()).unwrap();
+        let decoded = IndexSection::try_from(decoded).unwrap();
+
+        assert_eq!(section, decoded);
     }
 }

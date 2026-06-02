@@ -53,7 +53,7 @@ use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
 use lance_io::traits::{WriteExt, Writer};
 
-use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
+use crate::format::{IndexSection, Manifest, Transaction, is_detached_version};
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
 #[cfg(feature = "dynamodb")]
 use {
@@ -202,7 +202,7 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
 pub type ManifestWriter = for<'a> fn(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
+    index_section: Option<IndexSection>,
     path: &'a Path,
     transaction: Option<Transaction>,
 ) -> BoxFuture<'a, Result<WriteResult>>;
@@ -213,13 +213,13 @@ pub type ManifestWriter = for<'a> fn(
 pub fn write_manifest_file_to_path<'a>(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
+    index_section: Option<IndexSection>,
     path: &'a Path,
     transaction: Option<Transaction>,
 ) -> BoxFuture<'a, Result<WriteResult>> {
     Box::pin(async move {
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
-        let pos = write_manifest(&mut object_writer, manifest, indices, transaction).await?;
+        let pos = write_manifest(&mut object_writer, manifest, index_section, transaction).await?;
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
@@ -922,7 +922,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        index_section: Option<IndexSection>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1184,7 +1184,7 @@ impl CommitHandler for UnsafeCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        index_section: Option<IndexSection>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1201,8 +1201,14 @@ impl CommitHandler for UnsafeCommitHandler {
         }
 
         let version_path = naming_scheme.manifest_path(base_path, manifest.version);
-        let res =
-            manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
+        let res = manifest_writer(
+            object_store,
+            manifest,
+            index_section,
+            &version_path,
+            transaction,
+        )
+        .await?;
 
         write_version_hint(object_store, base_path, manifest.version).await;
 
@@ -1311,7 +1317,7 @@ where
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        index_section: Option<IndexSection>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1343,7 +1349,7 @@ where
                 return Err(CommitError::OtherError(e.into()));
             }
         }
-        let res = manifest_writer(object_store, manifest, indices, &path, transaction).await;
+        let res = manifest_writer(object_store, manifest, index_section, &path, transaction).await;
 
         // Release the lock
         lease.release(res.is_ok()).await?;
@@ -1370,7 +1376,7 @@ where
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        index_section: Option<IndexSection>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1380,7 +1386,7 @@ where
         self.as_ref()
             .commit(
                 manifest,
-                indices,
+                index_section,
                 base_path,
                 object_store,
                 manifest_writer,
@@ -1401,7 +1407,7 @@ impl CommitHandler for RenameCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        index_section: Option<IndexSection>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1414,7 +1420,14 @@ impl CommitHandler for RenameCommitHandler {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let tmp_path = make_staging_manifest_path(&path)?;
 
-        let res = manifest_writer(object_store, manifest, indices, &tmp_path, transaction).await?;
+        let res = manifest_writer(
+            object_store,
+            manifest,
+            index_section,
+            &tmp_path,
+            transaction,
+        )
+        .await?;
 
         match object_store
             .inner
@@ -1460,7 +1473,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        index_section: Option<IndexSection>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1474,7 +1487,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
         manifest_writer(
             &memory_store,
             manifest,
-            indices,
+            index_section,
             &dummy_path.into(),
             transaction,
         )

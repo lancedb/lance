@@ -31,13 +31,11 @@ use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta, pb,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, IndexSection,
+        LogicalIndexMetadata, Manifest, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta, pb,
     },
-    io::{
-        commit::CommitHandler,
-        manifest::{read_manifest, read_manifest_indexes},
-    },
+    io::{commit::CommitHandler, manifest::read_manifest},
     rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
 };
 use object_store::path::Path;
@@ -1586,9 +1584,18 @@ fn assign_index_segment_seqs(
     indices: &mut [IndexMetadata],
     new_index_uuids: &HashSet<Uuid>,
     sequence_baseline_indices: &[IndexMetadata],
+    logical_indexes: &mut Vec<LogicalIndexMetadata>,
 ) {
     let has_new_indices = !new_index_uuids.is_empty();
     let mut next_seq_by_name = HashMap::<String, u64>::new();
+    for logical_index in logical_indexes.iter() {
+        if let Some(max_segment_seq) = logical_index.max_segment_seq {
+            let next_seq = next_seq_by_name
+                .entry(logical_index.index_name.clone())
+                .or_insert(1);
+            *next_seq = (*next_seq).max(max_segment_seq + 1);
+        }
+    }
     for index in sequence_baseline_indices {
         if let Some(segment_seq) = index.segment_seq {
             let next_seq = next_seq_by_name.entry(index.name.clone()).or_insert(1);
@@ -1628,10 +1635,109 @@ fn assign_index_segment_seqs(
         index.segment_seq = Some(*next_seq);
         *next_seq += 1;
     }
+
+    let mut max_segment_seq_by_name = HashMap::<String, u64>::new();
+    for index in sequence_baseline_indices {
+        if let Some(segment_seq) = segment_seq_by_uuid
+            .get(&index.uuid)
+            .copied()
+            .or(index.segment_seq)
+        {
+            let max_segment_seq = max_segment_seq_by_name
+                .entry(index.name.clone())
+                .or_insert(segment_seq);
+            *max_segment_seq = (*max_segment_seq).max(segment_seq);
+        }
+    }
+    for index in indices.iter() {
+        if let Some(segment_seq) = index.segment_seq {
+            let max_segment_seq = max_segment_seq_by_name
+                .entry(index.name.clone())
+                .or_insert(segment_seq);
+            *max_segment_seq = (*max_segment_seq).max(segment_seq);
+        }
+    }
+    for logical_index in logical_indexes.iter() {
+        if let Some(max_segment_seq) = logical_index.max_segment_seq {
+            let max_entry = max_segment_seq_by_name
+                .entry(logical_index.index_name.clone())
+                .or_insert(max_segment_seq);
+            *max_entry = (*max_entry).max(max_segment_seq);
+        }
+    }
+
+    logical_indexes
+        .retain(|logical_index| max_segment_seq_by_name.contains_key(&logical_index.index_name));
+    let mut existing_names = logical_indexes
+        .iter()
+        .map(|logical_index| logical_index.index_name.clone())
+        .collect::<HashSet<_>>();
+    for logical_index in logical_indexes.iter_mut() {
+        logical_index.max_segment_seq = max_segment_seq_by_name
+            .get(&logical_index.index_name)
+            .copied();
+    }
+    for (index_name, max_segment_seq) in max_segment_seq_by_name {
+        if existing_names.insert(index_name.clone()) {
+            logical_indexes.push(LogicalIndexMetadata {
+                index_name,
+                max_segment_seq: Some(max_segment_seq),
+            });
+        }
+    }
+    logical_indexes.sort_by(|left, right| left.index_name.cmp(&right.index_name));
+}
+
+fn merge_logical_index_high_water_marks(
+    index_section: &mut IndexSection,
+    current_index_section: &IndexSection,
+) {
+    let mut max_segment_seq_by_name = HashMap::<String, u64>::new();
+    for logical_index in index_section
+        .logical_indexes
+        .iter()
+        .chain(current_index_section.logical_indexes.iter())
+    {
+        if let Some(max_segment_seq) = logical_index.max_segment_seq {
+            let max_entry = max_segment_seq_by_name
+                .entry(logical_index.index_name.clone())
+                .or_insert(max_segment_seq);
+            *max_entry = (*max_entry).max(max_segment_seq);
+        }
+    }
+    for index in index_section
+        .indices
+        .iter()
+        .chain(current_index_section.indices.iter())
+    {
+        if let Some(segment_seq) = index.segment_seq {
+            let max_entry = max_segment_seq_by_name
+                .entry(index.name.clone())
+                .or_insert(segment_seq);
+            *max_entry = (*max_entry).max(segment_seq);
+        }
+    }
+
+    index_section.logical_indexes = max_segment_seq_by_name
+        .into_iter()
+        .map(|(index_name, max_segment_seq)| LogicalIndexMetadata {
+            index_name,
+            max_segment_seq: Some(max_segment_seq),
+        })
+        .collect();
+    index_section
+        .logical_indexes
+        .sort_by(|left, right| left.index_name.cmp(&right.index_name));
+}
+
+pub(crate) struct CurrentManifestMetadata<'a> {
+    pub manifest: &'a Manifest,
+    pub index_section: &'a IndexSection,
 }
 
 pub(crate) fn assign_index_segment_seqs_for_new_indices(
     current_indices: &[IndexMetadata],
+    logical_indexes: &[LogicalIndexMetadata],
     removed_indices: &[IndexMetadata],
     new_indices: &mut [IndexMetadata],
 ) {
@@ -1659,7 +1765,13 @@ pub(crate) fn assign_index_segment_seqs_for_new_indices(
         .collect::<Vec<_>>();
     final_indices.extend(new_indices.iter().cloned());
 
-    assign_index_segment_seqs(&mut final_indices, &new_uuids, current_indices);
+    let mut logical_indexes = logical_indexes.to_vec();
+    assign_index_segment_seqs(
+        &mut final_indices,
+        &new_uuids,
+        current_indices,
+        &mut logical_indexes,
+    );
 
     let assigned = final_indices
         .into_iter()
@@ -1832,24 +1944,31 @@ impl Transaction {
         version: u64,
         config: &ManifestWriteConfig,
         tx_path: &str,
-        current_manifest: &Manifest,
-    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        current: CurrentManifestMetadata<'_>,
+    ) -> Result<(Manifest, IndexSection)> {
         let location = commit_handler
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
-        let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
+        let mut index_section = lance_table::io::manifest::read_manifest_index_section(
+            object_store,
+            &location,
+            &manifest,
+        )
+        .await?;
+        merge_logical_index_high_water_marks(&mut index_section, current.index_section);
         manifest.max_fragment_id = manifest
             .max_fragment_id
-            .max(current_manifest.max_fragment_id);
-        Ok((manifest, indices))
+            .max(current.manifest.max_fragment_id);
+        Ok((manifest, index_section))
     }
 
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
+    #[cfg(test)]
     pub(crate) fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
@@ -1857,6 +1976,23 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let (manifest, index_section) = self.build_manifest_with_index_section(
+            current_manifest,
+            IndexSection::new(current_indices),
+            transaction_file_path,
+            config,
+        )?;
+        Ok((manifest, index_section.indices))
+    }
+
+    /// Create a new manifest and index section from the current manifest and transaction.
+    pub(crate) fn build_manifest_with_index_section(
+        &self,
+        current_manifest: Option<&Manifest>,
+        current_index_section: IndexSection,
+        transaction_file_path: &str,
+        config: &ManifestWriteConfig,
+    ) -> Result<(Manifest, IndexSection)> {
         if config.use_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
@@ -1923,8 +2059,12 @@ impl Transaction {
                 .unwrap_or(0)
         };
         let mut final_fragments = Vec::new();
+        let IndexSection {
+            indices: current_indices,
+            logical_indexes: mut final_logical_indexes,
+        } = current_index_section;
         let mut final_indices = current_indices;
-        let segment_seq_baseline_indices = final_indices.clone();
+        let mut segment_seq_baseline_indices = final_indices.clone();
         let mut new_index_uuids_for_segment_seq = HashSet::new();
 
         let mut next_row_id = {
@@ -2158,6 +2298,8 @@ impl Transaction {
                 }
                 final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
+                final_logical_indexes.clear();
+                segment_seq_baseline_indices.clear();
             }
             Operation::Rewrite {
                 groups,
@@ -2446,6 +2588,7 @@ impl Transaction {
             &mut final_indices,
             &new_index_uuids_for_segment_seq,
             &segment_seq_baseline_indices,
+            &mut final_logical_indexes,
         );
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -2687,7 +2830,13 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
-        Ok((manifest, final_indices))
+        Ok((
+            manifest,
+            IndexSection {
+                indices: final_indices,
+                logical_indexes: final_logical_indexes,
+            },
+        ))
     }
 
     fn register_pure_rewrite_rows_update_frags_in_indices(

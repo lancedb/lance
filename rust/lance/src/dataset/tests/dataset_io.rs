@@ -2052,7 +2052,7 @@ impl lance_table::io::commit::CommitHandler for ErroringCommitHandler {
     async fn commit(
         &self,
         _manifest: &mut lance_table::format::Manifest,
-        _indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        _index_section: Option<lance_table::format::IndexSection>,
         _base_path: &Path,
         _object_store: &ObjectStore,
         _manifest_writer: lance_table::io::commit::ManifestWriter,

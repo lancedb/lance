@@ -23,7 +23,9 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
+use crate::format::{
+    DataStorageFormat, IndexMetadata, IndexSection, MAGIC, Manifest, Transaction, pb,
+};
 
 use super::commit::ManifestLocation;
 
@@ -114,6 +116,19 @@ pub async fn read_manifest_indexes(
     location: &ManifestLocation,
     manifest: &Manifest,
 ) -> Result<Vec<IndexMetadata>> {
+    Ok(
+        read_manifest_index_section(object_store, location, manifest)
+            .await?
+            .indices,
+    )
+}
+
+#[instrument(level = "debug", skip(object_store, manifest))]
+pub async fn read_manifest_index_section(
+    object_store: &ObjectStore,
+    location: &ManifestLocation,
+    manifest: &Manifest,
+) -> Result<IndexSection> {
     if let Some(pos) = manifest.index_section.as_ref() {
         let reader = if let Some(size) = location.size {
             object_store
@@ -123,29 +138,21 @@ pub async fn read_manifest_indexes(
             object_store.open(&location.path).await?
         };
         let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
-
-        let indices = section
-            .indices
-            .into_iter()
-            .map(IndexMetadata::try_from)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(indices)
+        IndexSection::try_from(section)
     } else {
-        Ok(vec![])
+        Ok(IndexSection::default())
     }
 }
 
 async fn do_write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
+    index_section: Option<IndexSection>,
     mut transaction: Option<Transaction>,
 ) -> Result<usize> {
     // Write indices if presented.
-    if let Some(indices) = indices.as_ref() {
-        let section = pb::IndexSection {
-            indices: indices.iter().map(|i| i.into()).collect(),
-        };
+    if let Some(index_section) = index_section.as_ref() {
+        let section = pb::IndexSection::from(index_section);
         let pos = writer.write_protobuf(&section).await?;
         manifest.index_section = Some(pos);
     }
@@ -165,7 +172,7 @@ async fn do_write_manifest(
 pub async fn write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<IndexMetadata>>,
+    index_section: Option<IndexSection>,
     transaction: Option<Transaction>,
 ) -> Result<usize> {
     // Write dictionary values.
@@ -209,7 +216,7 @@ pub async fn write_manifest(
         }
     }
 
-    do_write_manifest(writer, manifest, indices, transaction).await
+    do_write_manifest(writer, manifest, index_section, transaction).await
 }
 
 /// Implementation of ManifestProvider that describes a Lance file by writing

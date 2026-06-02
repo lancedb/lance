@@ -32,25 +32,28 @@ use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
+    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, IndexSection,
+    Manifest, WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
+use lance_table::io::manifest::read_manifest_index_section;
 use rand::{Rng, rng};
 
 use super::ObjectStore;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{CurrentManifestMetadata, Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
+#[cfg(test)]
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::retain_supported_indices;
 use crate::index::vector::details::infer_missing_vector_details;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
@@ -155,7 +158,7 @@ async fn do_commit_new_dataset(
         String::new()
     };
 
-    let (mut manifest, indices) = if let Operation::Clone {
+    let (mut manifest, index_section) = if let Operation::Clone {
         is_shallow,
         ref_name,
         ref_version,
@@ -192,23 +195,19 @@ async fn do_commit_new_dataset(
                 transaction_file.clone(),
             );
 
-            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = object_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = Some(new_base_id);
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                vec![]
-            };
-            (new_manifest, updated_indices)
+            let mut updated_index_section =
+                if let Some(index_section_pos) = source_manifest.index_section {
+                    let reader = object_store.open(&source_manifest_location.path).await?;
+                    let section: pb::IndexSection =
+                        lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+                    IndexSection::try_from(section)?
+                } else {
+                    IndexSection::default()
+                };
+            for index in &mut updated_index_section.indices {
+                index.base_id = Some(new_base_id);
+            }
+            (new_manifest, updated_index_section)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
             let mut new_manifest = source_manifest.clone();
@@ -228,27 +227,25 @@ async fn do_commit_new_dataset(
             new_manifest.fragments = Arc::new(new_frags);
 
             // Indices: keep metadata but normalize base to local
-            let mut updated_indices = Vec::new();
+            let mut updated_index_section = IndexSection::default();
             if let Some(index_section_pos) = source_manifest.index_section {
                 let reader = object_store.open(&source_manifest_location.path).await?;
                 let section: pb::IndexSection =
                     lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                updated_indices = section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = None;
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                updated_index_section = IndexSection::try_from(section)?;
+                for index in &mut updated_index_section.indices {
+                    index.base_id = None;
+                }
             }
-            (new_manifest, updated_indices)
+            (new_manifest, updated_index_section)
         }
     } else {
-        let (manifest, indices) =
-            transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
-        (manifest, indices)
+        transaction.build_manifest_with_index_section(
+            None,
+            IndexSection::default(),
+            &transaction_file,
+            write_config,
+        )?
     };
 
     let result = write_manifest_file(
@@ -256,10 +253,10 @@ async fn do_commit_new_dataset(
         commit_handler,
         base_path,
         &mut manifest,
-        if indices.is_empty() {
+        if index_section.is_empty() {
             None
         } else {
-            Some(indices.clone())
+            Some(index_section.clone())
         },
         write_config,
         manifest_naming_scheme,
@@ -743,6 +740,31 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
     Ok(())
 }
 
+async fn load_index_section_for_commit(dataset: &Dataset) -> Result<IndexSection> {
+    let mut index_section = read_manifest_index_section(
+        dataset.object_store.as_ref(),
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await?;
+    retain_supported_indices(&mut index_section.indices);
+    infer_missing_vector_details(dataset, &mut index_section.indices).await;
+    Ok(index_section)
+}
+
+fn index_section_for_write(
+    index_section: &IndexSection,
+    current_manifest: Option<&Manifest>,
+) -> Option<IndexSection> {
+    if !index_section.is_empty()
+        || current_manifest.is_some_and(|manifest| manifest.index_section.is_some())
+    {
+        Some(index_section.clone())
+    } else {
+        None
+    }
+}
+
 pub(crate) struct BadFragmentBitmapError {
     pub bad_indices: Vec<(String, Vec<u32>)>,
 }
@@ -808,8 +830,9 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
-        let (mut manifest, mut indices) = match transaction.operation {
+        let (mut manifest, mut index_section) = match transaction.operation {
             Operation::Restore { version } => {
+                let current_index_section = load_index_section_for_commit(dataset).await?;
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
@@ -817,13 +840,16 @@ pub(crate) async fn do_commit_detached_transaction(
                     version,
                     write_config,
                     &transaction_file,
-                    &dataset.manifest,
+                    CurrentManifestMetadata {
+                        manifest: dataset.manifest.as_ref(),
+                        index_section: &current_index_section,
+                    },
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
+            _ => transaction.build_manifest_with_index_section(
                 Some(dataset.manifest.as_ref()),
-                dataset.load_indices().await?.as_ref().clone(),
+                load_index_section_for_commit(dataset).await?,
                 &transaction_file,
                 write_config,
             )?,
@@ -838,7 +864,7 @@ pub(crate) async fn do_commit_detached_transaction(
         fix_schema(&mut manifest)?;
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
-        migrate_indices(dataset, &mut indices).await?;
+        migrate_indices(dataset, &mut index_section.indices).await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -846,11 +872,7 @@ pub(crate) async fn do_commit_detached_transaction(
             commit_handler,
             &dataset.base,
             &mut manifest,
-            if indices.is_empty() {
-                None
-            } else {
-                Some(indices.clone())
-            },
+            index_section_for_write(&index_section, Some(dataset.manifest.as_ref())),
             write_config,
             ManifestNamingScheme::V2,
             Some(transaction),
@@ -1015,8 +1037,9 @@ pub(crate) async fn commit_transaction(
             ));
         }
         // Build an up-to-date manifest from the transaction and current manifest
-        let (mut manifest, mut indices) = match transaction.operation {
+        let (mut manifest, mut index_section) = match transaction.operation {
             Operation::Restore { version } => {
+                let current_index_section = load_index_section_for_commit(&dataset).await?;
                 Transaction::restore_old_manifest(
                     object_store,
                     commit_handler,
@@ -1024,13 +1047,16 @@ pub(crate) async fn commit_transaction(
                     version,
                     write_config,
                     transaction_file,
-                    &dataset.manifest,
+                    CurrentManifestMetadata {
+                        manifest: dataset.manifest.as_ref(),
+                        index_section: &current_index_section,
+                    },
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
+            _ => transaction.build_manifest_with_index_section(
                 Some(dataset.manifest.as_ref()),
-                dataset.load_indices().await?.as_ref().clone(),
+                load_index_section_for_commit(&dataset).await?,
                 transaction_file,
                 write_config,
             )?,
@@ -1052,7 +1078,7 @@ pub(crate) async fn commit_transaction(
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
 
-        migrate_indices(&dataset, &mut indices).await?;
+        migrate_indices(&dataset, &mut index_section.indices).await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -1060,11 +1086,7 @@ pub(crate) async fn commit_transaction(
             commit_handler,
             &dataset.base,
             &mut manifest,
-            if indices.is_empty() {
-                None
-            } else {
-                Some(indices.clone())
-            },
+            index_section_for_write(&index_section, Some(dataset.manifest.as_ref())),
             write_config,
             manifest_naming_scheme,
             Some(&transaction),
@@ -1090,13 +1112,13 @@ pub(crate) async fn commit_transaction(
                     .metadata_cache
                     .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
                     .await;
-                if !indices.is_empty() {
+                if !index_section.indices.is_empty() {
                     let key = IndexMetadataKey {
                         version: target_version,
                     };
                     dataset
                         .index_cache
-                        .insert_with_key(&key, Arc::new(indices))
+                        .insert_with_key(&key, Arc::new(index_section.indices))
                         .await;
                 }
 
@@ -1792,7 +1814,7 @@ mod tests {
         async fn commit(
             &self,
             _manifest: &mut Manifest,
-            _indices: Option<Vec<IndexMetadata>>,
+            _index_section: Option<IndexSection>,
             _base_path: &Path,
             _object_store: &ObjectStore,
             _manifest_writer: ManifestWriter,

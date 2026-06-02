@@ -137,7 +137,8 @@ When loading an index:
 
 1. Get the offset to the index section from the `index_section` field in the [manifest](../table/index.md#manifest).
 2. Read the index section from the manifest file. This is a protobuf message of type `IndexSection`, which
-   contains a list of `IndexMetadata` messages, each describing an index segment.
+   contains a list of `IndexMetadata` messages, each describing an index segment, and a list of
+   `LogicalIndexMetadata` messages, each describing persistent metadata for one index name.
 3. Read the index files from the `_indices/{UUID}` directory under the dataset directory,
    where `{UUID}` is the UUID of the index segment.
 
@@ -154,17 +155,33 @@ The `IndexMetadata` message contains important information about the index segme
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
 - `segment_seq`: the monotonically increasing sequence number assigned when the physical segment is
-  committed. The sequence is scoped to the index name and starts at 1 for each index name. Missing
-  means the segment was written before `segment_seq` existed or the metadata has not reached the
-  commit layer yet.
+  committed. The sequence is scoped to the index name; the first assigned value for each index name
+  is 1. Missing means the segment was written before `segment_seq` existed or the metadata has not
+  reached the commit layer yet.
+
+The `LogicalIndexMetadata` message stores metadata for an index name even when no physical segment
+for that name is currently present:
+
+- `index_name`: the logical index name.
+- `max_segment_seq`: the highest `segment_seq` that has been assigned for this index name. Writers use
+  this as the high-water mark so deleting the latest segment does not allow a later segment to reuse
+  the same `segment_seq`. The value is preserved even when all physical segments for that index name
+  are removed.
+
+Writers set `FLAG_INDEX_SEGMENT_SEQ` when physical segment metadata contains `segment_seq` and
+`FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER` when logical high-water metadata is present. Readers do not need
+either flag to scan data, but writers must preserve both metadata forms once the corresponding writer
+flag appears.
 
 <details>
   <summary>Full protobuf definitions</summary>
 
-There are both part of the `table.proto` file in the Lance source code.
+These are part of the `table.proto` file in the Lance source code.
 
 ```protobuf
 %%% proto.message.IndexSection %%%
+
+%%% proto.message.LogicalIndexMetadata %%%
 
 %%% proto.message.IndexMetadata %%%
 ```

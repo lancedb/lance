@@ -369,7 +369,7 @@ async fn test_inline_transaction() {
         if indices.is_empty() {
             None
         } else {
-            Some(indices.clone())
+            Some(lance_table::format::IndexSection::new(indices.clone()))
         },
         &ManifestWriteConfig::default(),
         ds.manifest_location.naming_scheme,

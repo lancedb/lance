@@ -15,7 +15,7 @@ use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, IndexSection};
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
 use log::info;
@@ -320,7 +320,7 @@ impl MemTableFlusher {
         write_manifest_file_to_path(
             &self.object_store,
             &mut manifest,
-            indexes,
+            indexes.map(IndexSection::new),
             &manifest_path,
             None,
         )

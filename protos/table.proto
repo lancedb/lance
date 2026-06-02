@@ -309,9 +309,19 @@ message IndexFile {
   uint64 size_bytes = 2;
 }
 
+// Metadata about one logical index name.
+message LogicalIndexMetadata {
+  // Logical index name.
+  string index_name = 1;
+
+  // Highest segment_seq that has ever been assigned for this logical index.
+  optional uint64 max_segment_seq = 2;
+}
+
 // Index Section, containing a list of index metadata for one dataset version.
 message IndexSection {
   repeated IndexMetadata indices = 1;
+  repeated LogicalIndexMetadata logical_indexes = 2;
 }
 
 // A DataFragment is a set of files which represent the different columns of the same

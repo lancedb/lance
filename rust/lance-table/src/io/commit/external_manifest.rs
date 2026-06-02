@@ -23,7 +23,7 @@ use super::{
     MANIFEST_EXTENSION, ManifestLocation, ManifestNamingScheme, current_manifest_path,
     default_resolve_version, make_staging_manifest_path, write_version_hint,
 };
-use crate::format::{IndexMetadata, Manifest, Transaction};
+use crate::format::{IndexSection, Manifest, Transaction};
 use crate::io::commit::{CommitError, CommitHandler};
 
 /// External manifest store
@@ -459,7 +459,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<IndexMetadata>>,
+        index_section: Option<IndexSection>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: super::ManifestWriter,
@@ -472,8 +472,14 @@ impl CommitHandler for ExternalManifestCommitHandler {
         // step 1: Write the manifest we want to commit to object store with a temporary name
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         let staging_path = make_staging_manifest_path(&path)?;
-        let write_res =
-            manifest_writer(object_store, manifest, indices, &staging_path, transaction).await?;
+        let write_res = manifest_writer(
+            object_store,
+            manifest,
+            index_section,
+            &staging_path,
+            transaction,
+        )
+        .await?;
 
         // step 2 & 3: Put the manifest to external store
         let result = self

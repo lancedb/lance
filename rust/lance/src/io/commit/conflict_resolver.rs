@@ -1605,8 +1605,15 @@ impl<'a> TransactionRebase<'a> {
             }
 
             let current_indices = dataset.load_indices().await?;
+            let current_index_section = lance_table::io::manifest::read_manifest_index_section(
+                dataset.object_store.as_ref(),
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await?;
             assign_index_segment_seqs_for_new_indices(
                 current_indices.as_ref(),
+                &current_index_section.logical_indexes,
                 removed_indices,
                 new_indices,
             );
