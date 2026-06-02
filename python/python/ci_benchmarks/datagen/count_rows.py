@@ -3,7 +3,7 @@
 
 """Generate the count_rows benchmark dataset.
 
-Creates a 1-billion-row Lance dataset with five int32 columns that all hold the
+Creates a 10-million-row Lance dataset with five int32 columns that all hold the
 same values and the same ~1% null mask.  Each column carries a different scalar
 index so the benchmark can compare no-index, BITMAP, BTREE, ZONEMAP, and
 BLOOMFILTER side-by-side on the same underlying data.
@@ -26,8 +26,8 @@ from lance.log import LOGGER
 
 from ci_benchmarks.datasets import get_dataset_uri
 
-NUM_ROWS = 1_000_000_000
-BATCH_SIZE = 1_000_000  # 1 M rows per batch → 1 000 batches total
+NUM_ROWS = 10_000_000
+BATCH_SIZE = 1_000_000  # 1 M rows per batch → 10 batches total
 
 COLUMNS = [
     "value_none",
