@@ -28,7 +28,9 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
-use super::{HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic};
+use super::{
+    HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
+};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
@@ -565,26 +567,23 @@ impl HnswBuilder {
             }
         }
         for (level, pruned_neighbors) in pruned_neighbors_per_level.iter().enumerate() {
-            let _: Vec<_> = pruned_neighbors
-                .iter()
-                .map(|unpruned_edge| {
-                    let level = level as u16;
-                    let m_max = match level {
-                        0 => self.params.m * 2,
-                        _ => self.params.m,
-                    };
-                    if unpruned_edge.dist
-                        < nodes[unpruned_edge.id as usize]
-                            .read()
-                            .unwrap()
-                            .cutoff(level, m_max)
-                    {
-                        let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
-                        chosen_node.add_neighbor(node, unpruned_edge.dist, level);
-                        self.prune(storage, &mut chosen_node, level);
-                    }
-                })
-                .collect();
+            for unpruned_edge in pruned_neighbors {
+                let level = level as u16;
+                let m_max = match level {
+                    0 => self.params.m * 2,
+                    _ => self.params.m,
+                };
+                if unpruned_edge.dist
+                    < nodes[unpruned_edge.id as usize]
+                        .read()
+                        .unwrap()
+                        .cutoff(level, m_max)
+                {
+                    let mut chosen_node = nodes[unpruned_edge.id as usize].write().unwrap();
+                    chosen_node.add_neighbor(node, unpruned_edge.dist, level);
+                    self.prune(storage, &mut chosen_node, level);
+                }
+            }
         }
     }
 
@@ -621,13 +620,13 @@ impl HnswBuilder {
         };
 
         let neighbors_ranked = &mut builder_node.level_neighbors_ranked[level as usize];
-        let level_neighbors = neighbors_ranked.clone();
-        if level_neighbors.len() <= m_max {
+        if neighbors_ranked.len() <= m_max {
             builder_node.update_from_ranked_neighbors(level);
             return;
         }
 
-        *neighbors_ranked = select_neighbors_heuristic(storage, &level_neighbors, m_max);
+        let level_neighbors = std::mem::take(neighbors_ranked);
+        *neighbors_ranked = select_neighbors_heuristic_owned(storage, level_neighbors, m_max);
         builder_node.update_from_ranked_neighbors(level);
     }
 }

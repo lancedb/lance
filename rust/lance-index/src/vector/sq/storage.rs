@@ -372,10 +372,10 @@ impl VectorStore for ScalarQuantizationStorage {
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let (offset, chunk) = self.chunk(id);
-        let query_sq_code = chunk.sq_code_slice(id - offset).to_vec();
+        let query_sq_code = chunk.sq_code_slice(id - offset);
         let bounds = self.quantizer.bounds();
         SQDistCalculator {
-            query_sq_code,
+            query_sq_code: SQQueryCode::Borrowed(query_sq_code),
             scale: sq_distance_scale(&bounds),
             storage: self,
         }
@@ -389,9 +389,24 @@ fn sq_distance_scale(bounds: &Range<f64>) -> f32 {
 }
 
 pub struct SQDistCalculator<'a> {
-    query_sq_code: Vec<u8>,
+    query_sq_code: SQQueryCode<'a>,
     scale: f32,
     storage: &'a ScalarQuantizationStorage,
+}
+
+enum SQQueryCode<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl SQQueryCode<'_> {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(query) => query,
+            Self::Owned(query) => query,
+        }
+    }
 }
 
 impl<'a> SQDistCalculator<'a> {
@@ -415,7 +430,7 @@ impl<'a> SQDistCalculator<'a> {
             }
         };
         Self {
-            query_sq_code,
+            query_sq_code: SQQueryCode::Owned(query_sq_code),
             scale: sq_distance_scale(&bounds),
             storage,
         }
@@ -426,15 +441,17 @@ impl DistCalculator for SQDistCalculator<'_> {
     fn distance(&self, id: u32) -> f32 {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
+        let query_sq_code = self.query_sq_code.as_slice();
         let dist = match self.storage.distance_type {
-            DistanceType::L2 | DistanceType::Cosine => l2_u8(sq_code, &self.query_sq_code) as f32,
-            DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
+            DistanceType::L2 | DistanceType::Cosine => l2_u8(sq_code, query_sq_code) as f32,
+            DistanceType::Dot => dot_distance(sq_code, query_sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         };
         dist * self.scale
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+        let query_sq_code = self.query_sq_code.as_slice();
         match self.storage.distance_type {
             DistanceType::L2 | DistanceType::Cosine => self
                 .storage
@@ -444,7 +461,7 @@ impl DistCalculator for SQDistCalculator<'_> {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
-                        .map(|sq_codes| l2_u8(sq_codes, &self.query_sq_code) as f32)
+                        .map(|sq_codes| l2_u8(sq_codes, query_sq_code) as f32)
                 })
                 .map(|dist| dist * self.scale)
                 .collect(),
@@ -456,7 +473,7 @@ impl DistCalculator for SQDistCalculator<'_> {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
-                        .map(|sq_codes| dot_distance(sq_codes, &self.query_sq_code))
+                        .map(|sq_codes| dot_distance(sq_codes, query_sq_code))
                 })
                 .map(|dist| dist * self.scale)
                 .collect(),

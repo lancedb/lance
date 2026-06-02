@@ -93,6 +93,31 @@ print(f"{tot / n:.4f}")
 PY
 }
 
+# Optional apples-to-apples toggles:
+#   POSITIONS=0        index without token positions on BOTH sides (term-only,
+#                      no phrase) — Lance with_position=false vs Lucene
+#                      DOCS_AND_FREQS.
+#   IMMUTABLE=1        Lance reads only immutable frozen segments (Lucene model).
+#   FREEZE_THRESHOLD=n keep a large mutable tail (n docs per freeze) so the
+#                      tail-read path is exercised — needed to measure tail-skip.
+#   NO_TAIL_SKIP=1     disable Lance's block-max tail pruning (A/B the optimization).
+LANCE_FLAGS=""
+LUCENE_FLAGS=""
+if [ "${POSITIONS:-1}" = "0" ]; then
+    LANCE_FLAGS="$LANCE_FLAGS --no-positions"
+    LUCENE_FLAGS="$LUCENE_FLAGS --no-positions"
+fi
+if [ "${IMMUTABLE:-0}" = "1" ]; then
+    LANCE_FLAGS="$LANCE_FLAGS --immutable"
+fi
+if [ -n "${FREEZE_THRESHOLD:-}" ]; then
+    LANCE_FLAGS="$LANCE_FLAGS --freeze-threshold $FREEZE_THRESHOLD"
+fi
+if [ "${NO_TAIL_SKIP:-0}" = "1" ]; then
+    LANCE_FLAGS="$LANCE_FLAGS --no-tail-skip"
+fi
+echo "lance flags:'$LANCE_FLAGS'  lucene flags:'$LUCENE_FLAGS'"
+
 echo ""
 for SIZE in $SIZES; do
     DIR="$WORK/n$SIZE"
@@ -106,11 +131,11 @@ for SIZE in $SIZES; do
     for RUN in a b; do
         echo "--- run $RUN: lance ---"
         "$LANCE_BIN" --bench bench --in-dir "$DIR" --run "$RUN" --k "$K" \
-            --threads "$THREADS" | tee "$RESULT_DIR/lance_n${SIZE}_run${RUN}.txt" \
+            --threads "$THREADS" $LANCE_FLAGS | tee "$RESULT_DIR/lance_n${SIZE}_run${RUN}.txt" \
             | grep '^{' > "$RESULT_DIR/lance_n${SIZE}_run${RUN}.json"
         echo "--- run $RUN: lucene ---"
         "$JAVA" -cp "$LUCENE_CP:$WORK" LuceneFtsBench --in-dir "$DIR" --run "$RUN" \
-            --k "$K" --threads "$THREADS" | tee "$RESULT_DIR/lucene_n${SIZE}_run${RUN}.txt" \
+            --k "$K" --threads "$THREADS" $LUCENE_FLAGS | tee "$RESULT_DIR/lucene_n${SIZE}_run${RUN}.txt" \
             | grep '^{' > "$RESULT_DIR/lucene_n${SIZE}_run${RUN}.json"
         ov="$(mutual_overlap "$DIR/lance_fts_run${RUN}_topk.txt" \
                              "$DIR/lucene_run${RUN}_topk.txt" "$K")"
@@ -125,13 +150,14 @@ python3 - "$RESULT_DIR" "$K" <<'PY'
 import glob, json, os, sys
 d, k = sys.argv[1], sys.argv[2]
 print(f"{'size':>9} {'run':>4} {'impl':>10} {'build_dps':>11} {'q_p50_us':>10} "
-      f"{'q_p95_us':>10} {'qps_1t':>9} {'qps_nt':>10} {'term_rec':>9} {'phr_rec':>9}")
+      f"{'q_p95_us':>10} {'qps_1t':>9} {'qps_nt':>10} {'term_rec':>9} {'phr_rec':>9} {'or_rec':>9}")
 for p in sorted(glob.glob(os.path.join(d, "*_n*_run*.json"))):
     try: r = json.load(open(p))
     except Exception: continue
     print(f"{r['docs']:>9} {r['run']:>4} {r['impl']:>10} {r['build_docs_per_s']:>11.0f} "
           f"{r['q_p50_us']:>10.1f} {r['q_p95_us']:>10.1f} {r['qps_1t']:>9.0f} "
-          f"{r['qps_nt']:>10.0f} {r['term_recall_at_k']:>9.3f} {r['phrase_recall_at_k']:>9.3f}")
+          f"{r['qps_nt']:>10.0f} {r['term_recall_at_k']:>9.3f} {r['phrase_recall_at_k']:>9.3f} "
+          f"{r.get('or_recall_at_k', float('nan')):>9.3f}")
 for p in sorted(glob.glob(os.path.join(d, "overlap_*.txt"))):
     name = os.path.basename(p)[:-4]
     print(f"  {name} = {open(p).read().strip()}")

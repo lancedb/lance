@@ -9,6 +9,7 @@ import shutil
 import string
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -178,6 +179,127 @@ def run(ds, q=None, assert_func=None):
 
 def test_flat(dataset):
     run(dataset)
+
+
+@pytest.mark.parametrize(
+    "queries",
+    [
+        np.random.randn(2, 128).astype(np.float32),
+        np.random.randn(1, 128).astype(np.float32),
+    ],
+    ids=["two_queries", "single_query"],
+)
+def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
+    k = 5
+    query_count = queries.shape[0]
+
+    batch = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": k,
+            "use_index": False,
+        },
+    )
+
+    assert batch.num_rows == query_count * k
+    assert batch.column_names == ["query_index", "id", "_distance"]
+    query_index_field = batch.schema.field("query_index")
+    assert query_index_field.type == pa.int32()
+    assert not query_index_field.nullable
+    expected_query_index = sum([[i] * k for i in range(query_count)], [])
+    assert batch["query_index"].to_pylist() == expected_query_index
+
+    _assert_batch_matches_single_queries(
+        dataset,
+        queries,
+        k=k,
+        nearest_kwargs={"use_index": False},
+    )
+
+
+def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
+    batch = ds.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": k,
+            **nearest_kwargs,
+        },
+    )
+    if "distance_range" in nearest_kwargs:
+        lo, hi = nearest_kwargs["distance_range"]
+        assert all(lo <= d < hi for d in batch["_distance"].to_pylist())
+
+    for query_index, query in enumerate(queries):
+        single = ds.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": query,
+                "k": k,
+                **nearest_kwargs,
+            },
+        )
+        batch_slice = batch.filter(pc.field("query_index") == query_index)
+        assert batch_slice["id"].to_pylist() == single["id"].to_pylist()
+        np.testing.assert_allclose(
+            batch_slice["_distance"].to_numpy(),
+            single["_distance"].to_numpy(),
+        )
+
+
+def test_batch_vector_search_rejects_dataset_query_index_column(tmp_path):
+    dim = 128
+    table = create_table(nvec=80, ndim=dim)
+    table = table.append_column(
+        "query_index",
+        pa.array(range(80), type=pa.uint32()),
+    )
+    ds = lance.write_dataset(table, tmp_path / "with_query_index")
+
+    queries = np.random.randn(2, dim).astype(np.float32)
+    with pytest.raises(Exception, match="query_index"):
+        ds.to_table(
+            columns=["id", "query_index"],
+            nearest={
+                "column": "vector",
+                "q": queries,
+                "k": 5,
+                "use_index": False,
+            },
+        )
+
+
+def test_flat_1d_query_length_multiple_of_dim_is_rejected(dataset):
+    q = np.random.randn(256).astype(np.float32)
+    with pytest.raises(ValueError, match=r"256.*128"):
+        dataset.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": 5,
+                "use_index": False,
+            },
+        )
+
+
+def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset):
+    queries = np.random.randn(2, 128).astype(np.float32)
+    batch = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": queries,
+            "k": 5,
+        },
+        fast_search=True,
+    )
+    assert batch.num_rows == 0
+    assert "query_index" in batch.column_names
 
 
 def test_ann(indexed_dataset):
@@ -934,6 +1056,18 @@ def test_create_ivf_rq_skip_transpose():
     )
     stats = ds.stats.index_stats("vector_idx")
     assert stats["indices"][0]["sub_index"]["packed"] is False
+
+
+def test_create_ivf_rq_rejects_unsupported_num_bits():
+    ds = lance.write_dataset(create_table(), "memory://")
+
+    with pytest.raises(NotImplementedError, match="only num_bits=1 is supported"):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=2,
+        )
 
 
 def test_create_ivf_rq_requires_dim_divisible_by_8():
@@ -2103,6 +2237,24 @@ def test_prewarm_index(tmp_path):
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
+
+
+def test_scanner_rejects_unknown_index_segments(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
+
+    with pytest.raises(
+        ValueError, match="with_index_segments referenced unknown index segments"
+    ):
+        dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128).astype(np.float32),
+                "k": 10,
+            },
+            index_segments=[uuid.uuid4()],
+        ).to_table()
 
 
 def test_vector_index_distance_range(tmp_path):

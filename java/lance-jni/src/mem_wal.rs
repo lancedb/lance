@@ -23,7 +23,7 @@ use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use jni::JNIEnv;
 use jni::objects::{JClass, JMap, JObject, JString, JValueGen};
-use jni::sys::{jint, jlong};
+use jni::sys::{jdouble, jint, jlong};
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
     FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
@@ -855,13 +855,9 @@ pub extern "system" fn Java_org_lance_memwal_LsmVectorSearchPlanner_nativePlanSe
     k: jint,
     nprobes: jint,
     columns: JObject<'local>,
-    refine_factor: jint,
+    refine_base_table: bool,
+    overfetch_factor: jdouble,
 ) -> JObject<'local> {
-    let refine = if refine_factor > 0 {
-        Some(refine_factor as u32)
-    } else {
-        None
-    };
     ok_or_throw!(
         env,
         inner_plan_search(
@@ -872,7 +868,8 @@ pub extern "system" fn Java_org_lance_memwal_LsmVectorSearchPlanner_nativePlanSe
             k,
             nprobes,
             columns,
-            refine
+            refine_base_table,
+            overfetch_factor,
         )
     )
 }
@@ -886,7 +883,8 @@ fn inner_plan_search<'local>(
     k: jint,
     nprobes: jint,
     columns: JObject<'local>,
-    refine_factor: Option<u32>,
+    refine_base_table: bool,
+    overfetch_factor: f64,
 ) -> Result<JObject<'local>> {
     let query = import_ffi_array(array_addr, schema_addr)?;
     let columns = env.get_strings_opt(&columns)?;
@@ -918,7 +916,8 @@ fn inner_plan_search<'local>(
             k as usize,
             nprobes as usize,
             columns.as_deref(),
-            refine_factor,
+            refine_base_table,
+            overfetch_factor,
         ))?;
         (plan, guard.dataset_schema.clone())
     };

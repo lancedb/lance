@@ -23,12 +23,24 @@ use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 pub const ADD_FACTORS_COLUMN: &str = "__add_factors";
 // the inner product of quantized vector and the centroid vector.
 pub const SCALE_FACTORS_COLUMN: &str = "__scale_factors";
+pub const EX_ADD_FACTORS_COLUMN: &str = "__add_factors_ex";
+pub const EX_SCALE_FACTORS_COLUMN: &str = "__scale_factors_ex";
 
 pub static ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(ADD_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
 });
 pub static SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(SCALE_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
+});
+pub static EX_ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(EX_ADD_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
+});
+pub static EX_SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(
+        EX_SCALE_FACTORS_COLUMN,
+        arrow_schema::DataType::Float32,
+        true,
+    )
 });
 
 pub struct RQTransformer {

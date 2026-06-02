@@ -191,6 +191,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     batch_readahead: jint,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
+    fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
 ) -> JObject<'local> {
     crate::ok_or_throw!(
@@ -213,6 +214,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
             batch_readahead,
             column_orderings,
             use_scalar_index,
+            fast_search,
             substrait_aggregate_obj,
         )
     )
@@ -237,6 +239,7 @@ fn inner_create_async_scanner<'local>(
     batch_readahead: jint,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
+    fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
 ) -> Result<JObject<'local>> {
     let dataset_guard =
@@ -260,6 +263,7 @@ fn inner_create_async_scanner<'local>(
         batch_readahead,
         column_orderings,
         use_scalar_index,
+        fast_search,
         substrait_aggregate_obj,
     };
 
