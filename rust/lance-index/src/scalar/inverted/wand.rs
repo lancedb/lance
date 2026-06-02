@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
@@ -584,6 +585,28 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     docs: &'a DocSet,
     scorer: S,
+    // Optional shared cross-partition top-k threshold. When set, all partitions
+    // of one segment's query share this slot: each publishes its local k-th
+    // score (`fetch_max`) and reads it back as a pruning floor. Because the
+    // k-th largest of the union is >= the k-th largest of any single partition,
+    // the shared value is a lower bound on the true global k-th score, so using
+    // it to prune never drops a real top-k document. Lets a partition that
+    // can't reach the global top-k skip its blocks immediately rather than only
+    // after its own local heap fills.
+    shared_threshold: Option<Arc<AtomicU32>>,
+}
+
+/// Monotonic atomic max for a (non-NaN) f32 stored as bits in an `AtomicU32`.
+/// A CAS loop rather than a naive bit-max so it's correct for negative scores
+/// too (BM25 idf can go negative for very common terms).
+fn atomic_fetch_max_f32(slot: &AtomicU32, val: f32) {
+    let mut cur = slot.load(Ordering::Relaxed);
+    while val > f32::from_bits(cur) {
+        match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 // we were using row id as doc id in the past, which is u64,
@@ -630,7 +653,30 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_last_doc: None,
             docs,
             scorer,
+            shared_threshold: None,
         }
+    }
+
+    /// Attach a shared cross-partition top-k threshold slot (see the
+    /// `shared_threshold` field). All partitions of one segment query pass the
+    /// same `Arc<AtomicU32>` so they prune against the running global k-th.
+    pub(crate) fn with_shared_threshold(mut self, shared: Arc<AtomicU32>) -> Self {
+        self.shared_threshold = Some(shared);
+        self
+    }
+
+    /// Set the local pruning threshold from this partition's k-th best score,
+    /// publishing it to (and reading back) the shared cross-partition floor.
+    fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
+        let mut t = local_kth * wand_factor;
+        if let Some(shared) = self.shared_threshold.as_ref() {
+            atomic_fetch_max_f32(shared, local_kth);
+            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+            if g > t {
+                t = g;
+            }
+        }
+        self.threshold = t;
     }
 
     // search the top-k documents that contain the query
@@ -665,7 +711,24 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
-        while let Some((doc, mut score)) = self.next()? {
+        loop {
+            // Raise our pruning threshold to the shared global top-k floor
+            // before each step, so a partition that can't reach the global
+            // top-k skips its blocks immediately (not just after its own local
+            // heap fills). The shared value is a lower bound on the true global
+            // k-th score, so this never drops a real top-k document.
+            let shared_floor = self
+                .shared_threshold
+                .as_ref()
+                .map(|s| f32::from_bits(s.load(Ordering::Relaxed)) * params.wand_factor);
+            if let Some(g) = shared_floor {
+                if g > self.threshold {
+                    self.threshold = g;
+                }
+            }
+            let Some((doc, mut score)) = self.next()? else {
+                break;
+            };
             num_comparisons += 1;
 
             // Either a real row_id (so we can run the mask check
@@ -716,12 +779,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                    let kth = candidates.peek().unwrap().0.0.score.0;
+                    self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                let kth = candidates.peek().unwrap().0.0.score.0;
+                self.update_threshold(kth, params.wand_factor);
             }
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
@@ -833,12 +898,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                    let kth = candidates.peek().unwrap().0.0.score.0;
+                    self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                let kth = candidates.peek().unwrap().0.0.score.0;
+                self.update_threshold(kth, params.wand_factor);
             }
 
             self.advance_lead_to_head(doc_id + 1);

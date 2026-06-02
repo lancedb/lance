@@ -3,7 +3,7 @@
 
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
@@ -340,6 +340,18 @@ pub(super) fn parse_format_version_from_metadata(
     } else {
         Ok(InvertedListFormatVersion::V1)
     }
+}
+
+/// Cross-partition WAND threshold sharing (see `InvertedIndex::bm25_search`).
+/// On by default; set `LANCE_FTS_CROSS_PARTITION_WAND=0` (or `false`) to disable
+/// for A/B comparison or as a kill switch.
+fn cross_partition_wand_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("LANCE_FTS_CROSS_PARTITION_WAND")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    });
+    *ENABLED
 }
 
 #[derive(Clone)]
@@ -695,6 +707,14 @@ impl InvertedIndex {
         let mask = prefilter.mask();
 
         let mut candidates = BinaryHeap::new();
+        // Shared top-k floor across this query's partitions. Seeded to -inf so
+        // the first real score wins; each partition publishes its local k-th
+        // and prunes against the running global k-th (a lower bound on the true
+        // global k-th — see `Wand::shared_threshold`). Gated by an env kill
+        // switch (`LANCE_FTS_CROSS_PARTITION_WAND=0` to disable) so it can be
+        // A/B'd in place.
+        let shared_threshold = cross_partition_wand_enabled()
+            .then(|| Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())));
         let parts = self
             .partitions
             .iter()
@@ -704,6 +724,7 @@ impl InvertedIndex {
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
+                let shared_threshold = shared_threshold.clone();
                 async move {
                     let postings = part
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
@@ -737,6 +758,7 @@ impl InvertedIndex {
                             mask,
                             postings,
                             metrics.as_ref(),
+                            shared_threshold,
                         )?;
                         std::result::Result::<_, Error>::Ok(PartitionCandidates {
                             tokens_by_position,
@@ -1604,6 +1626,7 @@ impl InvertedPartition {
         mask: Arc<RowAddrMask>,
         postings: Vec<PostingIterator>,
         metrics: &dyn MetricsCollector,
+        shared_threshold: Option<Arc<AtomicU32>>,
     ) -> Result<Vec<DocCandidate>> {
         if postings.is_empty() {
             return Ok(Vec::new());
@@ -1614,6 +1637,12 @@ impl InvertedPartition {
         // handle the num_tokens-only case.
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), docs, scorer);
+        // Cross-partition pruning: all partitions of this query share one
+        // top-k floor so a partition that can't reach the global top-k skips
+        // early instead of fully scoring its own local top-k.
+        if let Some(shared) = shared_threshold {
+            wand = wand.with_shared_threshold(shared);
+        }
         let hits = wand.search(params, mask, metrics)?;
         Ok(hits)
     }
