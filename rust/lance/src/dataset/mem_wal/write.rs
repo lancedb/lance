@@ -4602,7 +4602,9 @@ mod shard_writer_tests {
             .expect("MemWAL details should exist")
             .writer_config_defaults;
         assert_eq!(
-            defaults.get("hnsw.vector_idx.num_edges").map(String::as_str),
+            defaults
+                .get("hnsw.vector_idx.num_edges")
+                .map(String::as_str),
             Some("7")
         );
         assert_eq!(
