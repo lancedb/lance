@@ -198,7 +198,7 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 | `_rabit_codes`       | list<uint8>[dimension / 8]                       | false                    | Binary quantized codes (1 bit per dimension, packed into bytes) |
 | `__add_factors`      | float32                                          | false                    | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | false                    | Scale correction factors for distance computation               |
-| `_rabit_ex_codes`    | list<uint8>[ceil(dimension * (num_bits - 1) / 8)] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ                         |
+| `__ex_codes`         | list<uint8>[ceil(dimension * (num_bits - 1) / 8)] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ                         |
 | `__add_factors_ex`   | float32                                          | false for `num_bits > 1` | Additive correction factors for ex-code distance computation    |
 | `__scale_factors_ex` | float32                                          | false for `num_bits > 1` | Scale correction factors for ex-code distance computation       |
 
@@ -278,7 +278,7 @@ to rotate vectors before binary quantization:
 
 The rotation matrix has shape `[code_dim, code_dim]` where `code_dim` is the rotated vector
 dimension. IVF_RQ always stores the 1-bit binary sign code in `_rabit_codes`; for `num_bits > 1`,
-the remaining `num_bits - 1` ex-code bits are stored in `_rabit_ex_codes` instead of widening the
+the remaining `num_bits - 1` ex-code bits are stored in `__ex_codes` instead of widening the
 binary code path.
 
 ## Appendices
@@ -323,7 +323,7 @@ pa.schema([
 
 This example shows how an `IVF_RQ` index is physically laid out. Assume vectors have dimension 128,
 RQ uses 1 bit per dimension (`num_bits=1`), and distance type is "l2". For `num_bits > 1`, the
-auxiliary schema also includes `_rabit_ex_codes`, `__add_factors_ex`, and `__scale_factors_ex`.
+auxiliary schema also includes `__ex_codes`, `__add_factors_ex`, and `__scale_factors_ex`.
 
 #### Index File
 

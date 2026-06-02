@@ -51,7 +51,7 @@ use crate::vector::storage::{DistCalculator, QueryResidual, VectorStore};
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
-pub const RABIT_EX_CODE_COLUMN: &str = "_rabit_ex_codes";
+pub const RABIT_EX_CODE_COLUMN: &str = "__ex_codes";
 pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 
@@ -1563,7 +1563,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("requires _rabit_ex_codes column"),
+            err.to_string().contains("requires __ex_codes column"),
             "{}",
             err
         );
