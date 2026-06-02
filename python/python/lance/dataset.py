@@ -1212,15 +1212,6 @@ class LanceDataset(pa.dataset.Dataset):
         disable_scoring_autoprojection: bool, optional
             Deprecated. Scoring autoprojection has been removed.
 
-            When a search (vector or full text) is performed, the scoring column
-            (_distance, _score) is only included in the output if no projection is
-            specified or if the column is explicitly requested in the projection.
-
-            Setting this to ``True`` or leaving it unset (``None``) are both accepted
-            and behave identically (the new default).  Setting it to ``False`` raises
-            an error — pass ``_distance`` or ``_score`` in your ``columns`` list
-            instead.
-
 
         .. note::
 
@@ -1465,15 +1456,6 @@ class LanceDataset(pa.dataset.Dataset):
             specified, it will assume ascending and nulls last ordering.
         disable_scoring_autoprojection: bool, optional
             Deprecated. Scoring autoprojection has been removed.
-
-            When a search (vector or full text) is performed, the scoring column
-            (_distance, _score) is only included in the output if no projection is
-            specified or if the column is explicitly requested in the projection.
-
-            Setting this to ``True`` or leaving it unset (``None``) are both accepted
-            and behave identically (the new default).  Setting it to ``False`` raises
-            an error — pass ``_distance`` or ``_score`` in your ``columns`` list
-            instead.
 
         Notes
         -----
