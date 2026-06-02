@@ -44,13 +44,15 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
-use lance_core::{Error, Result, is_system_column};
+use lance_core::{Error, ROW_ID, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::FtsQuery as IndexFtsQuery;
 use tracing::instrument;
 
+use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use super::exec::{DedupDirection, PkHashFilterExec, WithinSourceDedupExec};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
@@ -61,6 +63,11 @@ use crate::session::Session;
 /// require an import for one string constant.
 pub const SCORE_COLUMN: &str = "_score";
 
+/// Default over-fetch multiple for blocked sources. `1.0` keeps cross-generation
+/// dedup on with no over-fetch; callers (e.g. the sophon WAL handler) raise it
+/// so a blocked source still yields `k` live rows after the block-list filter.
+const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
+
 /// Plans local-scoring FTS queries over LSM data.
 pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
@@ -70,6 +77,8 @@ pub struct LsmFtsSearchPlanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Over-fetch multiple for blocked sources (clamped to `>= 1.0`).
+    overfetch_factor: f64,
 }
 
 impl LsmFtsSearchPlanner {
@@ -85,7 +94,15 @@ impl LsmFtsSearchPlanner {
             base_schema,
             session: None,
             flushed_cache: None,
+            overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
         }
+    }
+
+    /// Set the over-fetch multiple for blocked sources so they still yield `k`
+    /// live rows after cross-generation block-list filtering. Clamped to `>= 1.0`.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = factor;
+        self
     }
 
     /// Thread a session into flushed-generation opens so the first open
@@ -137,12 +154,63 @@ impl LsmFtsSearchPlanner {
             return self.empty_plan(&target_schema);
         }
 
+        // Per-source PK-hash block sets for cross-generation dedup (NEWER(G)
+        // per shard; base = union of all gens). Query-type-agnostic — same
+        // call the vector planner makes. `Box::pin` keeps the future off
+        // `clippy::large_futures`.
+        let block_lists = Box::pin(compute_source_block_lists(
+            &sources,
+            &self.pk_columns,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        ))
+        .await?;
+        let overfetch = self.overfetch_factor.max(1.0);
+
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
         for source in &sources {
+            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+            let blocked = block_lists.get(&(source.shard_id(), source.generation()));
+            // Over-fetch a blocked source so the post-filter still yields k live
+            // rows. The active arm returns all matches (no builder limit), so its
+            // within-source dedup needs no over-fetch hint.
+            let fetch_k = if blocked.is_some() {
+                ((k as f64) * overfetch).ceil() as usize
+            } else {
+                k
+            };
+
             let plan = self
-                .build_source_plan(source, column, &query, k, projection)
+                .build_source_plan(source, column, &query, fetch_k, projection, is_active)
                 .await?;
-            let normalized = project_to_canonical(plan, &target_schema)?;
+
+            // Dedup, mirroring LsmVectorSearchPlanner:
+            //  * active: collapse duplicate-PK appends to the newest insert
+            //    (larger _rowid = inserted later). The FTS index is append-only,
+            //    so an in-memtable update leaves both versions searchable.
+            //  * flushed/base: drop rows superseded by a newer generation via the
+            //    block-list (within-gen is handled by the flushed deletion vector).
+            let deduped = if is_active {
+                Arc::new(WithinSourceDedupExec::new(
+                    plan,
+                    self.pk_columns.clone(),
+                    ROW_ID,
+                    DedupDirection::KeepMaxRowAddr,
+                )) as Arc<dyn ExecutionPlan>
+            } else if let Some(set) = blocked {
+                Arc::new(PkHashFilterExec::new(
+                    plan,
+                    self.pk_columns.clone(),
+                    set.clone(),
+                    k,
+                )) as Arc<dyn ExecutionPlan>
+            } else {
+                plan
+            };
+
+            // Normalize to canonical. This also drops the active arm's _rowid,
+            // which the canonical FTS schema omits — it served only the dedup.
+            let normalized = project_to_canonical(deduped, &target_schema)?;
             per_source_plans.push(normalized);
         }
 
@@ -195,6 +263,7 @@ impl LsmFtsSearchPlanner {
         query: &FullTextSearchQuery,
         k: usize,
         projection: Option<&[String]>,
+        emit_row_id: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -232,6 +301,11 @@ impl LsmFtsSearchPlanner {
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                // Emit `_rowid` (row position) so the planner can collapse
+                // duplicate-PK appends via WithinSourceDedupExec before the union.
+                if emit_row_id {
+                    scanner.with_row_id();
+                }
                 // `MemTableScanner::full_text_search` takes a raw match
                 // string; richer query shapes (phrase/boolean/fuzzy) can
                 // be plumbed through once the MemTable scanner accepts a
@@ -560,5 +634,95 @@ mod tests {
                 prev_score = Some(s);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn local_mode_active_dedups_updated_pk_keeping_newest() {
+        // The active memtable is an append log and the FTS index is
+        // append-only, so a PK updated before flush is searchable as two
+        // row-positions. WithinSourceDedupExec(KeepMaxRowAddr) must collapse
+        // them to the newest insert. Without it the same PK would surface
+        // twice (criterion 2 violation).
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+
+        // First append (positions 0,1): id=1 is the stale version of the PK.
+        let batch_old = make_batch(&schema, &[1, 2], &["lance stale version", "other doc"]);
+        batch_store.append(batch_old.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch_old, 0, Some(0))
+            .unwrap();
+
+        // Second append (position 2): id=1 updated — same PK, later row.
+        let batch_new = make_batch(&schema, &[1], &["lance fresh version"]);
+        batch_store.append(batch_new.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch_new, 2, Some(1))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                10,
+                None,
+            )
+            .await
+            .expect("planner should produce an active-only plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut rows: Vec<(i32, String)> = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let texts = b
+                .column_by_name("text")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), texts.value(i).to_string()));
+            }
+        }
+
+        // id=1 must appear exactly once, and it must be the *newest* version.
+        let id1: Vec<&(i32, String)> = rows.iter().filter(|(id, _)| *id == 1).collect();
+        assert_eq!(
+            id1.len(),
+            1,
+            "updated PK id=1 must be deduped to one row; got {rows:?}"
+        );
+        assert_eq!(
+            id1[0].1, "lance fresh version",
+            "dedup must keep the newest (max row-position) version"
+        );
     }
 }
