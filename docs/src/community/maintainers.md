@@ -68,7 +68,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                 |
 | Beinan Wang            | beinan               | Microsoft AI      |                     | Alluxio PMC Member, Presto TSC Member           |
 | Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                 |
-| Yang Jie               | LuciferYang          | Baidu Inc.        |                     |                                                 |
+| Yang Jie               | LuciferYang          | Baidu Inc.        |                     | Apache Spark PMC Member, Apache Uniffle PMC Member |
 | Jianjian Xie           | jja725               | Uber              |                     |                                                 |
 | Zhang Yue              | zhangyue19921010     | ByteDance         |                     |                                                 |
 | Jinglun                | wojiaodoubao         | ByteDance         |                     | Apache Hadoop Committer                         |

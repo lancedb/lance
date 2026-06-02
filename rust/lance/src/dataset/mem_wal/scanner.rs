@@ -36,7 +36,7 @@ mod builder;
 mod collector;
 mod data_source;
 pub mod exec;
-mod flushed_cache;
+pub(crate) mod flushed_cache;
 mod fts_search;
 mod planner;
 mod point_lookup;

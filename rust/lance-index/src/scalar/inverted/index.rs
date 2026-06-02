@@ -51,13 +51,13 @@ use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
-use super::encoding::PositionBlockBuilder;
+use super::encoding::{PositionBlockBuilder, decode_group_starts};
 use super::iter::PostingListIterator;
 use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema_for_version, posting_file_path,
-        token_file_path,
+        BLOCK_SIZE, PostingGroupAccumulator, PostingGroupConfig, ScoredDoc, doc_file_path,
+        inverted_list_schema_for_version, posting_file_path, token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
@@ -109,6 +109,11 @@ pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
 pub const POSTING_TAIL_CODEC_KEY: &str = "posting_tail_codec";
 pub const POSITIONS_LAYOUT_KEY: &str = "positions_layout";
 pub const POSITIONS_CODEC_KEY: &str = "positions_codec";
+/// Schema-metadata key holding the 1-indexed global-buffer id of the
+/// varint-delta-encoded posting-list cache-group boundaries (issue #7040).
+/// Absent on indexes written before grouping was introduced, which fall back
+/// to the per-token cache path.
+pub const POSTING_GROUP_OFFSETS_BUF_KEY: &str = "posting_group_offsets_buf";
 pub const POSTING_TAIL_CODEC_FIXED32_V1: &str = "fixed32_v1";
 pub const POSTING_TAIL_CODEC_VARINT_DELTA_V1: &str = "varint_delta_v1";
 pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
@@ -1667,6 +1672,12 @@ pub struct PostingListReader {
     posting_tail_codec: PostingTailCodec,
     positions_layout: PositionsLayout,
 
+    /// First row of each posting-list cache group, decoded at open from the
+    /// global buffer named by [`POSTING_GROUP_OFFSETS_BUF_KEY`] (issue #7040).
+    /// `None` for indexes written before grouping; those use the per-token
+    /// cache path. Always present for grouped v2 indexes with `>0` rows.
+    group_starts: Option<Vec<u32>>,
+
     index_cache: WeakLanceCache,
 }
 
@@ -1727,7 +1738,7 @@ impl std::fmt::Debug for PostingListReader {
 
 impl DeepSizeOf for PostingListReader {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        match &self.metadata {
+        let metadata_size = match &self.metadata {
             PostingMetadata::LegacyV1 {
                 offsets,
                 max_scores,
@@ -1739,7 +1750,8 @@ impl DeepSizeOf for PostingListReader {
                         + loaded.lengths.deep_size_of_children(context)
                 })
                 .unwrap_or(0),
-        }
+        };
+        metadata_size + self.group_starts.deep_size_of_children(context)
     }
 }
 
@@ -1769,14 +1781,34 @@ impl PostingListReader {
             }
         };
 
+        let group_starts = Self::load_group_starts(reader.as_ref()).await?;
+
         Ok(Self {
             reader,
             metadata,
             has_position,
             posting_tail_codec,
             positions_layout,
+            group_starts,
             index_cache: WeakLanceCache::from(index_cache),
         })
+    }
+
+    /// Decode the posting-list cache-group boundaries from the global buffer
+    /// recorded in schema metadata, if present (issue #7040). Returns `None`
+    /// for indexes written before grouping was introduced.
+    async fn load_group_starts(reader: &dyn IndexReader) -> Result<Option<Vec<u32>>> {
+        let Some(buf_id) = reader.schema().metadata.get(POSTING_GROUP_OFFSETS_BUF_KEY) else {
+            return Ok(None);
+        };
+        let buf_id: u32 = buf_id.parse().map_err(|e| {
+            Error::index(format!(
+                "invalid {POSTING_GROUP_OFFSETS_BUF_KEY} metadata value {buf_id:?}: {e}"
+            ))
+        })?;
+        let bytes = reader.read_global_buffer(buf_id).await?;
+        let group_starts = decode_group_starts(&bytes)?;
+        Ok(Some(group_starts))
     }
 
     // for legacy format
@@ -1999,25 +2031,49 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
-        let cache_key = PostingListKey { token_id };
-        let mut posting = self
-            .index_cache
-            .get_or_insert_with_key(cache_key, || async move {
-                metrics.record_part_load();
-                info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-                // Fetch the posting batch and this token's (max_score,
-                // length) in parallel; for cold v2 partitions this is one
-                // single-row metadata read plus one posting-row read,
-                // instead of pulling the full per-token metadata table.
-                let (batch, (max_score, length)) = futures::try_join!(
-                    self.posting_batch(token_id, false),
-                    self.posting_metadata_for_token(token_id),
-                )?;
-                self.posting_list_from_batch(&batch, max_score, length)
-            })
-            .await?
-            .as_ref()
-            .clone();
+        let mut posting = match self.group_range_for_token(token_id) {
+            // Grouped path (issue #7040): one cache entry covers rows
+            // [start, end), so neighbouring rare terms share a single read.
+            Some((start, end)) => {
+                let group = self
+                    .index_cache
+                    .get_or_insert_with_key(PostingListGroupKey { start, end }, || async move {
+                        metrics.record_part_load();
+                        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=start);
+                        self.load_posting_list_group(start, end).await
+                    })
+                    .await?;
+                let slot = (token_id - start) as usize;
+                group
+                    .get(slot)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "token {token_id} maps to slot {slot} outside posting group [{start}, {end})"
+                        ))
+                    })?
+                    .clone()
+            }
+            // Fallback for indexes written before grouping: one cache entry
+            // per token.
+            None => self
+                .index_cache
+                .get_or_insert_with_key(PostingListKey { token_id }, || async move {
+                    metrics.record_part_load();
+                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                    // Fetch the posting batch and this token's (max_score,
+                    // length) in parallel; for cold v2 partitions this is one
+                    // single-row metadata read plus one posting-row read,
+                    // instead of pulling the full per-token metadata table.
+                    let (batch, (max_score, length)) = futures::try_join!(
+                        self.posting_batch(token_id, false),
+                        self.posting_metadata_for_token(token_id),
+                    )?;
+                    self.posting_list_from_batch(&batch, max_score, length)
+                })
+                .await?
+                .as_ref()
+                .clone(),
+        };
 
         if is_phrase_query && !posting.has_position() {
             // hit the cache and when the cache was populated, the positions column was not loaded
@@ -2026,6 +2082,58 @@ impl PostingListReader {
         }
 
         Ok(posting)
+    }
+
+    /// Map a token id to its cache group's row range `[start, end)`, or `None`
+    /// when grouping is not available (pre-grouping indexes) so the caller
+    /// falls back to the per-token path. In v2 the token id is the row offset,
+    /// so the group range is also the physical row range.
+    fn group_range_for_token(&self, token_id: u32) -> Option<(u32, u32)> {
+        let starts = self.group_starts.as_ref()?;
+        // partition_point returns the count of group starts <= token_id, so the
+        // owning group begins at index k - 1 and the next start (if any) is its
+        // exclusive end.
+        let k = starts.partition_point(|&s| s <= token_id);
+        // k == 0 means token_id precedes the first group start, which cannot
+        // happen for a valid token in a grouped index (the first group starts
+        // at row 0); guard anyway and fall back to the per-token path.
+        if k == 0 {
+            return None;
+        }
+        let start = starts[k - 1];
+        // The last group runs to the final posting list. `self.len()` is the
+        // authoritative posting-list count (offsets length for v1, row count for
+        // v2), and prewarm derives the same `end` from it — so warm- and
+        // cold-cache group keys are identical by construction, not by the
+        // incidental v2 `num_rows == token_count` equality.
+        let end = starts.get(k).copied().unwrap_or(self.len() as u32);
+        Some((start, end))
+    }
+
+    /// Read rows `[start, end)` of the posting file and decode them into a
+    /// [`PostingListGroup`] cache value (issue #7040). Positions are excluded;
+    /// phrase queries load them on demand via [`Self::read_positions`].
+    async fn load_posting_list_group(&self, start: u32, end: u32) -> Result<PostingListGroup> {
+        let batch = self
+            .reader
+            .read_range(
+                start as usize..end as usize,
+                Some(&[POSTING_COL, MAX_SCORE_COL, LENGTH_COL]),
+            )
+            .await?;
+        let max_scores = batch[MAX_SCORE_COL].as_primitive::<Float32Type>();
+        let lengths = batch[LENGTH_COL].as_primitive::<UInt32Type>();
+        let mut posting_lists = Vec::with_capacity(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            let row = batch.slice(i, 1);
+            let posting = self.posting_list_from_batch(
+                &row,
+                Some(max_scores.value(i)),
+                Some(lengths.value(i)),
+            )?;
+            posting_lists.push(posting);
+        }
+        Ok(PostingListGroup::new(posting_lists))
     }
 
     fn posting_list_from_batch_parts(
@@ -2150,15 +2258,47 @@ impl PostingListReader {
                 "Failed to build prewarm posting lists in blocking task: {err}"
             ))
         })??;
+        // Strip positions into their own per-token cache entries first
+        // (unchanged); the posting cache holds positions-free lists.
+        let mut postings_by_token = Vec::with_capacity(posting_lists.len());
         for (token_id, mut posting_list) in posting_lists {
             if with_position && let Some(positions) = posting_list.take_positions() {
                 self.index_cache
                     .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
                     .await;
             }
-            self.index_cache
-                .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))
-                .await;
+            debug_assert_eq!(token_id as usize, postings_by_token.len());
+            postings_by_token.push(posting_list);
+        }
+        // Populate the same cache keys the read path uses: grouped entries when
+        // grouping is active (issue #7040), per-token entries otherwise.
+        match self.group_starts.as_ref() {
+            Some(starts) => {
+                // The read path derives the last group's `end` from `self.len()`;
+                // match it here so both produce identical `PostingListGroupKey`s.
+                debug_assert_eq!(postings_by_token.len(), self.len());
+                for (k, &start) in starts.iter().enumerate() {
+                    let end = starts.get(k + 1).copied().unwrap_or(self.len() as u32);
+                    let group = PostingListGroup::new(
+                        postings_by_token[start as usize..end as usize].to_vec(),
+                    );
+                    self.index_cache
+                        .insert_with_key(&PostingListGroupKey { start, end }, Arc::new(group))
+                        .await;
+                }
+            }
+            None => {
+                for (token_id, posting_list) in postings_by_token.into_iter().enumerate() {
+                    self.index_cache
+                        .insert_with_key(
+                            &PostingListKey {
+                                token_id: token_id as u32,
+                            },
+                            Arc::new(posting_list),
+                        )
+                        .await;
+                }
+            }
         }
         let populate_elapsed = populate_start.elapsed();
 
@@ -2351,6 +2491,32 @@ impl CacheKey for PostingListKey {
     }
 }
 
+/// Cache key for a group of consecutive posting lists stored as a single
+/// entry, covering rows `[start, end)` (issue #7040). The range, not a token
+/// id, is the key so that a write-time config change that reshapes groups
+/// simply misses old entries instead of serving a differently-shaped group.
+#[derive(Debug, Clone)]
+pub struct PostingListGroupKey {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl CacheKey for PostingListGroupKey {
+    type ValueType = PostingListGroup;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("postings-{}-{}", self.start, self.end).into()
+    }
+
+    fn type_name() -> &'static str {
+        "PostingListGroup"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<PostingListGroup>())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PositionKey {
     pub token_id: u32,
@@ -2439,6 +2605,26 @@ impl SharedPositionStream {
 
     pub fn size(&self) -> usize {
         self.block_offsets.capacity() * std::mem::size_of::<u32>() + self.bytes.len()
+    }
+}
+
+/// A group of consecutive posting lists held in a single cache entry, in row
+/// order (issue #7040). `posting_lists[i]` corresponds to row `start + i`,
+/// where `start` is the group's first row from [`PostingListGroupKey`].
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct PostingListGroup {
+    pub(super) posting_lists: Vec<PostingList>,
+}
+
+impl PostingListGroup {
+    pub(super) fn new(posting_lists: Vec<PostingList>) -> Self {
+        Self { posting_lists }
+    }
+
+    /// Borrow the posting list at offset `slot` within the group (i.e.
+    /// `token_id - start`).
+    pub(super) fn get(&self, slot: usize) -> Option<&PostingList> {
+        self.posting_lists.get(slot)
     }
 }
 
@@ -2974,6 +3160,10 @@ pub(super) struct PostingListBatchBuilder {
     lengths: UInt32Builder,
     positions: BatchPositionsBuilder,
     len: usize,
+    /// Tracks posting-list cache-group boundaries in row order across all
+    /// batches this builder produces (issue #7040). Outlives `finish`, which
+    /// only resets the per-batch column builders.
+    group_accumulator: PostingGroupAccumulator,
 }
 
 enum BatchPositionsBuilder {
@@ -3001,6 +3191,7 @@ impl PostingListBatchBuilder {
         with_positions: bool,
         format_version: InvertedListFormatVersion,
         capacity: usize,
+        group_config: PostingGroupConfig,
     ) -> Self {
         let positions = if !with_positions {
             BatchPositionsBuilder::None
@@ -3022,6 +3213,7 @@ impl PostingListBatchBuilder {
             lengths: UInt32Builder::with_capacity(capacity),
             positions,
             len: 0,
+            group_accumulator: PostingGroupAccumulator::new(group_config),
         }
     }
 
@@ -3040,6 +3232,7 @@ impl PostingListBatchBuilder {
         length: u32,
         positions: Option<&CompressedPositionStorage>,
     ) -> Result<()> {
+        let posting_bytes = compressed.value_data().len();
         {
             let values = self.postings.values();
             for index in 0..compressed.len() {
@@ -3047,6 +3240,7 @@ impl PostingListBatchBuilder {
             }
         }
         self.postings.append(true);
+        self.group_accumulator.push(posting_bytes);
         self.max_scores.append_value(max_score);
         self.lengths.append_value(length);
 
@@ -3126,6 +3320,13 @@ impl PostingListBatchBuilder {
         }
         self.len = 0;
         RecordBatch::try_new(self.schema.clone(), columns).map_err(Error::from)
+    }
+
+    /// Consume the builder and return the posting-list cache-group boundaries
+    /// accumulated across all batches (issue #7040). Each entry is the first
+    /// row of a group; the sequence is monotonically increasing.
+    pub fn into_group_starts(self) -> Vec<u32> {
+        self.group_accumulator.into_starts()
     }
 }
 
@@ -5404,21 +5605,19 @@ mod tests {
 
         inverted_list.prewarm_posting_lists(false).await.unwrap();
 
-        let alpha = inverted_list
+        // The two tiny tokens land in a single cache group [0, 2) (issue
+        // #7040); both postings are read out of that group entry.
+        let (start, end) = inverted_list.group_range_for_token(0).unwrap();
+        let group = inverted_list
             .index_cache
-            .get_with_key(&PostingListKey { token_id: 0 })
-            .await
-            .unwrap();
-        let beta = inverted_list
-            .index_cache
-            .get_with_key(&PostingListKey { token_id: 1 })
+            .get_with_key(&PostingListGroupKey { start, end })
             .await
             .unwrap();
 
-        let PostingList::Compressed(alpha) = alpha.as_ref() else {
+        let PostingList::Compressed(alpha) = group.get(0).unwrap() else {
             panic!("expected compressed posting list for token 0");
         };
-        let PostingList::Compressed(beta) = beta.as_ref() else {
+        let PostingList::Compressed(beta) = group.get(1).unwrap() else {
             panic!("expected compressed posting list for token 1");
         };
 
@@ -5674,14 +5873,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_posting_list_metadata_reads_scale_with_query_size() {
-        // Cold-start scoring used to bulk-read `0..num_tokens` of the
-        // [MAX_SCORE_COL, LENGTH_COL] columns the first time `bm25_search`
-        // ran against a partition. Now `posting_list` fetches each token's
-        // (max_score, length) as a single-row read alongside its posting
-        // batch, so K concurrent posting_list lookups should pull O(K)
-        // metadata rows, not O(num_tokens).
-        let num_tokens = 32;
+    async fn test_grouped_posting_lists_read_one_group_per_neighborhood() {
+        // Cold-start scoring must not bulk-read the full `0..num_tokens`
+        // metadata table. With small-posting grouping (issue #7040), scoring
+        // K adjacent cold tokens shares a single group cache entry: one
+        // read_range bounded by the group size, independent of the partition's
+        // total token count.
+        let num_tokens = 500;
         let queried_tokens: [u32; 4] = [0, 1, 2, 3];
         let (index, counter) = load_counted_v2_index(num_tokens).await;
         let inverted_list = index.partitions[0].inverted_list.clone();
@@ -5689,31 +5887,39 @@ mod tests {
             !inverted_list.is_legacy_layout(),
             "this test only proves the lazy path for v2 indexes",
         );
+        assert!(
+            inverted_list.group_starts.is_some(),
+            "freshly written v2 index should carry posting group offsets",
+        );
 
+        // This fixture uses a no-op cache, so each call re-reads; that isolates
+        // the per-query read shape. Each posting_list call reads exactly its
+        // own group — bounded by the group size, never the full token table.
         let metrics = Arc::new(NoOpMetricsCollector);
-        stream::iter(queried_tokens)
-            .map(|token_id| {
-                let inverted_list = inverted_list.clone();
-                let metrics = metrics.clone();
-                async move {
-                    inverted_list
-                        .posting_list(token_id, false, metrics.as_ref())
-                        .await
-                        .unwrap();
-                }
-            })
-            .buffer_unordered(queried_tokens.len())
-            .collect::<Vec<_>>()
-            .await;
+        for token_id in queried_tokens {
+            inverted_list
+                .posting_list(token_id, false, metrics.as_ref())
+                .await
+                .unwrap();
+        }
 
+        let (start, end) = inverted_list.group_range_for_token(0).unwrap();
+        let group_len = (end - start) as usize;
+        assert!(
+            (queried_tokens.len()..num_tokens).contains(&group_len),
+            "group [{start}, {end}) should cover the queried neighborhood but be \
+             far smaller than the {num_tokens}-token table",
+        );
+        assert_eq!(
+            counter.read_range_calls(),
+            queried_tokens.len(),
+            "each cold token should read exactly its own group, no bulk read",
+        );
         assert_eq!(
             counter.metadata_rows_read(),
-            queried_tokens.len(),
-            "K posting_list calls should read K metadata rows (not the full \
-             {}-row metadata table); got {} rows across {} read_range calls",
-            num_tokens,
-            counter.metadata_rows_read(),
-            counter.read_range_calls(),
+            queried_tokens.len() * group_len,
+            "each query reads one group's metadata rows ({group_len}), not the \
+             full {num_tokens}-row table",
         );
     }
 
@@ -5785,13 +5991,17 @@ mod tests {
             .unwrap();
 
         let inverted_list = &index.partitions[0].inverted_list;
-        let posting = inverted_list
+        // The posting cache entry is grouped (issue #7040); the group holds
+        // positions-free lists while positions live in their own per-token
+        // entries.
+        let (start, end) = inverted_list.group_range_for_token(0).unwrap();
+        let group = inverted_list
             .index_cache
-            .get_with_key(&PostingListKey { token_id: 0 })
+            .get_with_key(&PostingListGroupKey { start, end })
             .await
             .unwrap();
         assert!(
-            !posting.has_position(),
+            !group.get(0).unwrap().has_position(),
             "posting cache should remain positions-free after prewarm"
         );
 
@@ -6380,6 +6590,413 @@ mod tests {
         assert!(
             elapsed_compute.value() > 0,
             "elapsed_compute should have been populated; got 0"
+        );
+    }
+
+    /// An [`IndexReader`] wrapper that hides the posting-group-offsets schema
+    /// metadata key, so a [`PostingListReader`] opened on it takes the
+    /// pre-grouping per-token fallback path (issue #7040).
+    struct GroupKeyStrippingReader {
+        inner: Arc<dyn IndexReader>,
+        schema: lance_core::datatypes::Schema,
+    }
+
+    impl GroupKeyStrippingReader {
+        fn new(inner: Arc<dyn IndexReader>) -> Self {
+            let mut schema = inner.schema().clone();
+            schema.metadata.remove(POSTING_GROUP_OFFSETS_BUF_KEY);
+            Self { inner, schema }
+        }
+    }
+
+    #[async_trait]
+    impl IndexReader for GroupKeyStrippingReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            self.inner.read_record_batch(n, batch_size).await
+        }
+        async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+            self.inner.read_global_buffer(index).await
+        }
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            self.inner.read_range(range, projection).await
+        }
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            &self.schema
+        }
+    }
+
+    fn posting_entries(posting: &PostingList) -> Vec<(u64, u32)> {
+        posting.iter().map(|(doc, freq, _)| (doc, freq)).collect()
+    }
+
+    /// The grouped read path and the legacy per-token fallback must return
+    /// identical posting lists for every token, including at group
+    /// boundaries. Builds a single v2 partition that spans several groups,
+    /// then reads it both with and without the group offsets present.
+    #[tokio::test]
+    async fn test_posting_list_fallback_matches_grouped() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // A small token cap forces several groups regardless of the default,
+        // so the comparison exercises the partition_point math at group
+        // boundaries.
+        let num_tokens = 150u32;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 32,
+        };
+        for t in 0..num_tokens {
+            builder.tokens.add(format!("t{t}"));
+            let mut pl = PostingListBuilder::new(false);
+            pl.add(t, PositionRecorder::Count(1));
+            builder.posting_lists.push(pl);
+            builder.docs.append(1000 + t as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let cache = LanceCache::no_cache();
+        let grouped = PostingListReader::try_new(reader.clone(), &cache)
+            .await
+            .unwrap();
+        assert!(
+            grouped.group_starts.as_ref().is_some_and(|s| s.len() > 1),
+            "fixture should span multiple groups",
+        );
+
+        let stripped: Arc<dyn IndexReader> = Arc::new(GroupKeyStrippingReader::new(reader));
+        let fallback = PostingListReader::try_new(stripped, &cache).await.unwrap();
+        assert!(
+            fallback.group_starts.is_none(),
+            "stripped reader must take the per-token fallback path",
+        );
+
+        let metrics = NoOpMetricsCollector;
+        for token in 0..num_tokens {
+            let g = grouped.posting_list(token, false, &metrics).await.unwrap();
+            let f = fallback.posting_list(token, false, &metrics).await.unwrap();
+            assert_eq!(
+                posting_entries(&g),
+                posting_entries(&f),
+                "grouped vs fallback mismatch for token {token}",
+            );
+            assert_eq!(g.len(), f.len(), "length mismatch for token {token}");
+            assert_eq!(
+                g.max_score(),
+                f.max_score(),
+                "max_score mismatch for token {token}",
+            );
+        }
+    }
+
+    /// Prewarm must populate exactly the `PostingListGroupKey`s the read path
+    /// looks up — in particular the final group, whose `end` both paths derive
+    /// from `self.len()`. If those derivations drifted (e.g. one used
+    /// `num_rows()` and the other the loaded posting count), the last group's
+    /// warm entry would be missing and prewarm silently wasted (issue #7040).
+    #[tokio::test]
+    async fn test_prewarm_group_keys_match_read_path() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Small token cap so the partition spans several groups regardless of
+        // the default, exercising every group boundary including the last.
+        let num_tokens = 150u32;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 32,
+        };
+        for t in 0..num_tokens {
+            builder.tokens.add(format!("t{t}"));
+            let mut pl = PostingListBuilder::new(false);
+            pl.add(t, PositionRecorder::Count(1));
+            builder.posting_lists.push(pl);
+            builder.docs.append(1000 + t as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        // A real (strong) cache must outlive the reader's weak handle so the
+        // prewarmed entries are still resolvable below.
+        let cache = LanceCache::with_capacity(1 << 20);
+        let posting_reader = PostingListReader::try_new(reader, &cache).await.unwrap();
+        assert!(
+            posting_reader
+                .group_starts
+                .as_ref()
+                .is_some_and(|s| s.len() > 1),
+            "fixture should span multiple groups",
+        );
+
+        posting_reader.prewarm_posting_lists(false).await.unwrap();
+
+        for token in 0..num_tokens {
+            let (start, end) = posting_reader.group_range_for_token(token).unwrap();
+            assert!(
+                posting_reader
+                    .index_cache
+                    .get_with_key(&PostingListGroupKey { start, end })
+                    .await
+                    .is_some(),
+                "prewarm did not populate group [{start}, {end}) that the read \
+                 path requests for token {token}",
+            );
+        }
+
+        let (_, last_end) = posting_reader
+            .group_range_for_token(num_tokens - 1)
+            .unwrap();
+        assert_eq!(
+            last_end, num_tokens,
+            "the last group must end at the posting count ({num_tokens})",
+        );
+    }
+
+    /// An empty partition writes no group-offsets buffer, so its reader takes
+    /// the per-token fallback path (issue #7040).
+    #[tokio::test]
+    async fn test_empty_partition_has_no_group_offsets() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        assert!(
+            !reader
+                .schema()
+                .metadata
+                .contains_key(POSTING_GROUP_OFFSETS_BUF_KEY),
+            "empty partition must not write the group-offsets metadata key",
+        );
+
+        let posting_reader = PostingListReader::try_new(reader, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(
+            posting_reader.group_starts.is_none(),
+            "reader for an empty partition must use the per-token fallback path",
+        );
+        assert!(posting_reader.is_empty());
+    }
+
+    /// A posting list that alone exceeds the group target lands in its own
+    /// `[t, t+1)` group (the clamp case) and reads back intact (issue #7040).
+    #[tokio::test]
+    async fn test_oversized_term_is_own_group_on_read() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // A tiny byte target so a modest posting trips the clamp without
+        // needing a huge fixture; the surrounding tiny terms regroup after it.
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 50,
+            max_tokens: 1000,
+        };
+        let big_docs = 30u32;
+        builder.tokens.add("big".to_owned());
+        let mut big = PostingListBuilder::new(false);
+        for d in 0..big_docs {
+            big.add(d, PositionRecorder::Count(1));
+        }
+        builder.posting_lists.push(big);
+        for t in 1..5u32 {
+            builder.tokens.add(format!("t{t}"));
+            let mut pl = PostingListBuilder::new(false);
+            pl.add(0, PositionRecorder::Count(1));
+            builder.posting_lists.push(pl);
+        }
+        for d in 0..big_docs as u64 {
+            builder.docs.append(1000 + d, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let posting_reader = PostingListReader::try_new(reader, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            posting_reader.group_range_for_token(0),
+            Some((0, 1)),
+            "an oversized term must occupy its own single-row group",
+        );
+        let big = posting_reader
+            .posting_list(0, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(big.len(), big_docs as usize);
+        // A trailing tiny term (in the next, multi-token group) still reads back.
+        let tiny = posting_reader
+            .posting_list(2, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(tiny.len(), 1);
+    }
+
+    /// When the group offsets are absent, prewarm populates per-token
+    /// `PostingListKey` entries (the fallback path), matching what the read
+    /// path then looks up (issue #7040).
+    #[tokio::test]
+    async fn test_prewarm_fallback_populates_per_token_entries() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_tokens = 3u32;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for t in 0..num_tokens {
+            builder.tokens.add(format!("t{t}"));
+            let mut pl = PostingListBuilder::new(false);
+            pl.add(t, PositionRecorder::Count(1));
+            builder.posting_lists.push(pl);
+            builder.docs.append(1000 + t as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let stripped: Arc<dyn IndexReader> = Arc::new(GroupKeyStrippingReader::new(reader));
+        let cache = LanceCache::with_capacity(1 << 20);
+        let posting_reader = PostingListReader::try_new(stripped, &cache).await.unwrap();
+        assert!(posting_reader.group_starts.is_none());
+
+        posting_reader.prewarm_posting_lists(false).await.unwrap();
+
+        for token_id in 0..num_tokens {
+            assert!(
+                posting_reader
+                    .index_cache
+                    .get_with_key(&PostingListKey { token_id })
+                    .await
+                    .is_some(),
+                "fallback prewarm should populate per-token entry {token_id}",
+            );
+        }
+    }
+
+    /// End-to-end BM25 search over a grouped multi-group index must return the
+    /// correct documents, and a warm-cache query must match the cold-cache
+    /// result exactly (issue #7040).
+    #[tokio::test]
+    async fn test_grouped_bm25_search_correct_and_cache_stable() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 130 rare tokens (one doc each) plus one common token in every doc; a
+        // small token cap spreads them across several groups so scoring must
+        // index into the right group slot.
+        let num_rare = 130u32;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 32,
+        };
+        for t in 0..num_rare {
+            builder.tokens.add(format!("t{t}"));
+            builder.posting_lists.push(PostingListBuilder::new(false));
+        }
+        let common_id = builder.tokens.add("common".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        for d in 0..num_rare {
+            builder.posting_lists[d as usize].add(d, PositionRecorder::Count(1));
+            builder.posting_lists[common_id as usize].add(d, PositionRecorder::Count(1));
+            builder.docs.append(1000 + d as u64, 2);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // A rare token in the middle of a group must resolve to its one doc.
+        let query = |term: &str| {
+            let index = index.clone();
+            let term = term.to_string();
+            async move {
+                index
+                    .bm25_search(
+                        Arc::new(Tokens::new(vec![term], DocType::Text)),
+                        Arc::new(FtsSearchParams::new().with_limit(Some(200))),
+                        Operator::Or,
+                        Arc::new(NoFilter),
+                        Arc::new(NoOpMetricsCollector),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let (rows_70, _) = query("t70").await;
+        assert_eq!(rows_70, vec![1070], "rare token must map to its single doc");
+
+        // Cold vs warm cache must agree for the common (large) token.
+        let (cold_rows, cold_scores) = query("common").await;
+        let (warm_rows, warm_scores) = query("common").await;
+        assert_eq!(cold_rows.len(), num_rare as usize);
+        assert_eq!(cold_rows, warm_rows, "warm-cache rows must match cold");
+        assert_eq!(
+            cold_scores, warm_scores,
+            "warm-cache scores must match cold"
         );
     }
 }

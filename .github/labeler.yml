@@ -1,8 +1,11 @@
 version: 1
 appendOnly: true
-# Labels are applied based on conventional commits standard
+# Title/body labels based on the conventional commits standard
 # https://www.conventionalcommits.org/en/v1.0.0/
 # These labels are later used in release notes. See .github/release.yml
+#
+# Path-based area labels (A-*) are handled separately by actions/labeler.
+# See .github/labeler-area.yml and .github/workflows/labeler.yml.
 labels:
 # If the PR title has an ! before the : it will be considered a breaking change
 # For example, `feat!: add new feature` will be considered a breaking change
@@ -22,9 +25,3 @@ labels:
   title: "^ci(\\(.+\\))?!?:.*"
 - label: chore
   title: "^(chore|test|build|style)(\\(.+\\))?!?:.*"
-- label: java
-  files:
-    - "java\\/.*"
-- label: python
-  files:
-    - "python\\/.*"

@@ -2375,14 +2375,7 @@ mod tests {
                 .fragments(vec![fragment_id]);
             metadatas.push(builder.execute_uncommitted().await.unwrap());
         }
-        let segments = ds
-            .create_index_segment_builder()
-            .with_index_type(IndexType::Inverted)
-            .with_segments(metadatas.clone())
-            .build_all()
-            .await
-            .unwrap();
-        ds.commit_existing_index_segments("seg_fts", "text", segments)
+        ds.commit_existing_index_segments("seg_fts", "text", metadatas.clone())
             .await
             .unwrap();
         assert_eq!(

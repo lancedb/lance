@@ -85,7 +85,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-pub use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentPlan, IntoIndexSegment};
+pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
@@ -164,6 +164,22 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
         let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+        if index_details.type_url.ends_with("InvertedIndexDetails") {
+            let metadata = IndexMetadata {
+                uuid,
+                name: index_name.to_string(),
+                fields: vec![field_id],
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: Some(fragment_bitmap.clone()),
+                index_details: Some(index_details.clone()),
+                index_version,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
+                files: None,
+            };
+            crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
+                .await?;
+        }
         let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
         let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         new_indices.push(IndexMetadata {
@@ -790,8 +806,6 @@ impl IndexDescription for IndexDescriptionImpl {
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
-    type IndexSegmentBuilder<'a> = create::IndexSegmentBuilder<'a>;
-
     /// Create a builder for creating an index on columns.
     ///
     /// This returns a builder that can be configured with additional options
@@ -836,10 +850,6 @@ impl DatasetIndexExt for Dataset {
         params: &'a dyn IndexParams,
     ) -> CreateIndexBuilder<'a> {
         CreateIndexBuilder::new(self, columns, index_type, params)
-    }
-
-    fn create_index_segment_builder<'a>(&'a self) -> create::IndexSegmentBuilder<'a> {
-        create::IndexSegmentBuilder::new(self)
     }
 
     #[instrument(skip_all)]
@@ -2690,13 +2700,6 @@ mod tests {
             .iter()
             .map(|segment| segment.uuid)
             .collect::<Vec<_>>();
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(params.index_type())
-            .with_segments(segments)
-            .build_all()
-            .await
-            .unwrap();
         dataset
             .commit_existing_index_segments(index_name, column, segments)
             .await

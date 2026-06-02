@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
@@ -47,7 +48,11 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    timeout: Option<Duration>,
 }
+
+/// Default timeout applied to [`CommitBuilder::execute`] when none is set.
+pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
@@ -64,6 +69,7 @@ impl<'a> CommitBuilder<'a> {
             commit_config: Default::default(),
             affected_rows: None,
             transaction_properties: None,
+            timeout: Some(DEFAULT_COMMIT_TIMEOUT),
         }
     }
 
@@ -169,6 +175,25 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Set a timeout for the commit operation.
+    ///
+    /// The timeout bounds the *entire* [`Self::execute`] / [`Self::execute_batch`]
+    /// call, including all conflict retries — it is not applied per attempt.
+    /// Pass `None` to disable the timeout entirely.
+    ///
+    /// The default is 30 minutes (see [`DEFAULT_COMMIT_TIMEOUT`]).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `timeout` is `Some(Duration::ZERO)` (raised
+    ///   when [`Self::execute`] is called, not here).
+    /// - [`Error::Timeout`] if the operation does not complete within the
+    ///   timeout.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// provide Configuration key-value pairs associated with this transaction.
     /// This is used to store metadata about the transaction, such as commit messages, engine information, etc.
     /// this properties map will be persisted as a part of the transaction object
@@ -181,6 +206,32 @@ impl<'a> CommitBuilder<'a> {
     }
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        let timeout = self.timeout;
+        if let Some(t) = timeout
+            && t.is_zero()
+        {
+            return Err(Error::invalid_input(
+                "CommitBuilder timeout must be non-zero; pass `None` to disable",
+            ));
+        }
+        // Box the inner future so wrapping it in `tokio::time::Timeout` does
+        // not deepen the future type — downstream `async fn`s that await
+        // `execute` otherwise hit the compiler's layout-query depth limit.
+        let fut = Box::pin(self.execute_inner(transaction));
+        match timeout {
+            Some(t) => match tokio::time::timeout(t, fut).await {
+                Ok(res) => res,
+                Err(_) => Err(Error::timeout(format!(
+                    "Commit timed out after {:?}. Increase the timeout via \
+                     CommitBuilder::with_timeout or pass `None` to disable.",
+                    t
+                ))),
+            },
+            None => fut.await,
+        }
+    }
+
+    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -717,6 +768,163 @@ mod tests {
             assert_io_lt!(io_stats, num_stages, 6);
         }
         assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
+    }
+
+    #[test]
+    fn test_commit_timeout_default_is_thirty_minutes() {
+        let builder = CommitBuilder::new("memory://default-timeout");
+        assert_eq!(builder.timeout, Some(DEFAULT_COMMIT_TIMEOUT));
+        assert_eq!(DEFAULT_COMMIT_TIMEOUT, Duration::from_secs(1800));
+    }
+
+    #[tokio::test]
+    async fn test_commit_timeout_zero_rejected() {
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://test")
+                .execute(vec![
+                    RecordBatch::try_new(
+                        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                            "i",
+                            DataType::Int32,
+                            false,
+                        )])),
+                        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                    )
+                    .unwrap(),
+                ])
+                .await
+                .unwrap(),
+        );
+        let res = CommitBuilder::new(dataset.clone())
+            .with_timeout(Some(Duration::ZERO))
+            .execute(sample_transaction(1))
+            .await;
+        assert!(
+            matches!(res, Err(Error::InvalidInput { .. })),
+            "got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_timeout_triggers() {
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_secs(5),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let res = CommitBuilder::new(Arc::new(dataset))
+            .with_timeout(Some(Duration::from_millis(50)))
+            .execute(sample_transaction(1))
+            .await;
+        let err = res.expect_err("commit should time out");
+        assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_commit_timeout_applies_to_execute_batch() {
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_secs(5),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://batch-timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let res = CommitBuilder::new(Arc::new(dataset))
+            .with_timeout(Some(Duration::from_millis(50)))
+            .execute_batch(vec![sample_transaction(1)])
+            .await;
+        let Err(err) = res else {
+            panic!("commit should time out");
+        };
+        assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
+    }
+
+    /// `with_timeout(None)` must let a commit run unbounded. Uses a throttled
+    /// store so the commit takes real wall-clock time — long enough that the
+    /// 50ms timeout in `test_commit_timeout_triggers` would have fired.
+    #[tokio::test]
+    async fn test_commit_timeout_none_disables() {
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(200),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://no-timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let new_ds = CommitBuilder::new(Arc::new(dataset))
+            .with_timeout(None)
+            .execute(sample_transaction(1))
+            .await
+            .unwrap();
+        assert_eq!(new_ds.manifest.version, 2);
     }
 
     #[tokio::test]

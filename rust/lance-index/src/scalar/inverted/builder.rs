@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::encoding::encode_group_starts;
 use super::{InvertedIndexParams, index::*};
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
@@ -15,6 +16,7 @@ use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
+use bytes::Bytes;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
 use fst::Streamer;
@@ -72,7 +74,91 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .parse()
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
+// Target serialized byte size of a posting-list cache group. Consecutive
+// posting lists are grouped into a single cache entry until their combined
+// serialized size reaches this target, amortizing per-entry overhead across
+// small (Zipfian-rare) terms. See issue #7040.
+static LANCE_FTS_POSTING_GROUP_TARGET_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_POSTING_GROUP_TARGET_BYTES")
+        .unwrap_or_else(|_| "4096".to_string())
+        .parse()
+        .expect("failed to parse LANCE_FTS_POSTING_GROUP_TARGET_BYTES")
+});
+// Maximum number of posting lists in a single cache group, regardless of byte
+// size. Caps the work and memory of a single group read for corpora with many
+// tiny terms.
+static LANCE_FTS_POSTING_GROUP_MAX_TOKENS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
+        .unwrap_or_else(|_| "256".to_string())
+        .parse()
+        .expect("failed to parse LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
+});
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
+
+/// Write-time configuration controlling how consecutive posting lists are
+/// grouped into a single read-path cache entry (issue #7040). Defaults come
+/// from the `LANCE_FTS_POSTING_GROUP_*` environment variables.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PostingGroupConfig {
+    pub(crate) target_bytes: usize,
+    pub(crate) max_tokens: usize,
+}
+
+impl Default for PostingGroupConfig {
+    fn default() -> Self {
+        Self {
+            target_bytes: (*LANCE_FTS_POSTING_GROUP_TARGET_BYTES).max(1),
+            max_tokens: (*LANCE_FTS_POSTING_GROUP_MAX_TOKENS).max(1),
+        }
+    }
+}
+
+/// Accumulates posting-list group boundaries at write time. Tokens are pushed
+/// in row order; a group is cut once its serialized bytes reach
+/// `target_bytes` or it holds `max_tokens` posting lists. A posting list
+/// larger than the target that *starts* a group occupies that group alone (the
+/// clamp case); one encountered mid-group is absorbed and closes that group, so
+/// a single term is never split across groups.
+#[derive(Debug)]
+pub(crate) struct PostingGroupAccumulator {
+    config: PostingGroupConfig,
+    starts: Vec<u32>,
+    next_token: u32,
+    current_bytes: usize,
+    current_tokens: usize,
+}
+
+impl PostingGroupAccumulator {
+    pub(crate) fn new(config: PostingGroupConfig) -> Self {
+        Self {
+            config,
+            starts: Vec::new(),
+            next_token: 0,
+            current_bytes: 0,
+            current_tokens: 0,
+        }
+    }
+
+    /// Record the next posting list in row order, given its serialized byte size.
+    pub(crate) fn push(&mut self, posting_bytes: usize) {
+        if self.current_tokens == 0 {
+            self.starts.push(self.next_token);
+        }
+        self.current_bytes += posting_bytes;
+        self.current_tokens += 1;
+        self.next_token += 1;
+        if self.current_bytes >= self.config.target_bytes
+            || self.current_tokens >= self.config.max_tokens
+        {
+            self.current_bytes = 0;
+            self.current_tokens = 0;
+        }
+    }
+
+    pub(crate) fn into_starts(self) -> Vec<u32> {
+        self.starts
+    }
+}
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -667,6 +753,7 @@ pub struct InnerBuilder {
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
+    pub(crate) group_config: PostingGroupConfig,
 }
 
 impl InnerBuilder {
@@ -694,6 +781,7 @@ impl InnerBuilder {
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
+            group_config: PostingGroupConfig::default(),
         }
     }
 
@@ -793,6 +881,7 @@ impl InnerBuilder {
             tokens,
             posting_lists,
             docs,
+            group_config: _,
         } = other;
 
         if self.with_position != with_position {
@@ -910,6 +999,7 @@ impl InnerBuilder {
         );
         let with_position = self.with_position;
         let format_version = self.format_version;
+        let group_config = self.group_config;
         let schema = inverted_list_schema_for_version(self.with_position, self.format_version);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
@@ -921,6 +1011,7 @@ impl InnerBuilder {
                 with_position,
                 format_version,
                 batch_rows,
+                group_config,
             );
             for posting_list in posting_lists {
                 posting_list.append_to_batch_with_docs(
@@ -949,7 +1040,7 @@ impl InnerBuilder {
                 }
             }
 
-            Result::Ok(())
+            Result::Ok(batch_builder.into_group_starts())
         });
 
         while let Ok(batch) = rx.recv().await {
@@ -961,9 +1052,22 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        producer.await?;
+        let group_starts = producer.await?;
 
-        writer.finish().await?;
+        // Persist the posting-list cache-group boundaries as a global buffer,
+        // recording its 1-indexed id in schema metadata so the reader can group
+        // small posting lists into a single cache entry (issue #7040). Empty
+        // partitions skip this entirely and fall back to the per-token path.
+        let mut extra_metadata = HashMap::new();
+        if !group_starts.is_empty() {
+            let encoded = encode_group_starts(&group_starts);
+            let buffer_id = writer.add_global_buffer(Bytes::from(encoded)).await?;
+            extra_metadata.insert(
+                POSTING_GROUP_OFFSETS_BUF_KEY.to_owned(),
+                buffer_id.to_string(),
+            );
+        }
+        writer.finish_with_metadata(extra_metadata).await?;
         Ok(())
     }
 
@@ -2132,6 +2236,12 @@ mod tests {
             Ok(self.write_count.fetch_add(1, Ordering::SeqCst) as u64)
         }
 
+        async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
+            // The posting-list writer stores the group offsets as a global
+            // buffer; mirror the real writer's 1-indexed return value.
+            Ok(1)
+        }
+
         async fn finish(&mut self) -> Result<()> {
             Ok(())
         }
@@ -2192,6 +2302,63 @@ mod tests {
         async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
             Ok(vec![])
         }
+    }
+
+    fn collect_group_starts(config: PostingGroupConfig, sizes: &[usize]) -> Vec<u32> {
+        let mut acc = PostingGroupAccumulator::new(config);
+        for &size in sizes {
+            acc.push(size);
+        }
+        acc.into_starts()
+    }
+
+    #[test]
+    fn test_group_accumulator_cuts_on_target_bytes() {
+        let config = PostingGroupConfig {
+            target_bytes: 100,
+            max_tokens: 1000,
+        };
+        // 40+40 -> cut at 80? no, 80 < 100; third 40 reaches 120 >= 100 -> cut.
+        // So group 0 = tokens [0,3), then a new group starts at token 3.
+        let starts = collect_group_starts(config, &[40, 40, 40, 10, 10]);
+        assert_eq!(starts, vec![0, 3]);
+    }
+
+    #[test]
+    fn test_group_accumulator_cuts_on_max_tokens() {
+        let config = PostingGroupConfig {
+            target_bytes: 1_000_000,
+            max_tokens: 2,
+        };
+        // Byte target never reached; cap of 2 forces a cut every 2 tokens.
+        let starts = collect_group_starts(config, &[1, 1, 1, 1, 1]);
+        assert_eq!(starts, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn test_group_accumulator_clamps_oversized_term() {
+        let config = PostingGroupConfig {
+            target_bytes: 100,
+            max_tokens: 64,
+        };
+        // A term larger than the target that *starts* a group occupies that
+        // group alone ([1, 2) here), so a single huge posting list is never
+        // forced to share a cache entry. Token 0 (==100) closes its own group
+        // first; the trailing small terms regroup after the big one.
+        let starts = collect_group_starts(config, &[100, 5000, 10, 10]);
+        assert_eq!(starts, vec![0, 1, 2]);
+
+        // A huge term encountered mid-group is absorbed and closes that group;
+        // we never split one term across groups.
+        let starts = collect_group_starts(config, &[10, 10, 5000, 10, 10]);
+        assert_eq!(starts, vec![0, 3]);
+    }
+
+    #[test]
+    fn test_group_accumulator_empty_and_single() {
+        let config = PostingGroupConfig::default();
+        assert_eq!(collect_group_starts(config, &[]), Vec::<u32>::new());
+        assert_eq!(collect_group_starts(config, &[10]), vec![0]);
     }
 
     #[tokio::test]

@@ -20,9 +20,12 @@ from packaging.version import Version
 
 NAMESPACE_0_6_DEPENDENCY = "lance-namespace<0.7"
 NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
+NAMESPACE_0_8_DEPENDENCY = "lance-namespace>=0.8.0,<0.9"
 
 
 def _lance_namespace_dependency(pylance_version: str) -> str:
+    if Version(pylance_version) >= Version("7.2.0b5"):
+        return NAMESPACE_0_8_DEPENDENCY
     if Version(pylance_version) >= Version("6.0.0b0"):
         return NAMESPACE_0_7_DEPENDENCY
     return NAMESPACE_0_6_DEPENDENCY

@@ -65,7 +65,7 @@ indices/<physical_segment_uuid_1>/
 
 These physical segments are then committed together as one logical index. In the
 common no-merge case, the input segments are already the physical
-segments and `build_all()` returns them unchanged.
+segments and can be committed directly.
 
 ## Roles
 
@@ -73,9 +73,8 @@ There are two parties involved in distributed indexing:
 
 - **Workers** build segments
 - **The caller** launches workers, chooses how those segments should be turned
-  into physical segments, provides any additional inputs requested by the
-  segment build APIs, and
-  commits the final result
+  into final segments, optionally merges caller-defined groups, and commits the
+  final result
 
 Lance does not provide a distributed scheduler. The caller is responsible for
 launching workers and driving the overall workflow.

@@ -97,6 +97,11 @@ pub struct FtsQuery {
     /// WAND factor for early termination (0.0 to 1.0).
     /// 1.0 = full recall (default), <1.0 = faster but may miss low-scoring results.
     pub wand_factor: f32,
+    /// Whether to also search the mutable tail (rows written since the last
+    /// freeze). `true` (default) = read-your-writes; `false` = search only the
+    /// immutable frozen partitions (the Lucene model), trading read-recency for
+    /// query latency. See [`crate::dataset::mem_wal::index::SearchOptions`].
+    pub include_tail: bool,
 }
 
 /// Default maximum number of fuzzy expansions.
@@ -114,6 +119,7 @@ impl FtsQuery {
                 query: query.into(),
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -126,6 +132,7 @@ impl FtsQuery {
                 slop,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -144,6 +151,7 @@ impl FtsQuery {
                 must_not,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -162,6 +170,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -179,6 +188,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -197,6 +207,7 @@ impl FtsQuery {
                 max_expansions,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -207,6 +218,13 @@ impl FtsQuery {
     /// - 0.0 = only return the absolute best match
     pub fn with_wand_factor(mut self, wand_factor: f32) -> Self {
         self.wand_factor = wand_factor.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set whether to search the mutable tail (read-your-writes) or only the
+    /// immutable frozen partitions (the Lucene model). Default `true`.
+    pub fn with_include_tail(mut self, include_tail: bool) -> Self {
+        self.include_tail = include_tail;
         self
     }
 }
@@ -611,6 +629,21 @@ impl MemTableScanner {
         } else {
             log::warn!(
                 "fts_wand_factor is not set because full_text_query has not been called yet"
+            );
+        }
+        self
+    }
+
+    /// Choose whether FTS searches the mutable tail (read-your-writes, default)
+    /// or only the immutable frozen partitions (the Lucene model — lower latency,
+    /// does not reflect rows written since the last freeze). Only applies when a
+    /// full-text query is set.
+    pub fn fts_include_tail(&mut self, include_tail: bool) -> &mut Self {
+        if let Some(ref mut q) = self.full_text_query {
+            q.include_tail = include_tail;
+        } else {
+            log::warn!(
+                "fts_include_tail is not set because full_text_query has not been called yet"
             );
         }
         self

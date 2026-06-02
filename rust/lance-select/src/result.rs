@@ -99,6 +99,23 @@ impl NullableIndexExprResult {
         }
     }
 
+    /// Construct an interval result from lower/upper bounds.
+    ///
+    /// `lower` rows are guaranteed TRUE and `upper` rows may be TRUE, with
+    /// NULL state preserved at both endpoints. Equal endpoints are canonicalized
+    /// to [`Self::exact`] so `is_exact()` remains structural.
+    pub fn new(lower: NullableRowAddrMask, upper: NullableRowAddrMask) -> Self {
+        if lower == upper {
+            Self::exact(lower)
+        } else {
+            Self {
+                lower,
+                upper,
+                exact: false,
+            }
+        }
+    }
+
     /// True if the result is exact — the answer is precisely the lower
     /// (== upper) mask.
     ///
@@ -267,6 +284,40 @@ impl IndexExprResult {
     /// convention consumers should follow.
     pub fn is_at_least(&self) -> bool {
         matches!(&self.upper, RowAddrMask::BlockList(set) if set.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NullableRowAddrSet, RowAddrTreeMap};
+
+    fn allow(rows: &[u64]) -> NullableRowAddrMask {
+        NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(rows.iter().copied()),
+            RowAddrTreeMap::new(),
+        ))
+    }
+
+    #[test]
+    fn nullable_index_expr_result_new_canonicalizes_exact() {
+        let lower = allow(&[1, 2]);
+        let result = NullableIndexExprResult::new(lower.clone(), lower.clone());
+
+        assert!(result.is_exact());
+        assert_eq!(result.lower, lower);
+        assert_eq!(result.upper, lower);
+    }
+
+    #[test]
+    fn nullable_index_expr_result_new_preserves_interval() {
+        let lower = allow(&[1, 2]);
+        let upper = allow(&[1, 2, 3]);
+        let result = NullableIndexExprResult::new(lower.clone(), upper.clone());
+
+        assert!(!result.is_exact());
+        assert_eq!(result.lower, lower);
+        assert_eq!(result.upper, upper);
     }
 }
 
