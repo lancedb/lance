@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::Debug,
     ops::Bound,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use arrow::array::BinaryBuilder;
@@ -158,7 +158,7 @@ impl CacheKey for BitmapKey {
 /// cache handle, a lazy reader, a fragment-reuse index). `BitmapIndexState`
 /// captures just the data needed to rebuild it: the value→file-offset map,
 /// the null bitmap, and the value type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BitmapIndexState {
     /// Value-to-row-offset lookup, encoded as an Arrow `RecordBatch` so we can
     /// reuse the existing IPC utilities for zero-copy round trips.
@@ -173,55 +173,27 @@ pub struct BitmapIndexState {
     /// Cached separately from the schema for the empty-index case where the
     /// `lookup_batch` is empty but we still need to remember the column type.
     value_type: DataType,
-    /// Parsed form of `lookup_batch`. Not serialized — populated eagerly by
-    /// [`BitmapIndexState::from_index`] and lazily on first
-    /// [`BitmapIndexState::into_bitmap_index`] call after disk deserialization.
-    /// Stored as `Arc` so that cloning into a new [`BitmapIndex`] is O(1).
-    index_map: OnceLock<Arc<BTreeMap<OrderableScalarValue, usize>>>,
-}
-
-impl Clone for BitmapIndexState {
-    fn clone(&self) -> Self {
-        Self {
-            lookup_batch: self.lookup_batch.clone(),
-            null_map: self.null_map.clone(),
-            value_type: self.value_type.clone(),
-            index_map: self
-                .index_map
-                .get()
-                .map(|m| {
-                    let lock = OnceLock::new();
-                    // safe: fresh lock
-                    lock.set(m.clone()).ok();
-                    lock
-                })
-                .unwrap_or_default(),
-        }
-    }
+    /// Parsed form of `lookup_batch`. Not serialized — populated eagerly in
+    /// both [`BitmapIndexState::from_index`] and [`CacheCodecImpl::deserialize`].
+    /// Stored as `Arc` so cloning into a new [`BitmapIndex`] is O(1).
+    index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
 }
 
 impl DeepSizeOf for BitmapIndexState {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.lookup_batch.get_array_memory_size()
             + self.null_map.deep_size_of_children(context)
-            + self
-                .index_map
-                .get()
-                .map(|m| m.deep_size_of_children(context))
-                .unwrap_or(0)
+            + self.index_map.deep_size_of_children(context)
     }
 }
 
 impl BitmapIndexState {
     pub(crate) fn from_index(index: &BitmapIndex) -> Result<Self> {
-        let lock = OnceLock::new();
-        // safe: fresh lock
-        lock.set(index.index_map.clone()).ok();
         Ok(Self {
             lookup_batch: build_lookup_batch(&index.index_map, &index.value_type)?,
             null_map: index.null_map.clone(),
             value_type: index.value_type.clone(),
-            index_map: lock,
+            index_map: index.index_map.clone(),
         })
     }
 
@@ -231,16 +203,8 @@ impl BitmapIndexState {
         index_cache: &LanceCache,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Arc<BitmapIndex>> {
-        let index_map = if let Some(map) = self.index_map.get() {
-            map.clone()
-        } else {
-            // Disk-backed cache hit: parse once and cache for subsequent calls.
-            let map = Arc::new(parse_lookup_batch(&self.lookup_batch)?);
-            // Another thread may have won the race; either result is equivalent.
-            self.index_map.get_or_init(|| map.clone()).clone()
-        };
         Ok(Arc::new(BitmapIndex::new(
-            index_map,
+            self.index_map.clone(),
             self.null_map.clone(),
             self.value_type.clone(),
             store,
@@ -307,11 +271,12 @@ impl CacheCodecImpl for BitmapIndexState {
         let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
         let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
         let value_type = lookup_batch.schema().field(0).data_type().clone();
+        let index_map = Arc::new(parse_lookup_batch(&lookup_batch)?);
         Ok(Self {
             lookup_batch,
             null_map,
             value_type,
-            index_map: OnceLock::new(),
+            index_map,
         })
     }
 }
@@ -1823,7 +1788,7 @@ mod tests {
             lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
             null_map: Arc::new(null_map),
             value_type: DataType::Int32,
-            index_map: OnceLock::new(),
+            index_map: Arc::new(index_map),
         };
         assert_state_roundtrips(&state);
 
@@ -1832,7 +1797,7 @@ mod tests {
             lookup_batch: build_lookup_batch(&BTreeMap::new(), &DataType::Utf8).unwrap(),
             null_map: Arc::new(RowAddrTreeMap::new()),
             value_type: DataType::Utf8,
-            index_map: OnceLock::new(),
+            index_map: Arc::new(BTreeMap::new()),
         };
         assert_state_roundtrips(&empty_state);
     }
