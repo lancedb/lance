@@ -121,7 +121,7 @@ impl ScalarIndexExec {
     }
 
     /// Return the wire format used when serializing this exec's
-    /// [`IndexExprResult`](lance_select::result::IndexExprResult) output.
+    /// [`IndexExprResult`] output.
     pub fn result_format(&self) -> IndexExprResultWireFormat {
         self.result_format
     }
