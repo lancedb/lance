@@ -1009,7 +1009,9 @@ impl FilteredReadStream {
                         global_metrics.io_metrics.record(&scan_scheduler);
                     })
                     .finally(move || {
-                        global_metrics_final.io_metrics.record(&scan_scheduler_final);
+                        global_metrics_final
+                            .io_metrics
+                            .record(&scan_scheduler_final);
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
@@ -3729,8 +3731,8 @@ mod tests {
         let fixture = TestFixture::new().await;
         // not_indexed values in the fixture go up to ~400; this filter matches nothing
         let filter_plan = fixture.filter_plan("not_indexed > 10000", false).await;
-        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
-            .with_filter_plan(filter_plan);
+        let options =
+            FilteredReadOptions::basic_full_read(&fixture.dataset).with_filter_plan(filter_plan);
         let filtered_read =
             Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
 
