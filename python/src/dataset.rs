@@ -238,13 +238,13 @@ fn writer_config_from_kwargs(
             let mut build = HnswBuildParams::default();
             for (key, value) in params {
                 match key.as_str() {
-                    "m" => build = build.num_edges(value as usize),
+                    "num_edges" => build = build.num_edges(value as usize),
                     "ef_construction" => build = build.ef_construction(value as usize),
                     "max_level" => build = build.max_level(value as u16),
                     other => {
                         return Err(PyValueError::new_err(format!(
                             "unknown HNSW build param '{}' for index '{}'; \
-                             expected one of 'm', 'ef_construction', 'max_level'",
+                             expected one of 'num_edges', 'ef_construction', 'max_level'",
                             other, index_name
                         )));
                     }

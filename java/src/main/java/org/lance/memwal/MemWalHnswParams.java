@@ -19,12 +19,12 @@ import com.google.common.base.Preconditions;
  * HNSW build parameters for a maintained vector index, used with {@link
  * ShardWriterConfig#withHnswParams}.
  *
- * <p>Defaults match the Lance defaults; override only the fields you need. {@code m} is the graph
- * degree (level 0 retains {@code 2*m}), equivalent to FAISS's {@code M}.
+ * <p>Defaults match the Lance defaults; override only the fields you need. {@code numEdges} is the
+ * graph degree (level 0 retains {@code 2 * numEdges}), equivalent to FAISS's {@code M}.
  */
 public class MemWalHnswParams {
   private final String indexName;
-  private int m = 20;
+  private int numEdges = 20;
   private int efConstruction = 150;
   private int maxLevel = 7;
 
@@ -34,10 +34,13 @@ public class MemWalHnswParams {
     this.indexName = indexName;
   }
 
-  /** HNSW graph degree: max neighbors retained per node on upper levels (level 0 retains 2*m). */
-  public MemWalHnswParams withM(int m) {
-    Preconditions.checkArgument(m > 0, "m must be greater than 0");
-    this.m = m;
+  /**
+   * HNSW graph degree: max neighbors retained per node on upper levels (level 0 retains 2 *
+   * numEdges).
+   */
+  public MemWalHnswParams withNumEdges(int numEdges) {
+    Preconditions.checkArgument(numEdges > 0, "numEdges must be greater than 0");
+    this.numEdges = numEdges;
     return this;
   }
 
@@ -59,8 +62,8 @@ public class MemWalHnswParams {
     return indexName;
   }
 
-  public int m() {
-    return m;
+  public int numEdges() {
+    return numEdges;
   }
 
   public int efConstruction() {

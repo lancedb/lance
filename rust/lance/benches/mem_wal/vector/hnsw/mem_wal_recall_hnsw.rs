@@ -369,17 +369,17 @@ async fn run_checkpoint(
     let shard_id = Uuid::new_v4();
     let row_size_estimate = DIM * 4 + 8;
     let total_batches_max = cp.div_ceil(1000);
-    // Optionally override the maintained HNSW index's graph degree `m` (and
-    // ef_construction) on the writer config so we can run matched-`m`
-    // comparisons vs FAISS. m=0 keeps the library default (m=20).
+    // Optionally override the maintained HNSW index's graph degree (num_edges)
+    // and ef_construction on the writer config so we can sweep build params and
+    // run matched comparisons vs FAISS. 0 keeps the library default.
     let mut hnsw_params = std::collections::HashMap::new();
-    let hnsw_m = env_usize("BENCH_HNSW_M", 0);
-    if hnsw_m > 0 {
+    let num_edges = env_usize("BENCH_HNSW_NUM_EDGES", 0);
+    if num_edges > 0 {
         let efc = env_usize("BENCH_HNSW_EFC", 200);
         hnsw_params.insert(
             VECTOR_INDEX_NAME.to_string(),
             HnswBuildParams::default()
-                .num_edges(hnsw_m)
+                .num_edges(num_edges)
                 .ef_construction(efc),
         );
     }

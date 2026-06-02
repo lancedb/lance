@@ -4823,11 +4823,12 @@ class LanceDataset(pa.dataset.Dataset):
         hnsw_params : dict, optional
             Per-index HNSW build-parameter overrides recorded as writer-config
             defaults, keyed by maintained vector index name. Each value is a dict
-            with any of ``m`` (graph degree; level 0 keeps ``2*m``, equivalent to
-            FAISS's ``M``), ``ef_construction``, and ``max_level``. Without an
-            override an index uses the default parameters (``m = 20``). These are
-            writer config — they affect the MemTable a writer builds and may be
-            overridden per-writer in :meth:`mem_wal_writer`.
+            with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters. These are writer config — they affect the MemTable a
+            writer builds and may be overridden per-writer in
+            :meth:`mem_wal_writer`.
         bucket_column : str, optional
             With ``num_buckets``, hash-bucket writes by this scalar column.
         num_buckets : int, optional
@@ -4941,10 +4942,10 @@ class LanceDataset(pa.dataset.Dataset):
         hnsw_params : dict, optional
             Per-index HNSW build-parameter overrides for the MemTable this
             writer builds, keyed by maintained vector index name. Each value is
-            a dict with any of ``m`` (graph degree; level 0 keeps ``2*m``,
-            equivalent to FAISS's ``M``), ``ef_construction``, and ``max_level``.
-            Without an override an index uses the default parameters
-            (``m = 20``).
+            a dict with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters.
 
         Returns
         -------

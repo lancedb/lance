@@ -451,7 +451,10 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
     }
     // Per-index HNSW build params are recorded under `hnsw.<index>.<field>` keys.
     for (index_name, params) in &config.hnsw_params {
-        defaults.insert(format!("hnsw.{index_name}.m"), params.m.to_string());
+        defaults.insert(
+            format!("hnsw.{index_name}.num_edges"),
+            params.m.to_string(),
+        );
         defaults.insert(
             format!("hnsw.{index_name}.ef_construction"),
             params.ef_construction.to_string(),

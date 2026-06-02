@@ -211,8 +211,8 @@ pub struct ShardWriterConfig {
     /// a property of the writer that builds the MemTable, not of the index
     /// definition: each flushed generation is independent, so different writers
     /// may use different parameters. An index without an entry uses the default
-    /// build parameters (`m = 20`). `m` is the graph degree (level 0 retains
-    /// `2*m`), equivalent to FAISS's `M`.
+    /// build parameters. `num_edges` is the HNSW graph degree (level 0 retains
+    /// `2 * num_edges`), equivalent to FAISS's `M`.
     ///
     /// Default: empty.
     pub hnsw_params: HashMap<String, HnswBuildParams>,
@@ -4602,7 +4602,7 @@ mod shard_writer_tests {
             .expect("MemWAL details should exist")
             .writer_config_defaults;
         assert_eq!(
-            defaults.get("hnsw.vector_idx.m").map(String::as_str),
+            defaults.get("hnsw.vector_idx.num_edges").map(String::as_str),
             Some("7")
         );
         assert_eq!(

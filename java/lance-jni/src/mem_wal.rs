@@ -1245,13 +1245,13 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
                 .call_method(&item, "indexName", "()Ljava/lang/String;", &[])?
                 .l()?;
             let index_name: String = JString::from(index_name).extract(env)?;
-            let m = env.call_method(&item, "m", "()I", &[])?.i()? as usize;
+            let num_edges = env.call_method(&item, "numEdges", "()I", &[])?.i()? as usize;
             let ef_construction = env.call_method(&item, "efConstruction", "()I", &[])?.i()? as usize;
             let max_level = env.call_method(&item, "maxLevel", "()I", &[])?.i()? as u16;
             Ok((
                 index_name,
                 HnswBuildParams::default()
-                    .num_edges(m)
+                    .num_edges(num_edges)
                     .ef_construction(ef_construction)
                     .max_level(max_level),
             ))
