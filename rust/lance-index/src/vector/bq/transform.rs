@@ -23,7 +23,6 @@ use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 pub const ADD_FACTORS_COLUMN: &str = "__add_factors";
 // the inner product of quantized vector and the centroid vector.
 pub const SCALE_FACTORS_COLUMN: &str = "__scale_factors";
-pub const EX_ADD_FACTORS_COLUMN: &str = "__add_factors_ex";
 pub const EX_SCALE_FACTORS_COLUMN: &str = "__scale_factors_ex";
 
 pub static ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
@@ -31,9 +30,6 @@ pub static ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
 });
 pub static SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(SCALE_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
-});
-pub static EX_ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
-    arrow_schema::Field::new(EX_ADD_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
 });
 pub static EX_SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(
@@ -81,7 +77,6 @@ impl Transformer for RQTransformer {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let has_split_codes = self.rq.num_bits() == 1
             || (batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
-                && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
                 && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
             return Ok(batch.clone());
@@ -207,9 +202,8 @@ impl Transformer for RQTransformer {
         if let (Some(ex_codes), Some(ex_res_dot_dists)) =
             (rq_codes.ex_codes, rq_codes.ex_res_dot_dists)
         {
-            let ex_add_factors = batch[ADD_FACTORS_COLUMN]
-                .as_primitive::<Float32Type>()
-                .clone();
+            // Lance's IVF_RQ estimator uses residual queries, so the ex-code
+            // path shares the additive factor and only needs a separate scale.
             let ex_scale_factors = match self.distance_type {
                 DistanceType::L2 => Float32Array::from_iter_values(
                     res_norm_square
@@ -247,7 +241,6 @@ impl Transformer for RQTransformer {
                     .expect("ex-code field should exist for num_bits > 1"),
                     ex_codes,
                 )?
-                .try_with_column(EX_ADD_FACTORS_FIELD.clone(), Arc::new(ex_add_factors))?
                 .try_with_column(EX_SCALE_FACTORS_FIELD.clone(), Arc::new(ex_scale_factors))?;
         }
 
@@ -274,12 +267,10 @@ mod tests {
     use crate::vector::transform::Transformer;
     use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
-    use super::{
-        ADD_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, RQTransformer,
-    };
+    use super::{ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, RQTransformer};
 
     #[test]
-    fn test_rq_transformer_writes_multi_bit_ex_factors() {
+    fn test_rq_transformer_writes_multi_bit_ex_scale_factors() {
         let rq = RabitQuantizer::new_with_rotation::<Float32Type>(4, 8, RQRotationType::Fast);
         let centroids =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
@@ -325,13 +316,6 @@ mod tests {
                 .iter()
                 .any(|value| *value != 0)
         );
-        assert_eq!(
-            transformed[EX_ADD_FACTORS_COLUMN]
-                .as_primitive::<Float32Type>()
-                .values(),
-            res_norm_square.values()
-        );
-
         let expected_ex_dots = rq
             .quantize_split(&residual_vectors)
             .unwrap()

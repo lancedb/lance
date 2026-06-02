@@ -21,7 +21,7 @@ use crate::vector::bq::storage::{
     rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
-    ADD_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
+    ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::{
     RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
@@ -652,7 +652,6 @@ impl Quantization for RabitQuantizer {
             .expect("RabitQ num_bits should be validated")
         {
             fields.push(ex_code_field);
-            fields.push(EX_ADD_FACTORS_FIELD.clone());
             fields.push(EX_SCALE_FACTORS_FIELD.clone());
         }
         fields

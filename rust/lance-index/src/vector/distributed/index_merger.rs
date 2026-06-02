@@ -24,7 +24,7 @@ use crate::vector::bq::storage::{
     rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
-    ADD_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
+    ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::validate_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
@@ -309,7 +309,6 @@ pub async fn init_writer_for_rq(
     ];
     if let Some(ex_code_field) = rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)? {
         fields.push(ex_code_field);
-        fields.push(EX_ADD_FACTORS_FIELD.clone());
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
     }
     let arrow_schema = ArrowSchema::new(fields);
@@ -1532,7 +1531,7 @@ mod tests {
 
     use crate::vector::bq::RQRotationType;
     use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
-    use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
+    use crate::vector::bq::transform::EX_SCALE_FACTORS_COLUMN;
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
         IndexBuildProgress,
@@ -2085,7 +2084,6 @@ mod tests {
         ];
         if let Some(field) = ex_code_field {
             fields.push(field);
-            fields.push(EX_ADD_FACTORS_FIELD.clone());
             fields.push(EX_SCALE_FACTORS_FIELD.clone());
         }
         let arrow_schema = ArrowSchema::new(fields);
@@ -2119,7 +2117,6 @@ mod tests {
         let mut scale_factors = Vec::with_capacity(total_rows);
         let mut ex_codes =
             ex_code_bytes.map(|num_bytes| Vec::with_capacity(total_rows * num_bytes));
-        let mut ex_add_factors = Vec::with_capacity(total_rows);
         let mut ex_scale_factors = Vec::with_capacity(total_rows);
 
         let mut current_row_id = base_row_id;
@@ -2136,7 +2133,6 @@ mod tests {
                     for b in 0..ex_code_bytes {
                         ex_codes.push((17 + pid + row_offset + b) as u8);
                     }
-                    ex_add_factors.push(pid as f32 + 1.0 + row_offset as f32 * 0.1);
                     ex_scale_factors.push(pid as f32 + 1.0 + row_offset as f32 * 0.2);
                 }
             }
@@ -2156,7 +2152,6 @@ mod tests {
                 UInt8Array::from(ex_codes),
                 ex_code_bytes as i32,
             )?));
-            columns.push(Arc::new(Float32Array::from(ex_add_factors)));
             columns.push(Arc::new(Float32Array::from(ex_scale_factors)));
         }
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
@@ -2528,7 +2523,6 @@ mod tests {
                     panic!("RQ ex-code field should be FixedSizeList");
                 };
                 assert_eq!(*ex_code_bytes, 6);
-                assert!(schema.field_with_name(EX_ADD_FACTORS_COLUMN).is_ok());
                 assert!(schema.field_with_name(EX_SCALE_FACTORS_COLUMN).is_ok());
                 checked_split_columns = true;
             }

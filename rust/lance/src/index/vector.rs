@@ -551,6 +551,9 @@ async fn prepare_vector_segment_build(
                 stages
             )));
         };
+        // Multi-bit RQ quantization/storage internals are kept available for
+        // split-code preparation, but public index creation stays binary-only
+        // until multi-bit search support lands.
         validate_supported_rq_num_bits(rq_params.num_bits)?;
     }
 

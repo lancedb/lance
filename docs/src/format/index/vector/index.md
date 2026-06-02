@@ -199,7 +199,6 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 | `__add_factors`      | float32                                          | false                    | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | false                    | Scale correction factors for distance computation               |
 | `__ex_codes`         | list<uint8>[ceil(dimension * (num_bits - 1) / 8)] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ                         |
-| `__add_factors_ex`   | float32                                          | false for `num_bits > 1` | Additive correction factors for ex-code distance computation    |
 | `__scale_factors_ex` | float32                                          | false for `num_bits > 1` | Scale correction factors for ex-code distance computation       |
 
 #### Arrow Schema Metadata
@@ -323,7 +322,7 @@ pa.schema([
 
 This example shows how an `IVF_RQ` index is physically laid out. Assume vectors have dimension 128,
 RQ uses 1 bit per dimension (`num_bits=1`), and distance type is "l2". For `num_bits > 1`, the
-auxiliary schema also includes `__ex_codes`, `__add_factors_ex`, and `__scale_factors_ex`.
+auxiliary schema also includes `__ex_codes` and `__scale_factors_ex`.
 
 #### Index File
 

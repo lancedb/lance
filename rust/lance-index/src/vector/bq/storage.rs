@@ -39,7 +39,7 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
 use crate::vector::bq::transform::{
-    ADD_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, SCALE_FACTORS_COLUMN,
+    ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, SCALE_FACTORS_COLUMN,
 };
 use crate::vector::bq::{
     RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
@@ -1004,15 +1004,6 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 )));
             }
             batch
-                .column_by_name(EX_ADD_FACTORS_COLUMN)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "RabitQ num_bits={} requires {} column",
-                        metadata.num_bits, EX_ADD_FACTORS_COLUMN
-                    ))
-                })?
-                .as_primitive::<Float32Type>();
-            batch
                 .column_by_name(EX_SCALE_FACTORS_COLUMN)
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
@@ -1504,12 +1495,6 @@ mod tests {
             ),
             (RABIT_EX_CODE_COLUMN, Arc::new(ex_codes) as ArrayRef),
             (
-                EX_ADD_FACTORS_COLUMN,
-                Arc::new(Float32Array::from_iter_values(
-                    (0..num_rows).map(|v| v as f32 + 1.0),
-                )) as ArrayRef,
-            ),
-            (
                 EX_SCALE_FACTORS_COLUMN,
                 Arc::new(Float32Array::from_iter_values(
                     (0..num_rows).map(|v| v as f32 + 1.5),
@@ -1664,12 +1649,6 @@ mod tests {
                 .as_fixed_size_list()
                 .value_length(),
             64
-        );
-        assert_eq!(
-            &remapped_batch[EX_ADD_FACTORS_COLUMN]
-                .as_primitive::<Float32Type>()
-                .values()[..5],
-            &[1.0, 2.0, 3.0, 5.0, 6.0]
         );
         assert_eq!(
             &remapped_batch[EX_SCALE_FACTORS_COLUMN]

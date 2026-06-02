@@ -1697,7 +1697,7 @@ mod tests {
     use lance_index::vector::bq::{
         RQBuildParams, RQRotationType,
         storage::{RABIT_EX_CODE_COLUMN, RabitQuantizationMetadata},
-        transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
+        transform::EX_SCALE_FACTORS_COLUMN,
     };
     use lance_index::vector::storage::VectorStore;
 
@@ -4041,7 +4041,6 @@ mod tests {
             panic!("RQ ex-code field should be FixedSizeList");
         };
         assert_eq!(ex_code_bytes, 32);
-        assert!(schema.field(EX_ADD_FACTORS_COLUMN).is_some());
         assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
 
         let query = vectors.value(0);
