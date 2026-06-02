@@ -109,9 +109,19 @@ impl MemTableFlusher {
     /// Storage file version of the shard's base dataset. Flushed generations
     /// (data fragments and index files) are written at this same version so the
     /// whole shard stays on one format (e.g. a 2.2 base => 2.2 flushed gens).
+    ///
+    /// Falls back to [`LanceFileVersion::default`] when no base dataset exists at
+    /// `base_uri` (e.g. flusher unit tests that run without a committed base).
+    /// In production MemWAL is always initialized on a real dataset, so the base
+    /// version is inherited; other open errors are propagated.
     async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
-        let dataset = Dataset::open(&self.base_uri).await?;
-        dataset.manifest().data_storage_format.lance_file_version()
+        match Dataset::open(&self.base_uri).await {
+            Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
+            Err(Error::DatasetNotFound { .. }) => {
+                Ok(lance_file::version::LanceFileVersion::default())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Flush the MemTable to storage (data files, indexes, bloom filter).
