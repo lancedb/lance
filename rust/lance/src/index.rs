@@ -1812,7 +1812,15 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
-        let reader: Arc<dyn Reader> = object_store.open(&index_file).await?.into();
+        let file_sizes = index_meta.file_size_map();
+        let reader: Arc<dyn Reader> = vector::open_index_file(
+            object_store.as_ref(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?
+        .into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
@@ -1879,7 +1887,6 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file_sizes = index_meta.file_size_map();
                 let cached_size = file_sizes
                     .get(INDEX_FILE_NAME)
                     .map(|&size| CachedFileSize::new(size))
