@@ -344,10 +344,7 @@ fn should_retry_upload_put(source: &OSError) -> bool {
     };
 
     let message = source.to_string().to_ascii_lowercase();
-    message.contains("connection reset by peer")
-        || message.contains("requesttimeout")
-        || message.contains("request timeout")
-        || (message.contains("timeout period") && message.contains("idle connection"))
+    message.contains("connection reset by peer") || message.contains("requesttimeout")
 }
 
 #[derive(Debug)]
