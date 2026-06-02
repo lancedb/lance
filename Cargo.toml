@@ -179,7 +179,7 @@ rand_distr = { version = "0.5.1" }
 rand_xoshiro = "0.7.0"
 rangemap = { version = "1.0" }
 rayon = "1.10"
-roaring = "0.11"
+roaring = "0.11.4"
 rstest = "0.23.0"
 serde = { version = "^1" }
 serde_json = { version = "1" }
