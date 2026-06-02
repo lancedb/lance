@@ -53,7 +53,7 @@ mod retry;
 pub mod update;
 
 pub use super::progress::{WriteProgressFn, WriteStats};
-pub use commit::CommitBuilder;
+pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
 pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
 

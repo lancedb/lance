@@ -119,6 +119,12 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Operation timed out: {message}, {location}"))]
+    Timeout {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"
     ))]
@@ -315,6 +321,14 @@ impl Error {
     #[track_caller]
     pub fn internal(message: impl Into<String>) -> Self {
         InternalSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn timeout(message: impl Into<String>) -> Self {
+        TimeoutSnafu {
             message: message.into(),
         }
         .build()

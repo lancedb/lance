@@ -105,6 +105,19 @@ pub struct CachedFileMetadata {
     pub minor_version: u16,
     /// The actual total file size in bytes, as reported by the object store.
     pub file_size_bytes: u64,
+    /// User global buffers (index >= 1) whose bytes were already captured by the
+    /// tail read that `read_all_metadata` performs at open, keyed by buffer index.
+    ///
+    /// All global buffers are laid out contiguously starting at the schema, so on
+    /// small/medium files they land inside the captured tail window. Retaining
+    /// those bytes lets `read_global_buffer` serve them with zero additional I/O.
+    /// The bytes are copied out of the tail (rather than sliced) so the much
+    /// larger tail allocation can be dropped — we only hold what we will serve.
+    ///
+    /// The schema (buffer 0) is excluded: it is already decoded at open and is
+    /// not fetched through `read_global_buffer`. Buffers that fall outside the
+    /// window (large files) are absent here and fall back to a dedicated read.
+    pub retained_global_buffers: BTreeMap<u32, Bytes>,
 }
 
 impl CachedFileMetadata {
@@ -166,7 +179,18 @@ impl DeepSizeOf for CachedFileMetadata {
             })
             .sum();
 
-        schema_size + buffers_size + column_metadatas_size + column_infos_size
+        // Global buffer bytes retained for zero-IO reads (copied out of the tail).
+        let retained_buffers_size: usize = self
+            .retained_global_buffers
+            .values()
+            .map(|buf| buf.len())
+            .sum();
+
+        schema_size
+            + buffers_size
+            + column_metadatas_size
+            + column_infos_size
+            + retained_buffers_size
     }
 }
 
@@ -480,6 +504,14 @@ impl FileReader {
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len())))?;
+
+        // If the buffer's bytes were captured by the tail read at open, serve them
+        // from memory with no additional I/O. Larger buffers (outside the window)
+        // are not retained and fall back to a dedicated read.
+        if let Some(bytes) = self.metadata.retained_global_buffers.get(&index) {
+            return Ok(bytes.clone());
+        }
+
         self.scheduler
             .submit_single(
                 buffer_desc.position..buffer_desc.position + buffer_desc.size,
@@ -661,6 +693,7 @@ impl FileReader {
     pub async fn read_all_metadata(scheduler: &FileScheduler) -> Result<CachedFileMetadata> {
         // 1. read the footer
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
+        let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
         let file_version = LanceFileVersion::try_from_major_minor(
@@ -702,6 +735,30 @@ impl FileReader {
 
         let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
 
+        // The tail read above already pulled in any global buffer that lives within
+        // the captured window. Copy those user buffers (index >= 1; the schema at 0
+        // is decoded above and never fetched via read_global_buffer) out of the tail
+        // so read_global_buffer can serve them without I/O. We copy rather than slice
+        // so the much larger tail allocation can be released once decoding is done.
+        let tail_end = tail_offset + tail_bytes.len() as u64;
+        let retained_global_buffers = gbo_table
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(index, buffer)| {
+                let start = buffer.position;
+                let end = buffer.position + buffer.size;
+                if start >= tail_offset && end <= tail_end {
+                    let rel_start = (start - tail_offset) as usize;
+                    let rel_end = (end - tail_offset) as usize;
+                    let bytes = Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]);
+                    Some((index as u32, bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         Ok(CachedFileMetadata {
             file_schema: Arc::new(schema),
             column_metadatas,
@@ -715,6 +772,7 @@ impl FileReader {
             major_version: footer.major_version,
             minor_version: footer.minor_version,
             file_size_bytes: file_len,
+            retained_global_buffers,
         })
     }
 
@@ -2335,10 +2393,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_global_buffers() {
-        let fs = FsFixture::default();
-
+    async fn write_file_with_global_buffer(fs: &FsFixture, buffer: Bytes) {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![Field::new(
                 "foo",
@@ -2349,21 +2404,36 @@ mod tests {
 
         let mut file_writer = FileWriter::try_new(
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
-            lance_schema.clone(),
+            lance_schema,
             FileWriterOptions::default(),
         )
         .unwrap();
 
-        let test_bytes = Bytes::from_static(b"hello");
-
-        let buf_index = file_writer
-            .add_global_buffer(test_bytes.clone())
-            .await
-            .unwrap();
-
+        let buf_index = file_writer.add_global_buffer(buffer).await.unwrap();
         assert_eq!(buf_index, 1);
 
         file_writer.finish().await.unwrap();
+    }
+
+    /// A global buffer that fits inside the tail region captured at open is served
+    /// from memory with no additional I/O.  A buffer larger than that window cannot
+    /// fit and falls back to a dedicated read.  Both must round-trip correctly.
+    #[rstest]
+    #[case::within_tail_window(true)]
+    #[case::outside_tail_window(false)]
+    #[tokio::test]
+    async fn test_read_global_buffer(#[case] within_window: bool) {
+        let fs = FsFixture::default();
+
+        let block_size = fs.object_store.block_size();
+        let buffer = if within_window {
+            Bytes::from_static(b"hello")
+        } else {
+            Bytes::from(vec![7u8; 2 * block_size])
+        };
+        let expected_read_iops = if within_window { 0 } else { 1 };
+
+        write_file_with_global_buffer(&fs, buffer.clone()).await;
 
         let file_scheduler = fs
             .scheduler
@@ -2371,7 +2441,7 @@ mod tests {
             .await
             .unwrap();
         let file_reader = FileReader::try_open(
-            file_scheduler.clone(),
+            file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
             &test_cache(),
@@ -2380,8 +2450,50 @@ mod tests {
         .await
         .unwrap();
 
+        // The user buffer should be retained only when it fits the tail window, and
+        // the schema (buffer 0) is never retained.
+        let retained = &file_reader.metadata().retained_global_buffers;
+        assert!(!retained.contains_key(&0), "schema must not be retained");
+        assert_eq!(retained.contains_key(&1), within_window);
+
+        // Reset the IO counters so we only measure the read_global_buffer call.
+        fs.object_store.io_stats_incremental();
+
         let buf = file_reader.read_global_buffer(1).await.unwrap();
-        assert_eq!(buf, test_bytes);
+        assert_eq!(buf, buffer);
+
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(stats.read_iops, expected_read_iops);
+    }
+
+    /// A file whose only global buffer is the schema (i.e. a plain data file, the
+    /// common case) must retain nothing — there is no user buffer to serve.
+    #[tokio::test]
+    async fn test_read_global_buffer_no_user_buffers() {
+        let fs = FsFixture::default();
+        create_some_file(&fs, LanceFileVersion::V2_1).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let metadata = file_reader.metadata();
+        assert_eq!(metadata.file_buffers.len(), 1, "expected only the schema");
+        assert!(
+            metadata.retained_global_buffers.is_empty(),
+            "a file with no user global buffers must retain nothing"
+        );
     }
 
     #[rstest]
@@ -2446,5 +2558,37 @@ mod tests {
             deep_size > num_columns * 50,
             "deep_size_of ({deep_size}) should scale with column count ({num_columns})"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_global_buffer_out_of_range() {
+        let fs = FsFixture::default();
+
+        write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // The file has two global buffers (schema at 0, "hello" at 1); index 2 is
+        // out of range and must surface a descriptive error rather than panicking.
+        let err = file_reader.read_global_buffer(2).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains('2'), "error should mention the index: {msg}");
     }
 }

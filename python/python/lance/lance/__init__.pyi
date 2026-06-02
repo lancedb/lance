@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -430,6 +431,7 @@ class _Dataset:
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        commit_timeout: Optional[timedelta] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod
@@ -441,6 +443,7 @@ class _Dataset:
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
+        commit_timeout: Optional[timedelta] = None,
     ) -> Tuple[_Dataset, Transaction]: ...
     def validate(self): ...
     def migrate_manifest_paths_v2(self): ...

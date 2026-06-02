@@ -369,11 +369,13 @@ impl BlockingDataset {
         max_retries: u32,
         skip_auto_cleanup: bool,
         commit_handler: Option<Arc<dyn CommitHandler>>,
+        commit_timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
             .with_detached(detached)
-            .enable_v2_manifest_paths(enable_v2_manifest_paths);
+            .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_timeout(commit_timeout);
         if let Some(use_stable) = use_stable_row_ids {
             builder = builder.use_stable_row_ids(use_stable);
         }

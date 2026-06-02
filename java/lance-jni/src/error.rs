@@ -17,6 +17,7 @@ pub enum JavaExceptionClass {
     UnsupportedOperationException,
     AlreadyInException,
     LanceNamespaceException,
+    LanceTimeoutException,
 }
 
 impl JavaExceptionClass {
@@ -29,6 +30,7 @@ impl JavaExceptionClass {
             // Included for display purposes.  This is not a real exception.
             Self::AlreadyInException => "AlreadyInException",
             Self::LanceNamespaceException => "org/lance/namespace/errors/LanceNamespaceException",
+            Self::LanceTimeoutException => "org/lance/LanceTimeoutException",
         }
     }
 }
@@ -67,6 +69,10 @@ impl Error {
 
     pub fn unsupported_error(message: String) -> Self {
         Self::new(message, JavaExceptionClass::UnsupportedOperationException)
+    }
+
+    pub fn timeout_error(message: String) -> Self {
+        Self::new(message, JavaExceptionClass::LanceTimeoutException)
     }
 
     pub fn namespace_error(code: u32, message: String) -> Self {
@@ -181,6 +187,7 @@ impl From<LanceError> for Error {
             | LanceError::CommitConflict { .. }
             | LanceError::InvalidInput { .. } => Self::input_error(err.to_string()),
             LanceError::IO { .. } => Self::io_error(err.to_string()),
+            LanceError::Timeout { .. } => Self::timeout_error(err.to_string()),
             LanceError::NotSupported { .. } => Self::unsupported_error(err.to_string()),
             LanceError::NotFound { .. } => Self::io_error(err.to_string()),
             LanceError::Namespace { source, .. } => {
