@@ -3,6 +3,7 @@
 import math
 import os
 import pathlib
+import uuid
 
 import lance
 import numpy as np
@@ -273,13 +274,32 @@ def test_ivf_centroids_multivector_fragment_ids(tmpdir):
         metric="cosine",
         num_partitions=2,
         fragment_ids=fragment_ids,
-        index_uuid="00000000-0000-4000-8000-000000000001",
         ivf_centroids=centroids,
     )
 
-    assert index.uuid == "00000000-0000-4000-8000-000000000001"
+    assert uuid.UUID(index.uuid)
     assert index.fragment_ids == set(fragment_ids)
     assert index.name == "embeddings_idx"
+
+
+def test_create_index_uncommitted_rejects_user_index_uuid(tmpdir):
+    ds, dimension = make_multivector_dataset(tmpdir)
+    centroids = pa.FixedSizeListArray.from_arrays(
+        pa.array([0.1, 0.2, 0.3, 0.4, 0.8, 0.7, 0.6, 0.5], type=pa.float32()),
+        dimension,
+    )
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+
+    with pytest.raises(ValueError, match="index_uuid is no longer accepted"):
+        ds.create_index_uncommitted(
+            "embeddings",
+            index_type="IVF_HNSW_SQ",
+            metric="cosine",
+            num_partitions=2,
+            fragment_ids=fragment_ids,
+            index_uuid="00000000-0000-4000-8000-000000000001",
+            ivf_centroids=centroids,
+        )
 
 
 def test_indices_builder_multivector_distributed_dimensions(tmpdir, monkeypatch):

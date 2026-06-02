@@ -3082,6 +3082,9 @@ class LanceDataset(pa.dataset.Dataset):
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated. This parameter is
             passed via kwargs internally.
+            Specifying a UUID is only used by the legacy distributed scalar
+            build; index types on the segmented-index architecture (such as
+            vector indexes) generate segment UUIDs internally and reject it.
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
@@ -3764,8 +3767,9 @@ class LanceDataset(pa.dataset.Dataset):
             ``create_index_segment_builder().with_index_type(...).with_segments(...)``
             and then committed with ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
-            A UUID to use for the segment written by this call.
-            If not provided, a new UUID will be generated.
+            Not accepted for vector indexes: under the segmented-index
+            architecture Lance generates the segment UUID and returns it in the
+            resulting index metadata. Passing a value raises an error.
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.

@@ -218,15 +218,14 @@ mod tests {
         let target_fragments = fragments.iter().take(2).collect::<Vec<_>>();
 
         let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
-        let first_segment_uuid = Uuid::new_v4();
         let second_segment_uuid = Uuid::new_v4();
         let built_index = dataset
             .create_index_builder(&["vector"], IndexType::Vector, &params)
             .name("vector_idx".to_string())
-            .index_uuid(first_segment_uuid.to_string())
             .execute_uncommitted()
             .await
             .unwrap();
+        let first_segment_uuid = built_index.uuid;
         let first_segment_dir = dataset.indices_dir().join(first_segment_uuid.to_string());
         let second_segment_dir = dataset.indices_dir().join(second_segment_uuid.to_string());
         for file_name in ["index.idx", "auxiliary.idx"] {

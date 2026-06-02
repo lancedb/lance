@@ -209,6 +209,14 @@ impl<'a> CreateIndexBuilder<'a> {
             )));
         }
 
+        if self.index_uuid.is_some() && uses_segment_commit_path(self.index_type, self.params) {
+            return Err(Error::invalid_input(format!(
+                "index_uuid is no longer accepted for {} indexes; segment UUIDs are generated \
+                 by Lance and returned in the index metadata.",
+                self.index_type
+            )));
+        }
+
         let index_id = match &self.index_uuid {
             Some(uuid_str) => Uuid::parse_str(uuid_str)
                 .map_err(|e| Error::index(format!("Invalid UUID string provided: {}", e)))?,
@@ -479,7 +487,7 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = if uses_segment_commit_path(self.index_type, &new_idx.name, self.params) {
+        let transaction = if uses_segment_commit_path(self.index_type, self.params) {
             let field_id = *new_idx.fields.first().ok_or_else(|| {
                 Error::internal(format!(
                     "Index '{}' is missing field ids after build",
@@ -560,15 +568,7 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
-fn uses_segment_commit_path(
-    index_type: IndexType,
-    index_name: &str,
-    params: &dyn IndexParams,
-) -> bool {
-    if index_name != LANCE_VECTOR_INDEX {
-        return false;
-    }
-
+fn uses_segment_commit_path(index_type: IndexType, params: &dyn IndexParams) -> bool {
     matches!(
         index_type,
         IndexType::Vector
@@ -2085,19 +2085,18 @@ mod tests {
         .await
         .unwrap();
 
-        let uuid = Uuid::new_v4();
         let params = VectorIndexParams::ivf_hnsw(
             DistanceType::L2,
             prepare_vector_ivf(&dataset, "vector").await,
             HnswBuildParams::default(),
         );
 
-        CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+        let uuid = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
             .name("vector_idx".to_string())
-            .index_uuid(uuid.to_string())
             .execute_uncommitted()
             .await
-            .unwrap();
+            .unwrap()
+            .uuid;
 
         dataset
             .commit_existing_index_segments(
@@ -2119,6 +2118,65 @@ mod tests {
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),
             dataset.fragment_bitmap.as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_uuid_rejected() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(128),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_vector_ivf(&dataset, "vector").await,
+        );
+
+        // Full build with a pinned UUID is rejected.
+        let err = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .index_uuid(Uuid::new_v4().to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("index_uuid is no longer accepted"),
+            "unexpected error: {err}"
+        );
+
+        // Distributed (fragment-scoped) build with a pinned UUID is rejected too.
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let err = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .fragments(vec![fragment_id])
+            .index_uuid(Uuid::new_v4().to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("index_uuid is no longer accepted"),
+            "unexpected error: {err}"
         );
     }
 
