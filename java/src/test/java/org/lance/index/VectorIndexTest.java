@@ -29,7 +29,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -95,14 +94,11 @@ public class VectorIndexTest {
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_FLAT index should not present before commit");
 
-        List<Index> builtSegments =
-            dataset.buildIndexSegments(
-                List.of(firstSegment, secondSegment), IndexType.IVF_FLAT, Optional.empty());
-        assertEquals(2, builtSegments.size());
-
         List<Index> committed =
             dataset.commitExistingIndexSegments(
-                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
+                TestVectorDataset.indexName,
+                TestVectorDataset.vectorColumnName,
+                List.of(firstSegment, secondSegment));
         assertEquals(2, committed.size());
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
@@ -188,14 +184,11 @@ public class VectorIndexTest {
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_PQ index should not present before commit");
 
-        List<Index> builtSegments =
-            dataset.buildIndexSegments(
-                List.of(firstSegment, secondSegment), IndexType.IVF_PQ, Optional.empty());
-        assertEquals(2, builtSegments.size());
-
         List<Index> committed =
             dataset.commitExistingIndexSegments(
-                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
+                TestVectorDataset.indexName,
+                TestVectorDataset.vectorColumnName,
+                List.of(firstSegment, secondSegment));
         assertEquals(2, committed.size());
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }
@@ -265,14 +258,11 @@ public class VectorIndexTest {
             dataset.listIndexes().contains(TestVectorDataset.indexName),
             "Partially created IVF_SQ index should not present before commit");
 
-        List<Index> builtSegments =
-            dataset.buildIndexSegments(
-                List.of(firstSegment, secondSegment), IndexType.IVF_SQ, Optional.empty());
-        assertEquals(2, builtSegments.size());
-
         List<Index> committed =
             dataset.commitExistingIndexSegments(
-                TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, builtSegments);
+                TestVectorDataset.indexName,
+                TestVectorDataset.vectorColumnName,
+                List.of(firstSegment, secondSegment));
         assertEquals(2, committed.size());
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
       }

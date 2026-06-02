@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use super::index::{
     CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
-    Positions, PostingList, PostingTailCodec, SharedPositionStream,
+    Positions, PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
 };
 
 // ---------------------------------------------------------------------------
@@ -382,6 +382,48 @@ fn deserialize_compressed(data: &Bytes, offset: &mut usize) -> Result<Compressed
 }
 
 // ---------------------------------------------------------------------------
+// PostingListGroup codec
+// ---------------------------------------------------------------------------
+
+/// Serializes a [`PostingListGroup`] as a count followed by each member
+/// posting list, length-prefixed so the existing [`PostingList`] codec can be
+/// reused per entry (and its byte buffers read back zero-copy). See issue
+/// #7040.
+impl CacheCodecImpl for PostingListGroup {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+        let count = u32::try_from(self.posting_lists.len())
+            .map_err(|_| Error::io("posting list group too large to serialize".to_string()))?;
+        writer
+            .write_all(&count.to_le_bytes())
+            .map_err(|e| Error::io(format!("failed to write group count: {e}")))?;
+        for posting in &self.posting_lists {
+            let mut buf = Vec::new();
+            posting.serialize(&mut buf)?;
+            write_len_prefixed_bytes(writer, &buf)?;
+        }
+        Ok(())
+    }
+
+    fn deserialize(data: &Bytes) -> Result<Self> {
+        let mut offset = 0;
+        if data.len() < 4 {
+            return Err(Error::io(
+                "truncated posting list group: missing count".to_string(),
+            ));
+        }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        offset += 4;
+        let mut posting_lists = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entry = read_len_prefixed_bytes_at(data, &mut offset)
+                .map_err(|e| Error::io(e.to_string()))?;
+            posting_lists.push(PostingList::deserialize(&entry)?);
+        }
+        Ok(Self::new(posting_lists))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Positions codec
 // ---------------------------------------------------------------------------
 
@@ -417,7 +459,7 @@ mod tests {
 
     use super::super::index::{
         CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
-        Positions, PostingList, PostingTailCodec, SharedPositionStream,
+        Positions, PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
     };
 
     fn legacy_positions(rows: &[&[i32]]) -> arrow_array::ListArray {
@@ -628,6 +670,47 @@ mod tests {
         assert_eq!(stream.block_offsets(), expected_stream.block_offsets());
         assert_eq!(stream.bytes(), expected_stream.bytes());
         assert_slice_points_into_bytes(stream.bytes(), &serialized);
+    }
+
+    #[test]
+    fn posting_list_group_roundtrip() {
+        // Mix of plain and compressed members, including an empty group.
+        let plain = PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(vec![1u64, 2, 3]),
+            ScalarBuffer::from(vec![1.0f32, 2.0, 3.0]),
+            Some(4.0),
+            None,
+        ));
+        let compressed = PostingList::Compressed(CompressedPostingList::new(
+            LargeBinaryArray::from_opt_vec(vec![Some(&[1u8, 2, 3][..])]),
+            2.5,
+            7,
+            PostingTailCodec::VarintDelta,
+            None,
+        ));
+
+        for members in [
+            Vec::new(),
+            vec![plain.clone()],
+            vec![plain.clone(), compressed, plain],
+        ] {
+            let group = PostingListGroup::new(members.clone());
+            let mut buf = Vec::new();
+            group.serialize(&mut buf).unwrap();
+            let restored = PostingListGroup::deserialize(&Bytes::from(buf)).unwrap();
+            assert_eq!(restored.posting_lists.len(), members.len());
+            for (a, b) in members.iter().zip(restored.posting_lists.iter()) {
+                match (a, b) {
+                    (PostingList::Plain(x), PostingList::Plain(y)) => assert_plain_eq(x, y),
+                    (PostingList::Compressed(x), PostingList::Compressed(y)) => {
+                        assert_eq!(x.blocks, y.blocks);
+                        assert_eq!(x.length, y.length);
+                        assert_eq!(x.max_score, y.max_score);
+                    }
+                    _ => panic!("variant mismatch in group roundtrip"),
+                }
+            }
+        }
     }
 
     #[test]
