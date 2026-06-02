@@ -390,8 +390,8 @@ fn train_pq_model<'py>(
 #[pyo3(signature = (dimension, num_bits=1, dtype="float32"))]
 pub fn build_rq_model(dimension: usize, num_bits: u8, dtype: &str) -> PyResult<String> {
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
-    use lance_index::vector::bq::builder::RabitQuantizer;
     use lance_index::vector::bq::RQRotationType;
+    use lance_index::vector::bq::builder::RabitQuantizer;
     use lance_index::vector::quantizer::Quantization;
 
     if !dimension.is_multiple_of(u8::BITS as usize) {
