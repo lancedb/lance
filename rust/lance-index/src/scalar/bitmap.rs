@@ -49,8 +49,8 @@ use crate::{
         CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME,
+            ScalarIndexCacheKey, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME,
         },
     },
 };
@@ -1694,11 +1694,20 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        // Fast path: pre-built index is already in memory (O(1))
+        if let Some(index) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await {
+            return Ok(Some(index));
+        }
+        // Fallback: reconstruct from serialized state (disk-backed cache hit)
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
             return Ok(None);
         };
         let state = (*state).clone();
         let index = state.into_bitmap_index(index_store, cache, frag_reuse_index)?;
+        // Populate the fast path so the next hit is O(1)
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, index.clone())
+            .await;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -1709,6 +1718,11 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             .ok_or_else(|| {
                 Error::internal("BitmapIndexPlugin::put_in_cache called with a non-bitmap index")
             })?;
+        // Fast in-memory path (O(1) hit on next get_from_cache)
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, index.clone())
+            .await;
+        // Serializable path for disk-backed cache backends
         let state = BitmapIndexState::from_index(bitmap)?;
         cache
             .insert_with_key(&BitmapIndexStateKey, Arc::new(state))
@@ -1930,6 +1944,90 @@ mod tests {
                 .collect();
             actual.sort();
             assert_eq!(actual, expected_in_rows);
+        }
+    }
+
+    // Regression test for the O(N log N) warm-cache rebuild introduced in
+    // commit 4de5ce67d.  put_in_cache must write an unsized (fast) entry so
+    // that get_from_cache returns it in O(1) without reconstructing the
+    // BTreeMap.  IS NULL is the worst case: the actual bitmap lookup is O(1)
+    // but the reconstruction touches every row in the lookup batch.
+    #[tokio::test]
+    async fn test_bitmap_cache_fast_path() {
+        use arrow_array::Int32Array;
+        use crate::scalar::registry::ScalarIndexCacheKey;
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // High-cardinality: 1 000 unique integers + 5 null rows.
+        const N: u64 = 1_000;
+        const NULL_COUNT: u64 = 5;
+        // nulls first (sorted batch: nulls precede values)
+        let null_values: Vec<Option<i32>> = std::iter::repeat(None).take(NULL_COUNT as usize).collect();
+        let non_null_values: Vec<Option<i32>> = (0..N as i32).map(Some).collect();
+        let all_values: Vec<Option<i32>> = null_values.into_iter().chain(non_null_values).collect();
+        let all_row_ids: Vec<u64> = (0..N + NULL_COUNT).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(all_values)),
+                Arc::new(UInt64Array::from(all_row_ids)),
+            ],
+        )
+        .unwrap();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(16 * 1024 * 1024);
+        let index = BitmapIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        let plugin = BitmapIndexPlugin;
+        let index_arc: Arc<dyn ScalarIndex> = index.clone() as Arc<dyn ScalarIndex>;
+        plugin.put_in_cache(&cache, index_arc).await.unwrap();
+
+        // The fast (unsized) entry must be present immediately after put_in_cache.
+        assert!(
+            cache.get_unsized_with_key(&ScalarIndexCacheKey).await.is_some(),
+            "put_in_cache must populate the in-memory (unsized) cache entry"
+        );
+
+        // get_from_cache must return the pre-built index via the fast path.
+        let cached = plugin
+            .get_from_cache(store.clone(), None, &cache)
+            .await
+            .unwrap()
+            .expect("get_from_cache must return Some after put_in_cache");
+
+        // IS NULL: trivial work once the index is in hand.
+        let query = SargableQuery::IsNull();
+        match cached.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(row_set) => {
+                let mut null_rows: Vec<u64> = row_set
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                null_rows.sort();
+                let expected: Vec<u64> = (0..NULL_COUNT).collect();
+                assert_eq!(null_rows, expected);
+            }
+            _ => panic!("Expected Exact result for IS NULL"),
         }
     }
 

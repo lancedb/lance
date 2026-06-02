@@ -35,8 +35,8 @@ use crate::pbold;
 use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    DefaultTrainingRequest, ScalarIndexCacheKey, ScalarIndexPlugin, TrainingCriteria,
+    TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -701,11 +701,20 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        // Fast path: pre-built index is already in memory (O(1))
+        if let Some(index) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await {
+            return Ok(Some(index));
+        }
+        // Fallback: reconstruct from serialized state (disk-backed cache hit)
         let Some(state) = cache.get_with_key(&LabelListIndexStateKey).await else {
             return Ok(None);
         };
         let state = (*state).clone();
         let index = state.into_label_list_index(index_store, cache, frag_reuse_index)?;
+        // Populate the fast path so the next hit is O(1)
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, index.clone())
+            .await;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -718,6 +727,11 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
                     "LabelListIndexPlugin::put_in_cache called with a non-label-list index",
                 )
             })?;
+        // Fast in-memory path (O(1) hit on next get_from_cache)
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, index.clone())
+            .await;
+        // Serializable path for disk-backed cache backends
         let state = LabelListIndexState::from_index(label_list)?;
         cache
             .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
