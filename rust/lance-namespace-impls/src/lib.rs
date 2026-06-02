@@ -86,7 +86,9 @@ pub mod rest_adapter;
 pub use connect::ConnectBuilder;
 pub use context::{DynamicContextProvider, OperationInfo};
 pub use dir::{
-    DirectoryNamespace, DirectoryNamespaceBuilder, OpsMetrics, manifest::ManifestNamespace,
+    DESCRIPTION_METADATA_KEY, DirectoryNamespace, DirectoryNamespaceBuilder, MetadataUpdate,
+    OpsMetrics, UpdateMetadataResponse, UpdateNamespaceMetadataRequest, UpdateTableMetadataRequest,
+    manifest::ManifestNamespace,
 };
 
 // Re-export credential vending
