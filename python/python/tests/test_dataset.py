@@ -3798,7 +3798,7 @@ def test_scoring_columns(tmp_path: Path):
     assert tbl.schema.names == ["vec", "_distance", "_rowid", "_rowaddr"]
 
     # If _rowid or _rowaddr are specified via projection, they stay in the specified
-    # order; _distance is not added automatically since autoprojection was removed
+    # order; _distance must be explicitly included
     tbl = dataset.scanner(
         columns=["_rowid", "vec", "_distance"], nearest=nearest
     ).to_table()
@@ -3811,12 +3811,6 @@ def test_scoring_columns(tmp_path: Path):
 
     # With an explicit projection, _distance is NOT added automatically
     tbl = dataset.scanner(columns=["vec"], nearest=nearest).to_table()
-    assert tbl.schema.names == ["vec"]
-
-    # disable_scoring_autoprojection=True is accepted (no-op, same as default)
-    tbl = dataset.scanner(
-        columns=["vec"], nearest=nearest, disable_scoring_autoprojection=True
-    ).to_table()
     assert tbl.schema.names == ["vec"]
 
     # disable_scoring_autoprojection=False raises an error

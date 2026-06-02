@@ -1772,17 +1772,6 @@ impl Scanner {
 
     /// No-op. Scoring autoprojection has been removed.
     ///
-    /// Previously, this method opted into the behavior where _score/_distance columns
-    /// are only included when no projection is specified or explicitly requested.
-    /// This is now always the case.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Scoring autoprojection has been removed. This method is a no-op."
-    )]
-    pub fn disable_scoring_autoprojection(&mut self) -> &mut Self {
-        self
-    }
-
     /// Set the file reader options to use when reading data files.
     pub fn with_file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
         self.file_reader_options = Some(options);
