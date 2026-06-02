@@ -3893,17 +3893,15 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
         assert any(file.path == "bitmap_page_lookup.lance" for file in segment.files)
         assert all(not file.path.startswith("part_") for file in segment.files)
 
-    segments = (
-        ds.create_index_segment_builder()
-        .with_index_type("BITMAP")
-        .with_segments(staged_segments)
-        .build_all()
-    )
-    assert len(segments) == len(staged_segments)
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.uuid not in {segment.uuid for segment in staged_segments}
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "bitmap_page_lookup.lance" for file in merged_segment.files)
+    assert all(not file.path.startswith("part_") for file in merged_segment.files)
 
-    ds = ds.commit_existing_index_segments(index_name, "category", segments)
+    ds = ds.commit_existing_index_segments(index_name, "category", [merged_segment])
     descriptions = {index.name: index for index in ds.describe_indices()}
-    assert len(descriptions[index_name].segments) == len(segments)
+    assert len(descriptions[index_name].segments) == 1
 
     filter_expr = "category = 3"
     without_index = ds.scanner(

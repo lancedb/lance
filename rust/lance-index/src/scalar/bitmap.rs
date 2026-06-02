@@ -1591,6 +1591,63 @@ pub async fn merge_index_files(
     Ok(())
 }
 
+pub async fn merge_bitmap_indices(
+    source_indices: &[Arc<BitmapIndex>],
+    dest_store: &dyn IndexStore,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<CreatedIndex> {
+    if source_indices.is_empty() {
+        return Err(Error::invalid_input(
+            "Bitmap segment merge requires at least one source segment".to_string(),
+        ));
+    }
+
+    let value_type = source_indices[0].value_type().clone();
+    let mut merged_state = HashMap::<ScalarValue, RowAddrTreeMap>::new();
+
+    progress
+        .stage_start(
+            "merge_bitmap_segments",
+            Some(source_indices.len() as u64),
+            "segments",
+        )
+        .await?;
+    for (idx, source_index) in source_indices.iter().enumerate() {
+        if source_index.value_type() != &value_type {
+            return Err(Error::invalid_input(format!(
+                "Bitmap segment has value type {:?}, expected {:?}",
+                source_index.value_type(),
+                value_type
+            )));
+        }
+
+        let state = source_index.load_bitmap_index_state().await?;
+        for (key, bitmap) in state {
+            merged_state
+                .entry(key)
+                .and_modify(|existing| *existing |= &bitmap)
+                .or_insert(bitmap);
+        }
+        progress
+            .stage_progress("merge_bitmap_segments", (idx + 1) as u64)
+            .await?;
+    }
+    progress.stage_complete("merge_bitmap_segments").await?;
+
+    progress
+        .stage_start("write_bitmap_index", Some(1), "files")
+        .await?;
+    BitmapIndexPlugin::write_bitmap_index(merged_state, dest_store, &value_type).await?;
+    progress.stage_progress("write_bitmap_index", 1).await?;
+    progress.stage_complete("write_bitmap_index").await?;
+
+    Ok(CreatedIndex {
+        index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap(),
+        index_version: BITMAP_INDEX_VERSION,
+        files: Some(dest_store.list_files_with_sizes().await?),
+    })
+}
+
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
     fn name(&self) -> &str {

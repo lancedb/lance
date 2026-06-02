@@ -543,21 +543,35 @@ mod tests {
             staged.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(IndexType::Bitmap)
-            .with_segments(staged)
-            .build_all()
-            .await
-            .unwrap();
+        let staged_uuids = staged
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+        assert!(!staged_uuids.contains(&merged.uuid));
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            fragments
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>()
+        );
+        let files = merged.files.as_ref().unwrap();
+        assert!(files.iter().any(|file| file.path == BITMAP_LOOKUP_NAME));
+        assert!(files.iter().all(|file| !file.path.starts_with("part_")));
 
         dataset
-            .commit_existing_index_segments("value_bitmap", "value", segments)
+            .commit_existing_index_segments("value_bitmap", "value", vec![merged])
             .await
             .unwrap();
 
         let committed = dataset.load_indices_by_name("value_bitmap").await.unwrap();
-        assert_eq!(committed.len(), 2);
+        assert_eq!(committed.len(), 1);
         assert_eq!(
             scalar_index_fragment_bitmap(&dataset, "value", "value_bitmap")
                 .await

@@ -3736,8 +3736,8 @@ class LanceDataset(pa.dataset.Dataset):
             This enables distributed/fragment-level indexing. When provided, the
             method creates one segment but does not commit the index
             to the dataset. The returned metadata can be passed to
-            ``create_index_segment_builder().with_index_type(...).with_segments(...)``
-            and then committed with ``commit_existing_index_segments(...)``.
+            ``merge_existing_index_segments(...)`` and then committed with
+            ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
@@ -3921,10 +3921,9 @@ class LanceDataset(pa.dataset.Dataset):
         1. run :meth:`create_index_uncommitted` on each worker with that worker's
            assigned ``fragment_ids``
         2. collect the returned :class:`Index` objects
-        3. call :meth:`IndexSegmentBuilder.with_index_type` with the concrete
-           distributed index type
-        4. pass them to :meth:`IndexSegmentBuilder.with_segments`
-        5. build one or more physical segments and commit them with
+        3. call :meth:`merge_existing_index_segments` on each caller-defined
+           segment group
+        4. commit the returned physical segments with
            :meth:`commit_existing_index_segments`
 
         Parameters are the same as :meth:`create_index`, with one additional
@@ -4030,17 +4029,16 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Merge distributed scalar index metadata.
 
-        Vector distributed indexing no longer uses this API. For vector indices,
-        build segments with :meth:`create_index_uncommitted`, plan or
-        merge them with :meth:`create_index_segment_builder`, and publish them
-        with :meth:`commit_existing_index_segments`.
+        Vector and Bitmap distributed indexing no longer use this API. For
+        those index families, build segments with
+        :meth:`create_index_uncommitted`, merge caller-defined segment groups
+        with :meth:`merge_existing_index_segments`, and publish them with
+        :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
         This API merges temporary scalar index files (for example per-fragment
-        BTree or inverted index outputs). Bitmap distributed indexing uses
-        :meth:`create_index_uncommitted` and :meth:`create_index_segment_builder`
-        instead.
+        BTree or inverted index outputs).
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
