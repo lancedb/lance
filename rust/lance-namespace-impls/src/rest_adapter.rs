@@ -1560,7 +1560,7 @@ mod tests {
                 let server_url = format!("http://127.0.0.1:{}", actual_port);
                 let namespace = RestNamespaceBuilder::new(&server_url)
                     .delimiter("$")
-                    .build();
+                    .build().unwrap();
 
                 Self {
                     _temp_dir: temp_dir,
@@ -3124,7 +3124,7 @@ mod tests {
                 .delimiter("$")
                 .header("X-Base-Header", "base-value")
                 .context_provider(provider)
-                .build();
+                .build().unwrap();
 
             // Create a namespace - should work with context provider
             let create_req = CreateNamespaceRequest {

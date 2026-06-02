@@ -13,6 +13,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::header::{HeaderName, HeaderValue};
 
+use crate::rest_auth::{
+    AUTH_PROPERTY_PREFIX, AUTH_TYPE_KEY, RequestContext, RestAuthProvider, create_auth_provider,
+};
+
 use crate::context::{DynamicContextProvider, OperationInfo};
 
 use lance_namespace::apis::urlencode;
@@ -69,6 +73,7 @@ struct RestClient {
     base_path: String,
     base_headers: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
+    auth_provider: Option<Arc<dyn RestAuthProvider>>,
 }
 
 impl std::fmt::Debug for RestClient {
@@ -80,58 +85,101 @@ impl std::fmt::Debug for RestClient {
                 "context_provider",
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
             )
+            .field(
+                "auth_provider",
+                &self.auth_provider.as_ref().map(|_| "Some(...)"),
+            )
             .finish()
     }
 }
 
-impl RestClient {
-    /// Apply base headers and dynamic context headers to a request.
-    ///
-    /// This method mutates the request's headers directly, which is more efficient
-    /// than creating a new client with default_headers for each request.
-    fn apply_headers(&self, request: &mut reqwest::Request, operation: &str, object_id: &str) {
-        let request_headers = request.headers_mut();
+fn reqwest_to_lance_error(e: reqwest::Error) -> lance_core::Error {
+    let message = format!("Failed to execute request: {e:?}");
+    if e.is_timeout() || e.is_connect() {
+        NamespaceError::ServiceUnavailable { message }.into()
+    } else {
+        NamespaceError::Internal { message }.into()
+    }
+}
 
-        // First apply base headers
-        for (key, value) in &self.base_headers {
-            if let (Ok(header_name), Ok(header_value)) =
-                (HeaderName::from_str(key), HeaderValue::from_str(value))
-            {
-                request_headers.insert(header_name, header_value);
-            }
+fn apply_string_headers<I, K, V>(headers: &mut reqwest::header::HeaderMap, pairs: I)
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    for (k, v) in pairs {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_str(k.as_ref()),
+            HeaderValue::from_str(v.as_ref()),
+        ) {
+            headers.insert(name, val);
         }
+    }
+}
 
-        // Then apply context headers (override base headers if conflict)
-        if let Some(provider) = &self.context_provider {
-            let info = OperationInfo::new(operation, object_id);
-            let context = provider.provide_context(&info);
-
-            const HEADERS_PREFIX: &str = "headers.";
-            for (key, value) in context {
-                if let Some(header_name) = key.strip_prefix(HEADERS_PREFIX)
-                    && let (Ok(header_name), Ok(header_value)) = (
-                        HeaderName::from_str(header_name),
-                        HeaderValue::from_str(&value),
-                    )
-                {
-                    request_headers.insert(header_name, header_value);
-                }
-            }
+impl RestClient {
+    fn build_auth_context(request: &reqwest::Request) -> RequestContext {
+        let headers = request
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+            .collect();
+        RequestContext {
+            method: request.method().to_string(),
+            url: request.url().to_string(),
+            headers,
         }
     }
 
-    /// Execute a request with dynamic headers applied.
-    ///
-    /// This method builds the request, applies headers, and executes it.
+    /// Apply base, auth, then context headers. Context wins on conflict so it
+    /// can intentionally override auth headers per request.
+    async fn apply_headers(
+        &self,
+        request: &mut reqwest::Request,
+        operation: &str,
+        object_id: &str,
+    ) -> Result<()> {
+        apply_string_headers(request.headers_mut(), &self.base_headers);
+
+        if let Some(auth) = &self.auth_provider {
+            let ctx = Self::build_auth_context(request);
+            let auth_headers =
+                auth.authenticate(&ctx)
+                    .await
+                    .map_err(|e| NamespaceError::Unauthenticated {
+                        message: format!(
+                            "auth provider failed for operation '{operation}' on '{object_id}': {e}"
+                        ),
+                    })?;
+            apply_string_headers(request.headers_mut(), auth_headers);
+        }
+
+        if let Some(provider) = &self.context_provider {
+            let info = OperationInfo::new(operation, object_id);
+            const HEADERS_PREFIX: &str = "headers.";
+            let context_headers = provider
+                .provide_context(&info)
+                .into_iter()
+                .filter_map(|(k, v)| k.strip_prefix(HEADERS_PREFIX).map(|n| (n.to_string(), v)));
+            apply_string_headers(request.headers_mut(), context_headers);
+        }
+        Ok(())
+    }
+
     async fn execute(
         &self,
         req_builder: reqwest::RequestBuilder,
         operation: &str,
         object_id: &str,
-    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
-        let mut request = req_builder.build()?;
-        self.apply_headers(&mut request, operation, object_id);
-        self.client.execute(request).await
+    ) -> Result<reqwest::Response> {
+        let mut request = req_builder.build().map_err(reqwest_to_lance_error)?;
+        self.apply_headers(&mut request, operation, object_id)
+            .await?;
+        self.client
+            .execute(request)
+            .await
+            .map_err(reqwest_to_lance_error)
     }
 
     /// Get the base path URL
@@ -159,7 +207,7 @@ impl RestClient {
 /// let namespace = RestNamespaceBuilder::new("http://localhost:8080")
 ///     .delimiter(".")
 ///     .header("Authorization", "Bearer token")
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -175,6 +223,8 @@ pub struct RestNamespaceBuilder {
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     /// When true, tracks operation metrics. Default: false.
     ops_metrics_enabled: bool,
+    auth_provider: Option<Arc<dyn RestAuthProvider>>,
+    auth_properties: HashMap<String, String>,
 }
 
 impl std::fmt::Debug for RestNamespaceBuilder {
@@ -192,6 +242,10 @@ impl std::fmt::Debug for RestNamespaceBuilder {
                 &self.context_provider.as_ref().map(|_| "Some(...)"),
             )
             .field("ops_metrics_enabled", &self.ops_metrics_enabled)
+            .field(
+                "auth_provider",
+                &self.auth_provider.as_ref().map(|_| "Some(...)"),
+            )
             .finish()
     }
 }
@@ -216,6 +270,8 @@ impl RestNamespaceBuilder {
             assert_hostname: true,
             context_provider: None,
             ops_metrics_enabled: false,
+            auth_provider: None,
+            auth_properties: HashMap::new(),
         }
     }
 
@@ -255,7 +311,7 @@ impl RestNamespaceBuilder {
     /// properties.insert("header.Authorization".to_string(), "Bearer token".to_string());
     ///
     /// let namespace = RestNamespaceBuilder::from_properties(properties)?
-    ///     .build();
+    ///     .build()?;
     /// # Ok(())
     /// # }
     /// ```
@@ -299,6 +355,12 @@ impl RestNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
+        let auth_properties: HashMap<String, String> = properties
+            .iter()
+            .filter(|(k, _)| k.starts_with(AUTH_PROPERTY_PREFIX))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
         Ok(Self {
             uri,
             delimiter,
@@ -309,6 +371,8 @@ impl RestNamespaceBuilder {
             assert_hostname,
             context_provider: None,
             ops_metrics_enabled,
+            auth_provider: None,
+            auth_properties,
         })
     }
 
@@ -414,10 +478,16 @@ impl RestNamespaceBuilder {
     ///
     /// let namespace = RestNamespaceBuilder::new("http://localhost:8080")
     ///     .context_provider(Arc::new(MyProvider))
-    ///     .build();
+    ///     .build()?;
     /// ```
     pub fn context_provider(mut self, provider: Arc<dyn DynamicContextProvider>) -> Self {
         self.context_provider = Some(provider);
+        self
+    }
+
+    /// Set the auth provider directly. Takes precedence over `rest.auth.*` properties.
+    pub fn auth_provider(mut self, provider: Arc<dyn RestAuthProvider>) -> Self {
+        self.auth_provider = Some(provider);
         self
     }
 
@@ -433,13 +503,17 @@ impl RestNamespaceBuilder {
         self
     }
 
-    /// Build the RestNamespace.
-    ///
-    /// # Returns
-    ///
-    /// Returns a `RestNamespace` instance.
-    pub fn build(self) -> RestNamespace {
-        RestNamespace::from_builder(self)
+    /// Build the RestNamespace. Auth provider precedence:
+    /// `auth_provider()` setter > `rest.auth.*` properties > none.
+    pub fn build(self) -> Result<RestNamespace> {
+        let auth = if let Some(p) = self.auth_provider.clone() {
+            Some(p)
+        } else if self.auth_properties.contains_key(AUTH_TYPE_KEY) {
+            Some(create_auth_provider(&self.auth_properties)?)
+        } else {
+            None
+        };
+        Ok(RestNamespace::from_builder(self, auth))
     }
 }
 
@@ -464,7 +538,7 @@ fn object_id_str(id: &Option<Vec<String>>, delimiter: &str) -> Result<String> {
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// // Use the builder to create a namespace
 /// let namespace = RestNamespaceBuilder::new("http://localhost:8080")
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -490,8 +564,11 @@ impl std::fmt::Display for RestNamespace {
 }
 
 impl RestNamespace {
-    /// Create a new REST namespace from builder
-    pub(crate) fn from_builder(builder: RestNamespaceBuilder) -> Self {
+    /// Create a new REST namespace from builder + resolved auth provider.
+    pub(crate) fn from_builder(
+        builder: RestNamespaceBuilder,
+        auth_provider: Option<Arc<dyn RestAuthProvider>>,
+    ) -> Self {
         // Build reqwest client WITHOUT default headers - we'll apply headers per-request
         let mut client_builder = reqwest::Client::builder();
 
@@ -524,6 +601,7 @@ impl RestNamespace {
             base_path: builder.uri,
             base_headers: builder.headers,
             context_provider: builder.context_provider,
+            auth_provider,
         };
 
         let ops_metrics = if builder.ops_metrics_enabled {
@@ -536,19 +614,6 @@ impl RestNamespace {
             delimiter: builder.delimiter,
             rest_client,
             ops_metrics,
-        }
-    }
-
-    /// Map a reqwest::Error to the appropriate NamespaceError variant.
-    ///
-    /// Timeout and connection errors are mapped to `ServiceUnavailable`,
-    /// while other errors are mapped to `Internal`.
-    fn request_error(e: reqwest::Error) -> lance_core::Error {
-        let message = format!("Failed to execute request: {:?}", e);
-        if e.is_timeout() || e.is_connect() {
-            NamespaceError::ServiceUnavailable { message }.into()
-        } else {
-            NamespaceError::Internal { message }.into()
         }
     }
 
@@ -588,8 +653,7 @@ impl RestNamespace {
         let resp = self
             .rest_client
             .execute(req_builder, operation, object_id)
-            .await
-            .map_err(Self::request_error)?;
+            .await?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
@@ -625,8 +689,7 @@ impl RestNamespace {
         let resp = self
             .rest_client
             .execute(req_builder, operation, object_id)
-            .await
-            .map_err(Self::request_error)?;
+            .await?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
@@ -662,8 +725,7 @@ impl RestNamespace {
         let resp = self
             .rest_client
             .execute(req_builder, operation, object_id)
-            .await
-            .map_err(Self::request_error)?;
+            .await?;
 
         let status = resp.status();
         if status.is_success() {
@@ -693,8 +755,7 @@ impl RestNamespace {
         let resp = self
             .rest_client
             .execute(req_builder, operation, object_id)
-            .await
-            .map_err(Self::request_error)?;
+            .await?;
 
         let status = resp.status();
         let content = resp.text().await.map_err(|e| {
@@ -1110,8 +1171,7 @@ impl LanceNamespace for RestNamespace {
         let resp = self
             .rest_client
             .execute(req_builder, operation, &id)
-            .await
-            .map_err(Self::request_error)?;
+            .await?;
 
         let status = resp.status();
         if status.is_success() {
@@ -1641,7 +1701,8 @@ mod tests {
 
         let _namespace = RestNamespaceBuilder::from_properties(properties)
             .expect("Failed to create namespace builder")
-            .build();
+            .build()
+            .unwrap();
 
         // Successfully created the namespace - test passes if no panic
     }
@@ -1658,7 +1719,8 @@ mod tests {
 
         let _namespace = RestNamespaceBuilder::from_properties(properties)
             .expect("Failed to create namespace builder")
-            .build();
+            .build()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1697,7 +1759,8 @@ mod tests {
 
         let namespace = RestNamespaceBuilder::from_properties(properties)
             .expect("Failed to create namespace builder")
-            .build();
+            .build()
+            .unwrap();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -1716,7 +1779,8 @@ mod tests {
         properties.insert("uri".to_string(), "http://localhost:8080".to_string());
         let _namespace = RestNamespaceBuilder::from_properties(properties)
             .expect("Failed to create namespace builder")
-            .build();
+            .build()
+            .unwrap();
 
         // The default delimiter should be "$" - test passes if no panic
     }
@@ -1728,7 +1792,8 @@ mod tests {
 
         let _namespace = RestNamespaceBuilder::from_properties(properties)
             .expect("Failed to create namespace builder")
-            .build();
+            .build()
+            .unwrap();
         // Test passes if no panic
     }
 
@@ -1795,7 +1860,8 @@ mod tests {
         // Should not panic even with nonexistent files (they're just ignored)
         let _namespace = RestNamespaceBuilder::from_properties(properties)
             .expect("Failed to create namespace builder")
-            .build();
+            .build()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1816,7 +1882,9 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .build()
+            .unwrap();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -1852,7 +1920,9 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .build()
+            .unwrap();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -1885,7 +1955,9 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .build()
+            .unwrap();
 
         let request = CreateNamespaceRequest {
             id: Some(vec!["test".to_string(), "newnamespace".to_string()]),
@@ -1918,7 +1990,9 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .build()
+            .unwrap();
 
         let request = CreateTableRequest {
             id: Some(vec![
@@ -1957,7 +2031,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .build()
+            .unwrap();
 
         let request = CreateTableRequest {
             id: Some(vec![
@@ -2022,7 +2098,9 @@ mod tests {
             .await;
 
         // Create namespace with mock server URL
-        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let namespace = RestNamespaceBuilder::new(mock_server.uri())
+            .build()
+            .unwrap();
 
         let request = InsertIntoTableRequest {
             id: Some(vec![
@@ -2085,7 +2163,8 @@ mod tests {
 
         let namespace = RestNamespaceBuilder::new(mock_server.uri())
             .context_provider(provider)
-            .build();
+            .build()
+            .unwrap();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -2131,7 +2210,8 @@ mod tests {
         let namespace = RestNamespaceBuilder::new(mock_server.uri())
             .header("Authorization", "Bearer base-token")
             .context_provider(provider)
-            .build();
+            .build()
+            .unwrap();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -2173,7 +2253,8 @@ mod tests {
         let namespace = RestNamespaceBuilder::new(mock_server.uri())
             .header("Authorization", "Bearer base-token")
             .context_provider(provider)
-            .build();
+            .build()
+            .unwrap();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -2204,7 +2285,8 @@ mod tests {
         // Create namespace WITHOUT context provider, only base headers
         let namespace = RestNamespaceBuilder::new(mock_server.uri())
             .header("Authorization", "Bearer base-only")
-            .build();
+            .build()
+            .unwrap();
 
         let request = ListNamespacesRequest {
             id: Some(vec!["test".to_string()]),
@@ -2213,5 +2295,155 @@ mod tests {
 
         let result = namespace.list_namespaces(request).await;
         assert!(result.is_ok(), "Failed: {:?}", result.err());
+    }
+
+    // Compatibility tests: the RestAuthProvider framework must not change
+    // existing behaviour for users on the static `header.*` path.
+
+    #[tokio::test]
+    async fn rest_auth_type_none_outbound_headers_identical_to_no_config() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/ns/list"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "namespaces": [] })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ns_no_auth = RestNamespaceBuilder::new(mock_server.uri())
+            .build()
+            .unwrap();
+        let req = ListNamespacesRequest {
+            id: Some(vec!["ns".to_string()]),
+            ..Default::default()
+        };
+        ns_no_auth.list_namespaces(req.clone()).await.unwrap();
+
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), mock_server.uri());
+        props.insert("rest.auth.type".to_string(), "none".to_string());
+        let ns_none = RestNamespaceBuilder::from_properties(props)
+            .unwrap()
+            .build()
+            .unwrap();
+        ns_none.list_namespaces(req).await.unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let h0: HashMap<_, _> = requests[0]
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap().to_string()))
+            .collect();
+        let h1: HashMap<_, _> = requests[1]
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            h0, h1,
+            "rest.auth.type=none should produce identical headers to no config"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_header_authorization_unchanged_with_auth_framework() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/ns/list"))
+            .and(wiremock::matchers::header(
+                "Authorization",
+                "Bearer legacy-static-token",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "namespaces": [] })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ns = RestNamespaceBuilder::new(mock_server.uri())
+            .header("Authorization", "Bearer legacy-static-token")
+            .build()
+            .unwrap();
+        let req = ListNamespacesRequest {
+            id: Some(vec!["ns".to_string()]),
+            ..Default::default()
+        };
+        ns.list_namespaces(req).await.unwrap();
+    }
+
+    #[test]
+    fn unknown_rest_auth_type_returns_error_at_build_time() {
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), "http://127.0.0.1:1".to_string());
+        props.insert(
+            "rest.auth.type".to_string(),
+            "definitely-not-a-real-scheme".to_string(),
+        );
+        let result = RestNamespaceBuilder::from_properties(props)
+            .unwrap()
+            .build();
+        assert!(
+            result.is_err(),
+            "expected build() to fail for unknown auth type"
+        );
+        let err_str = result.err().unwrap().to_string();
+        assert!(
+            err_str.contains("definitely-not-a-real-scheme"),
+            "error should mention the offending type, got: {err_str}"
+        );
+        assert!(
+            err_str.contains("none"),
+            "error should list supported types, got: {err_str}"
+        );
+    }
+
+    /// Auth provider errors must surface as hard failures, not be swallowed.
+    #[tokio::test]
+    async fn auth_provider_failure_surfaces_as_error() {
+        #[derive(Debug)]
+        struct AlwaysFailAuth;
+        #[async_trait::async_trait]
+        impl crate::rest_auth::RestAuthProvider for AlwaysFailAuth {
+            async fn authenticate(
+                &self,
+                _ctx: &crate::rest_auth::RequestContext,
+            ) -> Result<HashMap<String, String>> {
+                Err(NamespaceError::Unauthenticated {
+                    message: "synthetic-token-expired".to_string(),
+                }
+                .into())
+            }
+        }
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"namespaces": []})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ns = RestNamespaceBuilder::new(mock_server.uri())
+            .auth_provider(std::sync::Arc::new(AlwaysFailAuth))
+            .build()
+            .unwrap();
+        let req = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+        let result = ns.list_namespaces(req).await;
+        assert!(result.is_err(), "auth failure should bubble up");
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("synthetic-token-expired"),
+            "underlying error must be preserved: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("list_namespaces"),
+            "error should include operation context: {err_msg}"
+        );
     }
 }
