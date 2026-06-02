@@ -76,6 +76,12 @@ pub struct ScalarIndexExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
+    /// Hint passed to the index search so it can stop once it has found this many
+    /// matches. `None` means search all matches.
+    ///
+    /// This is only an optimization. A downstream `GlobalLimitExec` still applies the
+    /// exact limit, so the index only needs to return at least this many rows.
+    limit: Option<usize>,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -109,7 +115,18 @@ impl ScalarIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
+            limit: None,
         }
+    }
+
+    /// Push a `limit` hint into the index search so it can stop early.
+    ///
+    /// Only set this when returning any `limit` matching rows is safe, such as an
+    /// unordered scan whose results are not filtered further. Correctness still relies on
+    /// a downstream limit operator.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -161,12 +178,14 @@ impl ScalarIndexExec {
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
         result_format: IndexExprResultWireFormat,
+        limit: Option<usize>,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
-            expr.evaluate(dataset.as_ref(), &metrics).await?
+            expr.evaluate_limited(dataset.as_ref(), &metrics, limit)
+                .await?
         };
         let fragments_covered_by_result =
             Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
@@ -218,6 +237,7 @@ impl ExecutionPlan for ScalarIndexExec {
             self.dataset.clone(),
             self.metrics.clone(),
             self.result_format,
+            self.limit,
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
@@ -485,6 +505,12 @@ pub struct MaterializeIndexExec {
     fragments: Arc<Vec<Fragment>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    /// Hint passed to the index search so it can stop once it has found this many
+    /// matches. `None` means materialize all matches.
+    ///
+    /// This is only an optimization. A downstream `GlobalLimitExec` still applies the
+    /// exact limit, so the index only needs to return at least this many rows.
+    limit: Option<usize>,
 }
 
 impl DisplayAs for MaterializeIndexExec {
@@ -557,7 +583,18 @@ impl MaterializeIndexExec {
             fragments,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            limit: None,
         }
+    }
+
+    /// Push a `limit` hint into the index search so it can stop early.
+    ///
+    /// Only set this when returning any `limit` matching rows is safe, such as an
+    /// unordered scan whose results are not filtered further. Correctness still relies on
+    /// a downstream limit operator.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
     }
 
     #[instrument(name = "materialize_scalar_index", skip_all, level = "debug")]
@@ -566,8 +603,9 @@ impl MaterializeIndexExec {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
         metrics: Arc<IndexMetrics>,
+        limit: Option<usize>,
     ) -> Result<RecordBatch> {
-        let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
+        let expr_result = expr.evaluate_limited(dataset.as_ref(), metrics.as_ref(), limit);
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -734,6 +772,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.dataset.clone(),
             self.fragments.clone(),
             metrics,
+            self.limit,
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))

@@ -1309,21 +1309,24 @@ impl ScalarIndexExpr {
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
+        limit: Option<usize>,
     ) -> Result<NullableIndexExprResult> {
         match self {
+            // A limit only applies to a single positive lookup. NOT, AND, and OR need the
+            // full result of each side, so the limit is dropped when recursing into them.
             Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
+                let result = inner.evaluate_nullable(index_loader, metrics, None).await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable(index_loader, metrics, None);
+                let rhs_result = rhs.evaluate_nullable(index_loader, metrics, None);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable(index_loader, metrics, None);
+                let rhs_result = rhs.evaluate_nullable(index_loader, metrics, None);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1331,7 +1334,9 @@ impl ScalarIndexExpr {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
+                let search_result = index
+                    .search_limited(search.query.as_ref(), metrics, limit)
+                    .await?;
                 Ok(search_result.into())
             }
         }
@@ -1343,8 +1348,23 @@ impl ScalarIndexExpr {
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
+        self.evaluate_limited(index_loader, metrics, None).await
+    }
+
+    /// Like [`Self::evaluate`] but pushes a `limit` hint into the index search so it can
+    /// stop once it has found at least `limit` matches.
+    ///
+    /// See [`crate::scalar::ScalarIndex::search_limited`] for the rules on when a limit
+    /// may be pushed down.
+    #[instrument(level = "debug", skip_all)]
+    pub async fn evaluate_limited(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        limit: Option<usize>,
+    ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_nullable(index_loader, metrics)
+            .evaluate_nullable(index_loader, metrics, limit)
             .await?
             .drop_nulls())
     }

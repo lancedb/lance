@@ -132,6 +132,24 @@ impl ScalarIndex for LogicalScalarIndex {
         combine_search_results(results)
     }
 
+    async fn search_limited(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+        limit: Option<usize>,
+    ) -> Result<SearchResult> {
+        // Forwarding the limit to every segment is safe. Each segment returns at least
+        // `limit` matches when it has them, so the combined result still has at least
+        // `limit` matches overall.
+        let results = try_join_all(
+            self.segments
+                .iter()
+                .map(|segment| segment.search_limited(query, metrics, limit)),
+        )
+        .await?;
+        combine_search_results(results)
+    }
+
     fn can_remap(&self) -> bool {
         false
     }

@@ -983,6 +983,27 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
 
+    /// Like [`Self::search`] but with a best-effort `limit` hint: when `limit` is `Some(n)`
+    /// an index may stop after finding `n` matches (it may still return more). Only push a
+    /// limit for a single positive lookup. The default ignores it and calls [`Self::search`].
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_index::{metrics::NoOpMetricsCollector, scalar::{AnyQuery, ScalarIndex}};
+    /// # async fn example(index: &dyn ScalarIndex, query: &dyn AnyQuery) -> Result<()> {
+    /// let _result = index.search_limited(query, &NoOpMetricsCollector, Some(10)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn search_limited(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+        _limit: Option<usize>,
+    ) -> Result<SearchResult> {
+        self.search(query, metrics).await
+    }
+
     /// Returns true if the remap operation is supported
     fn can_remap(&self) -> bool;
 

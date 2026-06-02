@@ -2821,6 +2821,16 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Decide whether a limit can be pushed into the index search. The fragments the
+        // read covers (used for the deletion check) are the requested subset, or the whole
+        // dataset when none was given.
+        let all_fragments = self.dataset.fragments();
+        let scanned_fragments: &[Fragment] = fragments
+            .as_ref()
+            .map(|frags| frags.as_slice())
+            .unwrap_or_else(|| all_fragments.as_slice());
+        let pushdown_limit = self.index_search_limit(filter_plan, scanned_fragments);
+
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
             .with_projection(projection);
@@ -2859,11 +2869,10 @@ impl Scanner {
 
         let result_format = self.index_expr_result_format();
         let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(
-                self.dataset.clone(),
-                index_query,
-                result_format,
-            )) as Arc<dyn ExecutionPlan>
+            Arc::new(
+                ScalarIndexExec::new(self.dataset.clone(), index_query, result_format)
+                    .with_limit(pushdown_limit),
+            ) as Arc<dyn ExecutionPlan>
         });
 
         Ok(Arc::new(FilteredReadExec::try_new(
@@ -4042,6 +4051,55 @@ impl Scanner {
         Ok((relevant_frags, missing_frags))
     }
 
+    /// Compute the limit hint that can be safely pushed into a scalar index search.
+    ///
+    /// Pushing a limit is only an optimization. A `GlobalLimitExec` still applies the
+    /// exact limit and offset, so the index only needs to return at least `limit + offset`
+    /// rows. The first N matches are as good as any N matches only when all of these hold.
+    ///
+    /// - There is a positive row limit.
+    /// - The rows are not reordered before the limit (no `ORDER BY`, vector or FTS search).
+    /// - There is no aggregate (the limit applies after aggregation).
+    /// - The index result is used as is, with no refine filter and no recheck. Either of
+    ///   those re-filters rows later and could drop matches.
+    /// - The relevant fragments have no deletions. Deleted rows are pruned after the index
+    ///   search, so stopping early could leave fewer than `limit` live rows.
+    ///
+    /// Returns `None` when no limit can be pushed.
+    fn index_search_limit(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        relevant_fragments: &[Fragment],
+    ) -> Option<usize> {
+        let limit = self.limit?;
+        if limit <= 0 {
+            return None;
+        }
+        if self.ordering.is_some()
+            || self.nearest.is_some()
+            || self.full_text_query.is_some()
+            || self.aggregate.is_some()
+            || filter_plan.has_refine()
+        {
+            return None;
+        }
+        if filter_plan
+            .index_query
+            .as_ref()
+            .is_some_and(|query| query.needs_recheck())
+        {
+            return None;
+        }
+        if relevant_fragments
+            .iter()
+            .any(|fragment| fragment.deletion_file.is_some())
+        {
+            return None;
+        }
+        let offset = self.offset.unwrap_or(0).max(0) as usize;
+        Some((limit as usize).saturating_add(offset))
+    }
+
     // First perform a lookup in a scalar index for ids and then perform a take on the
     // target fragments with those ids
     async fn scalar_indexed_scan(
@@ -4066,11 +4124,18 @@ impl Scanner {
             .partition_frags_by_coverage(index_expr, fragments)
             .await?;
 
-        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(MaterializeIndexExec::new(
-            self.dataset.clone(),
-            index_expr.clone(),
-            Arc::new(relevant_frags),
-        ));
+        // A limit can be pushed into the index search, but only when its rows are used as
+        // is and the relevant fragments have no deletions.
+        let pushdown_limit = self.index_search_limit(filter_plan, &relevant_frags);
+
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(
+            MaterializeIndexExec::new(
+                self.dataset.clone(),
+                index_expr.clone(),
+                Arc::new(relevant_frags),
+            )
+            .with_limit(pushdown_limit),
+        );
 
         let refine_expr = filter_plan.refine_expr.as_ref();
 
@@ -5766,6 +5831,75 @@ mod test {
             .as_primitive::<Int32Type>()
             .values();
         assert_eq!(ids, &(10..20).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_limit_pushed_into_scalar_index() {
+        // When a scan filter is fully served by a scalar index (no refine, no recheck, no
+        // ordering) the limit can be pushed into the index search. The result must still
+        // be exactly `limit` rows that all match the filter. Early stop must not drop or
+        // duplicate matches.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        // Span several btree pages so a small limit short-circuits before the end.
+        let num_rows = 20_000;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let limit = 100;
+        let scan_ids = |dataset: Arc<Dataset>| async move {
+            let batch = dataset
+                .scan()
+                .filter("id >= 5")
+                .unwrap()
+                .limit(Some(limit), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        };
+
+        let ids = scan_ids(Arc::new(dataset.clone())).await;
+        assert_eq!(ids.len(), limit as usize);
+        assert!(
+            ids.iter().all(|&id| id >= 5),
+            "every returned row must satisfy the filter"
+        );
+
+        // With deletions present the limit must not be pushed, since deleted rows are
+        // pruned after the index search. The scan must still return exactly `limit` live
+        // matches.
+        dataset.delete("id >= 5 AND id < 10000").await.unwrap();
+        let ids = scan_ids(Arc::new(dataset)).await;
+        assert_eq!(ids.len(), limit as usize);
+        assert!(
+            ids.iter().all(|&id| id >= 10000),
+            "deleted rows must not be returned"
+        );
     }
 
     #[test_log::test(tokio::test)]
