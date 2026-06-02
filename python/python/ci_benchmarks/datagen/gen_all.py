@@ -6,6 +6,7 @@ import logging
 from lance.log import LOGGER
 
 from ci_benchmarks.datagen.basic import gen_basic
+from ci_benchmarks.datagen.count_rows import gen_count_rows
 from ci_benchmarks.datagen.lineitems import gen_tcph
 from ci_benchmarks.datagen.wikipedia import gen_wikipedia
 
@@ -39,6 +40,9 @@ if __name__ == "__main__":
 
     LOGGER.info("Generating Wikipedia dataset...")
     gen_wikipedia()
+
+    LOGGER.info("Generating count_rows benchmark dataset...")
+    gen_count_rows()
 
     LOGGER.info("=" * 80)
     LOGGER.info("All datasets generated successfully!")
