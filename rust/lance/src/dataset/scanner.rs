@@ -852,11 +852,10 @@ pub struct Scanner {
     legacy_with_row_id: bool,
     /// Whether the user wants the row address on top of the projection, will always come last
     legacy_with_row_addr: bool,
-    /// Whether the user explicitly requested a projection.  If they did then we will warn them
-    /// if they do not specify _score / _distance unless legacy_projection_behavior is set to false
+    /// Whether the user explicitly requested a projection.  When true, scoring columns
+    /// (_distance, _score) are only included if explicitly listed in the projection.
+    /// When false (SELECT *), they are automatically appended.
     explicit_projection: bool,
-    /// Whether the user wants to use the legacy projection behavior.
-    autoproject_scoring_columns: bool,
 }
 
 /// Represents a user-requested take operation
@@ -1051,7 +1050,6 @@ impl Scanner {
             legacy_with_row_addr: false,
             legacy_with_row_id: false,
             explicit_projection: false,
-            autoproject_scoring_columns: true,
             relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
         };
         scanner.apply_blob_handling();
@@ -1772,23 +1770,16 @@ impl Scanner {
         self
     }
 
-    /// Instruct the scanner to disable automatic projection of scoring columns
+    /// No-op. Scoring autoprojection has been removed.
     ///
-    /// In the future, this will be the default behavior.  This method is useful for
-    /// opting in to the new behavior early to avoid breaking changes (and a warning
-    /// message)
-    ///
-    /// Once the default switches, the old autoprojection behavior will be removed.
-    ///
-    /// The autoprojection behavior (current default) includes the _score or _distance
-    /// column even if a projection is manually specified with `[project]` or
-    /// `[project_with_transform]`.
-    ///
-    /// The new behavior will only include the _score or _distance column if no projection
-    /// is specified or if the user explicitly includes the _score or _distance column
-    /// in the projection.
+    /// Previously, this method opted into the behavior where _score/_distance columns
+    /// are only included when no projection is specified or explicitly requested.
+    /// This is now always the case.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Scoring autoprojection has been removed. This method is a no-op."
+    )]
     pub fn disable_scoring_autoprojection(&mut self) -> &mut Self {
-        self.autoproject_scoring_columns = false;
         self
     }
 
@@ -1944,26 +1935,17 @@ impl Scanner {
         // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
 
-        // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
-        // projection behavior
-        if self.autoproject_scoring_columns {
+        // When no explicit projection is set (SELECT *), automatically append _distance/_score
+        // so callers always receive scoring columns from a search.  When the user has specified
+        // a projection they must explicitly list the columns they want.
+        if !self.explicit_projection {
             if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
-                if self.explicit_projection {
-                    log::warn!(
-                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
-                    );
-                }
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
             }
             if self.full_text_query.is_some()
                 && output_expr.iter().all(|(_, name)| name != SCORE_COL)
             {
-                if self.explicit_projection {
-                    log::warn!(
-                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
-                    );
-                }
                 let score_expr = expressions::col(SCORE_COL, current_schema)?;
                 output_expr.push((score_expr, SCORE_COL.to_string()));
             }
@@ -7579,7 +7561,8 @@ mod test {
         let mut scan = data.scan();
         scan.nearest("vec", &Float32Array::from(vec![1.0, 1.0, 1.0, 1.0]), 5)
             .unwrap();
-        scan.with_row_id().project(&["text"]).unwrap();
+        // Explicitly request _distance to verify column ordering
+        scan.with_row_id().project(&["text", "_distance"]).unwrap();
 
         let results = scan
             .try_into_stream()
@@ -7593,6 +7576,22 @@ mod test {
             results[0].schema().field_names(),
             vec!["text", "_distance", "_rowid"]
         );
+
+        // Without explicit _distance, it should not be included
+        let mut scan = data.scan();
+        scan.nearest("vec", &Float32Array::from(vec![1.0, 1.0, 1.0, 1.0]), 5)
+            .unwrap();
+        scan.with_row_id().project(&["text"]).unwrap();
+
+        let results = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].schema().field_names(), vec!["text", "_rowid"]);
     }
 
     #[rstest]
@@ -9598,7 +9597,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: ANN with postfilter");
-        let expected = "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
+        // _distance is not in the final projection because the user specified an explicit
+        // projection (["s", "vec"]) that does not include _distance.
+        let expected = "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _rowid@1 as _rowid]
   Take: columns=\"_distance, _rowid, i, (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@2 > 10
@@ -10052,7 +10053,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         // All rows are indexed
         dataset.make_fts_index().await?;
         log::info!("Test case: Full text search (match query)");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello"#;
@@ -10068,7 +10069,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search (phrase query)");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       PhraseQuery: column=s, query=hello world"#;
@@ -10085,7 +10086,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search (boost query)");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
@@ -10109,7 +10110,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         log::info!("Test case: Full text search with prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello
@@ -10120,7 +10121,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
               FilterExec: i@0 > 10
                 LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello
@@ -10141,7 +10142,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -10163,7 +10164,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows and fast_search");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello"#;
@@ -10183,7 +10184,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         log::info!("Test case: Full text search with unindexed rows and prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -10200,7 +10201,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+            r#"ProjectionExec: expr=[s@2 as s, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
