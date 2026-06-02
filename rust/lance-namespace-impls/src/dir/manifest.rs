@@ -68,6 +68,8 @@ use std::{
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use uuid::Uuid;
 
+use super::MetadataUpdate;
+
 const MANIFEST_TABLE_NAME: &str = "__manifest";
 const DELIMITER: &str = "$";
 /// Bounded concurrency for per-table `_versions/` probes when filtering declared tables.
@@ -520,6 +522,84 @@ impl ManifestStreamMutation for DeleteObjectMutation {
             CopyOnWriteMutation::updated(true)
         } else {
             CopyOnWriteMutation::unchanged(false)
+        }
+    }
+}
+
+struct UpdateMetadataMutation {
+    object_id: String,
+    object_type: ObjectType,
+    update: MetadataUpdate,
+    updated: Option<Option<HashMap<String, String>>>,
+    changed: bool,
+}
+
+impl ManifestStreamMutation for UpdateMetadataMutation {
+    type Output = Option<Option<HashMap<String, String>>>;
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id == self.object_id && row.object_type == self.object_type {
+            let mut metadata = ManifestNamespace::deserialize_metadata(
+                row.metadata.as_deref(),
+                row.object_type.as_str(),
+                &row.object_id,
+            )?;
+            let original_metadata = metadata.clone();
+            self.update.apply(&mut metadata);
+
+            let serialized = ManifestNamespace::serialize_metadata(
+                Some(&metadata),
+                row.object_type.as_str(),
+                &row.object_id,
+            )?;
+            output.append(
+                index_data,
+                ManifestOutputRow {
+                    object_id: &row.object_id,
+                    object_type: row.object_type,
+                    location: row.location.as_deref(),
+                    metadata: serialized.as_deref(),
+                },
+            )?;
+
+            self.changed = original_metadata != metadata;
+            self.updated = Some((!metadata.is_empty()).then_some(metadata));
+            return Ok(());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        _output: &mut ManifestBatchBuilder,
+        _index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        if let Some(updated) = self.updated.clone() {
+            if self.changed {
+                CopyOnWriteMutation::updated(Some(updated))
+            } else {
+                CopyOnWriteMutation::unchanged(Some(updated))
+            }
+        } else {
+            CopyOnWriteMutation::unchanged(None)
         }
     }
 }
@@ -2295,6 +2375,102 @@ impl ManifestNamespace {
         }
     }
 
+    fn deserialize_metadata(
+        metadata: Option<&str>,
+        object_type: &str,
+        object_id: &str,
+    ) -> Result<HashMap<String, String>> {
+        let Some(metadata) = metadata else {
+            return Ok(HashMap::new());
+        };
+
+        serde_json::from_str::<HashMap<String, String>>(metadata).map_err(|e| {
+            LanceError::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to deserialize {} metadata for '{}': {}",
+                    object_type, object_id, e
+                ),
+            })
+        })
+    }
+
+    async fn update_manifest_metadata(
+        &self,
+        object_id: &str,
+        object_type: ObjectType,
+        update: &MetadataUpdate,
+    ) -> Result<Option<Option<HashMap<String, String>>>> {
+        if let Some(shard_count) = self.shard_count() {
+            let shard_index = Self::shard_index_for_key(shard_count, object_id);
+            return self
+                .rewrite_manifest_shard(
+                    shard_index,
+                    "Failed to update manifest metadata shard",
+                    || UpdateMetadataMutation {
+                        object_id: object_id.to_string(),
+                        object_type,
+                        update: update.clone(),
+                        updated: None,
+                        changed: false,
+                    },
+                )
+                .await;
+        }
+
+        self.rewrite_manifest("Failed to update manifest metadata", || {
+            UpdateMetadataMutation {
+                object_id: object_id.to_string(),
+                object_type,
+                update: update.clone(),
+                updated: None,
+                changed: false,
+            }
+        })
+        .await
+    }
+
+    pub async fn update_table_metadata(
+        &self,
+        table_id: &[String],
+        update: &MetadataUpdate,
+    ) -> Result<Option<HashMap<String, String>>> {
+        if table_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        let object_id = Self::str_object_id(table_id);
+        self.update_manifest_metadata(&object_id, ObjectType::Table, update)
+            .await?
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::TableNotFound {
+                    message: Self::format_table_id(table_id),
+                })
+            })
+    }
+
+    pub async fn update_namespace_metadata(
+        &self,
+        namespace_id: &[String],
+        update: &MetadataUpdate,
+    ) -> Result<Option<HashMap<String, String>>> {
+        if namespace_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Root namespace metadata cannot be updated".to_string(),
+            }
+            .into());
+        }
+
+        let object_id = namespace_id.join(DELIMITER);
+        self.update_manifest_metadata(&object_id, ObjectType::Namespace, update)
+            .await?
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::NamespaceNotFound { message: object_id })
+            })
+    }
+
     pub(crate) async fn path_has_actual_manifests(
         object_store: &ObjectStore,
         table_path: &Path,
@@ -3286,6 +3462,24 @@ impl ShardedManifestNamespace {
     ) -> Result<()> {
         self.manifest
             .insert_into_manifest_with_metadata(entries)
+            .await
+    }
+
+    pub async fn update_table_metadata(
+        &self,
+        table_id: &[String],
+        update: &MetadataUpdate,
+    ) -> Result<Option<HashMap<String, String>>> {
+        self.manifest.update_table_metadata(table_id, update).await
+    }
+
+    pub async fn update_namespace_metadata(
+        &self,
+        namespace_id: &[String],
+        update: &MetadataUpdate,
+    ) -> Result<Option<HashMap<String, String>>> {
+        self.manifest
+            .update_namespace_metadata(namespace_id, update)
             .await
     }
 

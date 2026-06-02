@@ -104,6 +104,78 @@ impl OpsMetrics {
     }
 }
 
+/// Metadata key used for the long description displayed separately by clients.
+pub const DESCRIPTION_METADATA_KEY: &str = "description";
+
+/// Set/unset update for manifest-backed table and namespace metadata.
+///
+/// The manifest stores metadata as JSON. This update interprets the JSON object
+/// as a string-to-string tag map.
+#[derive(Debug, Clone, Default)]
+pub struct MetadataUpdate {
+    /// Metadata keys to insert or replace.
+    pub set: HashMap<String, String>,
+    /// Metadata keys to remove.
+    pub unset: Vec<String>,
+}
+
+impl MetadataUpdate {
+    fn validate(&self, target: &str) -> Result<()> {
+        if self.set.is_empty() && self.unset.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: format!("{} metadata update cannot be empty", target),
+            }
+            .into());
+        }
+
+        for key in &self.unset {
+            if self.set.contains_key(key) {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "{} metadata key '{}' cannot be both set and unset",
+                        target, key
+                    ),
+                }
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn apply(&self, metadata: &mut HashMap<String, String>) {
+        for key in &self.unset {
+            metadata.remove(key);
+        }
+        metadata.extend(self.set.clone());
+    }
+}
+
+/// Native directory namespace request for updating a table manifest metadata row.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateTableMetadataRequest {
+    /// Table identifier, with the table name as the final path component.
+    pub id: Vec<String>,
+    /// Metadata changes to apply to the table row.
+    pub update: MetadataUpdate,
+}
+
+/// Native directory namespace request for updating a namespace manifest metadata row.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateNamespaceMetadataRequest {
+    /// Namespace identifier. Root namespace metadata updates are not supported.
+    pub id: Vec<String>,
+    /// Metadata changes to apply to the namespace row.
+    pub update: MetadataUpdate,
+}
+
+/// Response returned after updating manifest-backed table or namespace metadata.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateMetadataResponse {
+    /// Updated metadata properties, or `None` when all metadata keys were removed.
+    pub properties: Option<HashMap<String, String>>,
+}
+
 /// Result of checking table status atomically.
 ///
 /// This struct captures the state of a table directory in a single snapshot,
@@ -883,6 +955,28 @@ impl ManifestCatalog {
         match self {
             Self::Single(ns) => ns.insert_into_manifest_with_metadata(entries).await,
             Self::Sharded(ns) => ns.insert_into_manifest_with_metadata(entries).await,
+        }
+    }
+
+    async fn update_table_metadata(
+        &self,
+        table_id: &[String],
+        update: &MetadataUpdate,
+    ) -> Result<Option<HashMap<String, String>>> {
+        match self {
+            Self::Single(ns) => ns.update_table_metadata(table_id, update).await,
+            Self::Sharded(ns) => ns.update_table_metadata(table_id, update).await,
+        }
+    }
+
+    async fn update_namespace_metadata(
+        &self,
+        namespace_id: &[String],
+        update: &MetadataUpdate,
+    ) -> Result<Option<HashMap<String, String>>> {
+        match self {
+            Self::Single(ns) => ns.update_namespace_metadata(namespace_id, update).await,
+            Self::Sharded(ns) => ns.update_namespace_metadata(namespace_id, update).await,
         }
     }
 
@@ -2551,6 +2645,65 @@ impl DirectoryNamespace {
         if let Some(ref metrics) = self.ops_metrics {
             metrics.reset();
         }
+    }
+
+    /// Update metadata properties for a manifest-backed table row.
+    ///
+    /// The manifest metadata column remains JSON, and this API applies set/unset
+    /// changes to that JSON object as a string-to-string tag map.
+    pub async fn update_table_metadata(
+        &self,
+        request: UpdateTableMetadataRequest,
+    ) -> Result<UpdateMetadataResponse> {
+        self.record_op("update_table_metadata");
+        if request.id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+        request.update.validate("table")?;
+
+        let Some(ref manifest_ns) = self.manifest_ns else {
+            return Err(NamespaceError::Unsupported {
+                message: "Table metadata updates require manifest mode".to_string(),
+            }
+            .into());
+        };
+
+        let properties = manifest_ns
+            .update_table_metadata(&request.id, &request.update)
+            .await?;
+        Ok(UpdateMetadataResponse { properties })
+    }
+
+    /// Update metadata properties for a manifest-backed namespace row.
+    ///
+    /// The root namespace has no manifest row and cannot be updated through this API.
+    pub async fn update_namespace_metadata(
+        &self,
+        request: UpdateNamespaceMetadataRequest,
+    ) -> Result<UpdateMetadataResponse> {
+        self.record_op("update_namespace_metadata");
+        if request.id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Root namespace metadata cannot be updated".to_string(),
+            }
+            .into());
+        }
+        request.update.validate("namespace")?;
+
+        let Some(ref manifest_ns) = self.manifest_ns else {
+            return Err(NamespaceError::Unsupported {
+                message: "Namespace metadata updates require manifest mode".to_string(),
+            }
+            .into());
+        };
+
+        let properties = manifest_ns
+            .update_namespace_metadata(&request.id, &request.update)
+            .await?;
+        Ok(UpdateMetadataResponse { properties })
     }
 
     /// Increment the counter for an operation.
@@ -4679,6 +4832,326 @@ mod tests {
                 "sharded manifest mode should not create separate manifest tables"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_table_metadata_set_and_unset() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            DESCRIPTION_METADATA_KEY.to_string(),
+            "Original table description".to_string(),
+        );
+        properties.insert("owner".to_string(), "alice".to_string());
+        properties.insert("remove_me".to_string(), "old".to_string());
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["metadata_table".to_string()]);
+        create_request.properties = Some(properties);
+        namespace
+            .create_table(create_request, Bytes::from(create_scalar_table_ipc_data()))
+            .await
+            .unwrap();
+
+        let mut set = HashMap::new();
+        set.insert(
+            DESCRIPTION_METADATA_KEY.to_string(),
+            "Updated table description".to_string(),
+        );
+        set.insert("owner".to_string(), "bob".to_string());
+        set.insert("priority".to_string(), "high".to_string());
+
+        let response = namespace
+            .update_table_metadata(UpdateTableMetadataRequest {
+                id: vec!["metadata_table".to_string()],
+                update: MetadataUpdate {
+                    set,
+                    unset: vec!["remove_me".to_string()],
+                },
+            })
+            .await
+            .unwrap();
+        let response_properties = response.properties.unwrap();
+        assert_eq!(
+            response_properties.get(DESCRIPTION_METADATA_KEY),
+            Some(&"Updated table description".to_string())
+        );
+        assert_eq!(response_properties.get("owner"), Some(&"bob".to_string()));
+        assert_eq!(
+            response_properties.get("priority"),
+            Some(&"high".to_string())
+        );
+        assert!(!response_properties.contains_key("remove_me"));
+
+        let describe = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(vec!["metadata_table".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(describe.properties, Some(response_properties));
+
+        let response = namespace
+            .update_table_metadata(UpdateTableMetadataRequest {
+                id: vec!["metadata_table".to_string()],
+                update: MetadataUpdate {
+                    set: HashMap::new(),
+                    unset: vec![
+                        DESCRIPTION_METADATA_KEY.to_string(),
+                        "owner".to_string(),
+                        "priority".to_string(),
+                    ],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.properties, None);
+
+        let describe = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(vec!["metadata_table".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(describe.properties, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_namespace_metadata_set_and_unset() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            DESCRIPTION_METADATA_KEY.to_string(),
+            "Original namespace description".to_string(),
+        );
+        properties.insert("team".to_string(), "search".to_string());
+        properties.insert("remove_me".to_string(), "old".to_string());
+        let mut create_request = CreateNamespaceRequest::new();
+        create_request.id = Some(vec!["workspace".to_string()]);
+        create_request.properties = Some(properties);
+        namespace.create_namespace(create_request).await.unwrap();
+
+        let mut set = HashMap::new();
+        set.insert(
+            DESCRIPTION_METADATA_KEY.to_string(),
+            "Updated namespace description".to_string(),
+        );
+        set.insert("team".to_string(), "platform".to_string());
+        set.insert("env".to_string(), "prod".to_string());
+
+        let response = namespace
+            .update_namespace_metadata(UpdateNamespaceMetadataRequest {
+                id: vec!["workspace".to_string()],
+                update: MetadataUpdate {
+                    set,
+                    unset: vec!["remove_me".to_string()],
+                },
+            })
+            .await
+            .unwrap();
+        let response_properties = response.properties.unwrap();
+        assert_eq!(
+            response_properties.get(DESCRIPTION_METADATA_KEY),
+            Some(&"Updated namespace description".to_string())
+        );
+        assert_eq!(
+            response_properties.get("team"),
+            Some(&"platform".to_string())
+        );
+        assert_eq!(response_properties.get("env"), Some(&"prod".to_string()));
+        assert!(!response_properties.contains_key("remove_me"));
+
+        let describe = namespace
+            .describe_namespace(DescribeNamespaceRequest {
+                id: Some(vec!["workspace".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(describe.properties, Some(response_properties));
+    }
+
+    #[tokio::test]
+    async fn test_update_metadata_missing_and_invalid_requests() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut set = HashMap::new();
+        set.insert("owner".to_string(), "alice".to_string());
+        let err = namespace
+            .update_table_metadata(UpdateTableMetadataRequest {
+                id: vec!["missing".to_string()],
+                update: MetadataUpdate {
+                    set: set.clone(),
+                    unset: vec![],
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Table not found"));
+
+        let err = namespace
+            .update_namespace_metadata(UpdateNamespaceMetadataRequest {
+                id: vec!["missing".to_string()],
+                update: MetadataUpdate {
+                    set: set.clone(),
+                    unset: vec![],
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Namespace not found"));
+
+        let err = namespace
+            .update_table_metadata(UpdateTableMetadataRequest {
+                id: vec!["missing".to_string()],
+                update: MetadataUpdate::default(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("metadata update cannot be empty"));
+
+        let err = namespace
+            .update_table_metadata(UpdateTableMetadataRequest {
+                id: vec!["missing".to_string()],
+                update: MetadataUpdate {
+                    set,
+                    unset: vec!["owner".to_string()],
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be both set and unset"));
+
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        assert!(
+            namespace
+                .list_tables(list_request)
+                .await
+                .unwrap()
+                .tables
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_namespace_metadata_rejects_root_and_directory_only() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .build()
+            .await
+            .unwrap();
+
+        let mut set = HashMap::new();
+        set.insert("owner".to_string(), "alice".to_string());
+        let err = namespace
+            .update_namespace_metadata(UpdateNamespaceMetadataRequest {
+                id: vec![],
+                update: MetadataUpdate {
+                    set: set.clone(),
+                    unset: vec![],
+                },
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Root namespace metadata cannot be updated")
+        );
+
+        let dir_only = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let err = dir_only
+            .update_table_metadata(UpdateTableMetadataRequest {
+                id: vec!["table".to_string()],
+                update: MetadataUpdate { set, unset: vec![] },
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("require manifest mode"));
+    }
+
+    #[tokio::test]
+    async fn test_sharded_update_table_metadata_replaces_one_fragment() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = create_sharded_namespace(temp_path).await;
+
+        create_scalar_table(&namespace, "alpha").await;
+        create_scalar_table(&namespace, "beta").await;
+
+        let before = load_sharded_manifest(temp_path).await;
+        assert_eq!(before.count_fragments(), 4);
+        let before_files = fragment_data_files(&before);
+
+        let mut set = HashMap::new();
+        set.insert(
+            DESCRIPTION_METADATA_KEY.to_string(),
+            "Sharded table description".to_string(),
+        );
+        set.insert("owner".to_string(), "alice".to_string());
+        namespace
+            .update_table_metadata(UpdateTableMetadataRequest {
+                id: vec!["alpha".to_string()],
+                update: MetadataUpdate { set, unset: vec![] },
+            })
+            .await
+            .unwrap();
+
+        let after = load_sharded_manifest(temp_path).await;
+        assert_eq!(after.count_fragments(), 4);
+        let after_files = fragment_data_files(&after);
+        let changed_fragments = before_files
+            .iter()
+            .filter(|(fragment_id, before_files)| {
+                after_files
+                    .get(fragment_id)
+                    .is_some_and(|after_files| after_files != *before_files)
+            })
+            .count();
+        assert_eq!(
+            changed_fragments, 1,
+            "metadata update should replace one manifest shard fragment"
+        );
+
+        let describe = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(vec!["alpha".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let properties = describe.properties.unwrap();
+        assert_eq!(
+            properties.get(DESCRIPTION_METADATA_KEY),
+            Some(&"Sharded table description".to_string())
+        );
+        assert_eq!(properties.get("owner"), Some(&"alice".to_string()));
     }
 
     #[tokio::test]
