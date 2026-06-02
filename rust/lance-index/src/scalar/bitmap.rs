@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::Debug,
     ops::Bound,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use arrow::array::BinaryBuilder;
@@ -49,8 +49,8 @@ use crate::{
         CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            ScalarIndexCacheKey, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME,
+            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
         },
     },
 };
@@ -116,7 +116,7 @@ pub struct BitmapIndex {
     /// Maps each unique value to its bitmap location in the index file
     /// The usize value is the row offset in the bitmap_page_lookup.lance file
     /// for quickly locating the row and reading it out
-    index_map: BTreeMap<OrderableScalarValue, usize>,
+    index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
 
     null_map: Arc<RowAddrTreeMap>,
 
@@ -158,7 +158,7 @@ impl CacheKey for BitmapKey {
 /// cache handle, a lazy reader, a fragment-reuse index). `BitmapIndexState`
 /// captures just the data needed to rebuild it: the value→file-offset map,
 /// the null bitmap, and the value type.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BitmapIndexState {
     /// Value-to-row-offset lookup, encoded as an Arrow `RecordBatch` so we can
     /// reuse the existing IPC utilities for zero-copy round trips.
@@ -173,34 +173,76 @@ pub struct BitmapIndexState {
     /// Cached separately from the schema for the empty-index case where the
     /// `lookup_batch` is empty but we still need to remember the column type.
     value_type: DataType,
+    /// Parsed form of `lookup_batch`. Not serialized — populated eagerly by
+    /// [`BitmapIndexState::from_index`] and lazily on first
+    /// [`BitmapIndexState::into_bitmap_index`] call after disk deserialization.
+    /// Stored as `Arc` so that cloning into a new [`BitmapIndex`] is O(1).
+    index_map: OnceLock<Arc<BTreeMap<OrderableScalarValue, usize>>>,
+}
+
+impl Clone for BitmapIndexState {
+    fn clone(&self) -> Self {
+        Self {
+            lookup_batch: self.lookup_batch.clone(),
+            null_map: self.null_map.clone(),
+            value_type: self.value_type.clone(),
+            index_map: self
+                .index_map
+                .get()
+                .map(|m| {
+                    let lock = OnceLock::new();
+                    // safe: fresh lock
+                    lock.set(m.clone()).ok();
+                    lock
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 impl DeepSizeOf for BitmapIndexState {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.lookup_batch.get_array_memory_size() + self.null_map.deep_size_of_children(context)
+        self.lookup_batch.get_array_memory_size()
+            + self.null_map.deep_size_of_children(context)
+            + self
+                .index_map
+                .get()
+                .map(|m| m.deep_size_of_children(context))
+                .unwrap_or(0)
     }
 }
 
 impl BitmapIndexState {
     pub(crate) fn from_index(index: &BitmapIndex) -> Result<Self> {
+        let lock = OnceLock::new();
+        // safe: fresh lock
+        lock.set(index.index_map.clone()).ok();
         Ok(Self {
             lookup_batch: build_lookup_batch(&index.index_map, &index.value_type)?,
             null_map: index.null_map.clone(),
             value_type: index.value_type.clone(),
+            index_map: lock,
         })
     }
 
     pub(crate) fn into_bitmap_index(
-        self,
+        &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Arc<BitmapIndex>> {
-        let index_map = parse_lookup_batch(&self.lookup_batch)?;
+        let index_map = if let Some(map) = self.index_map.get() {
+            map.clone()
+        } else {
+            // Disk-backed cache hit: parse once and cache for subsequent calls.
+            let map = Arc::new(parse_lookup_batch(&self.lookup_batch)?);
+            // Another thread may have won the race; either result is equivalent.
+            self.index_map.get_or_init(|| map.clone()).clone()
+        };
         Ok(Arc::new(BitmapIndex::new(
             index_map,
-            self.null_map,
-            self.value_type,
+            self.null_map.clone(),
+            self.value_type.clone(),
             store,
             WeakLanceCache::from(index_cache),
             frag_reuse_index,
@@ -269,6 +311,7 @@ impl CacheCodecImpl for BitmapIndexState {
             lookup_batch,
             null_map,
             value_type,
+            index_map: OnceLock::new(),
         })
     }
 }
@@ -295,7 +338,7 @@ impl CacheKey for BitmapIndexStateKey {
 
 impl BitmapIndex {
     fn new(
-        index_map: BTreeMap<OrderableScalarValue, usize>,
+        index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
         null_map: Arc<RowAddrTreeMap>,
         value_type: DataType,
         store: Arc<dyn IndexStore>,
@@ -326,7 +369,7 @@ impl BitmapIndex {
             let schema = page_lookup_file.schema();
             let data_type = schema.fields[0].data_type();
             return Ok(Arc::new(Self::new(
-                BTreeMap::new(),
+                Arc::new(BTreeMap::new()),
                 Arc::new(RowAddrTreeMap::default()),
                 data_type,
                 store,
@@ -381,7 +424,7 @@ impl BitmapIndex {
         }
 
         Ok(Arc::new(Self::new(
-            index_map,
+            Arc::new(index_map),
             null_map,
             value_type,
             store,
@@ -466,12 +509,7 @@ impl BitmapIndex {
 
 impl DeepSizeOf for BitmapIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        let mut total_size = 0;
-
-        total_size += self.index_map.deep_size_of_children(context);
-        total_size += self.store.deep_size_of_children(context);
-
-        total_size
+        self.index_map.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
 
@@ -1694,20 +1732,10 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        // Fast path: pre-built index is already in memory (O(1))
-        if let Some(index) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await {
-            return Ok(Some(index));
-        }
-        // Fallback: reconstruct from serialized state (disk-backed cache hit)
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
             return Ok(None);
         };
-        let state = (*state).clone();
         let index = state.into_bitmap_index(index_store, cache, frag_reuse_index)?;
-        // Populate the fast path so the next hit is O(1)
-        cache
-            .insert_unsized_with_key(&ScalarIndexCacheKey, index.clone())
-            .await;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -1718,11 +1746,6 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             .ok_or_else(|| {
                 Error::internal("BitmapIndexPlugin::put_in_cache called with a non-bitmap index")
             })?;
-        // Fast in-memory path (O(1) hit on next get_from_cache)
-        cache
-            .insert_unsized_with_key(&ScalarIndexCacheKey, index.clone())
-            .await;
-        // Serializable path for disk-backed cache backends
         let state = BitmapIndexState::from_index(bitmap)?;
         cache
             .insert_with_key(&BitmapIndexStateKey, Arc::new(state))
@@ -1800,6 +1823,7 @@ mod tests {
             lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
             null_map: Arc::new(null_map),
             value_type: DataType::Int32,
+            index_map: OnceLock::new(),
         };
         assert_state_roundtrips(&state);
 
@@ -1808,6 +1832,7 @@ mod tests {
             lookup_batch: build_lookup_batch(&BTreeMap::new(), &DataType::Utf8).unwrap(),
             null_map: Arc::new(RowAddrTreeMap::new()),
             value_type: DataType::Utf8,
+            index_map: OnceLock::new(),
         };
         assert_state_roundtrips(&empty_state);
     }
@@ -1948,14 +1973,13 @@ mod tests {
     }
 
     // Regression test for the O(N log N) warm-cache rebuild introduced in
-    // commit 4de5ce67d.  put_in_cache must write an unsized (fast) entry so
-    // that get_from_cache returns it in O(1) without reconstructing the
-    // BTreeMap.  IS NULL is the worst case: the actual bitmap lookup is O(1)
-    // but the reconstruction touches every row in the lookup batch.
+    // commit 4de5ce67d.  BitmapIndexState now caches the parsed Arc<BTreeMap>
+    // so that get_from_cache skips parse_lookup_batch on warm hits.
+    // IS NULL is the worst case: the actual bitmap lookup is O(1) but
+    // reconstruction of the BTreeMap touched every row in the lookup batch.
     #[tokio::test]
     async fn test_bitmap_cache_fast_path() {
         use arrow_array::Int32Array;
-        use crate::scalar::registry::ScalarIndexCacheKey;
 
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
@@ -2000,13 +2024,8 @@ mod tests {
         let index_arc: Arc<dyn ScalarIndex> = index.clone() as Arc<dyn ScalarIndex>;
         plugin.put_in_cache(&cache, index_arc).await.unwrap();
 
-        // The fast (unsized) entry must be present immediately after put_in_cache.
-        assert!(
-            cache.get_unsized_with_key(&ScalarIndexCacheKey).await.is_some(),
-            "put_in_cache must populate the in-memory (unsized) cache entry"
-        );
-
-        // get_from_cache must return the pre-built index via the fast path.
+        // get_from_cache must return Some, and the BitmapIndexState's OnceLock
+        // must have been populated by put_in_cache so no parse_lookup_batch occurs.
         let cached = plugin
             .get_from_cache(store.clone(), None, &cache)
             .await
