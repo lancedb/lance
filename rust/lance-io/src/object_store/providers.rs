@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, RwLock, Weak,
+        Arc, Mutex, RwLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -82,6 +82,12 @@ pub struct ObjectStoreRegistryStats {
     pub active_stores: usize,
 }
 
+/// A cached object store's prefix plus the params it was built with.
+type StoreCacheKey = (String, ObjectStoreParams);
+
+/// Per-key lock that serializes concurrent cold builds of the same store.
+type BuildLock = Arc<tokio::sync::Mutex<()>>;
+
 /// A registry of object store providers.
 ///
 /// Use [`Self::default()`] to create one with the available default providers.
@@ -108,7 +114,12 @@ pub struct ObjectStoreRegistry {
     // Cache of object stores currently in use. We use a weak reference so the
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
-    active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    active_stores: RwLock<HashMap<StoreCacheKey, Weak<ObjectStore>>>,
+    // Per-key locks that serialize cold builds for the same key. The
+    // `active_stores` weak reference is only inserted after `new_store` returns,
+    // so without this, tasks racing in before the first build finishes each
+    // rebuild the same store. See issue #6838.
+    building: Mutex<HashMap<StoreCacheKey, BuildLock>>,
     // Cache statistics
     hits: AtomicU64,
     misses: AtomicU64,
@@ -123,6 +134,7 @@ impl ObjectStoreRegistry {
         Self {
             providers: RwLock::new(HashMap::new()),
             active_stores: RwLock::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -195,11 +207,59 @@ impl ObjectStoreRegistry {
         Error::invalid_input(message)
     }
 
+    /// Return a live cached store for `cache_key`, if one exists.
+    ///
+    /// A stale weak reference (the store was dropped since it was cached) is
+    /// removed. Does not touch the hit/miss counters, so callers decide how to
+    /// count the lookup.
+    fn cached_store(&self, cache_key: &StoreCacheKey) -> Result<Option<Arc<ObjectStore>>> {
+        let maybe_weak = self
+            .active_stores
+            .read()
+            .ok()
+            .expect_ok()?
+            .get(cache_key)
+            .cloned();
+        let Some(weak) = maybe_weak else {
+            return Ok(None);
+        };
+        if let Some(store) = weak.upgrade() {
+            return Ok(Some(store));
+        }
+        // The store was dropped since we cached it. Remove the stale weak
+        // reference so the slot can be rebuilt.
+        let mut cache_lock = self.active_stores.write().ok().expect_ok()?;
+        if let Some(weak) = cache_lock.get(cache_key)
+            && weak.upgrade().is_none()
+        {
+            cache_lock.remove(cache_key);
+        }
+        Ok(None)
+    }
+
+    /// Drop our in-flight build marker, but only if it is still the one we
+    /// registered. A later cold request may have installed a fresh lock, and we
+    /// must not evict theirs.
+    fn clear_build_lock(&self, cache_key: &StoreCacheKey, build_lock: &BuildLock) {
+        let mut building = self
+            .building
+            .lock()
+            .expect("ObjectStoreRegistry lock poisoned");
+        if let Some(existing) = building.get(cache_key)
+            && Arc::ptr_eq(existing, build_lock)
+        {
+            building.remove(cache_key);
+        }
+    }
+
     /// Get an object store for a given base path and parameters.
     ///
     /// If the object store is already in use, it will return a strong reference
     /// to the object store. If the object store is not in use, it will create a
     /// new object store and return a strong reference to it.
+    ///
+    /// Concurrent cold calls for the same key are serialized so the store is
+    /// built once and the rest reuse the cached result.
     pub async fn get_store(
         &self,
         base_path: Url,
@@ -214,57 +274,62 @@ impl ObjectStoreRegistry {
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_key = (cache_path.clone(), params.clone());
 
-        // Check if we have a cached store for this base path and params
-        {
-            let maybe_store = self
-                .active_stores
-                .read()
-                .ok()
-                .expect_ok()?
-                .get(&cache_key)
-                .cloned();
-            if let Some(store) = maybe_store {
-                if let Some(store) = store.upgrade() {
-                    self.hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(store);
-                } else {
-                    // Remove the weak reference if it is no longer valid
-                    let mut cache_lock = self
-                        .active_stores
-                        .write()
-                        .expect("ObjectStoreRegistry lock poisoned");
-                    if let Some(store) = cache_lock.get(&cache_key)
-                        && store.upgrade().is_none()
-                    {
-                        // Remove the weak reference if it is no longer valid
-                        cache_lock.remove(&cache_key);
-                    }
-                }
-            }
+        // Fast path: return the cached store without taking the build lock.
+        if let Some(store) = self.cached_store(&cache_key)? {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(store);
+        }
+
+        // Slow path: serialize cold builds for the same key behind one in-flight
+        // `new_store()` so racing tasks reuse it instead of each rebuilding it.
+        let build_lock = {
+            let mut building = self
+                .building
+                .lock()
+                .expect("ObjectStoreRegistry lock poisoned");
+            building
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _build_guard = build_lock.lock().await;
+
+        // Another task may have built the store while we waited for the lock.
+        if let Some(store) = self.cached_store(&cache_key)? {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.clear_build_lock(&cache_key, &build_lock);
+            return Ok(store);
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let mut store = provider.new_store(base_path, params).await?;
+        let build_result = async {
+            let mut store = provider.new_store(base_path, params).await?;
 
-        store.inner = store.inner.traced();
+            store.inner = store.inner.traced();
 
-        if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(&cache_path, store.inner);
-        }
+            if let Some(wrapper) = &params.object_store_wrapper {
+                store.inner = wrapper.wrap(&cache_path, store.inner);
+            }
 
-        // Always wrap with IO tracking
-        store.inner = store.io_tracker.wrap("", store.inner);
+            // Always wrap with IO tracking
+            store.inner = store.io_tracker.wrap("", store.inner);
 
-        let store = Arc::new(store);
+            let store = Arc::new(store);
 
-        {
             // Insert the store into the cache
             let mut cache_lock = self.active_stores.write().ok().expect_ok()?;
-            cache_lock.insert(cache_key, Arc::downgrade(&store));
-        }
+            cache_lock.insert(cache_key.clone(), Arc::downgrade(&store));
 
-        Ok(store)
+            Ok(store)
+        }
+        .await;
+
+        // Clear the in-flight marker on success or failure, so a failed build
+        // leaves no stale lock entry behind.
+        self.clear_build_lock(&cache_key, &build_lock);
+
+        build_result
     }
 
     /// Calculate the datastore prefix based on the URI and the storage options.
@@ -333,6 +398,7 @@ impl Default for ObjectStoreRegistry {
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -462,5 +528,107 @@ mod tests {
 
         // Same params returns same instance
         assert!(Arc::ptr_eq(&stores[0], &stores[1]));
+    }
+
+    /// Counts how many times it builds a store, and blocks inside the build
+    /// until released, so a test can hold the build window open while concurrent
+    /// callers race in.
+    #[derive(Debug)]
+    struct CountingProvider {
+        builds: Arc<AtomicU64>,
+        // Notified each time a build enters `new_store`.
+        entered: Arc<tokio::sync::Notify>,
+        // A build proceeds only once it acquires a permit. The test withholds
+        // permits to hold the build window open, then grants enough that every
+        // in-flight build can finish, so a regression with many concurrent
+        // builds fails on the `builds` assertion instead of deadlocking.
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for CountingProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            let _permit = self.release.acquire().await.expect("semaphore closed");
+            memory::MemoryStoreProvider
+                .new_store(base_path, params)
+                .await
+        }
+    }
+
+    // Concurrent cold opens for the same key must build the store once and share
+    // it. Regression test for issue #6838.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_cold_builds_share_one_store() {
+        let builds = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        // Start with no permits so the first build blocks inside `new_store`.
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let registry = Arc::new(ObjectStoreRegistry::empty());
+        registry.insert(
+            "memory",
+            Arc::new(CountingProvider {
+                builds: builds.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+
+        let url = Url::parse("memory://race").unwrap();
+        let params = ObjectStoreParams::default();
+
+        const N: usize = 16;
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let registry = registry.clone();
+                let url = url.clone();
+                let params = params.clone();
+                tokio::spawn(async move { registry.get_store(url, &params).await.unwrap() })
+            })
+            .collect();
+
+        // Wait until one task is inside the build, then let the rest pile up
+        // behind the build lock before allowing the build to finish.
+        entered.notified().await;
+        for _ in 0..N {
+            tokio::task::yield_now().await;
+        }
+        // Grant enough permits for every task. If serialization were broken and
+        // all N entered the build, they could all finish and trip the `builds`
+        // assertion instead of deadlocking.
+        release.add_permits(N);
+
+        let mut stores = Vec::with_capacity(N);
+        for handle in handles {
+            stores.push(handle.await.unwrap());
+        }
+
+        // The expensive build ran exactly once despite N concurrent cold opens.
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        // Every caller observes the same cached instance.
+        for store in &stores[1..] {
+            assert!(Arc::ptr_eq(&stores[0], store));
+        }
+
+        // One miss for the single build. The rest are served as hits.
+        let stats = registry.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, (N - 1) as u64);
+
+        // The in-flight build marker is cleaned up after the build completes.
+        assert!(
+            registry
+                .building
+                .lock()
+                .expect("ObjectStoreRegistry lock poisoned")
+                .is_empty()
+        );
     }
 }
