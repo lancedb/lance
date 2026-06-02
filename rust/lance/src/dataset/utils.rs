@@ -12,7 +12,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
-    is_arrow_json_field, is_json_field,
+    has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
 use lance_core::ROW_ID;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
@@ -208,12 +208,12 @@ impl SchemaAdapter {
         self.logical_schema
             .fields()
             .iter()
-            .any(|field| is_arrow_json_field(field) || physical_field(field).is_some())
+            .any(|field| has_arrow_json_fields(field) || physical_field(field).is_some())
     }
 
     /// Determine if the physical schema includes Lance JSON fields that must be converted back.
     pub fn requires_logical_conversion(schema: &ArrowSchemaRef) -> bool {
-        schema.fields().iter().any(|field| is_json_field(field))
+        schema.fields().iter().any(|field| has_json_fields(field))
     }
 
     pub fn to_physical_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
@@ -237,7 +237,7 @@ impl SchemaAdapter {
         let arrow_schema = stream.schema();
         let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
         for field in arrow_schema.fields() {
-            if is_arrow_json_field(field) {
+            if has_arrow_json_fields(field) {
                 new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
             } else if let Some(phys) = physical_field(field) {
                 new_fields.push(Arc::new(phys));
@@ -271,9 +271,6 @@ impl SchemaAdapter {
         &self,
         stream: SendableRecordBatchStream,
     ) -> SendableRecordBatchStream {
-        use lance_arrow::ARROW_EXT_NAME_KEY;
-        use lance_arrow::json::ARROW_JSON_EXT_NAME;
-
         if !Self::requires_logical_conversion(&stream.schema()) {
             return stream;
         }
@@ -281,19 +278,8 @@ impl SchemaAdapter {
         let arrow_schema = stream.schema();
         let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
         for field in arrow_schema.fields() {
-            if is_json_field(field) {
-                let mut new_field = arrow_schema::Field::new(
-                    field.name(),
-                    arrow_schema::DataType::Utf8,
-                    field.is_nullable(),
-                );
-                let mut metadata = field.metadata().clone();
-                metadata.insert(
-                    ARROW_EXT_NAME_KEY.to_string(),
-                    ARROW_JSON_EXT_NAME.to_string(),
-                );
-                new_field.set_metadata(metadata);
-                new_fields.push(new_field);
+            if has_json_fields(field) {
+                new_fields.push(lance_json_to_arrow_json(field));
             } else {
                 new_fields.push(field.as_ref().clone());
             }
