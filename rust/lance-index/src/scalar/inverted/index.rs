@@ -1211,11 +1211,21 @@ impl InvertedPartition {
         let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
         let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
-        // Defer the per-doc row_id/num_tokens read. Construction only
-        // calls reader.num_rows() (no IO); the bulk load happens on first
-        // scoring use, and partitions that never score skip it entirely.
-        let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = Arc::new(LazyDocSet::new(docs_file, false, frag_reuse_index));
+        // Defer the per-doc row_id/num_tokens read. Construction reads only
+        // the doc count (one footer read) and then drops the reader; the bulk
+        // load happens on first scoring use, re-opening the docs file on
+        // demand, and partitions that never score skip it entirely. Storing
+        // the store + path instead of an open reader keeps a cached partition
+        // from pinning a docs-file handle for its whole lifetime.
+        let docs_path = doc_file_path(id);
+        let num_docs = store.open_index_file(&docs_path).await?.num_rows();
+        let docs = Arc::new(LazyDocSet::new(
+            store.clone(),
+            docs_path,
+            num_docs,
+            false,
+            frag_reuse_index,
+        ));
 
         Ok(Self {
             id,

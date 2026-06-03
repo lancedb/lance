@@ -25,8 +25,8 @@ use lance_core::Result;
 use tokio::sync::OnceCell;
 
 use crate::frag_reuse::FragReuseIndex;
-use crate::scalar::IndexReader;
 use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
+use crate::scalar::{IndexReader, IndexStore};
 use lance_select::mask::RowAddrMask;
 
 /// Lazy view over an inverted-index partition's `DocSet`.
@@ -49,12 +49,22 @@ pub struct LoadedDocSet {
     total_tokens: u64,
 }
 
-/// Reader-backed DocSet view that loads on demand and caches.
+/// Store-backed DocSet view that loads on demand and caches.
+///
+/// Holds the [`IndexStore`] and docs-file path rather than an open
+/// [`IndexReader`], so a cached partition does not pin a docs-file
+/// handle for its whole lifetime. The reader is re-opened on demand
+/// inside each column accessor and dropped when that read completes;
+/// because the resulting buffers are cached in the `OnceCell`s below,
+/// a contributing partition re-opens only on a cold miss, and a
+/// partition that never scores never opens the docs file at all after
+/// construction.
 pub struct DeferredDocSet {
-    reader: Arc<dyn IndexReader>,
+    store: Arc<dyn IndexStore>,
+    docs_path: String,
     is_legacy: bool,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    /// `reader.num_rows()` cached at construction.
+    /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
     /// `sum(num_tokens)` cached on first compute.
     total_tokens: OnceCell<u64>,
@@ -108,13 +118,15 @@ impl deepsize::DeepSizeOf for LazyDocSet {
 
 impl LazyDocSet {
     pub fn new(
-        reader: Arc<dyn IndexReader>,
+        store: Arc<dyn IndexStore>,
+        docs_path: String,
+        num_rows: usize,
         is_legacy: bool,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Self {
-        let num_rows = reader.num_rows();
         Self::Deferred(Box::new(DeferredDocSet {
-            reader,
+            store,
+            docs_path,
             is_legacy,
             frag_reuse_index,
             num_rows,
@@ -225,6 +237,12 @@ impl LazyDocSet {
 }
 
 impl DeferredDocSet {
+    /// Open a fresh docs-file reader. Dropped by the caller once its read
+    /// completes, so no handle is pinned across the partition's lifetime.
+    async fn reader(&self) -> Result<Arc<dyn IndexReader>> {
+        self.store.open_index_file(&self.docs_path).await
+    }
+
     async fn total_tokens_num(&self) -> Result<u64> {
         if let Some(v) = self.total_tokens.get() {
             return Ok(*v);
@@ -243,8 +261,8 @@ impl DeferredDocSet {
     async fn num_tokens_column(&self) -> Result<Arc<UInt32Array>> {
         self.num_tokens_col
             .get_or_try_init(|| async {
-                let batch = self
-                    .reader
+                let reader = self.reader().await?;
+                let batch = reader
                     .read_range(0..self.num_rows, Some(&[NUM_TOKEN_COL]))
                     .await?;
                 Result::Ok(Arc::new(
@@ -258,10 +276,8 @@ impl DeferredDocSet {
     async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
         self.row_ids_col
             .get_or_try_init(|| async {
-                let batch = self
-                    .reader
-                    .read_range(0..self.num_rows, Some(&[ROW_ID]))
-                    .await?;
+                let reader = self.reader().await?;
+                let batch = reader.read_range(0..self.num_rows, Some(&[ROW_ID])).await?;
                 Result::Ok(Arc::new(batch[ROW_ID].as_primitive::<UInt64Type>().clone()))
             })
             .await
@@ -285,7 +301,7 @@ impl DeferredDocSet {
                     )?
                 } else {
                     DocSet::load(
-                        self.reader.clone(),
+                        self.reader().await?,
                         self.is_legacy,
                         self.frag_reuse_index.clone(),
                     )
@@ -322,7 +338,8 @@ impl DeferredDocSet {
             .iter()
             .map(|&d| d as usize..d as usize + 1)
             .collect();
-        let batch = self.reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
+        let reader = self.reader().await?;
+        let batch = reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
         let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
         Ok((0..arr.len()).map(|i| arr.value(i)).collect())
     }
