@@ -860,6 +860,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             }
 
+            // Block-Max WAND pruning: skip the whole window when its score upper
+            // bound cannot reach the top-k threshold.
+            if self.threshold > 0.0 && self.or_block_window_max() <= self.threshold {
+                // On the final block `up_to` is the `u64::MAX` sentinel; step once
+                // there to avoid seeking past the valid doc id range.
+                let skip_to = match self.up_to {
+                    Some(up_to) if up_to < u32::MAX as u64 => up_to + 1,
+                    _ => target + 1,
+                };
+                self.push_back_leads(skip_to);
+                continue;
+            }
+
             let Some(doc) = self.lead.first().and_then(|posting| posting.doc()) else {
                 self.push_back_leads(target + 1);
                 continue;
@@ -1032,6 +1045,24 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
             }
         }
+    }
+
+    /// Upper bound on the score of any document in the window `[target, up_to]`
+    /// for a disjunction. Sums the block-max of every overlapping iterator:
+    /// `lead`, `head` (later docs still in the window, which
+    /// `can_target_beat_threshold` omits), and the tail via `tail_max_score`.
+    fn or_block_window_max(&self) -> f32 {
+        let lead: f32 = self
+            .lead
+            .iter()
+            .map(|posting| posting.block_max_score())
+            .sum();
+        let head: f32 = self
+            .head
+            .iter()
+            .map(|posting| posting.posting.block_max_score())
+            .sum();
+        lead + head + self.tail_max_score
     }
 
     fn can_target_beat_threshold(&mut self, target: u64) -> bool {
@@ -1495,6 +1526,8 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
@@ -1537,6 +1570,23 @@ mod tests {
         }
 
         fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            freq as f32 / doc_tokens as f32
+        }
+    }
+
+    // Inverse-doc-length scorer that counts scored documents, so a test can
+    // assert that block-max pruning skipped blocks.
+    struct CountingScorer {
+        scored: Arc<AtomicUsize>,
+    }
+
+    impl Scorer for CountingScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            self.scored.fetch_add(1, Ordering::Relaxed);
             freq as f32 / doc_tokens as f32
         }
     }
@@ -1718,6 +1768,76 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_or_single_term_block_skip_matches_and() {
+        // Hot docs occupy the middle block; the flanking blocks score far below
+        // the threshold. A single-term disjunction must skip them yet return what
+        // the conjunctive path returns.
+        let total = 3 * BLOCK_SIZE as u32;
+        let hot = BLOCK_SIZE as u32..BLOCK_SIZE as u32 + 12;
+
+        let mut docs = DocSet::default();
+        for row_id in 0..total {
+            // hot docs get distinct scores 1/1..1/12; the rest score 0.001
+            let doc_tokens = if hot.contains(&row_id) {
+                row_id - hot.start + 1
+            } else {
+                1000
+            };
+            docs.append(row_id as u64, doc_tokens);
+        }
+
+        let params = FtsSearchParams::new().with_limit(Some(10));
+        let run = |operator| {
+            let scored = Arc::new(AtomicUsize::new(0));
+            let posting = PostingIterator::with_query_weight(
+                String::from("term"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(
+                    (0..total).collect(),
+                    1.0,
+                    Some(vec![0.001, 1.0, 0.001]),
+                    true,
+                ),
+                docs.len(),
+            );
+            let mut wand = Wand::new(
+                operator,
+                std::iter::once(posting),
+                &docs,
+                CountingScorer {
+                    scored: scored.clone(),
+                },
+            );
+            let hits = wand
+                .search(
+                    &params,
+                    Arc::new(RowAddrMask::default()),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            let mut row_ids = hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>();
+            row_ids.sort_unstable();
+            (row_ids, scored.load(Ordering::Relaxed))
+        };
+
+        let (or_hits, or_scored) = run(Operator::Or);
+        let (and_hits, _) = run(Operator::And);
+
+        let expected = (hot.start..hot.start + 10)
+            .map(u64::from)
+            .collect::<Vec<_>>();
+        assert_eq!(or_hits, expected, "OR must return the top-k");
+        assert_eq!(or_hits, and_hits, "OR and AND must agree for a single term");
+        // Without pruning OR scores all `total` docs; with it the cold blocks are skipped.
+        assert!(
+            or_scored <= 2 * BLOCK_SIZE,
+            "expected pruning to skip a block, but scored {or_scored} of {total}",
+        );
     }
 
     #[test]
