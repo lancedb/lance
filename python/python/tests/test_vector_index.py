@@ -1058,31 +1058,40 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
-@pytest.mark.skip(
-    reason=(
-        "IVF_RQ num_bits>1 creation is gated until split-code search support "
-        "is implemented"
-    )
-)
-def test_create_ivf_rq_multi_bit_gates_search():
-    ds = lance.write_dataset(create_table(), "memory://")
+@pytest.mark.parametrize("num_bits", [2, 8])
+def test_create_ivf_rq_multi_bit_search(num_bits):
+    tbl = create_table()
+    ds = lance.write_dataset(tbl, "memory://")
 
     ds = ds.create_index(
         "vector",
         index_type="IVF_RQ",
         num_partitions=4,
-        num_bits=9,
+        num_bits=num_bits,
     )
     stats = ds.stats.index_stats("vector_idx")
-    assert stats["indices"][0]["sub_index"]["num_bits"] == 9
+    assert stats["indices"][0]["sub_index"]["num_bits"] == num_bits
 
-    with pytest.raises(pa.ArrowInvalid, match="num_bits>1 search is not supported"):
-        ds.to_table(
-            nearest={
-                "column": "vector",
-                "q": np.random.randn(128).astype(np.float32),
-                "k": 10,
-            }
+    result = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.array(tbl["vector"][0].as_py(), dtype=np.float32),
+            "k": 10,
+            "nprobes": 4,
+        }
+    )
+    assert result.num_rows == 10
+
+
+def test_create_ivf_rq_rejects_num_bits_above_supported_range():
+    ds = lance.write_dataset(create_table(), "memory://")
+
+    with pytest.raises(ValueError, match="IVF_RQ num_bits must be in 1..=8"):
+        ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            num_partitions=4,
+            num_bits=9,
         )
 
 

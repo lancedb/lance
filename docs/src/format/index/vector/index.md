@@ -250,7 +250,7 @@ For **RabitQ (RQ)**:
 | JSON Key              | Type | Description                                          |
 | --------------------- | ---- | ---------------------------------------------------- |
 | `rotate_mat_position` | u32  | Position of the rotation matrix in the global buffer |
-| `num_bits`            | u8   | Number of bits per dimension, in the range 1..=9     |
+| `num_bits`            | u8   | Number of bits per dimension, in the range 1..=8     |
 | `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code   |
 | `packed`              | bool | Whether codes are packed for optimized computation   |
 
