@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source bitmap segments into a single segment.
-pub(crate) async fn merge_segments(
+pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
 ) -> Result<IndexMetadata> {
