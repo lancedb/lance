@@ -1067,13 +1067,7 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
-@pytest.mark.skip(
-    reason=(
-        "IVF_RQ num_bits>1 creation is gated until split-code search support "
-        "is implemented"
-    )
-)
-def test_create_ivf_rq_multi_bit_gates_search():
+def test_create_ivf_rq_multi_bit_searches_l2_and_gates_cosine():
     ds = lance.write_dataset(create_table(), "memory://")
 
     ds = ds.create_index(
@@ -1084,14 +1078,25 @@ def test_create_ivf_rq_multi_bit_gates_search():
     )
     stats = ds.stats.index_stats("vector_idx")
     assert stats["indices"][0]["sub_index"]["num_bits"] == 9
+    assert stats["indices"][0]["sub_index"]["query_estimator"] == "raw_query"
 
-    with pytest.raises(pa.ArrowInvalid, match="num_bits>1 search is not supported"):
-        ds.to_table(
-            nearest={
-                "column": "vector",
-                "q": np.random.randn(128).astype(np.float32),
-                "k": 10,
-            }
+    result = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128).astype(np.float32),
+            "k": 10,
+        }
+    )
+    assert result.num_rows == 10
+
+    cosine_ds = lance.write_dataset(create_table(), "memory://")
+    with pytest.raises(NotImplementedError, match="num_bits>1 cosine index creation"):
+        cosine_ds.create_index(
+            "vector",
+            index_type="IVF_RQ",
+            metric="cosine",
+            num_partitions=4,
+            num_bits=9,
         )
 
 

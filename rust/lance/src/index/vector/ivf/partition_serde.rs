@@ -32,7 +32,7 @@ use lance_core::cache::CacheCodecImpl;
 use lance_core::{Error, Result};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::storage::RabitQuantizationMetadata;
+use lance_index::vector::bq::storage::{RabitQuantizationMetadata, RabitQueryEstimator};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatMetadata, FlatQuantizer};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::storage::ProductQuantizationMetadata;
@@ -437,10 +437,16 @@ struct RabitPartitionHeader {
     distance_type: u8,
     num_bits: u8,
     code_dim: u32,
+    #[serde(default = "default_rabit_query_estimator")]
+    query_estimator: RabitQueryEstimator,
     /// 0 = Matrix, 1 = Fast
     rotation_type: u8,
     /// Fast rotation signs (only set when rotation_type == Fast).
     fast_rotation_signs: Option<Vec<u8>>,
+}
+
+fn default_rabit_query_estimator() -> RabitQueryEstimator {
+    RabitQueryEstimator::ResidualQuery
 }
 
 impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
@@ -452,6 +458,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             distance_type: distance_type_to_u8(distance_type),
             num_bits: metadata.num_bits,
             code_dim: metadata.code_dim,
+            query_estimator: metadata.query_estimator,
             rotation_type: rotation_type_to_u8(metadata.rotation_type),
             fast_rotation_signs: metadata.fast_rotation_signs.clone(),
         };
@@ -506,6 +513,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             num_bits: header.num_bits,
             // The storage batch already has packed codes; skip re-packing.
             packed: true,
+            query_estimator: header.query_estimator,
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(
             storage_batch,
@@ -1047,6 +1055,7 @@ mod tests {
         assert_eq!(rm.num_bits, m.num_bits);
         assert_eq!(rm.code_dim, m.code_dim);
         assert_eq!(rm.rotation_type, m.rotation_type);
+        assert_eq!(rm.query_estimator, m.query_estimator);
         assert_eq!(rm.fast_rotation_signs, m.fast_rotation_signs);
         assert!(rm.packed);
         assert_eq!(

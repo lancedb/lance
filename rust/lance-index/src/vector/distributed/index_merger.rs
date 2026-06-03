@@ -1531,7 +1531,7 @@ mod tests {
     use prost::Message;
 
     use crate::vector::bq::RQRotationType;
-    use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
+    use crate::vector::bq::storage::{RABIT_EX_CODE_COLUMN, RabitQueryEstimator};
     use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
@@ -2317,6 +2317,7 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
         };
 
         write_rq_partial_aux(
@@ -2452,6 +2453,7 @@ mod tests {
             code_dim: 16,
             num_bits: 4,
             packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
         };
 
         write_rq_partial_aux(

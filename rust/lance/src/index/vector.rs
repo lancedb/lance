@@ -29,7 +29,9 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::{RQBuildParams, RQRotationType, validate_supported_rq_num_bits};
+use lance_index::vector::bq::{
+    RABIT_BINARY_NUM_BITS, RQBuildParams, RQRotationType, validate_supported_rq_num_bits,
+};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
@@ -552,10 +554,13 @@ async fn prepare_vector_segment_build(
                 stages
             )));
         };
-        // Multi-bit RQ quantization/storage internals are kept available for
-        // split-code preparation, but public index creation stays binary-only
-        // until multi-bit search support lands.
         validate_supported_rq_num_bits(rq_params.num_bits)?;
+        if rq_params.num_bits > RABIT_BINARY_NUM_BITS && params.metric_type == DistanceType::Cosine
+        {
+            return Err(Error::not_supported(
+                "IVF_RQ num_bits>1 cosine index creation is not supported until raw-query cosine search support is implemented",
+            ));
+        }
     }
 
     let num_rows = dataset.count_rows(None).await?;

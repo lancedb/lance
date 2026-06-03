@@ -17,7 +17,7 @@ use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::vector::bq::rabit_ex_bits;
-use crate::vector::bq::storage::{RABIT_CODE_COLUMN, RABIT_EX_CODE_COLUMN};
+use crate::vector::bq::storage::{RABIT_CODE_COLUMN, RABIT_EX_CODE_COLUMN, RabitQueryEstimator};
 use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
 use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
@@ -28,6 +28,9 @@ pub const ADD_FACTORS_COLUMN: &str = "__add_factors";
 pub const SCALE_FACTORS_COLUMN: &str = "__scale_factors";
 pub const EX_ADD_FACTORS_COLUMN: &str = "__add_factors_ex";
 pub const EX_SCALE_FACTORS_COLUMN: &str = "__scale_factors_ex";
+pub const ERROR_FACTORS_COLUMN: &str = "__error_factors";
+
+const RABIT_ERROR_EPSILON: f32 = 1.9;
 
 pub static ADD_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
     arrow_schema::Field::new(ADD_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
@@ -44,6 +47,9 @@ pub static EX_SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new
         arrow_schema::DataType::Float32,
         true,
     )
+});
+pub static ERROR_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(|| {
+    arrow_schema::Field::new(ERROR_FACTORS_COLUMN, arrow_schema::DataType::Float32, true)
 });
 
 pub struct RQTransformer {
@@ -64,7 +70,8 @@ impl RQTransformer {
         // for dot product, the add factor is `1 - v*c + |c|^2`, so we need to compute |c|^2
         let centroids_norm_square = (distance_type == DistanceType::Dot)
             .then(|| Float32Array::from(norm_squared_fsl(&centroids)));
-        let rotated_centroids = (rq.num_bits() > 1)
+        let rotated_centroids = (rq.metadata_ref().query_estimator
+            == RabitQueryEstimator::RawQuery)
             .then(|| rq.rotate_fsl_to_f32(&centroids))
             .transpose()?;
 
@@ -81,8 +88,9 @@ impl RQTransformer {
 struct RabitRawQueryFactors {
     add_factors: Float32Array,
     scale_factors: Float32Array,
-    ex_add_factors: Float32Array,
-    ex_scale_factors: Float32Array,
+    error_factors: Float32Array,
+    ex_add_factors: Option<Float32Array>,
+    ex_scale_factors: Option<Float32Array>,
 }
 
 #[inline]
@@ -103,6 +111,28 @@ fn binary_factor_value(rotated_residual: f32) -> f32 {
     }
 }
 
+#[inline]
+fn error_factor_value(
+    distance_type: DistanceType,
+    norm_square: f32,
+    binary_res_dot: f32,
+    code_dim: usize,
+) -> f32 {
+    if code_dim <= 1 || norm_square <= 0.0 || binary_res_dot == 0.0 {
+        return 0.0;
+    }
+
+    let code_norm_square = code_dim as f32 * 0.25;
+    let alignment = norm_square * code_norm_square / binary_res_dot.powi(2);
+    let angular_error = ((alignment - 1.0).max(0.0) / (code_dim as f32 - 1.0)).sqrt();
+    let error = norm_square.sqrt() * RABIT_ERROR_EPSILON * angular_error;
+    match distance_type {
+        DistanceType::L2 => 2.0 * error,
+        DistanceType::Dot => error,
+        _ => unreachable!(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_raw_query_factors(
     distance_type: DistanceType,
@@ -110,8 +140,8 @@ fn compute_raw_query_factors(
     rotated_residuals: &[f32],
     rotated_centroids: &[f32],
     part_ids: &UInt32Array,
-    ex_code_values: &[u8],
-    ex_res_dot_dists: &[f32],
+    ex_code_values: Option<&[u8]>,
+    ex_res_dot_dists: Option<&[f32]>,
     ex_bits: u8,
     code_dim: usize,
 ) -> Result<RabitRawQueryFactors> {
@@ -124,21 +154,22 @@ fn compute_raw_query_factors(
 
     let num_rows = res_norm_square.len();
     debug_assert_eq!(rotated_residuals.len(), num_rows * code_dim);
-    debug_assert_eq!(ex_code_values.len(), num_rows * code_dim);
-    debug_assert_eq!(ex_res_dot_dists.len(), num_rows);
+    if let Some(ex_code_values) = ex_code_values {
+        debug_assert_eq!(ex_code_values.len(), num_rows * code_dim);
+    }
+    if let Some(ex_res_dot_dists) = ex_res_dot_dists {
+        debug_assert_eq!(ex_res_dot_dists.len(), num_rows);
+    }
 
+    let has_ex_codes = ex_bits != 0;
     let ex_code_bias = -((1u32 << ex_bits) as f32 - 0.5);
     let mut add_factors = Vec::with_capacity(num_rows);
     let mut scale_factors = Vec::with_capacity(num_rows);
-    let mut ex_add_factors = Vec::with_capacity(num_rows);
-    let mut ex_scale_factors = Vec::with_capacity(num_rows);
+    let mut error_factors = Vec::with_capacity(num_rows);
+    let mut ex_add_factors = has_ex_codes.then(|| Vec::with_capacity(num_rows));
+    let mut ex_scale_factors = has_ex_codes.then(|| Vec::with_capacity(num_rows));
 
-    for (row_idx, (&norm_square, &ex_res_dot)) in res_norm_square
-        .values()
-        .iter()
-        .zip(ex_res_dot_dists.iter())
-        .enumerate()
-    {
+    for (row_idx, &norm_square) in res_norm_square.values().iter().enumerate() {
         let part_id = part_ids.value(row_idx) as usize;
         let centroid_start = part_id.checked_mul(code_dim).ok_or_else(|| {
             Error::invalid_input(format!(
@@ -164,14 +195,14 @@ fn compute_raw_query_factors(
         let row_end = row_start + code_dim;
         let residual = &rotated_residuals[row_start..row_end];
         let centroid = &rotated_centroids[centroid_start..centroid_end];
-        let ex_values = &ex_code_values[row_start..row_end];
+        let ex_values = ex_code_values.map(|values| &values[row_start..row_end]);
 
         let mut binary_res_dot = 0.0f32;
         let mut binary_cent_dot = 0.0f32;
         let mut ex_cent_dot = 0.0f32;
         let mut residual_centroid_dot = 0.0f32;
-        for ((&residual_value, &centroid_value), &ex_code_value) in
-            residual.iter().zip(centroid.iter()).zip(ex_values.iter())
+        for (dim_idx, (&residual_value, &centroid_value)) in
+            residual.iter().zip(centroid.iter()).enumerate()
         {
             let residual_value: f32 = residual_value;
             let centroid_value: f32 = centroid_value;
@@ -181,30 +212,51 @@ fn compute_raw_query_factors(
                 0u32
             };
             let binary_factor = binary_factor_value(residual_value);
-            let ex_factor = ((binary_code << ex_bits) + ex_code_value as u32) as f32 + ex_code_bias;
 
             binary_res_dot += residual_value * binary_factor;
             binary_cent_dot += centroid_value * binary_factor;
-            ex_cent_dot += centroid_value * ex_factor;
+            if let Some(ex_values) = ex_values {
+                let ex_code_value = ex_values[dim_idx];
+                let ex_factor =
+                    ((binary_code << ex_bits) + ex_code_value as u32) as f32 + ex_code_bias;
+                ex_cent_dot += centroid_value * ex_factor;
+            }
             residual_centroid_dot += residual_value * centroid_value;
         }
 
         let binary_correction = factor_ratio(norm_square * binary_cent_dot, binary_res_dot);
+        let ex_res_dot = ex_res_dot_dists
+            .map(|values| values[row_idx])
+            .unwrap_or_default();
         let ex_correction = factor_ratio(norm_square * ex_cent_dot, ex_res_dot);
+        error_factors.push(error_factor_value(
+            distance_type,
+            norm_square,
+            binary_res_dot,
+            code_dim,
+        ));
 
         match distance_type {
             DistanceType::L2 => {
                 add_factors.push(norm_square + 2.0 * binary_correction);
                 scale_factors.push(factor_ratio(-2.0 * norm_square, binary_res_dot));
-                ex_add_factors.push(norm_square + 2.0 * ex_correction);
-                ex_scale_factors.push(factor_ratio(-2.0 * norm_square, ex_res_dot));
+                if let Some(ex_add_factors) = ex_add_factors.as_mut() {
+                    ex_add_factors.push(norm_square + 2.0 * ex_correction);
+                }
+                if let Some(ex_scale_factors) = ex_scale_factors.as_mut() {
+                    ex_scale_factors.push(factor_ratio(-2.0 * norm_square, ex_res_dot));
+                }
             }
             DistanceType::Dot => {
                 let dot_base = 1.0 - residual_centroid_dot;
                 add_factors.push(dot_base + binary_correction);
                 scale_factors.push(factor_ratio(-norm_square, binary_res_dot));
-                ex_add_factors.push(dot_base + ex_correction);
-                ex_scale_factors.push(factor_ratio(-norm_square, ex_res_dot));
+                if let Some(ex_add_factors) = ex_add_factors.as_mut() {
+                    ex_add_factors.push(dot_base + ex_correction);
+                }
+                if let Some(ex_scale_factors) = ex_scale_factors.as_mut() {
+                    ex_scale_factors.push(factor_ratio(-norm_square, ex_res_dot));
+                }
             }
             _ => unreachable!(),
         }
@@ -213,8 +265,9 @@ fn compute_raw_query_factors(
     Ok(RabitRawQueryFactors {
         add_factors: Float32Array::from(add_factors),
         scale_factors: Float32Array::from(scale_factors),
-        ex_add_factors: Float32Array::from(ex_add_factors),
-        ex_scale_factors: Float32Array::from(ex_scale_factors),
+        error_factors: Float32Array::from(error_factors),
+        ex_add_factors: ex_add_factors.map(Float32Array::from),
+        ex_scale_factors: ex_scale_factors.map(Float32Array::from),
     })
 }
 
@@ -274,8 +327,8 @@ impl Transformer for RQTransformer {
         debug_assert_eq!(codes_fsl.len(), batch.num_rows());
 
         let mut batch = batch.try_with_column(self.rq.field(), rq_codes.binary_codes)?;
-        if self.rq.num_bits() == 1 {
-            // Preserve the released 1-bit residual-query estimator and factor layout.
+        if self.rq.metadata_ref().query_estimator == RabitQueryEstimator::ResidualQuery {
+            // Preserve the released residual-query estimator and factor layout.
             let ip_rq_res = match residual_vectors.value_type() {
                 DataType::Float16 => Float32Array::from(
                     self.rq
@@ -356,40 +409,34 @@ impl Transformer for RQTransformer {
                 .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?
                 .try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
         } else {
-            // Multi-bit RQ is stored for the RaBitQ-Library raw-query estimator.
-            // Search remains gated until that query path lands.
-            let ex_codes = rq_codes.ex_codes.ok_or_else(|| {
-                Error::internal("RabitQ multi-bit quantization did not return ex codes".to_string())
-            })?;
-            let ex_res_dot_dists = rq_codes.ex_res_dot_dists.ok_or_else(|| {
-                Error::internal(
-                    "RabitQ multi-bit quantization did not return ex dot factors".to_string(),
-                )
-            })?;
+            // New RQ indexes use the RaBitQ-Library raw-query estimator.
+            let ex_bits = rabit_ex_bits(self.rq.num_bits())?;
+            let ex_codes = rq_codes.ex_codes;
+            let ex_res_dot_dists = rq_codes.ex_res_dot_dists;
             let rotated_residuals = rq_codes.rotated_residuals.ok_or_else(|| {
-                Error::internal(
-                    "RabitQ multi-bit quantization did not return rotated residuals".to_string(),
-                )
+                Error::internal("RabitQ quantization did not return rotated residuals".to_string())
             })?;
-            let ex_code_values = rq_codes.ex_code_values.ok_or_else(|| {
-                Error::internal(
-                    "RabitQ multi-bit quantization did not return ex code values".to_string(),
-                )
-            })?;
+            let ex_code_values = rq_codes.ex_code_values;
+            if ex_bits != 0
+                && (ex_codes.is_none() || ex_res_dot_dists.is_none() || ex_code_values.is_none())
+            {
+                return Err(Error::internal(
+                    "RabitQ multi-bit quantization did not return split-code values".to_string(),
+                ));
+            }
 
             let part_ids = batch[PART_ID_COLUMN].as_primitive::<UInt32Type>();
             let rotated_centroids = self.rotated_centroids.as_ref().ok_or_else(|| {
-                Error::internal("RabitQ multi-bit transformer is missing rotated centroids")
+                Error::internal("RabitQ raw-query transformer is missing rotated centroids")
             })?;
-            let ex_bits = rabit_ex_bits(self.rq.num_bits())?;
             let raw_query_factors = compute_raw_query_factors(
                 self.distance_type,
                 &res_norm_square,
                 &rotated_residuals,
                 rotated_centroids,
                 part_ids,
-                &ex_code_values,
-                &ex_res_dot_dists,
+                ex_code_values.as_deref(),
+                ex_res_dot_dists.as_deref(),
                 ex_bits,
                 self.rq.dim(),
             )?;
@@ -404,21 +451,28 @@ impl Transformer for RQTransformer {
                     Arc::new(raw_query_factors.scale_factors),
                 )?
                 .try_with_column(
+                    ERROR_FACTORS_FIELD.clone(),
+                    Arc::new(raw_query_factors.error_factors),
+                )?;
+
+            if let Some(ex_codes) = ex_codes {
+                batch = batch.try_with_column(
                     crate::vector::bq::storage::rabit_ex_code_field(
                         self.rq.dim(),
                         self.rq.num_bits(),
                     )?
                     .expect("ex-code field should exist for num_bits > 1"),
                     ex_codes,
-                )?
-                .try_with_column(
-                    EX_ADD_FACTORS_FIELD.clone(),
-                    Arc::new(raw_query_factors.ex_add_factors),
-                )?
-                .try_with_column(
-                    EX_SCALE_FACTORS_FIELD.clone(),
-                    Arc::new(raw_query_factors.ex_scale_factors),
                 )?;
+            }
+            if let Some(ex_add_factors) = raw_query_factors.ex_add_factors {
+                batch = batch
+                    .try_with_column(EX_ADD_FACTORS_FIELD.clone(), Arc::new(ex_add_factors))?;
+            }
+            if let Some(ex_scale_factors) = raw_query_factors.ex_scale_factors {
+                batch = batch
+                    .try_with_column(EX_SCALE_FACTORS_FIELD.clone(), Arc::new(ex_scale_factors))?;
+            }
         }
 
         let batch = batch
@@ -445,8 +499,8 @@ mod tests {
     use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
     use super::{
-        ADD_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, RQTransformer,
-        compute_raw_query_factors,
+        ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
+        RQTransformer, compute_raw_query_factors, error_factor_value,
     };
 
     #[test]
@@ -457,7 +511,6 @@ mod tests {
                 .unwrap();
         let transformer =
             RQTransformer::new(rq.clone(), DistanceType::L2, centroids, "vector").unwrap();
-        assert!(transformer.rotated_centroids.is_some());
 
         let residual_vectors = FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![
@@ -522,18 +575,27 @@ mod tests {
         assert!(transformed.column_by_name("vector").is_none());
         assert!(transformed.column_by_name(CENTROID_DIST_COLUMN).is_none());
         assert!(transformed.column_by_name(ADD_FACTORS_COLUMN).is_some());
+        assert!(transformed.column_by_name(ERROR_FACTORS_COLUMN).is_some());
     }
 
     #[test]
-    fn test_rq_transformer_caches_rotated_centroids_only_for_multi_bit() {
+    fn test_rq_transformer_caches_rotated_centroids_for_raw_query() {
         let centroids =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
                 .unwrap();
-        let binary_rq =
+        let raw_query_rq =
             RabitQuantizer::new_with_rotation::<Float32Type>(1, 8, RQRotationType::Fast);
-        let binary_transformer =
-            RQTransformer::new(binary_rq, DistanceType::L2, centroids.clone(), "vector").unwrap();
-        assert!(binary_transformer.rotated_centroids.is_none());
+        let raw_query_transformer =
+            RQTransformer::new(raw_query_rq, DistanceType::L2, centroids.clone(), "vector")
+                .unwrap();
+        assert_eq!(
+            raw_query_transformer
+                .rotated_centroids
+                .as_ref()
+                .unwrap()
+                .len(),
+            8
+        );
 
         let multi_bit_rq =
             RabitQuantizer::new_with_rotation::<Float32Type>(4, 8, RQRotationType::Fast);
@@ -564,8 +626,8 @@ mod tests {
             &rotated_residuals,
             &rotated_centroids,
             &part_ids,
-            &ex_code_values,
-            &ex_res_dot_dists,
+            Some(&ex_code_values),
+            Some(&ex_res_dot_dists),
             1,
             2,
         )
@@ -573,12 +635,17 @@ mod tests {
 
         assert!((factors.add_factors.value(0) - 1.6666667).abs() < 1e-5);
         assert!((factors.scale_factors.value(0) + 6.6666665).abs() < 1e-5);
-        assert!((factors.ex_add_factors.value(0) - 1.6666667).abs() < 1e-5);
-        assert!((factors.ex_scale_factors.value(0) + 2.2222223).abs() < 1e-5);
+        let expected_error = error_factor_value(DistanceType::L2, 5.0, 1.5, 2);
+        assert!((factors.error_factors.value(0) - expected_error).abs() < 1e-5);
+        let ex_add_factors = factors.ex_add_factors.unwrap();
+        let ex_scale_factors = factors.ex_scale_factors.unwrap();
+        assert!((ex_add_factors.value(0) - 1.6666667).abs() < 1e-5);
+        assert!((ex_scale_factors.value(0) + 2.2222223).abs() < 1e-5);
         assert_eq!(factors.add_factors.value(1), 7.0);
         assert_eq!(factors.scale_factors.value(1), 0.0);
-        assert_eq!(factors.ex_add_factors.value(1), 7.0);
-        assert_eq!(factors.ex_scale_factors.value(1), 0.0);
+        assert_eq!(factors.error_factors.value(1), 0.0);
+        assert_eq!(ex_add_factors.value(1), 7.0);
+        assert_eq!(ex_scale_factors.value(1), 0.0);
     }
 
     #[test]
@@ -596,8 +663,8 @@ mod tests {
             &rotated_residuals,
             &rotated_centroids,
             &part_ids,
-            &ex_code_values,
-            &ex_res_dot_dists,
+            Some(&ex_code_values),
+            Some(&ex_res_dot_dists),
             1,
             2,
         )
@@ -605,7 +672,11 @@ mod tests {
 
         assert!((factors.add_factors.value(0) + 2.6666667).abs() < 1e-5);
         assert!((factors.scale_factors.value(0) + 3.3333333).abs() < 1e-5);
-        assert!((factors.ex_add_factors.value(0) + 2.6666667).abs() < 1e-5);
-        assert!((factors.ex_scale_factors.value(0) + 1.1111112).abs() < 1e-5);
+        let expected_error = error_factor_value(DistanceType::Dot, 5.0, 1.5, 2);
+        assert!((factors.error_factors.value(0) - expected_error).abs() < 1e-5);
+        let ex_add_factors = factors.ex_add_factors.unwrap();
+        let ex_scale_factors = factors.ex_scale_factors.unwrap();
+        assert!((ex_add_factors.value(0) + 2.6666667).abs() < 1e-5);
+        assert!((ex_scale_factors.value(0) + 1.1111112).abs() < 1e-5);
     }
 }

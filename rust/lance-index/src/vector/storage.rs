@@ -136,9 +136,23 @@ impl QueryScratchCapacity {
     }
 }
 
+#[derive(Debug)]
+pub struct RabitRawQueryContext {
+    pub code_dim: usize,
+    pub ex_bits: u8,
+    pub rotated_query: Vec<f32>,
+    pub dist_table: Vec<f32>,
+    pub ex_dist_table: Vec<f32>,
+    pub sum_q: f32,
+}
+
 #[derive(Clone, Copy)]
 pub enum QueryResidual<'a> {
     Centroid(&'a dyn arrow_array::Array),
+    RabitRawQuery {
+        rotated_centroid: Option<&'a [f32]>,
+        query: Option<&'a RabitRawQueryContext>,
+    },
 }
 
 #[derive(Debug)]
@@ -295,7 +309,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
         &'a self,
         query: ArrayRef,
         dist_q_c: f32,
-        _residual: Option<QueryResidual<'_>>,
+        _residual: Option<QueryResidual<'a>>,
         _f32_scratch: &'a mut Vec<f32>,
     ) -> Self::DistanceCalculator<'a> {
         self.dist_calculator(query, dist_q_c)

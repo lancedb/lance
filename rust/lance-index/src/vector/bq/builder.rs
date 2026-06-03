@@ -18,7 +18,7 @@ use rayon::prelude::*;
 
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
-    rabit_binary_code_field, rabit_ex_code_field,
+    RabitQueryEstimator, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
@@ -236,6 +236,7 @@ impl RabitQuantizer {
                     code_dim: code_dim as u32,
                     num_bits,
                     packed: false,
+                    query_estimator: RabitQueryEstimator::RawQuery,
                 }
             }
             RQRotationType::Fast => RabitQuantizationMetadata {
@@ -246,6 +247,7 @@ impl RabitQuantizer {
                 code_dim: code_dim as u32,
                 num_bits,
                 packed: false,
+                query_estimator: RabitQueryEstimator::RawQuery,
             },
         };
         Self { metadata }
@@ -257,6 +259,10 @@ impl RabitQuantizer {
 
     pub fn rotation_type(&self) -> RQRotationType {
         self.metadata.rotation_type
+    }
+
+    pub fn metadata_ref(&self) -> &RabitQuantizationMetadata {
+        &self.metadata
     }
 
     #[inline]
@@ -324,7 +330,7 @@ impl RabitQuantizer {
         }
     }
 
-    pub(crate) fn rotate_fsl_to_f32(&self, vectors: &FixedSizeListArray) -> Result<Vec<f32>> {
+    pub fn rotate_fsl_to_f32(&self, vectors: &FixedSizeListArray) -> Result<Vec<f32>> {
         match vectors.value_type() {
             DataType::Float16 => self.rotate_fsl_to_f32_typed::<Float16Type>(vectors),
             DataType::Float32 => self.rotate_fsl_to_f32_typed::<Float32Type>(vectors),
@@ -522,16 +528,6 @@ impl RabitQuantizer {
         T::Native: AsPrimitive<f32> + Sync,
     {
         let ex_bits = rabit_ex_bits(self.metadata.num_bits)?;
-        if ex_bits == 0 {
-            return Ok(RabitQuantizedBatch {
-                binary_codes: self.transform::<T>(residual_vectors)?,
-                ex_codes: None,
-                ex_res_dot_dists: None,
-                rotated_residuals: None,
-                ex_code_values: None,
-            });
-        }
-
         let n = residual_vectors.len();
         let dim = self.dim();
         debug_assert_eq!(residual_vectors.values().len(), n * dim);
@@ -546,10 +542,10 @@ impl RabitQuantizer {
         let ex_code_bytes = rabit_ex_code_bytes(code_dim, ex_bits)?;
 
         let mut encoded_codes = vec![0u8; n * code_bytes];
-        let mut encoded_ex_codes = vec![0u8; n * ex_code_bytes];
-        let mut ex_res_dot_dists = vec![0.0f32; n];
+        let mut encoded_ex_codes = (ex_bits != 0).then(|| vec![0u8; n * ex_code_bytes]);
+        let mut ex_res_dot_dists = (ex_bits != 0).then(|| vec![0.0f32; n]);
         let mut rotated_residuals = vec![0.0f32; n * code_dim];
-        let mut ex_code_values = vec![0u8; n * code_dim];
+        let mut ex_code_values = (ex_bits != 0).then(|| vec![0u8; n * code_dim]);
 
         match self.rotation_type() {
             RQRotationType::Matrix => {
@@ -560,67 +556,67 @@ impl RabitQuantizer {
 
                 encoded_codes
                     .chunks_mut(code_bytes)
-                    .zip(encoded_ex_codes.chunks_mut(ex_code_bytes))
                     .zip(rotated_residuals.chunks_mut(code_dim))
-                    .zip(ex_code_values.chunks_mut(code_dim))
-                    .zip(ex_res_dot_dists.iter_mut())
                     .enumerate()
-                    .for_each(
-                        |(
-                            row_idx,
-                            ((((code_dst, ex_dst), rotated_dst), ex_values_dst), ex_dot_dst),
-                        )| {
-                            for (dst, value) in rotated_dst
-                                .iter_mut()
-                                .zip(rotated_vectors.column(row_idx).iter())
-                            {
-                                *dst = *value;
-                            }
-                            pack_sign_bits(code_dst, rotated_dst);
-                            *ex_dot_dst =
-                                quantize_ex_code(rotated_dst, ex_bits, ex_dst, ex_values_dst);
-                        },
-                    );
+                    .for_each(|(row_idx, (code_dst, rotated_dst))| {
+                        for (dst, value) in rotated_dst
+                            .iter_mut()
+                            .zip(rotated_vectors.column(row_idx).iter())
+                        {
+                            *dst = *value;
+                        }
+                        pack_sign_bits(code_dst, rotated_dst);
+                    });
             }
             RQRotationType::Fast => {
                 let signs = self.fast_rotation_signs();
                 encoded_codes
                     .par_chunks_mut(code_bytes)
-                    .zip(encoded_ex_codes.par_chunks_mut(ex_code_bytes))
                     .zip(rotated_residuals.par_chunks_mut(code_dim))
-                    .zip(ex_code_values.par_chunks_mut(code_dim))
-                    .zip(ex_res_dot_dists.par_iter_mut())
                     .zip(values.par_chunks_exact(dim))
-                    .for_each_init(
-                        || (),
-                        |_,
-                         (
-                            ((((code_dst, ex_dst), rotated_dst), ex_values_dst), ex_dot_dst),
-                            input,
-                        )| {
-                            apply_fast_rotation(input, rotated_dst, signs);
-                            pack_sign_bits(code_dst, rotated_dst);
-                            *ex_dot_dst =
-                                quantize_ex_code(rotated_dst, ex_bits, ex_dst, ex_values_dst);
-                        },
-                    );
+                    .for_each(|((code_dst, rotated_dst), input)| {
+                        apply_fast_rotation(input, rotated_dst, signs);
+                        pack_sign_bits(code_dst, rotated_dst);
+                    });
             }
         }
 
+        if ex_bits != 0 {
+            let encoded_ex_codes = encoded_ex_codes
+                .as_mut()
+                .expect("ex-code buffer should exist for multi-bit RQ");
+            let ex_res_dot_dists = ex_res_dot_dists
+                .as_mut()
+                .expect("ex dot buffer should exist for multi-bit RQ");
+            let ex_code_values = ex_code_values
+                .as_mut()
+                .expect("ex-code value buffer should exist for multi-bit RQ");
+            encoded_ex_codes
+                .par_chunks_mut(ex_code_bytes)
+                .zip(ex_code_values.par_chunks_mut(code_dim))
+                .zip(ex_res_dot_dists.par_iter_mut())
+                .zip(rotated_residuals.par_chunks(code_dim))
+                .for_each(|(((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
+                    *ex_dot_dst = quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst);
+                });
+        }
+
         let binary_codes = UInt8Array::from(encoded_codes);
-        let ex_codes = UInt8Array::from(encoded_ex_codes);
+        let ex_codes = encoded_ex_codes.map(UInt8Array::from);
         Ok(RabitQuantizedBatch {
             binary_codes: Arc::new(FixedSizeListArray::try_new_from_values(
                 binary_codes,
                 code_bytes as i32,
             )?),
-            ex_codes: Some(Arc::new(FixedSizeListArray::try_new_from_values(
-                ex_codes,
-                ex_code_bytes as i32,
-            )?)),
-            ex_res_dot_dists: Some(ex_res_dot_dists),
+            ex_codes: ex_codes
+                .map(|ex_codes| {
+                    FixedSizeListArray::try_new_from_values(ex_codes, ex_code_bytes as i32)
+                        .map(|array| Arc::new(array) as ArrayRef)
+                })
+                .transpose()?,
+            ex_res_dot_dists,
             rotated_residuals: Some(rotated_residuals),
-            ex_code_values: Some(ex_code_values),
+            ex_code_values,
         })
     }
 }
