@@ -205,13 +205,11 @@ impl LanceStream {
         // As a result, we don't really need to worry too much about fragment readahead.  We also want this
         // to be pretty high.  While we are reading one set of fragments we should be scheduling the next set
         // this should help ensure that we don't have breaks in I/O
-        let cap = config.parallelism_cap.unwrap_or(usize::MAX);
         let frag_parallelism = config
             .fragment_readahead
             .unwrap_or((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             // fragment_readhead=0 doesn't make sense so we just bump it to 1
-            .max(1)
-            .min(cap);
+            .max(1);
         debug!(
             "Given io_parallelism={} and num_columns={} we will read {} fragments at once while scanning v2 dataset",
             io_parallelism,
@@ -344,7 +342,11 @@ impl LanceStream {
             // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
-            .try_buffered(get_num_compute_intensive_cpus().min(cap).max(1))
+            .try_buffered(
+                get_num_compute_intensive_cpus()
+                    .min(config.parallelism_cap.unwrap_or(usize::MAX))
+                    .max(1),
+            )
             .stream_in_current_span()
             .boxed();
 
@@ -370,20 +372,13 @@ impl LanceStream {
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
         let project_schema = projection.clone();
-        let cap = config.parallelism_cap.unwrap_or(usize::MAX);
-        // fragment_readahead is used as the concurrency limit in the ordered path.
         let fragment_readahead = config
             .fragment_readahead
-            .unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD)
-            .min(cap)
+            .unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD);
+        let batch_readahead = config
+            .batch_readahead
+            .min(config.parallelism_cap.unwrap_or(usize::MAX))
             .max(1);
-        // fragment_flatten_limit is passed to try_flatten_unordered in the unordered path.
-        // None means unlimited, which is the original default; only apply the cap when set.
-        let fragment_flatten_limit = match config.parallelism_cap {
-            Some(cap) => Some(config.fragment_readahead.unwrap_or(cap).min(cap).max(1)),
-            None => config.fragment_readahead,
-        };
-        let batch_readahead = config.batch_readahead.min(cap).max(1);
         debug!(
             "Scanning v1 dataset with frag_readahead={} and batch_readahead={}",
             fragment_readahead, batch_readahead
@@ -454,7 +449,7 @@ impl LanceStream {
             // When we flatten the streams (one stream per fragment), we allow
             // `fragment_readahead` stream to be read concurrently.
             tasks
-                .try_flatten_unordered(fragment_flatten_limit)
+                .try_flatten_unordered(config.fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffer_unordered(batch_readahead)
                 .stream_in_current_span()
