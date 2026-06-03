@@ -642,7 +642,6 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
-    use serde_json::json;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use uuid::Uuid;
 
