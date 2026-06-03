@@ -1977,7 +1977,13 @@ mod tests {
                     &NoOpMetricsCollector,
                 )
                 .unwrap();
-            let mut row_ids = hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>();
+            let mut row_ids = hits
+                .iter()
+                .map(|hit| match hit.addr {
+                    CandidateAddr::RowId(r) => r,
+                    CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+                })
+                .collect::<Vec<_>>();
             row_ids.sort_unstable();
             (row_ids, scored.load(Ordering::Relaxed))
         };
