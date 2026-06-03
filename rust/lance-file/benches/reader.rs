@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{UInt32Array, cast::AsArray, types::Int32Type};
 use arrow_schema::DataType;
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{FutureExt, StreamExt};
 use lance_core::utils::{tempfile::TempDir, tokio::get_num_compute_intensive_cpus};
 use lance_datagen::ArrayGeneratorExt;

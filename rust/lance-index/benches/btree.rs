@@ -20,7 +20,9 @@ use std::{
 };
 
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;

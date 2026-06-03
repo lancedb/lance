@@ -3,7 +3,9 @@
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
 use geo_types::coord;

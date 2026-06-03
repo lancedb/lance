@@ -7,7 +7,9 @@ use std::iter::repeat_n;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{FixedSizeListArray, UInt8Array};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::distance::{build_distance_table_dot, build_distance_table_l2};

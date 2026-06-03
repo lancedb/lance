@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use arrow_array::{LargeBinaryArray, RecordBatch, RecordBatchIterator, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, ProjectionRequest, ReadParams, WriteParams};

@@ -7,7 +7,9 @@ use arrow_array::{
     Float16Array, Float32Array, Float64Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use half::{bf16, f16};
 use num_traits::Float;
 use rand::Rng;

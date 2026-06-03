@@ -8,7 +8,9 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
