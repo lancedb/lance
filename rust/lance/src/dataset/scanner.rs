@@ -83,6 +83,7 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
+use super::fragment::FileFragment;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
@@ -409,6 +410,10 @@ pub struct LanceFilter {
 impl LanceFilter {
     pub fn is_none(&self) -> bool {
         self.query_filter.is_none() && self.expr_filter.is_none()
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
     }
 }
 
@@ -2099,14 +2104,19 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    /// Scan and return the number of matching rows
+    /// Return the number of matching rows.
     ///
-    /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
-    /// especially if there is no filter.
+    /// A simple count — one with no filter, search, or other option that would require
+    /// inspecting row data — is answered directly from fragment metadata without building
+    /// or executing a scan plan.  Any other count falls back to executing a count plan.
     #[instrument(skip_all)]
     pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
+            if let Some(count) = self.count_rows_from_metadata().await? {
+                return Ok(count);
+            }
+
             let mut scanner = self.clone();
             scanner.aggregate(AggregateExpr::builder().count_star().build())?;
 
@@ -2129,6 +2139,47 @@ impl Scanner {
             }
         }
         .boxed()
+    }
+
+    /// Count rows using only fragment metadata when the scan configuration permits it.
+    ///
+    /// A `COUNT(*)` is just the number of live rows (physical rows minus deletions),
+    /// which is tracked in fragment metadata.  When nothing in the scan needs to inspect
+    /// row data we can sum those counts directly and skip building / executing a plan.
+    ///
+    /// Returns `None` to fall back to the count plan whenever the plan's behavior must be
+    /// preserved.  The fallback is forced by a row-level filter, vector / full-text search,
+    /// `index_segments`, `fast_search`, or `include_deleted_rows`; by an `order_by` or
+    /// `limit` / `offset`, which the plan rejects when combined with the count aggregate;
+    /// or by a dynamic-only projection such as `SELECT 1`, which the plan also rejects.
+    async fn count_rows_from_metadata(&self) -> Result<Option<u64>> {
+        let requires_plan = self.filter.is_some()
+            || self.full_text_query.is_some()
+            || self.nearest.is_some()
+            || self.index_segments.is_some()
+            || self.fast_search
+            || self.include_deleted_rows
+            || self.ordering.is_some()
+            || self.limit.is_some()
+            || self.offset.is_some()
+            // A projection with output columns but no physical columns (e.g. `SELECT 1`)
+            // is rejected by the plan; defer so that same error is raised.
+            || (self.projection_plan.has_output_cols()
+                && self.projection_plan.physical_projection.is_empty());
+        if requires_plan {
+            return Ok(None);
+        }
+
+        let fragments = match self.fragments.as_ref() {
+            Some(fragments) => fragments
+                .iter()
+                .map(|fragment| FileFragment::new(self.dataset.clone(), fragment.clone()))
+                .collect(),
+            None => self.dataset.get_fragments(),
+        };
+
+        let count = self.dataset.count_fragment_rows(fragments).await?;
+        Ok(Some(count as u64))
     }
 
     /// Create an execution plan with aggregation.
@@ -8001,6 +8052,122 @@ mod test {
                 .await
                 .unwrap()
         );
+    }
+
+    /// `Scanner::count_rows` with no row-level filter / search is satisfied from
+    /// fragment metadata and performs no I/O, even when restricted to a subset of
+    /// fragments. See https://github.com/lance-format/lance/issues/6970.
+    ///
+    /// This test relies on the default (new) file format, which caches `physical_rows`
+    /// and `num_deleted_rows` in fragment metadata; that is what makes the metadata-only
+    /// path issue zero I/O. It must NOT be parameterized over the Legacy format, where
+    /// those counts are absent and `physical_rows()` would open data files.
+    #[tokio::test]
+    async fn test_count_rows_metadata_only() {
+        // Asserts `scanner.count_rows() == expected` and that it touched no I/O at all
+        // (the metadata-only fast path).
+        async fn assert_metadata_only(scanner: Scanner, dataset: &Dataset, expected: u64) {
+            use lance_io::assert_io_eq;
+            let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+            assert_eq!(scanner.count_rows().await.unwrap(), expected);
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+            assert_io_eq!(io_stats, read_iops, 0);
+            assert_io_eq!(io_stats, write_iops, 0);
+        }
+
+        // Three fragments of 100 rows each; `i` steps 0..300 across fragments.
+        let mut dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        assert_eq!(dataset.fragments().len(), 3);
+        let fragments = dataset.fragments().as_ref().clone();
+
+        // Whole dataset, a fragment subset, and an empty fragment list are all
+        // answered from metadata.
+        assert_metadata_only(dataset.scan(), &dataset, 300).await;
+        let mut subset = dataset.scan();
+        subset.with_fragments(vec![fragments[0].clone(), fragments[2].clone()]);
+        assert_metadata_only(subset, &dataset, 200).await;
+        let mut empty = dataset.scan();
+        empty.with_fragments(vec![]);
+        assert_metadata_only(empty, &dataset, 0).await;
+
+        // limit / offset / order_by are rejected when combined with the count
+        // aggregate; the guard must defer to the plan so this error is preserved
+        // (rather than silently returning a metadata count).
+        let mut limited = dataset.scan();
+        limited.limit(Some(50), None).unwrap();
+        assert!(limited.count_rows().await.is_err());
+        let mut offset = dataset.scan();
+        offset.limit(None, Some(250)).unwrap();
+        assert!(offset.count_rows().await.is_err());
+        let mut ordered = dataset.scan();
+        ordered
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("i".to_string())]))
+            .unwrap();
+        assert!(ordered.count_rows().await.is_err());
+
+        // Deletions are reflected and remain metadata-only (deletion counts are
+        // tracked in fragment metadata).
+        dataset.delete("i < 10").await.unwrap();
+        assert_metadata_only(dataset.scan(), &dataset, 290).await;
+
+        // The subset path must also honor deletions: re-fetch the current fragments so
+        // the deletion file on fragment 0 is visible, then count just that fragment
+        // (100 physical - 10 deleted = 90) and the untouched pair (200).
+        let live_fragments = dataset.fragments().as_ref().clone();
+        let mut subset_deleted = dataset.scan();
+        subset_deleted.with_fragments(vec![live_fragments[0].clone()]);
+        assert_metadata_only(subset_deleted, &dataset, 90).await;
+        let mut subset_untouched = dataset.scan();
+        subset_untouched.with_fragments(vec![live_fragments[1].clone(), live_fragments[2].clone()]);
+        assert_metadata_only(subset_untouched, &dataset, 200).await;
+
+        // include_deleted_rows must count deleted rows too (300, not 290), proving the
+        // guard routes it through the plan rather than the live-row metadata path.
+        let mut with_deleted = dataset.scan();
+        with_deleted.with_row_id().include_deleted_rows();
+        assert_eq!(with_deleted.count_rows().await.unwrap(), 300);
+
+        // A row filter forces a real scan and returns the filtered count.
+        let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+        let mut filtered = dataset.scan();
+        filtered.filter("i >= 100").unwrap();
+        assert_eq!(filtered.count_rows().await.unwrap(), 200);
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_gt!(io_stats, read_iops, 0);
+
+        // All rows deleted: metadata-only count is zero (and physical - deletions does
+        // not underflow).
+        dataset.delete("i >= 0").await.unwrap();
+        assert_metadata_only(dataset.scan(), &dataset, 0).await;
+    }
+
+    #[tokio::test]
+    async fn test_count_rows_metadata_only_with_zero_io_threads() {
+        // Regression: `count_fragment_rows` fans the per-fragment count out at
+        // `io_parallelism()`, which reflects `LANCE_IO_THREADS` and can be 0.
+        // `buffer_unordered(0)` never polls its input, so without the `.max(1)` clamp the
+        // metadata count hangs forever. Assert it completes promptly and is correct.
+        let dataset = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+
+        // SAFETY: process-global env var, set and restored around a single count, mirroring
+        // the other env-var tests in this module. With the clamp a concurrent reader merely
+        // falls back to parallelism 1 (correct, just serial) rather than hanging.
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
+        let counted = tokio::time::timeout(Duration::from_secs(30), dataset.count_rows(None)).await;
+        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
+
+        let count = counted
+            .expect("count_rows must not hang with LANCE_IO_THREADS=0")
+            .unwrap();
+        assert_eq!(count, 300);
     }
 
     #[rstest]

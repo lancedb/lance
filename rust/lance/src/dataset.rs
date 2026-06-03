@@ -1477,12 +1477,24 @@ impl Dataset {
     }
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {
-        let cnts = stream::iter(self.get_fragments())
+        self.count_fragment_rows(self.get_fragments()).await
+    }
+
+    /// Sum the live row count (physical rows minus deletions) of the given fragments.
+    ///
+    /// Reads only fragment metadata where it is available, falling back to per-fragment
+    /// I/O only when the cached counts are absent (older fragments lacking `physical_rows`,
+    /// or deletion files lacking `num_deleted_rows`).  That fallback I/O is fanned out at
+    /// the object store's configured I/O parallelism, matching the rest of this module.
+    pub(crate) async fn count_fragment_rows(&self, fragments: Vec<FileFragment>) -> Result<usize> {
+        // `io_parallelism()` reflects `LANCE_IO_THREADS` and can be 0; `buffer_unordered(0)` never
+        // polls its input, so clamp to at least 1 to keep the metadata count from hanging.
+        let io_parallelism = self.object_store.io_parallelism().max(1);
+        stream::iter(fragments)
             .map(|f| async move { f.count_rows(None).await })
-            .buffer_unordered(16)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(cnts.iter().sum())
+            .buffer_unordered(io_parallelism)
+            .try_fold(0usize, |acc, count| futures::future::ready(Ok(acc + count)))
+            .await
     }
 
     /// Take rows by indices.
