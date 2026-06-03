@@ -850,10 +850,11 @@ impl MemTableFlusher {
             .unwrap_or_default();
         // Force fullzip structural encoding for the graph's List<u32>/List<f32>
         // columns. The HNSW graph has dense level-0 neighbor lists followed by
-        // many empty higher-level lists; the v2.x miniblock List codec mis-decodes
-        // the row count for that shape at scale (the locally-sparse empty block is
-        // missed by the global levels-per-value average), and at 2.1 it also
-        // overflows the 32 KiB miniblock cap. Fullzip round-trips it correctly.
+        // many empty higher-level lists; the v2.x miniblock List codec decodes
+        // the row count incorrectly for that shape at scale (the locally-sparse
+        // empty block is not captured by the global levels-per-value average),
+        // and at 2.1 it also overflows the 32 KiB miniblock cap. Fullzip
+        // round-trips it correctly.
         let fullzip_meta = std::collections::HashMap::from([(
             lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_string(),
             lance_encoding::constants::STRUCTURAL_ENCODING_FULLZIP.to_string(),
