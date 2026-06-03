@@ -2584,7 +2584,7 @@ mod tests {
     };
     use lance_io::{assert_io_eq, assert_io_lt};
     use lance_linalg::distance::{DistanceType, MetricType};
-    use lance_table::feature_flags::{FLAG_INDEX_SEGMENT_SEQ, FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER};
+    use lance_table::feature_flags::FLAG_INDEX_SEGMENT_SEQ;
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
@@ -6585,10 +6585,6 @@ mod tests {
             dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
             0
         );
-        assert_ne!(
-            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER,
-            0
-        );
 
         let replacement = write_vector_segment_metadata(
             &dataset,
@@ -6825,8 +6821,7 @@ mod tests {
 
         let mut legacy_manifest = dataset.manifest.as_ref().clone();
         legacy_manifest.version += 1;
-        legacy_manifest.writer_feature_flags &=
-            !(FLAG_INDEX_SEGMENT_SEQ | FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER);
+        legacy_manifest.writer_feature_flags &= !FLAG_INDEX_SEGMENT_SEQ;
         legacy_manifest.transaction_section = None;
         legacy_manifest.transaction_file = None;
         let mut legacy_indices = dataset.load_indices().await.unwrap().as_ref().clone();
@@ -6886,10 +6881,6 @@ mod tests {
             dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
             0
         );
-        assert_ne!(
-            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER,
-            0
-        );
     }
 
     #[tokio::test]
@@ -6940,8 +6931,7 @@ mod tests {
 
         let mut legacy_manifest = dataset.manifest.as_ref().clone();
         legacy_manifest.version += 1;
-        legacy_manifest.writer_feature_flags &=
-            !(FLAG_INDEX_SEGMENT_SEQ | FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER);
+        legacy_manifest.writer_feature_flags &= !FLAG_INDEX_SEGMENT_SEQ;
         legacy_manifest.transaction_section = None;
         legacy_manifest.transaction_file = None;
         let mut legacy_indices = dataset.load_indices().await.unwrap().as_ref().clone();
@@ -6994,8 +6984,7 @@ mod tests {
         .unwrap();
         assert!(index_section.is_empty());
         assert_eq!(
-            dataset.manifest.writer_feature_flags
-                & (FLAG_INDEX_SEGMENT_SEQ | FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER),
+            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
             0
         );
     }
@@ -7085,7 +7074,7 @@ mod tests {
             Some(1)
         );
         assert_ne!(
-            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER,
+            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
             0
         );
 
@@ -7203,7 +7192,7 @@ mod tests {
             Some(2)
         );
         assert_ne!(
-            restored.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER,
+            restored.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
             0
         );
         assert_eq!(
@@ -7310,8 +7299,7 @@ mod tests {
         .unwrap();
         assert!(index_section.is_empty());
         assert_eq!(
-            overwritten.manifest.writer_feature_flags
-                & (FLAG_INDEX_SEGMENT_SEQ | FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER),
+            overwritten.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
             0
         );
     }
@@ -7385,10 +7373,6 @@ mod tests {
         assert_eq!(refreshed[0].segment_seq, Some(1));
         assert_ne!(
             dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
-            0
-        );
-        assert_ne!(
-            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER,
             0
         );
     }

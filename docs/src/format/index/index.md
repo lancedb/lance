@@ -168,10 +168,9 @@ for that name is currently present:
   the same `segment_seq`. The value is preserved even when all physical segments for that index name
   are removed.
 
-Writers set `FLAG_INDEX_SEGMENT_SEQ` when physical segment metadata contains `segment_seq` and
-`FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER` when logical high-water metadata is present. Readers do not need
-either flag to scan data, but writers must preserve both metadata forms once the corresponding writer
-flag appears.
+Writers set `FLAG_INDEX_SEGMENT_SEQ` when physical segment metadata contains `segment_seq` or
+logical high-water metadata is present. Readers do not need the flag to scan data, but writers must
+preserve both metadata forms once the writer flag appears.
 
 <details>
   <summary>Full protobuf definitions</summary>

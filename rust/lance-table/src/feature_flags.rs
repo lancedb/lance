@@ -20,12 +20,10 @@ pub const FLAG_TABLE_CONFIG: u64 = 8;
 pub const FLAG_BASE_PATHS: u64 = 16;
 /// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
 pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
-/// Index metadata uses segment_seq.
+/// Index metadata uses segment_seq and logical high-water marks.
 pub const FLAG_INDEX_SEGMENT_SEQ: u64 = 64;
-/// Index section stores logical high-water marks for segment_seq assignment.
-pub const FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER: u64 = 128;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 128;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -108,7 +106,6 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_read_dataset(super::FLAG_INDEX_SEGMENT_SEQ));
-        assert!(can_read_dataset(super::FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -127,7 +124,6 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
         assert!(can_write_dataset(super::FLAG_INDEX_SEGMENT_SEQ));
-        assert!(can_write_dataset(super::FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -136,7 +132,6 @@ mod tests {
                 | super::FLAG_BASE_PATHS
                 | super::FLAG_DISABLE_TRANSACTION_FILE
                 | super::FLAG_INDEX_SEGMENT_SEQ
-                | super::FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
     }

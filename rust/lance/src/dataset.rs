@@ -123,10 +123,7 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{
-    FLAG_INDEX_SEGMENT_SEQ, FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER, apply_feature_flags,
-    can_read_dataset,
-};
+use lance_table::feature_flags::{FLAG_INDEX_SEGMENT_SEQ, apply_feature_flags, can_read_dataset};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -3362,21 +3359,14 @@ pub(crate) async fn write_manifest_file(
             use_stable_row_ids,
             config.disable_transaction_file,
         )?;
-        if let Some(index_section) = index_section.as_ref() {
-            if index_section
-                .indices
-                .iter()
-                .any(|idx| idx.segment_seq.is_some())
-            {
-                manifest.writer_feature_flags |= FLAG_INDEX_SEGMENT_SEQ;
-            }
-            if index_section
-                .logical_indexes
-                .iter()
-                .any(|idx| idx.max_segment_seq.is_some())
-            {
-                manifest.writer_feature_flags |= FLAG_INDEX_SEGMENT_SEQ_HIGH_WATER;
-            }
+        if index_section.as_ref().is_some_and(|section| {
+            section.indices.iter().any(|idx| idx.segment_seq.is_some())
+                || section
+                    .logical_indexes
+                    .iter()
+                    .any(|idx| idx.max_segment_seq.is_some())
+        }) {
+            manifest.writer_feature_flags |= FLAG_INDEX_SEGMENT_SEQ;
         }
     }
 
