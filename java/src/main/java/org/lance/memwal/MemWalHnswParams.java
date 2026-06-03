@@ -28,7 +28,9 @@ public class MemWalHnswParams {
   private int efConstruction = 150;
   private int maxLevel = 7;
 
-  /** @param indexName name of the maintained vector index these parameters apply to. */
+  /**
+   * @param indexName name of the maintained vector index these parameters apply to.
+   */
   public MemWalHnswParams(String indexName) {
     Preconditions.checkNotNull(indexName, "indexName must not be null");
     this.indexName = indexName;

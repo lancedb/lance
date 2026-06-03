@@ -447,10 +447,10 @@ async fn run_checkpoint(
         writer.force_seal_active().await?;
         let mut waited = 0u64;
         let gen_path = loop {
-            if let Some(m) = writer.manifest().await? {
-                if let Some(fg) = m.flushed_generations.last() {
-                    break format!("{}/_mem_wal/{}/{}", dir, shard_id.as_hyphenated(), fg.path);
-                }
+            if let Some(m) = writer.manifest().await?
+                && let Some(fg) = m.flushed_generations.last()
+            {
+                break format!("{}/_mem_wal/{}/{}", dir, shard_id.as_hyphenated(), fg.path);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             waited += 1;
@@ -500,7 +500,7 @@ async fn run_checkpoint(
                 let q_arr = Float32Array::from(q_vec.to_vec());
                 let mut scanner = gen_ds.scan();
                 scanner.nearest(VECTOR_COL, &q_arr, k)?;
-                scanner.nprobs(1);
+                scanner.nprobes(1);
                 scanner.ef(ef);
                 let h_t = Instant::now();
                 let batches: Vec<RecordBatch> =
@@ -605,10 +605,10 @@ async fn run_checkpoint(
                 if let Some(c) = batch.column_by_name(ROW_ID) {
                     let col = c.as_primitive::<arrow_array::types::UInt64Type>();
                     for i in 0..col.len() {
-                        if let Some(corpus_idx) = rowid_to_corpus.get(&col.value(i)) {
-                            if bf_set.contains(corpus_idx) {
-                                hits += 1;
-                            }
+                        if let Some(corpus_idx) = rowid_to_corpus.get(&col.value(i))
+                            && bf_set.contains(corpus_idx)
+                        {
+                            hits += 1;
                         }
                     }
                 }

@@ -1246,7 +1246,8 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
                 .l()?;
             let index_name: String = JString::from(index_name).extract(env)?;
             let num_edges = env.call_method(&item, "numEdges", "()I", &[])?.i()? as usize;
-            let ef_construction = env.call_method(&item, "efConstruction", "()I", &[])?.i()? as usize;
+            let ef_construction =
+                env.call_method(&item, "efConstruction", "()I", &[])?.i()? as usize;
             let max_level = env.call_method(&item, "maxLevel", "()I", &[])?.i()? as u16;
             Ok((
                 index_name,
