@@ -2458,14 +2458,52 @@ impl PostingListReader {
 #[derive(Clone)]
 pub struct Positions(pub(super) CompressedPositionStorage);
 
-impl DeepSizeOf for Positions {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        match &self.0 {
-            CompressedPositionStorage::LegacyPerDoc(positions) => {
-                positions.get_buffer_memory_size()
-            }
-            CompressedPositionStorage::SharedStream(stream) => stream.size(),
+/// Slice-aware cache-size charge for the Arrow array shapes stored in posting
+/// caches. [`Array::get_buffer_memory_size`] reports the full capacity of shared
+/// backing buffers; cached posting lists often reference only a small slice of a
+/// group read. Count the referenced span for the known posting-list types and
+/// fall back to Arrow's full-buffer size for anything else.
+fn sliced_cache_bytes(array: &dyn Array) -> usize {
+    let validity_bytes = array
+        .nulls()
+        .map(|nulls| nulls.len().div_ceil(8))
+        .unwrap_or(0);
+    match array.data_type() {
+        DataType::LargeBinary => {
+            let array = array.as_binary::<i64>();
+            let data_bytes = if array.is_empty() {
+                0
+            } else {
+                let offsets = array.value_offsets();
+                (offsets[array.len()] - offsets[0]) as usize
+            };
+            data_bytes + (array.len() + 1) * std::mem::size_of::<i64>() + validity_bytes
         }
+        DataType::List(_) => {
+            let array = array.as_list::<i32>();
+            let (child_start, child_end) = if array.is_empty() {
+                (0, 0)
+            } else {
+                let offsets = array.value_offsets();
+                (offsets[0] as usize, offsets[array.len()] as usize)
+            };
+            let offset_bytes = (array.len() + 1) * std::mem::size_of::<i32>();
+            let child = array.values().slice(child_start, child_end - child_start);
+            offset_bytes + validity_bytes + sliced_cache_bytes(child.as_ref())
+        }
+        // Fixed-width primitives hold exactly `len * width` bytes regardless of
+        // buffer capacity, so this is already slice-aware. Any other type falls
+        // back to the full-buffer size.
+        other => match other.primitive_width() {
+            Some(width) => array.len() * width + validity_bytes,
+            None => array.get_buffer_memory_size(),
+        },
+    }
+}
+
+impl DeepSizeOf for Positions {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.0.deep_size_of_children(context)
     }
 }
 
@@ -2547,7 +2585,7 @@ pub enum CompressedPositionStorage {
 impl DeepSizeOf for CompressedPositionStorage {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         match self {
-            Self::LegacyPerDoc(positions) => positions.get_buffer_memory_size(),
+            Self::LegacyPerDoc(positions) => sliced_cache_bytes(positions),
             Self::SharedStream(stream) => stream.size(),
         }
     }
@@ -2824,11 +2862,11 @@ pub struct PlainPostingList {
 impl DeepSizeOf for PlainPostingList {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         self.row_ids.len() * std::mem::size_of::<u64>()
-            + self.frequencies.len() * std::mem::size_of::<u32>()
+            + self.frequencies.len() * std::mem::size_of::<f32>()
             + self
                 .positions
                 .as_ref()
-                .map(Array::get_buffer_memory_size)
+                .map(|positions| sliced_cache_bytes(positions))
                 .unwrap_or(0)
     }
 }
@@ -2925,17 +2963,12 @@ pub struct CompressedPostingList {
 }
 
 impl DeepSizeOf for CompressedPostingList {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.blocks.get_buffer_memory_size()
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        sliced_cache_bytes(&self.blocks)
             + self
                 .positions
                 .as_ref()
-                .map(|positions| match positions {
-                    CompressedPositionStorage::LegacyPerDoc(positions) => {
-                        positions.get_buffer_memory_size()
-                    }
-                    CompressedPositionStorage::SharedStream(stream) => stream.size(),
-                })
+                .map(|positions| positions.deep_size_of_children(context))
                 .unwrap_or(0)
     }
 }
@@ -4842,7 +4875,7 @@ mod tests {
     };
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow::array::{AsArray, LargeBinaryBuilder, ListBuilder, UInt32Builder};
+    use arrow::array::{AsArray, Int32Builder, LargeBinaryBuilder, ListBuilder, UInt32Builder};
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -5920,6 +5953,255 @@ mod tests {
             queried_tokens.len() * group_len,
             "each query reads one group's metadata rows ({group_len}), not the \
              full {num_tokens}-row table",
+        );
+    }
+
+    /// Build a single-partition v2 index where every token's posting list spans
+    /// `docs_per_token` docs. Small `docs_per_token` yields tiny posting lists
+    /// that the writer packs densely into shared cache groups.
+    async fn load_v2_index_with_grouped_postings(
+        num_tokens: usize,
+        docs_per_token: usize,
+    ) -> (Arc<InvertedIndex>, Arc<LanceCache>) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_docs = num_tokens * docs_per_token;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for token_id in 0..num_tokens {
+            builder.tokens.add(format!("t{token_id}"));
+            let mut pl = PostingListBuilder::new(false);
+            for d in 0..docs_per_token {
+                let doc_id = (token_id * docs_per_token + d) as u32;
+                pl.add(doc_id, PositionRecorder::Count(1));
+            }
+            builder.posting_lists.push(pl);
+        }
+        for doc in 0..num_docs {
+            builder.docs.append(doc as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        // The inverted list keeps only a `WeakLanceCache`, so the caller must
+        // hold this `Arc<LanceCache>` alive for the cache to stay usable.
+        let cache = Arc::new(LanceCache::with_capacity(1 << 30));
+        let index = InvertedIndex::load(store, None, cache.as_ref())
+            .await
+            .unwrap();
+        (index, cache)
+    }
+
+    /// The read path decodes a posting-list group by slicing one buffer read for
+    /// the whole `[start, end)` row range, so every posting list in a cached
+    /// group shares a single `blocks` buffer. `DeepSizeOf` must count each
+    /// posting's slice of that buffer, not the whole buffer once per posting —
+    /// otherwise a group of N postings reports ~N times its real footprint.
+    #[rstest::rstest]
+    #[case::single_doc_terms(512, 1)]
+    #[case::small_terms(512, 4)]
+    #[case::medium_terms(256, 32)]
+    #[tokio::test]
+    async fn test_read_path_group_size_counts_slices_not_shared_buffer(
+        #[case] num_tokens: usize,
+        #[case] docs_per_token: usize,
+    ) {
+        let (index, _cache) = load_v2_index_with_grouped_postings(num_tokens, docs_per_token).await;
+        let inverted_list = index.partitions[0].inverted_list.clone();
+        assert!(!inverted_list.is_legacy_layout(), "expected v2 layout");
+        assert!(
+            inverted_list.group_starts.is_some(),
+            "expected grouped posting lists"
+        );
+
+        // Populate the group cache via the same path a query uses.
+        inverted_list
+            .posting_list(0, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let (start, end) = inverted_list.group_range_for_token(0).unwrap();
+        let group = inverted_list
+            .index_cache
+            .get_with_key(&PostingListGroupKey { start, end })
+            .await
+            .unwrap();
+
+        // Sum what counting the full backing buffer once per posting list would
+        // charge, and confirm the postings really do share a single buffer.
+        let mut distinct_buffers = std::collections::HashSet::new();
+        let mut charged_if_counted_per_posting = 0usize;
+        for posting in &group.posting_lists {
+            let PostingList::Compressed(compressed) = posting else {
+                panic!("expected compressed posting lists");
+            };
+            charged_if_counted_per_posting += compressed.blocks.get_buffer_memory_size();
+            distinct_buffers.insert(compressed.blocks.values().as_ptr());
+        }
+        let posting_count = group.posting_lists.len();
+
+        assert!(
+            posting_count > 1,
+            "default grouping should pack multiple tiny postings into one group"
+        );
+        assert_eq!(
+            distinct_buffers.len(),
+            1,
+            "read-path postings in a group should share one backing buffer"
+        );
+        // With slice-aware accounting the shared buffer is counted ~once, so the
+        // whole group costs far less than counting it once per posting list.
+        let reported = group.deep_size_of();
+        assert!(
+            reported < charged_if_counted_per_posting / 2,
+            "group deep_size_of {reported}B should not scale with the {posting_count}x-counted \
+             shared buffer ({charged_if_counted_per_posting}B)"
+        );
+    }
+
+    // ===========================================================================
+    // Regression tests for index-cache size accounting of cached posting lists.
+    //
+    // A cached posting list is a *slice* of a buffer read for a whole posting-list
+    // group, so its `DeepSizeOf` impl must charge only the bytes the slice
+    // references, not the full shared backing buffer. These lock that in: each
+    // builds an array that references a small slice of a much larger buffer and
+    // asserts `deep_size_of()` tracks the slice, not the buffer.
+    // ===========================================================================
+
+    /// Build a `List<Int32>` of `num_sublists` x `ints_per_sublist`, then return
+    /// the slice `[off, off + len)`. The returned array shares the full backing
+    /// buffers, so `values().get_buffer_memory_size()` still reports the whole
+    /// thing — the slicing-unaware over-count the fix targets.
+    fn sliced_int32_list(
+        num_sublists: usize,
+        ints_per_sublist: usize,
+        off: usize,
+        len: usize,
+    ) -> ListArray {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for s in 0..num_sublists {
+            for i in 0..ints_per_sublist {
+                builder
+                    .values()
+                    .append_value((s * ints_per_sublist + i) as i32);
+            }
+            builder.append(true);
+        }
+        builder.finish().slice(off, len)
+    }
+
+    #[test]
+    fn test_compressed_posting_deep_size_counts_only_referenced_blocks_slice() {
+        const ELEM_BYTES: usize = 256;
+        const TOTAL_ELEMS: usize = 64;
+        const SLICE_OFF: usize = 10;
+        const SLICE_LEN: usize = 2;
+
+        let mut builder = LargeBinaryBuilder::new();
+        for _ in 0..TOTAL_ELEMS {
+            builder.append_value(vec![7u8; ELEM_BYTES]);
+        }
+        let full = builder.finish();
+        let blocks = full.slice(SLICE_OFF, SLICE_LEN);
+
+        let posting = CompressedPostingList::new(
+            blocks,
+            1.0,
+            SLICE_LEN as u32,
+            PostingTailCodec::Fixed32,
+            None,
+        );
+
+        let full_backing = full.get_buffer_memory_size();
+        let slice_bytes = SLICE_LEN * ELEM_BYTES;
+        let reported = posting.deep_size_of();
+
+        assert!(
+            reported < full_backing / 4,
+            "deep_size_of {reported}B must not count the {full_backing}B shared buffer"
+        );
+        assert!(
+            reported <= slice_bytes * 2,
+            "deep_size_of {reported}B should track the ~{slice_bytes}B referenced slice"
+        );
+    }
+
+    #[test]
+    fn test_plain_posting_deep_size_counts_only_referenced_positions_slice() {
+        const SUBLISTS: usize = 64;
+        const INTS: usize = 64;
+        const SLICE_LEN: usize = 2;
+
+        let positions = sliced_int32_list(SUBLISTS, INTS, 10, SLICE_LEN);
+        let row_ids = ScalarBuffer::from(vec![0u64, 1]);
+        let frequencies = ScalarBuffer::from(vec![1.0f32, 1.0]);
+        let posting =
+            PlainPostingList::new(row_ids, frequencies, Some(1.0), Some(positions.clone()));
+
+        let full_backing = positions.values().get_buffer_memory_size();
+        let slice_bytes = SLICE_LEN * INTS * std::mem::size_of::<i32>();
+        let reported = posting.deep_size_of();
+
+        assert!(
+            reported < full_backing / 4,
+            "deep_size_of {reported}B must not count the {full_backing}B shared positions buffer"
+        );
+        assert!(
+            reported <= slice_bytes * 2 + 64,
+            "deep_size_of {reported}B should track the ~{slice_bytes}B referenced slice"
+        );
+    }
+
+    #[test]
+    fn test_legacy_per_doc_positions_deep_size_counts_only_referenced_slice() {
+        const SUBLISTS: usize = 64;
+        const INTS: usize = 64;
+        const SLICE_LEN: usize = 2;
+
+        let positions = sliced_int32_list(SUBLISTS, INTS, 10, SLICE_LEN);
+        let full_backing = positions.values().get_buffer_memory_size();
+        let slice_bytes = SLICE_LEN * INTS * std::mem::size_of::<i32>();
+
+        let storage = CompressedPositionStorage::LegacyPerDoc(positions);
+        let reported = storage.deep_size_of();
+        assert!(
+            reported < full_backing / 4,
+            "CompressedPositionStorage deep_size_of {reported}B must not count the \
+             {full_backing}B shared buffer"
+        );
+        assert!(
+            reported <= slice_bytes * 2 + 64,
+            "deep_size_of {reported}B should track the ~{slice_bytes}B referenced slice"
+        );
+
+        // The `Positions` cache wrapper must report the same slice-aware size.
+        let wrapped = Positions(storage).deep_size_of();
+        assert!(
+            wrapped < full_backing / 4,
+            "Positions deep_size_of {wrapped}B must not count the {full_backing}B shared buffer"
         );
     }
 
