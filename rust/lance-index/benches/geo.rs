@@ -17,9 +17,9 @@ use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::rtree::{BoundingBox, RTreeIndex, RTreeIndexPlugin, RTreeTrainingRequest};
 use lance_index::scalar::{GeoQuery, RelationQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

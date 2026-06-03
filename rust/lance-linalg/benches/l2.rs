@@ -12,7 +12,7 @@ use num_traits::{AsPrimitive, Float};
 use rand::Rng;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_linalg::distance::l2_u8::l2_u8;

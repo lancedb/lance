@@ -12,7 +12,7 @@ use lance_linalg::distance::cosine_u8::{cosine_u8, cosine_u8_scalar};
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_testing::datagen::generate_random_array_with_seed;
 

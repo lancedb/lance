@@ -35,9 +35,6 @@ cc = "1.0.83"
 # you need Clang 11 or later.)
 fp16kernels = []
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { workspace = true }
-
 [[bench]]
 name = "l2"
 harness = false

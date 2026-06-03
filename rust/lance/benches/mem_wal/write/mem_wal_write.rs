@@ -70,7 +70,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::DistanceType;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use uuid::Uuid;
 
 /// Default number of rows per batch.

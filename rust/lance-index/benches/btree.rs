@@ -30,9 +30,9 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::{SargableQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 
 /// Selectivity level for range queries
 #[derive(Clone, Copy, Debug)]

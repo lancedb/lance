@@ -29,7 +29,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 // Many small fragments to amplify the slow path: each indexed fragment with
 // a deletion file produces one RoaringBitmap::full() allocation per

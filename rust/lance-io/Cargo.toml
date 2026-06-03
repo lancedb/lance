@@ -54,14 +54,12 @@ io-uring = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
+lance-testing.workspace = true
 test-log.workspace = true
 mockall.workspace = true
 rstest.workspace = true
 mock_instant.workspace = true
 tracing-mock = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof.workspace = true
 
 [[bench]]
 name = "scheduler"

@@ -48,14 +48,12 @@ uuid.workspace = true
 
 [dev-dependencies]
 lance-datagen.workspace = true
+lance-testing.workspace = true
 arrow-schema.workspace = true
 criterion.workspace = true
 pretty_assertions.workspace = true
 proptest.workspace = true
 rstest.workspace = true
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { workspace = true }
 
 [build-dependencies]
 prost-build.workspace = true

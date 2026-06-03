@@ -17,7 +17,7 @@ use lance_linalg::distance::{norm_l2, norm_l2_f64_simd, norm_l2_impl};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors

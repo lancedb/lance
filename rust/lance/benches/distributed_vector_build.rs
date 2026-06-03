@@ -10,7 +10,7 @@ use arrow_array::{cast::AsArray, types::Float32Type};
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use serde::Serialize;
 use uuid::Uuid;
 

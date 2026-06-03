@@ -46,7 +46,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use rand::Rng;
 use uuid::Uuid;
 

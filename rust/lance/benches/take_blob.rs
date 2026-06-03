@@ -15,7 +15,7 @@ use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 

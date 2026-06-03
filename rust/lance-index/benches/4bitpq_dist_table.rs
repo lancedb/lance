@@ -16,7 +16,7 @@ use lance_testing::datagen::generate_random_array_with_seed;
 use rand::{Rng, SeedableRng, prelude::StdRng};
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 const PQ: usize = 96;
 const DIM: usize = 1536;

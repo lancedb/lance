@@ -13,7 +13,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use rayon::ThreadPoolBuilder;
 
 use lance_core::ROW_ID_FIELD;
