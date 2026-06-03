@@ -106,6 +106,24 @@ impl MemTableFlusher {
         }
     }
 
+    /// Storage file version of the shard's base dataset. Flushed generations
+    /// (data fragments and index files) are written at this same version so the
+    /// whole shard stays on one format (e.g. a 2.2 base => 2.2 flushed gens).
+    ///
+    /// Falls back to [`LanceFileVersion::default`] when no base dataset exists at
+    /// `base_uri` (e.g. flusher unit tests that run without a committed base).
+    /// In production MemWAL is always initialized on a real dataset, so the base
+    /// version is inherited; other open errors are propagated.
+    async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
+        match Dataset::open(&self.base_uri).await {
+            Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
+            Err(Error::DatasetNotFound { .. }) => {
+                Ok(lance_file::version::LanceFileVersion::default())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Flush the MemTable to storage (data files, indexes, bloom filter).
     ///
     /// `covered_wal_entry_position` is stamped into the manifest's
@@ -244,9 +262,13 @@ impl MemTableFlusher {
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
-        // Use very large max_rows_per_file to ensure 1 fragment per flushed memtable
+        // Use very large max_rows_per_file to ensure 1 fragment per flushed memtable.
+        // Inherit the base dataset's storage version so the flushed generation
+        // matches it (a 2.2 base also fixes the v2.1 miniblock 32 KiB chunk cap
+        // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
+            data_storage_version: Some(self.base_storage_version().await?),
             ..Default::default()
         };
         Dataset::write(reader, &uri, Some(write_params)).await?;
@@ -687,7 +709,7 @@ impl MemTableFlusher {
         use arrow_schema::Schema as ArrowSchema;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_core::ROW_ID;
-        use lance_file::writer::FileWriter;
+        use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_index::pb;
         use lance_index::vector::DISTANCE_TYPE_KEY;
         use lance_index::vector::SQ_CODE_COLUMN;
@@ -703,6 +725,10 @@ impl MemTableFlusher {
         use prost::Message;
         use std::ops::Range;
         use std::sync::Arc;
+
+        // Write the index files at the base dataset's storage version (matches
+        // the flushed data fragments; 2.2 avoids the v2.1 miniblock chunk cap).
+        let storage_version = self.base_storage_version().await?;
 
         let index_uuid = uuid::Uuid::new_v4();
         let index_dir = gen_path
@@ -777,7 +803,10 @@ impl MemTableFlusher {
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,
             (&storage_schema).try_into()?,
-            Default::default(),
+            FileWriterOptions {
+                format_version: Some(storage_version),
+                ..Default::default()
+            },
         )?;
         storage_writer.write_batch(&storage_batch).await?;
 
@@ -819,12 +848,40 @@ impl MemTableFlusher {
             .get(lance_index::vector::hnsw::builder::HNSW_METADATA_KEY)
             .cloned()
             .unwrap_or_default();
-        let index_schema: ArrowSchema = HNSW::schema().as_ref().clone();
+        // Force fullzip structural encoding for the graph's List<u32>/List<f32>
+        // columns. The HNSW graph has dense level-0 neighbor lists followed by
+        // many empty higher-level lists; the v2.x miniblock List codec decodes
+        // the row count incorrectly for that shape at scale (the locally-sparse
+        // empty block is not captured by the global levels-per-value average),
+        // and at 2.1 it also overflows the 32 KiB miniblock cap. Fullzip
+        // round-trips it correctly.
+        let fullzip_meta = std::collections::HashMap::from([(
+            lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_string(),
+            lance_encoding::constants::STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        )]);
+        let index_schema: ArrowSchema = {
+            let base = HNSW::schema();
+            let fields = base
+                .fields()
+                .iter()
+                .map(|f| {
+                    if matches!(f.data_type(), arrow_schema::DataType::List(_)) {
+                        Arc::new(f.as_ref().clone().with_metadata(fullzip_meta.clone()))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            ArrowSchema::new(fields)
+        };
         let index_path = index_dir.clone().join(INDEX_FILE_NAME);
         let mut index_writer = FileWriter::try_new(
             self.object_store.create(&index_path).await?,
             (&index_schema).try_into()?,
-            Default::default(),
+            FileWriterOptions {
+                format_version: Some(storage_version),
+                ..Default::default()
+            },
         )?;
         index_writer.write_batch(&hnsw_batch).await?;
 

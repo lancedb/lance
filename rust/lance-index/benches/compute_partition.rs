@@ -9,7 +9,7 @@ use lance_index::vector::kmeans::{KMeansAlgoFloat, compute_partitions};
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array_with_seed;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 fn bench_compute_partitions(c: &mut Criterion) {
     const K: usize = 1024 * 4;

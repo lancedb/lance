@@ -4,8 +4,10 @@
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
-use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+use arc_swap::ArcSwap;
 
 use arrow_array::builder::{Float32Builder, ListBuilder, UInt32Builder};
 use arrow_array::{ArrayRef, RecordBatch};
@@ -190,18 +192,6 @@ pub struct LanceHnswMetadata {
     pub level_offsets: Vec<usize>,
 }
 
-struct PublishedNeighbors {
-    ptr: *const u32,
-    len: usize,
-    _neighbors: Arc<Vec<u32>>,
-}
-
-// SAFETY: published neighbor descriptors point into immutable `Arc<Vec<u32>>`
-// allocations owned by the descriptor. The pointer and length never change
-// after publication.
-unsafe impl Send for PublishedNeighbors {}
-unsafe impl Sync for PublishedNeighbors {}
-
 struct PackedLevel {
     offsets: Vec<usize>,
     neighbors: Vec<u32>,
@@ -223,64 +213,28 @@ impl PackedLevel {
     }
 }
 
-// SAFETY: packed levels are immutable after publication and old snapshots are
-// retained until graph drop.
-unsafe impl Send for PackedLevel {}
-unsafe impl Sync for PackedLevel {}
-
 struct LevelLinks {
-    published: AtomicPtr<PublishedNeighbors>,
-    #[allow(clippy::vec_box)]
-    retired_published: Mutex<Vec<Box<PublishedNeighbors>>>,
+    /// Published neighbor ids for this level, read lock-free by searchers.
+    /// `ArcSwap` reclaims the previous snapshot once no reader guard references
+    /// it, so the repeated publishes of an incremental build do not accumulate
+    /// (the prior manual `AtomicPtr` + retired-`Vec` scheme leaked every old
+    /// snapshot until graph drop, growing O(N^2/batch) and OOMing at ~1M rows).
+    published: ArcSwap<Vec<u32>>,
     ranked: Mutex<Vec<ScoredPoint>>,
 }
 
 impl LevelLinks {
     fn new(capacity: usize) -> Self {
-        let neighbors = Arc::new(Vec::new());
-        let published = Box::into_raw(Box::new(PublishedNeighbors {
-            ptr: neighbors.as_ptr(),
-            len: neighbors.len(),
-            _neighbors: neighbors,
-        }));
         Self {
-            published: AtomicPtr::new(published),
-            retired_published: Mutex::new(Vec::new()),
+            published: ArcSwap::from_pointee(Vec::<u32>::new()),
             ranked: Mutex::new(Vec::with_capacity(capacity)),
         }
     }
 
-    fn publish_from_ranked(&self, ranked: &[ScoredPoint]) -> Result<()> {
-        let neighbors = Arc::new(ranked.iter().map(|point| point.id).collect::<Vec<_>>());
-        let published = Box::into_raw(Box::new(PublishedNeighbors {
-            ptr: neighbors.as_ptr(),
-            len: neighbors.len(),
-            _neighbors: neighbors,
-        }));
-        let old = self.published.swap(published, Ordering::AcqRel);
-        self.retired_published
-            .lock()
-            .map_err(|_| Error::internal("HNSW published-neighbor mutex poisoned"))?
-            // SAFETY: `old` was produced by `Box::into_raw` either in
-            // `new` or a previous `publish_from_ranked` call. Keeping the box
-            // in `retired_published` lets readers that already loaded it
-            // finish safely.
-            .push(unsafe { Box::from_raw(old) });
-        Ok(())
-    }
-}
-
-impl Drop for LevelLinks {
-    fn drop(&mut self) {
-        let published = *self.published.get_mut();
-        if !published.is_null() {
-            // SAFETY: `drop` has exclusive access to the graph. Retired
-            // descriptors are owned by `retired_published`; this pointer is
-            // the one currently installed in `published`.
-            unsafe {
-                drop(Box::from_raw(published));
-            }
-        }
+    fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
+        self.published.store(Arc::new(
+            ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
+        ));
     }
 }
 
@@ -337,9 +291,7 @@ pub struct HnswGraph {
     indexed_len: AtomicUsize,
     visible_len: AtomicUsize,
     visited_pool: ArrayQueue<VisitedList>,
-    packed_level0: AtomicPtr<PackedLevel>,
-    #[allow(clippy::vec_box)]
-    retired_packed_level0: Mutex<Vec<Box<PackedLevel>>>,
+    packed_level0: ArcSwap<PackedLevel>,
 }
 
 impl HnswGraph {
@@ -372,8 +324,6 @@ impl HnswGraph {
             let _ = visited_pool.push(VisitedList::new(0));
         }
 
-        let packed_level0 = Box::into_raw(Box::new(PackedLevel::empty()));
-
         Ok(Self {
             params,
             nodes,
@@ -384,8 +334,7 @@ impl HnswGraph {
             indexed_len: AtomicUsize::new(0),
             visible_len: AtomicUsize::new(0),
             visited_pool,
-            packed_level0: AtomicPtr::new(packed_level0),
-            retired_packed_level0: Mutex::new(Vec::new()),
+            packed_level0: ArcSwap::from_pointee(PackedLevel::empty()),
         })
     }
 
@@ -919,10 +868,7 @@ impl HnswGraph {
             return;
         }
         if level == 0 {
-            let packed = self.packed_level0.load(Ordering::Acquire);
-            // SAFETY: packed snapshots are immutable and retained until graph
-            // drop.
-            let packed = unsafe { &*packed };
+            let packed = self.packed_level0.load();
             if let Some(neighbors) = packed.neighbors(id) {
                 if visible_len == usize::MAX {
                     for neighbor in neighbors.iter().copied() {
@@ -939,22 +885,14 @@ impl HnswGraph {
                 return;
             }
         }
-        let published = node.levels[level as usize]
-            .published
-            .load(Ordering::Acquire);
-        // SAFETY: published descriptors are immutable and old descriptors are
-        // retained until the graph is dropped.
-        let published = unsafe { &*published };
-        // SAFETY: the descriptor owns the immutable Arc<Vec<u32>> backing this
-        // pointer, and the pointer/length pair was created from that Vec.
-        let neighbors = unsafe { std::slice::from_raw_parts(published.ptr, published.len) };
+        let published = node.levels[level as usize].published.load();
         if visible_len == usize::MAX {
-            for neighbor in neighbors.iter().copied() {
+            for neighbor in published.iter().copied() {
                 visit(neighbor);
             }
             return;
         }
-        for neighbor in neighbors.iter().copied() {
+        for neighbor in published.iter().copied() {
             if neighbor as usize >= visible_len {
                 continue;
             }
@@ -1093,7 +1031,7 @@ impl HnswGraph {
                     continue;
                 }
                 let ranked = node.ranked(level as u16)?;
-                node.levels[level].publish_from_ranked(&ranked)?;
+                node.levels[level].publish_from_ranked(&ranked);
                 has_level0_update |= level == 0;
             }
         }
@@ -1113,28 +1051,10 @@ impl HnswGraph {
             offsets.push(neighbors.len());
         }
 
-        let packed = Box::into_raw(Box::new(PackedLevel { offsets, neighbors }));
-        let old = self.packed_level0.swap(packed, Ordering::AcqRel);
-        self.retired_packed_level0
-            .lock()
-            .map_err(|_| Error::internal("HNSW packed-level mutex poisoned"))?
-            // SAFETY: `old` was produced by `Box::into_raw` and is retained so
-            // readers that already loaded it can finish safely.
-            .push(unsafe { Box::from_raw(old) });
+        // ArcSwap reclaims the prior snapshot once no reader guard holds it.
+        self.packed_level0
+            .store(Arc::new(PackedLevel { offsets, neighbors }));
         Ok(())
-    }
-}
-
-impl Drop for HnswGraph {
-    fn drop(&mut self) {
-        let packed = *self.packed_level0.get_mut();
-        if !packed.is_null() {
-            // SAFETY: `drop` has exclusive access to the graph. Retired packed
-            // snapshots are owned by `retired_packed_level0`.
-            unsafe {
-                drop(Box::from_raw(packed));
-            }
-        }
     }
 }
 

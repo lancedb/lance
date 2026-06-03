@@ -8,7 +8,9 @@
 use std::{sync::Arc, time::Duration};
 
 use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
@@ -23,9 +25,9 @@ use lance_index::{
     metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
 };
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::Zipf;
 

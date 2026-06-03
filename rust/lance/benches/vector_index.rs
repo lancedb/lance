@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use rand::Rng;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams, builder::DatasetBuilder};

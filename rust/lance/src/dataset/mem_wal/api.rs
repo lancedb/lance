@@ -13,6 +13,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
@@ -24,6 +25,8 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::ShardWriterConfig;
+use super::scanner::flushed_cache::open_flushed_dataset;
+use super::scanner::{FlushedMemTableCache, ShardSnapshot};
 use super::write::MemIndexConfig;
 use super::write::ShardWriter;
 
@@ -446,6 +449,18 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
             interval.as_millis().to_string(),
         );
     }
+    // Per-index HNSW build params are recorded under `hnsw.<index>.<field>` keys.
+    for (index_name, params) in &config.hnsw_params {
+        defaults.insert(format!("hnsw.{index_name}.num_edges"), params.m.to_string());
+        defaults.insert(
+            format!("hnsw.{index_name}.ef_construction"),
+            params.ef_construction.to_string(),
+        );
+        defaults.insert(
+            format!("hnsw.{index_name}.max_level"),
+            params.max_level.to_string(),
+        );
+    }
     defaults
 }
 
@@ -466,6 +481,28 @@ pub trait DatasetMemWalExt {
     /// List current MemWAL shard IDs from object storage directory listing.
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
         Ok(Vec::new())
+    }
+
+    /// Prewarm the flushed generations of the given MemWAL shards into this
+    /// dataset's session caches.
+    ///
+    /// For every flushed generation in `snapshots`, opens the generation's
+    /// on-disk dataset (populating the session's metadata/index caches, and the
+    /// optional `cache` of opened `Arc<Dataset>`s) and prewarms each of its
+    /// indexes. Opens run concurrently.
+    ///
+    /// The caller chooses how to enumerate the shards — list the `_mem_wal`
+    /// directory (e.g. [`Self::list_mem_wal_latest_shard_ids`] then read each
+    /// shard manifest), or read the MemWAL index shard snapshots — and passes
+    /// the resulting [`ShardSnapshot`]s here. Prewarming is purely a cache
+    /// optimization; correctness never depends on it, so passing a generation
+    /// that has since been retired is harmless.
+    async fn prewarm_mem_wal(
+        &self,
+        _snapshots: &[ShardSnapshot],
+        _cache: Option<&Arc<FlushedMemTableCache>>,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Get a ShardWriter for the specified shard.
@@ -492,6 +529,19 @@ pub trait DatasetMemWalExt {
         shard_id: Uuid,
         config: ShardWriterConfig,
     ) -> Result<ShardWriter>;
+}
+
+/// Prewarm every index of `dataset` into its session caches. A no-op when the
+/// dataset has no indexes; duplicate index names are warmed once.
+async fn prewarm_all_indexes(dataset: &Dataset) -> Result<()> {
+    let indices = dataset.load_indices().await?;
+    let mut seen = std::collections::HashSet::new();
+    for index in indices.iter() {
+        if seen.insert(index.name.as_str()) {
+            dataset.prewarm_index(&index.name).await?;
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -531,6 +581,34 @@ impl DatasetMemWalExt for Dataset {
         }
         ids.sort();
         Ok(ids)
+    }
+
+    async fn prewarm_mem_wal(
+        &self,
+        snapshots: &[ShardSnapshot],
+        cache: Option<&Arc<FlushedMemTableCache>>,
+    ) -> Result<()> {
+        let session = self.session();
+        // Resolve flushed paths exactly as the LSM collector does, so the
+        // session/cache entries we warm key-match the paths later lookups open.
+        let base_path = self.uri().trim_end_matches('/').to_string();
+        let opens = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                let shard_id = snapshot.shard_id;
+                let base_path = &base_path;
+                let session = &session;
+                snapshot.flushed_generations.iter().map(move |flushed| {
+                    let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, flushed.path);
+                    async move {
+                        let dataset = open_flushed_dataset(&path, Some(session), cache).await?;
+                        prewarm_all_indexes(&dataset).await
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        futures::future::try_join_all(opens).await?;
+        Ok(())
     }
 
     async fn mem_wal_writer(
@@ -595,8 +673,10 @@ impl DatasetMemWalExt for Dataset {
                     )?);
                 }
                 "vector" => {
+                    let hnsw_params = config.hnsw_params.get(index_name).cloned();
                     let vector_config =
-                        load_vector_index_config(self, index_name, &index_meta).await?;
+                        load_vector_index_config(self, index_name, &index_meta, hnsw_params)
+                            .await?;
                     index_configs.push(vector_config);
                 }
                 _ => {
@@ -639,6 +719,7 @@ async fn load_vector_index_config(
     dataset: &Dataset,
     index_name: &str,
     index_meta: &lance_table::format::IndexMetadata,
+    hnsw_params: Option<HnswBuildParams>,
 ) -> Result<MemIndexConfig> {
     use lance_index::metrics::NoOpMetricsCollector;
 
@@ -667,10 +748,119 @@ async fn load_vector_index_config(
         })?
         .metric_type();
 
-    Ok(MemIndexConfig::hnsw(
-        index_name.to_string(),
-        *field_id,
-        column,
-        distance_type,
-    ))
+    Ok(match hnsw_params {
+        Some(params) => MemIndexConfig::hnsw_with_params(
+            index_name.to_string(),
+            *field_id,
+            column,
+            distance_type,
+            params,
+        ),
+        None => MemIndexConfig::hnsw(index_name.to_string(), *field_id, column, distance_type),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    use crate::dataset::WriteParams;
+
+    fn id_v_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]))
+    }
+
+    fn id_v_batch(schema: &Arc<ArrowSchema>, ids: &[i32]) -> RecordBatch {
+        let vs: Vec<i32> = ids.iter().map(|i| i * 10).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(Int32Array::from(vs)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_mem_wal_opens_and_warms_indexes() {
+        // `prewarm_mem_wal` opens each flushed generation (into the base
+        // dataset's session + the supplied cache) and warms its indexes. We
+        // place a flushed-generation dataset with a BTree index at the
+        // canonical `{base}/_mem_wal/{shard}/{folder}` path, prewarm it via a
+        // snapshot, and assert the generation is cached and its index loadable.
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+
+        // Base dataset (1-row sentinel).
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[-1]))], schema.clone());
+        let base = Dataset::write(reader, &base_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        // Flushed generation with a BTree index on `id`.
+        let shard_id = Uuid::new_v4();
+        let folder = "deadbeef_gen_1";
+        let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, folder);
+        let reader =
+            RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1, 2, 3]))], schema.clone());
+        let mut gen_ds = Dataset::write(reader, &gen_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        gen_ds
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, folder.to_string());
+
+        let cache = Arc::new(FlushedMemTableCache::new(4));
+        base.prewarm_mem_wal(std::slice::from_ref(&snapshot), Some(&cache))
+            .await
+            .expect("prewarm must open the generation and warm its index");
+
+        // The generation is resident in the cache (same session), with its
+        // index loadable — a later lookup that opens this path is a pure hit.
+        let warmed = cache
+            .get_or_open(&gen_uri, Some(base.session()))
+            .await
+            .unwrap();
+        assert_eq!(warmed.load_indices().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_mem_wal_empty_is_noop() {
+        // No snapshots / no flushed generations: prewarm is a clean no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[-1]))], schema.clone());
+        let base = Dataset::write(reader, &base_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        base.prewarm_mem_wal(&[], None).await.unwrap();
+
+        let empty = ShardSnapshot::new(Uuid::new_v4()).with_current_generation(1);
+        base.prewarm_mem_wal(std::slice::from_ref(&empty), None)
+            .await
+            .unwrap();
+    }
 }

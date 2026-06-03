@@ -30,13 +30,20 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -320,6 +327,98 @@ public class AsyncScannerTest {
   }
 
   /**
+   * Regression test for classloader isolation.
+   *
+   * <p>Verifies that AsyncScanner works correctly when the calling thread has an isolated
+   * (non-system) context classloader, simulating environments like Spark executors, web containers,
+   * or shaded JARs where application classes are loaded by a custom classloader.
+   *
+   * <p>The fix under test moved class resolution from the JNI dispatcher thread (which only has the
+   * system classloader after attach_current_thread_permanently()) to JNI_OnLoad (which has the
+   * correct application classloader), passing a GlobalRef to the dispatcher.
+   */
+  @Test
+  void testAsyncScanWithIsolatedClassloader(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_classloader").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 40;
+
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        ScanOptions options = new ScanOptions.Builder().batchSize(20L).build();
+
+        // Use a classloader that delegates only to the bootstrap classloader,
+        // making it unable to find any org.lance.* classes on its own.
+        ClassLoader originalCl = Thread.currentThread().getContextClassLoader();
+        ClassLoader restrictedCl = new ClassLoader(null) {
+              // Intentionally empty: parent is null (bootstrap only)
+            };
+
+        // --- Part 1: Swap context classloader on the current thread ---
+        try {
+          Thread.currentThread().setContextClassLoader(restrictedCl);
+
+          try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator)) {
+            CompletableFuture<ArrowReader> future = scanner.scanBatchesAsync();
+            ArrowReader reader = future.get(10, TimeUnit.SECONDS);
+            assertNotNull(reader);
+
+            int rowCount = 0;
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              rowCount += root.getRowCount();
+            }
+
+            assertEquals(
+                totalRows, rowCount, "Async scan should succeed despite restrictive classloader");
+            reader.close();
+          }
+        } finally {
+          Thread.currentThread().setContextClassLoader(originalCl);
+        }
+
+        // --- Part 2: Run from a thread with an isolated classloader ---
+        // Simulates Spark executor threads that have a non-system classloader.
+        ExecutorService isolatedExecutor =
+            Executors.newSingleThreadExecutor(
+                r -> {
+                  Thread t = new Thread(r, "isolated-classloader-thread");
+                  t.setContextClassLoader(restrictedCl);
+                  return t;
+                });
+        try {
+          CompletableFuture<Integer> result =
+              CompletableFuture.supplyAsync(
+                  () -> {
+                    try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator)) {
+                      CompletableFuture<ArrowReader> future = scanner.scanBatchesAsync();
+                      ArrowReader reader = future.get(10, TimeUnit.SECONDS);
+                      int rowCount = 0;
+                      while (reader.loadNextBatch()) {
+                        rowCount += reader.getVectorSchemaRoot().getRowCount();
+                      }
+                      reader.close();
+                      return rowCount;
+                    } catch (Exception e) {
+                      throw new RuntimeException(e);
+                    }
+                  },
+                  isolatedExecutor);
+
+          assertEquals(
+              totalRows,
+              result.get(15, TimeUnit.SECONDS),
+              "Async scan from isolated classloader thread should succeed");
+        } finally {
+          isolatedExecutor.shutdown();
+        }
+      }
+    }
+  }
+
+  /**
    * Example 6: Using thenCompose for sequential async operations.
    *
    * <p>Shows how to chain multiple async operations together.
@@ -363,5 +462,138 @@ public class AsyncScannerTest {
         }
       }
     }
+  }
+
+  /**
+   * Regression test: reproduce the JNI classloader bug via a forked JVM.
+   *
+   * <p>Launches a child JVM where only {@code target/test-classes/} is on the system classpath. All
+   * lance classes are loaded by an isolated {@link URLClassLoader} with a null parent (bootstrap
+   * classloader only). This means JNI's {@code FindClass} on a native thread attached via {@code
+   * attach_current_thread_permanently()} will use the system classloader, which <b>cannot</b> find
+   * {@code org.lance.ipc.AsyncScanner}.
+   *
+   * <p>With the fix, {@code JNI_OnLoad} pre-resolves the class on the loading thread (which has the
+   * correct classloader) and passes a {@code GlobalRef} to the dispatcher — so the dispatcher never
+   * calls {@code FindClass}.
+   */
+  @Test
+  void testClassloaderIsolationWithForkedJvm(@TempDir Path tempDir) throws Exception {
+    // --- Collect full classpath from the current classloader hierarchy ---
+    List<String> classpathEntries = new ArrayList<>();
+    ClassLoader cl = Thread.currentThread().getContextClassLoader();
+    if (cl == null) {
+      cl = AsyncScannerTest.class.getClassLoader();
+    }
+    while (cl != null) {
+      if (cl instanceof URLClassLoader) {
+        for (URL url : ((URLClassLoader) cl).getURLs()) {
+          classpathEntries.add(url.getPath());
+        }
+      }
+      cl = cl.getParent();
+    }
+
+    // Fallback: if no URLClassLoader found (Java 9+ AppClassLoader), use java.class.path
+    if (classpathEntries.isEmpty()) {
+      String cp = System.getProperty("java.class.path");
+      if (cp != null) {
+        for (String entry : cp.split(java.io.File.pathSeparator)) {
+          classpathEntries.add(entry);
+        }
+      }
+    }
+
+    // Find the test-classes directory
+    String testClassesDir = null;
+    for (String entry : classpathEntries) {
+      if (entry.contains("test-classes")) {
+        testClassesDir = entry;
+        break;
+      }
+    }
+    assertNotNull(testClassesDir, "Could not find test-classes directory in classpath");
+
+    // Full classpath for the isolated URLClassLoader inside the forked JVM
+    String fullClasspath = String.join(java.io.File.pathSeparator, classpathEntries);
+
+    // --- Build the forked JVM command ---
+    String javaHome = System.getProperty("java.home");
+    String javaBin = javaHome + java.io.File.separator + "bin" + java.io.File.separator + "java";
+
+    List<String> command = new ArrayList<>();
+    command.add(javaBin);
+
+    // Add --add-opens flags matching surefire config (required by Arrow/Netty)
+    command.add("--add-opens=java.base/java.lang=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.lang.invoke=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.lang.reflect=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.io=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.net=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.nio=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.util=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.util.concurrent=ALL-UNNAMED");
+    command.add("--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED");
+    command.add("--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED");
+    command.add("--add-opens=java.base/sun.nio.ch=ALL-UNNAMED");
+    command.add("--add-opens=java.base/sun.nio.cs=ALL-UNNAMED");
+    command.add("--add-opens=java.base/sun.security.action=ALL-UNNAMED");
+    command.add("--add-opens=java.base/sun.util.calendar=ALL-UNNAMED");
+    command.add("--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED");
+    command.add("-XX:+IgnoreUnrecognizedVMOptions");
+    command.add("-Dio.netty.tryReflectionSetAccessible=true");
+
+    // System classpath: ONLY test-classes (no lance main classes)
+    command.add("-cp");
+    command.add(testClassesDir);
+
+    command.add("org.lance.ClassloaderBugBootstrap");
+    command.add(fullClasspath);
+    command.add(tempDir.toString());
+
+    ProcessBuilder pb = new ProcessBuilder(command);
+    pb.redirectErrorStream(false);
+
+    Process process = pb.start();
+
+    // Read stdout and stderr concurrently to avoid deadlock when buffers fill
+    CompletableFuture<String> stderrFuture =
+        CompletableFuture.supplyAsync(
+            () -> {
+              try (BufferedReader errReader =
+                  new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
+                return errReader.lines().collect(Collectors.joining("\n"));
+              } catch (Exception e) {
+                return "Failed to read stderr: " + e.getMessage();
+              }
+            });
+
+    String stdout;
+    try (BufferedReader outReader =
+        new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+      stdout = outReader.lines().collect(Collectors.joining("\n"));
+    }
+
+    String stderr = stderrFuture.get(60, TimeUnit.SECONDS);
+
+    boolean exited = process.waitFor(60, TimeUnit.SECONDS);
+    assertTrue(exited, "Forked JVM did not exit within 60 seconds");
+
+    int exitCode = process.exitValue();
+    assertEquals(
+        0,
+        exitCode,
+        "Forked JVM exited with code "
+            + exitCode
+            + "\n--- stdout ---\n"
+            + stdout
+            + "\n--- stderr ---\n"
+            + stderr);
+    assertTrue(
+        stdout.contains("SUCCESS"),
+        "Expected SUCCESS in stdout but got:\n--- stdout ---\n"
+            + stdout
+            + "\n--- stderr ---\n"
+            + stderr);
   }
 }

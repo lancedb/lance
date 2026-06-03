@@ -27,7 +27,6 @@ import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.operation.Append;
-import org.lance.operation.CreateIndex;
 import org.lance.operation.Overwrite;
 import org.lance.operation.UpdateConfig;
 import org.lance.operation.UpdateMap;
@@ -72,7 +71,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -2175,72 +2173,36 @@ public class DatasetTest {
 
         ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{\"zone_size\": 2048}");
         IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
-        UUID uuid = UUID.randomUUID();
 
         // 2. partially create index
-        dataset.createIndex(
-            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
-                .withIndexName("test_index")
-                .withIndexUUID(uuid.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
-                .build());
-        dataset.createIndex(
-            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
-                .withIndexName("test_index")
-                .withIndexUUID(uuid.toString())
-                .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
-                .build());
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : fragments) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                      .withIndexName("test_index")
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
 
         // then no index should have been created
         assertFalse(
             dataset.listIndexes().contains("test_index"),
             "Partially created index should not present");
 
-        // 3. merge metadata, which will still not be committed
-        dataset.mergeIndexMetadata(uuid.toString(), IndexType.BTREE, Optional.empty());
+        // 3. commit the index
+        List<Index> committed = dataset.commitExistingIndexSegments("test_index", "name", segments);
+        assertEquals(2, committed.size());
+        assertTrue(dataset.listIndexes().contains("test_index"));
 
-        // 4. commit the index
-        int fieldId =
-            dataset.getLanceSchema().fields().stream()
-                .filter(f -> f.getName().equals("name"))
-                .findAny()
-                .orElseThrow(() -> new RuntimeException("Cannot find 'name' field for TestDataset"))
-                .getId();
+        List<Index> indexes = dataset.getIndexes();
+        assertTrue(indexes.stream().anyMatch(idx -> idx.name().equals("test_index")));
 
-        long datasetVersion = dataset.version();
+        dataset.dropIndex("test_index");
 
-        Index index =
-            Index.builder()
-                .uuid(uuid)
-                .name("test_index")
-                .fields(Collections.singletonList(fieldId))
-                .datasetVersion(datasetVersion)
-                .indexVersion(0)
-                .fragments(fragments.stream().map(Fragment::getId).collect(Collectors.toList()))
-                .build();
-
-        CreateIndex createIndexOp =
-            CreateIndex.builder().withNewIndices(Collections.singletonList(index)).build();
-
-        try (Transaction createIndexTx =
-            new Transaction.Builder()
-                .readVersion(datasetVersion)
-                .operation(createIndexOp)
-                .build()) {
-          try (Dataset newDataset = new CommitBuilder(dataset).execute(createIndexTx)) {
-            // new dataset should contain that index
-            assertEquals(datasetVersion + 1, newDataset.version());
-            assertTrue(newDataset.listIndexes().contains("test_index"));
-
-            List<Index> indexes = newDataset.getIndexes();
-            assertTrue(indexes.stream().anyMatch(idx -> idx.name().equals("test_index")));
-
-            newDataset.dropIndex("test_index");
-
-            List<String> indexNamesAfterDrop = newDataset.listIndexes();
-            assertFalse(indexNamesAfterDrop.contains("test_index"));
-          }
-        }
+        List<String> indexNamesAfterDrop = dataset.listIndexes();
+        assertFalse(indexNamesAfterDrop.contains("test_index"));
       }
     }
   }

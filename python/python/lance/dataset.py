@@ -95,6 +95,8 @@ if TYPE_CHECKING:
         Iterable[Union[float, Iterable[float]]],
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
+# Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
+_DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=30)
 _BLOB_PANDAS_MODE_LAZY = "lazy"
 _BLOB_PANDAS_MODE_BYTES = "bytes"
 _BLOB_PANDAS_MODE_DESCRIPTIONS = "descriptions"
@@ -2959,6 +2961,107 @@ class LanceDataset(pa.dataset.Dataset):
             delete_rate_limit,
         )
 
+    def _prepare_scalar_index_request(
+        self,
+        column: Union[str, List[str]],
+        index_type: Union[str, IndexConfig],
+        kwargs: dict,
+    ) -> tuple[str, str, str]:
+        """Validate and normalize a scalar-index request for the native
+        ``create_index`` call.
+        """
+        if isinstance(column, str):
+            column = [column]
+
+        if len(column) > 1:
+            raise NotImplementedError(
+                "Scalar indices currently only support a single column"
+            )
+
+        column = column[0]
+        lance_field = self._ds.lance_schema.field_case_insensitive(column)
+        if lance_field is None:
+            raise KeyError(f"{column} not found in schema")
+
+        if isinstance(index_type, str):
+            index_type = index_type.upper()
+            if index_type not in [
+                "BTREE",
+                "BITMAP",
+                "NGRAM",
+                "ZONEMAP",
+                "LABEL_LIST",
+                "INVERTED",
+                "FTS",
+                "BLOOMFILTER",
+                "RTREE",
+            ]:
+                raise NotImplementedError(
+                    (
+                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
+                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
+                        f"scalar columns.  Received {index_type}",
+                    )
+                )
+
+            field = lance_field.to_arrow()
+
+            field_type = field.type
+            field_meta = field.metadata
+            if hasattr(field_type, "storage_type"):
+                field_type = field_type.storage_type
+
+            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
+                if (
+                    not pa.types.is_integer(field_type)
+                    and not pa.types.is_floating(field_type)
+                    and not pa.types.is_boolean(field_type)
+                    and not pa.types.is_string(field_type)
+                    and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_fixed_size_binary(field_type)
+                ):
+                    raise TypeError(
+                        f"BTREE/BITMAP index column {column} must be int",
+                        ", float, bool, str, fixed-size-binary, or temporal ",
+                    )
+            elif index_type == "LABEL_LIST":
+                if not pa.types.is_list(field_type):
+                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+            elif index_type == "NGRAM":
+                if not pa.types.is_string(field_type) and not pa.types.is_large_string(
+                    field_type
+                ):
+                    raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type in ["INVERTED", "FTS"]:
+                value_type = field_type
+                if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
+                    value_type = field_type.value_type
+                if (
+                    not pa.types.is_string(value_type)
+                    and not pa.types.is_large_string(value_type)
+                    and not (
+                        pa.types.is_large_binary(value_type)
+                        and field_meta[b"ARROW:extension:name"] == b"lance.json"
+                    )
+                ):
+                    raise TypeError(
+                        f"INVERTED index column {column} must be string, large string"
+                        f" or list of strings, or json, but got {value_type}"
+                    )
+
+            if pa.types.is_duration(field_type):
+                raise TypeError(
+                    f"Scalar index column {column} cannot currently be a duration"
+                )
+            return column, index_type, index_type
+        elif isinstance(index_type, IndexConfig):
+            logical_index_type = index_type.index_type.upper()
+            config = json.dumps(index_type.parameters)
+            kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
+            return column, "scalar", logical_index_type
+        else:
+            raise Exception("index_type must be str or IndexConfig")
+
     def create_scalar_index(
         self,
         column: str,
@@ -3075,8 +3178,9 @@ class LanceDataset(pa.dataset.Dataset):
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
             method returns metadata for one segment but does not commit
-            the index to the dataset. The segment can be planned, merged, and
-            committed later using the segment builder and commit APIs.
+            the index to the dataset. The segment can be optionally merged with
+            other segments and committed later with
+            ``commit_existing_index_segments(...)``.
             This parameter is passed via kwargs internally.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
@@ -3171,97 +3275,15 @@ class LanceDataset(pa.dataset.Dataset):
         ``MaterializeIndex`` operator.
 
         """
-        if isinstance(column, str):
-            column = [column]
+        column, index_type, logical_index_type = self._prepare_scalar_index_request(
+            column, index_type, kwargs
+        )
 
-        if len(column) > 1:
-            raise NotImplementedError(
-                "Scalar indices currently only support a single column"
+        if fragment_ids is not None and logical_index_type == "BTREE":
+            raise ValueError(
+                "BTree distributed indexing uses create_index_uncommitted(..., "
+                'index_type="BTREE", fragment_ids=...)'
             )
-
-        column = column[0]
-        lance_field = self._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise KeyError(f"{column} not found in schema")
-
-        # TODO: Add documentation of IndexConfig approach for creating
-        # indexes that need parameterization
-        if isinstance(index_type, str):
-            index_type = index_type.upper()
-            if index_type not in [
-                "BTREE",
-                "BITMAP",
-                "NGRAM",
-                "ZONEMAP",
-                "LABEL_LIST",
-                "INVERTED",
-                "FTS",
-                "BLOOMFILTER",
-                "RTREE",
-            ]:
-                raise NotImplementedError(
-                    (
-                        'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
-                    )
-                )
-
-            field = lance_field.to_arrow()
-
-            field_type = field.type
-            field_meta = field.metadata
-            if hasattr(field_type, "storage_type"):
-                field_type = field_type.storage_type
-
-            if index_type in ["BTREE", "BITMAP", "ZONEMAP"]:
-                if (
-                    not pa.types.is_integer(field_type)
-                    and not pa.types.is_floating(field_type)
-                    and not pa.types.is_boolean(field_type)
-                    and not pa.types.is_string(field_type)
-                    and not pa.types.is_temporal(field_type)
-                    and not pa.types.is_fixed_size_binary(field_type)
-                ):
-                    raise TypeError(
-                        f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, fixed-size-binary, or temporal ",
-                    )
-            elif index_type == "LABEL_LIST":
-                if not pa.types.is_list(field_type):
-                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
-            elif index_type == "NGRAM":
-                if not pa.types.is_string(field_type) and not pa.types.is_large_string(
-                    field_type
-                ):
-                    raise TypeError(f"NGRAM index column {column} must be a string")
-            elif index_type in ["INVERTED", "FTS"]:
-                value_type = field_type
-                if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
-                    value_type = field_type.value_type
-                if (
-                    not pa.types.is_string(value_type)
-                    and not pa.types.is_large_string(value_type)
-                    and not (
-                        pa.types.is_large_binary(value_type)
-                        and field_meta[b"ARROW:extension:name"] == b"lance.json"
-                    )
-                ):
-                    raise TypeError(
-                        f"INVERTED index column {column} must be string, large string"
-                        f" or list of strings, or json, but got {value_type}"
-                    )
-
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
-        elif isinstance(index_type, IndexConfig):
-            config = json.dumps(index_type.parameters)
-            kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
-            index_type = "scalar"
-        else:
-            raise Exception("index_type must be str or IndexConfig")
 
         # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
@@ -3761,8 +3783,8 @@ class LanceDataset(pa.dataset.Dataset):
             This enables distributed/fragment-level indexing. When provided, the
             method creates one segment but does not commit the index
             to the dataset. The returned metadata can be passed to
-            ``create_index_segment_builder().with_index_type(...).with_segments(...)``
-            and then committed with ``commit_existing_index_segments(...)``.
+            ``merge_existing_index_segments(...)`` if grouping is needed and then
+            committed with ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
@@ -3953,10 +3975,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Create one segment without publishing it and return its metadata.
 
-        This is the public distributed-build API for vector index
-        construction. Unlike :meth:`create_index`, this method does not publish
-        the index into the dataset manifest. Instead, it writes one segment
-        under ``_indices/<segment_uuid>/`` and returns the resulting
+        This is the public distributed-build API for vector and BTREE scalar
+        index construction. Unlike :meth:`create_index`, this method does not
+        publish the index into the dataset manifest. Instead, it writes one
+        segment under ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
         Callers should:
@@ -3964,11 +3986,14 @@ class LanceDataset(pa.dataset.Dataset):
         1. run :meth:`create_index_uncommitted` on each worker with that worker's
            assigned ``fragment_ids``
         2. collect the returned :class:`Index` objects
-        3. call :meth:`IndexSegmentBuilder.with_index_type` with the concrete
-           distributed index type
-        4. pass them to :meth:`IndexSegmentBuilder.with_segments`
-        5. build one or more physical segments and commit them with
+        3. optionally merge caller-defined groups with
+           :meth:`merge_existing_index_segments`
+        4. commit the final segment list with
            :meth:`commit_existing_index_segments`
+
+        BTREE segments do not yet support the segment builder (steps 3-4); collect
+        the returned segments and pass them straight to
+        :meth:`commit_existing_index_segments`.
 
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
@@ -3980,6 +4005,37 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
+        is_btree_request = (
+            isinstance(index_type, str) and index_type.upper() == "BTREE"
+        ) or (
+            isinstance(index_type, IndexConfig)
+            and index_type.index_type.upper() == "BTREE"
+        )
+        if is_btree_request:
+            if fragment_ids is None:
+                raise ValueError(
+                    "create_index_uncommitted requires fragment_ids "
+                    "for distributed index build"
+                )
+
+            kwargs = dict(kwargs)
+            column, rust_index_type, _ = self._prepare_scalar_index_request(
+                column, index_type, kwargs
+            )
+            kwargs["fragment_ids"] = fragment_ids
+            if index_uuid is not None:
+                kwargs["index_uuid"] = index_uuid
+
+            return self._ds.create_index(
+                [column],
+                rust_index_type,
+                name,
+                replace,
+                train,
+                storage_options,
+                kwargs,
+            )
+
         return self._create_index_impl(
             column,
             index_type,
@@ -4051,9 +4107,9 @@ class LanceDataset(pa.dataset.Dataset):
         Merge distributed scalar index metadata.
 
         Vector distributed indexing no longer uses this API. For vector indices,
-        build segments with :meth:`create_index_uncommitted`, plan or
-        merge them with :meth:`create_index_segment_builder`, and publish them
-        with :meth:`commit_existing_index_segments`.
+        build segments with :meth:`create_index_uncommitted`, optionally merge
+        them with :meth:`merge_existing_index_segments`, and publish them with
+        :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
@@ -4089,17 +4145,6 @@ class LanceDataset(pa.dataset.Dataset):
         # Merge physical index files at the index directory
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
         return None
-
-    def create_index_segment_builder(self):
-        """
-        Create a builder for turning existing segments into physical segments.
-
-        Provide the segment metadata returned by
-        :meth:`create_index_uncommitted` through
-        :meth:`IndexSegmentBuilder.with_segments`, and declare the segment type
-        with :meth:`IndexSegmentBuilder.with_index_type`.
-        """
-        return self._ds.create_index_segment_builder()
 
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """
@@ -4161,6 +4206,7 @@ class LanceDataset(pa.dataset.Dataset):
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        commit_timeout: Optional[timedelta] = _DEFAULT_COMMIT_TIMEOUT,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -4233,6 +4279,10 @@ class LanceDataset(pa.dataset.Dataset):
             Must be provided together with namespace_client.
         base_store_params : dict of str to dict, optional
             Runtime-only object store parameters keyed by base path URI.
+        commit_timeout : timedelta, optional
+            Maximum time to wait for the commit operation (including retries on
+            conflict) to complete. Defaults to 30 minutes. Pass ``None`` to
+            disable the timeout entirely. Must be a positive duration.
 
         Returns
         -------
@@ -4312,6 +4362,7 @@ class LanceDataset(pa.dataset.Dataset):
                 namespace_client=namespace_client,
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
+                commit_timeout=commit_timeout,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -4328,6 +4379,7 @@ class LanceDataset(pa.dataset.Dataset):
                 namespace_client=namespace_client,
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
+                commit_timeout=commit_timeout,
             )
         else:
             raise TypeError(
@@ -4357,6 +4409,7 @@ class LanceDataset(pa.dataset.Dataset):
         detached: Optional[bool] = False,
         max_retries: int = 20,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        commit_timeout: Optional[timedelta] = _DEFAULT_COMMIT_TIMEOUT,
     ) -> BulkCommitResult:
         """Create a new version of dataset with multiple transactions.
 
@@ -4401,6 +4454,10 @@ class LanceDataset(pa.dataset.Dataset):
             The maximum number of retries to perform when committing the dataset.
         base_store_params : dict of str to dict, optional
             Runtime-only object store parameters keyed by base path URI.
+        commit_timeout : timedelta, optional
+            Maximum time to wait for the commit operation (including retries on
+            conflict) to complete. Defaults to 30 minutes. Pass ``None`` to
+            disable the timeout entirely. Must be a positive duration.
 
         Returns
         -------
@@ -4437,6 +4494,7 @@ class LanceDataset(pa.dataset.Dataset):
             enable_v2_manifest_paths=enable_v2_manifest_paths,
             detached=detached,
             max_retries=max_retries,
+            commit_timeout=commit_timeout,
         )
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
@@ -4792,6 +4850,7 @@ class LanceDataset(pa.dataset.Dataset):
         async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
+        hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> None:
         """Initialize MemWAL on this dataset.
 
@@ -4815,6 +4874,15 @@ class LanceDataset(pa.dataset.Dataset):
         maintained_indexes : list of str, optional
             Names of existing indexes to keep updated as data is written
             through the MemWAL. Must reference indexes that already exist.
+        hnsw_params : dict, optional
+            Per-index HNSW build-parameter overrides recorded as writer-config
+            defaults, keyed by maintained vector index name. Each value is a dict
+            with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters. These are writer config — they affect the MemTable a
+            writer builds and may be overridden per-writer in
+            :meth:`mem_wal_writer`.
         bucket_column : str, optional
             With ``num_buckets``, hash-bucket writes by this scalar column.
         num_buckets : int, optional
@@ -4852,6 +4920,7 @@ class LanceDataset(pa.dataset.Dataset):
             async_index_interval_ms=async_index_interval_ms,
             backpressure_log_interval_ms=backpressure_log_interval_ms,
             stats_log_interval_ms=stats_log_interval_ms,
+            hnsw_params=hnsw_params,
         )
 
     def mem_wal_index_details(self) -> Optional[dict]:
@@ -4883,6 +4952,7 @@ class LanceDataset(pa.dataset.Dataset):
         async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
+        hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> "mem_wal.ShardWriter":
         """Get a ShardWriter for the specified shard.
 
@@ -4923,6 +4993,13 @@ class LanceDataset(pa.dataset.Dataset):
         stats_log_interval_ms : int, optional
             Interval for statistics log messages in milliseconds
             (default: 60 000).  Pass ``0`` to disable.
+        hnsw_params : dict, optional
+            Per-index HNSW build-parameter overrides for the MemTable this
+            writer builds, keyed by maintained vector index name. Each value is
+            a dict with any of ``num_edges`` (graph degree; level 0 keeps
+            ``2 * num_edges``, equivalent to FAISS's ``M``), ``ef_construction``,
+            and ``max_level``. Without an override an index uses the default
+            parameters.
 
         Returns
         -------
@@ -4969,6 +5046,7 @@ class LanceDataset(pa.dataset.Dataset):
                 ("async_index_interval_ms", async_index_interval_ms),
                 ("backpressure_log_interval_ms", backpressure_log_interval_ms),
                 ("stats_log_interval_ms", stats_log_interval_ms),
+                ("hnsw_params", hnsw_params),
             ]
             if val is not None
         }

@@ -6,15 +6,17 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::index::vector::VectorIndexParams;
-use lance_arrow::FixedSizeListArrayExt;
-use lance_arrow::json::{JsonArray, is_arrow_json_field, json_field};
+use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, json_field};
+use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
 
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::UInt64Array;
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, FixedSizeListArray, ListArray, StructArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
@@ -358,6 +360,80 @@ async fn test_scan_limit_offset_preserves_json_extension_metadata() {
         batch_with_offset.schema().field_with_name("meta").unwrap()
     ));
     assert_eq!(batch_no_offset.schema(), batch_with_offset.schema());
+}
+
+#[tokio::test]
+async fn test_scan_nested_arrow_json_extension_v2() {
+    let mut json_metadata = HashMap::new();
+    json_metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let item_fields = Fields::from(vec![
+        Arc::new(ArrowField::new("uri", DataType::Utf8, false)),
+        Arc::new(ArrowField::new("extra", DataType::Utf8, true).with_metadata(json_metadata)),
+    ]);
+    let item = Arc::new(ArrowField::new(
+        "item",
+        DataType::Struct(item_fields.clone()),
+        true,
+    ));
+    let media_field = ArrowField::new("media", DataType::List(item.clone()), true);
+    let schema = Arc::new(ArrowSchema::new(vec![media_field]));
+
+    for version in [
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+        LanceFileVersion::V2_3,
+    ] {
+        let values = StructArray::new(
+            item_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a.jpg"), Some("b.jpg")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"codec":"h264"}"#),
+                    None::<&str>,
+                ])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let media = ListArray::new(
+            item.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+            Arc::new(values),
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(media)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+        let write_params = WriteParams {
+            data_storage_version: Some(version),
+            ..WriteParams::default()
+        };
+        let uri = format!("memory://{}", Uuid::new_v4());
+        let dataset = Dataset::write(reader, &uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let batch_schema = batch.schema();
+        let DataType::List(item) = batch_schema.field(0).data_type() else {
+            panic!("expected media list field");
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("expected media item struct");
+        };
+        assert!(is_arrow_json_field(&fields[1]));
+
+        let media: &ListArray = batch.column(0).as_list();
+        let items = media.values().as_struct();
+        let extra = items
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(extra.value(0).contains("h264"));
+        assert!(extra.is_null(1));
+    }
 }
 
 #[tokio::test]

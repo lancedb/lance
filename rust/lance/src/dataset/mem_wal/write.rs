@@ -12,7 +12,7 @@
 //! - [`IndexStore`] - In-memory index management
 //! - [`MemTableFlusher`] - Flush MemTable to storage as single Lance file
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_io::object_store::ObjectStore;
 use log::{debug, error, info, warn};
 use object_store::path::Path;
@@ -201,6 +202,20 @@ pub struct ShardWriterConfig {
     /// no background tasks, use `WalAppender` directly — it is a strictly
     /// lower-level primitive.
     pub enable_memtable: bool,
+
+    /// Per-index HNSW build-parameter overrides for maintained vector indexes,
+    /// keyed by index name.
+    ///
+    /// These control the in-memory HNSW graph this writer builds for its
+    /// MemTable (and, on flush, the on-disk graph serialized from it). They are
+    /// a property of the writer that builds the MemTable, not of the index
+    /// definition: each flushed generation is independent, so different writers
+    /// may use different parameters. An index without an entry uses the default
+    /// build parameters. `num_edges` is the HNSW graph degree (level 0 retains
+    /// `2 * num_edges`), equivalent to FAISS's `M`.
+    ///
+    /// Default: empty.
+    pub hnsw_params: HashMap<String, HnswBuildParams>,
 }
 
 impl Default for ShardWriterConfig {
@@ -222,6 +237,7 @@ impl Default for ShardWriterConfig {
             async_index_interval: Duration::from_secs(1),
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
             enable_memtable: true,
+            hnsw_params: HashMap::new(),
         }
     }
 }
@@ -323,6 +339,20 @@ impl ShardWriterConfig {
     /// full WAL-only-mode contract. Defaults to `true`.
     pub fn with_enable_memtable(mut self, enable: bool) -> Self {
         self.enable_memtable = enable;
+        self
+    }
+
+    /// Override the HNSW build parameters for a maintained vector index.
+    ///
+    /// Applies to the in-memory HNSW graph this writer builds for `index_name`
+    /// (and the on-disk graph serialized from it on flush). Calling this
+    /// repeatedly for the same index replaces the previous value.
+    pub fn with_hnsw_params(
+        mut self,
+        index_name: impl Into<String>,
+        params: HnswBuildParams,
+    ) -> Self {
+        self.hnsw_params.insert(index_name.into(), params);
         self
     }
 }
@@ -4524,6 +4554,92 @@ mod shard_writer_tests {
             .await
             .unwrap();
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_writer_hnsw_params_override() {
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+
+        let vector_dim = 32;
+        let schema = create_test_schema(vector_dim);
+        let uri = format!("memory://test_writer_hnsw_params_{}", Uuid::new_v4());
+
+        let initial = create_test_batch(&schema, 0, 256, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+        let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &vector_params,
+                true,
+            )
+            .await
+            .expect("Failed to create vector index");
+
+        // Persisting a ShardWriterConfig that carries HNSW params records them
+        // in the writer-config defaults map under `hnsw.<index>.<field>` keys.
+        let configured = ShardWriterConfig::new(Uuid::new_v4()).with_hnsw_params(
+            "vector_idx",
+            HnswBuildParams::default().num_edges(7).ef_construction(48),
+        );
+        dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["vector_idx"])
+            .writer_config_defaults(configured)
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+        let defaults = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .expect("MemWAL details should exist")
+            .writer_config_defaults;
+        assert_eq!(
+            defaults
+                .get("hnsw.vector_idx.num_edges")
+                .map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            defaults
+                .get("hnsw.vector_idx.ef_construction")
+                .map(String::as_str),
+            Some("48")
+        );
+
+        // The writer's per-index HNSW override flows into the in-memory index.
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
+            .with_durable_write(false)
+            .with_hnsw_params(
+                "vector_idx",
+                HnswBuildParams::default().num_edges(7).ef_construction(48),
+            );
+        let writer = dataset
+            .mem_wal_writer(shard_id, config)
+            .await
+            .expect("mem_wal_writer must accept the HNSW-param override");
+        writer
+            .put(vec![create_test_batch(&schema, 300, 10, vector_dim)])
+            .await
+            .unwrap();
+
+        let active = writer.active_memtable_ref().await.unwrap();
+        let hnsw = active
+            .index_store
+            .get_hnsw("vector_idx")
+            .expect("maintained HNSW index should exist in the memtable");
+        assert_eq!(hnsw.build_params().m, 7);
+        assert_eq!(hnsw.build_params().ef_construction, 48);
+        drop(active);
+
         writer.close().await.unwrap();
     }
 

@@ -8,7 +8,9 @@ use std::time::Duration;
 use arrow::datatypes::UInt64Type;
 use arrow_array::types::Float32Type;
 use arrow_schema::DataType;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::fixed_size_list_type;
 use lance_core::ROW_ID;
 use lance_datagen::array::rand_type;

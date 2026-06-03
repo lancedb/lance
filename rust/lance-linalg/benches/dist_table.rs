@@ -8,7 +8,9 @@
 
 use std::iter::repeat_with;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_linalg::simd::dist_table::{BATCH_SIZE, sum_4bit_dist_table, sum_4bit_dist_table_scalar};
 use rand::Rng;
 

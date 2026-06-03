@@ -17,7 +17,7 @@ use lance_index::vector::{
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use rand::prelude::*;
 
 fn create_full_batch(range: Range<u64>, dim: usize) -> RecordBatch {

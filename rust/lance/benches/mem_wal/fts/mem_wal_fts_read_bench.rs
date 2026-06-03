@@ -463,7 +463,15 @@ async fn run_prepare(args: &Args) -> Result<()> {
     }
     let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
     let write_start = Instant::now();
-    let mut dataset = Dataset::write(reader, &args.uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        &args.uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     println!(
         "wrote {} base rows in {:.1}s",
         args.base_rows,
@@ -588,7 +596,15 @@ async fn build_and_query_baseline(
         lo = hi;
     }
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-    let mut merged = Dataset::write(reader, &merged_uri, Some(WriteParams::default())).await?;
+    let mut merged = Dataset::write(
+        reader,
+        &merged_uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     merged
         .create_index(
             &[TEXT_COL],

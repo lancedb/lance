@@ -40,13 +40,12 @@ use lance_index::{
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
-        expression::{
-            INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, ScalarIndexExpr, ScalarIndexLoader,
-            ScalarIndexSearch, serialize_index_expr_result,
-        },
+        expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
     },
 };
-use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use lance_select::{
+    IndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::{debug_span, instrument};
@@ -76,6 +75,7 @@ pub struct ScalarIndexExec {
     expr: ScalarIndexExpr,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    result_format: IndexExprResultWireFormat,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -92,9 +92,13 @@ impl DisplayAs for ScalarIndexExec {
 }
 
 impl ScalarIndexExec {
-    pub fn new(dataset: Arc<Dataset>, expr: ScalarIndexExpr) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        expr: ScalarIndexExpr,
+        result_format: IndexExprResultWireFormat,
+    ) -> Self {
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(INDEX_EXPR_RESULT_SCHEMA.clone()),
+            EquivalenceProperties::new(result_format.schema().clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -104,11 +108,26 @@ impl ScalarIndexExec {
             expr,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            result_format,
         }
     }
 
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn expr(&self) -> &ScalarIndexExpr {
+        &self.expr
+    }
+
+    /// Return the wire format used when serializing this exec's
+    /// [`IndexExprResult`] output.
+    pub fn result_format(&self) -> IndexExprResultWireFormat {
+        self.result_format
+    }
+
     #[async_recursion]
-    async fn fragments_covered_by_index_query(
+    pub async fn fragments_covered_by_index_query(
         index_expr: &ScalarIndexExpr,
         dataset: &Dataset,
     ) -> Result<RoaringBitmap> {
@@ -141,6 +160,7 @@ impl ScalarIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
+        result_format: IndexExprResultWireFormat,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
         let query_result = {
@@ -153,7 +173,7 @@ impl ScalarIndexExec {
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
-            serialize_index_expr_result(&query_result, &fragments_covered_by_result)
+            query_result.serialize(&fragments_covered_by_result, result_format)
         }
     }
 }
@@ -168,7 +188,7 @@ impl ExecutionPlan for ScalarIndexExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        INDEX_EXPR_RESULT_SCHEMA.clone()
+        self.result_format.schema().clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -197,13 +217,14 @@ impl ExecutionPlan for ScalarIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.metrics.clone(),
+            self.result_format,
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            INDEX_EXPR_RESULT_SCHEMA.clone(),
+            self.result_format.schema().clone(),
             stream,
             partition,
             &self.metrics,
@@ -216,7 +237,7 @@ impl ExecutionPlan for ScalarIndexExec {
     ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         Ok(datafusion::physical_plan::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(2),
-            ..datafusion::physical_plan::Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
+            ..datafusion::physical_plan::Statistics::new_unknown(self.result_format.schema())
         })
     }
 
@@ -361,9 +382,10 @@ impl MapIndexExec {
             needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
-        let IndexExprResult::Exact(mut row_addr_mask) = query_result else {
+        if !query_result.is_exact() {
             todo!("Support for non-exact query results as input for merge_insert")
-        };
+        }
+        let mut row_addr_mask = query_result.upper;
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
             row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
@@ -555,21 +577,26 @@ impl MaterializeIndexExec {
             // when the index was trained will still be deleted when the index is queried.
             DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
         });
+        // MaterializeIndexExec emits a deterministic set of row ids. The
+        // `upper` mask of the interval is the candidate set (the answer is
+        // a subset of `upper`). For `Exact` results this is the exact
+        // answer; for `AtMost` and Refined results it's a superset that
+        // gets pruned downstream by `LanceFilterExec` (the full filter
+        // runs on the materialized batches via the scan plan, so any
+        // non-matching candidates in `upper` are dropped before they
+        // reach the user). `AtLeast` carries an unbounded upper, so the
+        // candidate set is the whole row space — not actionable here.
+        let take_upper = |result: IndexExprResult| -> Result<RowAddrMask> {
+            if result.is_at_least() && !result.is_exact() {
+                todo!("Support AtLeast in MaterializeIndexExec")
+            }
+            Ok(result.upper)
+        };
         let mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
-            let mask = match expr_result {
-                IndexExprResult::Exact(mask) => mask,
-                IndexExprResult::AtMost(mask) => mask,
-                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
-            };
-            mask & (*prefilter).clone()
+            take_upper(expr_result)? & (*prefilter).clone()
         } else {
-            let expr_result = expr_result.await?;
-            match expr_result {
-                IndexExprResult::Exact(mask) => mask,
-                IndexExprResult::AtMost(mask) => mask,
-                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
-            }
+            take_upper(expr_result.await?)?
         };
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
@@ -744,6 +771,7 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
+    use arrow_schema::Schema;
     use datafusion::{
         execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
         scalar::ScalarValue,
@@ -758,6 +786,7 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
+    use lance_select::result::IndexExprResultWireFormat;
 
     use crate::{
         Dataset,
@@ -841,6 +870,62 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 5);
     }
 
+    /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
+    /// the same schema the batch actually carries — otherwise downstream
+    /// consumers that trust `ExecutionPlan::schema()` will see a different
+    /// shape than they receive.
+    ///
+    /// The schema depends on the `IndexExprResultWireFormat` passed to `ScalarIndexExec::new`.
+    #[tokio::test]
+    async fn test_scalar_index_exec_advertises_correct_schema() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "ordered".to_string(),
+            index_name: "ordered_idx".to_string(),
+            index_type: "BTree".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::UInt64(Some(47))),
+            )),
+            needs_recheck: false,
+        });
+
+        let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
+            assert_eq!(plan.schema(), schema);
+            assert_eq!(
+                plan.partition_statistics(None)
+                    .unwrap()
+                    .column_statistics
+                    .len(),
+                schema.fields().len(),
+            );
+
+            let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+            assert_eq!(stream.schema(), schema);
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].schema(), schema);
+        };
+
+        let plan = ScalarIndexExec::new(
+            dataset.clone(),
+            query.clone(),
+            IndexExprResultWireFormat::ThreeVariant,
+        );
+        let schema = IndexExprResultWireFormat::ThreeVariant.schema().clone();
+
+        verify(plan, schema).await;
+
+        let plan = ScalarIndexExec::new(dataset, query, IndexExprResultWireFormat::TwoMask);
+        let schema = IndexExprResultWireFormat::TwoMask.schema().clone();
+
+        verify(plan, schema).await;
+    }
+
     #[test]
     fn no_context_scalar_index() {
         // These tests ensure we can create nodes and call execute without a tokio Runtime
@@ -862,7 +947,11 @@ mod tests {
 
         // These plans aren't even valid but it appears we defer all work (even validation) until
         // read time.
-        let plan = ScalarIndexExec::new(arc_dasaset.clone(), query.clone());
+        let plan = ScalarIndexExec::new(
+            arc_dasaset.clone(),
+            query.clone(),
+            IndexExprResultWireFormat::default(),
+        );
         plan.execute(0, Arc::new(TaskContext::default())).unwrap();
 
         let plan = MapIndexExec::new(

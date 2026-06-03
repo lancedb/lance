@@ -28,14 +28,6 @@ class IndexSegment:
 
     def __repr__(self) -> str: ...
 
-class IndexSegmentPlan:
-    segment: IndexSegment
-    segments: list[object]
-    estimated_bytes: int
-    requested_index_type: Optional[str]
-
-    def __repr__(self) -> str: ...
-
 def train_ivf_model(
     dataset,
     column: str,

@@ -1151,11 +1151,19 @@ mod integration_tests {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm_with_btree_index().await;
 
-        // Create scanner with filter on the indexed column
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
-            .filter("id = 5")
-            .unwrap();
-        if let Some((shard_id, memtable)) = active_memtable {
+        // Use a range filter that is semantically `id = 5` but is NOT a
+        // point-lookup shape, so it exercises the union/block-list/dedup/
+        // pushdown structure asserted below. (The `id = 5` *equality* shape now
+        // routes to the fast point-lookup node — verified separately at the end
+        // of this test.)
+        let mut scanner = LsmScanner::new(
+            base_dataset.clone(),
+            shard_snapshots.clone(),
+            pk_columns.clone(),
+        )
+        .filter("id >= 5 AND id <= 5")
+        .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable.clone() {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
@@ -1240,6 +1248,51 @@ mod integration_tests {
             results.get(&5),
             Some(&"active_5".to_string()),
             "Should get newest version (active) for id=5"
+        );
+
+        // Equality shape `id = 5` routes to the fast point-lookup node and must
+        // return the identical newest (active) row across the LSM levels.
+        let mut routed = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .filter("id = 5")
+            .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            routed = routed.with_in_memory_memtables(shard_id, memtable);
+        }
+        let routed_plan = routed.create_plan().await.unwrap();
+        assert!(
+            format!("{}", displayable(routed_plan.as_ref()).indent(true)).contains("OneShotStream"),
+            "id = 5 must route to the fast point-lookup node"
+        );
+        let routed_batches: Vec<RecordBatch> = routed
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut routed_results: HashMap<i32, String> = HashMap::new();
+        for batch in routed_batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                routed_results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(routed_results.len(), 1);
+        assert_eq!(
+            routed_results.get(&5),
+            Some(&"active_5".to_string()),
+            "routed point lookup must also return newest (active) id=5"
         );
     }
 

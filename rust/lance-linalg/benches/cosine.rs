@@ -5,14 +5,16 @@ use arrow_array::{
     Float32Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::{ArrowFloatType, FloatArray, bfloat16::BFloat16Type};
 use lance_linalg::distance::cosine::{Cosine, cosine_distance_batch};
 use lance_linalg::distance::cosine_u8::{cosine_u8, cosine_u8_scalar};
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_testing::datagen::generate_random_array_with_seed;
 

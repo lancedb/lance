@@ -383,7 +383,11 @@ impl Default for NoContextTestFixture {
 
 impl NoContextTestFixture {
     pub fn new() -> Self {
+        // `enable_time` is required because `Dataset::write` runs the commit
+        // through `tokio::time::timeout` (CommitBuilder's default timeout),
+        // which panics without a timer driver.
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
 

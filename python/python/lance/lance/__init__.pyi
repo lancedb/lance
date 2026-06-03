@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -64,7 +65,6 @@ from .fragment import (
 )
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
-from .indices import IndexSegmentPlan as IndexSegmentPlan
 from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
@@ -191,14 +191,6 @@ class LanceColumnStatistics:
 
 class _Session:
     def size_bytes(self) -> int: ...
-
-class IndexSegmentBuilder:
-    def with_index_type(self, index_type: str) -> Self: ...
-    def with_segments(self, segments: List[Index]) -> Self: ...
-    def with_target_segment_bytes(self, bytes: int) -> Self: ...
-    def plan(self) -> List[IndexSegmentPlan]: ...
-    def build(self, plan: IndexSegmentPlan) -> IndexSegment: ...
-    def build_all(self) -> List[IndexSegment]: ...
 
 class LanceBlobFile:
     def close(self): ...
@@ -411,7 +403,6 @@ class _Dataset:
         batch_readhead: Optional[int] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ): ...
-    def create_index_segment_builder(self) -> IndexSegmentBuilder: ...
     def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
     def commit_existing_index_segments(
         self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
@@ -440,6 +431,7 @@ class _Dataset:
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        commit_timeout: Optional[timedelta] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod
@@ -451,6 +443,7 @@ class _Dataset:
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
+        commit_timeout: Optional[timedelta] = None,
     ) -> Tuple[_Dataset, Transaction]: ...
     def validate(self): ...
     def migrate_manifest_paths_v2(self): ...

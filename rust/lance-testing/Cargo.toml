@@ -16,6 +16,10 @@ arrow-schema = { workspace = true }
 rand = { workspace = true }
 num-traits = { workspace = true }
 lance-arrow = { workspace = true }
+criterion = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pprof = { workspace = true }
 
 [lints]
 workspace = true
