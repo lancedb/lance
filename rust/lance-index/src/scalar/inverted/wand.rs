@@ -578,14 +578,14 @@ pub struct Wand<'a, S: Scorer> {
     docs: &'a DocSet,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
-    // k-th score (`atomic_max_f32`) and prunes against the running value -- a
-    // lower bound on the global k-th, so it never drops a real top-k document.
+    // k-th score (`atomic_store_max_f32`) and prunes against the running value
+    // -- a lower bound on the global k-th, so it never drops a real top-k doc.
     shared_threshold: Option<Arc<AtomicU32>>,
 }
 
 /// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
 /// bit-max) so it stays correct for negative scores -- BM25 idf can go negative.
-fn atomic_max_f32(slot: &AtomicU32, val: f32) {
+fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
     let mut cur = slot.load(Ordering::Relaxed);
     while val > f32::from_bits(cur) {
         match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
@@ -654,7 +654,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
         let mut t = local_kth * wand_factor;
         if let Some(shared) = self.shared_threshold.as_ref() {
-            atomic_max_f32(shared, local_kth);
+            atomic_store_max_f32(shared, local_kth);
             let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
             if g > t {
                 t = g;
