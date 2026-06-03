@@ -5945,9 +5945,13 @@ mod tests {
         }
     }
 
+    // Returns the `TempObjDir` guard so callers keep the backing store alive
+    // for the index's lifetime: the deferred DocSet re-opens the docs file on
+    // demand (it does not pin an open handle), so the files must still exist
+    // when the test exercises a scoring path.
     async fn load_counted_v2_index(
         num_tokens: usize,
-    ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>) {
+    ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
         let tmpdir = TempObjDir::default();
         let inner_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -5994,7 +5998,7 @@ mod tests {
         let index = InvertedIndex::load(counting_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
-        (index, counter)
+        (index, counter, tmpdir)
     }
 
     /// IO regression test for the lazy posting-metadata refactor. Builds a
@@ -6019,7 +6023,7 @@ mod tests {
     #[case::tokens_1000(1000)]
     #[tokio::test]
     async fn test_bm25_stats_for_terms_is_lazy(#[case] num_tokens: usize) {
-        let (index, counter) = load_counted_v2_index(num_tokens).await;
+        let (index, counter, _tmpdir) = load_counted_v2_index(num_tokens).await;
         assert!(
             !index.partitions[0].inverted_list.is_legacy_layout(),
             "this test only proves the lazy path for v2 indexes",
@@ -6068,7 +6072,7 @@ mod tests {
         // total token count.
         let num_tokens = 500;
         let queried_tokens: [u32; 4] = [0, 1, 2, 3];
-        let (index, counter) = load_counted_v2_index(num_tokens).await;
+        let (index, counter, _tmpdir) = load_counted_v2_index(num_tokens).await;
         let inverted_list = index.partitions[0].inverted_list.clone();
         assert!(
             !inverted_list.is_legacy_layout(),
