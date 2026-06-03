@@ -524,7 +524,7 @@ impl LabelListIndexState {
     ) -> Result<Arc<LabelListIndex>> {
         let bitmap = self
             .bitmap_state
-            .into_bitmap_index(store, index_cache, frag_reuse_index)?;
+            .to_bitmap_index(store, index_cache, frag_reuse_index)?;
         Ok(Arc::new(LabelListIndex::new(bitmap, self.list_nulls)))
     }
 }

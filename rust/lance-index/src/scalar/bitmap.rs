@@ -197,7 +197,7 @@ impl BitmapIndexState {
         })
     }
 
-    pub(crate) fn into_bitmap_index(
+    pub(crate) fn to_bitmap_index(
         &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
@@ -1700,7 +1700,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
             return Ok(None);
         };
-        let index = state.into_bitmap_index(index_store, cache, frag_reuse_index)?;
+        let index = state.to_bitmap_index(index_store, cache, frag_reuse_index)?;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -1957,7 +1957,8 @@ mod tests {
         const N: u64 = 1_000;
         const NULL_COUNT: u64 = 5;
         // nulls first (sorted batch: nulls precede values)
-        let null_values: Vec<Option<i32>> = std::iter::repeat(None).take(NULL_COUNT as usize).collect();
+        let null_values: Vec<Option<i32>> =
+            std::iter::repeat_n(None, NULL_COUNT as usize).collect();
         let non_null_values: Vec<Option<i32>> = (0..N as i32).map(Some).collect();
         let all_values: Vec<Option<i32>> = null_values.into_iter().chain(non_null_values).collect();
         let all_row_ids: Vec<u64> = (0..N + NULL_COUNT).collect();
