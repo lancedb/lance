@@ -18,6 +18,7 @@ import org.lance.namespace.LanceNamespace;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -73,6 +74,8 @@ public class CommitBuilder {
   private String storageFormat;
   private int maxRetries = 0;
   private boolean skipAutoCleanup = false;
+  // -1 disables the timeout; any positive value is the timeout in nanoseconds.
+  private long commitTimeoutNanos = Duration.ofMinutes(30).toNanos();
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -236,6 +239,29 @@ public class CommitBuilder {
   }
 
   /**
+   * Set a timeout for the commit operation.
+   *
+   * <p>If the commit (including retries on conflict) does not complete within {@code timeout},
+   * {@link #execute(Transaction)} will fail. Pass {@code null} to disable the timeout entirely. The
+   * default is 30 minutes.
+   *
+   * @param timeout the commit timeout, or {@code null} to disable
+   * @return this builder instance
+   * @throws IllegalArgumentException if {@code timeout} is zero or negative
+   */
+  public CommitBuilder commitTimeout(Duration timeout) {
+    if (timeout == null) {
+      this.commitTimeoutNanos = -1L;
+    } else {
+      Preconditions.checkArgument(
+          !timeout.isZero() && !timeout.isNegative(),
+          "commit timeout must be a positive duration; pass null to disable");
+      this.commitTimeoutNanos = timeout.toNanos();
+    }
+    return this;
+  }
+
+  /**
    * Execute the commit with the given transaction.
    *
    * <p>The caller is responsible for closing the transaction (via try-with-resources or {@link
@@ -260,7 +286,8 @@ public class CommitBuilder {
               skipAutoCleanup,
               namespaceClient,
               tableId,
-              namespaceClientManagedVersioning);
+              namespaceClientManagedVersioning,
+              commitTimeoutNanos);
       result.setAllocator(dataset.allocator());
       return result;
     }
@@ -279,7 +306,8 @@ public class CommitBuilder {
               storageFormat,
               maxRetries,
               skipAutoCleanup,
-              namespaceClientManagedVersioning);
+              namespaceClientManagedVersioning,
+              commitTimeoutNanos);
       result.setAllocator(allocator);
       return result;
     }
@@ -298,7 +326,8 @@ public class CommitBuilder {
       boolean skipAutoCleanup,
       Object namespace,
       Object tableId,
-      boolean namespaceClientManagedVersioning);
+      boolean namespaceClientManagedVersioning,
+      long commitTimeoutNanos);
 
   private static native Dataset nativeCommitToUri(
       String uri,
@@ -313,5 +342,6 @@ public class CommitBuilder {
       String storageFormat,
       int maxRetries,
       boolean skipAutoCleanup,
-      boolean namespaceClientManagedVersioning);
+      boolean namespaceClientManagedVersioning,
+      long commitTimeoutNanos);
 }

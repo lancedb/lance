@@ -11,9 +11,9 @@ use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::DatasetIndexExt;
+use lance::index::IndexSegment;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
-use lance::index::{IndexSegment, IndexSegmentPlan};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -36,7 +36,7 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
-use crate::utils::{PyJson, PyLance};
+use crate::utils::PyJson;
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
@@ -73,12 +73,6 @@ pub struct PyIndexSegment {
     pub(crate) inner: IndexSegment,
 }
 
-impl PyIndexSegment {
-    pub(crate) fn from_inner(inner: IndexSegment) -> Self {
-        Self { inner }
-    }
-}
-
 #[pymethods]
 impl PyIndexSegment {
     #[getter]
@@ -102,56 +96,6 @@ impl PyIndexSegment {
             self.uuid(),
             self.fragment_ids(),
             self.index_version()
-        )
-    }
-}
-
-#[pyclass(
-    name = "IndexSegmentPlan",
-    module = "lance.indices",
-    skip_from_py_object
-)]
-#[derive(Debug, Clone)]
-pub struct PyIndexSegmentPlan {
-    pub(crate) inner: IndexSegmentPlan,
-}
-
-impl PyIndexSegmentPlan {
-    pub(crate) fn from_inner(inner: IndexSegmentPlan) -> Self {
-        Self { inner }
-    }
-}
-
-#[pymethods]
-impl PyIndexSegmentPlan {
-    #[getter]
-    fn segment(&self) -> PyIndexSegment {
-        PyIndexSegment::from_inner(self.inner.segment().clone())
-    }
-
-    #[getter]
-    fn segments(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
-        self.inner.segments().iter().cloned().map(PyLance).collect()
-    }
-
-    #[getter]
-    fn estimated_bytes(&self) -> u64 {
-        self.inner.estimated_bytes()
-    }
-
-    #[getter]
-    fn requested_index_type(&self) -> Option<String> {
-        self.inner
-            .requested_index_type()
-            .map(|index_type| index_type.to_string())
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "IndexSegmentPlan(segments={}, estimated_bytes={}, requested_index_type={:?})",
-            self.inner.segments().len(),
-            self.estimated_bytes(),
-            self.requested_index_type()
         )
     }
 }
@@ -758,7 +702,6 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
     indices.add_class::<PyIndexSegment>()?;
-    indices.add_class::<PyIndexSegmentPlan>()?;
     indices.add_class::<PyIndexDescription>()?;
     indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;

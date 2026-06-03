@@ -136,9 +136,9 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, ExternalBlobMode, InsertBuilder,
-    UncommittedDelete, WriteDestination, WriteMode, WriteParams, WriteProgressFn, WriteStats,
-    write_fragments,
+    AutoCleanupParams, CommitBuilder, DEFAULT_COMMIT_TIMEOUT, DeleteBuilder, DeleteResult,
+    ExternalBlobMode, InsertBuilder, UncommittedDelete, WriteDestination, WriteMode, WriteParams,
+    WriteProgressFn, WriteStats, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";

@@ -2762,16 +2762,9 @@ mod tests {
     async fn build_distributed_segments(
         dataset: &mut Dataset,
         segments: Vec<IndexMetadata>,
-        index_type: IndexType,
+        _index_type: IndexType,
         index_name: &str,
-    ) -> Vec<crate::index::api::IndexSegment> {
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(index_type)
-            .with_segments(segments)
-            .build_all()
-            .await
-            .unwrap();
+    ) -> Vec<IndexMetadata> {
         dataset
             .commit_existing_index_segments(index_name, "vector", segments.clone())
             .await
@@ -2994,7 +2987,7 @@ mod tests {
             let segment_index = ds_split
                 .indices_dir()
                 .clone()
-                .join(segment.uuid().to_string())
+                .join(segment.uuid.to_string())
                 .join(crate::index::INDEX_FILE_NAME);
             assert!(
                 ds_split
@@ -3181,7 +3174,14 @@ mod tests {
         assert_eq!(grouped_segments.len(), expected_fragment_coverage.len());
         let mut actual_fragment_coverage = grouped_segments
             .iter()
-            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
+            .map(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .expect("segment should have fragment coverage")
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         actual_fragment_coverage.sort();
         assert_eq!(
@@ -3310,14 +3310,6 @@ mod tests {
             segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(IndexType::IvfHnswFlat)
-            .with_segments(segments)
-            .build_all()
-            .await
-            .unwrap();
-
         dataset
             .commit_existing_index_segments("vector_idx", "vector", segments)
             .await
@@ -3387,15 +3379,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let merged_segment = dataset
-            .create_index_segment_builder()
-            .with_index_type(params.index_type())
-            .with_segments(vec![merged_segment])
-            .build_all()
-            .await
-            .unwrap();
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", merged_segment)
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
             .await
             .unwrap();
 

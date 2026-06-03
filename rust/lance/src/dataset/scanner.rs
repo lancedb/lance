@@ -5111,13 +5111,6 @@ pub mod test_dataset {
                 .iter()
                 .map(|segment| segment.uuid)
                 .collect::<Vec<_>>();
-            let segments = self
-                .dataset
-                .create_index_segment_builder()
-                .with_index_type(params.index_type())
-                .with_segments(segments)
-                .build_all()
-                .await?;
             self.dataset
                 .commit_existing_index_segments("idx", "vec", segments)
                 .await?;

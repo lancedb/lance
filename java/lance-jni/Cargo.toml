@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.91"
@@ -48,7 +48,7 @@ log = "0.4"
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
 prost = "0.14.1"
-roaring = "0.11"
+roaring = "0.11.4"
 prost-types = "0.14.1"
 chrono = "0.4.41"
 
