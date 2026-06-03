@@ -6688,6 +6688,21 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(segment_seq_by_uuid.get(&seg0.uuid), Some(&Some(1)));
         assert_eq!(segment_seq_by_uuid.get(&seg1.uuid), Some(&Some(2)));
+        let index_section = lance_table::io::manifest::read_manifest_index_section(
+            dataset.object_store.as_ref(),
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            index_section
+                .logical_indexes
+                .iter()
+                .find(|idx| idx.index_name == "vector_idx")
+                .and_then(|idx| idx.max_segment_seq),
+            Some(2)
+        );
     }
 
     #[tokio::test]
@@ -6877,6 +6892,21 @@ mod tests {
         assert_eq!(segment_seq_by_uuid.get(&seg0.uuid), Some(&Some(1)));
         assert!(!segment_seq_by_uuid.contains_key(&seg1.uuid));
         assert_eq!(segment_seq_by_uuid.get(&replacement.uuid), Some(&Some(3)));
+        let index_section = lance_table::io::manifest::read_manifest_index_section(
+            dataset.object_store.as_ref(),
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            index_section
+                .logical_indexes
+                .iter()
+                .find(|idx| idx.index_name == "vector_idx")
+                .and_then(|idx| idx.max_segment_seq),
+            Some(3)
+        );
         assert_ne!(
             dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
             0
