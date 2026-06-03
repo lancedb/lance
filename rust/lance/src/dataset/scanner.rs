@@ -4248,6 +4248,7 @@ impl Scanner {
             with_make_deletions_null,
             ordered_output: ordered,
             file_reader_options: self.resolved_file_reader_options(),
+            parallelism_cap: None,
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
