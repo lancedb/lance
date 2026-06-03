@@ -377,7 +377,7 @@ version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "serde_core",
  "serde_json",
 ]
@@ -1110,9 +1110,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "bitpacking"
@@ -3079,7 +3079,7 @@ version = "25.12.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "rustc_version",
 ]
 
@@ -3159,7 +3159,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -4169,7 +4169,7 @@ version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "cfg-if 1.0.4",
  "libc",
 ]
@@ -4433,7 +4433,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4537,7 +4537,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrayref",
  "paste",
@@ -4594,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4631,7 +4631,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4664,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4684,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4729,7 +4729,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4755,7 +4755,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4795,7 +4795,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4809,7 +4809,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4888,7 +4888,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4958,7 +4958,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4970,7 +4970,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4986,7 +4986,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5042,7 +5042,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5061,7 +5061,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5108,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5117,7 +5117,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5128,7 +5128,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "icu_segmenter",
  "jieba-rs",
@@ -5140,7 +5140,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "7.2.0-beta.5"
+version = "8.0.0-beta.1"
 dependencies = [
  "clap",
  "lance-core",
@@ -5333,9 +5333,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.30"
+version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
 
 [[package]]
 name = "loom"
@@ -5846,7 +5846,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
 ]
 
 [[package]]
@@ -5958,7 +5958,7 @@ version = "6.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc3cbf698f9438986c11a880c90a6d04b9de27575afd28bbf45b154b6c709e2"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "libc",
  "once_cell",
  "onig_sys",
@@ -6222,7 +6222,7 @@ version = "0.10.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "cfg-if 1.0.4",
  "foreign-types",
  "libc",
@@ -6778,7 +6778,7 @@ checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bit-set",
  "bit-vec",
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "num-traits",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
@@ -7180,7 +7180,7 @@ version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
 ]
 
 [[package]]
@@ -7684,7 +7684,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -7902,7 +7902,7 @@ version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
@@ -8593,7 +8593,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "core-foundation 0.9.4",
  "system-configuration-sys",
 ]
@@ -8985,7 +8985,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e9cd434a998747dd2c4276bc96ee2e0c7a2eadf3cae88e52be55a05fa9053f5"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "bytes",
  "http 1.4.1",
  "http-body 1.0.1",
@@ -9003,7 +9003,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "async-compression",
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -9573,7 +9573,7 @@ version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "semver",
@@ -10052,7 +10052,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
 dependencies = [
  "anyhow",
- "bitflags 2.11.1",
+ "bitflags 2.12.1",
  "indexmap 2.14.0",
  "log",
  "serde",

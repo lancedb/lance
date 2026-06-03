@@ -3035,7 +3035,7 @@ impl Dataset {
         &self,
         index_uuid: &str,
         index_type: IndexType,
-        batch_readhead: Option<usize>,
+        _batch_readhead: Option<usize>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
@@ -3052,15 +3052,11 @@ impl Dataset {
                 .await
             }
             IndexType::BTree => {
-                // Call merge_index_files function for btree index
-                lance_index::scalar::btree::merge_index_files(
-                    self.object_store.as_ref(),
-                    &index_dir,
-                    Arc::new(store),
-                    batch_readhead,
-                    progress,
-                )
-                .await
+                Err(Error::invalid_input(
+                    "BTree distributed indexing no longer supports merge_index_metadata; \
+                     build segments, and commit with commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
             }
             IndexType::Bitmap => {
                 Err(Error::invalid_input(

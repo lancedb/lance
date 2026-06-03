@@ -70,6 +70,26 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
 
+/// Blob v2 user-view struct fields used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+    ])
+});
+
+/// Blob v2 user-view struct type used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_USER_FIELDS.clone()));
+
 pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
 /// LogicalType is a string presentation of arrow type.

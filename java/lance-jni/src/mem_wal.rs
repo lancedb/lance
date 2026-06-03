@@ -35,6 +35,7 @@ use lance::dataset::mem_wal::{
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{MemWalIndexDetails, ShardManifest, ShardingField, ShardingSpec};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
@@ -43,7 +44,9 @@ use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{IntoJava, export_vec, import_vec, import_vec_to_rust};
+use crate::traits::{
+    FromJString, IntoJava, export_vec, import_vec, import_vec_from_method, import_vec_to_rust,
+};
 use crate::utils::to_rust_map;
 
 const NATIVE_SHARD_WRITER: &str = "nativeShardWriterHandle";
@@ -1232,6 +1235,31 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
             Some(Duration::from_millis(v))
         };
         writer_config = writer_config.with_stats_log_interval(interval);
+    }
+    let hnsw_params = import_vec_from_method(
+        env,
+        config,
+        "hnswParams",
+        |env, item| -> Result<(String, HnswBuildParams)> {
+            let index_name = env
+                .call_method(&item, "indexName", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let index_name: String = JString::from(index_name).extract(env)?;
+            let num_edges = env.call_method(&item, "numEdges", "()I", &[])?.i()? as usize;
+            let ef_construction =
+                env.call_method(&item, "efConstruction", "()I", &[])?.i()? as usize;
+            let max_level = env.call_method(&item, "maxLevel", "()I", &[])?.i()? as u16;
+            Ok((
+                index_name,
+                HnswBuildParams::default()
+                    .num_edges(num_edges)
+                    .ef_construction(ef_construction)
+                    .max_level(max_level),
+            ))
+        },
+    )?;
+    for (index_name, params) in hnsw_params {
+        writer_config = writer_config.with_hnsw_params(index_name, params);
     }
     Ok(writer_config)
 }

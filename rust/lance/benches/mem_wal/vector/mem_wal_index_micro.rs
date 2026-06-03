@@ -141,7 +141,15 @@ async fn build_base_dataset(uri: &str, dim: usize) -> lance_core::Result<Dataset
     let s = schema(dim);
     let batch = make_batch(0, BASE_ROWS, dim);
     let reader = RecordBatchIterator::new(std::iter::once(Ok(batch)), s.clone());
-    let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     let ivf_params = IvfBuildParams::new(BASE_IVF_PARTITIONS);
     let pq_params = PQBuildParams::new(BASE_PQ_SUBVECTORS, 8);
     let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);

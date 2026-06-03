@@ -58,10 +58,9 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_io::object_store::ObjectStore;
 use lance_select::NullableRowAddrSet;
 use log::{debug, warn};
-use object_store::{Error as ObjectStoreError, path::Path};
+use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -2141,66 +2140,6 @@ pub async fn train_btree_index(
     Ok(())
 }
 
-pub async fn merge_index_files(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-    store: Arc<dyn IndexStore>,
-    batch_readhead: Option<usize>,
-    progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
-    // List all partition page / lookup files in the index directory
-    let (part_page_files, part_lookup_files) =
-        list_page_lookup_files(object_store, index_dir).await?;
-    merge_metadata_files(
-        store.as_ref(),
-        &part_page_files,
-        &part_lookup_files,
-        batch_readhead,
-        progress,
-    )
-    .await
-}
-
-/// List and filter files from the index directory
-/// Returns (page_files, lookup_files)
-async fn list_page_lookup_files(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let mut part_page_files = Vec::new();
-    let mut part_lookup_files = Vec::new();
-
-    let mut list_stream = object_store.list(Some(index_dir.clone()));
-
-    while let Some(item) = list_stream.next().await {
-        match item {
-            Ok(meta) => {
-                let file_name = meta.location.filename().unwrap_or_default();
-                // Filter files matching the pattern part_*_page_data.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_page_data.lance") {
-                    part_page_files.push(file_name.to_string());
-                }
-                // Filter files matching the pattern part_*_page_lookup.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance") {
-                    part_lookup_files.push(file_name.to_string());
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-
-    if part_page_files.is_empty() || part_lookup_files.is_empty() {
-        return Err(Error::internal(format!(
-            "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-            index_dir,
-            part_page_files.len(),
-            part_lookup_files.len()
-        )));
-    }
-
-    Ok((part_page_files, part_lookup_files))
-}
-
 fn find_single_partition_files(
     files: &[lance_table::format::IndexFile],
 ) -> Result<Option<(&str, &str)>> {
@@ -2803,29 +2742,19 @@ pub struct BTreeParameters {
     /// The number of rows to include in each zone
     pub zone_size: Option<u64>,
 
-    /// The ordinal ID of a data partition for building a large, distributed BTree index.
+    /// DEPRECATED: range-based distributed BTree building has been retired.
+    /// Setting this to `Some(..)` now emits a warning and is ignored at build time
+    /// (see `BTreeIndexPlugin::train_index`). Build one segment per worker and
+    /// commit them with `commit_existing_index_segments(...)`, optionally
+    /// consolidating with `merge_existing_index_segments(...)`. The field is
+    /// retained (rather than removed) so the plugin can detect stale `range_id`
+    /// inputs and warn loudly instead of serde silently dropping an unknown field.
     ///
-    /// When building an index from multiple, pre-partitioned data chunks (for example,
-    /// in a distributed environment), this ID specifies which partition this particular
-    /// build operation corresponds to.
-    ///
-    /// # Data Distribution Requirements
-    ///
-    /// If this parameter is `Some(id)`, the caller **must** guarantee that the input data
-    /// is strictly global sorted. The input data, when considered as a whole across all
-    /// partitions ordered by `range_id`, must be sorted.
-    ///
-    /// Concretely, this means:
-    ///
-    /// All values in the data provided for `range_id: N` must be **less than or equal to**
-    /// all values in the data for `range_id: N+1`.
-    ///
-    /// Lance relies on this precondition to ensure the final, merged index is valid and
-    /// correctly ordered.
-    ///
-    /// # `None` Case
-    ///
-    /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
+    /// Historically, this was the ordinal ID of a globally sorted range
+    /// partition. Lance used it to write `part_*` BTree files that were later
+    /// merged by `merge_index_metadata`. That flow has been retired. A
+    /// pre-sorted training stream is still accepted, but this field no longer
+    /// affects file names, commit behavior, or query semantics.
     pub range_id: Option<u32>,
 }
 
@@ -2903,13 +2832,27 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
             .downcast_ref::<BTreeTrainingRequest>()
             .unwrap();
+        if request.parameters.range_id.is_some() {
+            // `range_id` is deprecated and now ignored. A pre-sorted data stream is
+            // still supported (pass it as the training data), but `range_id` no longer
+            // needs to be set: each build now produces one canonical segment, and
+            // distribution is handled by the segmented-index APIs. The field will be
+            // removed in a future release.
+            warn!(
+                "BTree `range_id` is deprecated and now ignored; a pre-sorted data \
+                 stream is still supported, but `range_id` no longer needs to be passed. \
+                 Use the segmented-index APIs instead (build per-fragment segments, then \
+                 commit_existing_index_segments(...) / merge_existing_index_segments(...)). \
+                 The `range_id` field will be removed in a future release."
+            );
+        }
         train_btree_index(
             data,
             index_store,
@@ -2917,8 +2860,8 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
                 .parameters
                 .zone_size
                 .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
-            fragment_ids,
-            request.parameters.range_id,
+            None,
+            None,
         )
         .await?;
         Ok(CreatedIndex {

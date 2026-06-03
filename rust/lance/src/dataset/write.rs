@@ -657,6 +657,26 @@ pub(crate) async fn cleanup_data_fragments(
                 if let Err(e) = object_store.delete(&path).await {
                     log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
                 }
+
+                // Clean up any blob v2 sidecars that might exist for this data file.
+                // Blob v2 sidecars are written to `data/{data_file_key}/{blob_id}.blob`.
+                // The `data_file_key` is the file stem of the .lance file.
+                if let Some(stem) = std::path::Path::new(file.path.as_str())
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                {
+                    let blob_dir = data_dir.clone().join(stem);
+                    match object_store.remove_dir_all(blob_dir.clone()).await {
+                        Err(e) if !matches!(e, Error::NotFound { .. }) => {
+                            log::warn!(
+                                "Failed to clean up orphaned blob dir '{}': {}",
+                                blob_dir,
+                                e
+                            );
+                        }
+                        _ => {}
+                    }
+                }
             } else {
                 skipped_external += 1;
             }
