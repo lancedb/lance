@@ -12,6 +12,7 @@ use crate::OpsMetrics;
 use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::header::{HeaderName, HeaderValue};
+use sha2::{Digest, Sha256};
 
 use crate::rest_auth::{
     AUTH_PROPERTY_PREFIX, AUTH_TYPE_KEY, RequestContext, RestAuthProvider, create_auth_provider,
@@ -109,31 +110,57 @@ where
     V: AsRef<str>,
 {
     for (k, v) in pairs {
-        if let (Ok(name), Ok(val)) = (
+        match (
             HeaderName::from_str(k.as_ref()),
             HeaderValue::from_str(v.as_ref()),
         ) {
-            headers.insert(name, val);
+            (Ok(name), Ok(val)) => {
+                headers.insert(name, val);
+            }
+            _ => {
+                log::warn!("dropping invalid header: {:?}: {:?}", k.as_ref(), v.as_ref());
+            }
         }
+    }
+}
+
+pub(crate) const EMPTY_BODY_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// `None` for streaming bodies (currently unreachable).
+fn body_sha256_hex(request: &reqwest::Request) -> Option<String> {
+    match request.body() {
+        None => Some(EMPTY_BODY_SHA256.to_string()),
+        Some(body) => match body.as_bytes() {
+            None => None,
+            Some([]) => Some(EMPTY_BODY_SHA256.to_string()),
+            Some(bytes) => Some(hex::encode(Sha256::digest(bytes))),
+        },
     }
 }
 
 impl RestClient {
     fn build_auth_context(request: &reqwest::Request) -> RequestContext {
+        // Lossy decode keeps non-ASCII headers in the signer's view.
         let headers = request
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
             .collect();
         RequestContext {
             method: request.method().to_string(),
             url: request.url().to_string(),
             headers,
+            body_sha256: body_sha256_hex(request),
         }
     }
 
-    /// Apply base, auth, then context headers. Context wins on conflict so it
-    /// can intentionally override auth headers per request.
+    /// Apply headers: base → auth (signed) → context (unsigned).
     async fn apply_headers(
         &self,
         request: &mut reqwest::Request,
@@ -615,6 +642,13 @@ impl RestNamespace {
             rest_client,
             ops_metrics,
         }
+    }
+
+    pub async fn warm_up_auth(&self) -> Result<()> {
+        if let Some(auth) = &self.rest_client.auth_provider {
+            auth.initialize().await?;
+        }
+        Ok(())
     }
 
     /// Parse an error response body and return the appropriate NamespaceError.
@@ -1689,6 +1723,11 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn empty_body_sha256_const_matches_computed() {
+        assert_eq!(EMPTY_BODY_SHA256, hex::encode(Sha256::digest(b"")));
+    }
+
+    #[test]
     fn test_rest_namespace_creation() {
         let mut properties = HashMap::new();
         properties.insert("uri".to_string(), "http://example.com".to_string());
@@ -2297,9 +2336,6 @@ mod tests {
         assert!(result.is_ok(), "Failed: {:?}", result.err());
     }
 
-    // Compatibility tests: the RestAuthProvider framework must not change
-    // existing behaviour for users on the static `header.*` path.
-
     #[tokio::test]
     async fn rest_auth_type_none_outbound_headers_identical_to_no_config() {
         let mock_server = MockServer::start().await;
@@ -2399,7 +2435,6 @@ mod tests {
         );
     }
 
-    /// Auth provider errors must surface as hard failures, not be swallowed.
     #[tokio::test]
     async fn auth_provider_failure_surfaces_as_error() {
         #[derive(Debug)]
@@ -2444,6 +2479,91 @@ mod tests {
         assert!(
             err_msg.contains("list_namespaces"),
             "error should include operation context: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_up_auth_surfaces_initialize_error() {
+        #[derive(Debug)]
+        struct FailOnInit;
+        #[async_trait::async_trait]
+        impl crate::rest_auth::RestAuthProvider for FailOnInit {
+            async fn authenticate(
+                &self,
+                _ctx: &crate::rest_auth::RequestContext,
+            ) -> Result<HashMap<String, String>> {
+                Ok(HashMap::new())
+            }
+            async fn initialize(&self) -> Result<()> {
+                Err(NamespaceError::Unauthenticated {
+                    message: "synthetic-credential-chain-failure".to_string(),
+                }
+                .into())
+            }
+        }
+
+        let ns = RestNamespaceBuilder::new("http://127.0.0.1:1")
+            .auth_provider(std::sync::Arc::new(FailOnInit))
+            .build()
+            .unwrap();
+        let err = ns.warm_up_auth().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("synthetic-credential-chain-failure"),
+            "warm_up_auth must propagate initialize() error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_provider_setter_takes_precedence_over_properties() {
+        #[derive(Debug)]
+        struct MarkerAuth;
+        #[async_trait::async_trait]
+        impl crate::rest_auth::RestAuthProvider for MarkerAuth {
+            async fn authenticate(
+                &self,
+                _ctx: &crate::rest_auth::RequestContext,
+            ) -> Result<HashMap<String, String>> {
+                let mut h = HashMap::new();
+                h.insert("x-marker".to_string(), "from-setter".to_string());
+                Ok(h)
+            }
+        }
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"namespaces": []})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), mock_server.uri());
+        props.insert("rest.auth.type".to_string(), "none".to_string());
+        let ns = RestNamespaceBuilder::from_properties(props)
+            .unwrap()
+            .auth_provider(std::sync::Arc::new(MarkerAuth))
+            .build()
+            .unwrap();
+
+        let req = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+        let _ = ns.list_namespaces(req).await.unwrap();
+
+        let matched = mock_server.received_requests().await.unwrap();
+        assert!(!matched.is_empty());
+        let marker = matched[0]
+            .headers
+            .get("x-marker")
+            .map(|v| v.to_str().unwrap());
+        assert_eq!(
+            marker,
+            Some("from-setter"),
+            "setter auth_provider must override rest.auth.type property"
         );
     }
 }
