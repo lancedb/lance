@@ -33,6 +33,8 @@ pub mod oss;
 pub mod shared_memory;
 #[cfg(feature = "tencent")]
 pub mod tencent;
+#[cfg(feature = "tos")]
+pub mod tos;
 
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
@@ -95,6 +97,7 @@ pub struct ObjectStoreRegistryStats {
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
 /// - `az`: An Azure Blob Storage object store.
 /// - `gs`: A Google Cloud Storage object store.
+/// - `tos`: A Volcengine TOS object store.
 ///
 /// Use [`Self::empty()`] to create an empty registry, with no providers registered.
 ///
@@ -330,6 +333,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
+        #[cfg(feature = "tos")]
+        providers.insert("tos".into(), Arc::new(tos::TosStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),

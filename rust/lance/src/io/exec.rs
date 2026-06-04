@@ -7,6 +7,8 @@
 
 #[cfg(feature = "substrait")]
 pub mod ann_proto;
+pub mod count_from_mask;
+pub mod count_pushdown;
 mod filter;
 pub mod filtered_read;
 #[cfg(feature = "substrait")]

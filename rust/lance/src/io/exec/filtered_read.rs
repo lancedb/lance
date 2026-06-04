@@ -997,6 +997,10 @@ impl FilteredReadStream {
                     base_batch_stream.boxed()
                 };
 
+                // Clone so the finally handler can record a final snapshot even when
+                // no output batches were produced (inspect_ok never fires in that case).
+                let global_metrics_final = global_metrics.clone();
+                let scan_scheduler_final = scan_scheduler.clone();
                 let batch_stream = batch_stream
                     .inspect_ok(move |batch| {
                         partition_metrics_clone
@@ -1005,6 +1009,9 @@ impl FilteredReadStream {
                         global_metrics.io_metrics.record(&scan_scheduler);
                     })
                     .finally(move || {
+                        global_metrics_final
+                            .io_metrics
+                            .record(&scan_scheduler_final);
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
@@ -3714,6 +3721,55 @@ mod tests {
             .map(|v| v.as_usize())
             .unwrap_or(0);
         assert!(iops > 0, "Should have recorded IO operations");
+    }
+
+    // Reproduces a bug where bytes_read (and iops/requests) stay at 0 when a filter matches
+    // no rows. io_metrics.record is only called inside inspect_ok on the output batch stream,
+    // so when the filter produces zero output batches, the I/O that did occur is never counted.
+    #[tokio::test]
+    async fn test_io_metrics_recorded_when_filter_matches_no_rows() {
+        let fixture = TestFixture::new().await;
+        // not_indexed values in the fixture go up to ~400; this filter matches nothing
+        let filter_plan = fixture.filter_plan("not_indexed > 10000", false).await;
+        let options =
+            FilteredReadOptions::basic_full_read(&fixture.dataset).with_filter_plan(filter_plan);
+        let filtered_read =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+
+        let batches = filtered_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "filter should match no rows"
+        );
+
+        let metrics = filtered_read.metrics().unwrap();
+
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            rows_scanned > 0,
+            "rows_scanned ({}) should be > 0: data was read even though filter matched nothing",
+            rows_scanned
+        );
+
+        let bytes_read = metrics
+            .sum_by_name("bytes_read")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            bytes_read > 0,
+            "bytes_read ({}) should be > 0: io_metrics.record is only called when output batches \
+             are produced, so bytes_read stays 0 even though I/O occurred",
+            bytes_read
+        );
     }
 
     /// Test that direct execution gives the same result as get_plan + execute_with_plan

@@ -250,6 +250,13 @@ fn segment_has_inverted_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
 }
 
+fn segment_has_bitmap_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("BitmapIndexDetails"))
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
@@ -585,9 +592,37 @@ pub(crate) async fn remap_index(
     }))
 }
 
+/// Snapshot of every scalar index on a dataset, captured at planning time
+/// and consumed by the scalar/aggregate pushdown machinery.
+///
+/// Built once per planner invocation by walking the manifest's `IndexMetadata`
+/// entries; thereafter all lookups are synchronous, so optimizer rules and the
+/// filter parser can interrogate it without needing an async context.
 #[derive(Debug)]
 pub struct ScalarIndexInfo {
+    /// Per-column dispatch table for [`apply_scalar_indices`]: keyed by the
+    /// full dotted field path (e.g. `"x"`, `"metadata.status.code"`), the same
+    /// string callers use when referring to columns in filter expressions.
+    ///
+    /// The value pairs the column's data type with a [`MultiQueryParser`]
+    /// that fans out to every per-index parser registered for that column.
+    /// When a column carries more than one index (e.g. BTree + bitmap), the
+    /// `MultiQueryParser` tries each in order and the first match wins; the
+    /// resulting [`crate::scalar::expression::ScalarIndexSearch`] records
+    /// which specific index was chosen. So *which* index served the query is
+    /// an output of parsing, not an input — that's why this map is keyed only
+    /// by column.
+    ///
+    /// `fragment_bitmaps`, by contrast, *is* keyed by `(column, index_name)`,
+    /// because by the time the optimizer needs the bitmap the index name is
+    /// already pinned in the parsed leaf.
     indexed_columns: HashMap<String, (DataType, Box<MultiQueryParser>)>,
+    /// `(column, index_name) → fragment_bitmap` taken straight off each
+    /// [`IndexMetadata`] at construction time. Used by the optimizer rule for
+    /// aggregate pushdown to reason about index coverage synchronously.
+    /// Indices that omit `fragment_bitmap` (legacy or unsupported) simply
+    /// don't appear here and so report coverage as unknown.
+    fragment_bitmaps: HashMap<(String, String), RoaringBitmap>,
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
@@ -595,6 +630,12 @@ impl IndexInformationProvider for ScalarIndexInfo {
         self.indexed_columns
             .get(col)
             .map(|(ty, parser)| (ty, parser.as_ref() as &dyn ScalarQueryParser))
+    }
+
+    fn fragment_bitmap(&self, column: &str, index_name: &str) -> Option<RoaringBitmap> {
+        self.fragment_bitmaps
+            .get(&(column.to_string(), index_name.to_string()))
+            .cloned()
     }
 }
 
@@ -1069,7 +1110,8 @@ impl DatasetIndexExt for Dataset {
         }
         let all_vector = source_segments.iter().all(segment_has_vector_details);
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
-        if !all_vector && !all_inverted {
+        let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
+        if !all_vector && !all_inverted && !all_bitmap {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
@@ -1083,8 +1125,10 @@ impl DatasetIndexExt for Dataset {
                 source_segments,
             )
             .await?
-        } else {
+        } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
+        } else {
+            crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
         };
         merged_segment.dataset_version = self.manifest.version;
         merged_segment.fields = vec![field_id];
@@ -2177,6 +2221,12 @@ impl DatasetIndexInternalExt for Dataset {
         let indices = self.load_indices().await?;
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
+        // (column, index_name) → union of every contributing IndexMetadata's
+        // fragment_bitmap. Multiple entries can land here for delta-merged
+        // indices that share a name. We only insert when every contributing
+        // entry has a bitmap; if any are missing, we leave the entry absent
+        // so the optimizer treats coverage as unknown.
+        let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
         for index in indices.iter().filter(|idx| {
             let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
             let is_vector_index = idx_schema
@@ -2235,6 +2285,23 @@ impl DatasetIndexInternalExt for Dataset {
             let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
             if let Some(query_parser) = query_parser {
+                // Union the per-segment fragment bitmap into this
+                // (column, index_name) entry. If any segment is missing a
+                // bitmap, downgrade the entry to None so callers know
+                // coverage is partial/unknown.
+                let key = (field_path.clone(), index.name.clone());
+                fragment_bitmaps
+                    .entry(key)
+                    .and_modify(|entry| {
+                        if let (Some(acc), Some(seg)) =
+                            (entry.as_mut(), index.fragment_bitmap.as_ref())
+                        {
+                            *acc |= seg;
+                        } else {
+                            *entry = None;
+                        }
+                    })
+                    .or_insert_with(|| index.fragment_bitmap.clone());
                 indexed_fields.push((field_path, (field.data_type(), query_parser)));
             }
         }
@@ -2259,8 +2326,14 @@ impl DatasetIndexInternalExt for Dataset {
                     )
                 });
         }
+        // Drop entries we couldn't pin to a known bitmap.
+        let fragment_bitmaps = fragment_bitmaps
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|bm| (k, bm)))
+            .collect();
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
+            fragment_bitmaps,
         })
     }
 

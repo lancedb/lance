@@ -3783,41 +3783,52 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
 
-def _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragment_ids):
-    ds.merge_index_metadata(index_id, index_type="BITMAP")
-
-    from lance.dataset import Index
-
-    field_id = ds.schema.get_field_index("category")
-    index = Index(
-        uuid=index_id,
-        name=index_name,
-        fields=[field_id],
-        dataset_version=ds.version,
-        fragment_ids=set(fragment_ids),
-        index_version=0,
+def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
+    dataset_path = tmp_path / "bitmap_segments.lance"
+    ds = generate_multi_fragment_bitmap_dataset(
+        dataset_path, num_fragments=4, rows_per_fragment=40
     )
-    create_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[index],
-        removed_indices=[],
-    )
-    lance.LanceDataset.commit(
-        ds.uri,
-        create_index_op,
-        read_version=ds.version,
-    )
-    reopened_ds = lance.dataset(ds.uri)
 
-    stats = reopened_ds.stats.index_stats(index_name)
-    assert stats["index_type"] == "Bitmap"
+    index_name = "bitmap_segment_idx"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    fragment_groups = [
+        fragment_ids[idx : idx + 2] for idx in range(0, len(fragment_ids), 2)
+    ]
+    assert len(fragment_groups) >= 2
+
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="category",
+            index_type="BITMAP",
+            name=index_name,
+            fragment_ids=fragment_group,
+        )
+        for fragment_group in fragment_groups
+    ]
+
+    assert len({segment.uuid for segment in staged_segments}) == len(staged_segments)
+    for segment, fragment_group in zip(staged_segments, fragment_groups):
+        assert segment.fragment_ids == set(fragment_group)
+        assert any(file.path == "bitmap_page_lookup.lance" for file in segment.files)
+        assert all(not file.path.startswith("part_") for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.uuid not in {segment.uuid for segment in staged_segments}
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "bitmap_page_lookup.lance" for file in merged_segment.files)
+    assert all(not file.path.startswith("part_") for file in merged_segment.files)
+
+    ds = ds.commit_existing_index_segments(index_name, "category", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert len(descriptions[index_name].segments) == 1
 
     filter_expr = "category = 3"
-    without_index = reopened_ds.scanner(
+    without_index = ds.scanner(
         filter=filter_expr,
         columns=["id", "category"],
         use_scalar_index=False,
     ).to_table()
-    with_index = reopened_ds.scanner(
+    with_index = ds.scanner(
         filter=filter_expr,
         columns=["id", "category"],
         use_scalar_index=True,
@@ -3826,77 +3837,10 @@ def _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragmen
     assert with_index.num_rows == without_index.num_rows
     assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
     assert set(with_index["category"].to_pylist()) == {3}
-
-    explain = reopened_ds.scanner(
-        filter=filter_expr,
-        use_scalar_index=True,
-    ).explain_plan()
-    assert "ScalarIndexQuery" in explain
-
-    empty_without_index = reopened_ds.scanner(
-        filter="category = 99",
-        use_scalar_index=False,
-    ).to_table()
-    empty_with_index = reopened_ds.scanner(
-        filter="category = 99",
-        use_scalar_index=True,
-    ).to_table()
-    assert empty_with_index.num_rows == empty_without_index.num_rows == 0
-
-
-def test_distributed_bitmap_index_build(tmp_path):
-    ds = generate_multi_fragment_bitmap_dataset(
-        tmp_path / "bitmap_dist.lance", num_fragments=4, rows_per_fragment=40
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
     )
-
-    index_id = str(uuid.uuid4())
-    index_name = "bitmap_multiple_fragment_idx"
-    fragments = ds.get_fragments()
-    fragment_ids = [fragment.fragment_id for fragment in fragments]
-    fragment_groups = [
-        fragment_ids[idx : idx + 2] for idx in range(0, len(fragment_ids), 2)
-    ]
-    assert len(fragment_groups) >= 2
-
-    for shard_id, fragment_group in enumerate(fragment_groups):
-        ds.create_scalar_index(
-            column="category",
-            index_type=IndexConfig(
-                index_type="bitmap",
-                parameters={"shard_id": shard_id},
-            ),
-            name=index_name,
-            replace=False,
-            index_uuid=index_id,
-            fragment_ids=fragment_group,
-        )
-
-    _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragment_ids)
-
-
-def test_distributed_bitmap_index_build_single_fragment_shards(tmp_path):
-    ds = generate_multi_fragment_bitmap_dataset(
-        tmp_path / "bitmap_single_fragment_dist.lance",
-        num_fragments=4,
-        rows_per_fragment=40,
-    )
-
-    index_id = str(uuid.uuid4())
-    index_name = "bitmap_single_fragment_idx"
-    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
-    assert len(fragment_ids) >= 2
-
-    for fragment_id in fragment_ids:
-        ds.create_scalar_index(
-            column="category",
-            index_type="BITMAP",
-            name=index_name,
-            replace=False,
-            index_uuid=index_id,
-            fragment_ids=[fragment_id],
-        )
-
-    _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragment_ids)
 
 
 def test_merge_index_metadata_btree_soft_break(tmp_path):

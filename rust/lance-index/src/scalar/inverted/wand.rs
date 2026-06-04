@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
@@ -576,6 +577,22 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     docs: &'a DocSet,
     scorer: S,
+    // Shared cross-partition top-k floor. Each partition publishes its local
+    // k-th score (`atomic_store_max_f32`) and prunes against the running value
+    // -- a lower bound on the global k-th, so it never drops a real top-k doc.
+    shared_threshold: Option<Arc<AtomicU32>>,
+}
+
+/// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
+/// bit-max) so it stays correct for negative scores -- BM25 idf can go negative.
+fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
+    let mut cur = slot.load(Ordering::Relaxed);
+    while val > f32::from_bits(cur) {
+        match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 // we were using row id as doc id in the past, which is u64,
@@ -622,6 +639,38 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_last_doc: None,
             docs,
             scorer,
+            shared_threshold: None,
+        }
+    }
+
+    /// Share one cross-partition top-k floor across a query's partitions.
+    pub(crate) fn with_shared_threshold(mut self, shared: Arc<AtomicU32>) -> Self {
+        self.shared_threshold = Some(shared);
+        self
+    }
+
+    /// Set the pruning threshold from this partition's k-th best, raised to the
+    /// shared cross-partition floor when one is attached.
+    fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
+        let mut t = local_kth * wand_factor;
+        if let Some(shared) = self.shared_threshold.as_ref() {
+            atomic_store_max_f32(shared, local_kth);
+            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+            if g > t {
+                t = g;
+            }
+        }
+        self.threshold = t;
+    }
+
+    /// Raise the local threshold to the shared cross-partition floor, picking up
+    /// updates published by sibling partitions.
+    fn raise_to_shared_floor(&mut self, wand_factor: f32) {
+        if let Some(shared) = self.shared_threshold.as_ref() {
+            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+            if g > self.threshold {
+                self.threshold = g;
+            }
         }
     }
 
@@ -651,7 +700,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
-        while let Some((doc, mut score)) = self.next()? {
+        loop {
+            self.raise_to_shared_floor(params.wand_factor);
+            let Some((doc, mut score)) = self.next()? else {
+                break;
+            };
             num_comparisons += 1;
 
             let row_id = match &doc {
@@ -696,12 +749,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                    let kth = candidates.peek().unwrap().0.0.score.0;
+                    self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                let kth = candidates.peek().unwrap().0.0.score.0;
+                self.update_threshold(kth, params.wand_factor);
             }
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
@@ -802,12 +857,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if candidates.len() < limit {
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                    let kth = candidates.peek().unwrap().0.0.score.0;
+                    self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                let kth = candidates.peek().unwrap().0.0.score.0;
+                self.update_threshold(kth, params.wand_factor);
             }
 
             self.advance_lead_to_head(doc_id + 1);
@@ -859,6 +916,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
             self.move_head_doc_to_lead(target);
             if self.lead.is_empty() {
+                continue;
+            }
+
+            // Block-Max WAND pruning: skip the whole window when its score upper
+            // bound cannot reach the top-k threshold.
+            if self.threshold > 0.0 && self.or_block_window_max() <= self.threshold {
+                // On the final block `up_to` is the `u64::MAX` sentinel; step once
+                // there to avoid seeking past the valid doc id range.
+                let skip_to = match self.up_to {
+                    Some(up_to) if up_to < u32::MAX as u64 => up_to + 1,
+                    _ => target + 1,
+                };
+                self.push_back_leads(skip_to);
                 continue;
             }
 
@@ -1033,6 +1103,24 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
             }
         }
+    }
+
+    /// Upper bound on the score of any document in the window `[target, up_to]`
+    /// for a disjunction. Sums the block-max of every overlapping iterator:
+    /// `lead`, `head` (later docs still in the window, which
+    /// `can_target_beat_threshold` omits), and the tail via `tail_max_score`.
+    fn or_block_window_max(&self) -> f32 {
+        let lead: f32 = self
+            .lead
+            .iter()
+            .map(|posting| posting.block_max_score())
+            .sum();
+        let head: f32 = self
+            .head
+            .iter()
+            .map(|posting| posting.posting.block_max_score())
+            .sum();
+        lead + head + self.tail_max_score
     }
 
     fn can_target_beat_threshold(&mut self, target: u64) -> bool {
@@ -1496,6 +1584,8 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
@@ -1538,6 +1628,23 @@ mod tests {
         }
 
         fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            freq as f32 / doc_tokens as f32
+        }
+    }
+
+    // Inverse-doc-length scorer that counts scored documents, so a test can
+    // assert that block-max pruning skipped blocks.
+    struct CountingScorer {
+        scored: Arc<AtomicUsize>,
+    }
+
+    impl Scorer for CountingScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            self.scored.fetch_add(1, Ordering::Relaxed);
             freq as f32 / doc_tokens as f32
         }
     }
@@ -1656,6 +1763,70 @@ mod tests {
         assert_eq!(result.len(), 0); // Should not panic
     }
 
+    /// The shared floor prunes partitions that can't reach the global top-k: a
+    /// high-scoring partition sets the floor and the rest skip their blocks.
+    /// (Result correctness is covered by the FTS search tests, since sharing is
+    /// always on.)
+    #[test]
+    fn cross_partition_threshold_sharing_prunes() {
+        use crate::metrics::MetricsCollector;
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Default)]
+        struct CountComparisons(AtomicUsize);
+        impl MetricsCollector for CountComparisons {
+            fn record_parts_loaded(&self, _: usize) {}
+            fn record_index_loads(&self, _: usize) {}
+            fn record_comparisons(&self, n: usize) {
+                self.0.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let part_docs = 4 * BLOCK_SIZE as u32;
+        // One high-scoring partition (weight 10) then 7 low-scoring ones.
+        let parts: Vec<(f32, std::ops::Range<u32>)> = std::iter::once((10.0, 0..part_docs))
+            .chain((1..8).map(|i| (1.0, i * part_docs..(i + 1) * part_docs)))
+            .collect();
+
+        let new_floor = || Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+
+        // Total comparisons across all partitions. `Some(floor)` makes every
+        // partition share that one floor; `None` gives each its own.
+        let total_comparisons = |shared_floor: Option<&Arc<AtomicU32>>| -> usize {
+            let metrics = CountComparisons::default();
+            for (qw, rows) in &parts {
+                let mut docs = DocSet::default();
+                for d in rows.clone() {
+                    docs.append(d as u64, 1);
+                }
+                let postings = vec![PostingIterator::with_query_weight(
+                    String::from("t"),
+                    0,
+                    0,
+                    *qw,
+                    generate_posting_list(rows.clone().collect(), *qw, None, false),
+                    docs.len(),
+                )];
+                let floor = shared_floor.cloned().unwrap_or_else(new_floor);
+                Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer)
+                    .with_shared_threshold(floor)
+                    .search(&params, Arc::new(RowAddrMask::default()), &metrics)
+                    .unwrap();
+            }
+            metrics.0.load(Ordering::Relaxed)
+        };
+
+        let one_floor = new_floor();
+        let with_shared_floor = total_comparisons(Some(&one_floor));
+        let with_private_floors = total_comparisons(None);
+        assert!(
+            with_shared_floor < with_private_floors,
+            "shared floor should prune comparisons: \
+             shared={with_shared_floor} private={with_private_floors}"
+        );
+    }
+
     #[test]
     fn test_posting_iterator_next_compressed_partition_point() {
         let mut docs = DocSet::default();
@@ -1719,6 +1890,76 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_or_single_term_block_skip_matches_and() {
+        // Hot docs occupy the middle block; the flanking blocks score far below
+        // the threshold. A single-term disjunction must skip them yet return what
+        // the conjunctive path returns.
+        let total = 3 * BLOCK_SIZE as u32;
+        let hot = BLOCK_SIZE as u32..BLOCK_SIZE as u32 + 12;
+
+        let mut docs = DocSet::default();
+        for row_id in 0..total {
+            // hot docs get distinct scores 1/1..1/12; the rest score 0.001
+            let doc_tokens = if hot.contains(&row_id) {
+                row_id - hot.start + 1
+            } else {
+                1000
+            };
+            docs.append(row_id as u64, doc_tokens);
+        }
+
+        let params = FtsSearchParams::new().with_limit(Some(10));
+        let run = |operator| {
+            let scored = Arc::new(AtomicUsize::new(0));
+            let posting = PostingIterator::with_query_weight(
+                String::from("term"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(
+                    (0..total).collect(),
+                    1.0,
+                    Some(vec![0.001, 1.0, 0.001]),
+                    true,
+                ),
+                docs.len(),
+            );
+            let mut wand = Wand::new(
+                operator,
+                std::iter::once(posting),
+                &docs,
+                CountingScorer {
+                    scored: scored.clone(),
+                },
+            );
+            let hits = wand
+                .search(
+                    &params,
+                    Arc::new(RowAddrMask::default()),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            let mut row_ids = hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>();
+            row_ids.sort_unstable();
+            (row_ids, scored.load(Ordering::Relaxed))
+        };
+
+        let (or_hits, or_scored) = run(Operator::Or);
+        let (and_hits, _) = run(Operator::And);
+
+        let expected = (hot.start..hot.start + 10)
+            .map(u64::from)
+            .collect::<Vec<_>>();
+        assert_eq!(or_hits, expected, "OR must return the top-k");
+        assert_eq!(or_hits, and_hits, "OR and AND must agree for a single term");
+        // Without pruning OR scores all `total` docs; with it the cold blocks are skipped.
+        assert!(
+            or_scored <= 2 * BLOCK_SIZE,
+            "expected pruning to skip a block, but scored {or_scored} of {total}",
+        );
     }
 
     #[test]

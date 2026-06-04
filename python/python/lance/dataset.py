@@ -3279,12 +3279,12 @@ class LanceDataset(pa.dataset.Dataset):
             column, index_type, kwargs
         )
 
-        if fragment_ids is not None and logical_index_type == "BTREE":
+        if fragment_ids is not None and logical_index_type in {"BTREE", "BITMAP"}:
             raise ValueError(
-                "BTree distributed indexing uses create_index_uncommitted(..., "
-                'index_type="BTREE", fragment_ids=...)'
+                f"{logical_index_type} distributed indexing uses "
+                "create_index_uncommitted(..., "
+                f'index_type="{logical_index_type}", fragment_ids=...)'
             )
-
         # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
             kwargs["fragment_ids"] = fragment_ids
@@ -3327,6 +3327,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        rabitq_model: Optional[str] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -3647,6 +3648,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         if skip_transpose:
             kwargs["skip_transpose"] = True
+
+        if rabitq_model is not None:
+            kwargs["rabitq_model"] = rabitq_model
 
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
@@ -3970,15 +3974,17 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        rabitq_model: Optional[str] = None,
         **kwargs,
     ) -> Index:
         """
         Create one segment without publishing it and return its metadata.
 
-        This is the public distributed-build API for vector and BTREE scalar
-        index construction. Unlike :meth:`create_index`, this method does not
-        publish the index into the dataset manifest. Instead, it writes one
-        segment under ``_indices/<segment_uuid>/`` and returns the resulting
+        This is the public distributed-build API for vector, BTREE scalar,
+        and canonical bitmap scalar index construction. Unlike
+        :meth:`create_index`, this method does not publish the index into the
+        dataset manifest. Instead, it writes one segment under
+        ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
         Callers should:
@@ -3991,27 +3997,33 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE segments do not yet support the segment builder (steps 3-4); collect
-        the returned segments and pass them straight to
+        BTREE segments do not yet support merging; collect the returned
+        segments and pass them straight to
         :meth:`commit_existing_index_segments`.
 
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
         - ``fragment_ids`` must be provided
+        - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
+          ``lance.lance.indices.build_rq_model``. It must be identical across all
+          workers for their segments to be mergeable, since it pins the RaBitQ
+          rotation so every segment rotates vectors the same way. If omitted, each
+          call generates its own random rotation, which is only safe for a single,
+          non-merged segment.
 
         Returns
         -------
         Index
             Metadata for the segment that was written by this call.
         """
-        is_btree_request = (
-            isinstance(index_type, str) and index_type.upper() == "BTREE"
+        is_scalar_segment_request = (
+            isinstance(index_type, str) and index_type.upper() in {"BTREE", "BITMAP"}
         ) or (
             isinstance(index_type, IndexConfig)
-            and index_type.index_type.upper() == "BTREE"
+            and index_type.index_type.upper() in {"BTREE", "BITMAP"}
         )
-        if is_btree_request:
+        if is_scalar_segment_request:
             if fragment_ids is None:
                 raise ValueError(
                     "create_index_uncommitted requires fragment_ids "
@@ -4062,6 +4074,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            rabitq_model=rabitq_model,
             require_commit=False,
             **kwargs,
         )
@@ -4106,9 +4119,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Merge distributed scalar index metadata.
 
-        Vector distributed indexing no longer uses this API. For vector indices,
-        build segments with :meth:`create_index_uncommitted`, optionally merge
-        them with :meth:`merge_existing_index_segments`, and publish them with
+        Vector and Bitmap distributed indexing no longer use this API. For
+        those index families, build segments with
+        :meth:`create_index_uncommitted`, optionally merge caller-defined
+        groups with :meth:`merge_existing_index_segments`, and publish them with
         :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
@@ -6496,20 +6510,22 @@ class LanceScanner(pa.dataset.Scanner):
 
         return self._scanner.explain_plan(verbose=verbose)
 
-    def analyze_plan(self) -> str:
+    def analyze_plan(self, count_rows: bool = False) -> str:
         """Execute the plan for this scanner and display with runtime metrics.
 
         Parameters
         ----------
-        verbose : bool, default False
-            Use a verbose output format.
+        count_rows : bool, default False
+            If True, auto-apply a ``COUNT(*)`` aggregate before analyzing so
+            the returned plan reflects what :py:meth:`count_rows` would
+            execute (including the optimizer's count-pushdown decisions).
 
         Returns
         -------
         plan : str
         """
 
-        return self._scanner.analyze_plan()
+        return self._scanner.analyze_plan(count_rows=count_rows)
 
 
 class DatasetOptimizer:

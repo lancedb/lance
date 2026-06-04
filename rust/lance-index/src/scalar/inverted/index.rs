@@ -3,7 +3,7 @@
 
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
@@ -651,6 +651,11 @@ impl InvertedIndex {
         let mask = prefilter.mask();
 
         let mut candidates = BinaryHeap::new();
+        // Shared top-k floor across this query's partitions. Seeded to -inf so
+        // the first real score wins; each partition publishes its local k-th
+        // and prunes against the running global k-th (a lower bound on the true
+        // global k-th — see `Wand::shared_threshold`).
+        let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let parts = self
             .partitions
             .iter()
@@ -660,6 +665,7 @@ impl InvertedIndex {
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
+                let shared_threshold = shared_threshold.clone();
                 async move {
                     let postings = part
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
@@ -687,6 +693,7 @@ impl InvertedIndex {
                             mask,
                             postings,
                             metrics.as_ref(),
+                            shared_threshold,
                         )?;
                         Ok(PartitionCandidates {
                             tokens_by_position,
@@ -1252,6 +1259,7 @@ impl InvertedPartition {
         mask: Arc<RowAddrMask>,
         postings: Vec<PostingIterator>,
         metrics: &dyn MetricsCollector,
+        shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate>> {
         if postings.is_empty() {
             return Ok(Vec::new());
@@ -1259,7 +1267,8 @@ impl InvertedPartition {
 
         // let local_metrics = LocalMetricsCollector::default();
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
-        let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
+        let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer)
+            .with_shared_threshold(shared_threshold);
         let hits = wand.search(params, mask, metrics)?;
         // local_metrics.dump_into(metrics);
         Ok(hits)
@@ -4797,6 +4806,17 @@ pub async fn flat_bm25_search_stream_with_metrics(
     let mut tokenizer = tokenizer;
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
+    // A query that tokenizes to no terms (e.g. only stop words) has no
+    // searchable content and matches nothing. Return early rather than
+    // proceeding. This mirrors the indexed search path, which already
+    // short-circuits on empty query tokens.
+    if query_tokens.is_empty() {
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            FTS_SCHEMA.clone(),
+            stream::empty::<DataFusionResult<RecordBatch>>(),
+        )));
+    }
+
     let input_schema = input.schema();
     let doc_col_idx = input_schema.index_of(&doc_col)?;
 
@@ -4881,6 +4901,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
+    use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
 
     use super::*;
 
@@ -7279,6 +7302,58 @@ mod tests {
         assert_eq!(
             cold_scores, warm_scores,
             "warm-cache scores must match cold"
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_search_stop_word_query_over_unindexed_rows_returns_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+                Arc::new(StringArray::from(vec![
+                    "the quick brown fox",
+                    "a lazy dog",
+                    "for the win",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+
+        // Analyzer with an English stop-word filter, so the query "the"
+        // tokenizes to zero terms -- exactly the production trigger.
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(StopWordFilter::new(Language::English).unwrap())
+                .build(),
+        ));
+
+        let result_stream = flat_bm25_search_stream_with_metrics(
+            input,
+            "text".to_string(),
+            "the".to_string(),
+            tokenizer,
+            None,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "a stop-word-only query has no searchable terms and must match nothing"
         );
     }
 }

@@ -147,7 +147,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -158,7 +158,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1491,7 +1491,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2853,7 +2853,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3005,7 +3005,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3166,7 +3166,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -4195,7 +4195,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4431,7 +4431,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4534,7 +4534,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4582,7 +4582,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrayref",
  "paste",
@@ -4591,7 +4591,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4628,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4661,7 +4661,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4681,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4726,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4752,7 +4752,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4792,7 +4792,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4806,7 +4806,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "approx",
  "arc-swap",
@@ -4884,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4933,7 +4933,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "approx",
  "arrow-array",
@@ -4953,7 +4953,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4965,7 +4965,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4981,7 +4981,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5037,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5056,7 +5056,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5103,7 +5103,7 @@ dependencies = [
 
 [[package]]
 name = "lance-test-macros"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5112,7 +5112,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5125,7 +5125,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "icu_segmenter",
  "jieba-rs",
@@ -5137,7 +5137,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "8.0.0-beta.1"
+version = "8.0.0-beta.2"
 dependencies = [
  "clap",
  "lance-core",
@@ -5715,7 +5715,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5996,6 +5996,7 @@ dependencies = [
  "opendal-service-hf",
  "opendal-service-oss",
  "opendal-service-s3",
+ "opendal-service-tos",
 ]
 
 [[package]]
@@ -6211,6 +6212,23 @@ dependencies = [
  "reqsign-file-read-tokio",
  "serde",
  "url",
+]
+
+[[package]]
+name = "opendal-service-tos"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f2f7a4c32e5202eb4ac72e76c4b5e30c86ab60762811172f4111103b9d673a1"
+dependencies = [
+ "bytes",
+ "http 1.4.1",
+ "opendal-core",
+ "quick-xml 0.39.4",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "reqsign-volcengine-tos",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6972,7 +6990,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7410,6 +7428,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqsign-volcengine-tos"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d757602a7ef2b6025c0da77e6d2e23fbdef35930fa466b15ffbf0a3f13acf7"
+dependencies = [
+ "anyhow",
+ "http 1.4.1",
+ "log",
+ "percent-encoding",
+ "reqsign-core",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7693,7 +7724,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7752,7 +7783,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8297,7 +8328,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8635,7 +8666,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9666,7 +9697,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10294,9 +10325,9 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",

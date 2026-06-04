@@ -3059,13 +3059,13 @@ impl Dataset {
                 ))
             }
             IndexType::Bitmap => {
-                lance_index::scalar::bitmap::merge_index_files(
-                    self.object_store.as_ref(),
-                    &index_dir,
-                    Arc::new(store),
-                    progress,
-                )
-                .await
+                Err(Error::invalid_input(
+                    "Bitmap distributed indexing no longer supports merge_index_metadata; \
+                     build segments with create_index_uncommitted(...), merge them with \
+                     merge_existing_index_segments(...), and commit with \
+                     commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
             }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(

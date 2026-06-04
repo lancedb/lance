@@ -22,6 +22,7 @@ use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
+use roaring::RoaringBitmap;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
@@ -436,6 +437,7 @@ impl ScalarQueryParser for SargableQueryParser {
             index_type: self.index_type.clone(),
             query: Arc::new(query),
             needs_recheck: self.needs_recheck,
+            fragment_bitmap: None,
         }));
 
         // If the pattern has wildcards beyond simple prefix, add refine expression
@@ -1074,7 +1076,8 @@ impl IndexedExpression {
                 index_name,
                 index_type,
                 query,
-                needs_recheck: false, // Default to false, will be set by parser
+                needs_recheck: false,  // Default to false, will be set by parser
+                fragment_bitmap: None, // Filled in by `apply_scalar_indices`
             })),
             refine_expr: None,
         }
@@ -1095,6 +1098,7 @@ impl IndexedExpression {
                 index_type,
                 query,
                 needs_recheck,
+                fragment_bitmap: None, // Filled in by `apply_scalar_indices`
             })),
             refine_expr: None,
         }
@@ -1236,10 +1240,21 @@ pub struct ScalarIndexSearch {
     pub query: Arc<dyn AnyQuery>,
     /// If true, the query results are inexact and will need a recheck
     pub needs_recheck: bool,
+    /// The fragments the underlying index has entries for.
+    ///
+    /// `None` means coverage is unknown (e.g. constructed outside of scanner
+    /// planning, or from a legacy code path). Optimizer rules that need to
+    /// decide whether the index covers the dataset must treat `None` as
+    /// "refuse to use" — the bitmap is the only way to safely answer that
+    /// question synchronously without an async metadata load.
+    pub fragment_bitmap: Option<RoaringBitmap>,
 }
 
 impl PartialEq for ScalarIndexSearch {
     fn eq(&self, other: &Self) -> bool {
+        // `fragment_bitmap` is metadata derived from the dataset state, not
+        // part of the query identity, so it intentionally does not participate
+        // in equality.
         self.column == other.column
             && self.index_name == other.index_name
             && self.query.as_ref().eq(other.query.as_ref())
@@ -1819,6 +1834,16 @@ pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
     /// as well as a query parser that can parse queries for that column
     fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
+
+    /// The set of fragments covered by `(column, index_name)`.
+    ///
+    /// Returns `None` when the provider doesn't know — callers must treat
+    /// that as "coverage unknown" rather than "covers everything". The
+    /// default implementation always returns `None`, so providers that
+    /// haven't been updated cannot accidentally claim full coverage.
+    fn fragment_bitmap(&self, _column: &str, _index_name: &str) -> Option<RoaringBitmap> {
+        None
+    }
 }
 
 /// Attempt to split a filter expression into a search of scalar indexes and an
@@ -1827,7 +1852,31 @@ pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
 ) -> Result<IndexedExpression> {
-    Ok(visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr)))
+    let mut result =
+        visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr));
+    if let Some(query) = result.scalar_query.as_mut() {
+        populate_fragment_bitmaps(query, index_info);
+    }
+    Ok(result)
+}
+
+/// Walk a [`ScalarIndexExpr`] and fill in `fragment_bitmap` on each leaf from
+/// the `index_info` provider. Leaves the bitmap as `None` if the provider
+/// can't answer.
+fn populate_fragment_bitmaps(
+    expr: &mut ScalarIndexExpr,
+    index_info: &dyn IndexInformationProvider,
+) {
+    match expr {
+        ScalarIndexExpr::Not(inner) => populate_fragment_bitmaps(inner, index_info),
+        ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+            populate_fragment_bitmaps(lhs, index_info);
+            populate_fragment_bitmaps(rhs, index_info);
+        }
+        ScalarIndexExpr::Query(search) => {
+            search.fragment_bitmap = index_info.fragment_bitmap(&search.column, &search.index_name);
+        }
+    }
 }
 
 #[derive(Clone, Default, Debug)]
@@ -2422,6 +2471,7 @@ mod tests {
             index_type: "BTree".to_string(),
             query: Arc::new(SargableQuery::Equals(ScalarValue::UInt32(Some(10)))),
             needs_recheck: false,
+            fragment_bitmap: None,
         }));
         let right = Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
             column: "color".to_string(),
@@ -2431,6 +2481,7 @@ mod tests {
                 "blue".to_string(),
             )))),
             needs_recheck: false,
+            fragment_bitmap: None,
         }));
         check(
             &index_info,

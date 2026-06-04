@@ -138,9 +138,13 @@ fn sign_bytes_per_round(dim: usize) -> usize {
     dim.div_ceil(8)
 }
 
+pub(crate) fn fast_rotation_signs_len(dim: usize) -> usize {
+    FAST_ROTATION_ROUNDS * sign_bytes_per_round(dim)
+}
+
 pub fn random_fast_rotation_signs(dim: usize) -> Vec<u8> {
     // Each round needs one random sign bit per dimension.
-    let mut signs = vec![0u8; FAST_ROTATION_ROUNDS * sign_bytes_per_round(dim)];
+    let mut signs = vec![0u8; fast_rotation_signs_len(dim)];
     rand::rng().fill_bytes(&mut signs);
     signs
 }

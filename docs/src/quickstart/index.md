@@ -22,17 +22,17 @@ For the latest features and bug fixes, you can install the preview version:
 === "pip"
 
     ```bash
-    pip install --pre --extra-index-url https://pypi.fury.io/lance-format/ pylance
+    pip install --pre --extra-index-url https://pypi.fury.io/lance-format pylance
     ```
 
 === "uv"
 
     ```bash
     uv venv
-    uv pip install --prerelease allow --index https://pypi.fury.io/lance-format/ pylance
+    uv pip install --prerelease allow --index https://pypi.fury.io/lance-format pylance
 
     # To add to pyproject.toml, just do:
-    uv add --prerelease allow --index https://pypi.fury.io/lance-format/ pylance
+    uv add --prerelease allow --index https://pypi.fury.io/lance-format pylance
     ```
 
 !!! note

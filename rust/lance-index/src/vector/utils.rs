@@ -302,13 +302,13 @@ mod tests {
     #[rstest]
     #[case::f16(Arc::new(Float16Array::from(
         (0..100).flat_map(|i| std::iter::repeat_n(f16::from_f32(i as f32), 16)).collect::<Vec<_>>(),
-    )) as ArrayRef)]
+    )) as ArrayRef, 42.0f32)]
     #[case::f32(Arc::new(Float32Array::from(
         (0..100).flat_map(|i| std::iter::repeat_n(i as f32, 16)).collect::<Vec<_>>(),
-    )) as ArrayRef)]
-    fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef) {
+    )) as ArrayRef, 42.1f32)]
+    fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef, #[case] query_val: f32) {
         let index = build_index(centroids, 16);
-        let query: ArrayRef = Arc::new(Float32Array::from(vec![42.1f32; 16]));
+        let query: ArrayRef = Arc::new(Float32Array::from(vec![query_val; 16]));
         let (id, _) = index.search(query).unwrap();
         assert_eq!(id, 42);
     }
