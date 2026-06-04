@@ -5762,6 +5762,11 @@ mod tests {
             self.passthrough.invalidate_prefix(prefix).await;
         }
 
+        async fn invalidate_entry(&self, key: &lance_core::cache::InternalCacheKey) {
+            self.serialized.lock().await.remove(key);
+            self.passthrough.invalidate_entry(key).await;
+        }
+
         async fn clear(&self) {
             self.serialized.lock().await.clear();
             self.passthrough.clear().await;

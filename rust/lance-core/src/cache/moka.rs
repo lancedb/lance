@@ -118,6 +118,10 @@ impl CacheBackend for MokaCacheBackend {
             .expect("Cache configured correctly");
     }
 
+    async fn invalidate_entry(&self, key: &InternalCacheKey) {
+        self.cache.invalidate(key).await;
+    }
+
     async fn clear(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
