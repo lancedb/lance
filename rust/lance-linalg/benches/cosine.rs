@@ -40,7 +40,7 @@ where
     T::Native: Cosine,
 {
     const DIMENSION: usize = 1024;
-    const TOTAL: usize = 1024 * 1024; // 1M vectors
+    const TOTAL: usize = 512 * 1024;
 
     let type_name = std::any::type_name::<T::Native>();
     let key = generate_random_array_with_seed::<T>(DIMENSION, [0; 32]);
