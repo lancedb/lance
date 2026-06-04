@@ -7513,12 +7513,16 @@ mod tests {
             .unwrap();
         assert!(results.num_rows() > 0);
 
-        // Verify IOPs
+        // Verify IOPs. The deferred DocSet loads per-doc num_tokens/row_ids on
+        // first use rather than eagerly at index open, so a cold (un-prewarmed)
+        // query opens the docs file on demand — a couple more IOPs than the
+        // eager path, but constant and only on the first query (prewarm or a
+        // warm cache serve it with zero IO).
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(
             stats,
             read_iops,
-            15,
+            18,
             "Inverted index query should use minimal IOPs"
         );
     }

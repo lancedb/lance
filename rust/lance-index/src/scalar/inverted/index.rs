@@ -1035,6 +1035,11 @@ impl InvertedIndex {
                 part.inverted_list
                     .prewarm_posting_lists(with_position)
                     .await?;
+                // Materialize the deferred DocSet too: prewarm's contract is
+                // that subsequent queries do no IO, so the per-doc row_ids /
+                // num_tokens must be resident, not lazily faulted in at query
+                // time. `ensure_loaded` opens, reads, and drops the reader.
+                part.docs.ensure_loaded().await?;
                 Result::Ok(())
             });
         stream::iter(prewarm_futures)
