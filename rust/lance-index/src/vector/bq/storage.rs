@@ -2,9 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::ops::Sub;
-use std::sync::Arc;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt8Type, UInt64Type};
@@ -19,7 +22,7 @@ use itertools::Itertools;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_linalg::distance::{DistanceType, Dot, dot};
+use lance_linalg::distance::{DistanceType, Dot, dot, l2::l2};
 use lance_linalg::simd::{
     self,
     dist_table::{BATCH_SIZE, PERM0, PERM0_INVERSE},
@@ -39,12 +42,14 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
 use crate::vector::bq::transform::{
-    ADD_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, SCALE_FACTORS_COLUMN,
+    ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
+    SCALE_FACTORS_COLUMN,
 };
 use crate::vector::bq::{
     RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
     validate_rq_num_bits,
 };
+use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{DistCalculator, QueryResidual, RabitRawQueryContext, VectorStore};
@@ -54,6 +59,129 @@ pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
 pub const RABIT_EX_CODE_COLUMN: &str = "__ex_codes";
 pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
+const RABIT_PRUNE_STATS_ENV: &str = "LANCE_RQ_PRUNE_STATS";
+const RABIT_PRUNE_STATS_INTERVAL_ENV: &str = "LANCE_RQ_PRUNE_STATS_INTERVAL";
+const DEFAULT_RABIT_PRUNE_STATS_INTERVAL: u64 = 1024;
+
+#[derive(Default)]
+struct RabitPruneStats {
+    calls: AtomicU64,
+    candidates: AtomicU64,
+    pruned_upper_bound: AtomicU64,
+    pruned_heap: AtomicU64,
+    exact: AtomicU64,
+    exact_rejected: AtomicU64,
+}
+
+#[derive(Default)]
+struct RabitPruneBypassStats {
+    calls: AtomicU64,
+}
+
+static RABIT_PRUNE_STATS: OnceLock<RabitPruneStats> = OnceLock::new();
+static RABIT_PRUNE_BYPASS_STATS: OnceLock<RabitPruneBypassStats> = OnceLock::new();
+static RABIT_PRUNE_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+static RABIT_PRUNE_STATS_INTERVAL: OnceLock<u64> = OnceLock::new();
+
+fn rabit_prune_stats_enabled() -> bool {
+    *RABIT_PRUNE_STATS_ENABLED.get_or_init(|| match std::env::var(RABIT_PRUNE_STATS_ENV) {
+        Ok(value) => {
+            let value = value.to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    })
+}
+
+fn rabit_prune_stats_interval() -> u64 {
+    *RABIT_PRUNE_STATS_INTERVAL.get_or_init(|| {
+        std::env::var(RABIT_PRUNE_STATS_INTERVAL_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|interval| *interval > 0)
+            .unwrap_or(DEFAULT_RABIT_PRUNE_STATS_INTERVAL)
+    })
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn emit_rabit_prune_stats(message: &str) {
+    log::warn!(
+        target: "lance_index::vector::bq::prune_stats",
+        "{}",
+        message
+    );
+}
+
+fn record_rabit_prune_stats(
+    candidates: usize,
+    pruned_upper_bound: usize,
+    pruned_heap: usize,
+    exact: usize,
+    exact_rejected: usize,
+) {
+    if !rabit_prune_stats_enabled() {
+        return;
+    }
+
+    let stats = RABIT_PRUNE_STATS.get_or_init(RabitPruneStats::default);
+    let calls = stats.calls.fetch_add(1, Ordering::Relaxed) + 1;
+    let candidates = stats
+        .candidates
+        .fetch_add(candidates as u64, Ordering::Relaxed)
+        + candidates as u64;
+    let pruned_upper_bound = stats
+        .pruned_upper_bound
+        .fetch_add(pruned_upper_bound as u64, Ordering::Relaxed)
+        + pruned_upper_bound as u64;
+    let pruned_heap = stats
+        .pruned_heap
+        .fetch_add(pruned_heap as u64, Ordering::Relaxed)
+        + pruned_heap as u64;
+    let exact = stats.exact.fetch_add(exact as u64, Ordering::Relaxed) + exact as u64;
+    let exact_rejected = stats
+        .exact_rejected
+        .fetch_add(exact_rejected as u64, Ordering::Relaxed)
+        + exact_rejected as u64;
+    let interval = rabit_prune_stats_interval();
+    if calls.is_multiple_of(interval) {
+        let pruned = pruned_upper_bound + pruned_heap;
+        emit_rabit_prune_stats(&format!(
+            "ivf_rq_prune_stats calls={} candidates={} pruned={} pruned_upper_bound={} pruned_heap={} prune_ratio={:.6} exact={} exact_ratio={:.6} exact_rejected={} exact_reject_ratio={:.6}",
+            calls,
+            candidates,
+            pruned,
+            pruned_upper_bound,
+            pruned_heap,
+            ratio(pruned, candidates),
+            exact,
+            ratio(exact, candidates),
+            exact_rejected,
+            ratio(exact_rejected, exact),
+        ));
+    }
+}
+
+fn record_rabit_prune_bypass(reason: &'static str) {
+    if !rabit_prune_stats_enabled() {
+        return;
+    }
+
+    let stats = RABIT_PRUNE_BYPASS_STATS.get_or_init(RabitPruneBypassStats::default);
+    let calls = stats.calls.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls.is_multiple_of(rabit_prune_stats_interval()) {
+        emit_rabit_prune_stats(&format!(
+            "ivf_rq_prune_stats_bypass calls={} reason={}",
+            calls, reason
+        ));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -330,14 +458,22 @@ pub struct RabitQuantizationStorage {
     codes: FixedSizeListArray,
     add_factors: Float32Array,
     scale_factors: Float32Array,
+    error_factors: Option<Float32Array>,
     ex_codes: Option<FixedSizeListArray>,
+    packed_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.metadata.deep_size_of_children(context) + self.batch.get_array_memory_size()
+        self.metadata.deep_size_of_children(context)
+            + self.batch.get_array_memory_size()
+            + self
+                .packed_ex_codes
+                .as_ref()
+                .map(|codes| codes.get_array_memory_size())
+                .unwrap_or_default()
     }
 }
 
@@ -376,6 +512,25 @@ impl RabitQuantizationStorage {
         }
     }
 
+    fn raw_query_error(
+        &self,
+        dist_q_c: f32,
+        rotated_query: &[f32],
+        rotated_centroid: Option<&[f32]>,
+    ) -> f32 {
+        match self.distance_type {
+            DistanceType::L2 => dist_q_c.max(0.0).sqrt(),
+            DistanceType::Dot => rotated_centroid
+                .map(|centroid| l2(rotated_query, centroid).sqrt())
+                .unwrap_or_else(|| dist_q_c.max(0.0).sqrt()),
+            DistanceType::Cosine => dist_q_c.max(0.0).sqrt(),
+            _ => unimplemented!(
+                "RabitQ does not support distance type: {}",
+                self.distance_type
+            ),
+        }
+    }
+
     fn distance_calculator_from_parts<'a>(
         &'a self,
         dim: usize,
@@ -383,9 +538,14 @@ impl RabitQuantizationStorage {
         ex_dist_table: Cow<'a, [f32]>,
         sum_q: f32,
         query_factor: f32,
+        query_error: f32,
     ) -> RabitDistCalculator<'a> {
         let ex_codes = self
             .ex_codes
+            .as_ref()
+            .map(|codes| codes.values().as_primitive::<UInt8Type>().values().as_ref());
+        let packed_ex_codes = self
+            .packed_ex_codes
             .as_ref()
             .map(|codes| codes.values().as_primitive::<UInt8Type>().values().as_ref());
         RabitDistCalculator::new(
@@ -399,13 +559,18 @@ impl RabitQuantizationStorage {
             ex_codes,
             self.add_factors.values(),
             self.scale_factors.values(),
+            self.error_factors
+                .as_ref()
+                .map(|factors| factors.values().as_ref()),
             self.ex_add_factors
                 .as_ref()
                 .map(|factors| factors.values().as_ref()),
             self.ex_scale_factors
                 .as_ref()
                 .map(|factors| factors.values().as_ref()),
+            packed_ex_codes,
             query_factor,
+            query_error,
         )
     }
 
@@ -586,9 +751,12 @@ pub struct RabitDistCalculator<'a> {
     ex_dist_table: Cow<'a, [f32]>,
     add_factors: &'a [f32],
     scale_factors: &'a [f32],
+    error_factors: Option<&'a [f32]>,
     ex_add_factors: Option<&'a [f32]>,
     ex_scale_factors: Option<&'a [f32]>,
+    packed_ex_codes: Option<&'a [u8]>,
     query_factor: f32,
+    query_error: f32,
 
     sum_q: f32,
     sqrt_d: f32,
@@ -607,9 +775,12 @@ impl<'a> RabitDistCalculator<'a> {
         ex_codes: Option<&'a [u8]>,
         add_factors: &'a [f32],
         scale_factors: &'a [f32],
+        error_factors: Option<&'a [f32]>,
         ex_add_factors: Option<&'a [f32]>,
         ex_scale_factors: Option<&'a [f32]>,
+        packed_ex_codes: Option<&'a [u8]>,
         query_factor: f32,
+        query_error: f32,
     ) -> Self {
         Self {
             dim,
@@ -621,11 +792,313 @@ impl<'a> RabitDistCalculator<'a> {
             ex_dist_table,
             add_factors,
             scale_factors,
+            error_factors,
             ex_add_factors,
             ex_scale_factors,
+            packed_ex_codes,
             query_factor,
+            query_error,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
+        }
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn binary_distances_with_scratch(
+        &self,
+        n: usize,
+        code_len: usize,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+    ) -> usize {
+        let (qmin, qmax) = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
+        let remainder = n % BATCH_SIZE;
+        let simd_len = n - remainder;
+        quantized_dists.clear();
+        quantized_dists.reserve(simd_len);
+        // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
+        unsafe {
+            quantized_dists.set_len(simd_len);
+        }
+        simd::dist_table::sum_4bit_dist_table(
+            simd_len,
+            code_len,
+            self.codes,
+            quantized_dists_table,
+            quantized_dists,
+        );
+
+        let range = (qmax - qmin) / 255.0;
+        let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
+        let sum_min = num_tables as f32 * qmin;
+        dists.clear();
+        dists.reserve(n);
+        // SAFETY: the SIMD section below writes [0, simd_len), and the
+        // remainder section writes [simd_len, n).
+        unsafe {
+            dists.set_len(n);
+        }
+        let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
+        simd_dists
+            .iter_mut()
+            .zip(quantized_dists.iter())
+            .for_each(|(dist, q_dist)| {
+                *dist = (*q_dist as f32) * range + sum_min;
+            });
+
+        remainder_dists
+            .iter_mut()
+            .enumerate()
+            .for_each(|(id, dist)| {
+                *dist = compute_single_rq_distance(
+                    self.codes,
+                    simd_len + id,
+                    n,
+                    code_len,
+                    &self.dist_table,
+                );
+            });
+        simd_len
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn apply_raw_query_multi_bit_distances(
+        &self,
+        simd_len: usize,
+        dists: &mut [f32],
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+    ) {
+        let ex_bits = self.num_bits - 1;
+        let ex_codes = self
+            .ex_codes
+            .expect("raw-query multi-bit RQ requires ex codes");
+        let ex_add_factors = self
+            .ex_add_factors
+            .expect("raw-query multi-bit RQ requires ex add factors");
+        let ex_scale_factors = self
+            .ex_scale_factors
+            .expect("raw-query multi-bit RQ requires ex scale factors");
+        let ex_code_len =
+            rabit_ex_code_bytes(self.dim, ex_bits).expect("RabitQ num_bits should be validated");
+        let code_scale = (1u32 << ex_bits) as f32;
+        let code_bias = -(code_scale - 0.5);
+
+        let fastscan_len = if simd_len > 0 && supports_ex_fastscan(ex_bits) {
+            self.packed_ex_codes
+                .map(|packed_ex_codes| {
+                    let fastscan_len = simd_len;
+                    let fastscan_code_len = ex_fastscan_code_len(self.dim, ex_bits)
+                        .expect("RabitQ num_bits should be validated");
+                    let (qmin, qmax, quantization_max) = quantize_ex_fastscan_dist_table_into(
+                        self.dim,
+                        ex_bits,
+                        &self.ex_dist_table,
+                        quantized_dists_table,
+                    );
+                    quantized_dists.clear();
+                    quantized_dists.reserve(fastscan_len);
+                    // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
+                    unsafe {
+                        quantized_dists.set_len(fastscan_len);
+                    }
+                    simd::dist_table::sum_4bit_dist_table(
+                        fastscan_len,
+                        fastscan_code_len,
+                        packed_ex_codes,
+                        quantized_dists_table,
+                        quantized_dists,
+                    );
+
+                    let range = (qmax - qmin) / quantization_max;
+                    let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
+                    let sum_min = num_tables as f32 * qmin;
+                    dists
+                        .iter_mut()
+                        .take(fastscan_len)
+                        .zip(quantized_dists.iter())
+                        .enumerate()
+                        .for_each(|(id, (dist, q_ex_dist))| {
+                            let ex_dist = (*q_ex_dist as f32) * range + sum_min;
+                            let full_dot = code_scale * *dist + ex_dist + code_bias * self.sum_q;
+                            *dist = full_dot * ex_scale_factors[id]
+                                + ex_add_factors[id]
+                                + self.query_factor;
+                        });
+                    fastscan_len
+                })
+                .unwrap_or_default()
+        } else {
+            0
+        };
+
+        dists
+            .iter_mut()
+            .enumerate()
+            .skip(fastscan_len)
+            .for_each(|(id, dist)| {
+                let ex_dist = compute_single_rq_ex_distance(
+                    ex_codes,
+                    id,
+                    ex_code_len,
+                    ex_bits,
+                    self.dim,
+                    &self.ex_dist_table,
+                );
+                let full_dot = code_scale * *dist + ex_dist + code_bias * self.sum_q;
+                *dist = full_dot * ex_scale_factors[id] + ex_add_factors[id] + self.query_factor;
+            });
+    }
+
+    #[inline]
+    fn raw_query_binary_distance(&self, id: usize, binary_ip: f32) -> f32 {
+        (binary_ip - 0.5 * self.sum_q) * self.scale_factors[id]
+            + self.add_factors[id]
+            + self.query_factor
+    }
+
+    #[inline]
+    fn raw_query_lower_bound(&self, id: usize, binary_ip: f32) -> Option<f32> {
+        let error_factors = self.error_factors?;
+        Some(self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error)
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn raw_query_multi_bit_exact_distance(
+        &self,
+        id: usize,
+        binary_ip: f32,
+        ex_bits: u8,
+        ex_code_len: usize,
+        ex_codes: &[u8],
+        ex_add_factors: &[f32],
+        ex_scale_factors: &[f32],
+    ) -> f32 {
+        let ex_dist = compute_single_rq_ex_distance(
+            ex_codes,
+            id,
+            ex_code_len,
+            ex_bits,
+            self.dim,
+            &self.ex_dist_table,
+        );
+        let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
+        let full_dot = (1u32 << ex_bits) as f32 * binary_ip + ex_dist + code_bias * self.sum_q;
+        full_dot * ex_scale_factors[id] + ex_add_factors[id] + self.query_factor
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_raw_query_multi_bit_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (usize, u64)>,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+    ) {
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let n = self.codes.len() / code_len;
+        if n == 0 {
+            dists.clear();
+            quantized_dists.clear();
+            return;
+        }
+
+        self.binary_distances_with_scratch(
+            n,
+            code_len,
+            dists,
+            quantized_dists,
+            quantized_dists_table,
+        );
+
+        let ex_bits = self.num_bits - 1;
+        let ex_codes = self
+            .ex_codes
+            .expect("raw-query multi-bit RQ requires ex codes");
+        let ex_add_factors = self
+            .ex_add_factors
+            .expect("raw-query multi-bit RQ requires ex add factors");
+        let ex_scale_factors = self
+            .ex_scale_factors
+            .expect("raw-query multi-bit RQ requires ex scale factors");
+        let ex_code_len =
+            rabit_ex_code_bytes(self.dim, ex_bits).expect("RabitQ num_bits should be validated");
+        let query_lower_bound = lower_bound.unwrap_or(f32::MIN);
+        let query_upper_bound = upper_bound.unwrap_or(f32::MAX);
+        let mut max_dist = res.peek().map(|node| node.dist);
+        let mut candidates = 0;
+        let mut pruned_upper_bound = 0;
+        let mut pruned_heap = 0;
+        let mut exact = 0;
+        let mut exact_rejected = 0;
+
+        for (id, row_id) in row_ids {
+            let Some(binary_ip) = dists.get(id).copied() else {
+                continue;
+            };
+            candidates += 1;
+            let Some(raw_lower_bound) = self.raw_query_lower_bound(id, binary_ip) else {
+                continue;
+            };
+            if raw_lower_bound >= query_upper_bound {
+                pruned_upper_bound += 1;
+                continue;
+            }
+            if res.len() >= k && max_dist.is_some_and(|max_dist| raw_lower_bound >= max_dist.0) {
+                pruned_heap += 1;
+                continue;
+            }
+
+            exact += 1;
+            let dist = self.raw_query_multi_bit_exact_distance(
+                id,
+                binary_ip,
+                ex_bits,
+                ex_code_len,
+                ex_codes,
+                ex_add_factors,
+                ex_scale_factors,
+            );
+            if dist < query_lower_bound || dist >= query_upper_bound {
+                exact_rejected += 1;
+                continue;
+            }
+            let dist = OrderedFloat(dist);
+            if res.len() < k {
+                res.push(OrderedNode::new(row_id, dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                res.pop();
+                res.push(OrderedNode::new(row_id, dist));
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+        record_rabit_prune_stats(
+            candidates,
+            pruned_upper_bound,
+            pruned_heap,
+            exact,
+            exact_rejected,
+        );
+    }
+
+    fn raw_query_lower_bound_gating_disabled_reason(&self) -> Option<&'static str> {
+        if self.query_estimator != RabitQueryEstimator::RawQuery {
+            Some("residual_query_estimator")
+        } else if self.num_bits <= 1 {
+            Some("num_bits_le_one")
+        } else if self.error_factors.is_none() {
+            Some("missing_error_factors")
+        } else {
+            None
         }
     }
 }
@@ -744,15 +1217,117 @@ fn quantize_dist_table_into(dist_table: &[f32], quantized_dist_table: &mut Vec<u
 #[inline]
 fn packed_ex_code_value(row_codes: &[u8], dim_idx: usize, ex_bits: u8) -> u8 {
     debug_assert!(ex_bits > 0);
-    let mut value = 0u8;
     let bit_offset = dim_idx * ex_bits as usize;
-    for bit_idx in 0..ex_bits as usize {
-        let src_bit = bit_offset + bit_idx;
-        if (row_codes[src_bit / u8::BITS as usize] >> (src_bit % u8::BITS as usize)) & 1 != 0 {
-            value |= 1u8 << bit_idx;
+    let byte_idx = bit_offset / u8::BITS as usize;
+    let bit_shift = bit_offset % u8::BITS as usize;
+    let bits = row_codes[byte_idx] as u16
+        | row_codes
+            .get(byte_idx + 1)
+            .map(|byte| (*byte as u16) << u8::BITS)
+            .unwrap_or_default();
+    let mask = (1u16 << ex_bits) - 1;
+    ((bits >> bit_shift) & mask) as u8
+}
+
+fn quantize_ex_fastscan_dist_table_into(
+    dim: usize,
+    ex_bits: u8,
+    ex_dist_table: &[f32],
+    quantized_dist_table: &mut Vec<u8>,
+) -> (f32, f32, f32) {
+    debug_assert!(supports_ex_fastscan(ex_bits));
+
+    let entries_per_dim = 1usize << ex_bits;
+    debug_assert_eq!(ex_dist_table.len(), dim * entries_per_dim);
+    let num_split_tables =
+        ex_fastscan_code_len(dim, ex_bits).expect("RabitQ num_bits should be validated") * 2;
+    let quantization_max = (u16::MAX as usize / num_split_tables)
+        .min(u8::MAX as usize)
+        .max(1) as f32;
+
+    let mut qmin = f32::INFINITY;
+    let mut qmax = f32::NEG_INFINITY;
+    for table_idx in 0..num_split_tables {
+        for code in 0..SEGMENT_NUM_CODES {
+            let value = ex_fastscan_dist_table_value(dim, ex_bits, ex_dist_table, table_idx, code);
+            qmin = qmin.min(value);
+            qmax = qmax.max(value);
         }
     }
-    value
+
+    quantized_dist_table.clear();
+    quantized_dist_table.reserve(num_split_tables * SEGMENT_NUM_CODES);
+    if qmin == qmax {
+        quantized_dist_table.resize(num_split_tables * SEGMENT_NUM_CODES, 0);
+        return (qmin, qmax, quantization_max);
+    }
+
+    let factor = quantization_max / (qmax - qmin);
+    for table_idx in 0..num_split_tables {
+        for code in 0..SEGMENT_NUM_CODES {
+            let value = ex_fastscan_dist_table_value(dim, ex_bits, ex_dist_table, table_idx, code);
+            quantized_dist_table.push(((value - qmin) * factor).round() as u8);
+        }
+    }
+
+    (qmin, qmax, quantization_max)
+}
+
+#[inline]
+fn supports_ex_fastscan(ex_bits: u8) -> bool {
+    matches!(ex_bits, 2 | 4 | 8)
+}
+
+#[inline]
+fn ex_fastscan_code_len(dim: usize, ex_bits: u8) -> Option<usize> {
+    match ex_bits {
+        2 | 4 | 8 => rabit_ex_code_bytes(dim, ex_bits).ok(),
+        _ => None,
+    }
+}
+
+#[inline]
+fn ex_fastscan_dist_table_value(
+    dim: usize,
+    ex_bits: u8,
+    ex_dist_table: &[f32],
+    table_idx: usize,
+    code: usize,
+) -> f32 {
+    match ex_bits {
+        2 => {
+            let dim_idx = table_idx * 2;
+            let low = code & 0b11;
+            let high = (code >> 2) & 0b11;
+            ex_dist_table_value(ex_dist_table, dim, ex_bits, dim_idx, low)
+                + ex_dist_table_value(ex_dist_table, dim, ex_bits, dim_idx + 1, high)
+        }
+        4 => ex_dist_table_value(ex_dist_table, dim, ex_bits, table_idx, code),
+        8 => {
+            let dim_idx = table_idx / 2;
+            if table_idx.is_multiple_of(2) {
+                ex_dist_table_value(ex_dist_table, dim, ex_bits, dim_idx, code)
+            } else {
+                ex_dist_table_value(ex_dist_table, dim, ex_bits, dim_idx, code << SEGMENT_LENGTH)
+            }
+        }
+        _ => unreachable!("unsupported RabitQ ex_bits={ex_bits} for FastScan"),
+    }
+}
+
+#[inline]
+fn ex_dist_table_value(
+    ex_dist_table: &[f32],
+    dim: usize,
+    ex_bits: u8,
+    dim_idx: usize,
+    code: usize,
+) -> f32 {
+    if dim_idx >= dim {
+        return 0.0;
+    }
+    let entries_per_dim = 1usize << ex_bits;
+    ex_dist_table[dim_idx * entries_per_dim + code]
 }
 
 #[inline]
@@ -775,6 +1350,17 @@ fn compute_single_rq_ex_distance(
             ex_dist_table[dim_idx * entries_per_dim + code]
         })
         .sum()
+}
+
+fn maybe_pack_ex_codes(
+    ex_codes: Option<&FixedSizeListArray>,
+    ex_bits: u8,
+) -> Option<FixedSizeListArray> {
+    let ex_codes = ex_codes?;
+    match ex_bits {
+        2 | 4 | 8 => Some(pack_codes(ex_codes)),
+        _ => None,
+    }
 }
 
 impl DistCalculator for RabitDistCalculator<'_> {
@@ -812,17 +1398,15 @@ impl DistCalculator for RabitDistCalculator<'_> {
                     .expect("raw-query multi-bit RQ requires ex scale factors");
                 let ex_code_len = rabit_ex_code_bytes(self.dim, ex_bits)
                     .expect("RabitQ num_bits should be validated");
-                let ex_dist = compute_single_rq_ex_distance(
-                    ex_codes,
+                self.raw_query_multi_bit_exact_distance(
                     id,
-                    ex_code_len,
+                    dist,
                     ex_bits,
-                    self.dim,
-                    &self.ex_dist_table,
-                );
-                let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
-                let full_dot = (1u32 << ex_bits) as f32 * dist + ex_dist + code_bias * self.sum_q;
-                full_dot * ex_scale_factors[id] + ex_add_factors[id] + self.query_factor
+                    ex_code_len,
+                    ex_codes,
+                    ex_add_factors,
+                    ex_scale_factors,
+                )
             }
         }
     }
@@ -858,73 +1442,187 @@ impl DistCalculator for RabitDistCalculator<'_> {
             return;
         }
 
+        let simd_len = self.binary_distances_with_scratch(
+            n,
+            code_len,
+            dists,
+            quantized_dists,
+            quantized_dists_table,
+        );
+
         if self.query_estimator == RabitQueryEstimator::RawQuery && self.num_bits > 1 {
-            dists.clear();
-            dists.reserve(n);
-            for id in 0..n {
-                dists.push(self.distance(id as u32));
-            }
-            quantized_dists.clear();
-            quantized_dists_table.clear();
+            self.apply_raw_query_multi_bit_distances(
+                simd_len,
+                dists,
+                quantized_dists,
+                quantized_dists_table,
+            );
             return;
         }
 
-        let (qmin, qmax) = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
-        let remainder = n % BATCH_SIZE;
-        let simd_len = n - remainder;
-        quantized_dists.clear();
-        quantized_dists.reserve(simd_len);
-        // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
-        unsafe {
-            quantized_dists.set_len(simd_len);
+        dists
+            .iter_mut()
+            .enumerate()
+            .for_each(|(id, dist)| match self.query_estimator {
+                RabitQueryEstimator::ResidualQuery => {
+                    let dist_vq_qr = (2.0 * *dist - self.sum_q) / self.sqrt_d;
+                    *dist = dist_vq_qr * self.scale_factors[id]
+                        + self.add_factors[id]
+                        + self.query_factor;
+                }
+                RabitQueryEstimator::RawQuery => {
+                    let binary_dot = *dist - 0.5 * self.sum_q;
+                    *dist = binary_dot * self.scale_factors[id]
+                        + self.add_factors[id]
+                        + self.query_factor;
+                }
+            });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+    ) {
+        if k == 0 {
+            return;
         }
-        simd::dist_table::sum_4bit_dist_table(
-            simd_len,
-            code_len,
-            self.codes,
-            quantized_dists_table,
+        if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
+            record_rabit_prune_bypass(reason);
+            self.distance_all_with_scratch(k, dists, quantized_dists, quantized_dists_table);
+            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+            return;
+        }
+
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let n = self.codes.len() / code_len;
+        self.accumulate_raw_query_multi_bit_topk_with_scratch(
+            k,
+            lower_bound,
+            upper_bound,
+            (0..n).map(|id| (id, row_id(id as u32))),
+            res,
+            dists,
             quantized_dists,
+            quantized_dists_table,
         );
+    }
 
-        let range = (qmax - qmin) / 255.0;
-        let num_tables = quantized_dists_table.len() / 16;
-        let sum_min = num_tables as f32 * qmin;
-        dists.clear();
-        dists.reserve(n);
-        // SAFETY: the SIMD section below writes [0, simd_len), and the
-        // remainder section writes [simd_len, n).
-        unsafe {
-            dists.set_len(n);
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_filtered_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (u32, u64)>,
+        accept_row: impl Fn(u64) -> bool,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+    ) {
+        if k == 0 {
+            return;
         }
-        let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
-        simd_dists
-            .iter_mut()
-            .zip(quantized_dists.iter())
-            .enumerate()
-            .for_each(|(id, (dist, q_dist))| {
-                let dist_vq = (*q_dist as f32) * range + sum_min;
-                *dist = match self.query_estimator {
-                    RabitQueryEstimator::ResidualQuery => {
-                        let dist_vq_qr = (2.0 * dist_vq - self.sum_q) / self.sqrt_d;
-                        dist_vq_qr * self.scale_factors[id]
-                            + self.add_factors[id]
-                            + self.query_factor
-                    }
-                    RabitQueryEstimator::RawQuery => {
-                        let binary_dot = dist_vq - 0.5 * self.sum_q;
-                        binary_dot * self.scale_factors[id]
-                            + self.add_factors[id]
-                            + self.query_factor
-                    }
-                };
-            });
+        if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
+            record_rabit_prune_bypass(reason);
+            self.distance_all_with_scratch(k, dists, quantized_dists, quantized_dists_table);
+            accumulate_filtered_distances_into_heap(
+                k,
+                lower_bound,
+                upper_bound,
+                row_ids,
+                accept_row,
+                res,
+                dists,
+            );
+            return;
+        }
 
-        remainder_dists
-            .iter_mut()
-            .enumerate()
-            .for_each(|(id, dist)| {
-                *dist = self.distance((simd_len + id) as u32);
-            });
+        self.accumulate_raw_query_multi_bit_topk_with_scratch(
+            k,
+            lower_bound,
+            upper_bound,
+            row_ids
+                .filter(|(_, row_id)| accept_row(*row_id))
+                .map(|(id, row_id)| (id as usize, row_id)),
+            res,
+            dists,
+            quantized_dists,
+            quantized_dists_table,
+        );
+    }
+}
+
+fn accumulate_distances_into_heap(
+    k: usize,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+    row_id: impl Fn(u32) -> u64,
+    res: &mut BinaryHeap<OrderedNode<u64>>,
+    dists: &[f32],
+) {
+    let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+    let mut max_dist = res.peek().map(|node| node.dist);
+    for (id, dist) in dists.iter().copied().enumerate() {
+        let dist = OrderedFloat(dist);
+        if dist < lower_bound || dist >= upper_bound {
+            continue;
+        }
+        if res.len() < k {
+            res.push(OrderedNode::new(row_id(id as u32), dist));
+            if res.len() == k {
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+            res.pop();
+            res.push(OrderedNode::new(row_id(id as u32), dist));
+            max_dist = res.peek().map(|node| node.dist);
+        }
+    }
+}
+
+fn accumulate_filtered_distances_into_heap(
+    k: usize,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+    row_ids: impl Iterator<Item = (u32, u64)>,
+    accept_row: impl Fn(u64) -> bool,
+    res: &mut BinaryHeap<OrderedNode<u64>>,
+    dists: &[f32],
+) {
+    let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+    let mut max_dist = res.peek().map(|node| node.dist);
+    for (id, row_id) in row_ids {
+        if !accept_row(row_id) {
+            continue;
+        }
+        let Some(dist) = dists.get(id as usize).copied() else {
+            continue;
+        };
+        let dist = OrderedFloat(dist);
+        if dist < lower_bound || dist >= upper_bound {
+            continue;
+        }
+        if res.len() < k {
+            res.push(OrderedNode::new(row_id, dist));
+            if res.len() == k {
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+            res.pop();
+            res.push(OrderedNode::new(row_id, dist));
+            max_dist = res.peek().map(|node| node.dist);
+        }
     }
 }
 
@@ -975,6 +1673,10 @@ impl VectorStore for RabitQuantizationStorage {
             RabitQueryEstimator::ResidualQuery => self.residual_query_factor(dist_q_c),
             RabitQueryEstimator::RawQuery => self.raw_query_factor(dist_q_c, &rotated_qr, None),
         };
+        let query_error = match self.metadata.query_estimator {
+            RabitQueryEstimator::ResidualQuery => 0.0,
+            RabitQueryEstimator::RawQuery => self.raw_query_error(dist_q_c, &rotated_qr, None),
+        };
         let sum_q = rotated_qr.into_iter().sum();
 
         self.distance_calculator_from_parts(
@@ -983,6 +1685,7 @@ impl VectorStore for RabitQuantizationStorage {
             Cow::Owned(ex_dist_table),
             sum_q,
             query_factor,
+            query_error,
         )
     }
 
@@ -1008,12 +1711,15 @@ impl VectorStore for RabitQuantizationStorage {
             debug_assert_eq!(raw_query.ex_bits, self.metadata.num_bits - 1);
             let query_factor =
                 self.raw_query_factor(dist_q_c, &raw_query.rotated_query, rotated_centroid);
+            let query_error =
+                self.raw_query_error(dist_q_c, &raw_query.rotated_query, rotated_centroid);
             return self.distance_calculator_from_parts(
                 code_dim,
                 Cow::Borrowed(&raw_query.dist_table),
                 Cow::Borrowed(&raw_query.ex_dist_table),
                 raw_query.sum_q,
                 query_factor,
+                query_error,
             );
         }
 
@@ -1027,6 +1733,7 @@ impl VectorStore for RabitQuantizationStorage {
         f32_scratch.resize(code_dim + dist_table_len + ex_dist_table_len, 0.0);
 
         let query_factor;
+        let query_error;
         let sum_q = {
             let (rotated_qr, remaining) = f32_scratch.split_at_mut(code_dim);
             let (dist_table, ex_dist_table) = remaining.split_at_mut(dist_table_len);
@@ -1055,6 +1762,18 @@ impl VectorStore for RabitQuantizationStorage {
                     self.raw_query_factor(dist_q_c, rotated_qr, None)
                 }
             };
+            query_error = match (self.metadata.query_estimator, residual) {
+                (RabitQueryEstimator::ResidualQuery, _) => 0.0,
+                (
+                    RabitQueryEstimator::RawQuery,
+                    Some(QueryResidual::RabitRawQuery {
+                        rotated_centroid, ..
+                    }),
+                ) => self.raw_query_error(dist_q_c, rotated_qr, rotated_centroid),
+                (RabitQueryEstimator::RawQuery, _) => {
+                    self.raw_query_error(dist_q_c, rotated_qr, None)
+                }
+            };
             build_dist_table_direct_into::<Float32Type>(rotated_qr, dist_table);
             build_ex_dist_table_direct_into(rotated_qr, ex_bits, ex_dist_table);
             rotated_qr.iter().copied().sum()
@@ -1069,6 +1788,7 @@ impl VectorStore for RabitQuantizationStorage {
             ),
             sum_q,
             query_factor,
+            query_error,
         )
     }
 
@@ -1257,6 +1977,9 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let scale_factors = batch[SCALE_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
+        let error_factors = batch
+            .column_by_name(ERROR_FACTORS_COLUMN)
+            .map(|factors| factors.as_primitive::<Float32Type>().clone());
         let ex_bits = rabit_ex_bits(metadata.num_bits)?;
         let mut ex_codes = None;
         let mut ex_add_factors = None;
@@ -1336,6 +2059,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
 
         let mut metadata = metadata.clone();
         metadata.packed = true;
+        let packed_ex_codes = maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits);
 
         Ok(Self {
             metadata,
@@ -1345,7 +2069,9 @@ impl QuantizerStorage for RabitQuantizationStorage {
             codes,
             add_factors,
             scale_factors,
+            error_factors,
             ex_codes,
+            packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
         })
@@ -1413,9 +2139,14 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let scale_factors = batch[SCALE_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
+        let error_factors = batch
+            .column_by_name(ERROR_FACTORS_COLUMN)
+            .map(|factors| factors.as_primitive::<Float32Type>().clone());
         let ex_codes = batch
             .column_by_name(RABIT_EX_CODE_COLUMN)
             .map(|codes| codes.as_fixed_size_list().clone());
+        let packed_ex_codes =
+            maybe_pack_ex_codes(ex_codes.as_ref(), rabit_ex_bits(self.metadata.num_bits)?);
         let ex_add_factors = batch
             .column_by_name(EX_ADD_FACTORS_COLUMN)
             .map(|factors| factors.as_primitive::<Float32Type>().clone());
@@ -1430,7 +2161,9 @@ impl QuantizerStorage for RabitQuantizationStorage {
             codes,
             add_factors,
             scale_factors,
+            error_factors,
             ex_codes,
+            packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
             row_ids: new_row_ids,
@@ -1541,7 +2274,7 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BinaryHeap, HashMap};
 
     use arrow_array::{ArrayRef, Float32Array, Float64Array, UInt64Array};
     use lance_core::ROW_ID;
@@ -1799,6 +2532,12 @@ mod tests {
                     (0..num_rows).map(|v| v as f32 + 0.5),
                 )) as ArrayRef,
             ),
+            (
+                ERROR_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32 + 0.25),
+                )) as ArrayRef,
+            ),
         ])
         .unwrap()
     }
@@ -1834,6 +2573,12 @@ mod tests {
                 SCALE_FACTORS_COLUMN,
                 Arc::new(Float32Array::from_iter_values(
                     (0..num_rows).map(|v| v as f32 + 0.5),
+                )) as ArrayRef,
+            ),
+            (
+                ERROR_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32 + 0.25),
                 )) as ArrayRef,
             ),
             (RABIT_EX_CODE_COLUMN, Arc::new(ex_codes) as ArrayRef),
@@ -1920,6 +2665,223 @@ mod tests {
         let mut u8_scratch = Vec::new();
         calc.distance_all_with_scratch(0, &mut distances, &mut u16_scratch, &mut u8_scratch);
         assert_eq!(distances, vec![104.0, 22.0]);
+    }
+
+    fn assert_raw_query_multi_bit_distance_all_uses_fastscan(num_bits: u8) {
+        let code_dim = 8usize;
+        let num_rows = BATCH_SIZE + 1;
+        let ex_bits = rabit_ex_bits(num_bits).unwrap();
+        let identity = Float32Array::from_iter_values(
+            (0..code_dim)
+                .flat_map(|row| (0..code_dim).map(move |col| if row == col { 1.0 } else { 0.0 })),
+        );
+        let rotate_mat =
+            FixedSizeListArray::try_new_from_values(identity, code_dim as i32).unwrap();
+        let metadata = RabitQuantizationMetadata {
+            rotate_mat: Some(rotate_mat),
+            rotate_mat_position: None,
+            fast_rotation_signs: None,
+            rotation_type: RQRotationType::Matrix,
+            code_dim: code_dim as u32,
+            num_bits,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values((0..num_rows).map(|idx| (idx * 13) as u8)),
+            1,
+        )
+        .unwrap();
+        let ex_code_len = rabit_ex_code_bytes(code_dim, ex_bits).unwrap();
+        let ex_codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values(
+                (0..num_rows * ex_code_len).map(|idx| (idx * 37 % 251) as u8),
+            ),
+            ex_code_len as i32,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+            ),
+            (RABIT_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+            (
+                ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0; num_rows])) as ArrayRef,
+            ),
+            (
+                SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![1.0; num_rows])) as ArrayRef,
+            ),
+            (RABIT_EX_CODE_COLUMN, Arc::new(ex_codes) as ArrayRef),
+            (
+                EX_ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0; num_rows])) as ArrayRef,
+            ),
+            (
+                EX_SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![1.0; num_rows])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+        assert!(storage.packed_ex_codes.is_some());
+
+        let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
+        let calc = storage.dist_calculator(query, 0.0);
+        let mut distances = Vec::new();
+        let mut u16_scratch = Vec::new();
+        let mut u8_scratch = Vec::new();
+        calc.distance_all_with_scratch(0, &mut distances, &mut u16_scratch, &mut u8_scratch);
+
+        assert_eq!(distances.len(), num_rows);
+        assert_eq!(u16_scratch.len(), BATCH_SIZE);
+        assert_eq!(
+            u8_scratch.len(),
+            ex_fastscan_code_len(code_dim, ex_bits).unwrap() * 2 * SEGMENT_NUM_CODES
+        );
+        for (id, distance) in distances.iter().take(BATCH_SIZE).enumerate() {
+            let exact = calc.distance(id as u32);
+            assert!(
+                (*distance - exact).abs() < 10.0,
+                "distance_all fastscan mismatch for id {id}: actual={distance}, exact={exact}"
+            );
+        }
+        assert_eq!(distances[BATCH_SIZE], calc.distance(BATCH_SIZE as u32));
+    }
+
+    #[test]
+    fn test_raw_query_multi_bit_distance_all_uses_fastscan_for_split_ex_codes() {
+        for num_bits in [3, 9] {
+            assert_raw_query_multi_bit_distance_all_uses_fastscan(num_bits);
+        }
+    }
+
+    #[test]
+    fn test_raw_query_multi_bit_accumulate_topk_uses_lower_bound_gating() {
+        let code_dim = 8usize;
+        let num_rows = BATCH_SIZE + 9;
+        let num_bits = 3;
+        let ex_bits = rabit_ex_bits(num_bits).unwrap();
+        let identity = Float32Array::from_iter_values(
+            (0..code_dim)
+                .flat_map(|row| (0..code_dim).map(move |col| if row == col { 1.0 } else { 0.0 })),
+        );
+        let rotate_mat =
+            FixedSizeListArray::try_new_from_values(identity, code_dim as i32).unwrap();
+        let metadata = RabitQuantizationMetadata {
+            rotate_mat: Some(rotate_mat),
+            rotate_mat_position: None,
+            fast_rotation_signs: None,
+            rotation_type: RQRotationType::Matrix,
+            code_dim: code_dim as u32,
+            num_bits,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values((0..num_rows).map(|idx| (idx * 19) as u8)),
+            1,
+        )
+        .unwrap();
+        let ex_code_len = rabit_ex_code_bytes(code_dim, ex_bits).unwrap();
+        let ex_codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values(
+                (0..num_rows * ex_code_len).map(|idx| (idx * 29 % 251) as u8),
+            ),
+            ex_code_len as i32,
+        )
+        .unwrap();
+        let batch = make_test_batch_with_ex(codes, ex_codes)
+            .replace_column_by_name(
+                ERROR_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![1000.0; num_rows])),
+            )
+            .unwrap();
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+        let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
+        let calc = storage.dist_calculator(query, 4.0);
+        assert!(
+            calc.raw_query_lower_bound_gating_disabled_reason()
+                .is_none()
+        );
+
+        let k = 5;
+        let mut binary_ips = Vec::new();
+        let mut binary_u16_scratch = Vec::new();
+        let mut binary_u8_scratch = Vec::new();
+        calc.binary_distances_with_scratch(
+            num_rows,
+            rabit_binary_code_bytes(code_dim),
+            &mut binary_ips,
+            &mut binary_u16_scratch,
+            &mut binary_u8_scratch,
+        );
+        let ex_codes = calc.ex_codes.unwrap();
+        let ex_add_factors = calc.ex_add_factors.unwrap();
+        let ex_scale_factors = calc.ex_scale_factors.unwrap();
+        let mut expected = binary_ips
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(id, binary_ip)| {
+                (
+                    id,
+                    calc.raw_query_multi_bit_exact_distance(
+                        id,
+                        binary_ip,
+                        ex_bits,
+                        ex_code_len,
+                        ex_codes,
+                        ex_add_factors,
+                        ex_scale_factors,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.1.total_cmp(&right.1));
+        expected.truncate(k);
+        let mut expected = expected
+            .into_iter()
+            .map(|(id, dist)| (id as u64, dist))
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut heap = BinaryHeap::with_capacity(k);
+        let mut distances = Vec::new();
+        let mut u16_scratch = Vec::new();
+        let mut u8_scratch = Vec::new();
+        calc.accumulate_topk_with_scratch(
+            k,
+            None,
+            None,
+            |id| id as u64,
+            &mut heap,
+            &mut distances,
+            &mut u16_scratch,
+            &mut u8_scratch,
+        );
+        let mut actual = heap
+            .into_iter()
+            .map(|node| (node.id, node.dist.0))
+            .collect::<Vec<_>>();
+        actual.sort_by(|left, right| left.0.cmp(&right.0));
+
+        assert_eq!(actual.len(), expected.len());
+        for ((actual_id, actual_dist), (expected_id, expected_dist)) in
+            actual.into_iter().zip(expected)
+        {
+            assert_eq!(actual_id, expected_id);
+            assert!(
+                (actual_dist - expected_dist).abs() < 1e-5,
+                "actual={actual_dist}, expected={expected_dist}"
+            );
+        }
     }
 
     #[test]
@@ -2106,6 +3068,31 @@ mod tests {
                 .value_length(),
             64
         );
+        assert!(stored_batch.column_by_name(ERROR_FACTORS_COLUMN).is_some());
+    }
+
+    #[test]
+    fn test_try_from_batch_accepts_missing_error_factors_for_compatibility() {
+        let original_codes = make_test_codes(50, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 9);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 9;
+        let batch = make_test_batch_with_ex(original_codes, ex_codes)
+            .drop_column(ERROR_FACTORS_COLUMN)
+            .unwrap();
+
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+        let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
+        let calc = storage.dist_calculator(query, 4.0);
+
+        assert!(storage.error_factors.is_none());
+        assert_eq!(
+            calc.raw_query_lower_bound_gating_disabled_reason(),
+            Some("missing_error_factors")
+        );
     }
 
     #[test]
@@ -2189,6 +3176,12 @@ mod tests {
                 .as_primitive::<Float32Type>()
                 .values()[..5],
             &[1.5, 2.5, 3.5, 5.5, 6.5]
+        );
+        assert_eq!(
+            &remapped_batch[ERROR_FACTORS_COLUMN]
+                .as_primitive::<Float32Type>()
+                .values()[..5],
+            &[0.25, 1.25, 2.25, 4.25, 5.25]
         );
     }
 }
