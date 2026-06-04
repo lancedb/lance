@@ -3,7 +3,7 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use super::{IndexReader, IndexStore, IndexWriter};
+use super::{IndexReader, IndexStore, IndexWriteSummary, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
@@ -109,14 +109,21 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
         Ok(offset as u64)
     }
 
-    async fn finish(&mut self) -> Result<()> {
-        Self::finish(self).await.map(|_| ())
+    async fn finish(&mut self) -> Result<IndexWriteSummary> {
+        Self::finish(self).await?;
+        Ok(IndexWriteSummary {
+            size_bytes: self.tell().await? as u64,
+        })
     }
 
-    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
-        Self::finish_with_metadata(self, &metadata)
-            .await
-            .map(|_| ())
+    async fn finish_with_metadata(
+        &mut self,
+        metadata: HashMap<String, String>,
+    ) -> Result<IndexWriteSummary> {
+        Self::finish_with_metadata(self, &metadata).await?;
+        Ok(IndexWriteSummary {
+            size_bytes: self.tell().await? as u64,
+        })
     }
 }
 
@@ -132,15 +139,24 @@ impl IndexWriter for current_writer::FileWriter {
         Self::add_global_buffer(self, data).await
     }
 
-    async fn finish(&mut self) -> Result<()> {
-        Self::finish(self).await.map(|_| ())
+    async fn finish(&mut self) -> Result<IndexWriteSummary> {
+        let summary = Self::finish(self).await?;
+        Ok(IndexWriteSummary {
+            size_bytes: summary.size_bytes,
+        })
     }
 
-    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+    async fn finish_with_metadata(
+        &mut self,
+        metadata: HashMap<String, String>,
+    ) -> Result<IndexWriteSummary> {
         metadata.into_iter().for_each(|(k, v)| {
             self.add_schema_metadata(k, v);
         });
-        Self::finish(self).await.map(|_| ())
+        let summary = Self::finish(self).await?;
+        Ok(IndexWriteSummary {
+            size_bytes: summary.size_bytes,
+        })
     }
 }
 
@@ -479,7 +495,11 @@ mod tests {
             .unwrap();
         let expected = bytes::Bytes::from_static(b"scalar-global-buffer");
         let buffer_idx = writer.add_global_buffer(expected.clone()).await.unwrap();
-        writer.finish().await.unwrap();
+        let write_summary = writer.finish().await.unwrap();
+        let files = index_store.list_files_with_sizes().await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "global-buffer.lance");
+        assert_eq!(write_summary.size_bytes, files[0].size_bytes);
 
         let reader = index_store
             .open_index_file("global-buffer.lance")

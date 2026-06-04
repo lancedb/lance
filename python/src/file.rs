@@ -347,7 +347,7 @@ impl LanceFileWriter {
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        rt().block_on(None, async { self.inner.lock().await.finish().await })?
+        rt().block_on(None, async { self.inner.lock().await.finish().await.map(|s| s.num_rows) })?
             .infer_error()
     }
 

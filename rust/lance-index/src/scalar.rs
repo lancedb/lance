@@ -52,6 +52,13 @@ use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
+/// Summary of a completed index file write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexWriteSummary {
+    /// The final size of the index file in bytes.
+    pub size_bytes: u64,
+}
+
 /// Builtin index types supported by the Lance library
 ///
 /// This is primarily for convenience to avoid a bunch of string
@@ -182,9 +189,12 @@ pub trait IndexWriter: Send {
         ))
     }
     /// Finishes writing the file and closes the file
-    async fn finish(&mut self) -> Result<()>;
+    async fn finish(&mut self) -> Result<IndexWriteSummary>;
     /// Finishes writing the file and closes the file with additional metadata
-    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()>;
+    async fn finish_with_metadata(
+        &mut self,
+        metadata: HashMap<String, String>,
+    ) -> Result<IndexWriteSummary>;
 }
 
 /// Trait for reading an index (or parts of an index) from storage

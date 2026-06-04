@@ -885,7 +885,8 @@ impl RTreeIndexPlugin {
         )?;
 
         writer.write_record_batch(batch).await?;
-        writer.finish().await
+        writer.finish().await?;
+        Ok(())
     }
 
     async fn train_rtree_index(
