@@ -3088,6 +3088,70 @@ mod tests {
         Ok(())
     }
 
+    // Regression test for an FTS optimize panic seen in production:
+    //   panicked at scalar/inverted/builder.rs ...
+    //   index out of bounds: the len is N but the index is N+k
+    //
+    // The setup is a target builder whose token set was previously shrunk by
+    // an `InnerBuilder::remap` (i.e. some posting lists became empty after
+    // row deletes during compaction). Before the accompanying fix,
+    // `TokenSet::remap` shifted the surviving ids down but left `next_id`
+    // unchanged, so a later `get_or_add` for an unseen token returned an id
+    // past `tokens.len()`. `merge_from` then sized `posting_lists` to
+    // `tokens.len()` and indexed it with that stale id.
+    #[tokio::test]
+    async fn merge_from_tolerates_remapped_target_token_set() -> Result<()> {
+        let mut target = InnerBuilder::new(0, false, TokenSetFormat::default());
+        // Seed with two tokens, each appearing in exactly one doc so that
+        // deleting that doc empties the corresponding posting list.
+        let alpha = target.tokens.add("alpha".to_owned());
+        let beta = target.tokens.add("beta".to_owned());
+        target
+            .posting_lists
+            .resize_with(target.tokens.len(), || PostingListBuilder::new(false));
+        let alpha_doc = target.docs.append(10, 1);
+        let beta_doc = target.docs.append(11, 1);
+        target.posting_lists[alpha as usize].add(alpha_doc, PositionRecorder::Count(1));
+        target.posting_lists[beta as usize].add(beta_doc, PositionRecorder::Count(1));
+
+        // Simulate compaction removing the beta row. InnerBuilder::remap
+        // empties beta's posting list, drops it, and calls
+        // TokenSet::remap which (without the fix) leaves next_id stale.
+        let mut mapping = HashMap::new();
+        mapping.insert(11_u64, None);
+        target.remap(&mapping).await?;
+
+        assert_eq!(target.tokens.len(), 1);
+        assert_eq!(target.tokens.next_id(), 1);
+        assert_eq!(target.posting_lists.len(), 1);
+
+        // A delta partition introducing a brand new token. With the fix,
+        // get_or_add hands back id 1 (== current tokens.len()), merge_from
+        // grows posting_lists to length 2, and the merge succeeds.
+        let mut delta = InnerBuilder::new(1, false, TokenSetFormat::default());
+        let gamma = delta.tokens.add("gamma".to_owned());
+        delta
+            .posting_lists
+            .resize_with(delta.tokens.len(), || PostingListBuilder::new(false));
+        let delta_doc = delta.docs.append(20, 1);
+        delta.posting_lists[gamma as usize].add(delta_doc, PositionRecorder::Count(1));
+
+        target.merge_from(delta)?;
+
+        assert_eq!(target.docs.len(), 2);
+        assert_eq!(target.tokens.len(), 2);
+        assert_eq!(target.posting_lists.len(), 2);
+        assert_eq!(
+            target.posting_lists[target.tokens.get("alpha").unwrap() as usize].len(),
+            1
+        );
+        assert_eq!(
+            target.posting_lists[target.tokens.get("gamma").unwrap() as usize].len(),
+            1
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_update_index_returns_worker_error_when_workers_exit_during_dispatch() {
         let num_batches = (*LANCE_FTS_NUM_SHARDS * 2 + 1) as u64;

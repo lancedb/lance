@@ -1648,6 +1648,13 @@ impl TokenSet {
             },
         );
 
+        // Surviving token ids were shifted down to close the gaps left by the
+        // removed ids, so `next_id` must shrink by the same amount or future
+        // `get_or_add` calls will hand out ids past `tokens.len()`. That breaks
+        // `InnerBuilder::merge_from`, which sizes `posting_lists` to
+        // `tokens.len()` and then indexes it with `get_or_add`'s return.
+        self.next_id -= removed_token_ids.len() as u32;
+
         self.tokens = TokenMap::HashMap(map);
     }
 
