@@ -48,29 +48,6 @@ fn push_candidate_local(
     }
 }
 
-#[inline(always)]
-fn push_candidate_global(
-    res: &mut BinaryHeap<OrderedNode<u64>>,
-    k: usize,
-    row_id: u64,
-    dist: OrderedFloat,
-    max_dist: &mut Option<OrderedFloat>,
-) {
-    if k == 0 {
-        return;
-    }
-    if res.len() < k {
-        res.push(OrderedNode::new(row_id, dist));
-        if res.len() == k {
-            *max_dist = res.peek().map(|node| node.dist);
-        }
-    } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-        res.pop();
-        res.push(OrderedNode::new(row_id, dist));
-        *max_dist = res.peek().map(|node| node.dist);
-    }
-}
-
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results
 #[derive(Debug, Clone, Default, DeepSizeOf)]
@@ -271,7 +248,6 @@ impl IvfSubIndex for FlatIndex {
         scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
-        let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
@@ -279,7 +255,6 @@ impl IvfSubIndex for FlatIndex {
             residual,
             &mut scratch.query_f32,
         );
-        let mut max_dist = res.peek().map(|node| node.dist);
         metrics.record_comparisons(storage.len());
 
         match prefilter.is_empty() {
@@ -297,29 +272,17 @@ impl IvfSubIndex for FlatIndex {
             }
             false => {
                 let row_addr_mask = prefilter.mask();
-                if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
-                        if dist < lower_bound || dist >= upper_bound {
-                            continue;
-                        }
-
-                        push_candidate_global(res, k, row_addr, dist, &mut max_dist);
-                    }
-                } else {
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
-                        push_candidate_global(res, k, row_addr, dist, &mut max_dist);
-                    }
-                }
+                dist_calc.accumulate_filtered_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    row_ids.enumerate().map(|(id, &row_id)| (id as u32, row_id)),
+                    |row_id| row_addr_mask.selected(row_id),
+                    res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                );
             }
         };
         Ok(())

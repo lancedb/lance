@@ -103,6 +103,48 @@ pub trait DistCalculator {
             }
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_filtered_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (u32, u64)>,
+        accept_row: impl Fn(u64) -> bool,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        _dists: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+    ) {
+        if k == 0 {
+            return;
+        }
+
+        let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+        let mut max_dist = res.peek().map(|node| node.dist);
+
+        for (id, row_id) in row_ids {
+            if !accept_row(row_id) {
+                continue;
+            }
+            let dist = OrderedFloat(self.distance(id));
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
+            if res.len() < k {
+                res.push(OrderedNode::new(row_id, dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                res.pop();
+                res.push(OrderedNode::new(row_id, dist));
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+    }
 }
 
 pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
