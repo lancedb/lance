@@ -49,8 +49,8 @@ pub static EX_SCALE_FACTORS_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new
 pub struct RQTransformer {
     rq: RabitQuantizer,
     distance_type: DistanceType,
-    centroids: FixedSizeListArray,
     centroids_norm_square: Option<Float32Array>,
+    rotated_centroids: Option<Vec<f32>>,
     vector_column: String,
 }
 
@@ -60,18 +60,21 @@ impl RQTransformer {
         distance_type: DistanceType,
         centroids: FixedSizeListArray,
         vector_column: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         // for dot product, the add factor is `1 - v*c + |c|^2`, so we need to compute |c|^2
         let centroids_norm_square = (distance_type == DistanceType::Dot)
             .then(|| Float32Array::from(norm_squared_fsl(&centroids)));
+        let rotated_centroids = (rq.num_bits() > 1)
+            .then(|| rq.rotate_fsl_to_f32(&centroids))
+            .transpose()?;
 
-        Self {
+        Ok(Self {
             rq,
             distance_type,
-            centroids,
             centroids_norm_square,
+            rotated_centroids,
             vector_column: vector_column.into(),
-        }
+        })
     }
 }
 
@@ -375,13 +378,15 @@ impl Transformer for RQTransformer {
             })?;
 
             let part_ids = batch[PART_ID_COLUMN].as_primitive::<UInt32Type>();
-            let rotated_centroids = self.rq.rotate_fsl_to_f32(&self.centroids)?;
+            let rotated_centroids = self.rotated_centroids.as_ref().ok_or_else(|| {
+                Error::internal("RabitQ multi-bit transformer is missing rotated centroids")
+            })?;
             let ex_bits = rabit_ex_bits(self.rq.num_bits())?;
             let raw_query_factors = compute_raw_query_factors(
                 self.distance_type,
                 &res_norm_square,
                 &rotated_residuals,
-                &rotated_centroids,
+                rotated_centroids,
                 part_ids,
                 &ex_code_values,
                 &ex_res_dot_dists,
@@ -450,7 +455,9 @@ mod tests {
         let centroids =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
                 .unwrap();
-        let transformer = RQTransformer::new(rq.clone(), DistanceType::L2, centroids, "vector");
+        let transformer =
+            RQTransformer::new(rq.clone(), DistanceType::L2, centroids, "vector").unwrap();
+        assert!(transformer.rotated_centroids.is_some());
 
         let residual_vectors = FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![
@@ -515,6 +522,31 @@ mod tests {
         assert!(transformed.column_by_name("vector").is_none());
         assert!(transformed.column_by_name(CENTROID_DIST_COLUMN).is_none());
         assert!(transformed.column_by_name(ADD_FACTORS_COLUMN).is_some());
+    }
+
+    #[test]
+    fn test_rq_transformer_caches_rotated_centroids_only_for_multi_bit() {
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32; 8]), 8)
+                .unwrap();
+        let binary_rq =
+            RabitQuantizer::new_with_rotation::<Float32Type>(1, 8, RQRotationType::Fast);
+        let binary_transformer =
+            RQTransformer::new(binary_rq, DistanceType::L2, centroids.clone(), "vector").unwrap();
+        assert!(binary_transformer.rotated_centroids.is_none());
+
+        let multi_bit_rq =
+            RabitQuantizer::new_with_rotation::<Float32Type>(4, 8, RQRotationType::Fast);
+        let multi_bit_transformer =
+            RQTransformer::new(multi_bit_rq, DistanceType::L2, centroids, "vector").unwrap();
+        assert_eq!(
+            multi_bit_transformer
+                .rotated_centroids
+                .as_ref()
+                .unwrap()
+                .len(),
+            8
+        );
     }
 
     #[test]
