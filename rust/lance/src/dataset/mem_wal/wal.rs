@@ -39,6 +39,10 @@ use super::memtable::batch_store::{BatchStore, StoredBatch};
 /// Key for storing writer epoch in Arrow IPC file schema metadata.
 pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
 
+/// Marks a WAL entry as a data-less fence sentinel (observability only;
+/// replay skips sentinels via their empty batch list).
+pub const FENCE_SENTINEL_KEY: &str = "fence_sentinel";
+
 /// Watcher for batch durability using watermark-based tracking.
 ///
 /// Uses a shared watch channel that broadcasts the durable watermark.
@@ -882,6 +886,52 @@ impl WalAppender {
         self.manifest_store.check_fenced(self.writer_epoch).await
     }
 
+    /// Drop a data-less sentinel at the WAL tip so the predecessor's next
+    /// `append` collides on PUT-IF-NOT-EXISTS and learns it is fenced, rather
+    /// than succeeding into the empty next slot. Call *before* replay: any
+    /// predecessor entry below the sentinel is then recovered, not orphaned.
+    /// On a lost slot race, re-probes one past the winner. Seeds next position
+    /// past the sentinel; returns the sentinel position.
+    pub(crate) async fn write_fence_sentinel(&self) -> Result<u64> {
+        let sentinel = Bytes::from(serialize_fence_sentinel(self.writer_epoch)?);
+        let mut next_pos = self.next_entry_position.lock().await;
+        let mut pos = match *next_pos {
+            Some(p) => p,
+            None => self.discover_next_position().await?,
+        };
+        let mut conflicts = 0;
+        loop {
+            match atomic_put(
+                self.object_store.as_ref(),
+                &self.wal_dir,
+                &wal_entry_filename(pos),
+                sentinel.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    let next = pos.checked_add(1).ok_or_else(|| {
+                        Error::io(format!("WAL position overflow for shard {}", self.shard_id))
+                    })?;
+                    *next_pos = Some(next);
+                    self.next_entry_position_hint.store(next, Ordering::SeqCst);
+                    return Ok(pos);
+                }
+                Err(AtomicPutError::AlreadyExists) => {
+                    conflicts += 1;
+                    if conflicts >= MAX_APPEND_CREATE_CONFLICTS {
+                        return Err(Error::io(format!(
+                            "fence sentinel write for shard {} failed after {} conflicts",
+                            self.shard_id, conflicts
+                        )));
+                    }
+                    pos = self.discover_next_position().await?;
+                }
+                Err(AtomicPutError::Other(error)) => return Err(error),
+            }
+        }
+    }
+
     async fn discover_next_position(&self) -> Result<u64> {
         if let Ok(Some(manifest)) = self.manifest_store.read_latest().await {
             let hint = manifest.wal_entry_position_last_seen;
@@ -1049,6 +1099,28 @@ fn serialize_appender_batches(batches: &[RecordBatch], writer_epoch: u64) -> Res
         writer
             .finish()
             .map_err(|e| Error::io(format!("failed to finish WAL IPC stream: {}", e)))?;
+    }
+    Ok(buffer)
+}
+
+/// Data-less sentinel: an empty-schema Arrow IPC stream with the writer epoch
+/// and a marker flag, no batches. Reads back as `(epoch, [])` so replay skips
+/// it. See [`WalAppender::write_fence_sentinel`].
+fn serialize_fence_sentinel(writer_epoch: u64) -> Result<Vec<u8>> {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(WRITER_EPOCH_KEY.to_string(), writer_epoch.to_string());
+    metadata.insert(FENCE_SENTINEL_KEY.to_string(), "true".to_string());
+    let ipc_schema = Arc::new(ArrowSchema::new_with_metadata(
+        arrow_schema::Fields::empty(),
+        metadata,
+    ));
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &ipc_schema)
+            .map_err(|e| Error::io(format!("failed to create fence sentinel IPC writer: {}", e)))?;
+        writer
+            .finish()
+            .map_err(|e| Error::io(format!("failed to finish fence sentinel IPC stream: {}", e)))?;
     }
     Ok(buffer)
 }
@@ -1582,6 +1654,50 @@ mod tests {
             err.to_string().contains("Writer fenced"),
             "expected fence error from append, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fence_sentinel_fences_predecessor_without_successor_write() {
+        // The race the sentinel closes: a successor claims a higher epoch but
+        // has NOT yet written any data batch. Without the sentinel, the
+        // predecessor's next append lands in the empty next slot, succeeds,
+        // and false-acks. With the sentinel, the predecessor collides.
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        let first = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+            .await
+            .unwrap();
+        let schema = create_test_schema();
+        let batch = create_test_batch(&schema, 1);
+        first.append(vec![batch.clone()]).await.unwrap(); // position 1
+
+        // Successor claims epoch 2 and drops a sentinel at the tip (position 2)
+        // — but writes no data of its own.
+        let second = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(second.writer_epoch(), 2);
+        let sentinel_pos = second.write_fence_sentinel().await.unwrap();
+        assert_eq!(sentinel_pos, 2, "sentinel should land at the tip");
+
+        // Predecessor's next append collides with the sentinel and is fenced.
+        let err = first.append(vec![batch.clone()]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Writer fenced"),
+            "expected fence error from append, got: {err}"
+        );
+
+        // The sentinel is data-less: a tailer reads it back as zero batches so
+        // replay skips it.
+        let tailer = WalTailer::new(store.clone(), base_path.clone(), shard_id);
+        let entry = tailer.read_entry(sentinel_pos).await.unwrap().unwrap();
+        assert_eq!(entry.writer_epoch, 2);
+        assert!(entry.batches.is_empty(), "sentinel must carry no batches");
+
+        // Successor's own writes land after the sentinel (position 3).
+        let res = second.append(vec![batch]).await.unwrap();
+        assert_eq!(res.entry_position, 3);
     }
 
     #[tokio::test]
