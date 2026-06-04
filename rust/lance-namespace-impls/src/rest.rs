@@ -222,15 +222,25 @@ impl RestClient {
 
 /// Builder for creating a RestNamespace.
 ///
-/// This builder provides a fluent API for configuring and establishing
-/// connections to REST-based Lance namespaces.
+/// # Authentication
+///
+/// SigV4 authentication via properties:
+/// - `rest.auth.type` — `"sigv4"` or `"none"` (default: none)
+/// - `rest.auth.sigv4.region` — AWS region (required for sigv4)
+/// - `rest.auth.sigv4.service` — AWS service name (default: `"execute-api"`)
+///
+/// Credentials are resolved via the standard AWS chain (env vars, profile,
+/// IMDS). Alternatively, use [`auth_provider()`](Self::auth_provider) to
+/// inject a custom provider (takes precedence over properties).
+///
+/// `rest.auth.*` and `header.Authorization` are mutually exclusive —
+/// setting both will return an error at build time.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// # use lance_namespace_impls::RestNamespaceBuilder;
 /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // Create a REST namespace
 /// let namespace = RestNamespaceBuilder::new("http://localhost:8080")
 ///     .delimiter(".")
 ///     .header("Authorization", "Bearer token")
@@ -530,9 +540,18 @@ impl RestNamespaceBuilder {
         self
     }
 
-    /// Build the RestNamespace. Auth provider precedence:
-    /// `auth_provider()` setter > `rest.auth.*` properties > none.
+    /// Build the RestNamespace.
     pub fn build(self) -> Result<RestNamespace> {
+        let has_auth = self.auth_provider.is_some()
+            || self.auth_properties.contains_key(AUTH_TYPE_KEY);
+        if has_auth && self.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) {
+            return Err(NamespaceError::InvalidInput {
+                message: "cannot combine header.Authorization with rest.auth.* — \
+                          use one authentication method"
+                    .to_string(),
+            }
+            .into());
+        }
         let auth = if let Some(p) = self.auth_provider.clone() {
             Some(p)
         } else if self.auth_properties.contains_key(AUTH_TYPE_KEY) {
@@ -2564,6 +2583,22 @@ mod tests {
             marker,
             Some("from-setter"),
             "setter auth_provider must override rest.auth.type property"
+        );
+    }
+
+    #[test]
+    fn build_rejects_header_authorization_combined_with_auth_type() {
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), "http://localhost:8080".to_string());
+        props.insert("header.Authorization".to_string(), "Bearer token".to_string());
+        props.insert("rest.auth.type".to_string(), "none".to_string());
+        let err = RestNamespaceBuilder::from_properties(props)
+            .unwrap()
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("one authentication method"),
+            "build must reject header.Authorization + rest.auth.*: {err}"
         );
     }
 }

@@ -826,15 +826,17 @@ pub struct PyRestNamespace {
 
 #[pymethods]
 impl PyRestNamespace {
-    /// Create a new RestNamespace from properties
+    /// Create a new RestNamespace from properties.
     ///
     /// # Arguments
     ///
     /// * `context_provider` - Optional object with `provide_context(info: dict) -> dict` method
     ///   for providing dynamic per-request context. Context keys that start with `headers.`
-    ///   are converted to HTTP headers by stripping the prefix. For example,
-    ///   `{"headers.Authorization": "Bearer token"}` becomes the `Authorization` header.
-    /// * `**properties` - Namespace configuration properties (uri, delimiter, header.*, etc.)
+    ///   are converted to HTTP headers by stripping the prefix.
+    /// * `**properties` - Namespace configuration properties (uri, delimiter, header.*,
+    ///   rest.auth.type, rest.auth.sigv4.region, rest.auth.sigv4.service, etc.)
+    ///
+    /// `rest.auth.*` and `header.Authorization` are mutually exclusive.
     #[new]
     #[pyo3(signature = (context_provider = None, **properties))]
     fn new(

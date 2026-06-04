@@ -120,6 +120,15 @@ import java.util.Optional;
  *   <li>uri (required): REST API endpoint URL
  *   <li>delimiter (optional): Namespace delimiter (default: "$")
  *   <li>header.* (optional): HTTP headers (e.g., header.Authorization=Bearer token)
+ *   <li>rest.auth.type (optional): Authentication type — "sigv4" or "none" (default: none)
+ *   <li>rest.auth.sigv4.region (required if sigv4): AWS region
+ *   <li>rest.auth.sigv4.service (optional): AWS service name (default: "execute-api")
+ * </ul>
+ *
+ * <p>Note: {@code rest.auth.*} and {@code header.Authorization} are mutually exclusive.
+ * Setting both will throw an error at initialization time.
+ *
+ * <ul>
  *   <li>tls.cert_file (optional): Path to client certificate file
  *   <li>tls.key_file (optional): Path to client key file
  *   <li>tls.ssl_ca_cert (optional): Path to CA certificate file
@@ -131,8 +140,8 @@ import java.util.Optional;
  * <pre>{@code
  * Map<String, String> properties = new HashMap<>();
  * properties.put("uri", "https://api.example.com");
- * properties.put("delimiter", ".");
- * properties.put("header.Authorization", "Bearer my-token");
+ * properties.put("rest.auth.type", "sigv4");
+ * properties.put("rest.auth.sigv4.region", "us-east-1");
  *
  * RestNamespace namespace = new RestNamespace();
  * namespace.initialize(properties, allocator);
