@@ -800,14 +800,14 @@ impl KMeans {
         let mut adjusted_balance_factor = f32::MAX;
 
         // TODO: use seed for Rng.
-        let rng = SmallRng::from_os_rng();
+        let mut rng = SmallRng::from_os_rng();
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
                     data.values(),
                     dimension,
                     k,
-                    rng.clone(),
+                    &mut rng,
                     params.distance_type,
                 ),
                 KMeanInit::Incremental(centroids) => Self::with_centroids(
@@ -1590,6 +1590,21 @@ mod tests {
             DistanceType::L2,
         );
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_random_init_advances_rng() {
+        let values = Float32Array::from_iter_values((0..64).map(|value| value as f32));
+        let mut rng = SmallRng::seed_from_u64(42);
+        let first =
+            KMeans::init_random::<Float32Type>(values.values(), 1, 8, &mut rng, DistanceType::L2);
+        let second =
+            KMeans::init_random::<Float32Type>(values.values(), 1, 8, &mut rng, DistanceType::L2);
+
+        assert_ne!(
+            first.centroids.as_primitive::<Float32Type>().values(),
+            second.centroids.as_primitive::<Float32Type>().values(),
+        );
     }
 
     #[tokio::test]

@@ -3609,7 +3609,7 @@ impl PyWriteDest {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum IndexProgressEventType {
     Start,
     Progress,
@@ -3765,7 +3765,20 @@ impl IndexProgressDispatcher {
 
     fn drain(&mut self) -> PyResult<()> {
         while let Ok(event) = self.receiver.try_recv() {
-            self.dispatch(event)?;
+            let is_complete = event.event == IndexProgressEventType::Complete;
+            if let Err(err) = self.dispatch(event) {
+                if is_complete {
+                    // Complete events are purely informational — the stage's work
+                    // is already done. Propagating a callback error here would
+                    // abort the operation after the real work has succeeded.
+                    log::warn!(
+                        "Ignoring progress callback error on stage-complete event: {}",
+                        err
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }

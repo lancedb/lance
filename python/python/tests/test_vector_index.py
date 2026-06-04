@@ -23,7 +23,10 @@ from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
-from lance.util import validate_vector_index  # noqa: E402
+from lance.util import (  # noqa: E402
+    _target_partition_size_to_num_partitions,
+    validate_vector_index,
+)
 from lance.vector import vec_to_table  # noqa: E402
 
 
@@ -854,6 +857,12 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
         replace=True,
     )
     assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
+
+
+def test_target_partition_size_to_num_partitions_clamps():
+    assert _target_partition_size_to_num_partitions(1000, 1000) == 1
+    assert _target_partition_size_to_num_partitions(1000, 500) == 2
+    assert _target_partition_size_to_num_partitions(8192 * 5000, 8192) == 4096
 
 
 def test_index_size_stats(tmp_path: Path):

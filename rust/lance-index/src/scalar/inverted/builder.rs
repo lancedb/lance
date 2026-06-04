@@ -2055,7 +2055,7 @@ mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::IndexBuildProgress;
-    use crate::scalar::{IndexFile, IndexReader, IndexWriter, ScalarIndex};
+    use crate::scalar::{IndexFile, IndexReader, IndexWriteSummary, IndexWriter, ScalarIndex};
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -2242,12 +2242,15 @@ mod tests {
             Ok(1)
         }
 
-        async fn finish(&mut self) -> Result<()> {
-            Ok(())
+        async fn finish(&mut self) -> Result<IndexWriteSummary> {
+            Ok(IndexWriteSummary { size_bytes: 0 })
         }
 
-        async fn finish_with_metadata(&mut self, _metadata: HashMap<String, String>) -> Result<()> {
-            Ok(())
+        async fn finish_with_metadata(
+            &mut self,
+            _metadata: HashMap<String, String>,
+        ) -> Result<IndexWriteSummary> {
+            Ok(IndexWriteSummary { size_bytes: 0 })
         }
     }
 

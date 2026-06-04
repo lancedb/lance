@@ -1051,9 +1051,10 @@ where
         Ok(self.writer.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let num_rows = self.writer.finish().await? as u32;
         let size_bytes = self.writer.tell().await?;
         Ok((
-            self.writer.finish().await? as u32,
+            num_rows,
             DataFile::new_legacy(
                 self.path.clone(),
                 self.writer.schema(),
@@ -1106,17 +1107,17 @@ impl GenericWriter for V2WriterAdapter {
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
-        let num_rows = self.writer.finish().await? as u32;
+        let write_summary = self.writer.finish().await?;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             major,
             minor,
-            NonZero::new(self.writer.tell().await?),
+            NonZero::new(write_summary.size_bytes),
             self.base_id,
         );
-        Ok((num_rows, data_file))
+        Ok((write_summary.num_rows as u32, data_file))
     }
 }
 

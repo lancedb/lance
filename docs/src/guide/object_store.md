@@ -218,3 +218,33 @@ ds = lance.dataset(
 | `oss_secret_access_key` | Access key secret used for OSS authentication. Optional if credentials are provided by environment. |
 | `oss_region` | OSS region (for example, `cn-hangzhou`). Optional. |
 | `oss_security_token` | Security token for temporary credentials (STS). Optional. |
+
+## Volcengine TOS Configuration
+
+TOS credentials can be set in the environment variables `TOS_ACCESS_KEY_ID`,
+`TOS_SECRET_ACCESS_KEY`, `TOS_ENDPOINT`, `TOS_REGION`, and `TOS_SECURITY_TOKEN`.
+Lance also accepts the corresponding `VOLCENGINE_` environment variable prefix.
+Alternatively, credentials can be passed as parameters to the `storage_options`
+parameter; explicit `storage_options` override environment variables:
+
+```python
+import lance
+ds = lance.dataset(
+    "tos://bucket/path",
+    storage_options={
+        "tos_endpoint": "https://tos-cn-beijing.volces.com",
+        "tos_region": "cn-beijing",
+        "tos_access_key_id": "my-access-key",
+        "tos_secret_access_key": "my-secret-key",
+        "tos_security_token": "my-session-token",
+    }
+)
+```
+
+| Key | Description |
+|-----|-------------|
+| `tos_endpoint` | TOS endpoint. Required (for example, `https://tos-cn-beijing.volces.com`). |
+| `tos_region` | TOS signing region (for example, `cn-beijing`). Optional. |
+| `tos_access_key_id` | Access key ID used for TOS authentication. Optional if credentials are provided by environment. |
+| `tos_secret_access_key` | Secret access key used for TOS authentication. Optional if credentials are provided by environment. |
+| `tos_security_token` | Security token for temporary credentials. Optional. |

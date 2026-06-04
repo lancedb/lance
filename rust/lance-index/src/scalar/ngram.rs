@@ -1079,7 +1079,8 @@ impl NGramIndexBuilder {
             }
         }
 
-        writer.finish().await
+        writer.finish().await?;
+        Ok(())
     }
 
     async fn merge_spill_files(
@@ -1221,7 +1222,8 @@ impl NGramIndexBuilder {
             offset += batch_size;
         }
 
-        writer.finish().await
+        writer.finish().await?;
+        Ok(())
     }
 }
 

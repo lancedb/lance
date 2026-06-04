@@ -318,7 +318,7 @@ impl AimdThrottleConfig {
 
 struct TokenBucketState {
     tokens: f64,
-    last_refill: std::time::Instant,
+    last_refill: tokio::time::Instant,
     rate: f64,
 }
 
@@ -346,7 +346,7 @@ impl OperationThrottle {
             controller,
             bucket: Mutex::new(TokenBucketState {
                 tokens: burst_capacity,
-                last_refill: std::time::Instant::now(),
+                last_refill: tokio::time::Instant::now(),
                 rate: initial_rate,
             }),
             burst_capacity,
@@ -364,7 +364,7 @@ impl OperationThrottle {
     async fn acquire_token(&self) {
         let sleep_duration = {
             let mut bucket = self.bucket.lock().await;
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
             bucket.tokens = (bucket.tokens + elapsed * bucket.rate).min(self.burst_capacity);
             bucket.last_refill = now;
@@ -1176,12 +1176,15 @@ mod tests {
     }
 
     fn list_start_throttle_config() -> AimdThrottleConfig {
+        // Use a low rate (10 tokens/s) so that the token-acquisition sleep is
+        // 1/10 = 100 ms — well above the 50 ms timeout used in assertions,
+        // avoiding flakiness from coarse OS timer resolution (e.g. Windows ~16 ms).
         AimdThrottleConfig::default()
             .with_burst_capacity(0)
-            .with_list_aimd(AimdConfig::default().with_initial_rate(50.0))
+            .with_list_aimd(AimdConfig::default().with_initial_rate(10.0))
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_list_acquires_token_before_starting_underlying_stream() {
         let store = Arc::new(CountingListStartStore::default());
         store
@@ -1199,14 +1202,16 @@ mod tests {
 
         let mut stream = throttled.list(Some(&Path::from("prefix")));
         assert_eq!(store.list_calls(), 0);
+        // With rate=10 tokens/s and burst_capacity=0, the token acquisition
+        // sleeps for 100 ms. A 50 ms timeout must expire before that.
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(5), stream.next())
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
                 .await
                 .is_err()
         );
         assert_eq!(store.list_calls(), 0);
 
-        let item = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+        let item = tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
             .await
             .unwrap()
             .unwrap()
@@ -1215,7 +1220,7 @@ mod tests {
         assert_eq!(store.list_calls(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_list_with_offset_acquires_token_before_starting_underlying_stream() {
         let store = Arc::new(CountingListStartStore::default());
         store
@@ -1231,14 +1236,16 @@ mod tests {
         let mut stream =
             throttled.list_with_offset(Some(&Path::from("prefix")), &Path::from("prefix/a"));
         assert_eq!(store.offset_calls(), 0);
+        // With rate=10 tokens/s and burst_capacity=0, the token acquisition
+        // sleeps for 100 ms. A 50 ms timeout must expire before that.
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(5), stream.next())
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
                 .await
                 .is_err()
         );
         assert_eq!(store.offset_calls(), 0);
 
-        let item = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+        let item = tokio::time::timeout(std::time::Duration::from_millis(300), stream.next())
             .await
             .unwrap()
             .unwrap()

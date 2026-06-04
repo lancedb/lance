@@ -40,38 +40,38 @@ Maintainers with GitHub write access are additionally encouraged to:
 
 ## Roster
 
-| Name                   | GitHub Handle        | Affiliation       | GitHub Write Access | Ecosystem Roles                                 |
-|------------------------|----------------------|-------------------|---------------------|-------------------------------------------------|
-| Wyatt Alt              | wkalt                | LanceDB           | ✓                   |                                                 |
-| Matt Basta             | mattbasta            | Runway AI         |                     |                                                 |
-| Giuseppe Battista      | giusedroid           | AWS               |                     |                                                 |
-| Timothy Carambat       | timothycarambat      | Anything LLM      |                     |                                                 |
-| Ayush Chaurasia        | AyushExel            | LanceDB           |                     |
-| Chongchen Chen         | chenkovsky           | MiraclePlus       |                     |                                                 |
-| Akela Drissner-Schmid  | akelad               | dltHub            |                     |                                                 |
-| Ty Dunn                | TyDunn               | Continue          |                     |                                                 |
-| Enwei Jiao             | jiaoew1991           | Luma.ai           | ✓                   | Milvus Maintainer                               |
-| Bryan Keller           | bryanck              | Netflix           |                     | Apache Iceberg Committer                        |
-| Aman Kishore           | AmanKishore          | Harvey.ai         |                     |                                                 |
-| Sangwu Lee             | RE-N-Y               | Krea.ai           |                     |                                                 |
-| Jeremy Leibs           | jleibs               | Rerun.io          |                     |                                                 |
-| Haocheng Liu           | HaochengLIU          | Seven Research    | ✓                   |                                                 |
-| Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PPMC Member           |
-| ChanChan Mao           | ccmao1130            | LanceDB           |                     |                                                 |
-| Lu Qiu                 | LuQQiu               | LanceDB           | ✓                   | Alluxio PMC Member                              |
-| Dan Rammer             | hamersaw             | LanceDB           | ✓                   |                                                 |
-| Rong Rong              | walterddr            | Google DeepMind   |                     | Apache Pinot PMC Member, Apache Flink Committer |
-| Nat Roth               | nrothGIT             | Meta AI           |                     |                                                 |
-| Kevin Shaffer-Morrison | kevinshaffermorrison | AWS               |                     |                                                 |
-| Noah Shpak             | noahshpak            | Thinking Machines |                     |                                                 |
-| Chunxu Tang            | ChunxuTang           | Google            |                     | PrestoDB Committer                              |
-| Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                 |
-| Beinan Wang            | beinan               | Microsoft AI      |                     | Alluxio PMC Member, Presto TSC Member           |
-| Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                 |
-| Yang Jie               | LuciferYang          | Baidu Inc.        |                     | Apache Spark PMC Member, Apache Uniffle PMC Member |
-| Jianjian Xie           | jja725               | Uber              |                     |                                                 |
-| Zhang Yue              | zhangyue19921010     | ByteDance         |                     |                                                 |
-| Jinglun                | wojiaodoubao         | ByteDance         |                     | Apache Hadoop Committer                         |
+| Name                   | GitHub Handle        | Affiliation       | GitHub Write Access | Ecosystem Roles                                    |
+|------------------------|----------------------|-------------------|---------------------|----------------------------------------------------|
+| Wyatt Alt              | wkalt                | LanceDB           | ✓                   |                                                    |
+| Matt Basta             | mattbasta            | Runway AI         |                     |                                                    |
+| Giuseppe Battista      | giusedroid           | AWS               |                     |                                                    |
+| Timothy Carambat       | timothycarambat      | Anything LLM      |                     |                                                    |
+| Ayush Chaurasia        | AyushExel            | LanceDB           |                     |                                                    |
+| Chongchen Chen         | chenkovsky           | MiraclePlus       |                     |                                                    |
+| Akela Drissner-Schmid  | akelad               | dltHub            |                     |                                                    |
+| Ty Dunn                | TyDunn               | Continue          |                     |                                                    |
+| Enwei Jiao             | jiaoew1991           | Luma.ai           | ✓                   | Milvus Maintainer                                  |
+| Bryan Keller           | bryanck              | Netflix           |                     | Apache Iceberg Committer                           |
+| Aman Kishore           | AmanKishore          | Harvey.ai         |                     |                                                    |
+| Sangwu Lee             | RE-N-Y               | Krea.ai           |                     |                                                    |
+| Jeremy Leibs           | jleibs               | Rerun.io          |                     |                                                    |
+| Haocheng Liu           | HaochengLIU          | Seven Research    | ✓                   |                                                    |
+| Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PPMC Member              |
+| ChanChan Mao           | ccmao1130            | LanceDB           |                     |                                                    |
+| Lu Qiu                 | LuQQiu               | LanceDB           | ✓                   | Alluxio PMC Member                                 |
+| Dan Rammer             | hamersaw             | LanceDB           | ✓                   |                                                    |
+| Rong Rong              | walterddr            | Google DeepMind   |                     | Apache Pinot PMC Member, Apache Flink Committer    |
+| Nat Roth               | nrothGIT             | Meta AI           |                     |                                                    |
+| Kevin Shaffer-Morrison | kevinshaffermorrison | AWS               |                     |                                                    |
+| Noah Shpak             | noahshpak            | Thinking Machines |                     |                                                    |
+| Chunxu Tang            | ChunxuTang           | Google            |                     | PrestoDB Committer                                 |
+| Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                    |
+| Beinan Wang            | beinan               | Microsoft AI      |                     | Alluxio PMC Member, Presto TSC Member              |
+| Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                    |
+| Yang Jie               | LuciferYang          | Baidu Inc.        |                     | Apache Spark PMC Member, Apache Uniffle PMC Member | 
+| Jianjian Xie           | jja725               | Uber              |                     |                                                    |
+| Zhang Yue              | zhangyue19921010     | ByteDance         |                     | Apache Hudi PMC, Apache Druid Committer, Kafka Contributor |
+| Jinglun                | wojiaodoubao         | ByteDance         |                     | Apache Hadoop Committer                            |
 
 ## Becoming a Maintainer
 
