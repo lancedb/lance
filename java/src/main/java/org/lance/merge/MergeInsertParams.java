@@ -231,8 +231,8 @@ public class MergeInsertParams {
   /**
    * Controls whether to use indices for the merge operation.
    *
-   * <p>When set to false, forces a full table scan even if an index exists on the join key.
-   * This can be useful for benchmarking or when the optimizer chooses a suboptimal path.
+   * <p>When set to false, forces a full table scan even if an index exists on the join key. This
+   * can be useful for benchmarking or when the optimizer chooses a suboptimal path.
    *
    * <p>Default is true (use index if available).
    *
