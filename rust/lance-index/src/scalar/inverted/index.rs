@@ -1341,6 +1341,10 @@ impl InvertedPartition {
     }
 
     #[instrument(level = "debug", skip_all)]
+    // Deferred-DocSet adds the `docs` param (caller materializes it) on top of
+    // the cross-partition `shared_threshold`, tipping this hot-path search fn
+    // one over the limit. Bundling args isn't worth the churn here.
+    #[allow(clippy::too_many_arguments)]
     pub fn bm25_search(
         &self,
         docs: &DocSet,
