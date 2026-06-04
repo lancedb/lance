@@ -860,7 +860,11 @@ impl PyRestNamespace {
             builder = builder.context_provider(Arc::new(py_provider));
         }
 
-        let namespace = builder.build();
+        let namespace = builder.build().infer_error()?;
+
+        crate::rt()
+            .block_on(None, namespace.warm_up_auth())?
+            .infer_error()?;
 
         Ok(Self {
             inner: Arc::new(namespace),
