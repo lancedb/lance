@@ -50,6 +50,7 @@ use crate::dataset::{
 };
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::invalidate_removed_index_caches;
 use crate::index::vector::details::infer_missing_vector_details;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
@@ -58,6 +59,7 @@ use crate::session::index_caches::IndexMetadataKey;
 use futures::future::Either;
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::{Error, Result};
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
@@ -1071,6 +1073,12 @@ pub(crate) async fn commit_transaction(
                     .metadata_cache
                     .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
                     .await;
+                // Keep the active FRI UUID for `uuid-fri_uuid` cache keys.
+                let new_fri_uuid = indices
+                    .iter()
+                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                    .map(|idx| idx.uuid);
+
                 if !indices.is_empty() {
                     let key = IndexMetadataKey {
                         version: target_version,
@@ -1079,6 +1087,20 @@ pub(crate) async fn commit_transaction(
                         .index_cache
                         .insert_with_key(&key, Arc::new(indices))
                         .await;
+                }
+
+                // The rebased transaction has the indices actually retired.
+                if let Operation::CreateIndex {
+                    removed_indices, ..
+                } = &transaction.operation
+                    && !removed_indices.is_empty()
+                {
+                    invalidate_removed_index_caches(
+                        &dataset.index_cache,
+                        removed_indices,
+                        new_fri_uuid.as_ref(),
+                    )
+                    .await;
                 }
 
                 if !commit_config.skip_auto_cleanup {

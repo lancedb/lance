@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::FutureExt;
 use itertools::Itertools;
-use lance_core::cache::CacheKey;
+use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
@@ -381,6 +381,41 @@ impl CacheKey for MemWalCacheKey<'_> {
 
     fn type_name() -> &'static str {
         "MemWalIndex"
+    }
+}
+
+/// Drop root and partition cache entries for removed index UUIDs.
+///
+/// Clears both bare `uuid` and active `uuid-fri_uuid` key shapes.
+pub(crate) async fn invalidate_removed_index_caches(
+    cache: &LanceCache,
+    removed_indices: &[IndexMetadata],
+    current_fri_uuid: Option<&Uuid>,
+) {
+    for removed in removed_indices {
+        let uuid_str = removed.uuid.to_string();
+
+        // Bare-UUID entries from caches created without FRI.
+        cache
+            .invalidate_with_key(&LegacyVectorIndexCacheKey::new(&uuid_str, None))
+            .await;
+        cache
+            .invalidate_with_key(&IvfIndexStateCacheKey::new(&uuid_str, None))
+            .await;
+        cache.invalidate_prefix(&format!("{}/", uuid_str)).await;
+
+        // Active FRI namespace.
+        if let Some(fri_uuid) = current_fri_uuid {
+            cache
+                .invalidate_with_key(&LegacyVectorIndexCacheKey::new(&uuid_str, Some(fri_uuid)))
+                .await;
+            cache
+                .invalidate_with_key(&IvfIndexStateCacheKey::new(&uuid_str, Some(fri_uuid)))
+                .await;
+            cache
+                .invalidate_prefix(&format!("{}-{}/", uuid_str, fri_uuid))
+                .await;
+        }
     }
 }
 
@@ -4092,6 +4127,113 @@ mod tests {
         for id in ids.values() {
             assert!(seen.insert(*id), "Duplicate id found: {}", id);
         }
+    }
+
+    #[tokio::test]
+    async fn test_optimize_indices_invalidates_removed_index_cache() {
+        // Prewarm an IVF-PQ index, then retrain it so the old UUID is retired.
+        let nrows = 256;
+        let dimensions = 16;
+        let column_name = "vector";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                column_name,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimensions,
+                ),
+                false,
+            ),
+        ]));
+
+        let float_arr = generate_random_array(nrows * dimensions as usize);
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from_iter_values(0..nrows as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
+        dataset
+            .create_index(&[column_name], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let old_meta = indices
+            .iter()
+            .find(|idx| idx.fields == [dataset.schema().field(column_name).unwrap().id])
+            .expect("vector index should be present");
+        let old_uuid = old_meta.uuid;
+        let old_uuid_str = old_uuid.to_string();
+        let index_name = old_meta.name.clone();
+
+        // Prewarm fills the root state and partition sub-cache.
+        dataset.prewarm_index(&index_name).await.unwrap();
+
+        // Guard against a vacuous test.
+        assert!(
+            dataset
+                .index_cache
+                .get_with_key(&IvfIndexStateCacheKey::new(&old_uuid_str, None))
+                .await
+                .is_some(),
+            "IvfIndexState entry for the freshly opened index should be cached",
+        );
+
+        // Retrain replaces the index UUID.
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .unwrap();
+
+        let new_indices = dataset.load_indices().await.unwrap();
+        let new_uuid = new_indices
+            .iter()
+            .find(|idx| idx.fields == old_meta.fields)
+            .expect("vector index should be present after optimize")
+            .uuid;
+        assert_ne!(new_uuid, old_uuid, "retrain must produce a new UUID");
+
+        // Old root entries must be gone.
+        assert!(
+            dataset
+                .index_cache
+                .get_with_key(&IvfIndexStateCacheKey::new(&old_uuid_str, None))
+                .await
+                .is_none(),
+            "stale IvfIndexState root entry must be invalidated",
+        );
+        assert!(
+            dataset
+                .index_cache
+                .get_with_key(&LegacyVectorIndexCacheKey::new(&old_uuid_str, None))
+                .await
+                .is_none(),
+            "stale LegacyVectorIndex root entry must be invalidated",
+        );
+
+        // Prefix invalidation should now be a no-op.
+        let size_before = dataset.index_cache.size().await;
+        dataset
+            .index_cache
+            .invalidate_prefix(&format!("{}/", old_uuid_str))
+            .await;
+        let size_after = dataset.index_cache.size().await;
+        assert_eq!(
+            size_before, size_after,
+            "no cache entries should remain under the removed index's UUID prefix",
+        );
     }
 
     #[tokio::test]
