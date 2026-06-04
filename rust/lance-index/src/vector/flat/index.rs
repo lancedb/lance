@@ -284,31 +284,16 @@ impl IvfSubIndex for FlatIndex {
 
         match prefilter.is_empty() {
             true => {
-                dist_calc.distance_all_with_scratch(
+                dist_calc.accumulate_topk_with_scratch(
                     k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    res,
                     &mut scratch.distances,
                     &mut scratch.u16,
                     &mut scratch.u8,
                 );
-                let dists = scratch.distances.iter().copied();
-
-                if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-
-                    for (&row_id, dist) in row_ids.zip(dists) {
-                        let dist = dist.into();
-                        if dist < lower_bound || dist >= upper_bound {
-                            continue;
-                        }
-                        push_candidate_global(res, k, row_id, dist, &mut max_dist);
-                    }
-                } else {
-                    for (&row_id, dist) in row_ids.zip(dists) {
-                        let dist = dist.into();
-                        push_candidate_global(res, k, row_id, dist, &mut max_dist);
-                    }
-                }
             }
             false => {
                 let row_addr_mask = prefilter.mask();
