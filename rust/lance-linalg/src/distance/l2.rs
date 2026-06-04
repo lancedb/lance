@@ -15,6 +15,7 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type, Int8Type},
 };
 use arrow_schema::DataType;
+use deepsize::DeepSizeOf;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
@@ -331,7 +332,7 @@ fn accumulate_l2_dimension(q: f32, row: &[f32], result: &mut [f32]) {
 /// sub-vector codebooks (e.g. 256 centroids × 16 dims = 16 KB).
 /// For large target sets the SoA layout causes L1 thrashing and
 /// [`l2_distance_batch`] with its AoS per-target locality is faster.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct L2Prepared {
     transposed: Vec<f32>,
     dimension: usize,

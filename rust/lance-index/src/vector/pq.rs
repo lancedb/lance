@@ -60,10 +60,9 @@ impl DeepSizeOf for ProductQuantizer {
             + self.num_bits.deep_size_of_children(_context)
             + self.dimension.deep_size_of_children(_context)
             + self.distance_type.deep_size_of_children(_context)
-            + self
-                .l2_targets
-                .as_ref()
-                .map_or(0, |v| (**v).iter().map(|t| t.size_bytes()).sum())
+            // deep_size_of_children on the Arc de-duplicates shared allocations
+            // via the context, so partitions sharing one l2_targets are counted once.
+            + self.l2_targets.deep_size_of_children(_context)
     }
 }
 
