@@ -1638,17 +1638,26 @@ impl TokenSet {
             }
         };
 
+        let mut retained_length = 0;
         map.retain(
-            |_, token_id| match removed_token_ids.binary_search(token_id) {
+            |token, token_id| match removed_token_ids.binary_search(token_id) {
                 Ok(_) => false,
                 Err(index) => {
                     *token_id -= index as u32;
+                    retained_length += token.len();
                     true
                 }
             },
         );
 
         self.tokens = TokenMap::HashMap(map);
+
+        // The retain above compacts the surviving token ids into a dense `[0, len)`
+        // range, so `next_id` (handed to the next new token) must follow them down.
+        // `total_length` likewise must drop the removed tokens' bytes; it is persisted
+        // and feeds memory accounting, so a stale value drifts across remap/merge cycles.
+        self.next_id = self.tokens.len() as u32;
+        self.total_length = retained_length;
     }
 
     pub fn next_id(&self) -> u32 {

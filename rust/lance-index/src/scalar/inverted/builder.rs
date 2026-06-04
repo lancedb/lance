@@ -3091,6 +3091,44 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_merge_from_after_remap_does_not_panic() {
+        // `first` is the merge accumulator. Give it three tokens, then remap away the
+        // middle one, mirroring filter_old_data dropping a token whose postings emptied.
+        let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for token in ["a", "b", "c"] {
+            first.tokens.add(token.to_owned());
+        }
+        first
+            .posting_lists
+            .resize_with(first.tokens.len(), || PostingListBuilder::new(false));
+        let first_doc = first.docs.append(10, 1);
+        first.posting_lists[0].add(first_doc, PositionRecorder::Count(1)); // "a"
+        first.posting_lists[2].add(first_doc, PositionRecorder::Count(1)); // "c"
+
+        // Remove token "b" (id 1) and compact its (empty) posting list to match.
+        first.tokens.remap(&[1]);
+        first.posting_lists.remove(1);
+        assert_eq!(first.tokens.len(), first.posting_lists.len());
+
+        // `second` contributes a brand-new token absent from `first`. Before the fix,
+        // get_or_add returned the stale next_id, indexing past posting_lists.
+        let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());
+        let zeta = second.tokens.add("zeta".to_owned());
+        second
+            .posting_lists
+            .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
+        let second_doc = second.docs.append(20, 1);
+        second.posting_lists[zeta as usize].add(second_doc, PositionRecorder::Count(1));
+
+        first.merge_from(second).unwrap();
+
+        assert_eq!(first.tokens.len(), 3);
+        assert_eq!(first.posting_lists.len(), 3);
+        let zeta_id = first.tokens.get("zeta").expect("zeta should be merged in");
+        assert!((zeta_id as usize) < first.posting_lists.len());
+    }
+
     #[tokio::test]
     async fn test_update_index_returns_worker_error_when_workers_exit_during_dispatch() {
         let num_batches = (*LANCE_FTS_NUM_SHARDS * 2 + 1) as u64;
