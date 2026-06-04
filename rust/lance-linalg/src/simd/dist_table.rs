@@ -10,7 +10,7 @@ use std::arch::x86_64::*;
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
 pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
-pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15];
+pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
 
 // This function is used to sum the distance table for 4-bit codes.
@@ -269,6 +269,13 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_perm0_inverse_matches_perm0() {
+        for (idx, &value) in PERM0.iter().enumerate() {
+            assert_eq!(PERM0_INVERSE[value], idx);
+        }
+    }
 
     #[test]
     fn test_sum_4bit_dist_table_basic() {
