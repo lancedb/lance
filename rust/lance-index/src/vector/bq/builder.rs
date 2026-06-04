@@ -17,8 +17,8 @@ use rand_distr::Distribution;
 use rayon::prelude::*;
 
 use crate::vector::bq::storage::{
-    RABIT_CODE_COLUMN, RABIT_EX_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata,
-    RabitQuantizationStorage, RabitQueryEstimator, rabit_binary_code_field, rabit_ex_code_field,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
+    RabitQueryEstimator, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
