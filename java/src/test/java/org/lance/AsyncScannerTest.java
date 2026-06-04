@@ -192,6 +192,75 @@ public class AsyncScannerTest {
     return rowCount;
   }
 
+  @Test
+  void testIncludeDeletedRowsAsync(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_include_deleted_rows").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        assertEquals(10, dataset.countRows());
+
+        // Delete half the rows
+        dataset.delete("id >= 5");
+        assertEquals(5, dataset.countRows());
+
+        // Async scan without includeDeletedRows — should only see live rows
+        ScanOptions defaultOptions = new ScanOptions.Builder().batchSize(20L).build();
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, defaultOptions, allocator)) {
+          ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS);
+          assertEquals(5, countRows(reader), "default async scan: should exclude deleted rows");
+          reader.close();
+        }
+
+        // Async scan with includeDeletedRows=true — should see all rows
+        ScanOptions includeDeletedOptions =
+            new ScanOptions.Builder()
+                .batchSize(20L)
+                .withRowId(true) // required by includeDeletedRows
+                .includeDeletedRows(true)
+                .build();
+        try (AsyncScanner scanner =
+            AsyncScanner.create(dataset, includeDeletedOptions, allocator)) {
+          ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS);
+          assertEquals(
+              10, countRows(reader), "includeDeletedRows async: should include deleted rows");
+          reader.close();
+        }
+      }
+    }
+  }
+
+  @Test
+  void testStrictBatchSizeAsync(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_strict_batch_size").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 25)) {
+        int batchSize = 10;
+
+        ScanOptions strictOptions =
+            new ScanOptions.Builder().batchSize(batchSize).strictBatchSize(true).build();
+
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, strictOptions, allocator)) {
+          ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS);
+          int totalRows = 0;
+          while (reader.loadNextBatch()) {
+            int rows = reader.getVectorSchemaRoot().getRowCount();
+            assertTrue(
+                rows <= batchSize, "strict async: batch " + rows + " should be <= " + batchSize);
+            totalRows += rows;
+          }
+          assertEquals(25, totalRows, "strictBatchSize async: should read all rows");
+          reader.close();
+        }
+      }
+    }
+  }
+
   /**
    * Example 3: Multiple concurrent async scans.
    *

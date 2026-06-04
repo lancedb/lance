@@ -40,6 +40,9 @@ public class ScanOptions {
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
   private final boolean fastSearch;
+  private final boolean includeDeletedRows;
+  private final boolean strictBatchSize;
+  private final boolean disableScoringAutoprojection;
 
   public ScanOptions(
       Optional<List<Integer>> fragmentIds,
@@ -77,6 +80,9 @@ public class ScanOptions {
         useScalarIndex,
         substraitAggregate,
         collectStats,
+        false,
+        false,
+        false,
         false);
   }
 
@@ -121,7 +127,10 @@ public class ScanOptions {
       boolean useScalarIndex,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
-      boolean fastSearch) {
+      boolean fastSearch,
+      boolean includeDeletedRows,
+      boolean strictBatchSize,
+      boolean disableScoringAutoprojection) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -143,6 +152,9 @@ public class ScanOptions {
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
     this.fastSearch = fastSearch;
+    this.includeDeletedRows = includeDeletedRows;
+    this.strictBatchSize = strictBatchSize;
+    this.disableScoringAutoprojection = disableScoringAutoprojection;
   }
 
   /**
@@ -297,6 +309,33 @@ public class ScanOptions {
     return collectStats;
   }
 
+  /**
+   * Get whether to include deleted rows in scan results.
+   *
+   * @return true if deleted rows should be included, false otherwise.
+   */
+  public boolean isIncludeDeletedRows() {
+    return includeDeletedRows;
+  }
+
+  /**
+   * Get whether to enforce strict batch sizing.
+   *
+   * @return true if batch sizes must be strictly enforced, false otherwise.
+   */
+  public boolean isStrictBatchSize() {
+    return strictBatchSize;
+  }
+
+  /**
+   * Get whether to disable scoring autoprojection.
+   *
+   * @return true if scoring column autoprojection is disabled, false otherwise.
+   */
+  public boolean isDisableScoringAutoprojection() {
+    return disableScoringAutoprojection;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -322,6 +361,9 @@ public class ScanOptions {
             "substraitAggregate",
             substraitAggregate.map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
         .add("collectStats", collectStats)
+        .add("includeDeletedRows", includeDeletedRows)
+        .add("strictBatchSize", strictBatchSize)
+        .add("disableScoringAutoprojection", disableScoringAutoprojection)
         .toString();
   }
 
@@ -345,6 +387,9 @@ public class ScanOptions {
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
     private boolean collectStats = false;
+    private boolean includeDeletedRows = false;
+    private boolean strictBatchSize = false;
+    private boolean disableScoringAutoprojection = false;
 
     public Builder() {}
 
@@ -372,6 +417,9 @@ public class ScanOptions {
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
       this.collectStats = options.isCollectStats();
+      this.includeDeletedRows = options.isIncludeDeletedRows();
+      this.strictBatchSize = options.isStrictBatchSize();
+      this.disableScoringAutoprojection = options.isDisableScoringAutoprojection();
     }
 
     /**
@@ -578,6 +626,39 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to include deleted rows in scan results. Default is false.
+     *
+     * @param includeDeletedRows whether to include deleted rows
+     * @return Builder instance for method chaining.
+     */
+    public Builder includeDeletedRows(boolean includeDeletedRows) {
+      this.includeDeletedRows = includeDeletedRows;
+      return this;
+    }
+
+    /**
+     * Set whether to enforce strict batch sizing. Default is false.
+     *
+     * @param strictBatchSize whether to enforce strict batch sizing
+     * @return Builder instance for method chaining.
+     */
+    public Builder strictBatchSize(boolean strictBatchSize) {
+      this.strictBatchSize = strictBatchSize;
+      return this;
+    }
+
+    /**
+     * Set whether to disable scoring column autoprojection. Default is false.
+     *
+     * @param disableScoringAutoprojection whether to disable autoprojection
+     * @return Builder instance for method chaining.
+     */
+    public Builder disableScoringAutoprojection(boolean disableScoringAutoprojection) {
+      this.disableScoringAutoprojection = disableScoringAutoprojection;
+      return this;
+    }
+
+    /**
      * Build the LanceScanOptions instance.
      *
      * @return LanceScanOptions instance with the specified parameters.
@@ -601,7 +682,10 @@ public class ScanOptions {
           useScalarIndex,
           substraitAggregate,
           collectStats,
-          fastSearch);
+          fastSearch,
+          includeDeletedRows,
+          strictBatchSize,
+          disableScoringAutoprojection);
     }
   }
 }
