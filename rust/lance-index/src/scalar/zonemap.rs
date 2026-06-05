@@ -666,6 +666,7 @@ impl ScalarIndex for ZoneMapIndex {
 pub async fn merge_zonemap_indices(
     source_indices: &[Arc<ZoneMapIndex>],
     dest_store: &dyn IndexStore,
+    fragment_filter: Option<&RoaringBitmap>,
 ) -> Result<CreatedIndex> {
     let first = source_indices.first().ok_or_else(|| {
         Error::invalid_input("merge_zonemap_indices requires at least one source index")
@@ -687,7 +688,13 @@ pub async fn merge_zonemap_indices(
                 data_type, source.data_type
             )));
         }
-        zones.extend(source.zones.iter().cloned());
+        zones.extend(source.zones.iter().filter_map(|zone| {
+            let include = fragment_filter.is_none_or(|fragments| {
+                u32::try_from(zone.bound.fragment_id)
+                    .is_ok_and(|fragment_id| fragments.contains(fragment_id))
+            });
+            include.then(|| zone.clone())
+        }));
     }
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 

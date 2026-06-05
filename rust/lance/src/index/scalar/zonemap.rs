@@ -31,13 +31,17 @@ pub(in crate::index) async fn merge_segments(
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
+    let dataset_fragments = dataset.fragment_bitmap.as_ref();
     for segment in &segments {
-        fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
-            Error::invalid_input(format!(
+        if segment.fragment_bitmap.is_none() {
+            return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} is missing fragment coverage",
                 segment.uuid
-            ))
-        })?;
+            )));
+        }
+        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
+            fragment_bitmap |= effective;
+        }
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
         let zonemap_index = scalar_index
@@ -55,8 +59,12 @@ pub(in crate::index) async fn merge_segments(
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid.to_string())?;
-    let created_index =
-        lance_index::scalar::zonemap::merge_zonemap_indices(&source_indices, &new_store).await?;
+    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
+        &source_indices,
+        &new_store,
+        Some(&fragment_bitmap),
+    )
+    .await?;
 
     Ok(IndexMetadata {
         uuid: new_uuid,

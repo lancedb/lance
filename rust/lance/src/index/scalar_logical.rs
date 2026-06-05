@@ -326,6 +326,10 @@ mod tests {
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 
+    use crate::Dataset;
+    use crate::dataset::WriteParams;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::write::WriteMode;
     use crate::index::create::CreateIndexBuilder;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
@@ -768,6 +772,124 @@ mod tests {
                 .iter()
                 .map(|fragment| fragment.id() as u32)
                 .collect::<BTreeSet<_>>()
+        );
+
+        let selective_query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(20))),
+            Bound::Included(ScalarValue::Int32(Some(43))),
+        );
+        let selective_result = logical
+            .search(&selective_query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let selective_fragments = selective_result
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            selective_fragments,
+            fragments[1..=2]
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_existing_zonemap_segments_drops_retired_fragments() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(64),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut staged = Vec::new();
+        for fragment in dataset.get_fragments() {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
+                    .name("value_zonemap_retired".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_zonemap_retired", "value", staged)
+            .await
+            .unwrap();
+
+        dataset.delete("value < 16").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 64,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let live_frags = dataset.fragment_bitmap.as_ref().clone();
+        assert!(!live_frags.contains(0), "compaction should retire frag 0");
+
+        let merged = dataset
+            .merge_existing_index_segments(
+                dataset
+                    .load_indices_by_name("value_zonemap_retired")
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let coverage = merged.fragment_bitmap.as_ref().unwrap();
+        assert!(!coverage.contains(0), "must drop retired frag 0");
+        assert!(coverage.contains(1), "must keep live indexed frag 1");
+
+        let field_path = dataset.schema().field_path(merged.fields[0]).unwrap();
+        let index = crate::index::scalar::open_scalar_index(
+            &dataset,
+            &field_path,
+            &merged,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(0))),
+            Bound::Excluded(ScalarValue::Int32(Some(16))),
+        );
+        let searched_fragments = index
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            searched_fragments.is_empty(),
+            "must filter retired-fragment zones"
         );
     }
 
