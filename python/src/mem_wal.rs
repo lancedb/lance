@@ -957,6 +957,7 @@ fn shard_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -
                 path: generation.path,
             })
             .collect(),
+        shard_field_values: Default::default(),
     }
 }
 

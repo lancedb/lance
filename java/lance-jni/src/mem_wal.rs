@@ -1075,6 +1075,7 @@ fn shard_snapshot_from_manifest(manifest: ShardManifest) -> ShardSnapshot {
                 path: generation.path,
             })
             .collect(),
+        shard_field_values: Default::default(),
     }
 }
 
