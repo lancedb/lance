@@ -801,8 +801,9 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         // Create scanner with projection (only id column)
-        let mut scanner =
-            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&["id"]);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -832,7 +833,9 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         // Create scanner with limit
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).limit(3, None);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .limit(Some(3), None)
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -1603,13 +1606,9 @@ mod integration_tests {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&[
-            "id",
-            "_rowoffset",
-            "name",
-            "_rowaddr",
-            "_rowid",
-        ]);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id", "_rowoffset", "name", "_rowaddr", "_rowid"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -1699,7 +1698,8 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
-            .project(&["id", "_rowid", "name"]);
+            .project(&["id", "_rowid", "name"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -1762,7 +1762,8 @@ mod integration_tests {
 
         let scanner =
             LsmScanner::without_base_table(schema, base_uri, vec![], vec!["id".to_string()])
-                .project(&["id", "_rowaddr", "name", "_rowid"]);
+                .project(&["id", "_rowaddr", "name", "_rowid"])
+                .unwrap();
         let plan = scanner.create_plan().await.unwrap();
 
         let names: Vec<String> = plan
