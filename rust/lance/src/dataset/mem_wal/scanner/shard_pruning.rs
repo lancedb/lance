@@ -371,4 +371,169 @@ mod tests {
         assert!(pruned.contains(&shard_a));
         assert!(pruned.contains(&shard_b)); // kept because no field values
     }
+
+    #[test]
+    fn test_and_conjunction_extracts_sharding_column() {
+        let spec = bucket_spec("id", 8);
+        let shard_a = Uuid::new_v4();
+        let shard_b = Uuid::new_v4();
+
+        let bucket_for_1 = hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), 8).unwrap();
+        let other_bucket = (0..8).find(|b| *b != bucket_for_1).unwrap();
+
+        let snapshots = vec![
+            snapshot_with_bucket(shard_a, "bucket", bucket_for_1),
+            snapshot_with_bucket(shard_b, "bucket", other_bucket),
+        ];
+
+        // Filter: id = 1 AND name = "foo"
+        // Only id = 1 should be extracted; name is not the sharding column.
+        let filter = col("id").eq(lit(1i32)).and(col("name").eq(lit("foo")));
+        let result = prune_shards(&filter, &spec, &snapshots, &HashMap::new(), None);
+
+        let pruned = result.expect("should prune using id = 1 from AND");
+        assert!(pruned.contains(&shard_a));
+        assert!(!pruned.contains(&shard_b));
+    }
+
+    #[test]
+    fn test_or_disjunction_returns_none() {
+        let spec = bucket_spec("id", 8);
+        let shard_a = Uuid::new_v4();
+
+        let bucket_for_1 = hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), 8).unwrap();
+        let snapshots = vec![snapshot_with_bucket(shard_a, "bucket", bucket_for_1)];
+
+        // Filter: id = 1 OR id = 2 -- OR is not handled, should return None.
+        let filter = col("id").eq(lit(1i32)).or(col("id").eq(lit(2i32)));
+        let result = prune_shards(&filter, &spec, &snapshots, &HashMap::new(), None);
+
+        assert!(result.is_none(), "OR filters should not be prunable");
+    }
+
+    #[test]
+    fn test_not_in_returns_none() {
+        let spec = bucket_spec("id", 8);
+        let shard_a = Uuid::new_v4();
+
+        let bucket_for_1 = hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), 8).unwrap();
+        let snapshots = vec![snapshot_with_bucket(shard_a, "bucket", bucket_for_1)];
+
+        // Filter: id NOT IN (1, 2) -- negated InList should return None.
+        let filter = col("id").in_list(vec![lit(1i32), lit(2i32)], true);
+        let result = prune_shards(&filter, &spec, &snapshots, &HashMap::new(), None);
+
+        assert!(result.is_none(), "NOT IN should not be prunable");
+    }
+
+    #[test]
+    fn test_type_coercion_int64_to_int32() {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        let num_buckets = 8;
+        let spec = bucket_spec("id", num_buckets);
+        let shard_a = Uuid::new_v4();
+        let shard_b = Uuid::new_v4();
+
+        // Snapshots store bucket values computed from Int32(1) -- matches write path.
+        let bucket_for_int32 =
+            hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), num_buckets).unwrap();
+        let bucket_for_int64 =
+            hash_scalar_to_bucket(&ScalarValue::Int64(Some(1)), num_buckets).unwrap();
+        // Precondition: Int32 and Int64 must hash to different buckets for this
+        // test to be meaningful. Murmur3 uses hash_int vs hash_long code paths.
+        assert_ne!(
+            bucket_for_int32, bucket_for_int64,
+            "Int32 and Int64 should hash to different buckets for value 1"
+        );
+
+        let snapshots = vec![
+            snapshot_with_bucket(shard_a, "bucket", bucket_for_int32),
+            snapshot_with_bucket(shard_b, "bucket", bucket_for_int64),
+        ];
+
+        // Filter uses Int64 literal (as SQL parsing typically produces).
+        let filter = col("id").eq(lit(1i64));
+
+        // WITH base_schema: Int64 coerced to Int32 before hashing -> matches shard_a.
+        let schema: SchemaRef = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let with_schema = prune_shards(&filter, &spec, &snapshots, &HashMap::new(), Some(&schema));
+        let pruned = with_schema.expect("coercion should enable pruning");
+        assert!(
+            pruned.contains(&shard_a),
+            "with coercion, Int64 -> Int32 should match the Int32-hashed shard"
+        );
+        assert!(
+            !pruned.contains(&shard_b),
+            "with coercion, should not match the Int64-hashed shard"
+        );
+
+        // WITHOUT base_schema: Int64 stays Int64, hashes differently -> misses shard_a.
+        let without_schema = prune_shards(&filter, &spec, &snapshots, &HashMap::new(), None);
+        let pruned_raw = without_schema.expect("should still return Some (literals extracted)");
+        assert!(
+            !pruned_raw.contains(&shard_a),
+            "without coercion, Int64 hash differs from Int32 -- should miss shard_a"
+        );
+        assert!(
+            pruned_raw.contains(&shard_b),
+            "without coercion, Int64 hash matches shard_b (stored with Int64 bucket)"
+        );
+    }
+
+    #[test]
+    fn test_multi_field_spec_uses_first_field() {
+        let spec = ShardingSpec {
+            spec_id: 1,
+            fields: vec![
+                ShardingField {
+                    field_id: "bucket".to_string(),
+                    source_ids: vec![],
+                    transform: Some("bucket".to_string()),
+                    expression: None,
+                    result_type: "int32".to_string(),
+                    parameters: HashMap::from([
+                        ("num_buckets".to_string(), "4".to_string()),
+                        ("column".to_string(), "id".to_string()),
+                    ]),
+                },
+                ShardingField {
+                    field_id: "second_field".to_string(),
+                    source_ids: vec![],
+                    transform: Some("bucket".to_string()),
+                    expression: None,
+                    result_type: "int32".to_string(),
+                    parameters: HashMap::from([
+                        ("num_buckets".to_string(), "4".to_string()),
+                        ("column".to_string(), "region".to_string()),
+                    ]),
+                },
+            ],
+        };
+
+        let shard_a = Uuid::new_v4();
+        let bucket_for_1 = hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), 4).unwrap();
+        let snapshots = vec![snapshot_with_bucket(shard_a, "bucket", bucket_for_1)];
+
+        // Filter on the first field's column -- should work without panic.
+        let filter = col("id").eq(lit(1i32));
+        let result = prune_shards(&filter, &spec, &snapshots, &HashMap::new(), None);
+        let pruned = result.expect("should prune using first field");
+        assert!(pruned.contains(&shard_a));
+    }
+
+    #[test]
+    fn test_empty_snapshots_returns_empty_set() {
+        let spec = bucket_spec("id", 4);
+        let filter = col("id").eq(lit(1i32));
+        let result = prune_shards(&filter, &spec, &[], &HashMap::new(), None);
+        let pruned = result.expect("should return Some even with empty snapshots");
+        assert!(pruned.is_empty(), "empty snapshots should yield empty set");
+    }
 }
