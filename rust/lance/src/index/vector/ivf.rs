@@ -383,7 +383,7 @@ pub(crate) async fn optimize_vector_indices(
     vector_column: &str,
     logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize, Option<Vec<IndexFile>>)> {
+) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -420,49 +420,51 @@ pub(crate) async fn optimize_vector_indices(
             "optimizing vector index: the first index isn't IVF".to_string(),
         ))?;
 
-    let merged = if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
-        optimize_ivf_pq_indices(
-            first_idx,
-            pq_index,
-            vector_column,
-            unindexed,
-            &existing_indices,
-            options,
-            writer,
-            dataset.version().version,
-        )
-        .await?
-    } else if let Some(hnsw_sq) = first_idx
-        .sub_index
-        .as_any()
-        .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
-    {
-        let aux_file = dataset
-            .indices_dir()
-            .join(new_uuid.to_string())
-            .join(INDEX_AUXILIARY_FILE_NAME);
-        let aux_writer = object_store.create(&aux_file).await?;
-        optimize_ivf_hnsw_indices(
-            Arc::new(dataset),
-            first_idx,
-            hnsw_sq,
-            vector_column,
-            unindexed,
-            &existing_indices,
-            options,
-            writer,
-            aux_writer,
-        )
-        .await?
-    } else {
-        return Err(Error::index(
-            "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
-        ));
-    };
+    let (merged, files) =
+        if let Some(pq_index) = first_idx.sub_index.as_any().downcast_ref::<PQIndex>() {
+            let (merged, file) = optimize_ivf_pq_indices(
+                first_idx,
+                pq_index,
+                vector_column,
+                unindexed,
+                &existing_indices,
+                options,
+                writer,
+                dataset.version().version,
+            )
+            .await?;
+            (merged, vec![file])
+        } else if let Some(hnsw_sq) = first_idx
+            .sub_index
+            .as_any()
+            .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
+        {
+            let aux_file = dataset
+                .indices_dir()
+                .join(new_uuid.to_string())
+                .join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_writer = object_store.create(&aux_file).await?;
+            optimize_ivf_hnsw_indices(
+                Arc::new(dataset),
+                first_idx,
+                hnsw_sq,
+                vector_column,
+                unindexed,
+                &existing_indices,
+                options,
+                writer,
+                aux_writer,
+            )
+            .await?
+        } else {
+            return Err(Error::index(
+                "optimizing vector index: the sub index isn't PQ or HNSW".to_string(),
+            ));
+        };
 
     // never change the index version,
     // because we won't update the legacy vector index format
-    Ok((new_uuid, merged, None))
+    Ok((new_uuid, merged, files))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -471,7 +473,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize, Option<Vec<IndexFile>>)> {
+) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -515,7 +517,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build_with_summary()
+                .build()
                 .await?
             } else {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
@@ -533,7 +535,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build_with_summary()
+                .build()
                 .await?
             }
         }
@@ -554,7 +556,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build_with_summary()
+            .build()
             .await?
         }
         // IVF_PQ
@@ -574,7 +576,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build_with_summary()
+            .build()
             .await?
         }
         // IVF_SQ
@@ -594,7 +596,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build_with_summary()
+            .build()
             .await?
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
@@ -613,7 +615,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build_with_summary()
+            .build()
             .await?
         }
         // IVF_HNSW_FLAT
@@ -634,7 +636,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build_with_summary()
+                .build()
                 .await?
             } else {
                 IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
@@ -652,7 +654,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build_with_summary()
+                .build()
                 .await?
             }
         }
@@ -673,7 +675,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build_with_summary()
+            .build()
             .await?
         }
         // IVF_HNSW_PQ
@@ -693,7 +695,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build_with_summary()
+            .build()
             .await?
         }
         (sub_index_type, quantization_type) => {
@@ -705,7 +707,7 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
     };
 
-    Ok((new_uuid, summary.indices_merged, Some(summary.files)))
+    Ok((new_uuid, summary.indices_merged, summary.files))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -718,7 +720,7 @@ async fn optimize_ivf_pq_indices(
     options: &OptimizeOptions,
     mut writer: Box<dyn Writer>,
     dataset_version: u64,
-) -> Result<usize> {
+) -> Result<(usize, IndexFile)> {
     let metric_type = first_idx.metric_type;
     let dim = first_idx.ivf.dimension();
 
@@ -785,9 +787,16 @@ async fn optimize_ivf_pq_indices(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
+    let size_bytes = writer.tell().await? as u64;
     Writer::shutdown(writer.as_mut()).await?;
 
-    Ok(existing_indices.len() - start_pos)
+    Ok((
+        existing_indices.len() - start_pos,
+        IndexFile {
+            path: INDEX_FILE_NAME.to_string(),
+            size_bytes,
+        },
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,7 +810,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     options: &OptimizeOptions,
     writer: Box<dyn Writer>,
     aux_writer: Box<dyn Writer>,
-) -> Result<usize> {
+) -> Result<(usize, Vec<IndexFile>)> {
     let distance_type = first_idx.metric_type;
     let quantizer = hnsw_index.quantizer().clone();
     let ivf = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
@@ -938,13 +947,25 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     ivf_mut.write(&mut writer).await?;
-    writer.finish().await?;
+    let index_size = writer.finish().await? as u64;
 
     // Write the aux file
     aux_ivf.write(&mut aux_writer).await?;
-    aux_writer.finish().await?;
+    let aux_size = aux_writer.finish().await? as u64;
 
-    Ok(existing_indices.len() - start_pos)
+    Ok((
+        existing_indices.len() - start_pos,
+        vec![
+            IndexFile {
+                path: INDEX_FILE_NAME.to_string(),
+                size_bytes: index_size,
+            },
+            IndexFile {
+                path: INDEX_AUXILIARY_FILE_NAME.to_string(),
+                size_bytes: aux_size,
+            },
+        ],
+    ))
 }
 
 #[derive(Serialize)]
@@ -1594,7 +1615,7 @@ pub async fn build_ivf_pq_index(
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     let (ivf_model, pq) = build_ivf_model_and_pq(
         dataset,
         column,
@@ -1607,7 +1628,7 @@ pub async fn build_ivf_pq_index(
     let stream = scan_index_field_stream(dataset, column).await?;
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
-    write_ivf_pq_file(
+    let file = write_ivf_pq_file(
         dataset.object_store.as_ref(),
         dataset.indices_dir(),
         column,
@@ -1623,7 +1644,8 @@ pub async fn build_ivf_pq_index(
         ivf_params.shuffle_partition_concurrency,
         ivf_params.precomputed_shuffle_buffers.clone(),
     )
-    .await
+    .await?;
+    Ok(vec![file])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1837,7 +1859,7 @@ pub(crate) async fn remap_index_file(
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
-) -> Result<()> {
+) -> Result<IndexFile> {
     let object_store = dataset.object_store.as_ref();
     let old_path = dataset.indices_dir().join(old_uuid).join(INDEX_FILE_NAME);
     let new_path = dataset.indices_dir().join(new_uuid).join(INDEX_FILE_NAME);
@@ -1883,9 +1905,13 @@ pub(crate) async fn remap_index_file(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
+    let size_bytes = writer.tell().await? as u64;
     Writer::shutdown(writer.as_mut()).await?;
 
-    Ok(())
+    Ok(IndexFile {
+        path: INDEX_FILE_NAME.to_string(),
+        size_bytes,
+    })
 }
 
 /// Write the index to the index file.
@@ -1906,7 +1932,7 @@ async fn write_ivf_pq_file(
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
-) -> Result<()> {
+) -> Result<IndexFile> {
     let path = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
@@ -1944,9 +1970,13 @@ async fn write_ivf_pq_file(
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
     writer.write_magics(pos, 0, 1, MAGIC).await?;
+    let size_bytes = writer.tell().await? as u64;
     Writer::shutdown(writer.as_mut()).await?;
 
-    Ok(())
+    Ok(IndexFile {
+        path: INDEX_FILE_NAME.to_string(),
+        size_bytes,
+    })
 }
 
 pub async fn write_ivf_pq_file_from_existing_index(

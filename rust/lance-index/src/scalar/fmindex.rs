@@ -1334,7 +1334,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
-            files: Some(files),
+            files,
         })
     }
     fn update_criteria(&self) -> UpdateCriteria {
@@ -1582,7 +1582,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
-            files: Some(files),
+            files,
         })
     }
     fn provides_exact_answer(&self) -> bool {

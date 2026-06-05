@@ -872,7 +872,7 @@ pub struct CreatedIndex {
     ///
     /// This enables skipping HEAD calls when opening indices and provides
     /// visibility into index storage size via describe_indices().
-    pub files: Option<Vec<IndexFile>>,
+    pub files: Vec<IndexFile>,
 }
 
 /// The criteria that specifies how to update an index

@@ -164,8 +164,7 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
-        let (uuid, fragment_bitmap, index_details, index_version, files) =
-            segment.into_parts_with_files();
+        let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
         if index_details.type_url.ends_with("InvertedIndexDetails") {
             let metadata = IndexMetadata {
                 uuid,
@@ -182,13 +181,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
         }
-        let files = match files {
-            Some(files) => files,
-            None => {
-                let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
-                list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
-            }
-        };
+        let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
+        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
@@ -582,13 +576,6 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
-            let files = match files {
-                Some(files) => files,
-                None => {
-                    let index_dir = dataset.indices_dir().join(new_id.to_string());
-                    list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
-                }
-            };
 
             CreatedIndex {
                 index_details: prost_types::Any::from_msg(
@@ -596,7 +583,7 @@ pub(crate) async fn remap_index(
                 )
                 .unwrap(),
                 index_version,
-                files: Some(files),
+                files,
             }
         }
         _ => {
@@ -612,7 +599,7 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
-        files: created_index.files,
+        files: Some(created_index.files),
     }))
 }
 
@@ -1382,7 +1369,7 @@ impl DatasetIndexExt for Dataset {
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.
-                files: res.files,
+                files: Some(res.files),
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);

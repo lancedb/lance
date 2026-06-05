@@ -172,7 +172,7 @@ type BuildStream<S, Q> =
 
 type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin + 'static>;
 
-pub(crate) struct VectorIndexBuildSummary {
+pub struct VectorIndexBuildSummary {
     pub indices_merged: usize,
     pub files: Vec<IndexFile>,
 }
@@ -288,14 +288,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    // build the index with the all data in the dataset,
-    // return the number of indices merged.
-    pub async fn build(&mut self) -> Result<usize> {
-        Ok(self.build_with_summary().await?.indices_merged)
-    }
-
     // build the index and return the files created by the writer.
-    pub(crate) async fn build_with_summary(&mut self) -> Result<VectorIndexBuildSummary> {
+    pub async fn build(&mut self) -> Result<VectorIndexBuildSummary> {
         let progress = self.progress.clone();
 
         // step 1. train IVF & quantizer

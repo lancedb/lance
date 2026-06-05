@@ -465,7 +465,7 @@ impl ScalarIndex for BloomFilterIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 
@@ -1080,7 +1080,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 

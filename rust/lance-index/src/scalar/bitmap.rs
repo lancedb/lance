@@ -776,7 +776,7 @@ impl ScalarIndex for BitmapIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 
@@ -799,7 +799,7 @@ impl ScalarIndex for BitmapIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 
@@ -1644,7 +1644,7 @@ pub async fn merge_bitmap_indices(
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap(),
         index_version: BITMAP_INDEX_VERSION,
-        files: Some(vec![file]),
+        files: vec![file],
     })
 }
 
@@ -1730,7 +1730,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 

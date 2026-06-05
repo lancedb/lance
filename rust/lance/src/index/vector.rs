@@ -674,7 +674,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
-                .build_with_summary()
+                .build()
                 .await?;
                 return Ok((segment_uuid, summary.files));
             }
@@ -695,7 +695,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
-                .build_with_summary()
+                .build()
                 .await?;
                 return Ok((segment_uuid, summary.files));
             }
@@ -744,7 +744,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_transpose(false)
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
                     return Ok((segment_uuid, summary.files));
                 }
@@ -771,7 +771,7 @@ pub(crate) async fn build_distributed_vector_index(
             )?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
             return Ok((segment_uuid, summary.files));
         }
@@ -799,7 +799,7 @@ pub(crate) async fn build_distributed_vector_index(
                     )?
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
                     return Ok((segment_uuid, summary.files));
                 }
@@ -817,7 +817,7 @@ pub(crate) async fn build_distributed_vector_index(
                     )?
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
                     return Ok((segment_uuid, summary.files));
                 }
@@ -859,7 +859,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_transpose(false)
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
             return Ok((segment_uuid, summary.files));
         }
@@ -890,7 +890,7 @@ pub(crate) async fn build_distributed_vector_index(
             )?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
             return Ok((segment_uuid, summary.files));
         }
@@ -922,7 +922,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_transpose(false)
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
             return Ok((segment_uuid, summary.files));
         }
@@ -946,7 +946,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<Option<Vec<IndexFile>>> {
+) -> Result<Vec<IndexFile>> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -973,9 +973,9 @@ pub(crate) async fn build_vector_index(
                     frag_reuse_index,
                 )?
                 .with_progress(progress.clone())
-                .build_with_summary()
+                .build()
                 .await?;
-                return Ok(Some(summary.files));
+                return Ok(summary.files);
             }
             DataType::UInt8 => {
                 let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
@@ -990,9 +990,9 @@ pub(crate) async fn build_vector_index(
                     frag_reuse_index,
                 )?
                 .with_progress(progress.clone())
-                .build_with_summary()
+                .build()
                 .await?;
-                return Ok(Some(summary.files));
+                return Ok(summary.files);
             }
             _ => {
                 return Err(Error::index(format!(
@@ -1012,7 +1012,7 @@ pub(crate) async fn build_vector_index(
 
             match params.version {
                 IndexFileVersion::Legacy => {
-                    build_ivf_pq_index(
+                    let files = build_ivf_pq_index(
                         dataset,
                         column,
                         name,
@@ -1023,7 +1023,7 @@ pub(crate) async fn build_vector_index(
                         progress.clone(),
                     )
                     .await?;
-                    return Ok(None);
+                    return Ok(files);
                 }
                 IndexFileVersion::V3 => {
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
@@ -1041,9 +1041,9 @@ pub(crate) async fn build_vector_index(
                     let summary = builder
                         .with_transpose(!params.skip_transpose)
                         .with_progress(progress.clone())
-                        .build_with_summary()
+                        .build()
                         .await?;
-                    return Ok(Some(summary.files));
+                    return Ok(summary.files);
                 }
             }
         }
@@ -1067,9 +1067,9 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
-            return Ok(Some(summary.files));
+            return Ok(summary.files);
         }
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
@@ -1094,9 +1094,9 @@ pub(crate) async fn build_vector_index(
             let summary = builder
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
-                .build_with_summary()
+                .build()
                 .await?;
-            return Ok(Some(summary.files));
+            return Ok(summary.files);
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1119,9 +1119,9 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
-                    return Ok(Some(summary.files));
+                    return Ok(summary.files);
                 }
                 _ => {
                     let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
@@ -1136,9 +1136,9 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
-                    return Ok(Some(summary.files));
+                    return Ok(summary.files);
                 }
             }
         }
@@ -1167,9 +1167,9 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
-            return Ok(Some(summary.files));
+            return Ok(summary.files);
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1196,9 +1196,9 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
-            return Ok(Some(summary.files));
+            return Ok(summary.files);
         }
         _ => {
             return Err(Error::index(format!(
@@ -1293,7 +1293,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
             return Ok(summary);
         }
@@ -1311,7 +1311,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
             return Ok(summary);
         }
@@ -1332,7 +1332,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
-                .build_with_summary()
+                .build()
                 .await?;
             return Ok(summary);
         }
@@ -1351,7 +1351,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
-            .build_with_summary()
+            .build()
             .await?;
             return Ok(summary);
         }
@@ -1372,7 +1372,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
-                .build_with_summary()
+                .build()
                 .await?;
             return Ok(summary);
         }
@@ -1400,7 +1400,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
                     return Ok(summary);
                 }
@@ -1418,7 +1418,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
                     return Ok(summary);
                 }
@@ -1436,7 +1436,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
                     return Ok(summary);
                 }
@@ -1454,7 +1454,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build_with_summary()
+                    .build()
                     .await?;
                     return Ok(summary);
                 }
@@ -1476,7 +1476,7 @@ pub(crate) async fn build_empty_vector_index(
     name: &str,
     _uuid: &str,
     _params: &VectorIndexParams,
-) -> Result<Option<Vec<IndexFile>>> {
+) -> Result<Vec<IndexFile>> {
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed
     Err(Error::not_supported_source(
@@ -1497,13 +1497,13 @@ pub(crate) async fn remap_vector_index(
     new_uuid: &Uuid,
     old_metadata: &IndexMetadata,
     mapping: &HashMap<u64, Option<u64>>,
-) -> Result<Option<Vec<IndexFile>>> {
+) -> Result<Vec<IndexFile>> {
     let old_index = dataset
         .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
         .await?;
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
-        remap_index_file(
+        let file = remap_index_file(
             dataset.as_ref(),
             &old_uuid.to_string(),
             &new_uuid.to_string(),
@@ -1518,7 +1518,7 @@ pub(crate) async fn remap_vector_index(
             vec![],
         )
         .await?;
-        Ok(None)
+        Ok(vec![file])
     } else {
         // it's v3 index
         let files = remap_index_file_v3(
@@ -1529,7 +1529,7 @@ pub(crate) async fn remap_vector_index(
             column.to_string(),
         )
         .await?;
-        Ok(Some(files))
+        Ok(files)
     }
 }
 

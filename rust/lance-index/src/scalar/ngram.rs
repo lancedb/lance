@@ -510,7 +510,7 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 
@@ -531,7 +531,7 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 
@@ -1302,7 +1302,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 

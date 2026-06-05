@@ -645,7 +645,7 @@ impl ScalarIndex for ZoneMapIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 
@@ -987,7 +987,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: Some(vec![file]),
+            files: vec![file],
         })
     }
 

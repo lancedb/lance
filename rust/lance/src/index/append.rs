@@ -16,7 +16,7 @@ use lance_index::{
     },
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::{Fragment, IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -37,7 +37,7 @@ pub struct IndexMergeResults<'a> {
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
     /// List of files and their sizes for the merged index
-    pub files: Option<Vec<lance_table::format::IndexFile>>,
+    pub files: Vec<lance_table::format::IndexFile>,
 }
 
 async fn build_stable_row_id_filter(
@@ -452,13 +452,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(None);
             }
 
-            let files = match files {
-                Some(files) => files,
-                None => {
-                    let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-                    list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
-                }
-            };
             let new_fragment_bitmap = removed_segment
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
                 .or_else(|| removed_segment.fragment_bitmap.clone())
@@ -471,7 +464,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files: Some(files),
+                    files,
                 },
             ))
         } else {
@@ -524,14 +517,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 .map(|d| d.as_ref().clone())
                 .unwrap_or_else(vector_index_details_default);
 
-            let files = match files {
-                Some(files) => files,
-                None => {
-                    let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-                    list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
-                }
-            };
-
             Ok((
                 new_uuid,
                 removed_indices,
@@ -542,7 +527,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // index_version <= our max supported version, so we can safely
                     // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files: Some(files),
+                    files,
                 },
             ))
         }
