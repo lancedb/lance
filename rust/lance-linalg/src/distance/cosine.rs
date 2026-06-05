@@ -82,7 +82,7 @@ mod bf16_kernel {
         #[cfg(target_arch = "aarch64")]
         pub fn cosine_bf16_neon(x: *const bf16, x_norm: f32, y: *const bf16, dimension: u32)
         -> f32;
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
         pub fn cosine_bf16_avx512(
             x: *const bf16,
             x_norm: f32,
@@ -109,7 +109,7 @@ impl Cosine for bf16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_support = "avx512",
+                kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512FP16 => unsafe {
@@ -141,7 +141,7 @@ mod kernel {
     unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn cosine_f16_neon(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
         pub fn cosine_f16_avx512(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn cosine_f16_avx2(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
@@ -161,7 +161,7 @@ impl Cosine for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_support = "avx512",
+                kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512FP16 => unsafe {
