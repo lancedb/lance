@@ -4170,6 +4170,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         Ok(GetTableTagVersionResponse {
             version: version as i64,
+            ..Default::default()
         })
     }
 
