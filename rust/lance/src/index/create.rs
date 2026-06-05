@@ -569,6 +569,12 @@ impl<'a> CreateIndexBuilder<'a> {
         let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
         let column = format_field_path(&names);
 
+        let train = if self.train {
+            self.dataset.count_rows(None).await? > 0
+        } else {
+            false
+        };
+
         let indices = self.dataset.load_indices().await?;
         let index_name = if let Some(name) = self.name.take() {
             name
@@ -586,8 +592,64 @@ impl<'a> CreateIndexBuilder<'a> {
             }
             candidate
         };
+        let existing_named_indices = indices
+            .iter()
+            .filter(|idx| idx.name == index_name)
+            .collect::<Vec<_>>();
+        if existing_named_indices
+            .iter()
+            .any(|idx| idx.fields != [field.id])
+        {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        if !existing_named_indices.is_empty() && !self.replace {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists, \
+                please specify a different name or use replace=True"
+            )));
+        }
 
         let all_fragment_ids: Vec<u32> = self.dataset.fragment_bitmap.as_ref().iter().collect();
+        if !train || all_fragment_ids.is_empty() {
+            let segment_uuid = Uuid::new_v4();
+            let created_index = build_scalar_index(
+                self.dataset,
+                &column,
+                &segment_uuid.to_string(),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::FMIndex),
+                false,
+                None,
+                None,
+                self.progress.clone(),
+            )
+            .await?;
+            let metadata = IndexMetadata {
+                uuid: segment_uuid,
+                name: index_name.clone(),
+                fields: vec![field.id],
+                dataset_version: self.dataset.manifest.version,
+                fragment_bitmap: Some(roaring::RoaringBitmap::new()),
+                index_details: Some(Arc::new(created_index.index_details)),
+                index_version: created_index.index_version as i32,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
+                files: created_index.files,
+            };
+            self.dataset
+                .commit_existing_index_segments(&index_name, &column, vec![metadata])
+                .await?;
+            let indices = self.dataset.load_indices_by_name(&index_name).await?;
+            return indices.into_iter().next().ok_or_else(|| {
+                Error::internal(format!(
+                    "FM-Index segments for '{}' not found after commit",
+                    index_name
+                ))
+            });
+        }
+
         let num_segments = (num_segments as usize).min(all_fragment_ids.len()).max(1);
         let chunk_size = all_fragment_ids.len().div_ceil(num_segments);
 
