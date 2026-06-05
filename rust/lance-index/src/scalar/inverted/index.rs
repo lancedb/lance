@@ -7051,6 +7051,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn flat_bm25_search_uses_full_document_length_for_normalization() {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1])),
+                Arc::new(StringArray::from(vec![
+                    "alpha",
+                    "alpha filler filler filler filler filler filler filler filler filler",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+
+        let result_stream = flat_bm25_search_stream_with_metrics(
+            input,
+            "text".to_string(),
+            "alpha".to_string(),
+            tokenizer,
+            None,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+        let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+        let scores = scored[SCORE_COL].as_primitive::<Float32Type>();
+
+        assert_eq!(row_ids.values(), &[0, 1]);
+        assert!(
+            scores.value(0) > scores.value(1),
+            "same term frequency should score shorter document higher; short={}, long={}",
+            scores.value(0),
+            scores.value(1)
+        );
+    }
+
     /// An [`IndexReader`] wrapper that hides the posting-group-offsets schema
     /// metadata key, so a [`PostingListReader`] opened on it takes the
     /// pre-grouping per-token fallback path (issue #7040).
