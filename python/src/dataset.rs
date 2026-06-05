@@ -2201,14 +2201,14 @@ impl Dataset {
             }),
             "FMINDEX" => {
                 let mut params_json = serde_json::Map::new();
-                if let Some(kwargs) = kwargs {
-                    if let Some(num_segments) = kwargs.get_item("num_segments")? {
-                        let n: u32 = num_segments.extract()?;
-                        params_json.insert(
-                            "num_segments".to_string(),
-                            serde_json::Value::Number(n.into()),
-                        );
-                    }
+                if let Some(kwargs) = kwargs
+                    && let Some(num_segments) = kwargs.get_item("num_segments")?
+                {
+                    let n: u32 = num_segments.extract()?;
+                    params_json.insert(
+                        "num_segments".to_string(),
+                        serde_json::Value::Number(n.into()),
+                    );
                 }
                 let params = if params_json.is_empty() {
                     None
