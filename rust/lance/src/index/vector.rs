@@ -23,6 +23,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -42,7 +43,7 @@ use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::{Shuffler, create_ivf_shuffler};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{
-    VectorIndex,
+    Query, VectorIndex,
     hnsw::{
         builder::HnswBuildParams,
         index::{HNSWIndex, HNSWIndexOptions},
@@ -66,6 +67,35 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
+
+pub(crate) fn effective_query_parallelism_for_partitions(
+    query: &Query,
+    index: &dyn VectorIndex,
+    target_partitions: usize,
+) -> usize {
+    let cpu_pool_size = get_num_compute_intensive_cpus()
+        .min(target_partitions)
+        .max(1);
+    effective_query_parallelism_for(
+        query,
+        cpu_pool_size,
+        index.auto_query_parallelism(cpu_pool_size),
+    )
+}
+
+pub(crate) fn effective_query_parallelism_for(
+    query: &Query,
+    cpu_pool_size: usize,
+    auto_parallelism: usize,
+) -> usize {
+    let cpu_pool_size = cpu_pool_size.max(1);
+    match query.query_parallelism {
+        -1 => cpu_pool_size,
+        0 => auto_parallelism.clamp(1, cpu_pool_size),
+        n if n > 0 => (n as usize).min(cpu_pool_size).max(1),
+        _ => 1,
+    }
+}
 
 /// A materialized snapshot of one logical vector index and all of its segments.
 #[derive(Debug)]
@@ -1953,12 +1983,81 @@ mod tests {
     use arrow_array::Array;
     use arrow_array::RecordBatch;
     use arrow_array::types::{Float32Type, Int32Type};
+    use arrow_array::{ArrayRef, Float32Array};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
     use lance_linalg::distance::MetricType;
+
+    fn base_query() -> Query {
+        Query {
+            column: "vec".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0f32])) as ArrayRef,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(MetricType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_effective_query_parallelism_clamps_to_cpu_pool() {
+        let mut query = base_query();
+
+        query.query_parallelism = -1;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
+
+        query.query_parallelism = 0;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 1);
+        assert_eq!(effective_query_parallelism_for(&query, 16, 8), 8);
+        assert_eq!(effective_query_parallelism_for(&query, 16, 128), 16);
+
+        query.query_parallelism = 1;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 8), 1);
+
+        query.query_parallelism = 4;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 4);
+
+        query.query_parallelism = 128;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
+
+        query.query_parallelism = -2;
+        assert_eq!(effective_query_parallelism_for(&query, 16, 8), 1);
+    }
+
+    #[test]
+    fn test_effective_query_parallelism_respects_target_partitions() {
+        let mut query = base_query();
+        let cpu_pool_size = 16;
+
+        query.query_parallelism = -1;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 1),
+            4
+        );
+
+        query.query_parallelism = 0;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 8),
+            4
+        );
+
+        query.query_parallelism = 16;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 1),
+            4
+        );
+    }
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_pq() {

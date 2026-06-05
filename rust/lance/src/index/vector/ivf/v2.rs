@@ -11,7 +11,9 @@ use std::{
     sync::Arc,
 };
 
-use crate::index::vector::{IndexFileVersion, builder::index_type_string};
+use crate::index::vector::{
+    IndexFileVersion, builder::index_type_string, effective_query_parallelism_for_partitions,
+};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
@@ -28,7 +30,7 @@ use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -1340,7 +1342,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             )));
         }
 
-        let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
+        let prepare_parallelism =
+            effective_query_parallelism_for_partitions(&query, self.as_ref(), end_idx - start_idx);
 
         if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
