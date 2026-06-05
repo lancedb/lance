@@ -20,9 +20,7 @@ use lance_index::mem_wal::ShardingSpec;
 use uuid::Uuid;
 
 use super::data_source::ShardSnapshot;
-use crate::dataset::mem_wal::sharding::{
-    hash_scalar_to_bucket, source_column_for_field,
-};
+use crate::dataset::mem_wal::sharding::{hash_scalar_to_bucket, source_column_for_field};
 
 /// Attempt to prune shards based on a query filter and the sharding spec.
 ///
@@ -64,11 +62,7 @@ pub fn prune_shards(
 
     match transform {
         "bucket" => {
-            let num_buckets: i32 = field
-                .parameters
-                .get("num_buckets")?
-                .parse()
-                .ok()?;
+            let num_buckets: i32 = field.parameters.get("num_buckets")?.parse().ok()?;
             if num_buckets <= 0 {
                 return None;
             }
@@ -179,9 +173,7 @@ fn scalar_to_identity_bytes(scalar: &ScalarValue) -> Option<Vec<u8>> {
         ScalarValue::UInt16(Some(v)) => Some(v.to_le_bytes().to_vec()),
         ScalarValue::UInt32(Some(v)) => Some(v.to_le_bytes().to_vec()),
         ScalarValue::UInt64(Some(v)) => Some(v.to_le_bytes().to_vec()),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
-            Some(v.as_bytes().to_vec())
-        }
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => Some(v.as_bytes().to_vec()),
         _ => None,
     }
 }

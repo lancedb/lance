@@ -229,12 +229,8 @@ pub fn hash_scalar_to_bucket(
         ScalarValue::UInt16(Some(v)) => hash_int(*v as i32, MURMUR3_SEED),
         ScalarValue::UInt32(Some(v)) => hash_int(*v as i32, MURMUR3_SEED),
         ScalarValue::UInt64(Some(v)) => hash_long(*v as i64, MURMUR3_SEED),
-        ScalarValue::Float32(Some(v)) => {
-            hash_int(canonical_f32_bits(*v) as i32, MURMUR3_SEED)
-        }
-        ScalarValue::Float64(Some(v)) => {
-            hash_long(canonical_f64_bits(*v) as i64, MURMUR3_SEED)
-        }
+        ScalarValue::Float32(Some(v)) => hash_int(canonical_f32_bits(*v) as i32, MURMUR3_SEED),
+        ScalarValue::Float64(Some(v)) => hash_long(canonical_f64_bits(*v) as i64, MURMUR3_SEED),
         ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
             hash_bytes(v.as_bytes(), MURMUR3_SEED)
         }

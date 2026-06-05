@@ -1832,7 +1832,10 @@ mod integration_tests {
         let bucket_a = hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), 4).unwrap();
         let bucket_b = hash_scalar_to_bucket(&ScalarValue::Int32(Some(2)), 4).unwrap();
         // Ensure distinct buckets to have a meaningful test.
-        assert_ne!(bucket_a, bucket_b, "id=1 and id=2 must hash to different buckets for this test");
+        assert_ne!(
+            bucket_a, bucket_b,
+            "id=1 and id=2 must hash to different buckets for this test"
+        );
 
         // Shard A: active memtable with id=1, name="shard_a_1"
         let store_a = Arc::new(BatchStore::with_capacity(16));
@@ -1940,10 +1943,7 @@ mod integration_tests {
             Some(&"shard_a_1".to_string()),
             "shard_a row must survive"
         );
-        assert!(
-            !results.contains_key(&2),
-            "shard_b row must be pruned"
-        );
+        assert!(!results.contains_key(&2), "shard_b row must be pruned");
 
         // Verify that WITHOUT the sharding spec, both rows appear (no pruning).
         let scanner_no_pruning = LsmScanner::without_base_table(
@@ -2018,9 +2018,7 @@ mod integration_tests {
 
         let mk_memtable = |ids: &[i32], generation: u64| {
             let store = Arc::new(BatchStore::with_capacity(16));
-            store
-                .append(create_test_batch(&schema, ids, "v"))
-                .unwrap();
+            store.append(create_test_batch(&schema, ids, "v")).unwrap();
             InMemoryMemTables {
                 active: InMemoryMemTableRef {
                     batch_store: store,

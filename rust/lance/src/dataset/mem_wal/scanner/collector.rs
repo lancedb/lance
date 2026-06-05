@@ -344,23 +344,22 @@ impl LsmDataSourceCollector {
     /// Falls back to [`Self::collect`] when pruning is not possible (no spec,
     /// no filter, or the filter does not match the sharding column).
     pub fn collect_pruned(&self, filter: Option<&Expr>) -> Result<Vec<LsmDataSource>> {
-        if let Some(spec) = &self.sharding_spec {
-            if let Some(filter) = filter {
-                if let Some(shard_ids) = super::shard_pruning::prune_shards(
-                    filter,
-                    spec,
-                    &self.shard_snapshots,
-                    &self.source_id_to_column,
-                    self.base_schema.as_ref(),
-                ) {
-                    tracing::debug!(
-                        pruned_to = shard_ids.len(),
-                        total = self.shard_snapshots.len(),
-                        "shard pruning applied"
-                    );
-                    return self.collect_for_shards(&shard_ids);
-                }
-            }
+        if let Some(spec) = &self.sharding_spec
+            && let Some(filter) = filter
+            && let Some(shard_ids) = super::shard_pruning::prune_shards(
+                filter,
+                spec,
+                &self.shard_snapshots,
+                &self.source_id_to_column,
+                self.base_schema.as_ref(),
+            )
+        {
+            tracing::debug!(
+                pruned_to = shard_ids.len(),
+                total = self.shard_snapshots.len(),
+                "shard pruning applied"
+            );
+            return self.collect_for_shards(&shard_ids);
         }
         self.collect()
     }

@@ -513,9 +513,9 @@ impl LsmScanner {
         }
 
         if let Some(spec) = &self.sharding_spec {
-            collector =
-                collector.with_sharding_spec(spec.clone(), self.source_id_to_column.clone())
-                    .with_base_schema(self.schema.clone());
+            collector = collector
+                .with_sharding_spec(spec.clone(), self.source_id_to_column.clone())
+                .with_base_schema(self.schema.clone());
         }
 
         collector
