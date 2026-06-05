@@ -29,32 +29,37 @@ pub(in crate::index) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
-    let mut source_indices = Vec::with_capacity(segments.len());
+    let mut scalar_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
     for segment in &segments {
-        if segment.fragment_bitmap.is_none() {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            )));
-        }
-        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
-            fragment_bitmap |= effective;
-        }
+        let effective = segment
+            .effective_fragment_bitmap(dataset_fragments)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+        fragment_bitmap |= effective;
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
+        scalar_indices.push((segment.uuid, scalar_index));
+    }
+
+    let mut source_indices = Vec::with_capacity(scalar_indices.len());
+    for (segment_uuid, scalar_index) in &scalar_indices {
         let zonemap_index = scalar_index
             .as_any()
             .downcast_ref::<ZoneMapIndex>()
             .ok_or_else(|| {
                 Error::index(format!(
                     "merge_existing_index_segments: expected zonemap segment {}, got {:?}",
-                    segment.uuid,
+                    segment_uuid,
                     scalar_index.index_type()
                 ))
             })?;
-        source_indices.push(Arc::new(zonemap_index.clone()));
+        source_indices.push(zonemap_index);
     }
 
     let new_uuid = Uuid::new_v4();
@@ -62,7 +67,7 @@ pub(in crate::index) async fn merge_segments(
     let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
         &source_indices,
         &new_store,
-        Some(&fragment_bitmap),
+        &fragment_bitmap,
     )
     .await?;
 

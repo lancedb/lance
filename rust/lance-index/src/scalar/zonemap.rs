@@ -102,7 +102,6 @@ impl AsRef<ZoneBound> for ZoneMapStatistics {
 /// 2           | 10  | 14  | 5
 /// 2           | 15  | 16  | 2
 /// 3           | 20  | 23  | 4
-#[derive(Clone)]
 pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
@@ -664,9 +663,9 @@ impl ScalarIndex for ZoneMapIndex {
 
 /// Merge caller-selected ZoneMap segments into one self-contained segment.
 pub async fn merge_zonemap_indices(
-    source_indices: &[Arc<ZoneMapIndex>],
+    source_indices: &[&ZoneMapIndex],
     dest_store: &dyn IndexStore,
-    fragment_filter: Option<&RoaringBitmap>,
+    fragment_filter: &RoaringBitmap,
 ) -> Result<CreatedIndex> {
     let first = source_indices.first().ok_or_else(|| {
         Error::invalid_input("merge_zonemap_indices requires at least one source index")
@@ -688,13 +687,16 @@ pub async fn merge_zonemap_indices(
                 data_type, source.data_type
             )));
         }
-        zones.extend(source.zones.iter().filter_map(|zone| {
-            let include = fragment_filter.is_none_or(|fragments| {
-                u32::try_from(zone.bound.fragment_id)
-                    .is_ok_and(|fragment_id| fragments.contains(fragment_id))
-            });
-            include.then(|| zone.clone())
-        }));
+        zones.extend(
+            source
+                .zones
+                .iter()
+                .filter(|zone| {
+                    u32::try_from(zone.bound.fragment_id)
+                        .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+                })
+                .cloned(),
+        );
     }
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
