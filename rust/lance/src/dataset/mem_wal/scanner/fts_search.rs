@@ -44,6 +44,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
+use datafusion::prelude::Expr;
 use lance_core::{Error, ROW_ID, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::FtsQuery as IndexFtsQuery;
@@ -79,6 +80,10 @@ pub struct LsmFtsSearchPlanner {
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
     /// Over-fetch multiple for blocked sources (clamped to `>= 1.0`).
     overfetch_factor: f64,
+    /// Optional prefilter predicate applied to every source arm so FTS hits
+    /// failing the predicate are dropped. Base/flushed arms use the dataset
+    /// scanner's native filter; memtable arms filter the materialized hits.
+    filter: Option<Expr>,
 }
 
 impl LsmFtsSearchPlanner {
@@ -95,7 +100,16 @@ impl LsmFtsSearchPlanner {
             session: None,
             flushed_cache: None,
             overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
+            filter: None,
         }
+    }
+
+    /// Attach an optional prefilter predicate. Every source arm restricts its
+    /// FTS hits to rows matching the predicate, matching a normal filtered
+    /// full-text scan over base ∪ flushed ∪ in-memory data.
+    pub fn with_filter(mut self, filter: Option<Expr>) -> Self {
+        self.filter = filter;
+        self
     }
 
     /// Set the over-fetch multiple for blocked sources so they still yield `k`
@@ -270,6 +284,9 @@ impl LsmFtsSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                if let Some(ref filter) = self.filter {
+                    scanner.filter_expr(filter.clone());
+                }
                 let bound_query = query
                     .clone()
                     .with_column(column.to_string())?
@@ -284,6 +301,9 @@ impl LsmFtsSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                if let Some(ref filter) = self.filter {
+                    scanner.filter_expr(filter.clone());
+                }
                 let bound_query = query
                     .clone()
                     .with_column(column.to_string())?
@@ -301,6 +321,11 @@ impl LsmFtsSearchPlanner {
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                if let Some(ref filter) = self.filter {
+                    // Honored inside `plan_fts_search`: the materialized hits are
+                    // masked by the predicate before projection.
+                    scanner.filter_expr(filter.clone());
+                }
                 // Emit `_rowid` (row position) so the planner can collapse
                 // duplicate-PK appends via WithinSourceDedupExec before the union.
                 if emit_row_id {
@@ -550,6 +575,100 @@ mod tests {
         }
         assert!(ids.contains(&1), "missing base hit id=1; got ids={ids:?}");
         assert!(ids.contains(&3), "missing active hit id=3; got ids={ids:?}");
+    }
+
+    /// A prefilter on a full-text search must drop hits failing the predicate
+    /// from both the base arm (native scanner filter) and the active memtable
+    /// arm (materialized-hit mask), even though they match the query text.
+    #[tokio::test]
+    async fn prefilter_drops_nonmatching_hits_across_base_and_active() {
+        use crate::index::DatasetIndexExt;
+        use datafusion::prelude::{col, lit};
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Base rows 1 and 2 both contain "lance".
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(&schema, &[1, 2], &["lance one", "lance two"])],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        // Active memtable rows 0 and 3 both contain "lance".
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(&schema, &[0, 3], &["lance zero", "lance three"]);
+        batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            // `id >= 2` keeps base id=2 and active id=3; drops base id=1 and active id=0.
+            .with_filter(Some(col("id").gt_eq(lit(2i32))));
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                10,
+                None,
+            )
+            .await
+            .expect("planner should produce a filtered base+active plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "prefilter must keep only id>=2 across base (id=2) and active (id=3), \
+             dropping base id=1 and active id=0; got {ids:?}"
+        );
     }
 
     #[tokio::test]
