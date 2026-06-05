@@ -838,7 +838,7 @@ impl ObjectStore {
             .common_prefixes
             .iter()
             .chain(output.objects.iter().map(|o| &o.location))
-            .map(|s| s.filename().unwrap().to_string())
+            .filter_map(|s| s.filename().map(|f| f.to_string()))
             .collect())
     }
 

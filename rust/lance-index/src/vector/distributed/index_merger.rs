@@ -21,10 +21,12 @@ use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, pack_codes,
-    rabit_binary_code_field,
+    rabit_binary_code_field, rabit_ex_code_field,
 };
-use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
-use crate::vector::bq::validate_supported_rq_num_bits;
+use crate::vector::bq::transform::{
+    ADD_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
+};
+use crate::vector::bq::validate_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
 use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel as IvfStorageModel};
 use crate::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
@@ -299,12 +301,18 @@ pub async fn init_writer_for_rq(
     rq_meta: &RabitQuantizationMetadata,
     format_version: LanceFileVersion,
 ) -> Result<FileWriter> {
-    let arrow_schema = ArrowSchema::new(vec![
+    let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
         rabit_binary_code_field(rq_meta.rotated_dim()),
         ADD_FACTORS_FIELD.clone(),
         SCALE_FACTORS_FIELD.clone(),
-    ]);
+    ];
+    if let Some(ex_code_field) = rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)? {
+        fields.push(ex_code_field);
+        fields.push(EX_ADD_FACTORS_FIELD.clone());
+        fields.push(EX_SCALE_FACTORS_FIELD.clone());
+    }
+    let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
     let mut w = FileWriter::try_new(
         writer,
@@ -982,7 +990,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                     let rotate_mat_bytes = reader.read_global_buffer(buf_idx).await?;
                     rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
                 }
-                validate_supported_rq_num_bits(rq_meta_parsed.num_bits)?;
+                validate_rq_num_bits(rq_meta_parsed.num_bits)?;
 
                 let d0 = rq_meta_parsed.rotated_dim();
                 if d0 == 0 {
@@ -1523,6 +1531,8 @@ mod tests {
     use prost::Message;
 
     use crate::vector::bq::RQRotationType;
+    use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
+    use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
         IndexBuildProgress,
@@ -2053,7 +2063,14 @@ mod tests {
         distance_type: DistanceType,
     ) -> Result<usize> {
         let num_bytes = (metadata.code_dim as usize).div_ceil(u8::BITS as usize);
-        let arrow_schema = ArrowSchema::new(vec![
+        let ex_code_field = rabit_ex_code_field(metadata.code_dim as usize, metadata.num_bits)?;
+        let ex_code_bytes = ex_code_field.as_ref().map(|field| {
+            let DataType::FixedSizeList(_, num_bytes) = field.data_type() else {
+                panic!("RQ ex-code field should be FixedSizeList");
+            };
+            *num_bytes as usize
+        });
+        let mut fields = vec![
             (*ROW_ID_FIELD).clone(),
             Field::new(
                 RABIT_CODE_COLUMN,
@@ -2065,7 +2082,13 @@ mod tests {
             ),
             ADD_FACTORS_FIELD.clone(),
             SCALE_FACTORS_FIELD.clone(),
-        ]);
+        ];
+        if let Some(field) = ex_code_field {
+            fields.push(field);
+            fields.push(EX_ADD_FACTORS_FIELD.clone());
+            fields.push(EX_SCALE_FACTORS_FIELD.clone());
+        }
+        let arrow_schema = ArrowSchema::new(fields);
 
         let writer = store.create(aux_path).await?;
         let mut v2w = V2Writer::try_new(
@@ -2094,6 +2117,10 @@ mod tests {
         let mut codes = Vec::with_capacity(total_rows * num_bytes);
         let mut add_factors = Vec::with_capacity(total_rows);
         let mut scale_factors = Vec::with_capacity(total_rows);
+        let mut ex_codes =
+            ex_code_bytes.map(|num_bytes| Vec::with_capacity(total_rows * num_bytes));
+        let mut ex_add_factors = Vec::with_capacity(total_rows);
+        let mut ex_scale_factors = Vec::with_capacity(total_rows);
 
         let mut current_row_id = base_row_id;
         for (pid, len) in lengths.iter().enumerate() {
@@ -2105,21 +2132,34 @@ mod tests {
                 }
                 add_factors.push(pid as f32 + row_offset as f32 * 0.1);
                 scale_factors.push(pid as f32 + row_offset as f32 * 0.2);
+                if let (Some(ex_codes), Some(ex_code_bytes)) = (ex_codes.as_mut(), ex_code_bytes) {
+                    for b in 0..ex_code_bytes {
+                        ex_codes.push((17 + pid + row_offset + b) as u8);
+                    }
+                    ex_add_factors.push(pid as f32 + 10.0 + row_offset as f32 * 0.2);
+                    ex_scale_factors.push(pid as f32 + 1.0 + row_offset as f32 * 0.2);
+                }
             }
         }
 
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![
-                Arc::new(UInt64Array::from(row_ids)),
-                Arc::new(FixedSizeListArray::try_new_from_values(
-                    UInt8Array::from(codes),
-                    num_bytes as i32,
-                )?),
-                Arc::new(Float32Array::from(add_factors)),
-                Arc::new(Float32Array::from(scale_factors)),
-            ],
-        )?;
+        let mut columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(UInt64Array::from(row_ids)),
+            Arc::new(FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(codes),
+                num_bytes as i32,
+            )?),
+            Arc::new(Float32Array::from(add_factors)),
+            Arc::new(Float32Array::from(scale_factors)),
+        ];
+        if let (Some(ex_codes), Some(ex_code_bytes)) = (ex_codes, ex_code_bytes) {
+            columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(ex_codes),
+                ex_code_bytes as i32,
+            )?));
+            columns.push(Arc::new(Float32Array::from(ex_add_factors)));
+            columns.push(Arc::new(Float32Array::from(ex_scale_factors)));
+        }
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
 
         v2w.write_batch(&batch).await?;
         v2w.finish().await?;
@@ -2388,6 +2428,118 @@ mod tests {
         }
         assert!(checked_code_width);
         let expected_total: usize = expected_lengths.iter().map(|v| *v as usize).sum();
+        assert_eq!(total_rows, expected_total);
+    }
+
+    #[tokio::test]
+    async fn test_merge_ivf_rq_multi_bit_preserves_split_columns() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq_multi_bit");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
+
+        let lengths0 = vec![2_u32, 1_u32];
+        let lengths1 = vec![1_u32, 2_u32];
+
+        let rq_meta = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 4,
+            packed: false,
+        };
+
+        write_rq_partial_aux(
+            &object_store,
+            &aux0,
+            &rq_meta,
+            &lengths0,
+            0,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+        write_rq_partial_aux(
+            &object_store,
+            &aux1,
+            &rq_meta,
+            &lengths1,
+            1_000,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+
+        merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux0.clone(), aux1.clone()],
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let sched = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let fh = sched
+            .open_file(&aux_out, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let meta = reader.metadata();
+        let rq_meta_json = meta.file_schema.metadata.get(RABIT_METADATA_KEY).unwrap();
+        let merged_rq_meta: RabitQuantizationMetadata = serde_json::from_str(rq_meta_json).unwrap();
+        assert_eq!(merged_rq_meta.num_bits, 4);
+        assert!(merged_rq_meta.packed);
+
+        let mut total_rows = 0usize;
+        let mut checked_split_columns = false;
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                4,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            if !checked_split_columns {
+                let schema = batch.schema();
+                let ex_code_field = schema.field_with_name(RABIT_EX_CODE_COLUMN).unwrap();
+                let DataType::FixedSizeList(_, ex_code_bytes) = ex_code_field.data_type() else {
+                    panic!("RQ ex-code field should be FixedSizeList");
+                };
+                assert_eq!(*ex_code_bytes, 6);
+                assert!(schema.field_with_name(EX_ADD_FACTORS_COLUMN).is_ok());
+                assert!(schema.field_with_name(EX_SCALE_FACTORS_COLUMN).is_ok());
+                checked_split_columns = true;
+            }
+            total_rows += batch.num_rows();
+        }
+        assert!(checked_split_columns);
+        let expected_total: usize = lengths0
+            .iter()
+            .zip(lengths1.iter())
+            .map(|(a, b)| (*a + *b) as usize)
+            .sum();
         assert_eq!(total_rows, expected_total);
     }
 

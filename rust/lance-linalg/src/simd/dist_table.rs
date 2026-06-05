@@ -37,18 +37,22 @@ pub fn sum_4bit_dist_table(
     debug_assert!(n.is_multiple_of(BATCH_SIZE));
 
     match *SIMD_SUPPORT {
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
+        #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16
+            if std::arch::is_x86_feature_detected!("avx512bw") =>
+        {
             for i in (0..n).step_by(BATCH_SIZE) {
                 let codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
-                sum_4bit_dist_table_32bytes_batch_avx512(
-                    codes.as_ptr(),
-                    codes.len(),
-                    dist_table.as_ptr(),
-                    dists[i..i + BATCH_SIZE].as_mut_ptr(),
-                )
+                unsafe {
+                    sum_4bit_dist_table_32bytes_batch_avx512(
+                        codes.as_ptr(),
+                        codes.len(),
+                        dist_table.as_ptr(),
+                        dists[i..i + BATCH_SIZE].as_mut_ptr(),
+                    )
+                }
             }
-        },
+        }
         #[cfg(target_arch = "x86_64")]
         SimdSupport::Avx2 => unsafe {
             for i in (0..n).step_by(BATCH_SIZE) {
@@ -253,7 +257,7 @@ unsafe fn sum_dist_table_32bytes_batch_neon(codes: &[u8], dist_table: &[u8], dis
 // We implement the AVX512 version in C because AVX512 is not stable yet in Rust,
 // implement it in Rust once we upgrade rust to 1.89.0.
 unsafe extern "C" {
-    #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+    #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
     pub fn sum_4bit_dist_table_32bytes_batch_avx512(
         codes: *const u8,
         code_length: usize,

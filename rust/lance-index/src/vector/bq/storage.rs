@@ -38,10 +38,12 @@ use serde::{Deserialize, Serialize};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
-use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
+use crate::vector::bq::transform::{
+    ADD_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN, SCALE_FACTORS_COLUMN,
+};
 use crate::vector::bq::{
     RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
-    validate_supported_rq_num_bits,
+    validate_rq_num_bits,
 };
 use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
@@ -49,7 +51,7 @@ use crate::vector::storage::{DistCalculator, QueryResidual, VectorStore};
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
-pub const RABIT_EX_CODE_COLUMN: &str = "_rabit_ex_codes";
+pub const RABIT_EX_CODE_COLUMN: &str = "__ex_codes";
 pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 
@@ -959,7 +961,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         _fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        validate_supported_rq_num_bits(metadata.num_bits)?;
+        validate_rq_num_bits(metadata.num_bits)?;
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
         let expected_code_bytes = metadata.binary_code_bytes();
@@ -978,6 +980,48 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let scale_factors = batch[SCALE_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
+        let ex_bits = rabit_ex_bits(metadata.num_bits)?;
+        if ex_bits != 0 {
+            let ex_codes = batch
+                .column_by_name(RABIT_EX_CODE_COLUMN)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "RabitQ num_bits={} requires {} column",
+                        metadata.num_bits, RABIT_EX_CODE_COLUMN
+                    ))
+                })?
+                .as_fixed_size_list()
+                .clone();
+            let expected_ex_code_bytes = rabit_ex_code_bytes(metadata.rotated_dim(), ex_bits)?;
+            if ex_codes.value_length() as usize != expected_ex_code_bytes {
+                return Err(Error::invalid_input(format!(
+                    "RabitQ ex-code byte width mismatch: column {} has {} bytes, metadata rotated_dim={} ex_bits={} requires {} bytes",
+                    RABIT_EX_CODE_COLUMN,
+                    ex_codes.value_length(),
+                    metadata.rotated_dim(),
+                    ex_bits,
+                    expected_ex_code_bytes
+                )));
+            }
+            batch
+                .column_by_name(EX_ADD_FACTORS_COLUMN)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "RabitQ num_bits={} requires {} column",
+                        metadata.num_bits, EX_ADD_FACTORS_COLUMN
+                    ))
+                })?
+                .as_primitive::<Float32Type>();
+            batch
+                .column_by_name(EX_SCALE_FACTORS_COLUMN)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "RabitQ num_bits={} requires {} column",
+                        metadata.num_bits, EX_SCALE_FACTORS_COLUMN
+                    ))
+                })?
+                .as_primitive::<Float32Type>();
+        }
 
         let (batch, codes) = if !metadata.packed {
             let codes = pack_codes(&codes);
@@ -1058,14 +1102,20 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 .replace_column_by_name(RABIT_CODE_COLUMN, codes)?
         };
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
+        let add_factors = batch[ADD_FACTORS_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
+        let scale_factors = batch[SCALE_FACTORS_COLUMN]
+            .as_primitive::<Float32Type>()
+            .clone();
 
         Ok(Self {
             metadata: self.metadata.clone(),
             distance_type: self.distance_type,
             batch,
             codes,
-            add_factors: self.add_factors.clone(),
-            scale_factors: self.scale_factors.clone(),
+            add_factors,
+            scale_factors,
             row_ids: new_row_ids,
         })
     }
@@ -1368,12 +1418,12 @@ mod tests {
         assert_eq!(*bin_code_bytes, 16);
 
         assert!(rabit_ex_code_field(128, 1).unwrap().is_none());
-        let ex_field = rabit_ex_code_field(128, 4).unwrap().unwrap();
+        let ex_field = rabit_ex_code_field(128, 9).unwrap().unwrap();
         assert_eq!(ex_field.name(), RABIT_EX_CODE_COLUMN);
         let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
             panic!("ex-code field should be FixedSizeList");
         };
-        assert_eq!(*ex_code_bytes, 48);
+        assert_eq!(*ex_code_bytes, 128);
     }
 
     fn make_test_codes(num_vectors: usize, code_dim: i32) -> FixedSizeListArray {
@@ -1419,6 +1469,56 @@ mod tests {
         .unwrap()
     }
 
+    fn make_test_ex_codes(num_vectors: usize, code_dim: usize, num_bits: u8) -> FixedSizeListArray {
+        let ex_bits = rabit_ex_bits(num_bits).unwrap();
+        let ex_code_bytes = rabit_ex_code_bytes(code_dim, ex_bits).unwrap();
+        let values = (0..num_vectors * ex_code_bytes)
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        FixedSizeListArray::try_new_from_values(UInt8Array::from(values), ex_code_bytes as i32)
+            .unwrap()
+    }
+
+    fn make_test_batch_with_ex(
+        codes: FixedSizeListArray,
+        ex_codes: FixedSizeListArray,
+    ) -> RecordBatch {
+        let num_rows = codes.len();
+        RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+            ),
+            (RABIT_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+            (
+                ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32),
+                )) as ArrayRef,
+            ),
+            (
+                SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32 + 0.5),
+                )) as ArrayRef,
+            ),
+            (RABIT_EX_CODE_COLUMN, Arc::new(ex_codes) as ArrayRef),
+            (
+                EX_ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32 + 10.5),
+                )) as ArrayRef,
+            ),
+            (
+                EX_SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|v| v as f32 + 1.5),
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
     fn assert_codes_eq(actual: &FixedSizeListArray, expected: &FixedSizeListArray) {
         assert_eq!(actual.len(), expected.len());
         assert_eq!(actual.value_length(), expected.value_length());
@@ -1450,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_batch_rejects_unsupported_rq_num_bits() {
+    fn test_try_from_batch_requires_ex_columns_for_multi_bit_rq() {
         let original_codes = make_test_codes(50, 64);
         let mut metadata = make_test_metadata(original_codes.value_length() as usize * 8);
         metadata.num_bits = 2;
@@ -1463,9 +1563,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("only num_bits=1 is supported"),
+            err.to_string().contains("requires __ex_codes column"),
             "{}",
             err
+        );
+    }
+
+    #[test]
+    fn test_try_from_batch_requires_ex_add_factors_for_multi_bit_rq() {
+        let original_codes = make_test_codes(50, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 9);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 9;
+        let batch = make_test_batch_with_ex(original_codes, ex_codes)
+            .drop_column(EX_ADD_FACTORS_COLUMN)
+            .unwrap();
+
+        let err =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("requires __add_factors_ex column"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_try_from_batch_accepts_multi_bit_rq_split_codes() {
+        let original_codes = make_test_codes(50, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 9);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 9;
+
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch_with_ex(original_codes, ex_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        assert!(storage.metadata().packed);
+        let stored_batch = storage.to_batches().unwrap().next().unwrap();
+        assert_eq!(
+            stored_batch[RABIT_EX_CODE_COLUMN]
+                .as_fixed_size_list()
+                .value_length(),
+            64
         );
     }
 
@@ -1501,5 +1648,55 @@ mod tests {
         let remapped_codes = remapped_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
         let repacked = pack_codes(&unpack_codes(remapped_codes));
         assert_codes_eq(remapped_codes, &repacked);
+    }
+
+    #[test]
+    fn test_remap_preserves_multi_bit_rq_split_columns() {
+        let original_codes = make_test_codes(50, 64);
+        let code_dim = original_codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 9);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 9;
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch_with_ex(original_codes.clone(), ex_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        let mut mapping = HashMap::new();
+        mapping.insert(1, Some(101));
+        mapping.insert(3, None);
+        mapping.insert(4, Some(104));
+
+        let remapped = storage.remap(&mapping).unwrap();
+        let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
+        let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
+        let expected_row_ids = UInt64Array::from_iter_values(
+            [0, 101, 2, 104]
+                .into_iter()
+                .chain(5..original_codes.len() as u64),
+        );
+        assert_eq!(remapped_row_ids, expected_row_ids.values());
+
+        assert_eq!(
+            remapped_batch[RABIT_EX_CODE_COLUMN]
+                .as_fixed_size_list()
+                .value_length(),
+            64
+        );
+        assert_eq!(
+            &remapped_batch[EX_ADD_FACTORS_COLUMN]
+                .as_primitive::<Float32Type>()
+                .values()[..5],
+            &[10.5, 11.5, 12.5, 14.5, 15.5]
+        );
+        assert_eq!(
+            &remapped_batch[EX_SCALE_FACTORS_COLUMN]
+                .as_primitive::<Float32Type>()
+                .values()[..5],
+            &[1.5, 2.5, 3.5, 5.5, 6.5]
+        );
     }
 }

@@ -435,9 +435,19 @@ impl PostingIterator {
     }
 }
 
+/// How wand identified a candidate: either it already had the real
+/// row_id (DocSet carried row_ids), or only the partition-local
+/// doc_id (deferred-row_id path; the caller must resolve via
+/// [`super::lazy_docset::LazyDocSet::resolve_row_ids`]).
+#[derive(Debug, Clone, Copy)]
+pub enum CandidateAddr {
+    RowId(u64),
+    Pending(u32),
+}
+
 #[derive(Debug)]
 pub struct DocCandidate {
-    pub row_id: u64,
+    pub addr: CandidateAddr,
     /// (term_index, freq)
     pub freqs: Vec<(u32, u32)>,
     pub doc_length: u32,
@@ -698,6 +708,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
+        // Deferred-row_id path: when the DocSet was built without
+        // row_ids, wand emits candidates carrying just the
+        // partition-local doc_id; the outer caller resolves them to
+        // row_ids post-wand.
+        let docs_has_row_ids = self.docs.has_row_ids();
+
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         loop {
@@ -707,14 +723,20 @@ impl<'a, S: Scorer> Wand<'a, S> {
             };
             num_comparisons += 1;
 
+            // Either a real row_id (so we can run the mask check
+            // inline) or the doc_id widened to u64 (deferred path;
+            // the outer caller will resolve it post-wand).
             let row_id = match &doc {
                 DocInfo::Raw(doc) => {
-                    // if the doc is not located, we need to find the row id
-                    self.docs.row_id(doc.doc_id)
+                    if docs_has_row_ids {
+                        self.docs.row_id(doc.doc_id)
+                    } else {
+                        doc.doc_id as u64
+                    }
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
-            if !mask.selected(row_id) {
+            if docs_has_row_ids && !mask.selected(row_id) {
                 if self.operator == Operator::Or {
                     self.push_back_leads(doc.doc_id() + 1);
                 }
@@ -764,10 +786,21 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
         metrics.record_comparisons(num_comparisons);
 
+        // The heap entry's `row_id` slot is either a real row_id
+        // (DocSet had row_ids) or the doc_id widened to u64
+        // (deferred). Tag it accordingly so the caller can match
+        // rather than guess.
+        let to_addr = |row_id_slot: u64| {
+            if docs_has_row_ids {
+                CandidateAddr::RowId(row_id_slot)
+            } else {
+                CandidateAddr::Pending(row_id_slot as u32)
+            }
+        };
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                addr: to_addr(doc.row_id),
                 freqs,
                 doc_length,
             })
@@ -871,10 +904,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
         metrics.record_comparisons(num_comparisons);
 
+        // flat_search is driven by an explicit row_ids iterator, so
+        // every candidate already has a real row_id.
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                addr: CandidateAddr::RowId(doc.row_id),
                 freqs,
                 doc_length,
             })
@@ -1942,7 +1977,13 @@ mod tests {
                     &NoOpMetricsCollector,
                 )
                 .unwrap();
-            let mut row_ids = hits.iter().map(|hit| hit.row_id).collect::<Vec<_>>();
+            let mut row_ids = hits
+                .iter()
+                .map(|hit| match hit.addr {
+                    CandidateAddr::RowId(r) => r,
+                    CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+                })
+                .collect::<Vec<_>>();
             row_ids.sort_unstable();
             (row_ids, scored.load(Ordering::Relaxed))
         };
@@ -2160,7 +2201,13 @@ mod tests {
             )
             .unwrap();
 
-        let matched = result.into_iter().map(|doc| doc.row_id).collect::<Vec<_>>();
+        let matched = result
+            .into_iter()
+            .map(|doc| match doc.addr {
+                CandidateAddr::RowId(r) => r,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
         assert_eq!(matched, vec![2]);
     }
 

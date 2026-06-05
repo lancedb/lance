@@ -5,6 +5,7 @@
 //!
 
 pub(crate) mod bitmap;
+pub(crate) mod btree;
 pub(crate) mod inverted;
 
 pub use inverted::{load_segment_details, load_segments};

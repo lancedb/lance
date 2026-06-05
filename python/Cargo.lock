@@ -1302,9 +1302,9 @@ dependencies = [
 
 [[package]]
 name = "chrono"
-version = "0.4.44"
+version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "js-sys",
@@ -2919,7 +2919,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "rand 0.9.4",
@@ -3275,6 +3275,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "goosefs-sdk"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae079b88ffe7772d12cfc5c40a5a324babb357893d95b5e3a22ae857f236c5f"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "hostname",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3427,6 +3451,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if 1.0.4",
+ "libc",
+ "windows-link",
+]
+
+[[package]]
 name = "http"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3543,6 +3578,20 @@ dependencies = [
  "rustls-native-certs",
  "tokio",
  "tokio-rustls",
+ "tower-service",
+ "webpki-roots",
+]
+
+[[package]]
+name = "hyper-timeout"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "tokio",
  "tower-service",
 ]
 
@@ -4087,7 +4136,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4162,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4204,7 +4253,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrayref",
  "paste",
@@ -4213,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4248,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4280,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4298,7 +4347,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4333,7 +4382,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4364,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "datafusion",
  "geo-traits",
@@ -4378,7 +4427,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4424,6 +4473,7 @@ dependencies = [
  "lance-table",
  "lance-tokenizer",
  "libm",
+ "libsais-rs",
  "log",
  "ndarray",
  "num-traits",
@@ -4448,7 +4498,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4490,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4506,7 +4556,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4518,7 +4568,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4548,9 +4598,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.8.0"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eefb02ded2c3d4b6b60669bb74822d9fa628e144fc748c79ee31f13f566e87b"
+checksum = "7a09733325812e046cb217d548afc4864dedb59545389d45cd498b3d8ecb0d20"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -4562,7 +4612,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4578,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4618,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "icu_segmenter",
  "jieba-rs",
@@ -4758,6 +4808,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsais-rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40fe164dbd47ea0c20e78a121c980ef673326905f1d4fba55e3645a20ef6717f"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "lindera"
 version = "3.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4846,9 +4905,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.31"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "loom"
@@ -5331,6 +5390,7 @@ dependencies = [
  "opendal-service-azdls",
  "opendal-service-cos",
  "opendal-service-gcs",
+ "opendal-service-goosefs",
  "opendal-service-hf",
  "opendal-service-oss",
  "opendal-service-s3",
@@ -5494,6 +5554,20 @@ dependencies = [
  "reqsign-google",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "opendal-service-goosefs"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e43048bde419947ba826fbdc2f134d6c03f44ebf48bd33a03b72f9fc45fcb4"
+dependencies = [
+ "bytes",
+ "goosefs-sdk",
+ "log",
+ "opendal-core",
+ "serde",
  "tokio",
 ]
 
@@ -6082,7 +6156,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "8.0.0-beta.2"
+version = "8.0.0-beta.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -6712,9 +6786,9 @@ dependencies = [
 
 [[package]]
 name = "reqsign-volcengine-tos"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d757602a7ef2b6025c0da77e6d2e23fbdef35930fa466b15ffbf0a3f13acf7"
+checksum = "91d083a363b3577f519ce8425bb50f902622a28a83f7c4a26a5c990b66ec75b3"
 dependencies = [
  "anyhow",
  "http 1.4.1",
@@ -6766,6 +6840,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -7295,9 +7370,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e72c1c2cb7b223fafb600a619537a871c2818583d619401b785e7c0b746ccde2"
+checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
  "base64",
  "bs58",
@@ -7315,9 +7390,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b90c488738ecb4fb0262f41f43bc40efc5868d9fb744319ddf5f5317f417bfac"
+checksum = "84d57bc0c8b9a17920c178daa6bb924850d54a9c97ab45194bb8c17ad66bb660"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -8048,6 +8123,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "tonic"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "h2",
+ "http 1.4.1",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper",
+ "hyper-timeout",
+ "hyper-util",
+ "percent-encoding",
+ "pin-project",
+ "socket2",
+ "sync_wrapper",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tonic-prost"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
+dependencies = [
+ "bytes",
+ "prost",
+ "tonic",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8055,9 +8169,12 @@ checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
 dependencies = [
  "futures-core",
  "futures-util",
+ "indexmap 2.14.0",
  "pin-project-lite",
+ "slab",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -8633,6 +8750,15 @@ name = "webpki-root-certs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
 ]

@@ -49,7 +49,8 @@ pub struct ProductQuantizer {
     /// Pre-transposed L2 targets per sub-vector for fast f32 L2 batch computation.
     /// Only populated when codebook is f32 and distance_type is L2
     /// (Cosine is converted to L2 before construction, so it benefits too).
-    l2_targets: Option<Vec<L2Prepared>>,
+    /// Wrapped in Arc so all clones (one per cached IVF partition) share one copy.
+    l2_targets: Option<Arc<Vec<L2Prepared>>>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
@@ -59,10 +60,9 @@ impl DeepSizeOf for ProductQuantizer {
             + self.num_bits.deep_size_of_children(_context)
             + self.dimension.deep_size_of_children(_context)
             + self.distance_type.deep_size_of_children(_context)
-            + self
-                .l2_targets
-                .as_ref()
-                .map_or(0, |v| v.iter().map(|t| t.size_bytes()).sum())
+            // deep_size_of_children on the Arc de-duplicates shared allocations
+            // via the context, so partitions sharing one l2_targets are counted once.
+            + self.l2_targets.deep_size_of_children(_context)
     }
 }
 
@@ -74,7 +74,7 @@ impl ProductQuantizer {
         num_sub_vectors: usize,
         num_bits: u32,
         dimension: usize,
-    ) -> Option<Vec<L2Prepared>> {
+    ) -> Option<Arc<Vec<L2Prepared>>> {
         if codebook.value_type() != DataType::Float32 || distance_type != DistanceType::L2 {
             return None;
         }
@@ -86,14 +86,14 @@ impl ProductQuantizer {
         let num_centroids = 2_usize.pow(num_bits);
         let block_size = sub_dim * num_centroids;
 
-        let targets = (0..num_sub_vectors)
+        let targets: Vec<L2Prepared> = (0..num_sub_vectors)
             .map(|sub_idx| {
                 let block_start = sub_idx * block_size;
                 let block = &values[block_start..block_start + block_size];
                 L2Prepared::new(block, sub_dim)
             })
             .collect();
-        Some(targets)
+        Some(Arc::new(targets))
     }
 
     pub fn new(
@@ -361,7 +361,7 @@ impl ProductQuantizer {
             DataType::Float32 => {
                 if let Some(targets) = &self.l2_targets {
                     let query = key.as_primitive::<datatypes::Float32Type>().values();
-                    Ok(build_distance_table_l2_prepared(targets, query))
+                    Ok(build_distance_table_l2_prepared(targets.as_slice(), query))
                 } else {
                     Ok(self
                         .build_l2_distance_table_impl::<datatypes::Float32Type>(key.as_primitive()))

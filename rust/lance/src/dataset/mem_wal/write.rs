@@ -806,6 +806,8 @@ async fn replay_memtable_from_wal(
                         position, entry.writer_epoch, our_epoch, shard_id
                     )));
                 }
+                // Fence sentinels deserialize to zero batches and are skipped
+                // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
                     memtable.insert_batches_only(entry.batches).await?;
                 }
@@ -1207,6 +1209,12 @@ impl ShardWriter {
             epoch,
             position_hint_seed,
         ));
+
+        // Fence the predecessor before replay (see `write_fence_sentinel`).
+        // Epoch 1 is a fresh shard with no predecessor to fence.
+        if epoch >= 2 {
+            wal_appender.write_fence_sentinel().await?;
+        }
 
         // Create WAL flusher backed by the shared appender.
         let mut wal_flusher = WalFlusher::new(wal_appender);

@@ -10,8 +10,9 @@ use crate::{
     pb, pbold,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
+        fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
+        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
+        zonemap::ZoneMapIndexPlugin,
     },
 };
 
@@ -66,6 +67,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
+        registry.add_plugin::<pb::FmIndexIndexDetails, FMIndexPlugin>();
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 

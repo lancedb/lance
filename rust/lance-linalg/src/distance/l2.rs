@@ -15,6 +15,7 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type, Int8Type},
 };
 use arrow_schema::DataType;
+use deepsize::DeepSizeOf;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
@@ -151,7 +152,7 @@ mod bf16_kernel {
     unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn l2_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
         pub fn l2_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn l2_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
@@ -172,7 +173,7 @@ impl L2 for bf16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_support = "avx512",
+                kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512FP16 => unsafe {
@@ -204,7 +205,7 @@ mod kernel {
     unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn l2_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
         pub fn l2_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn l2_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
@@ -225,7 +226,7 @@ impl L2 for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_support = "avx512",
+                kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512FP16 => unsafe {
@@ -331,7 +332,7 @@ fn accumulate_l2_dimension(q: f32, row: &[f32], result: &mut [f32]) {
 /// sub-vector codebooks (e.g. 256 centroids × 16 dims = 16 KB).
 /// For large target sets the SoA layout causes L1 thrashing and
 /// [`l2_distance_batch`] with its AoS per-target locality is faster.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct L2Prepared {
     transposed: Vec<f32>,
     dimension: usize,

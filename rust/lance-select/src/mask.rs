@@ -78,6 +78,13 @@ impl RowAddrMask {
         }
     }
 
+    /// True if every row_id is selected. Lets callers (e.g. the FTS wand
+    /// loop) skip per-row mask checks entirely, which in turn lets the
+    /// deferred-row_id scoring path skip loading the row_id column.
+    pub fn is_select_all(&self) -> bool {
+        matches!(self, Self::BlockList(b) if b.is_empty())
+    }
+
     /// Return the indices of the input row ids that were valid
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
         row_ids

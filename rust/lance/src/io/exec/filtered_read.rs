@@ -1739,7 +1739,13 @@ impl FilteredReadExec {
         // Second, multiple partitions all share the same underlying task stream (see get_stream)
         let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
-        let options = self.options.clone();
+        let target_partitions = context.session_config().target_partitions();
+        let mut options = self.options.clone();
+        if let FilteredReadThreadingMode::OnePartitionMultipleThreads(n) = options.threading_mode {
+            options.threading_mode = FilteredReadThreadingMode::OnePartitionMultipleThreads(
+                n.min(target_partitions).max(1),
+            );
+        }
         let batch_size_bytes = options
             .file_reader_options
             .as_ref()
@@ -3853,5 +3859,38 @@ mod tests {
         for i in 0..result1.num_columns() {
             assert_eq!(result1.column(i).as_ref(), result3.column(i).as_ref());
         }
+    }
+
+    /// Verify that executing with target_partitions=1 produces the same results as the default
+    /// context and does not panic. This is a regression guard for the parallelism cap.
+    #[test_log::test(tokio::test)]
+    async fn test_target_partitions_cap_produces_correct_results() {
+        use datafusion::prelude::SessionConfig;
+
+        let fixture = TestFixture::new().await;
+
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
+
+        // Execute with default context (high thread count)
+        let default_ctx = Arc::new(TaskContext::default());
+        let stream = plan.execute(0, default_ctx).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let default_result = concat_batches(&schema, &batches).unwrap();
+
+        // Execute fresh plan with target_partitions=1
+        let plan2 = FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap();
+        let low_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::default().with_target_partitions(1)),
+        );
+        let stream2 = plan2.execute(0, low_ctx).unwrap();
+        let schema2 = stream2.schema();
+        let batches2 = stream2.try_collect::<Vec<_>>().await.unwrap();
+        let capped_result = concat_batches(&schema2, &batches2).unwrap();
+
+        assert_eq!(default_result.num_rows(), capped_result.num_rows());
     }
 }

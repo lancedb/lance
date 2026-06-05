@@ -68,7 +68,7 @@ use tracing::{info, instrument};
 
 mod flat;
 
-const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
+pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
@@ -1489,7 +1489,7 @@ impl BTreeIndex {
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
-    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+    async fn data_stream(&self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = lazy_reader.get().await?;
         let new_schema = Arc::new(self.train_schema());
@@ -1512,25 +1512,51 @@ impl BTreeIndex {
         )))
     }
 
-    async fn combine_old_new(
-        self,
+    /// Merge N source BTree segments plus an additional `new_data` stream into
+    /// a single BTree under `dest_store`, without re-reading the dataset.
+    pub async fn merge_segments(
+        segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
-        chunk_size: u64,
+        dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
-    ) -> Result<SendableRecordBatchStream> {
-        let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
-
-        let new_input = Arc::new(OneShotExec::new(new_data));
-        let old_stream = self.into_data_stream().await?;
-        let old_stream = match old_data_filter {
-            Some(filter) => filter_row_ids(old_stream, filter),
-            None => old_stream,
+    ) -> Result<CreatedIndex> {
+        let Some(first) = segments.first() else {
+            return Err(Error::invalid_input(
+                "cannot merge BTree index without at least one source segment".to_string(),
+            ));
         };
-        let old_input = Arc::new(OneShotExec::new(old_stream));
-        debug_assert_eq!(
-            old_input.schema().flattened_fields().len(),
-            new_input.schema().flattened_fields().len()
-        );
+
+        for segment in segments.iter().skip(1) {
+            if segment.data_type != first.data_type {
+                return Err(Error::index(format!(
+                    "cannot merge BTree segments with different value types ({:?} vs {:?})",
+                    first.data_type, segment.data_type
+                )));
+            }
+        }
+
+        let new_schema = new_data.schema();
+        let value_column_index = new_schema.index_of(VALUE_COLUMN_NAME)?;
+        let new_value_type = new_schema.field(value_column_index).data_type();
+        if new_value_type != &first.data_type {
+            return Err(Error::invalid_input(format!(
+                "BTree merge: new_data value column type {:?} does not match \
+                 segment value type {:?}",
+                new_value_type, first.data_type
+            )));
+        }
+
+        let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
+        for segment in segments {
+            let stream = segment.data_stream().await?;
+            let stream = match old_data_filter.clone() {
+                Some(filter) => filter_row_ids(stream, filter),
+                None => stream,
+            };
+            let exec = Arc::new(OneShotExec::new(stream));
+            inputs.push(exec);
+        }
+        inputs.push(Arc::new(OneShotExec::new(new_data)));
 
         let sort_expr = PhysicalSortExpr {
             expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
@@ -1539,11 +1565,10 @@ impl BTreeIndex {
                 nulls_first: true,
             },
         };
-        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
-        // them back into a single partition.
-        let all_data = UnionExec::try_new(vec![old_input, new_input])?;
-        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
-
+        // UnionExec yields multiple partitions; SortPreservingMergeExec merges
+        // them back into a single partition while preserving value-ordering.
+        let unioned = UnionExec::try_new(inputs)?;
+        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), unioned));
         let unchunked = execute_plan(
             ordered,
             LanceExecutionOptions {
@@ -1551,7 +1576,16 @@ impl BTreeIndex {
                 ..Default::default()
             },
         )?;
-        Ok(chunk_concat_stream(unchunked, chunk_size as usize))
+        let merged_stream = chunk_concat_stream(unchunked, first.batch_size as usize);
+
+        train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
+            index_version: BTREE_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
+        })
     }
 }
 
@@ -1896,19 +1930,15 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Merge the existing index data with the new data and then retrain the index on the merged stream
-        let merged_data_source = self
-            .clone()
-            .combine_old_new(new_data, self.batch_size, old_data_filter)
-            .await?;
-        train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
-                .unwrap(),
-            index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
-        })
+        // Updating is the single-segment case of a segment merge: union this
+        // index's data with `new_data`, re-sort on value, and retrain.
+        Self::merge_segments(
+            &[Arc::new(self.clone())],
+            new_data,
+            dest_store,
+            old_data_filter,
+        )
+        .await
     }
 
     fn update_criteria(&self) -> UpdateCriteria {

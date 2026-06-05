@@ -35,6 +35,7 @@ pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
+pub mod fmindex;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
@@ -74,6 +75,7 @@ pub enum BuiltinIndexType {
     BloomFilter,
     RTree,
     Inverted,
+    FMIndex,
 }
 
 impl BuiltinIndexType {
@@ -87,6 +89,7 @@ impl BuiltinIndexType {
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
+            Self::FMIndex => "fmindex",
         }
     }
 }
@@ -104,6 +107,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
+            IndexType::FMIndex => Ok(Self::FMIndex),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
@@ -217,6 +221,23 @@ pub trait IndexReader: Send + Sync {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
+    /// Read multiple ranges and concatenate into a single batch.
+    /// Default impl runs `read_range`s in parallel via `try_join_all`.
+    async fn read_ranges(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        if ranges.is_empty() {
+            return self.read_range(0..0, projection).await;
+        }
+        let futures = ranges
+            .iter()
+            .map(|r| self.read_range(r.clone(), projection));
+        let batches = futures::future::try_join_all(futures).await?;
+        let schema = batches[0].schema();
+        Ok(arrow_select::concat::concat_batches(&schema, &batches)?)
+    }
     /// Read a range of rows as a stream of record batches.
     ///
     /// This allows the caller to process rows incrementally without loading the

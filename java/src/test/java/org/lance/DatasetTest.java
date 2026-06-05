@@ -1993,18 +1993,20 @@ public class DatasetTest {
           OptimizeOptions options = OptimizeOptions.builder().numIndicesToMerge(0).build();
           dsAppended.optimizeIndices(options);
 
-          List<Index> afterIndexes = dsAppended.getIndexes();
-          Index idIndexAfter =
-              afterIndexes.stream()
+          List<Index> idIndexes =
+              dsAppended.getIndexes().stream()
                   .filter(idx -> "id_idx".equals(idx.name()))
-                  .findFirst()
-                  .orElse(null);
-          assertNotNull(idIndexAfter);
-          List<Integer> afterFragments = idIndexAfter.fragments().orElse(Collections.emptyList());
+                  .collect(Collectors.toList());
+          assertEquals(
+              2,
+              idIndexes.size(),
+              "append-only optimize must add a delta segment instead of merging");
 
-          assertTrue(afterFragments.contains(0));
-          assertTrue(afterFragments.contains(1));
-          assertEquals(2, afterFragments.size());
+          Set<Integer> coveredFragments =
+              idIndexes.stream()
+                  .flatMap(idx -> idx.fragments().orElse(Collections.emptyList()).stream())
+                  .collect(Collectors.toSet());
+          assertEquals(new HashSet<>(Arrays.asList(0, 1)), coveredFragments);
         }
       }
     }

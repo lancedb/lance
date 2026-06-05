@@ -3054,7 +3054,8 @@ impl Dataset {
             IndexType::BTree => {
                 Err(Error::invalid_input(
                     "BTree distributed indexing no longer supports merge_index_metadata; \
-                     build segments, and commit with commit_existing_index_segments(...)"
+                     build segments, optionally merge groups with merge_existing_index_segments(...), \
+                     and commit with commit_existing_index_segments(...)"
                         .to_string(),
                 ))
             }

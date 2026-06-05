@@ -239,6 +239,85 @@ impl IndexReader for current_reader::FileReader {
         Ok(batches[0].clone())
     }
 
+    async fn read_ranges(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let empty_batch = || {
+            Ok(RecordBatch::new_empty(Arc::new(
+                self.schema().as_ref().into(),
+            )))
+        };
+        if ranges.is_empty() {
+            return empty_batch();
+        }
+        let projection = if let Some(projection) = projection {
+            ReaderProjection::from_column_names(
+                self.metadata().version(),
+                self.schema(),
+                projection,
+            )?
+        } else {
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+        };
+        // `DecodeBatchScheduler::schedule_ranges` requires sorted,
+        // non-overlapping ranges; sort internally and permute the
+        // result back to caller order so callers don't have to know.
+        let mut order: Vec<usize> = (0..ranges.len()).collect();
+        order.sort_by_key(|&i| ranges[i].start);
+        let already_sorted = order.iter().enumerate().all(|(i, &j)| i == j);
+        let sorted_ranges: Arc<[std::ops::Range<u64>]> = order
+            .iter()
+            .map(|&i| ranges[i].start as u64..ranges[i].end as u64)
+            .collect();
+        let total_rows: u64 = sorted_ranges.iter().map(|r| r.end - r.start).sum();
+        let batches = self
+            .read_stream_projected(
+                ReadBatchParams::Ranges(sorted_ranges),
+                (total_rows as u32).max(1),
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let merged = match batches.len() {
+            0 => return empty_batch(),
+            1 => batches.into_iter().next().unwrap(),
+            _ => {
+                let schema = batches[0].schema();
+                arrow_select::concat::concat_batches(&schema, &batches)?
+            }
+        };
+        if already_sorted {
+            return Ok(merged);
+        }
+        let sorted_sizes: Vec<u32> = order
+            .iter()
+            .map(|&i| (ranges[i].end - ranges[i].start) as u32)
+            .collect();
+        let mut sorted_offsets = Vec::with_capacity(sorted_sizes.len());
+        let mut acc = 0u32;
+        for &s in &sorted_sizes {
+            sorted_offsets.push(acc);
+            acc += s;
+        }
+        let mut sorted_pos = vec![0usize; ranges.len()];
+        for (sp, &oi) in order.iter().enumerate() {
+            sorted_pos[oi] = sp;
+        }
+        let mut take_indices = Vec::with_capacity(total_rows as usize);
+        for &sp in &sorted_pos {
+            for k in 0..sorted_sizes[sp] {
+                take_indices.push(sorted_offsets[sp] + k);
+            }
+        }
+        let take_arr = arrow_array::UInt32Array::from(take_indices);
+        Ok(arrow_select::take::take_record_batch(&merged, &take_arr)?)
+    }
+
     async fn read_range_stream(
         &self,
         range: std::ops::Range<usize>,

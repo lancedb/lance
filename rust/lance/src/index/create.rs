@@ -222,6 +222,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::BTree
                 | IndexType::Inverted
                 | IndexType::NGram
+                | IndexType::FMIndex
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
@@ -507,7 +508,7 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = if uses_segment_commit_path(self.index_type, &new_idx.name, self.params) {
+        let transaction = if uses_segment_commit_path(self.index_type, self.params) {
             let field_id = *new_idx.fields.first().ok_or_else(|| {
                 Error::internal(format!(
                     "Index '{}' is missing field ids after build",
@@ -561,6 +562,13 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
+fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
+    params
+        .as_any()
+        .downcast_ref::<ScalarIndexParams>()
+        .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
+}
+
 /// Validate that a user-supplied `index_uuid` is permitted for this build.
 fn ensure_index_uuid_allowed(
     index_type: IndexType,
@@ -587,26 +595,35 @@ fn ensure_index_uuid_allowed(
     Ok(())
 }
 
-fn uses_segment_commit_path(
-    index_type: IndexType,
-    index_name: &str,
-    params: &dyn IndexParams,
-) -> bool {
-    if index_name != LANCE_VECTOR_INDEX {
-        return false;
+fn uses_segment_commit_path(index_type: IndexType, params: &dyn IndexParams) -> bool {
+    let params_family = params.index_name();
+
+    if params_family == LANCE_VECTOR_INDEX
+        && matches!(
+            index_type,
+            IndexType::Vector
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfFlat
+                | IndexType::IvfRq
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq
+        )
+        && params.as_any().is::<VectorIndexParams>()
+    {
+        return true;
     }
 
-    matches!(
-        index_type,
-        IndexType::Vector
-            | IndexType::IvfPq
-            | IndexType::IvfSq
-            | IndexType::IvfFlat
-            | IndexType::IvfRq
-            | IndexType::IvfHnswFlat
-            | IndexType::IvfHnswPq
-            | IndexType::IvfHnswSq
-    ) && params.as_any().is::<VectorIndexParams>()
+    if params_family == LANCE_SCALAR_INDEX {
+        match index_type {
+            IndexType::BTree => return true,
+            IndexType::Scalar if is_btree_scalar_params(params) => return true,
+            _ => {}
+        }
+    }
+
+    false
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
@@ -1882,6 +1899,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_btree_merge_existing_index_segments() {
+        use datafusion::common::ScalarValue;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        use std::ops::Bound;
+
+        // Open `segment` and count rows whose `id` falls in `[lo, hi)`.
+        async fn count_in_range(
+            dataset: &Dataset,
+            segment: &IndexMetadata,
+            lo: i32,
+            hi: i32,
+        ) -> usize {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let query = SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(lo))),
+                Bound::Excluded(ScalarValue::Int32(Some(hi))),
+            );
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_addrs) => {
+                    row_addrs.true_rows().row_addrs().unwrap().count()
+                }
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // 128 rows across two 64-row fragments. Stable row ids so the
+        // retired-fragment filter below exercises the exact row-id allow-list.
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(64),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // One staged BTree segment per fragment, committed as a multi-segment
+        // logical index.
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut staged = Vec::new();
+        for fragment in dataset.get_fragments() {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                    .name("id_btree".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("id_btree", "id", staged)
+            .await
+            .unwrap();
+
+        // Phase 1 — healthy merge: the two per-fragment segments consolidate
+        // into a single canonical segment covering both fragments, and a range
+        // spanning both (ids 50..100) returns every matching row.
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.fragment_bitmap.as_ref().unwrap(),
+            &roaring::RoaringBitmap::from_iter([0u32, 1])
+        );
+        assert!(
+            merged
+                .index_details
+                .as_ref()
+                .unwrap()
+                .type_url
+                .ends_with("BTreeIndexDetails")
+        );
+        assert_eq!(count_in_range(&dataset, &merged, 50, 100).await, 50);
+
+        // Phase 2 — retire fragment 0: delete >10% of its rows so compaction
+        // rewrites only frag 0 (frag 1 has no deletions and is at target size).
+        // The committed per-fragment segment now claims a fragment the dataset
+        // no longer has.
+        dataset.delete("id < 16").await.unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 64,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let live_frags: roaring::RoaringBitmap = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        assert!(!live_frags.contains(0), "compaction should retire frag 0");
+
+        // Filtered merge: coverage drops the retired fragment but keeps the
+        // live one, and the merged page data does not leak the retired row ids
+        // (ids < 16 lived only in frag 0, so the range now returns nothing).
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
+            .await
+            .unwrap();
+        let coverage = merged.fragment_bitmap.as_ref().unwrap();
+        assert!(!coverage.contains(0), "must drop retired frag 0");
+        assert!(coverage.contains(1), "must keep live frag 1");
+        assert_eq!(
+            count_in_range(&dataset, &merged, 0, 16).await,
+            0,
+            "must filter retired-fragment row ids"
+        );
+    }
+
+    #[tokio::test]
     async fn test_commit_existing_index_supports_local_hnsw_segments() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -2142,39 +2296,38 @@ mod tests {
         // Load indices after optimization
         let indices_after = dataset.load_indices().await.unwrap();
 
-        // There should be 3 indices:
-        // 1. one scalar index with name "id_idx", and the bitmap is [0,1]
-        // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
-        // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
-        assert_eq!(indices_after.len(), 3, "{:?}", indices_after);
-        let id_idx = indices_after
+        // After unifying scalar optimize, `OptimizeOptions::append()` honors
+        // `Some(0)` for BTree the same way it does for vector: keep the old
+        // segment, add a delta for the unindexed fragment. So we now expect:
+        //   1. id_idx old segment, bitmap [0]
+        //   2. id_idx delta segment, bitmap [1]
+        //   3. vector_idx old segment, bitmap [0]
+        //   4. vector_idx delta segment, bitmap [1]
+        // Previously BTree silently merged into 1 segment because legacy
+        // scalar ignored `num_indices_to_merge`.
+        assert_eq!(indices_after.len(), 4, "{:?}", indices_after);
+        let id_indices = indices_after
             .iter()
-            .find(|idx| idx.name == "id_idx")
-            .unwrap();
+            .filter(|idx| idx.name == "id_idx")
+            .collect::<Vec<_>>();
         let vector_indices = indices_after
             .iter()
             .filter(|idx| idx.name == "vector_idx")
             .collect::<Vec<_>>();
-        assert!(
-            id_idx
-                .fragment_bitmap
-                .as_ref()
-                .unwrap()
-                .contains_range(0..2)
-                && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
-        );
-        assert_eq!(vector_indices.len(), 2);
-        assert!(
-            vector_indices
-                .iter()
-                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
-                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
-        );
-        assert!(
-            vector_indices
-                .iter()
-                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
-                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
-        );
+        for indices in [&id_indices, &vector_indices] {
+            assert_eq!(indices.len(), 2);
+            assert!(
+                indices
+                    .iter()
+                    .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
+                        && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+            );
+            assert!(
+                indices
+                    .iter()
+                    .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
+                        && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+            );
+        }
     }
 }

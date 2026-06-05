@@ -875,10 +875,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
+        context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let timer = Instant::now();
 
+        let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
@@ -927,7 +928,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     Ok::<_, DataFusionError>(batch)
                 }
             })
-            .buffered(self.index_uuids.len())
+            .buffered(self.index_uuids.len().min(target_partitions).max(1))
             .finally(move || {
                 metrics_clone.baseline_metrics.done();
                 metrics_clone
@@ -1148,8 +1149,14 @@ impl PartitionSearchControl for LatePartitionSearchControl {
     }
 }
 
-fn effective_query_parallelism(query: &Query, index: &dyn VectorIndex) -> usize {
-    let cpu_pool_size = get_num_compute_intensive_cpus();
+fn effective_query_parallelism(
+    query: &Query,
+    index: &dyn VectorIndex,
+    target_partitions: usize,
+) -> usize {
+    let cpu_pool_size = get_num_compute_intensive_cpus()
+        .min(target_partitions)
+        .max(1);
     effective_query_parallelism_for(
         query,
         cpu_pool_size,
@@ -1211,6 +1218,7 @@ impl ANNIvfSubIndexExec {
             .boxed()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn late_search(
         index: Arc<dyn VectorIndex>,
         query: Query,
@@ -1219,6 +1227,7 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        target_partitions: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -1288,7 +1297,8 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
 
-            let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+            let query_parallelism =
+                effective_query_parallelism(&query, index.as_ref(), target_partitions);
             if query_parallelism <= 1 {
                 return stream::once(async move {
                     let prefilter: Arc<dyn PreFilter> = prefilter;
@@ -1359,6 +1369,7 @@ impl ANNIvfSubIndexExec {
         stream.flatten()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn initial_search(
         index: Arc<dyn VectorIndex>,
         query: Query,
@@ -1367,10 +1378,12 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        target_partitions: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
-        let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+        let query_parallelism =
+            effective_query_parallelism(&query, index.as_ref(), target_partitions);
         if query_parallelism <= 1 {
             metrics.partitions_searched.add(minimum_nprobes);
             return stream::once(async move {
@@ -1502,6 +1515,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
+        let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
@@ -1593,6 +1607,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter.clone(),
                             metrics.clone(),
                             state.clone(),
+                            target_partitions,
                         );
                         let late_search = Self::late_search(
                             raw_index.clone(),
@@ -1602,6 +1617,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter,
                             metrics,
                             state,
+                            target_partitions,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -1941,6 +1957,36 @@ mod tests {
 
         query.query_parallelism = 128;
         assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
+    }
+
+    #[test]
+    fn test_effective_query_parallelism_respects_target_partitions() {
+        // effective_query_parallelism caps cpu_pool_size at target_partitions before
+        // passing it to effective_query_parallelism_for, so the ceiling is
+        // min(cpu_pool_size, target_partitions).
+        let mut query = base_query();
+        let cpu_pool_size = 16;
+
+        // use-all-cpus mode: capped at target_partitions
+        query.query_parallelism = -1;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 1),
+            4
+        );
+
+        // auto mode: auto_parallelism also clamped to the reduced cpu_pool_size
+        query.query_parallelism = 0;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 8),
+            4
+        );
+
+        // explicit parallelism > target_partitions: clamped down
+        query.query_parallelism = 16;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 1),
+            4
+        );
     }
 
     #[derive(Debug, DeepSizeOf)]
@@ -2444,6 +2490,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state,
+            usize::MAX,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2492,6 +2539,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state.clone(),
+            usize::MAX,
         )
         .try_collect::<Vec<_>>()
         .await

@@ -47,6 +47,7 @@ use lance_index::{INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector:
 use lance_index::{
     IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
+    scalar::btree::BTREE_LOOKUP_NAME,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -257,6 +258,19 @@ fn segment_has_bitmap_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("BitmapIndexDetails"))
 }
 
+/// Detect BTree segments, preserving a legacy pre-details fallback.
+fn segment_has_btree_details(segment: &IndexMetadata) -> bool {
+    segment.index_details.as_ref().map_or_else(
+        || {
+            segment
+                .files
+                .as_ref()
+                .is_some_and(|files| files.iter().any(|file| file.path == BTREE_LOOKUP_NAME))
+        },
+        |details| details.type_url.ends_with("BTreeIndexDetails"),
+    )
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
@@ -423,6 +437,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "BloomFilter" => IndexType::BloomFilter.to_string(),
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
+        "FMIndex" => IndexType::FMIndex.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -1111,7 +1126,8 @@ impl DatasetIndexExt for Dataset {
         let all_vector = source_segments.iter().all(segment_has_vector_details);
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
         let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
-        if !all_vector && !all_inverted && !all_bitmap {
+        let all_btree = source_segments.iter().all(segment_has_btree_details);
+        if !all_vector && !all_inverted && !all_bitmap && !all_btree {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
@@ -1127,8 +1143,10 @@ impl DatasetIndexExt for Dataset {
             .await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
-        } else {
+        } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+        } else {
+            crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
         merged_segment.dataset_version = self.manifest.version;
         merged_segment.fields = vec![field_id];
@@ -7512,12 +7530,16 @@ mod tests {
             .unwrap();
         assert!(results.num_rows() > 0);
 
-        // Verify IOPs
+        // Verify IOPs. The deferred DocSet loads per-doc num_tokens/row_ids on
+        // first use rather than eagerly at index open, so a cold (un-prewarmed)
+        // query opens the docs file on demand — a couple more IOPs than the
+        // eager path, but constant and only on the first query (prewarm or a
+        // warm cache serve it with zero IO).
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(
             stats,
             read_iops,
-            15,
+            18,
             "Inverted index query should use minimal IOPs"
         );
     }
