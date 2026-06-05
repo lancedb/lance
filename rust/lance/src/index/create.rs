@@ -486,7 +486,9 @@ impl<'a> CreateIndexBuilder<'a> {
     async fn execute(mut self) -> Result<IndexMetadata> {
         // Multi-segment FM-Index path: when num_segments > 1, build one segment
         // per fragment group and commit them all atomically.
-        if let Some(num_segments) = self.fmindex_num_segments() && num_segments > 1 {
+        if let Some(num_segments) = self.fmindex_num_segments()
+            && num_segments > 1
+        {
             return self.execute_multi_segment_fmindex(num_segments).await;
         }
 
