@@ -7,6 +7,7 @@
 pub(crate) mod bitmap;
 pub(crate) mod btree;
 pub(crate) mod inverted;
+pub(crate) mod zonemap;
 
 pub use inverted::{load_segment_details, load_segments};
 

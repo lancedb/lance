@@ -669,6 +669,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_existing_index_segments_supports_zonemap_segments() {
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(16))
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let zonemap_params = lance_index::scalar::zonemap::ZoneMapIndexBuilderParams::new(8);
+        let params_json = serde_json::to_value(&zonemap_params).unwrap();
+        let params =
+            ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params_json);
+        let mut staged = Vec::new();
+
+        for fragment in &fragments {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
+                    .name("value_zonemap_merged".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            staged.push(segment);
+        }
+
+        let staged_uuids = staged
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+        assert!(!staged_uuids.contains(&merged.uuid));
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            fragments
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            merged
+                .files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|file| file.path == "zonemap.lance")
+        );
+
+        dataset
+            .commit_existing_index_segments("value_zonemap_merged", "value", vec![merged])
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .load_indices_by_name("value_zonemap_merged")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), 1);
+
+        let logical = open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_zonemap_merged",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(logical.index_type(), IndexType::ZoneMap);
+        assert_eq!(
+            logical.statistics().unwrap()["rows_per_zone"],
+            serde_json::json!(8)
+        );
+        assert_eq!(
+            logical.calculate_included_frags().await.unwrap(),
+            dataset.fragment_bitmap.as_ref().clone()
+        );
+
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(0))),
+            Bound::Included(ScalarValue::Int32(Some(10_000))),
+        );
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let searched_fragments = result
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            searched_fragments,
+            fragments
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_existing_index_segments_rejects_mismatched_zonemap_params() {
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(16))
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let mut staged = Vec::new();
+
+        for (fragment, rows_per_zone) in fragments.iter().zip([8, 16]) {
+            let zonemap_params =
+                lance_index::scalar::zonemap::ZoneMapIndexBuilderParams::new(rows_per_zone);
+            let params_json = serde_json::to_value(&zonemap_params).unwrap();
+            let params =
+                ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params_json);
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
+                    .name("value_zonemap_mismatched".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            staged.push(segment);
+        }
+
+        let err = dataset
+            .merge_existing_index_segments(staged)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("different rows_per_zone values"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_commit_existing_zonemap_segments_replaces_overlapping_segments() {
         let dataset = lance_datagen::gen_batch()
             .col("value", array::step::<Int32Type>())
