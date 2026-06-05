@@ -237,9 +237,7 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
 }
 
 fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<bool> {
-    let use_index = env
-        .call_method(jparam, "useIndex", "()Z", &[])?
-        .z()?;
+    let use_index = env.call_method(jparam, "useIndex", "()Z", &[])?.z()?;
     Ok(use_index)
 }
 
