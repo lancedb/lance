@@ -1332,8 +1332,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         let texts = collect_texts(new_data).await?;
         let files = write_partitioned_fmindex(&texts, dest).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails { num_segments: 0 })
-                .unwrap(),
+            index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
             files,
         })
@@ -1581,8 +1580,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         let texts = collect_texts(data).await?;
         let files = write_partitioned_fmindex(&texts, store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails { num_segments: 0 })
-                .unwrap(),
+            index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
             files,
         })
