@@ -5045,7 +5045,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "lance",
  "lance-arrow",
  "lance-core",
