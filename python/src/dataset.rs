@@ -2159,6 +2159,7 @@ impl Dataset {
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
+            "FMINDEX" => IndexType::FMIndex,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -2198,6 +2199,27 @@ impl Dataset {
                 index_type: "rtree".to_string(),
                 params: None,
             }),
+            "FMINDEX" => {
+                let mut params_json = serde_json::Map::new();
+                if let Some(kwargs) = kwargs {
+                    if let Some(num_segments) = kwargs.get_item("num_segments")? {
+                        let n: u32 = num_segments.extract()?;
+                        params_json.insert(
+                            "num_segments".to_string(),
+                            serde_json::Value::Number(n.into()),
+                        );
+                    }
+                }
+                let params = if params_json.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(params_json).to_string())
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "FMIndex".to_string(),
+                    params,
+                })
+            }
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
                     return Err(PyValueError::new_err(

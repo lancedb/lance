@@ -6,6 +6,7 @@
 
 pub(crate) mod bitmap;
 pub(crate) mod btree;
+pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod zonemap;
 

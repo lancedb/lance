@@ -248,4 +248,9 @@ message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
 
-message FMIndexIndexDetails {}
+message FMIndexIndexDetails {
+  // Number of segments to split the index across.
+  // Each segment covers a disjoint set of dataset fragments.
+  // Default 0 means single-segment (legacy monolithic build).
+  uint32 num_segments = 1;
+}
