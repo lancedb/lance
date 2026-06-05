@@ -73,6 +73,12 @@ pub struct Manifest {
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
 
+    /// The next fragment id to assign.
+    ///
+    /// When present, this lets writers allocate fragment ids in O(1) time
+    /// without scanning the fragment list.
+    pub next_fragment_id: Option<u64>,
+
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
 
@@ -188,6 +194,7 @@ impl Manifest {
             reader_feature_flags: 0,
             writer_feature_flags: 0,
             max_fragment_id: None,
+            next_fragment_id: None,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -219,6 +226,7 @@ impl Manifest {
             reader_feature_flags: 0, // These will be set on commit
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
+            next_fragment_id: previous.next_fragment_id,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -276,6 +284,7 @@ impl Manifest {
             reader_feature_flags: 0, // These will be set on commit
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: self.max_fragment_id,
+            next_fragment_id: self.next_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
@@ -373,35 +382,36 @@ impl Manifest {
         }
     }
 
-    /// Check the current fragment list and update the high water mark
+    /// Update the max_fragment_id high-water mark from a known value.
+    ///
+    /// Call this with the last assigned fragment ID rather than scanning all fragments.
+    /// The high-water mark only increases; passing a value smaller than the current max
+    /// is a no-op for the max counter, while `next_fragment_id` is still kept in sync.
+    pub fn set_max_fragment_id_from(&mut self, new_max: u64) {
+        let new_max_u32: u32 = new_max.try_into().expect("fragment id exceeds u32::MAX");
+        let max_fragment_id = self
+            .max_fragment_id
+            .map(|current_max| current_max.max(new_max_u32))
+            .unwrap_or(new_max_u32);
+        self.max_fragment_id = Some(max_fragment_id);
+        self.next_fragment_id = Some(
+            u64::from(max_fragment_id)
+                .checked_add(1)
+                .expect("fragment id counter overflowed"),
+        );
+    }
+
+    /// Check the current fragment list and update the high water mark.
+    ///
+    /// Prefer [`set_max_fragment_id_from`] when the last assigned ID is already known,
+    /// as it avoids an O(n) scan of the fragment list.
     pub fn update_max_fragment_id(&mut self) {
-        // If there are no fragments, don't update max_fragment_id
         if self.fragments.is_empty() {
             return;
         }
 
-        let max_fragment_id = self
-            .fragments
-            .iter()
-            .map(|f| f.id)
-            .max()
-            .unwrap() // Safe because we checked fragments is not empty
-            .try_into()
-            .unwrap();
-
-        match self.max_fragment_id {
-            None => {
-                // First time being set
-                self.max_fragment_id = Some(max_fragment_id);
-            }
-            Some(current_max) => {
-                // Only update if the computed max is greater than current
-                // This preserves the high water mark even when fragments are deleted
-                if max_fragment_id > current_max {
-                    self.max_fragment_id = Some(max_fragment_id);
-                }
-            }
-        }
+        let max_fragment_id: u64 = self.fragments.iter().map(|f| f.id).max().unwrap();
+        self.set_max_fragment_id_from(max_fragment_id);
     }
 
     /// Return the max fragment id.
@@ -412,9 +422,29 @@ impl Manifest {
         if let Some(max_id) = self.max_fragment_id {
             // Return the stored high water mark
             Some(max_id.into())
+        } else if let Some(next_fragment_id) = self.next_fragment_id {
+            next_fragment_id.checked_sub(1)
         } else {
             // Not yet set, compute from fragment list
             self.fragments.iter().map(|f| f.id).max()
+        }
+    }
+
+    /// Return the next fragment id to assign.
+    ///
+    /// Prefer this over scanning fragments when allocating new fragment ids.
+    pub fn next_fragment_id(&self) -> u64 {
+        if let Some(next_fragment_id) = self.next_fragment_id {
+            next_fragment_id
+        } else if let Some(max_fragment_id) = self.max_fragment_id {
+            u64::from(max_fragment_id) + 1
+        } else {
+            self.fragments
+                .iter()
+                .map(|f| f.id)
+                .max()
+                .map(|id| id + 1)
+                .unwrap_or(0)
         }
     }
 
@@ -914,6 +944,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            next_fragment_id: p.next_fragment_id,
             fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
@@ -976,6 +1007,7 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
+            next_fragment_id: m.next_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
@@ -1344,6 +1376,62 @@ mod tests {
         );
 
         assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn test_fragment_id_counters_round_trip() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let fragments = vec![
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+        ];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        manifest.set_max_fragment_id_from(1);
+        assert_eq!(manifest.max_fragment_id(), Some(1));
+        assert_eq!(manifest.next_fragment_id(), 2);
+
+        let proto: pb::Manifest = (&manifest).into();
+        assert_eq!(proto.next_fragment_id, Some(2));
+
+        let round_trip = Manifest::try_from(proto).unwrap();
+        assert_eq!(round_trip.max_fragment_id(), Some(1));
+        assert_eq!(round_trip.next_fragment_id(), 2);
+    }
+
+    #[test]
+    fn set_max_fragment_id_from_keeps_next_fragment_id_in_sync() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        manifest.max_fragment_id = Some(1);
+        manifest.next_fragment_id = None;
+
+        manifest.set_max_fragment_id_from(1);
+
+        assert_eq!(manifest.max_fragment_id(), Some(1));
+        assert_eq!(manifest.next_fragment_id(), 2);
+        assert_eq!(manifest.next_fragment_id, Some(2));
     }
 
     #[test]

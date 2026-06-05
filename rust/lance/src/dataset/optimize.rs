@@ -1383,7 +1383,14 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
             let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-            let frags = 0..dataset_at_index.manifest.max_fragment_id.unwrap_or(0);
+            let next_fragment_id: u32 = dataset_at_index
+                .manifest
+                .next_fragment_id()
+                .try_into()
+                .expect(
+                    "fragment count exceeds u32::MAX; RoaringBitmap cannot represent fragment ids",
+                );
+            let frags = 0..next_fragment_id;
             index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
         }
     }
@@ -1444,8 +1451,11 @@ async fn reserve_fragment_ids(
     )
     .await?;
 
-    // Need +1 since max_fragment_id is inclusive in this case and ranges are exclusive
-    let new_max_exclusive = manifest.max_fragment_id.unwrap_or(0) + 1;
+    // next_fragment_id is exclusive and the bitmap range end is exclusive too.
+    let new_max_exclusive: u32 = manifest
+        .next_fragment_id()
+        .try_into()
+        .expect("fragment count exceeds u32::MAX; RoaringBitmap cannot represent fragment ids");
     let reserved_ids = (new_max_exclusive - fragments.len() as u32)..(new_max_exclusive);
 
     for (fragment, new_id) in fragments.zip(reserved_ids) {

@@ -3357,7 +3357,17 @@ pub(crate) async fn write_manifest_file(
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
-    manifest.update_max_fragment_id();
+    // Only scan fragments when neither fragment id counter was written yet
+    // (backward compat with old manifests).
+    if manifest.max_fragment_id.is_none() {
+        match manifest.next_fragment_id {
+            Some(next_fragment_id) if next_fragment_id > 0 => {
+                manifest.set_max_fragment_id_from(next_fragment_id - 1)
+            }
+            Some(_) => {}
+            None => manifest.update_max_fragment_id(),
+        }
+    }
 
     commit_handler
         .commit(

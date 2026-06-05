@@ -1712,6 +1712,23 @@ impl Transaction {
         })
     }
 
+    fn track_max_fragment_id(max_fragment_id: &mut Option<u64>, fragment_id: u64) {
+        *max_fragment_id = Some(
+            max_fragment_id
+                .map(|current| current.max(fragment_id))
+                .unwrap_or(fragment_id),
+        );
+    }
+
+    fn track_max_fragment_ids<'a>(
+        max_fragment_id: &mut Option<u64>,
+        fragments: impl IntoIterator<Item = &'a Fragment>,
+    ) {
+        for fragment in fragments {
+            Self::track_max_fragment_id(max_fragment_id, fragment.id);
+        }
+    }
+
     fn data_storage_format_from_files(
         fragments: &[Fragment],
         user_requested: Option<LanceFileVersion>,
@@ -1751,9 +1768,19 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
-        manifest.max_fragment_id = manifest
-            .max_fragment_id
-            .max(current_manifest.max_fragment_id);
+        // Ensure the high-water marks never go backwards when restoring an old
+        // version.  Both max_fragment_id and next_fragment_id must stay in sync;
+        // bumping one without the other would cause subsequent appends to reuse
+        // already-allocated fragment IDs.
+        let current_next = current_manifest.next_fragment_id();
+        let restored_next = manifest.next_fragment_id();
+        if current_next > restored_next {
+            // Current manifest has a higher water mark; advance the restored one.
+            // current_next - 1 is safe: next_fragment_id() returns 0 only when
+            // there are no fragments, but current_next > restored_next >= 0 means
+            // current_next >= 1.
+            manifest.set_max_fragment_id_from(current_next - 1);
+        }
         Ok((manifest, indices))
     }
 
@@ -1827,11 +1854,9 @@ impl Transaction {
         let mut fragment_id = if matches!(self.operation, Operation::Overwrite { .. }) {
             0
         } else {
-            current_manifest
-                .and_then(|m| m.max_fragment_id())
-                .map(|id| id + 1)
-                .unwrap_or(0)
+            current_manifest.map(|m| m.next_fragment_id()).unwrap_or(0)
         };
+        let mut max_transaction_fragment_id = None;
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
@@ -1872,6 +1897,7 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+                Self::track_max_fragment_ids(&mut max_transaction_fragment_id, &new_fragments);
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -1980,6 +2006,7 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+                Self::track_max_fragment_ids(&mut max_transaction_fragment_id, &new_fragments);
 
                 // Assign row IDs to any fragments that don't have them yet
                 // (e.g., inserted rows from merge_insert operations)
@@ -2042,6 +2069,7 @@ impl Transaction {
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
+                Self::track_max_fragment_ids(&mut max_transaction_fragment_id, &new_fragments);
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -2062,13 +2090,18 @@ impl Transaction {
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
-                Self::handle_rewrite_fragments(
+                if let Some(max_rewritten_fragment_id) = Self::handle_rewrite_fragments(
                     &mut final_fragments,
                     groups,
                     &mut fragment_id,
                     current_version,
                     next_row_id.as_ref(),
-                )?;
+                )? {
+                    Self::track_max_fragment_id(
+                        &mut max_transaction_fragment_id,
+                        max_rewritten_fragment_id,
+                    );
+                }
 
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
@@ -2142,6 +2175,7 @@ impl Transaction {
                         }
                     }
                 }
+                Self::track_max_fragment_ids(&mut max_transaction_fragment_id, &merged_fragments);
                 final_fragments.extend(merged_fragments);
 
                 // Some fields that have indices may have been removed, so we should
@@ -2372,7 +2406,12 @@ impl Transaction {
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
-        manifest.update_max_fragment_id();
+        // Update max_fragment_id from fragment IDs supplied or produced by this transaction.
+        // This covers both locally assigned IDs and pre-reserved IDs without
+        // scanning the full active fragment list.
+        if let Some(max_transaction_fragment_id) = max_transaction_fragment_id {
+            manifest.set_max_fragment_id_from(max_transaction_fragment_id);
+        }
 
         match &self.operation {
             Operation::Overwrite {
@@ -2543,8 +2582,10 @@ impl Transaction {
             }
         }
 
-        if let Operation::ReserveFragments { num_fragments } = self.operation {
-            manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
+        if let Operation::ReserveFragments { num_fragments } = self.operation
+            && num_fragments > 0
+        {
+            manifest.set_max_fragment_id_from(fragment_id + u64::from(num_fragments) - 1);
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
@@ -2822,7 +2863,8 @@ impl Transaction {
         fragment_id: &mut u64,
         version: u64,
         _next_row_id: Option<&u64>,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
+        let mut max_rewritten_fragment_id = None;
         for group in groups {
             // If the old fragments are contiguous, find the range
             let replace_range = {
@@ -2857,6 +2899,7 @@ impl Transaction {
 
             let new_fragments = Self::fragments_with_ids(group.new_fragments.clone(), fragment_id)
                 .collect::<Vec<_>>();
+            Self::track_max_fragment_ids(&mut max_rewritten_fragment_id, &new_fragments);
 
             // Version metadata for rewritten fragments is handled by the compaction code
             // (recalc_versions_for_rewritten_fragments) which preserves version information
@@ -2873,7 +2916,7 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
             }
         }
-        Ok(())
+        Ok(max_rewritten_fragment_id)
     }
 
     /// collect the pure(the num of row IDs are equal to the physical rows) "rewrite rows" updated fragment ids
@@ -3876,6 +3919,37 @@ mod tests {
     }
 
     #[test]
+    fn reserve_fragments_backfills_legacy_fragment_counters() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![Fragment::new(0), Fragment::new(1), Fragment::new(2)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.max_fragment_id = None;
+        manifest.next_fragment_id = None;
+
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::ReserveFragments { num_fragments: 2 },
+            None,
+        );
+
+        let (reserved, _) = tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(reserved.max_fragment_id(), Some(4));
+        assert_eq!(reserved.next_fragment_id(), 5);
+    }
+
+    #[test]
     fn test_rewrite_fragments() {
         let existing_fragments: Vec<Fragment> = (0..10).map(Fragment::new).collect();
 
@@ -3900,7 +3974,7 @@ mod tests {
         let mut fragment_id = 20;
         let version = 0;
 
-        Transaction::handle_rewrite_fragments(
+        let max_rewritten_fragment_id = Transaction::handle_rewrite_fragments(
             &mut final_fragments,
             &rewrite_groups,
             &mut fragment_id,
@@ -3910,6 +3984,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(fragment_id, 21);
+        assert_eq!(max_rewritten_fragment_id, Some(20));
 
         let expected_fragments: Vec<Fragment> = vec![
             Fragment::new(0),
@@ -3924,6 +3999,78 @@ mod tests {
         ];
 
         assert_eq!(final_fragments, expected_fragments);
+    }
+
+    #[test]
+    fn rewrite_build_manifest_advances_counter_for_preassigned_fragment_ids() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&schema).unwrap();
+        let mut manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![Fragment::new(0), Fragment::new(1), Fragment::new(2)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.set_max_fragment_id_from(2);
+
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                    new_fragments: vec![Fragment::new(15), Fragment::new(16)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+
+        let (rewritten, _) = tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(rewritten.max_fragment_id(), Some(16));
+        assert_eq!(rewritten.next_fragment_id(), 17);
+    }
+
+    #[test]
+    fn merge_build_manifest_advances_counter_for_preassigned_fragment_ids() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&schema).unwrap();
+        let mut manifest = Manifest::new(
+            lance_schema.clone(),
+            Arc::new(vec![Fragment::new(0), Fragment::new(1)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.set_max_fragment_id_from(1);
+
+        let tx = Transaction::new(
+            manifest.version,
+            Operation::Merge {
+                fragments: vec![Fragment::new(0), Fragment::new(1), Fragment::new(9)],
+                schema: lance_schema,
+            },
+            None,
+        );
+
+        let (merged, _) = tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(merged.max_fragment_id(), Some(9));
+        assert_eq!(merged.next_fragment_id(), 10);
     }
 
     #[test]

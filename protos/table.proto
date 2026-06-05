@@ -133,6 +133,11 @@ message Manifest {
   // For a single fragment, will be zero. For no fragments, will be absent.
   optional uint32 max_fragment_id = 11;
 
+  // The next fragment ID to assign.
+  //
+  // Writers use this counter directly instead of scanning the fragment list.
+  optional uint64 next_fragment_id = 22;
+
   // Path to the transaction file, relative to `{root}/_transactions`. The file at that
   // location contains a wire-format serialized Transaction message representing the
   // transaction that created this version.

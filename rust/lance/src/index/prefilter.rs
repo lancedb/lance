@@ -65,7 +65,10 @@ impl DatasetPreFilter {
         let mut fragments = RoaringBitmap::new();
         let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
         if !all_have_bitmaps {
-            fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
+            let next_fragment_id: u32 = dataset.manifest.next_fragment_id().try_into().expect(
+                "fragment count exceeds u32::MAX; RoaringBitmap cannot represent fragment ids",
+            );
+            fragments.insert_range(0..next_fragment_id);
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
