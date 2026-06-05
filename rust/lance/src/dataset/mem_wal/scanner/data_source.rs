@@ -3,6 +3,7 @@
 
 //! Data source types for LSM scanner.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -93,6 +94,9 @@ pub struct ShardSnapshot {
     pub current_generation: u64,
     /// List of flushed generations and their paths.
     pub flushed_generations: Vec<FlushedGeneration>,
+    /// Computed shard field values, keyed by field id (e.g. bucket id).
+    /// Used by shard pruning to skip shards that cannot contain matching rows.
+    pub shard_field_values: HashMap<String, Vec<u8>>,
 }
 
 impl ShardSnapshot {
@@ -103,6 +107,7 @@ impl ShardSnapshot {
             spec_id: 0,
             current_generation: 1,
             flushed_generations: Vec::new(),
+            shard_field_values: HashMap::new(),
         }
     }
 
@@ -122,6 +127,16 @@ impl ShardSnapshot {
     pub fn with_flushed_generation(mut self, generation: u64, path: String) -> Self {
         self.flushed_generations
             .push(FlushedGeneration { generation, path });
+        self
+    }
+
+    /// Set the shard field values for this snapshot.
+    ///
+    /// These are the computed sharding-field values for the shard, keyed by
+    /// field id (e.g. the bucket number). Used by the read-path shard pruning
+    /// to skip shards whose field values do not match the query filter.
+    pub fn with_shard_field_values(mut self, values: HashMap<String, Vec<u8>>) -> Self {
+        self.shard_field_values = values;
         self
     }
 }

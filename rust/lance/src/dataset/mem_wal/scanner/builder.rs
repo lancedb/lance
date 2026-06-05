@@ -17,6 +17,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
 use lance_core::{Error, Result, is_system_column};
+use lance_index::mem_wal::ShardingSpec;
 use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
@@ -125,6 +126,10 @@ pub struct LsmScanner {
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Optional sharding spec for read-path shard pruning.
+    sharding_spec: Option<ShardingSpec>,
+    /// Mapping from source field id to column name, for sharding evaluation.
+    source_id_to_column: HashMap<i32, String>,
 }
 
 impl LsmScanner {
@@ -160,6 +165,8 @@ impl LsmScanner {
             pk_columns,
             session,
             flushed_cache: None,
+            sharding_spec: None,
+            source_id_to_column: HashMap::new(),
         }
     }
 
@@ -198,6 +205,8 @@ impl LsmScanner {
             pk_columns,
             session: None,
             flushed_cache: None,
+            sharding_spec: None,
+            source_id_to_column: HashMap::new(),
         }
     }
 
@@ -250,6 +259,19 @@ impl LsmScanner {
     /// set by default, so behavior is unchanged unless opted in.
     pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Set the sharding spec and source-column mapping for read-path shard
+    /// pruning. When set, the scan planner can skip shards whose field values
+    /// do not match the query filter.
+    pub fn with_sharding_spec(
+        mut self,
+        spec: ShardingSpec,
+        source_id_to_column: HashMap<i32, String>,
+    ) -> Self {
+        self.sharding_spec = Some(spec);
+        self.source_id_to_column = source_id_to_column;
         self
     }
 
@@ -488,6 +510,12 @@ impl LsmScanner {
 
         for (shard_id, mems) in &self.in_memory_memtables {
             collector = collector.with_in_memory_memtables(*shard_id, mems.clone());
+        }
+
+        if let Some(spec) = &self.sharding_spec {
+            collector =
+                collector.with_sharding_spec(spec.clone(), self.source_id_to_column.clone())
+                    .with_base_schema(self.schema.clone());
         }
 
         collector
