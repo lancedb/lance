@@ -199,8 +199,7 @@ fn source_column_name(
     })
 }
 
-/// Public wrapper for [`source_column_name`] so that the shard-pruning module
-/// can resolve a sharding field's source column without duplicating the logic.
+/// Resolve a sharding field's source column name from the field-id-to-column mapping.
 pub fn source_column_for_field(
     field: &ShardingField,
     source_id_to_column: &HashMap<i32, String>,
@@ -208,8 +207,8 @@ pub fn source_column_for_field(
     source_column_name(field, source_id_to_column)
 }
 
-/// Compute the bucket id for a single [`ScalarValue`] using the same Murmur3
-/// hash that [`evaluate_bucket_sharding`] applies per-row. Returns `None` if
+/// Compute the bucket id for a single scalar value using the same Murmur3
+/// hash that the bucket sharding transform applies per-row. Returns `None` if
 /// the scalar type is unsupported or `num_buckets` is non-positive.
 pub fn hash_scalar_to_bucket(
     scalar: &datafusion::common::ScalarValue,
