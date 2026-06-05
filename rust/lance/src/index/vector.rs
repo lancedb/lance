@@ -18,7 +18,7 @@ mod fixture_test;
 
 use self::{ivf::*, pq::PQIndex};
 use arrow_schema::{DataType, Schema};
-use builder::IvfIndexBuilder;
+use builder::{IvfIndexBuilder, VectorIndexBuildSummary};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
@@ -54,7 +54,7 @@ use lance_index::vector::{
 use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType};
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata};
 use serde::Serialize;
 use tracing::instrument;
 use utils::get_vector_type;
@@ -594,7 +594,7 @@ pub(crate) async fn build_distributed_vector_index(
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<Uuid> {
+) -> Result<(Uuid, Vec<IndexFile>)> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -660,7 +660,7 @@ pub(crate) async fn build_distributed_vector_index(
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 let ivf_model = make_ivf_model();
 
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     filtered_dataset,
                     column.to_owned(),
                     index_dir.clone(),
@@ -674,13 +674,14 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
-                .build()
+                .build_with_summary()
                 .await?;
+                return Ok((segment_uuid, summary.files));
             }
             DataType::UInt8 => {
                 let ivf_model = make_ivf_model();
 
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     filtered_dataset,
                     column.to_owned(),
                     index_dir.clone(),
@@ -694,8 +695,9 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
-                .build()
+                .build_with_summary()
                 .await?;
+                return Ok((segment_uuid, summary.files));
             }
             _ => {
                 return Err(Error::index(format!(
@@ -724,7 +726,7 @@ pub(crate) async fn build_distributed_vector_index(
                     let ivf_model = make_ivf_model();
                     let global_pq = make_global_pq(pq_params)?;
 
-                    IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
+                    let summary = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -742,8 +744,9 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_transpose(false)
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
             }
         }
@@ -755,7 +758,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -768,8 +771,9 @@ pub(crate) async fn build_distributed_vector_index(
             )?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfHnswFlat => {
@@ -782,7 +786,7 @@ pub(crate) async fn build_distributed_vector_index(
 
             match element_type {
                 DataType::UInt8 => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -795,11 +799,12 @@ pub(crate) async fn build_distributed_vector_index(
                     )?
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
                 _ => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -812,8 +817,9 @@ pub(crate) async fn build_distributed_vector_index(
                     )?
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
             }
         }
@@ -835,7 +841,7 @@ pub(crate) async fn build_distributed_vector_index(
             let ivf_model = make_ivf_model();
             let global_pq = make_global_pq(pq_params)?;
 
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -853,8 +859,9 @@ pub(crate) async fn build_distributed_vector_index(
             .with_transpose(false)
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfHnswSq => {
@@ -870,7 +877,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -883,8 +890,9 @@ pub(crate) async fn build_distributed_vector_index(
             )?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfRq => {
@@ -897,7 +905,7 @@ pub(crate) async fn build_distributed_vector_index(
 
             let ivf_model = make_ivf_model();
 
-            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -914,8 +922,9 @@ pub(crate) async fn build_distributed_vector_index(
             .with_transpose(false)
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         _ => {
@@ -924,9 +933,7 @@ pub(crate) async fn build_distributed_vector_index(
                 index_type
             )));
         }
-    };
-
-    Ok(segment_uuid)
+    }
 }
 
 /// Build a Vector Index
@@ -939,7 +946,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Option<Vec<IndexFile>>> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -954,7 +961,7 @@ pub(crate) async fn build_vector_index(
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
                     dataset.indices_dir().clone().join(uuid),
@@ -966,11 +973,12 @@ pub(crate) async fn build_vector_index(
                     frag_reuse_index,
                 )?
                 .with_progress(progress.clone())
-                .build()
+                .build_with_summary()
                 .await?;
+                return Ok(Some(summary.files));
             }
             DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
                     dataset.indices_dir().clone().join(uuid),
@@ -982,8 +990,9 @@ pub(crate) async fn build_vector_index(
                     frag_reuse_index,
                 )?
                 .with_progress(progress.clone())
-                .build()
+                .build_with_summary()
                 .await?;
+                return Ok(Some(summary.files));
             }
             _ => {
                 return Err(Error::index(format!(
@@ -1014,6 +1023,7 @@ pub(crate) async fn build_vector_index(
                         progress.clone(),
                     )
                     .await?;
+                    return Ok(None);
                 }
                 IndexFileVersion::V3 => {
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
@@ -1028,11 +1038,12 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?;
 
-                    builder
+                    let summary = builder
                         .with_transpose(!params.skip_transpose)
                         .with_progress(progress.clone())
-                        .build()
+                        .build_with_summary()
                         .await?;
+                    return Ok(Some(summary.files));
                 }
             }
         }
@@ -1044,7 +1055,7 @@ pub(crate) async fn build_vector_index(
                 )));
             };
 
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().clone().join(uuid),
@@ -1056,8 +1067,9 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok(Some(summary.files));
         }
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
@@ -1079,11 +1091,12 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?;
 
-            builder
+            let summary = builder
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
-                .build()
+                .build_with_summary()
                 .await?;
+            return Ok(Some(summary.files));
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1094,7 +1107,7 @@ pub(crate) async fn build_vector_index(
             };
             match element_type {
                 DataType::UInt8 => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().clone().join(uuid),
@@ -1106,11 +1119,12 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok(Some(summary.files));
                 }
                 _ => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().clone().join(uuid),
@@ -1122,8 +1136,9 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok(Some(summary.files));
                 }
             }
         }
@@ -1140,7 +1155,7 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().clone().join(uuid),
@@ -1152,8 +1167,9 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok(Some(summary.files));
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1168,7 +1184,7 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().clone().join(uuid),
@@ -1180,8 +1196,9 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok(Some(summary.files));
         }
         _ => {
             return Err(Error::index(format!(
@@ -1189,8 +1206,7 @@ pub(crate) async fn build_vector_index(
                 index_type
             )));
         }
-    };
-    Ok(())
+    }
 }
 
 /// Build a Vector Index incrementally using an existing index's IVF model and quantizer
@@ -1204,7 +1220,7 @@ pub(crate) async fn build_vector_index_incremental(
     existing_index: Arc<dyn VectorIndex>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<VectorIndexBuildSummary> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -1264,7 +1280,7 @@ pub(crate) async fn build_vector_index_incremental(
     match (sub_index_type, quantization_type) {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
-            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1277,11 +1293,12 @@ pub(crate) async fn build_vector_index_incremental(
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok(summary);
         }
         (SubIndexType::Flat, QuantizationType::FlatBin) => {
-            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1294,8 +1311,9 @@ pub(crate) async fn build_vector_index_incremental(
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok(summary);
         }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
@@ -1309,17 +1327,18 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?;
-            builder
+            let summary = builder
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
-                .build()
+                .build_with_summary()
                 .await?;
+            return Ok(summary);
         }
         // IVF_SQ
         (SubIndexType::Flat, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1332,8 +1351,9 @@ pub(crate) async fn build_vector_index_incremental(
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
-            .build()
+            .build_with_summary()
             .await?;
+            return Ok(summary);
         }
         // IVF_RQ
         (SubIndexType::Flat, QuantizationType::Rabit) => {
@@ -1347,13 +1367,14 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?;
-            builder
+            let summary = builder
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
-                .build()
+                .build_with_summary()
                 .await?;
+            return Ok(summary);
         }
         // IVF_HNSW variants
         (SubIndexType::Hnsw, quantization_type) => {
@@ -1366,7 +1387,7 @@ pub(crate) async fn build_vector_index_incremental(
 
             match quantization_type {
                 QuantizationType::Flat => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1379,11 +1400,12 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::FlatBin => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1396,11 +1418,12 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Product => {
-                    IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1413,11 +1436,12 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Scalar => {
-                    IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1430,8 +1454,9 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
-                    .build()
+                    .build_with_summary()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Rabit => {
                     return Err(Error::index(
@@ -1441,8 +1466,6 @@ pub(crate) async fn build_vector_index_incremental(
             }
         }
     }
-
-    Ok(())
 }
 
 /// Build an empty vector index without training on data
@@ -1453,7 +1476,7 @@ pub(crate) async fn build_empty_vector_index(
     name: &str,
     _uuid: &str,
     _params: &VectorIndexParams,
-) -> Result<()> {
+) -> Result<Option<Vec<IndexFile>>> {
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed
     Err(Error::not_supported_source(
@@ -1474,7 +1497,7 @@ pub(crate) async fn remap_vector_index(
     new_uuid: &Uuid,
     old_metadata: &IndexMetadata,
     mapping: &HashMap<u64, Option<u64>>,
-) -> Result<()> {
+) -> Result<Option<Vec<IndexFile>>> {
     let old_index = dataset
         .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
         .await?;
@@ -1495,9 +1518,10 @@ pub(crate) async fn remap_vector_index(
             vec![],
         )
         .await?;
+        Ok(None)
     } else {
         // it's v3 index
-        remap_index_file_v3(
+        let files = remap_index_file_v3(
             dataset.as_ref(),
             &new_uuid.to_string(),
             old_index,
@@ -1505,9 +1529,8 @@ pub(crate) async fn remap_vector_index(
             column.to_string(),
         )
         .await?;
+        Ok(Some(files))
     }
-
-    Ok(())
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
@@ -1790,7 +1813,7 @@ pub async fn initialize_vector_index(
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?;
 
-    build_vector_index_incremental(
+    let summary = build_vector_index_incremental(
         target_dataset,
         column_name,
         &new_uuid.to_string(),
@@ -1800,10 +1823,6 @@ pub async fn initialize_vector_index(
         noop_progress(),
     )
     .await?;
-
-    // Capture file sizes for the new vector index
-    let index_dir = target_dataset.indices_dir().join(new_uuid.to_string());
-    let files = list_index_files_with_sizes(&target_dataset.object_store, &index_dir).await?;
 
     let field = target_dataset.schema().field(column_name).ok_or_else(|| {
         Error::index(format!(
@@ -1824,7 +1843,7 @@ pub async fn initialize_vector_index(
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(files),
+        files: Some(summary.files),
     };
 
     let transaction = Transaction::new(

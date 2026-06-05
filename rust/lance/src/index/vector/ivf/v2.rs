@@ -1723,6 +1723,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::PQBuildParams;
@@ -1735,7 +1736,6 @@ mod tests {
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
-    use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -4739,7 +4739,10 @@ mod tests {
             STORAGE_METADATA_KEY.to_owned(),
             serde_json::to_string(&vec![pq_metadata])?,
         );
-        writer.finish_with_metadata(metadata).await?;
+        for (key, value) in metadata {
+            writer.add_schema_metadata(key, value);
+        }
+        writer.finish().await?;
 
         // Build new IndexMetadata with the new UUID and file sizes.
         let new_files =

@@ -538,7 +538,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version())
             .with_posting_tail_codec(first.posting_tail_codec());
-        builder
+        let files = builder
             .update_from_segments(new_data, dest_store, segments, old_data_filter)
             .await?;
 
@@ -547,7 +547,7 @@ impl InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: first.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: Some(files),
         })
     }
 
@@ -1107,7 +1107,8 @@ impl ScalarIndex for InvertedIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        self.to_builder()
+        let files = self
+            .to_builder()
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
@@ -1116,7 +1117,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: self.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: Some(files),
         })
     }
 
@@ -1126,7 +1127,8 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        self.to_builder()
+        let files = self
+            .to_builder()
             .update(new_data, dest_store, old_data_filter)
             .await?;
 
@@ -1135,7 +1137,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: self.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: Some(files),
         })
     }
 
@@ -5949,10 +5951,18 @@ mod tests {
                 Ok(reader)
             }
         }
-        async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
             self.inner.copy_index_file(name, dest_store).await
         }
-        async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()> {
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> Result<crate::scalar::IndexFile> {
             self.inner.rename_index_file(name, new_name).await
         }
         async fn delete_index_file(&self, name: &str) -> Result<()> {

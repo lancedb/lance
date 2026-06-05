@@ -97,7 +97,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
-use lance_table::format::{IndexMetadata as TableIndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
@@ -376,14 +376,14 @@ pub(crate) fn select_segment_for_single_rebalance(
 
 // TODO: move to `lance-index` crate.
 ///
-/// Returns (new_uuid, num_indices_merged)
+/// Returns (new_uuid, num_indices_merged, files)
 pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize)> {
+) -> Result<(Uuid, usize, Option<Vec<IndexFile>>)> {
     let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -462,7 +462,7 @@ pub(crate) async fn optimize_vector_indices(
 
     // never change the index version,
     // because we won't update the legacy vector index format
-    Ok((new_uuid, merged))
+    Ok((new_uuid, merged, None))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -471,7 +471,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize)> {
+) -> Result<(Uuid, usize, Option<Vec<IndexFile>>)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -496,7 +496,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
-    let merged_num = match index_type {
+    let summary = match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
             if element_type == DataType::UInt8 {
@@ -515,7 +515,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build()
+                .build_with_summary()
                 .await?
             } else {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
@@ -533,7 +533,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build()
+                .build_with_summary()
                 .await?
             }
         }
@@ -554,7 +554,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build()
+            .build_with_summary()
             .await?
         }
         // IVF_PQ
@@ -574,7 +574,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build()
+            .build_with_summary()
             .await?
         }
         // IVF_SQ
@@ -594,7 +594,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build()
+            .build_with_summary()
             .await?
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
@@ -613,7 +613,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build()
+            .build_with_summary()
             .await?
         }
         // IVF_HNSW_FLAT
@@ -634,7 +634,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build()
+                .build_with_summary()
                 .await?
             } else {
                 IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
@@ -652,7 +652,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
-                .build()
+                .build_with_summary()
                 .await?
             }
         }
@@ -673,7 +673,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build()
+            .build_with_summary()
             .await?
         }
         // IVF_HNSW_PQ
@@ -693,7 +693,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
-            .build()
+            .build_with_summary()
             .await?
         }
         (sub_index_type, quantization_type) => {
@@ -705,7 +705,7 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
     };
 
-    Ok((new_uuid, merged_num))
+    Ok((new_uuid, summary.indices_merged, Some(summary.files)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1736,7 +1736,7 @@ pub(crate) async fn remap_index_file_v3(
     index: Arc<dyn VectorIndex>,
     mapping: &HashMap<u64, Option<u64>>,
     column: String,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().join(new_uuid);
     let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
@@ -2158,7 +2158,7 @@ pub(crate) async fn merge_segments_with_progress(
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
     let final_dir = indices_dir.clone().join(segment_uuid.to_string());
-    merge_segments_to_dir(
+    let files = merge_segments_to_dir(
         object_store,
         indices_dir,
         &final_dir,
@@ -2167,7 +2167,6 @@ pub(crate) async fn merge_segments_with_progress(
         progress,
     )
     .await?;
-    let files = list_index_files_with_sizes(object_store, &final_dir).await?;
 
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
@@ -2194,7 +2193,7 @@ async fn merge_segments_to_dir(
     segments: &[TableIndexMetadata],
     _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     reset_final_segment_dir(object_store, final_dir).await?;
 
     debug_assert!(
@@ -2221,14 +2220,15 @@ async fn merge_segments_to_dir(
         })
         .collect::<Vec<_>>();
 
-    lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
-        object_store,
-        &aux_paths,
-        final_dir,
-        progress.clone(),
-    )
-    .await?;
-    write_root_vector_index_from_auxiliary(
+    let auxiliary_file =
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
+            object_store,
+            &aux_paths,
+            final_dir,
+            progress.clone(),
+        )
+        .await?;
+    let index_file = write_root_vector_index_from_auxiliary(
         object_store,
         final_dir,
         None,
@@ -2237,7 +2237,7 @@ async fn merge_segments_to_dir(
     )
     .await?;
 
-    Ok(())
+    Ok(vec![auxiliary_file, index_file])
 }
 
 fn infer_source_index_version(group: &[TableIndexMetadata]) -> Result<i32> {
@@ -2267,7 +2267,7 @@ async fn write_root_vector_index_from_auxiliary(
     requested_index_type: Option<IndexType>,
     centroid_source_index_paths: &[Path],
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<IndexFile> {
     let aux_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
     let scheduler = ScanScheduler::new(
         Arc::new(object_store.clone()),
@@ -2408,11 +2408,14 @@ async fn write_root_vector_index_from_auxiliary(
 
     let empty_batch = RecordBatch::new_empty(arrow_schema);
     v2_writer.write_batch(&empty_batch).await?;
-    v2_writer.finish().await?;
+    let summary = v2_writer.finish().await?;
     progress.stage_progress("write_root_index", 1).await?;
     progress.stage_complete("write_root_index").await?;
 
-    Ok(())
+    Ok(IndexFile {
+        path: INDEX_FILE_NAME.to_string(),
+        size_bytes: summary.size_bytes,
+    })
 }
 
 async fn do_train_ivf_model<T: ArrowPrimitiveType>(

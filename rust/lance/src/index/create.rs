@@ -366,12 +366,12 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
                 let index_version = vec_params.index_type().version() as u32;
 
-                if train {
+                let files = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = &self.fragments {
                         // For distributed indexing, build only on specified fragments
                         // This creates temporary index metadata without committing
-                        let segment_uuid = Box::pin(build_distributed_vector_index(
+                        let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -383,9 +383,10 @@ impl<'a> CreateIndexBuilder<'a> {
                         ))
                         .await?;
                         output_index_uuid = segment_uuid;
+                        files
                     } else {
                         // Standard full dataset indexing
-                        Box::pin(build_vector_index(
+                        let files = Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -395,6 +396,16 @@ impl<'a> CreateIndexBuilder<'a> {
                             self.progress.clone(),
                         ))
                         .await?;
+                        if let Some(files) = files {
+                            files
+                        } else {
+                            let index_dir = self
+                                .dataset
+                                .indices_dir()
+                                .join(output_index_uuid.to_string());
+                            list_index_files_with_sizes(&self.dataset.object_store, &index_dir)
+                                .await?
+                        }
                     }
                 } else {
                     // Create empty vector index
@@ -406,14 +417,12 @@ impl<'a> CreateIndexBuilder<'a> {
                         vec_params,
                     )
                     .await?;
-                }
-                // Capture file sizes after vector index creation
-                let index_dir = self
-                    .dataset
-                    .indices_dir()
-                    .join(output_index_uuid.to_string());
-                let files =
-                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                    let index_dir = self
+                        .dataset
+                        .indices_dir()
+                        .join(output_index_uuid.to_string());
+                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?
+                };
                 CreatedIndex {
                     index_details: vector_index_details(vec_params),
                     index_version,

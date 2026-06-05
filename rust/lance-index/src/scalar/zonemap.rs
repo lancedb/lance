@@ -19,7 +19,7 @@ use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
-    BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
+    BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,
     compute_next_prefix,
 };
 use lance_arrow_stats::StatisticsAccumulator;
@@ -639,13 +639,13 @@ impl ScalarIndex for ZoneMapIndex {
         let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
         builder.options.rows_per_zone = self.rows_per_zone;
         builder.maps = updated_zones;
-        builder.write_index(dest_store).await?;
+        let file = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: Some(vec![file]),
         })
     }
 
@@ -772,7 +772,7 @@ impl ZoneMapIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
         let record_batch = self.zonemap_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -785,8 +785,7 @@ impl ZoneMapIndexBuilder {
             .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await?;
-        Ok(())
+        index_file.finish().await
     }
 }
 
@@ -891,7 +890,7 @@ impl ZoneMapIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<ZoneMapIndexBuilderParams>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         // train_zonemap_index: calling scan_aligned_chunks
         let value_type = batches_source.schema().field(0).data_type().clone();
 
@@ -899,8 +898,7 @@ impl ZoneMapIndexPlugin {
 
         builder.train(batches_source).await?;
 
-        builder.write_index(index_store).await?;
-        Ok(())
+        builder.write_index(index_store).await
     }
 }
 
@@ -984,12 +982,12 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        let file = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: Some(vec![file]),
         })
     }
 

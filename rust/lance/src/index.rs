@@ -164,7 +164,8 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
-        let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+        let (uuid, fragment_bitmap, index_details, index_version, files) =
+            segment.into_parts_with_files();
         if index_details.type_url.ends_with("InvertedIndexDetails") {
             let metadata = IndexMetadata {
                 uuid,
@@ -181,8 +182,13 @@ pub(crate) async fn build_index_metadata_from_segments(
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
         }
-        let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        let files = match files {
+            Some(files) => files,
+            None => {
+                let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
+                list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
+            }
+        };
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
@@ -567,7 +573,7 @@ pub(crate) async fn remap_index(
                     matched.index_version, matched.name
                 ))
             })?;
-            remap_vector_index(
+            let files = remap_vector_index(
                 Arc::new(dataset.clone()),
                 &field_path,
                 index_id,
@@ -576,10 +582,13 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
-
-            // Capture file sizes for the vector index
-            let index_dir = dataset.indices_dir().join(new_id.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+            let files = match files {
+                Some(files) => files,
+                None => {
+                    let index_dir = dataset.indices_dir().join(new_id.to_string());
+                    list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
+                }
+            };
 
             CreatedIndex {
                 index_details: prost_types::Any::from_msg(
@@ -2577,7 +2586,7 @@ mod tests {
         kmeans::{KMeansParams, train_kmeans},
         sq::builder::SQBuildParams,
     };
-    use lance_io::{assert_io_eq, assert_io_lt};
+    use lance_io::{assert_io_eq, assert_io_lt, utils::tracking_store::IoStats};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
@@ -2616,6 +2625,20 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+        }
+    }
+
+    fn list_io_stats(stats: &IoStats) -> IoStats {
+        let requests = stats
+            .requests
+            .iter()
+            .filter(|request| request.method == "list")
+            .cloned()
+            .collect::<Vec<_>>();
+        IoStats {
+            read_iops: requests.len() as u64,
+            requests,
+            ..Default::default()
         }
     }
 
@@ -7183,6 +7206,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_create_does_not_list_files() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Int32, false),
+        ]));
+        let ids = Int32Array::from_iter_values(0..128);
+        let categories = Int32Array::from_iter_values((0..128).map(|value| value % 8));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(categories)])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+
+        io_tracker.incremental_stats();
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Bitmap,
+                Some("category_bitmap".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        let list_stats = list_io_stats(&stats);
+        assert_io_eq!(
+            list_stats,
+            read_iops,
+            0,
+            "new scalar index files should be reported by writer return values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_create_does_not_list_files() {
+        let test_dir = TempStrDir::default();
+        let dimension = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+        let ids = Int32Array::from_iter_values(0..256);
+        let vectors = (0..256)
+            .map(|row| {
+                Some(
+                    (0..dimension)
+                        .map(|dim| Some((row * dimension + dim) as f32))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let vector_array =
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, dimension);
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vector_array)])
+                .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+
+        io_tracker.incremental_stats();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_flat".to_string()),
+                &VectorIndexParams::ivf_flat(4, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        let list_stats = list_io_stats(&stats);
+        assert_io_eq!(
+            list_stats,
+            read_iops,
+            0,
+            "new V3 vector index files should be reported by builder return values"
+        );
     }
 
     #[tokio::test]

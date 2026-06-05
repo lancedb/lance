@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_index::{IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexFile, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -27,6 +27,8 @@ pub struct IndexSegment {
     index_details: Arc<prost_types::Any>,
     /// The on-disk index version for this segment.
     index_version: i32,
+    /// The files written for this segment, when already known by the builder.
+    files: Option<Vec<IndexFile>>,
 }
 
 impl IndexSegment {
@@ -46,6 +48,7 @@ impl IndexSegment {
             fragment_bitmap: fragment_bitmap.into_iter().collect(),
             index_details,
             index_version,
+            files: None,
         }
     }
 
@@ -76,6 +79,29 @@ impl IndexSegment {
             self.fragment_bitmap,
             self.index_details,
             self.index_version,
+        )
+    }
+
+    pub(crate) fn with_files(mut self, files: Option<Vec<IndexFile>>) -> Self {
+        self.files = files;
+        self
+    }
+
+    pub(crate) fn into_parts_with_files(
+        self,
+    ) -> (
+        Uuid,
+        RoaringBitmap,
+        Arc<prost_types::Any>,
+        i32,
+        Option<Vec<IndexFile>>,
+    ) {
+        (
+            self.uuid,
+            self.fragment_bitmap,
+            self.index_details,
+            self.index_version,
+            self.files,
         )
     }
 }
@@ -112,7 +138,8 @@ impl IntoIndexSegment for IndexMetadata {
             fragment_bitmap.iter(),
             index_details,
             self.index_version,
-        ))
+        )
+        .with_files(self.files))
     }
 }
 

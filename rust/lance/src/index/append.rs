@@ -436,7 +436,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 vec![(selected_metadata, selected_index)],
             )?;
             let selected_ivf_view = selected_logical_index.as_ivf()?;
-            let (new_uuid, indices_merged) = Box::pin(optimize_vector_indices(
+            let (new_uuid, indices_merged, files) = Box::pin(optimize_vector_indices(
                 dataset.as_ref().clone(),
                 Option::<
                     lance_io::stream::RecordBatchStreamAdapter<
@@ -452,8 +452,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(None);
             }
 
-            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+            let files = match files {
+                Some(files) => files,
+                None => {
+                    let index_dir = dataset.indices_dir().join(new_uuid.to_string());
+                    list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
+                }
+            };
             let new_fragment_bitmap = removed_segment
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
                 .or_else(|| removed_segment.fragment_bitmap.clone())
@@ -488,7 +493,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 Some(scanner.try_into_stream().await?)
             };
 
-            let (new_uuid, indices_merged) = optimize_vector_indices(
+            let (new_uuid, indices_merged, files) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
                 &field_path,
@@ -519,8 +524,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 .map(|d| d.as_ref().clone())
                 .unwrap_or_else(vector_index_details_default);
 
-            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+            let files = match files {
+                Some(files) => files,
+                None => {
+                    let index_dir = dataset.indices_dir().join(new_uuid.to_string());
+                    list_index_files_with_sizes(&dataset.object_store, &index_dir).await?
+                }
+            };
 
             Ok((
                 new_uuid,
