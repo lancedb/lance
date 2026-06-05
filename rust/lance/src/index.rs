@@ -283,7 +283,7 @@ fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
         .as_ref()
-        .is_some_and(|details| details.type_url.ends_with("FmIndexIndexDetails"))
+        .is_some_and(|details| details.type_url.ends_with("FMIndexIndexDetails"))
 }
 
 // Cache keys for different index types

@@ -1086,4 +1086,213 @@ mod tests {
             dataset.fragment_bitmap.as_ref().clone()
         );
     }
+
+    #[tokio::test]
+    async fn test_fmindex_segments_commit_and_query_as_logical_index() {
+        let test_dir = TempStrDir::default();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let write_params = crate::dataset::write::WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        };
+        let batches = vec![
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(vec![
+                    "the quick brown fox",
+                    "jumps over the lazy dog",
+                    "hello world from rust",
+                    "pack my box with five dozen liquor jugs",
+                    "how vexingly quick daft zebras jump",
+                    "the five boxing wizards jump quickly",
+                    "sphinx of black quartz judge my vow",
+                    "two driven jocks help fax my big quiz",
+                    "waltz bad nymph for quick jigs vex",
+                    "glib jocks quiz nymph to vex dwarf",
+                    "quick brown fox jumps again here",
+                    "lazy dog sleeps under the tree",
+                ]))],
+            )
+            .unwrap(),
+        ];
+        let reader =
+            arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::FMIndex, &params)
+                    .name("text_fmindex".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+
+            assert_eq!(
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![fragment.id() as u32]
+            );
+            segments.push(segment);
+        }
+
+        dataset
+            .commit_existing_index_segments("text_fmindex", "text", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("text_fmindex").await.unwrap();
+        assert_eq!(committed.len(), fragments.len());
+
+        let logical =
+            open_named_scalar_index(&dataset, "text", "text_fmindex", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        assert_eq!(logical.index_type(), IndexType::FMIndex);
+
+        let query = lance_index::scalar::TextQuery::StringContains("quick".to_string());
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!(
+                "expected exact result from segmented fmindex, got {:?}",
+                other
+            ),
+        };
+        let match_count = row_addrs.true_rows().row_addrs().unwrap().count();
+        assert!(
+            match_count >= 3,
+            "expected at least 3 matches for 'quick', got {match_count}"
+        );
+
+        // Verify fragment coverage via manifest metadata (not calculate_included_frags,
+        // which derives from row addresses and may not encode fragment IDs for all layouts)
+        assert_eq!(
+            scalar_index_fragment_bitmap(&dataset, "text", "text_fmindex")
+                .await
+                .unwrap()
+                .unwrap(),
+            dataset.fragment_bitmap.as_ref().clone()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fmindex_segments_merge_and_query() {
+        let test_dir = TempStrDir::default();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let write_params = crate::dataset::write::WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        };
+        let batches = vec![
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(vec![
+                    "alpha beta gamma delta",
+                    "beta gamma delta epsilon",
+                    "gamma delta epsilon zeta",
+                    "delta epsilon zeta eta",
+                    "epsilon zeta eta theta",
+                    "zeta eta theta iota",
+                    "eta theta iota kappa",
+                    "theta iota kappa lambda",
+                ]))],
+            )
+            .unwrap(),
+        ];
+        let reader =
+            arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        let mut staged = Vec::new();
+        for fragment in &fragments {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::FMIndex, &params)
+                    .name("text_fmindex_merge".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            staged.push(segment);
+        }
+        assert_eq!(staged.len(), 2);
+
+        let staged_uuids = staged.iter().map(|s| s.uuid).collect::<Vec<_>>();
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+
+        assert!(!staged_uuids.contains(&merged.uuid));
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            fragments.iter().map(|f| f.id() as u32).collect::<Vec<_>>()
+        );
+
+        dataset
+            .commit_existing_index_segments("text_fmindex_merge", "text", vec![merged])
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .load_indices_by_name("text_fmindex_merge")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), 1);
+
+        let logical = open_named_scalar_index(
+            &dataset,
+            "text",
+            "text_fmindex_merge",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(logical.index_type(), IndexType::FMIndex);
+
+        let query = lance_index::scalar::TextQuery::StringContains("delta".to_string());
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!("expected exact result from merged fmindex, got {:?}", other),
+        };
+        assert_eq!(row_addrs.true_rows().row_addrs().unwrap().count(), 4);
+
+        let query = lance_index::scalar::TextQuery::StringContains("nonexistent".to_string());
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!("expected exact result from merged fmindex, got {:?}", other),
+        };
+        assert_eq!(row_addrs.true_rows().row_addrs().unwrap().count(), 0);
+    }
 }
