@@ -545,7 +545,11 @@ impl PyLsmScanner {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
         let cols: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        slf.inner = Some(scanner.project(&cols));
+        slf.inner = Some(
+            scanner
+                .project(&cols)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 
@@ -574,7 +578,11 @@ impl PyLsmScanner {
             .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
-        slf.inner = Some(scanner.limit(n, offset));
+        slf.inner = Some(
+            scanner
+                .limit(Some(n as i64), offset.map(|o| o as i64))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 

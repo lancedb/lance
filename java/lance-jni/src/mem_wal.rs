@@ -398,7 +398,7 @@ fn inner_scanner_project(env: &mut JNIEnv, this: JObject, columns: JObject) -> R
     let columns = env.get_strings(&columns)?;
     with_lsm_scanner(env, &this, |scanner| {
         let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
-        Ok(scanner.project(&cols))
+        Ok(scanner.project(&cols)?)
     })
 }
 
@@ -432,10 +432,12 @@ fn inner_scanner_limit(
     limit: jlong,
     offset: JObject,
 ) -> Result<()> {
-    let offset = env.get_u64_opt(&offset)?.map(|v| v as usize);
-    with_lsm_scanner(env, &this, |scanner| {
-        Ok(scanner.limit(limit as usize, offset))
-    })
+    let offset = env.get_u64_opt(&offset)?.map(|v| v as i64);
+    with_lsm_scanner(
+        env,
+        &this,
+        |scanner| Ok(scanner.limit(Some(limit), offset)?),
+    )
 }
 
 #[unsafe(no_mangle)]

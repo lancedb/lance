@@ -24,9 +24,9 @@
 //! use lance::dataset::mem_wal::scanner::LsmScanner;
 //!
 //! let scanner = LsmScanner::new(base_table, shard_snapshots, vec!["pk".to_string()])
-//!     .project(&["id", "name"])
+//!     .project(&["id", "name"])?
 //!     .filter("id > 10")?
-//!     .limit(100, None);
+//!     .limit(Some(100), None)?;
 //!
 //! let stream = scanner.try_into_stream().await?;
 //! ```
