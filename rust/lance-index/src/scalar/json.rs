@@ -239,12 +239,14 @@ impl JsonQueryParser {
                     index_type,
                     query,
                     needs_recheck,
+                    fragment_bitmap,
                 }) => ScalarIndexExpr::Query(ScalarIndexSearch {
                     column,
                     index_name,
                     index_type,
                     query: Arc::new(JsonQuery::new(query, self.path.clone())),
                     needs_recheck,
+                    fragment_bitmap,
                 }),
                 // This code path should only be hit on leaf expr
                 _ => unreachable!(),

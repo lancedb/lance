@@ -13,6 +13,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
@@ -448,6 +449,18 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
             interval.as_millis().to_string(),
         );
     }
+    // Per-index HNSW build params are recorded under `hnsw.<index>.<field>` keys.
+    for (index_name, params) in &config.hnsw_params {
+        defaults.insert(format!("hnsw.{index_name}.num_edges"), params.m.to_string());
+        defaults.insert(
+            format!("hnsw.{index_name}.ef_construction"),
+            params.ef_construction.to_string(),
+        );
+        defaults.insert(
+            format!("hnsw.{index_name}.max_level"),
+            params.max_level.to_string(),
+        );
+    }
     defaults
 }
 
@@ -660,8 +673,10 @@ impl DatasetMemWalExt for Dataset {
                     )?);
                 }
                 "vector" => {
+                    let hnsw_params = config.hnsw_params.get(index_name).cloned();
                     let vector_config =
-                        load_vector_index_config(self, index_name, &index_meta).await?;
+                        load_vector_index_config(self, index_name, &index_meta, hnsw_params)
+                            .await?;
                     index_configs.push(vector_config);
                 }
                 _ => {
@@ -704,6 +719,7 @@ async fn load_vector_index_config(
     dataset: &Dataset,
     index_name: &str,
     index_meta: &lance_table::format::IndexMetadata,
+    hnsw_params: Option<HnswBuildParams>,
 ) -> Result<MemIndexConfig> {
     use lance_index::metrics::NoOpMetricsCollector;
 
@@ -732,12 +748,16 @@ async fn load_vector_index_config(
         })?
         .metric_type();
 
-    Ok(MemIndexConfig::hnsw(
-        index_name.to_string(),
-        *field_id,
-        column,
-        distance_type,
-    ))
+    Ok(match hnsw_params {
+        Some(params) => MemIndexConfig::hnsw_with_params(
+            index_name.to_string(),
+            *field_id,
+            column,
+            distance_type,
+            params,
+        ),
+        None => MemIndexConfig::hnsw(index_name.to_string(), *field_id, column, distance_type),
+    })
 }
 
 #[cfg(test)]

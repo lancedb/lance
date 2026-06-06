@@ -30,9 +30,14 @@ use futures::TryStreamExt;
 use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::mem_wal::write::{MemTableScanner, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
-use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use lance_core::ROW_ID;
 use lance_index::IndexType;
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::prefilter::NoFilter;
+use lance_index::vector::Query;
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -298,7 +303,15 @@ async fn build_base_dataset(uri: &str, schema: Arc<ArrowSchema>) -> lance_core::
     }
     let base_batch = make_batch(0, &base_vec, schema.clone());
     let reader = RecordBatchIterator::new(std::iter::once(Ok(base_batch)), schema.clone());
-    let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     let ivf = IvfBuildParams::new(16);
     let pq = PQBuildParams::new(16, 8);
     let params = VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf, pq);
@@ -340,13 +353,36 @@ async fn run_checkpoint(
 ) -> lance_core::Result<CheckpointResult> {
     println!("\n=== checkpoint rows={} ===", cp);
     let temp = tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
-    let uri = format!("file://{}/lsm", temp.path().display());
+    // When BENCH_URI_BASE is set, write to a persistent path and flush the
+    // MemTable to an on-disk generation (instead of querying the active
+    // MemTable), printing the flushed generation's dataset path for a
+    // downstream direct-read benchmark.
+    let flush_base = std::env::var("BENCH_URI_BASE").ok();
+    let local_dir = flush_base.as_ref().map(|b| format!("{}/cp_{}", b, cp));
+    let uri = match &local_dir {
+        Some(d) => format!("file://{}", d),
+        None => format!("file://{}/lsm", temp.path().display()),
+    };
     build_base_dataset(&uri, schema.clone()).await?;
     let dataset = Arc::new(Dataset::open(&uri).await?);
 
     let shard_id = Uuid::new_v4();
     let row_size_estimate = DIM * 4 + 8;
     let total_batches_max = cp.div_ceil(1000);
+    // Optionally override the maintained HNSW index's graph degree (num_edges)
+    // and ef_construction on the writer config so we can sweep build params and
+    // run matched comparisons vs FAISS. 0 keeps the library default.
+    let mut hnsw_params = std::collections::HashMap::new();
+    let num_edges = env_usize("BENCH_HNSW_NUM_EDGES", 0);
+    if num_edges > 0 {
+        let efc = env_usize("BENCH_HNSW_EFC", 200);
+        hnsw_params.insert(
+            VECTOR_INDEX_NAME.to_string(),
+            HnswBuildParams::default()
+                .num_edges(num_edges)
+                .ef_construction(efc),
+        );
+    }
     let writer_config = ShardWriterConfig {
         shard_id,
         shard_spec_id: 0,
@@ -357,6 +393,7 @@ async fn run_checkpoint(
         max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
         max_wal_flush_interval: Some(Duration::from_millis(200)),
         max_unflushed_memtable_bytes: usize::MAX / 2,
+        hnsw_params,
         ..ShardWriterConfig::default()
     };
     let writer = dataset
@@ -401,6 +438,206 @@ async fn run_checkpoint(
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
+
+    // Flush mode: seal the active MemTable to a persistent on-disk generation
+    // (single-partition IVF_HNSW_SQ at the base dataset's storage version) and
+    // print its dataset path. Validates we can flush cp=100k/500k/1M.
+    if let Some(dir) = &local_dir {
+        let seal_start = Instant::now();
+        writer.force_seal_active().await?;
+        let mut waited = 0u64;
+        let gen_path = loop {
+            if let Some(m) = writer.manifest().await?
+                && let Some(fg) = m.flushed_generations.last()
+            {
+                break format!("{}/_mem_wal/{}/{}", dir, shard_id.as_hyphenated(), fg.path);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            waited += 1;
+            if waited.is_multiple_of(50) {
+                println!("  ... waiting for flush cp={cp} ({}s)", waited / 10);
+                std::io::stdout().flush().ok();
+            }
+            if waited > 6000 {
+                return Err(lance_core::Error::io(format!(
+                    "flush timed out for cp={cp}"
+                )));
+            }
+        };
+        println!(
+            "FLUSHED_OK cp={} id_offset={} flush_s={:.2} path={}",
+            cp,
+            id_offset,
+            seal_start.elapsed().as_secs_f64(),
+            gen_path
+        );
+        std::io::stdout().flush().ok();
+        writer.close().await?;
+
+        // Item 4: open the flushed generation directly from its dataset path and
+        // benchmark its on-disk IVF_HNSW_SQ read in Rust (single-thread per-query
+        // latency + recall vs brute force), sweeping ef. nprobes=1 (single part).
+        let gen_uri = format!("file://{}", gen_path);
+        let gen_ds = Dataset::open(&gen_uri).await?;
+        // Precompute brute-force ground truth once per query (corpus indices).
+        let gt_sets: Vec<std::collections::HashSet<i64>> = (0..num_queries)
+            .map(|q| {
+                let q_vec = &queries[q * DIM..(q + 1) * DIM];
+                brute_force_top_k(corpus, cp, q_vec, k)
+                    .iter()
+                    .map(|(_, id)| *id)
+                    .collect()
+            })
+            .collect();
+        let efs = [16usize, 64, 256];
+        let mut best: Option<(usize, f64, u128, u128)> = None;
+        for &ef in &efs {
+            let mut recall_sum = 0.0f64;
+            let mut lat: Vec<u128> = Vec::with_capacity(num_queries);
+            for q in 0..num_queries {
+                let q_vec = &queries[q * DIM..(q + 1) * DIM];
+                let bf_set = &gt_sets[q];
+                let q_arr = Float32Array::from(q_vec.to_vec());
+                let mut scanner = gen_ds.scan();
+                scanner.nearest(VECTOR_COL, &q_arr, k)?;
+                scanner.nprobes(1);
+                scanner.ef(ef);
+                let h_t = Instant::now();
+                let batches: Vec<RecordBatch> =
+                    scanner.try_into_stream().await?.try_collect().await?;
+                lat.push(h_t.elapsed().as_micros());
+                let mut hits = 0usize;
+                for b in &batches {
+                    if let Some(c) = b.column_by_name("id") {
+                        let col = c.as_primitive::<arrow_array::types::Int64Type>();
+                        for i in 0..col.len() {
+                            if bf_set.contains(&(col.value(i) - id_offset)) {
+                                hits += 1;
+                            }
+                        }
+                    }
+                }
+                recall_sum += hits as f64 / k as f64;
+            }
+            lat.sort();
+            let median_q = lat[lat.len() / 2];
+            let p99_q = lat[lat.len() * 99 / 100];
+            let mean_recall = recall_sum / num_queries as f64;
+            println!(
+                "FLUSHED_READ cp={} ef={} mean_recall={:.4} median_us={} p99_us={}",
+                cp, ef, mean_recall, median_q, p99_q
+            );
+            std::io::stdout().flush().ok();
+            if mean_recall >= 0.95 && best.is_none() {
+                best = Some((ef, mean_recall, median_q, p99_q));
+            }
+        }
+
+        // Raw-index path: call VectorIndex::search() directly (partition-find +
+        // HNSW+SQ search, returns _rowid/_distance) bypassing the DataFusion
+        // scanner/take/projection. The RAW_READ vs FLUSHED_READ latency delta at
+        // matched ef isolates the DataFusion per-query overhead from the actual
+        // index search cost.
+        let idx_metas = gen_ds.load_indices_by_name(VECTOR_INDEX_NAME).await?;
+        let uuid = idx_metas
+            .first()
+            .ok_or_else(|| lance_core::Error::io("flushed gen has no vector index".to_string()))?
+            .uuid
+            .to_string();
+        let vidx = gen_ds
+            .open_vector_index(VECTOR_COL, &uuid, &NoOpMetricsCollector)
+            .await?;
+        // _rowid -> corpus index, to score recall on the raw path (built once,
+        // outside the timed region).
+        let mut rowid_to_corpus: std::collections::HashMap<u64, i64> =
+            std::collections::HashMap::new();
+        {
+            let mut scan = gen_ds.scan();
+            scan.with_row_id();
+            scan.project(&["id"])?;
+            let mut stream = scan.try_into_stream().await?;
+            while let Some(b) = stream.try_next().await? {
+                let rid = b
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| lance_core::Error::io("row id missing".to_string()))?
+                    .as_primitive::<arrow_array::types::UInt64Type>();
+                let idc = b
+                    .column_by_name("id")
+                    .ok_or_else(|| lance_core::Error::io("id missing".to_string()))?
+                    .as_primitive::<arrow_array::types::Int64Type>();
+                for i in 0..b.num_rows() {
+                    rowid_to_corpus.insert(rid.value(i), idc.value(i) - id_offset);
+                }
+            }
+        }
+        for &ef in &efs {
+            let mut recall_sum = 0.0f64;
+            let mut lat: Vec<u128> = Vec::with_capacity(num_queries);
+            for q in 0..num_queries {
+                let q_vec = &queries[q * DIM..(q + 1) * DIM];
+                let bf_set = &gt_sets[q];
+                let query = Query {
+                    column: VECTOR_COL.to_string(),
+                    key: Arc::new(Float32Array::from(q_vec.to_vec())),
+                    k,
+                    lower_bound: None,
+                    upper_bound: None,
+                    minimum_nprobes: 1,
+                    maximum_nprobes: Some(1),
+                    ef: Some(ef),
+                    refine_factor: None,
+                    metric_type: Some(DistanceType::Cosine),
+                    use_index: true,
+                    query_parallelism: 1,
+                    dist_q_c: 0.0,
+                };
+                // IVFIndex::search is intentionally unimplemented (top-level does
+                // partition-aware search); replicate the ANN exec node: pick the
+                // closest partition then search it. Single-partition flushed gen.
+                let t = Instant::now();
+                let (parts, _) = vidx.find_partitions(&query)?;
+                let pid = parts.value(0) as usize;
+                let batch = vidx
+                    .search_in_partition(pid, &query, Arc::new(NoFilter), &NoOpMetricsCollector)
+                    .await?;
+                lat.push(t.elapsed().as_micros());
+                let mut hits = 0usize;
+                if let Some(c) = batch.column_by_name(ROW_ID) {
+                    let col = c.as_primitive::<arrow_array::types::UInt64Type>();
+                    for i in 0..col.len() {
+                        if let Some(corpus_idx) = rowid_to_corpus.get(&col.value(i))
+                            && bf_set.contains(corpus_idx)
+                        {
+                            hits += 1;
+                        }
+                    }
+                }
+                recall_sum += hits as f64 / k as f64;
+            }
+            lat.sort();
+            println!(
+                "RAW_READ cp={} ef={} mean_recall={:.4} median_us={} p99_us={}",
+                cp,
+                ef,
+                recall_sum / num_queries as f64,
+                lat[lat.len() / 2],
+                lat[lat.len() * 99 / 100]
+            );
+            std::io::stdout().flush().ok();
+        }
+
+        let (_, mr, med, p99) = best.unwrap_or((0, 0.0, 0, 0));
+        return Ok(CheckpointResult {
+            rows: cp,
+            write_wall,
+            mean_recall: mr,
+            min_recall: 0.0,
+            median_query_us: med,
+            p99_query_us: p99,
+            bf_total: Duration::ZERO,
+            hnsw_total: Duration::ZERO,
+        });
+    }
 
     let active = writer.active_memtable_ref().await?;
     let mut recall_sum: f64 = 0.0;

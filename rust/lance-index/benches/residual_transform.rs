@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use arrow_array::{FixedSizeListArray, RecordBatch, UInt32Array, types::Float32Type};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::residual::ResidualTransform;
 use lance_index::vector::transform::Transformer;

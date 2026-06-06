@@ -166,7 +166,7 @@ fn bench_encode_structural_pages(c: &mut Criterion) {
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+        .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_encode_compressed, bench_encode_structural_pages);
 
 #[cfg(not(target_os = "linux"))]

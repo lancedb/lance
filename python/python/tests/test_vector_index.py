@@ -23,7 +23,10 @@ from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
-from lance.util import validate_vector_index  # noqa: E402
+from lance.util import (  # noqa: E402
+    _target_partition_size_to_num_partitions,
+    validate_vector_index,
+)
 from lance.vector import vec_to_table  # noqa: E402
 
 
@@ -856,6 +859,12 @@ def test_create_ivf_pq_with_target_partition_size(dataset, tmp_path):
     assert ann_ds.stats.index_stats("vector_idx")["indices"][0]["num_partitions"] == 2
 
 
+def test_target_partition_size_to_num_partitions_clamps():
+    assert _target_partition_size_to_num_partitions(1000, 1000) == 1
+    assert _target_partition_size_to_num_partitions(1000, 500) == 2
+    assert _target_partition_size_to_num_partitions(8192 * 5000, 8192) == 4096
+
+
 def test_index_size_stats(tmp_path: Path):
     num_rows = 512
     dims = 32
@@ -1058,15 +1067,31 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
-def test_create_ivf_rq_rejects_unsupported_num_bits():
+@pytest.mark.skip(
+    reason=(
+        "IVF_RQ num_bits>1 creation is gated until split-code search support "
+        "is implemented"
+    )
+)
+def test_create_ivf_rq_multi_bit_gates_search():
     ds = lance.write_dataset(create_table(), "memory://")
 
-    with pytest.raises(NotImplementedError, match="only num_bits=1 is supported"):
-        ds.create_index(
-            "vector",
-            index_type="IVF_RQ",
-            num_partitions=4,
-            num_bits=2,
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=9,
+    )
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["num_bits"] == 9
+
+    with pytest.raises(pa.ArrowInvalid, match="num_bits>1 search is not supported"):
+        ds.to_table(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128).astype(np.float32),
+                "k": 10,
+            }
         )
 
 
@@ -1797,7 +1822,7 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
     assert results == results_no_scalar_index
 
 
-def test_load_indices(dataset):
+def test_describe_indices(dataset):
     indices = dataset.describe_indices()
     assert len(indices) == 0
 
@@ -2141,7 +2166,7 @@ def test_nested_field_vector_index(tmp_path):
     # Verify index was created
     indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["embedding"]
+    assert indices[0].field_names == ["data.embedding"]
 
     # Test querying with the index
     query_vec = vectors[0]
@@ -2996,6 +3021,51 @@ def test_commit_existing_index_segments_accepts_index_metadata(tmp_path):
     ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged])
 
     q = np.random.rand(32).astype(np.float32)
+    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert 0 < len(results) <= 5
+
+
+def test_distributed_ivf_rq_shared_rotation(tmp_path):
+    """Two IVF_RQ segments built on separate fragments with one shared RaBitQ rotation
+    merge into a single committed, queryable index. The shared ``rabitq_model`` (from
+    ``lance.lance.indices.build_rq_model``) is what makes the independently built
+    segments mergeable."""
+    from lance.lance import indices
+
+    dim = 32
+    ds = _make_sample_dataset_base(
+        tmp_path, "dist_rq_merge", n_rows=512, dim=dim, max_rows_per_file=256
+    )
+    frags = ds.get_fragments()
+    assert len(frags) == 2
+
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
+        distance_type="l2",
+        sample_rate=8,
+    )
+    rabitq_model = indices.build_rq_model(dimension=dim, num_bits=1)
+    base_kwargs = {
+        "column": "vector",
+        "index_type": "IVF_RQ",
+        "num_partitions": 2,
+        "num_bits": 1,
+        "ivf_centroids": ivf_model.centroids,
+        "rabitq_model": rabitq_model,
+    }
+    first = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[0].fragment_id],
+    )
+    second = ds.create_index_uncommitted(
+        **base_kwargs,
+        fragment_ids=[frags[1].fragment_id],
+    )
+
+    merged = ds.merge_existing_index_segments([first, second])
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged])
+
+    q = np.random.rand(dim).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
 

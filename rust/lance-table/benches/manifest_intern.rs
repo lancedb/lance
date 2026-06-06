@@ -253,7 +253,7 @@ fn bench_memory(c: &mut Criterion) {
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+    config = Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_deserialization, bench_memory
 );
 #[cfg(not(target_os = "linux"))]

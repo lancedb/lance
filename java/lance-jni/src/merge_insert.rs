@@ -51,6 +51,7 @@ fn inner_merge_insert<'local>(
     let conflict_retries = extract_conflict_retries(env, &jparam)?;
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
+    let use_index = extract_use_index(env, &jparam)?;
     let marked_generations = extract_marked_generations(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
@@ -69,6 +70,7 @@ fn inner_merge_insert<'local>(
             .conflict_retries(conflict_retries)
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
+            .use_index(use_index)
             .mark_generations_as_merged(marked_generations)
             .try_build()?;
 
@@ -232,6 +234,11 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
         .call_method(jparam, "skipAutoCleanup", "()Z", &[])?
         .z()?;
     Ok(skip_auto_cleanup)
+}
+
+fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<bool> {
+    let use_index = env.call_method(jparam, "useIndex", "()Z", &[])?.z()?;
+    Ok(use_index)
 }
 
 fn extract_marked_generations<'local>(

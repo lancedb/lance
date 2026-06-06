@@ -7,6 +7,7 @@ mod encoding;
 mod index;
 mod iter;
 pub mod json;
+mod lazy_docset;
 pub mod parser;
 pub mod query;
 mod scorer;

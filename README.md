@@ -67,7 +67,7 @@ pip install pylance
 To install a preview release:
 
 ```shell
-pip install --pre --extra-index-url https://pypi.fury.io/lance-format/pylance
+pip install --pre --extra-index-url https://pypi.fury.io/lance-format pylance
 ```
 
 > [!TIP]

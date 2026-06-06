@@ -22,7 +22,7 @@ use lance_index::{
     scalar::{FullTextSearchQuery, inverted::tokenizer::InvertedIndexParams},
 };
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use tempfile::TempDir;
 
 const WIKIPEDIA_DATASET_ENV_VAR: &str = "LANCE_WIKIPEDIA_DATASET_PATH";

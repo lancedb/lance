@@ -14,6 +14,7 @@ use lance_core::{Error, Result};
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
 
+use crate::vector::bq::storage::RabitQuantizationMetadata;
 use crate::vector::quantizer::QuantizerBuildParams;
 
 pub mod builder;
@@ -22,7 +23,7 @@ pub mod storage;
 pub mod transform;
 
 pub const RABIT_MIN_NUM_BITS: u8 = 1;
-pub const RABIT_MAX_NUM_BITS: u8 = 8;
+pub const RABIT_MAX_NUM_BITS: u8 = 9;
 pub const RABIT_BINARY_NUM_BITS: u8 = 1;
 
 #[derive(Clone, Default)]
@@ -104,10 +105,16 @@ impl FromStr for RQRotationType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct RQBuildParams {
     pub num_bits: u8,
     pub rotation_type: RQRotationType,
+    /// Optional pre-built rotation to reuse instead of generating a fresh random one.
+    ///
+    /// Distributed `IVF_RQ` builds mint one rotation and broadcast it so every segment
+    /// rotates vectors identically. This is transient build-time state and is never
+    /// persisted to the `RabitQuantization` params proto.
+    pub rotation: Option<RabitQuantizationMetadata>,
 }
 
 pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
@@ -124,7 +131,7 @@ pub fn validate_supported_rq_num_bits(num_bits: u8) -> Result<()> {
     validate_rq_num_bits(num_bits)?;
     if num_bits != RABIT_BINARY_NUM_BITS {
         return Err(Error::not_supported(format!(
-            "IVF_RQ num_bits={} is not supported yet; only num_bits=1 is supported",
+            "IVF_RQ num_bits={} index creation is not supported until split-code search support is implemented",
             num_bits
         )));
     }
@@ -155,6 +162,7 @@ impl RQBuildParams {
         Self {
             num_bits,
             rotation_type: RQRotationType::default(),
+            rotation: None,
         }
     }
 
@@ -162,6 +170,7 @@ impl RQBuildParams {
         Self {
             num_bits,
             rotation_type,
+            rotation: None,
         }
     }
 }
@@ -190,6 +199,7 @@ impl Default for RQBuildParams {
         Self {
             num_bits: 1,
             rotation_type: RQRotationType::default(),
+            rotation: None,
         }
     }
 }
@@ -234,7 +244,7 @@ mod tests {
     #[test]
     fn test_rabit_num_bits_validation() {
         validate_rq_num_bits(1).unwrap();
-        validate_rq_num_bits(8).unwrap();
+        validate_rq_num_bits(9).unwrap();
 
         let err = validate_rq_num_bits(0).unwrap_err();
         assert!(
@@ -243,16 +253,18 @@ mod tests {
             err
         );
 
-        let err = validate_rq_num_bits(9).unwrap_err();
+        let err = validate_rq_num_bits(10).unwrap_err();
         assert!(
             err.to_string().contains("IVF_RQ num_bits must be in"),
             "{}",
             err
         );
 
-        let err = validate_supported_rq_num_bits(2).unwrap_err();
+        validate_supported_rq_num_bits(1).unwrap();
+        let err = validate_supported_rq_num_bits(9).unwrap_err();
         assert!(
-            err.to_string().contains("only num_bits=1 is supported"),
+            err.to_string()
+                .contains("num_bits=9 index creation is not supported"),
             "{}",
             err
         );
@@ -261,13 +273,14 @@ mod tests {
     #[test]
     fn test_rabit_split_code_byte_sizing() {
         assert_eq!(rabit_ex_bits(1).unwrap(), 0);
-        assert_eq!(rabit_ex_bits(8).unwrap(), 7);
+        assert_eq!(rabit_ex_bits(9).unwrap(), 8);
 
         assert_eq!(rabit_binary_code_bytes(128), 16);
         assert_eq!(rabit_binary_code_bytes(129), 17);
 
         assert_eq!(rabit_ex_code_bytes(128, 0).unwrap(), 0);
         assert_eq!(rabit_ex_code_bytes(128, 3).unwrap(), 48);
+        assert_eq!(rabit_ex_code_bytes(128, 8).unwrap(), 128);
         assert_eq!(rabit_ex_code_bytes(129, 3).unwrap(), 49);
     }
 }

@@ -192,12 +192,15 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 Compresses vectors using RabitQ with random rotation and binary quantization for extreme compression:
 
-| Column            | Type                       | Nullable | Description                                                     |
-| ----------------- | -------------------------- | -------- | --------------------------------------------------------------- |
-| `_rowid`          | uint64                     | false    | Row identifier                                                  |
-| `_rabit_codes`    | list<uint8>[dimension / 8] | false    | Binary quantized codes (1 bit per dimension, packed into bytes) |
-| `__add_factors`   | float32                    | false    | Additive correction factors for distance computation            |
-| `__scale_factors` | float32                    | false    | Scale correction factors for distance computation               |
+| Column               | Type                                             | Nullable                 | Description                                                     |
+| -------------------- | ------------------------------------------------ | ------------------------ | --------------------------------------------------------------- |
+| `_rowid`             | uint64                                           | false                    | Row identifier                                                  |
+| `_rabit_codes`       | list<uint8>[dimension / 8]                       | false                    | Binary quantized codes (1 bit per dimension, packed into bytes) |
+| `__add_factors`      | float32                                          | false                    | Additive correction factors for distance computation            |
+| `__scale_factors`    | float32                                          | false                    | Scale correction factors for distance computation               |
+| `__ex_codes`         | list<uint8>[ceil(dimension * (num_bits - 1) / 8)] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ                         |
+| `__add_factors_ex`   | float32                                          | false for `num_bits > 1` | Additive correction factors for ex-code distance computation    |
+| `__scale_factors_ex` | float32                                          | false for `num_bits > 1` | Scale correction factors for ex-code distance computation       |
 
 #### Arrow Schema Metadata
 
@@ -248,7 +251,7 @@ For **RabitQ (RQ)**:
 | JSON Key              | Type | Description                                          |
 | --------------------- | ---- | ---------------------------------------------------- |
 | `rotate_mat_position` | u32  | Position of the rotation matrix in the global buffer |
-| `num_bits`            | u8   | Number of bits per dimension (currently always 1)    |
+| `num_bits`            | u8   | Number of bits per dimension, in the range 1..=9     |
 | `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code   |
 | `packed`              | bool | Whether codes are packed for optimized computation   |
 
@@ -274,9 +277,10 @@ to rotate vectors before binary quantization:
 ```
 
 The rotation matrix has shape `[code_dim, code_dim]` where `code_dim` is the rotated vector
-dimension. Current IVF_RQ stores the 1-bit binary code in `_rabit_codes`; future multi-bit support
-will store the remaining `num_bits - 1` ex-code bits separately instead of widening this binary
-code path.
+dimension. IVF_RQ always stores the 1-bit binary sign code in `_rabit_codes`; for `num_bits > 1`,
+the remaining `num_bits - 1` ex-code bits are stored in `__ex_codes` instead of widening the
+binary code path. `num_bits=1` indexes only store the binary-code factor columns; multi-bit indexes
+also store separate ex-code additive and scale factors.
 
 ## Appendices
 
@@ -319,7 +323,8 @@ pa.schema([
 ### Appendix 2: Example IVF_RQ Format
 
 This example shows how an `IVF_RQ` index is physically laid out. Assume vectors have dimension 128,
-RQ uses 1 bit per dimension (num_bits=1), and distance type is "l2".
+RQ uses 1 bit per dimension (`num_bits=1`), and distance type is "l2". For `num_bits > 1`, the
+auxiliary schema also includes `__ex_codes`, `__add_factors_ex`, and `__scale_factors_ex`.
 
 #### Index File
 

@@ -4168,9 +4168,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await
             .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
 
-        Ok(GetTableTagVersionResponse {
-            version: version as i64,
-        })
+        Ok(GetTableTagVersionResponse::new(version as i64))
     }
 
     async fn create_table_tag(

@@ -311,7 +311,7 @@ fn bench_apply_row_id(c: &mut Criterion) {
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
-    config=Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+    config=Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets=bench_creation, bench_get_single, bench_apply_row_id);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(

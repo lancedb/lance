@@ -5,7 +5,9 @@ use std::{sync::Arc, time::Duration};
 
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
@@ -18,9 +20,9 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndexBuilder, NGramIndexBuilderOptions, NGramIndexPlugin};
 use lance_index::scalar::{TextQuery, registry::ScalarIndexPlugin};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 
 fn bench_ngram(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;

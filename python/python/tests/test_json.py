@@ -8,6 +8,7 @@ from typing import Union
 
 import lance
 import pyarrow as pa
+import pytest
 
 
 def check_json_type(ds: Union[lance.LanceDataset, pa.Table], col_name: str):
@@ -17,6 +18,16 @@ def check_json_type(ds: Union[lance.LanceDataset, pa.Table], col_name: str):
     schema = ds.schema
     field = schema.field(col_name)
     assert field.type == pa.json_()
+
+
+def check_nested_json_type(ds: Union[lance.LanceDataset, pa.Table]):
+    media_field = ds.schema.field("media")
+    extra_field = media_field.type.value_type.field("extra")
+    assert extra_field.type == pa.json_()
+
+
+def nested_extra_value(table: pa.Table):
+    return table.to_pylist()[0]["media"][0]["extra"]
 
 
 def test_json_basic_write_read():
@@ -65,6 +76,71 @@ def test_json_basic_write_read():
         # Verify data
         assert result_table.num_rows == 5
         assert result_table.column("id").to_pylist() == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.parametrize("version", ["2.1", "2.2", "2.3"])
+def test_nested_json_large_binary_cast_roundtrip(tmp_path: Path, version: str):
+    storage_schema = pa.schema(
+        [
+            pa.field(
+                "media",
+                pa.list_(
+                    pa.struct(
+                        [
+                            pa.field("uri", pa.utf8(), nullable=False),
+                            pa.field("extra", pa.large_binary()),
+                        ]
+                    )
+                ),
+            )
+        ]
+    )
+    extension_schema = pa.schema(
+        [
+            pa.field(
+                "media",
+                pa.list_(
+                    pa.struct(
+                        [
+                            pa.field("uri", pa.utf8(), nullable=False),
+                            pa.field("extra", pa.json_()),
+                        ]
+                    )
+                ),
+            )
+        ]
+    )
+    table = pa.Table.from_pylist(
+        [
+            {
+                "media": [
+                    {
+                        "uri": "s3://bucket/a.mp4",
+                        "extra": b'{"codec": "h264"}',
+                    }
+                ]
+            }
+        ],
+        schema=storage_schema,
+    ).cast(extension_schema)
+
+    dataset_path = tmp_path / f"nested_json_{version.replace('.', '_')}.lance"
+    lance.write_dataset(table, dataset_path, data_storage_version=version)
+    dataset = lance.dataset(dataset_path)
+
+    check_nested_json_type(dataset)
+
+    scanned = dataset.to_table()
+    check_nested_json_type(scanned)
+    assert json.loads(nested_extra_value(scanned)) == {"codec": "h264"}
+
+    taken = dataset.take([0])
+    check_nested_json_type(taken)
+    assert json.loads(nested_extra_value(taken)) == {"codec": "h264"}
+
+    empty = dataset.take([])
+    assert empty.num_rows == 0
+    check_nested_json_type(empty)
 
 
 def test_json_with_other_types():

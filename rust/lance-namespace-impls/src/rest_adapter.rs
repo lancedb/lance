@@ -3095,13 +3095,7 @@ mod tests {
                     "context_test_ns".to_string(),
                     "test_table".to_string(),
                 ]),
-                with_table_uri: None,
-                load_detailed_metadata: None,
-                check_declared: None,
-                vend_credentials: None,
-                version: None,
-                identity: None,
-                context: None,
+                ..Default::default()
             };
             let result = namespace.describe_table(describe_req).await;
             assert!(result.is_ok(), "Failed to describe table: {:?}", result);

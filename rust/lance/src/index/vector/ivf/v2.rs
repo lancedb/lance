@@ -550,6 +550,22 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
+    fn ensure_search_supported(&self) -> Result<()> {
+        if Q::quantization_type() == QuantizationType::Rabit {
+            let metadata = serde_json::to_value(self.storage.metadata())?;
+            let num_bits = metadata
+                .get("num_bits")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1);
+            if num_bits > 1 {
+                return Err(Error::not_supported(
+                    "IVF_RQ num_bits>1 search is not supported until split-code query support is implemented",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn prepare_partition(
         &self,
         partition_id: usize,
@@ -1205,6 +1221,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        self.ensure_search_supported()?;
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         pre_filter.wait_for_ready().await?;
 
@@ -1257,6 +1274,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<PreparedPartitionSearchHandle> {
+        self.ensure_search_supported()?;
         Ok(Box::new(
             self.prepare_partition(partition_id, query, pre_filter, metrics)
                 .await?,
@@ -1268,6 +1286,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         prepared: PreparedPartitionSearchHandle,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        self.ensure_search_supported()?;
         let prepared = prepared
             .downcast::<PreparedPartitionSearch<S, Q>>()
             .map_err(|_| Error::internal("failed to downcast prepared partition search"))?;
@@ -1306,6 +1325,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         control: Option<Arc<dyn PartitionSearchControl>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
+        self.ensure_search_supported()?;
         if partitions.len() != q_c_dists.len() {
             return Err(Error::invalid_input(format!(
                 "partition count {} does not match centroid distance count {}",
@@ -1675,7 +1695,9 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
-        RQBuildParams, RQRotationType, storage::RabitQuantizationMetadata,
+        RQBuildParams, RQRotationType,
+        storage::{RABIT_EX_CODE_COLUMN, RabitQuantizationMetadata},
+        transform::EX_SCALE_FACTORS_COLUMN,
     };
     use lance_index::vector::storage::VectorStore;
 
@@ -1694,7 +1716,7 @@ mod tests {
     };
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{ROW_ID, Result};
+    use lance_core::{Error, ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
@@ -1790,11 +1812,11 @@ mod tests {
         vectors
     }
 
-    async fn get_rq_metadata(
+    async fn open_rq_aux_reader(
         dataset: &Dataset,
         scheduler: Arc<ScanScheduler>,
         index_uuid: &str,
-    ) -> RabitQuantizationMetadata {
+    ) -> FileReader {
         let index_path = dataset
             .indices_dir()
             .join(index_uuid)
@@ -1803,7 +1825,7 @@ mod tests {
             .open_file(&index_path, &CachedFileSize::unknown())
             .await
             .unwrap();
-        let reader = FileReader::try_open(
+        FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
@@ -1811,7 +1833,15 @@ mod tests {
             FileReaderOptions::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn get_rq_metadata(
+        dataset: &Dataset,
+        scheduler: Arc<ScanScheduler>,
+        index_uuid: &str,
+    ) -> RabitQuantizationMetadata {
+        let reader = open_rq_aux_reader(dataset, scheduler, index_uuid).await;
         let metadata = reader.schema().metadata.get(STORAGE_METADATA_KEY).unwrap();
         let metadata_entries: Vec<String> = serde_json::from_str(metadata).unwrap();
         serde_json::from_str(&metadata_entries[0]).unwrap()
@@ -3964,6 +3994,54 @@ mod tests {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
         test_remap(params.clone(), nlist, recall_requirement).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "IVF_RQ num_bits>1 creation is gated until split-code search support is implemented"]
+    async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_gates_search() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::new(4);
+        let rq_params = RQBuildParams::with_rotation_type(9, RQRotationType::Fast);
+        let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let obj_store = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+        let index_uuid = indices[0].uuid.to_string();
+        let rq_meta = get_rq_metadata(&dataset, scheduler.clone(), &index_uuid).await;
+        assert_eq!(rq_meta.num_bits, 9);
+
+        let reader = open_rq_aux_reader(&dataset, scheduler, &index_uuid).await;
+        let schema = reader.schema();
+        let ex_field = schema.field(RABIT_EX_CODE_COLUMN).unwrap();
+        let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
+            panic!("RQ ex-code field should be FixedSizeList");
+        };
+        assert_eq!(ex_code_bytes, 32);
+        assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
+
+        let query = vectors.value(0);
+        let err = dataset
+            .scan()
+            .nearest("vector", query.as_primitive::<Float32Type>(), 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Execution { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("num_bits>1 search is not supported"),
+            "{err}"
+        );
     }
 
     #[rstest]

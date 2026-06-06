@@ -59,6 +59,11 @@ def transform_vectors(
     pq_codebook: pa.Array,
     dst_uri: str,
 ): ...
+def build_rq_model(
+    dimension: int,
+    num_bits: int = 1,
+    dtype: str = "float32",
+) -> str: ...
 
 class IndexSegmentDescription:
     uuid: str
@@ -67,6 +72,7 @@ class IndexSegmentDescription:
     index_version: int
     created_at: Optional[datetime]
     size_bytes: Optional[int]
+    base_id: Optional[int]
 
     def __repr__(self) -> str: ...
 
