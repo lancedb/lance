@@ -6518,6 +6518,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_INDEX_SEGMENT_SEQ,
+            0
+        );
 
         let field_id = dataset.schema().field("vector").unwrap().id;
         let seg0 = write_vector_segment_metadata(
