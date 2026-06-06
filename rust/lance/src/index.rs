@@ -178,6 +178,7 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                segment_seq: None,
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -4496,6 +4497,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -4536,6 +4538,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            segment_seq: None,
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)

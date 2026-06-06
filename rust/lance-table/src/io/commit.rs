@@ -2055,7 +2055,7 @@ mod tests {
     fn succeeding_manifest_writer<'a>(
         _object_store: &'a ObjectStore,
         _manifest: &'a mut Manifest,
-        _indices: Option<Vec<IndexMetadata>>,
+        _index_section: Option<IndexSection>,
         _path: &'a Path,
         _transaction: Option<Transaction>,
     ) -> BoxFuture<'a, Result<WriteResult>> {
@@ -2066,7 +2066,7 @@ mod tests {
     fn hanging_manifest_writer<'a>(
         _object_store: &'a ObjectStore,
         _manifest: &'a mut Manifest,
-        _indices: Option<Vec<IndexMetadata>>,
+        _index_section: Option<IndexSection>,
         _path: &'a Path,
         _transaction: Option<Transaction>,
     ) -> BoxFuture<'a, Result<WriteResult>> {

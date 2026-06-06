@@ -1205,23 +1205,6 @@ fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
     ))
 }
 
-fn index_segment_to_metadata(template: &SegmentTemplate, segment: IndexSegment) -> IndexMetadata {
-    let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-    IndexMetadata {
-        uuid,
-        fields: template.fields.clone(),
-        name: template.name.clone(),
-        dataset_version: template.dataset_version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(index_details),
-        index_version,
-        created_at: Some(Utc::now()),
-        base_id: None,
-        files: None,
-        segment_seq: None,
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeOptimizeIndices(
     mut env: JNIEnv,
