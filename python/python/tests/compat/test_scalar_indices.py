@@ -5,8 +5,9 @@
 Scalar index compatibility tests for Lance.
 
 Tests that scalar indices (BTREE, BITMAP, LABEL_LIST, NGRAM, ZONEMAP,
-BLOOMFILTER, JSON, FTS) created with one version of Lance can be read
-and written by other versions.
+BLOOMFILTER, JSON, FTS) created with one version of Lance can be read by
+other versions. Older writers are expected to reject current index metadata
+once writer-only compatibility flags are set.
 """
 
 import shutil
@@ -22,8 +23,13 @@ from .compat_decorator import (
 from .util import safe_data_storage_version
 
 
+class ScalarIndexForwardCompatTest(UpgradeDowngradeTest):
+    def expected_write_error_after_current_write(self, version: str) -> str:
+        return "This dataset cannot be written by this version of Lance"
+
+
 @compat_test(min_version="0.30.0")
-class BTreeIndex(UpgradeDowngradeTest):
+class BTreeIndex(ScalarIndexForwardCompatTest):
     """Test BTREE scalar index compatibility (introduced in 0.20.0).
 
     Started fully working in 0.30.0 with various fixes.
@@ -79,7 +85,7 @@ class BTreeIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.22.0")
-class BitmapLabelListIndex(UpgradeDowngradeTest):
+class BitmapLabelListIndex(ScalarIndexForwardCompatTest):
     """Test BITMAP and LABEL_LIST scalar index compatibility (introduced in 0.20.0).
 
     Started fully working in 0.22.0 with fixes to LABEL_LIST index.
@@ -137,7 +143,7 @@ class BitmapLabelListIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.36.0")
-class NgramIndex(UpgradeDowngradeTest):
+class NgramIndex(ScalarIndexForwardCompatTest):
     """Test NGRAM index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):
@@ -186,7 +192,7 @@ class NgramIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.36.0")
-class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
+class ZonemapBloomfilterIndex(ScalarIndexForwardCompatTest):
     """Test ZONEMAP and BLOOMFILTER index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):
@@ -241,7 +247,7 @@ class ZonemapBloomfilterIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.36.0")
-class JsonIndex(UpgradeDowngradeTest):
+class JsonIndex(ScalarIndexForwardCompatTest):
     """Test JSON index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):
@@ -297,7 +303,7 @@ class JsonIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.36.0")
-class FtsIndex(UpgradeDowngradeTest):
+class FtsIndex(ScalarIndexForwardCompatTest):
     """Test FTS (full-text search) index compatibility (introduced in 0.36.0)."""
 
     def __init__(self, path: Path):

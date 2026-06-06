@@ -157,6 +157,10 @@ class UpgradeDowngradeTest:
         """Return True to skip the current-write -> old-read downgrade test."""
         return False
 
+    def expected_write_error_after_current_write(self, version: str) -> Optional[str]:
+        """Return expected error text when old writers cannot write current data."""
+        return None
+
     def current_env(self, method_name: str) -> Dict[str, str]:
         """Return environment overrides for methods executed in the current runtime."""
         return {}
@@ -334,7 +338,7 @@ def test_func({sig_params}):
     # Old version: verify can read
     venv = venv_factory.get_venv(version)
     venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
-    venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
+    _check_write_after_current_write(obj, venv, version)
 '''
     else:  # upgrade_downgrade
         func_body = f'''
@@ -353,10 +357,26 @@ def test_func({sig_params}):
         obj.check_write()
     # Old version: verify can still read
     venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
-    venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
+    _check_write_after_current_write(obj, venv, version)
 '''
 
     # Execute to create the function
-    namespace = {"cls": cls, "_temporary_env": _temporary_env, "pytest": pytest}
+    namespace = {
+        "cls": cls,
+        "_temporary_env": _temporary_env,
+        "_check_write_after_current_write": _check_write_after_current_write,
+        "pytest": pytest,
+    }
     exec(func_body, namespace)
     return namespace["test_func"]
+
+
+def _check_write_after_current_write(obj, venv, version: str):
+    expected = obj.expected_write_error_after_current_write(version)
+    if expected is None:
+        venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
+        return
+
+    with pytest.raises(RuntimeError) as exc:
+        venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
+    assert expected in str(exc.value)

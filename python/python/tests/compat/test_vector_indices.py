@@ -5,7 +5,8 @@
 Vector index compatibility tests for Lance.
 
 Tests that vector indices (IVF_PQ, etc.) created with one version of Lance
-can be read and written by other versions.
+can be read by other versions. Older writers are expected to reject current
+index metadata once writer-only compatibility flags are set.
 """
 
 import os
@@ -24,8 +25,13 @@ from .compat_decorator import (
 from .util import safe_data_storage_version
 
 
+class VectorIndexForwardCompatTest(UpgradeDowngradeTest):
+    def expected_write_error_after_current_write(self, version: str) -> str:
+        return "This dataset cannot be written by this version of Lance"
+
+
 @compat_test(min_version="0.29.1.beta2")
-class PqVectorIndex(UpgradeDowngradeTest):
+class PqVectorIndex(VectorIndexForwardCompatTest):
     """Test PQ (Product Quantization) vector index compatibility."""
 
     def __init__(self, path: Path):
@@ -101,7 +107,7 @@ class PqVectorIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.39.0")
-class HnswPqVectorIndex(UpgradeDowngradeTest):
+class HnswPqVectorIndex(VectorIndexForwardCompatTest):
     """Test IVF_HNSW_PQ vector index compatibility.
 
     Note: Only tests versions >= 0.39.0 because earlier versions don't support
@@ -182,7 +188,7 @@ class HnswPqVectorIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="0.39.0")
-class HnswSqVectorIndex(UpgradeDowngradeTest):
+class HnswSqVectorIndex(VectorIndexForwardCompatTest):
     """Test IVF_HNSW_SQ vector index compatibility.
 
     Note: Only tests versions >= 0.39.0 because earlier versions don't support
@@ -263,7 +269,7 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
 
 
 @compat_test(min_version="4.0.0-beta.8")
-class IvfRqVectorIndex(UpgradeDowngradeTest):
+class IvfRqVectorIndex(VectorIndexForwardCompatTest):
     """Test IVF_RQ vector index compatibility. V2 was introduced in v4.0.0-beta.8"""
 
     def __init__(self, path: Path):
