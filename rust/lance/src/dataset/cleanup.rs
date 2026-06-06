@@ -1601,7 +1601,7 @@ mod tests {
             dataset_version: dataset.version().version,
             fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
             index_details: None,
-            index_version: IndexType::Vector.version(),
+            index_version: 0,
             created_at: None,
             base_id: None,
             files: None,

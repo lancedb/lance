@@ -754,11 +754,9 @@ async fn load_index_section_for_commit(dataset: &Dataset) -> Result<IndexSection
 
 fn index_section_for_write(
     index_section: &IndexSection,
-    current_manifest: Option<&Manifest>,
+    _current_manifest: Option<&Manifest>,
 ) -> Option<IndexSection> {
-    if !index_section.is_empty()
-        || current_manifest.is_some_and(|manifest| manifest.index_section.is_some())
-    {
+    if !index_section.is_empty() {
         Some(index_section.clone())
     } else {
         None
