@@ -337,7 +337,9 @@ class LsmScanner:
         self._raw = self._raw.filter(expr)
         return self
 
-    def limit(self, n: int, offset: Optional[int] = None) -> "LsmScanner":
+    def limit(
+        self, n: Optional[int] = None, offset: Optional[int] = None
+    ) -> "LsmScanner":
         """Limit rows returned, optionally with an offset."""
         self._raw = self._raw.limit(n, offset)
         return self

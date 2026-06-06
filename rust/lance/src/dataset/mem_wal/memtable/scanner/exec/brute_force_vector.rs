@@ -12,6 +12,7 @@
 //! exec keeps KNN correct by computing exact distances row-by-row.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ use lance_linalg::distance::DistanceType;
 
 use super::super::builder::VectorQuery;
 use super::vector::DISTANCE_COLUMN;
+use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, resolve_pk_indices};
 use crate::dataset::mem_wal::write::BatchStore;
 
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
@@ -57,6 +59,11 @@ pub struct MemTableBruteForceVectorExec {
     /// Applied per row before the top-k cut so the KNN only ranks matching
     /// rows (true prefilter, not a lossy post-filter on the top-k).
     filter: Option<PhysicalExprRef>,
+    /// Primary-key columns. When set alongside `filter`, the predicate is
+    /// evaluated against the *newest* version of each PK only, so a PK whose
+    /// current version fails the predicate is excluded rather than falling back
+    /// to a stale older version that still passes (filter-before-dedup leak).
+    pk_columns: Option<Vec<String>>,
 }
 
 impl Debug for MemTableBruteForceVectorExec {
@@ -113,6 +120,7 @@ impl MemTableBruteForceVectorExec {
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
             filter: None,
+            pk_columns: None,
         })
     }
 
@@ -121,6 +129,48 @@ impl MemTableBruteForceVectorExec {
     pub fn with_filter(mut self, filter: Option<PhysicalExprRef>) -> Self {
         self.filter = filter;
         self
+    }
+
+    /// Provide the primary-key columns so a filtered search evaluates the
+    /// predicate against the newest version of each PK (see `pk_columns`).
+    pub fn with_pk_columns(mut self, pk_columns: Option<Vec<String>>) -> Self {
+        self.pk_columns = pk_columns;
+        self
+    }
+
+    /// Build a map from PK hash to the newest (largest) visible row position,
+    /// used to drop superseded versions before the prefilter. `Ok(None)` when no
+    /// PK columns are configured. Visibility mirrors `compute_topk`'s bounds.
+    fn newest_pos_per_pk(&self, max_visible_row: u64) -> Result<Option<HashMap<u64, u64>>> {
+        let Some(ref pk_columns) = self.pk_columns else {
+            return Ok(None);
+        };
+        let mut newest: HashMap<u64, u64> = HashMap::new();
+        let mut current_row: u64 = 0;
+        for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
+            let n = stored_batch.num_rows;
+            if n == 0 {
+                continue;
+            }
+            if batch_position > self.max_visible_batch_position {
+                current_row += n as u64;
+                continue;
+            }
+            let pk_indices = resolve_pk_indices(&stored_batch.data, pk_columns)
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
+            for row in 0..n {
+                let pos = current_row + row as u64;
+                if pos > max_visible_row {
+                    break;
+                }
+                // Append order means later rows have larger `pos`, so overwriting
+                // leaves the newest version's position per PK.
+                let hash = compute_pk_hash(&stored_batch.data, &pk_indices, row);
+                newest.insert(hash, pos);
+            }
+            current_row += n as u64;
+        }
+        Ok(Some(newest))
     }
 
     /// Evaluate the prefilter predicate against a memtable batch, returning a
@@ -203,6 +253,17 @@ impl MemTableBruteForceVectorExec {
         let distance_type = self.query.distance_type.unwrap_or(DEFAULT_DISTANCE_TYPE);
         let batch_func = distance_type.arrow_batch_func();
 
+        // With a prefilter, evaluate the predicate against the newest version of
+        // each PK only: drop superseded versions before filtering so a PK whose
+        // current version fails the predicate is excluded, not replaced by a
+        // stale older version that still passes. Only needed when filtering;
+        // without a filter the downstream within-source dedup is sufficient.
+        let newest_pos = if self.filter.is_some() {
+            self.newest_pos_per_pk(max_visible_row)?
+        } else {
+            None
+        };
+
         // Walk batches in append order. `current_row` is the global row offset
         // of the *next* row about to be visited; rows past `max_visible_row`
         // are dropped before they reach the heap.
@@ -247,10 +308,27 @@ impl MemTableBruteForceVectorExec {
             // top-k heap (a NULL predicate result excludes the row, matching SQL).
             let filter_mask = self.filter_mask(&stored_batch.data)?;
 
+            // PK indices for the newest-version check (only when deduping).
+            let pk_indices = match (&newest_pos, &self.pk_columns) {
+                (Some(_), Some(cols)) => Some(
+                    resolve_pk_indices(&stored_batch.data, cols)
+                        .map_err(|e| Error::invalid_input(e.to_string()))?,
+                ),
+                _ => None,
+            };
+
             for row in 0..n {
                 let pos = current_row + row as u64;
                 if pos > max_visible_row {
                     break;
+                }
+                // Skip superseded versions: only the newest version of each PK is
+                // eligible, so a newer non-matching version excludes the PK.
+                if let (Some(newest), Some(pk_indices)) = (&newest_pos, &pk_indices) {
+                    let hash = compute_pk_hash(&stored_batch.data, pk_indices, row);
+                    if newest.get(&hash) != Some(&pos) {
+                        continue;
+                    }
                 }
                 if let Some(ref mask) = filter_mask
                     && (!mask.is_valid(row) || !mask.value(row))

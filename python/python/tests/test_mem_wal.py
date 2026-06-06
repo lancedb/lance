@@ -163,6 +163,11 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[2] == "gen1_2", "Flushed gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
 
+    offset_table = (
+        LsmScanner.from_snapshots(base_ds, [snap]).limit(None, offset=1).to_table()
+    )
+    assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
+
 
 def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
     ds_path = str(tmp_path / "base")

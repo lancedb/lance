@@ -32,10 +32,6 @@ use super::point_lookup::LsmPointLookupPlanner;
 use crate::dataset::Dataset;
 use crate::session::Session;
 
-/// Default top-k for an FTS query when no `limit` is set, mirroring the scanner's
-/// vector default so the FTS arm bounds its per-source fetch.
-const DEFAULT_FTS_K: usize = 10;
-
 /// Vector (KNN) search state, set by [`LsmScanner::nearest`] and friends. Mirrors
 /// the subset of `lance::dataset::scanner::Query` the LSM vector planner honors.
 #[derive(Debug, Clone)]
@@ -411,22 +407,22 @@ impl LsmScanner {
     /// [`crate::dataset::scanner::Scanner::limit`]: both bounds are `Option<i64>`
     /// and must be non-negative.
     pub fn limit(mut self, limit: Option<i64>, offset: Option<i64>) -> Result<Self> {
-        if let Some(limit) = limit {
-            if limit < 0 {
-                return Err(Error::invalid_input(
-                    "limit must be non-negative".to_string(),
-                ));
-            }
-            self.limit = Some(limit as usize);
+        if let Some(value) = limit
+            && value < 0
+        {
+            return Err(Error::invalid_input(
+                "limit must be non-negative".to_string(),
+            ));
         }
-        if let Some(offset) = offset {
-            if offset < 0 {
-                return Err(Error::invalid_input(
-                    "offset must be non-negative".to_string(),
-                ));
-            }
-            self.offset = Some(offset as usize);
+        if let Some(value) = offset
+            && value < 0
+        {
+            return Err(Error::invalid_input(
+                "offset must be non-negative".to_string(),
+            ));
         }
+        self.limit = limit.map(|value| value as usize);
+        self.offset = offset.map(|value| value as usize);
         Ok(self)
     }
 
@@ -600,7 +596,8 @@ impl LsmScanner {
     }
 
     /// Full-text search across base ∪ flushed ∪ in-memory, via the LSM FTS
-    /// planner. The column comes from the query; `k` from `limit` (+ `offset`).
+    /// planner. Query/scanner limits bound per-source fetches when present;
+    /// otherwise the search remains unbounded and any offset is applied above.
     async fn plan_fts(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let query = self
             .full_text_query
@@ -618,7 +615,21 @@ impl LsmScanner {
                     .to_string(),
             )
         })?;
-        let k = self.limit.unwrap_or(DEFAULT_FTS_K) + self.offset.unwrap_or(0);
+        let query_limit = query
+            .limit
+            .map(|limit| {
+                if limit < 0 {
+                    Err(Error::invalid_input(
+                        "full-text search limit must be non-negative".to_string(),
+                    ))
+                } else {
+                    Ok(limit as usize)
+                }
+            })
+            .transpose()?;
+        let source_limit = query_limit
+            .or(self.limit)
+            .map(|limit| limit + self.offset.unwrap_or(0));
 
         let collector = self.build_collector();
         let base_schema = self.schema();
@@ -638,7 +649,12 @@ impl LsmScanner {
             planner = planner.with_overfetch_factor(factor);
         }
         let plan = planner
-            .plan_search(&column, query.clone(), k, self.projection.as_deref())
+            .plan_search(
+                &column,
+                query.clone(),
+                source_limit,
+                self.projection.as_deref(),
+            )
             .await?;
         Ok(self.apply_limit_offset(plan))
     }
@@ -732,14 +748,14 @@ impl LsmScanner {
     /// Execute the scan and collect all results into a single RecordBatch.
     pub async fn try_into_batch(&self) -> Result<RecordBatch> {
         let stream = self.try_into_stream().await?;
+        let output_schema = stream.schema();
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
             .map_err(|e| Error::io(format!("Failed to collect batches: {}", e)))?;
 
         if batches.is_empty() {
-            let schema = self.schema();
-            return Ok(RecordBatch::new_empty(schema));
+            return Ok(RecordBatch::new_empty(output_schema));
         }
 
         let schema = batches[0].schema();
@@ -1088,6 +1104,7 @@ mod tests {
 
         let store = Arc::new(BatchStore::with_capacity(16));
         let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
         index.add_hnsw(
             "vec_hnsw".to_string(),
             1,
@@ -1282,6 +1299,39 @@ mod tests {
         .unwrap();
         let base = Arc::new(Dataset::open(&uri).await.unwrap());
 
+        let query_limited = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .full_text_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .limit(Some(1)),
+            )
+            .unwrap();
+        let batches: Vec<RecordBatch> = query_limited
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let out: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            out,
+            vec![1],
+            "query-level FTS limit=1 must cap the unpaginated scanner result; got {out:?}"
+        );
+
         let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
             .full_text_search(
                 FullTextSearchQuery::new("lance".to_string())
@@ -1315,6 +1365,65 @@ mod tests {
             out,
             vec![2],
             "offset=1, limit=1 must return the 2nd-ranked hit (id=2); got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_without_limit_returns_all_matches() {
+        use crate::dataset::{Dataset, WriteParams};
+        use crate::index::DatasetIndexExt;
+        use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field};
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = pk_schema_with(Field::new("text", DataType::Utf8, true));
+        let ids: Vec<i32> = (0..12).collect();
+        let texts: Vec<&str> = (0..12).map(|_| "lance").collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(texts)),
+            ],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut base = Dataset::write(reader, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        base.create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".to_string()),
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let base = Arc::new(Dataset::open(&uri).await.unwrap());
+
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .full_text_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 12,
+            "unbounded LSM FTS must not apply the old default top-10 cap"
         );
     }
 
@@ -1470,6 +1579,7 @@ mod tests {
 
         let store = Arc::new(BatchStore::with_capacity(16));
         let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
         index.add_fts("text_fts".to_string(), 1, "text".to_string());
         let batch = make_batch(&[99], &["zebra"]);
         store.append(batch.clone()).unwrap();
@@ -1508,6 +1618,33 @@ mod tests {
         assert_eq!(
             rows, 1,
             "facade FTS should surface the memtable 'zebra' row"
+        );
+    }
+
+    /// Empty search results must still preserve the execution plan schema.
+    #[tokio::test]
+    async fn try_into_batch_empty_fts_keeps_score_schema() {
+        use arrow_schema::{DataType, Field};
+
+        let schema = pk_schema_with(Field::new("text", DataType::Utf8, true));
+        let scanner = LsmScanner::without_base_table(
+            schema,
+            "memory://empty",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .full_text_search(
+            FullTextSearchQuery::new("missing".to_string())
+                .with_column("text".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert!(
+            batch.schema().field_with_name("_score").is_ok(),
+            "empty FTS batch must keep the planned _score column"
         );
     }
 
@@ -1579,6 +1716,29 @@ mod tests {
                 rows.iter().map(|b| b.num_rows()).sum::<usize>()
             }
         };
+        let collect_ids = |plan: Arc<dyn ExecutionPlan>| {
+            let ctx = ctx.clone();
+            async move {
+                let rows: Vec<RecordBatch> = plan
+                    .execute(0, ctx.task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let mut ids = Vec::new();
+                for batch in rows {
+                    let id_array = batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int32Array>()
+                        .unwrap();
+                    ids.extend(id_array.values().iter().copied());
+                }
+                ids.sort_unstable();
+                ids
+            }
+        };
 
         // `id = 2` routes to the direct point-lookup node (OneShotStream), not the
         // union/dedup scan, and returns the one matching row.
@@ -1618,5 +1778,21 @@ mod tests {
             "range filter must not route to the point-lookup node"
         );
         assert_eq!(count(plan).await, 3); // 3,4,5
+
+        // Offset changes the semantics, so even a point-lookup-shaped filter
+        // must bypass the direct lookup route and use the general scan path.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(3i32), lit(5i32)], false))
+            .limit(None, Some(1))
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+        let disp = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            !disp.contains("OneShotStream"),
+            "offset point-lookup filters must use the scan path: {disp}"
+        );
+        assert_eq!(collect_ids(plan).await, vec![3, 5]);
     }
 }

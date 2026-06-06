@@ -420,7 +420,7 @@ fn inner_scanner_filter(env: &mut JNIEnv, this: JObject, expr: JString) -> Resul
 pub extern "system" fn Java_org_lance_memwal_LsmScanner_nativeLimit(
     mut env: JNIEnv,
     this: JObject,
-    limit: jlong,
+    limit: JObject,
     offset: JObject,
 ) {
     ok_or_throw_without_return!(env, inner_scanner_limit(&mut env, this, limit, offset));
@@ -429,15 +429,12 @@ pub extern "system" fn Java_org_lance_memwal_LsmScanner_nativeLimit(
 fn inner_scanner_limit(
     env: &mut JNIEnv,
     this: JObject,
-    limit: jlong,
+    limit: JObject,
     offset: JObject,
 ) -> Result<()> {
+    let limit = env.get_u64_opt(&limit)?.map(|v| v as i64);
     let offset = env.get_u64_opt(&offset)?.map(|v| v as i64);
-    with_lsm_scanner(
-        env,
-        &this,
-        |scanner| Ok(scanner.limit(Some(limit), offset)?),
-    )
+    with_lsm_scanner(env, &this, |scanner| Ok(scanner.limit(limit, offset)?))
 }
 
 #[unsafe(no_mangle)]

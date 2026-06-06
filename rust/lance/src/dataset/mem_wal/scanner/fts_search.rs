@@ -47,7 +47,6 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::Expr;
 use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::FtsQuery as IndexFtsQuery;
 use tracing::instrument;
 
 use super::block_list::compute_source_block_lists;
@@ -150,24 +149,24 @@ impl LsmFtsSearchPlanner {
     /// * `query` — the FTS query (match / phrase / boolean / fuzzy for
     ///   base/flushed Lance sources; the active memtable currently
     ///   supports `MatchQuery`).
-    /// * `k` — global top-k to return.
+    /// * `limit` — optional global top-k to return.
     /// * `projection` — user columns to project. PK columns are
     ///   auto-included; `_score` is always appended.
     ///
     /// Each source is scored independently (local BM25), normalized to a
-    /// canonical schema, unioned, and merged by `_score` DESC with a
-    /// top-k cap pushed into each partition.
+    /// canonical schema, unioned, and merged by `_score` DESC. When a finite
+    /// limit is supplied, top-k caps are pushed into each partition.
     #[instrument(
         name = "lsm_fts_search",
         level = "info",
         skip_all,
-        fields(column = %column, k)
+        fields(column = %column, limit)
     )]
     pub async fn plan_search(
         &self,
         column: &str,
         query: FullTextSearchQuery,
-        k: usize,
+        limit: Option<usize>,
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
@@ -195,44 +194,52 @@ impl LsmFtsSearchPlanner {
         let arm_inputs: Vec<_> = sources
             .iter()
             .map(|source| {
+                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
                 let blocked = block_lists.get(&(source.shard_id(), source.generation()));
-                // Over-fetch a blocked source so the post-filter still yields k live
-                // rows. The active arm returns all matches (no builder limit), so its
-                // within-source dedup needs no over-fetch hint.
-                let fetch_k = if blocked.is_some() {
-                    ((k as f64) * overfetch).ceil() as usize
+                // The active PK arm has an exact recency filter after the FTS
+                // exec. Keep it uncapped until that filter runs so stale
+                // high-scoring hits cannot consume the per-source limit.
+                // Blocked non-active sources use heuristic over-fetch because
+                // their newer generation membership may also drop candidates.
+                let fetch_limit = if is_active && !self.pk_columns.is_empty() {
+                    None
+                } else if blocked.is_some() {
+                    limit.map(|limit| ((limit as f64) * overfetch).ceil() as usize)
                 } else {
-                    k
+                    limit
                 };
-                (source, blocked, fetch_k)
+                (source, is_active, blocked, fetch_limit)
             })
             .collect();
-        let built = futures::future::try_join_all(arm_inputs.iter().map(|(source, _, fetch_k)| {
-            Box::pin(self.build_source_plan(source, column, &query, *fetch_k, projection))
-        }))
-        .await?;
+        let built =
+            futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, fetch_limit)| {
+                Box::pin(self.build_source_plan(source, column, &query, *fetch_limit, projection))
+            }))
+            .await?;
 
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
-        for ((_source, blocked, _), plan) in arm_inputs.iter().zip(built) {
+        for ((_, is_active, blocked, _), plan) in arm_inputs.iter().zip(built) {
+            let is_active = *is_active;
             let blocked = *blocked;
             // Within-generation dedup is already applied per source:
             //  * active/frozen in-memory: `NewestPkFilterExec` inside
             //    `build_source_plan` (drops predicate-crossing stale hits, which a
             //    result-set dedup can't catch).
-            //  * flushed: the on-disk deletion vector.
-            // Cross-generation supersession (a newer gen's write or tombstone) is
-            // applied uniformly here via the block-list — including frozen
-            // in-memory generations, whose per-gen recency filter can't see a
-            // newer gen. The newest generation of each shard has no newer gen
-            // (`blocked` is None) and is unaffected.
-            let deduped = match blocked {
-                Some(set) => Arc::new(PkBlockFilterExec::new(
+            //  * flushed/base: drop rows superseded by a newer generation via the
+            //    block-list (within-gen is handled by the flushed deletion vector).
+            let deduped = if is_active {
+                plan
+            } else if let Some(set) = blocked
+                && !self.pk_columns.is_empty()
+            {
+                Arc::new(PkBlockFilterExec::new(
                     plan,
                     self.pk_columns.clone(),
                     set.clone(),
-                    k,
-                )) as Arc<dyn ExecutionPlan>,
-                None => plan,
+                    limit.unwrap_or(usize::MAX),
+                )) as Arc<dyn ExecutionPlan>
+            } else {
+                plan
             };
 
             // Normalize to canonical. This also drops the active arm's _rowid,
@@ -277,10 +284,10 @@ impl LsmFtsSearchPlanner {
         let per_partition_sorted: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(lex_ordering.clone(), merged)
                 .with_preserve_partitioning(true)
-                .with_fetch(Some(k)),
+                .with_fetch(limit),
         );
         let merged_sorted: Arc<dyn ExecutionPlan> = Arc::new(
-            SortPreservingMergeExec::new(lex_ordering, per_partition_sorted).with_fetch(Some(k)),
+            SortPreservingMergeExec::new(lex_ordering, per_partition_sorted).with_fetch(limit),
         );
 
         Ok(merged_sorted)
@@ -291,7 +298,7 @@ impl LsmFtsSearchPlanner {
         source: &LsmDataSource,
         column: &str,
         query: &FullTextSearchQuery,
-        k: usize,
+        limit: Option<usize>,
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
@@ -306,10 +313,12 @@ impl LsmFtsSearchPlanner {
                     scanner.filter_expr(filter.clone());
                     scanner.prefilter(true);
                 }
-                let bound_query = query
-                    .clone()
-                    .with_column(column.to_string())?
-                    .limit(Some(k as i64));
+                let mut bound_query = query.clone().with_column(column.to_string())?;
+                if let Some(limit) = limit {
+                    bound_query = bound_query.limit(Some(limit as i64));
+                } else {
+                    bound_query = bound_query.limit(None);
+                }
                 scanner.full_text_search(bound_query)?;
                 scanner.create_plan().await
             }
@@ -330,10 +339,12 @@ impl LsmFtsSearchPlanner {
                     scanner.filter_expr(filter.clone());
                     scanner.prefilter(true);
                 }
-                let bound_query = query
-                    .clone()
-                    .with_column(column.to_string())?
-                    .limit(Some(k as i64));
+                let mut bound_query = query.clone().with_column(column.to_string())?;
+                if let Some(limit) = limit {
+                    bound_query = bound_query.limit(Some(limit as i64));
+                } else {
+                    bound_query = bound_query.limit(None);
+                }
                 scanner.full_text_search(bound_query)?;
                 scanner.create_plan().await
             }
@@ -346,7 +357,7 @@ impl LsmFtsSearchPlanner {
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
                     // Honored inside `plan_fts_search`: the materialized hits are
                     // masked by the predicate before projection.
@@ -357,29 +368,30 @@ impl LsmFtsSearchPlanner {
                 // index keeps an updated row's old postings live, so a stale hit
                 // can match a query the fresh row no longer does; the filter
                 // drops it. `project_to_canonical` strips `_rowid` afterward.
-                scanner.with_row_id();
-                // `MemTableScanner::full_text_search` takes a raw match
-                // string; richer query shapes (phrase/boolean/fuzzy) can
-                // be plumbed through once the MemTable scanner accepts a
-                // structured query.
-                let match_str = match &query.query {
-                    IndexFtsQuery::Match(m) => m.terms.clone(),
-                    other => {
-                        return Err(Error::not_supported(format!(
-                            "Active memtable FTS via LsmFtsSearchPlanner currently only \
-                             supports MatchQuery, got: {other:?}"
-                        )));
-                    }
-                };
-                let _ = scanner.full_text_search(column, &match_str);
-                // Active arm doesn't take a top-K hint via the builder
-                // today; the per-partition Sort+fetch above bounds the
-                // emitted rows.
-                let _ = k;
+                if !self.pk_columns.is_empty() {
+                    scanner.with_row_id();
+                }
+                // `MemTableScanner::full_text_search` now takes a structured
+                // `FullTextSearchQuery` (match/phrase); it rejects compound
+                // shapes the MemTable path can't model.
+                let mut bound_query = query.clone().with_column(column.to_string())?;
+                if let Some(limit) = limit {
+                    bound_query = bound_query.limit(Some(limit as i64));
+                } else {
+                    bound_query = bound_query.limit(None);
+                }
+                scanner.full_text_search(bound_query)?;
                 let plan = scanner.create_plan().await?;
+                if self.pk_columns.is_empty() {
+                    return Ok(plan);
+                }
                 // Drop predicate-crossing stale hits: keep a hit iff it is the
                 // newest visible version of its PK (collapses duplicate-PK
                 // appends too — supersedes the old WithinSourceDedupExec).
+                debug_assert!(
+                    index_store.has_pk_index(),
+                    "active FTS PK recency filtering requires a maintained PK index"
+                );
                 let filtered: Arc<dyn ExecutionPlan> = Arc::new(NewestPkFilterExec::new(
                     plan,
                     self.pk_columns.clone(),
@@ -573,7 +585,7 @@ mod tests {
             .plan_search(
                 "text",
                 FullTextSearchQuery::new("lance".to_string()),
-                10,
+                Some(10),
                 None,
             )
             .await
@@ -652,6 +664,7 @@ mod tests {
         // Active memtable rows 0 and 3 both contain "lance".
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
         let active_batch = make_batch(&schema, &[0, 3], &["lance zero", "lance three"]);
         batch_store.append(active_batch.clone()).unwrap();
@@ -680,7 +693,7 @@ mod tests {
             .plan_search(
                 "text",
                 FullTextSearchQuery::new("lance".to_string()),
-                10,
+                Some(10),
                 None,
             )
             .await
@@ -707,7 +720,82 @@ mod tests {
             ids,
             vec![2, 3],
             "prefilter must keep only id>=2 across base (id=2) and active (id=3), \
-             dropping base id=1 and active id=0; got {ids:?}"
+            dropping base id=1 and active id=0; got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_filtered_search_without_pk_applies_small_limit_after_filter() {
+        use datafusion::prelude::{col, lit};
+
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(
+            &schema,
+            &[1, 2, 3],
+            &["lance one", "lance two", "lance three"],
+        );
+        batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec![], schema)
+            .with_filter(Some(col("id").gt_eq(lit(1i32))));
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(2),
+                None,
+            )
+            .await
+            .expect("planner should produce an active-only filtered plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids.len(),
+            2,
+            "no-PK filtered active search must apply the limit after filtering; got ids={ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| (1..=3).contains(id)),
+            "no-PK filtered active search returned a row outside the filtered matches: {ids:?}"
         );
     }
 
@@ -760,7 +848,7 @@ mod tests {
             .plan_search(
                 "text",
                 FullTextSearchQuery::new("lance".to_string()),
-                1,
+                Some(1),
                 None,
             )
             .await
@@ -790,11 +878,292 @@ mod tests {
         );
     }
 
+    /// The active memtable FTS arm must also apply the predicate before its
+    /// top-k cap. With `k = 1` and the higher-scoring active doc failing the
+    /// predicate, pushing the limit into the index would return zero rows.
+    #[tokio::test]
+    async fn prefilter_on_active_is_not_a_lossy_postfilter() {
+        use datafusion::prelude::{col, lit};
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![
+                    "lance",
+                    "lance filler filler filler filler filler",
+                ])),
+                Arc::new(StringArray::from(vec!["archived", "active"])),
+            ],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_filter(Some(col("status").eq(lit("active"))));
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(1),
+                None,
+            )
+            .await
+            .expect("planner should produce a filtered active plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![2],
+            "active FTS prefilter must return the lower-scoring matching row, \
+             not post-filter the top-1 down to nothing; got {ids:?}"
+        );
+    }
+
+    /// The active FTS arm must also avoid capping before the newest-PK filter.
+    /// A stale high-scoring hit can be removed by `NewestPkFilterExec`; a lower
+    /// scoring live hit must still be available for the final global top-k.
+    #[tokio::test]
+    async fn active_limit_applies_after_newest_pk_filter() {
+        use datafusion::prelude::{col, lit};
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 1])),
+                Arc::new(StringArray::from(vec![
+                    "lance",
+                    "lance filler filler filler filler filler",
+                    "other text",
+                ])),
+                Arc::new(StringArray::from(vec!["active", "active", "active"])),
+            ],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_filter(Some(col("status").eq(lit("active"))));
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(1),
+                None,
+            )
+            .await
+            .expect("planner should produce a filtered active plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![2],
+            "active FTS limit must apply after newest-PK filtering; got {ids:?}"
+        );
+    }
+
+    /// An in-memtable update whose *newest* version fails the prefilter must
+    /// exclude the PK, not leak the stale older hit that still passes. Both
+    /// versions of pk=5 match the query text "lance", but only the older one is
+    /// "active"; the current version is "archived" and must be dropped.
+    /// Regression for filter-before-dedup on the active FTS arm.
+    #[tokio::test]
+    async fn prefilter_excludes_pk_whose_newest_version_fails() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_schema::{DataType, Field};
+        use datafusion::prelude::{col, lit};
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let make_row = |statuses: &[&str]| -> RecordBatch {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![5; statuses.len()])),
+                    Arc::new(StringArray::from(vec!["lance text"; statuses.len()])),
+                    Arc::new(StringArray::from(statuses.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Base unindexed → contributes nothing; isolate the active arm.
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![999])),
+                Arc::new(StringArray::from(vec!["unrelated"])),
+                Arc::new(StringArray::from(vec!["active"])),
+            ],
+        )
+        .unwrap();
+        let base_ds = Arc::new(write_dataset(&base_uri, vec![base_batch]).await);
+
+        // Active memtable: pk=5 appended twice (active then archived), both "lance".
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_row(&["active", "archived"]);
+        batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_filter(Some(col("status").eq(lit("active"))));
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(10),
+                None,
+            )
+            .await
+            .expect("planner should produce a filtered active plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 0,
+            "pk=5's current version is 'archived' and must be excluded; the stale \
+             'active' older hit must not leak (filter evaluated on newest version)"
+        );
+    }
+
     #[tokio::test]
     async fn local_mode_active_memtable_only_returns_score_sorted_hits() {
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
         // text column has field_id 1 in fts_schema()
         indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
         let batch = make_batch(
@@ -834,7 +1203,7 @@ mod tests {
             .plan_search(
                 "text",
                 FullTextSearchQuery::new("lance".to_string()),
-                10,
+                Some(10),
                 None,
             )
             .await
@@ -872,6 +1241,79 @@ mod tests {
                 prev_score = Some(s);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn active_match_query_preserves_and_operator() {
+        use lance_index::scalar::inverted::query::{
+            FtsQuery as IndexFtsQuery, MatchQuery, Operator,
+        };
+
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let batch = make_batch(
+            &schema,
+            &[1, 2, 3],
+            &["lance only", "memwal only", "lance memwal"],
+        );
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("lance memwal".to_string())
+                .with_operator(Operator::And)
+                .with_column(Some("text".to_string())),
+        ));
+        let plan = planner
+            .plan_search("text", query, Some(10), None)
+            .await
+            .expect("planner should produce an active-only plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![3],
+            "AND query must only return rows containing both terms; got ids={ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -923,7 +1365,7 @@ mod tests {
             .plan_search(
                 "text",
                 FullTextSearchQuery::new("lance".to_string()),
-                10,
+                Some(10),
                 None,
             )
             .await
@@ -1016,7 +1458,7 @@ mod tests {
             .plan_search(
                 "text",
                 FullTextSearchQuery::new("alpha".to_string()),
-                10,
+                Some(10),
                 None,
             )
             .await

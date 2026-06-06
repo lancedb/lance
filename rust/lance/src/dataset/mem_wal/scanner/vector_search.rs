@@ -57,7 +57,7 @@ use crate::session::Session;
 ///         ProjectionExec (canonical output schema)
 ///           SortExec(_distance, fetch=k)
 ///             NewestPkFilterExec: newest-per-PK recency        (active)
-///               KNNExec: active memtable, fetch=ceil(k*overfetch)
+///               KNNExec: active memtable, fetch=visible_rows when PK recency is needed
 ///         ProjectionExec (canonical output schema)
 ///           ProjectionExec (null_columns _rowid)
 ///             PkBlockFilterExec: block-list                   (flushed)
@@ -312,7 +312,7 @@ impl LsmVectorSearchPlanner {
             //    distance.
             //  * flushed/base: drop cross-gen superseded rows via the
             //    block-list (within-gen is handled by the flushed DV).
-            let knn = if is_active {
+            let knn = if is_active && !self.pk_columns.is_empty() {
                 let (batch_store, index_store) = match source {
                     LsmDataSource::ActiveMemTable {
                         batch_store,
@@ -321,6 +321,10 @@ impl LsmVectorSearchPlanner {
                     } => (batch_store.clone(), index_store.clone()),
                     _ => unreachable!("is_active implies ActiveMemTable"),
                 };
+                debug_assert!(
+                    index_store.has_pk_index(),
+                    "active vector PK recency filtering requires a maintained PK index"
+                );
                 let filtered: Arc<dyn ExecutionPlan> =
                     Arc::new(super::exec::NewestPkFilterExec::new(
                         knn,
@@ -348,6 +352,7 @@ impl LsmVectorSearchPlanner {
                 sort_by_distance(blocked_filtered, k)?
             } else {
                 match blocked {
+                    Some(_) if self.pk_columns.is_empty() => knn,
                     Some(set) => Arc::new(super::exec::PkBlockFilterExec::new(
                         knn,
                         self.pk_columns.clone(),
@@ -527,14 +532,16 @@ impl LsmVectorSearchPlanner {
                 ..
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
-                use arrow_array::Array;
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                // Supply PKs so a filtered search evaluates the predicate against
+                // the newest version of each PK (no stale-match leak).
+                scanner.with_pk_columns(self.pk_columns.clone());
                 // PK auto-included so the staleness filter retains its bloom hash key.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
                     // Routed to filtered brute-force (see `plan_vector_search`):
                     // the predicate masks rows before the memtable top-k cut.
@@ -548,8 +555,17 @@ impl LsmVectorSearchPlanner {
                 // `with_row_address`, but the two yield identical values
                 // for an active memtable so either would work.)
                 scanner.with_row_id();
-                let query_arr: Arc<dyn Array> = Arc::new(query_vector.clone());
-                scanner.nearest(&self.vector_column, query_arr, k);
+                let active_k = if self.filter.is_none() && !self.pk_columns.is_empty() {
+                    batch_store
+                        .visible_batches(scanner.max_visible_batch_position())
+                        .iter()
+                        .map(|batch| batch.num_rows)
+                        .sum::<usize>()
+                        .max(k)
+                } else {
+                    k
+                };
+                scanner.nearest(&self.vector_column, query_vector, active_k)?;
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 let plan = scanner.create_plan().await?;
@@ -901,6 +917,7 @@ mod tests {
         // Active memtable with ids 0..=3 (id=1 is the exact match, id=0 ties id=2).
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -974,6 +991,81 @@ mod tests {
             sorted,
             vec![2, 3],
             "prefilter must drop id=0 and id=1 (nearer but failing `id >= 2`)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_filtered_active_without_pk_keeps_all_matching_rows() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::{SessionContext, col, lit};
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let base_dataset = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[100, 200])]).await,
+        );
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let index_store = IndexStore::new();
+        let batch = create_test_batch(&schema, &[1, 2, 3]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec![],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        )
+        .with_filter(Some(col("id").gt_eq(lit(1i32))));
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 3, 1, None, false, 1.0)
+            .await
+            .expect("planner should produce a filtered active plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "no-PK filtered active vector search must not collapse all rows into one key"
         );
     }
 
@@ -1054,6 +1146,134 @@ mod tests {
             vec![3, 4],
             "base prefilter must return the two nearest matches (id=3, id=4), not \
              post-filter the unfiltered top-2 (id=1, id=2) down to nothing; got {ids:?}"
+        );
+    }
+
+    /// An in-memtable update whose *newest* version fails the prefilter must
+    /// exclude the PK entirely, not leak the stale older version that still
+    /// passes. Regression for filter-before-dedup on the active arm: the filter
+    /// is evaluated against the newest version of each PK.
+    #[tokio::test]
+    async fn test_vector_search_prefilter_excludes_pk_whose_newest_version_fails() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use arrow_array::StringArray;
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_schema::{DataType, Field};
+        use datafusion::prelude::{SessionContext, col, lit};
+        use futures::TryStreamExt;
+
+        let mut id_meta = std::collections::HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        // Same PK id=5 appended twice (an in-memtable update): row0 "active"
+        // (passes), row1 "archived" (the current version, fails the filter). Both
+        // vectors are near the query.
+        let make_batch = |statuses: &[&str]| -> RecordBatch {
+            let mut vb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+            for _ in statuses {
+                for d in 0..4 {
+                    vb.values().append_value(0.1 + d as f32 * 0.1);
+                }
+                vb.append(true);
+            }
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![5; statuses.len()])),
+                    Arc::new(vb.finish()),
+                    Arc::new(StringArray::from(statuses.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Base is unindexed, so `fast_search` contributes nothing; the test
+        // isolates the active-memtable dedup-before-filter behavior. Use a
+        // non-conflicting id to avoid any PK confusion.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let mut fb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        for d in 0..4 {
+            fb.values().append_value(100.0 + d as f32);
+        }
+        fb.append(true);
+        let far = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![999])),
+                Arc::new(fb.finish()),
+                Arc::new(StringArray::from(vec!["active"])),
+            ],
+        )
+        .unwrap();
+        let base_dataset = Arc::new(create_dataset(&base_uri, vec![far]).await);
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let batch = make_batch(&["active", "archived"]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        )
+        .with_filter(Some(col("status").eq(lit("active"))));
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 10, 1, None, false, 1.0)
+            .await
+            .expect("planner should produce a filtered plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 0,
+            "pk=5's current version is 'archived' and must be excluded; a stale \
+             'active' older version must not leak (filter evaluated on newest)"
         );
     }
 
@@ -2081,8 +2301,9 @@ mod tests {
             lance_linalg::distance::DistanceType::L2,
         );
 
-        // k=3, no over-fetch: the candidate set is {pk1@near, two nearest
-        // fillers}; fresh pk1@far ranks 7th and never enters the candidates.
+        // k=3, no over-fetch: if the active HNSW only requests three rows then
+        // the candidate set is {pk1@near, two nearest fillers}; fresh pk1@far
+        // ranks 7th and never enters the candidates.
         let query = create_query_vector();
         let plan = planner
             .plan_search(&query, 3, 1, None, false, 1.0)
@@ -2093,6 +2314,13 @@ mod tests {
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
         let rows = collect_id_dist(&batches);
 
+        assert_eq!(
+            rows.len(),
+            3,
+            "active PK recency filtering must not underfill k after dropping stale candidates; \
+             results={:?}",
+            rows
+        );
         assert!(
             !rows.iter().any(|&(id, d)| id == 1 && d.abs() < 1e-3),
             "stale near pk=1 leaked: its live vector is far from the query, so it \

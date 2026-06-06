@@ -676,7 +676,7 @@ impl LsmPointLookupPlanner {
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
                 // Expose `_rowid` (the BatchStore row offset, monotonic with
                 // insert order) so we can pick the most recently inserted

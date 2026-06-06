@@ -567,11 +567,11 @@ impl PyLsmScanner {
         Ok(slf)
     }
 
-    /// Limit the number of rows returned.
-    #[pyo3(signature = (n, offset=None))]
+    /// Limit the number of rows returned, optionally with an offset.
+    #[pyo3(signature = (n=None, offset=None))]
     pub fn limit(
         mut slf: PyRefMut<'_, Self>,
-        n: usize,
+        n: Option<usize>,
         offset: Option<usize>,
     ) -> PyResult<PyRefMut<'_, Self>> {
         let scanner = slf
@@ -580,7 +580,7 @@ impl PyLsmScanner {
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
         slf.inner = Some(
             scanner
-                .limit(Some(n as i64), offset.map(|o| o as i64))
+                .limit(n.map(|n| n as i64), offset.map(|o| o as i64))
                 .map_err(|e| PyValueError::new_err(e.to_string()))?,
         );
         Ok(slf)

@@ -406,6 +406,14 @@ public class MemWalTest {
         assertEquals("gen1_2", byId.get(2L), "Flushed generation must win over base");
         assertEquals("base_3", byId.get(3L));
       }
+
+      try (LsmScanner scanner =
+              LsmScanner.fromSnapshots(dataset, Collections.singletonList(snapshot))
+                  .limit(Optional.empty(), Optional.of(1L));
+          ArrowReader reader = scanner.scanBatches()) {
+        Map<Long, String> byId = readByName(reader);
+        assertEquals(2, byId.size(), "Offset-only LSM scan should not require a limit");
+      }
     }
   }
 

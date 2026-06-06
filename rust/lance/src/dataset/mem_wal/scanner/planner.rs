@@ -261,9 +261,9 @@ impl LsmScanPlanner {
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
         )?;
 
-        // 6. Add limit if specified
-        if let Some(limit) = limit {
-            plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), Some(limit)));
+        // 6. Add limit / offset if specified
+        if limit.is_some() || offset.unwrap_or(0) > 0 {
+            plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), limit));
         }
 
         Ok(plan)
@@ -386,7 +386,7 @@ impl LsmScanPlanner {
 
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
                 // The dedup scan applies the filter post-dedup; pushing it
@@ -990,6 +990,35 @@ mod integration_tests {
         // Count total rows
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows due to limit");
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_with_offset_without_limit() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .limit(Some(3), None)
+            .unwrap()
+            .limit(None, Some(2))
+            .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 5,
+            "offset-only scan should skip 2 rows from the 7-row deduped result"
+        );
     }
 
     #[tokio::test]
@@ -2127,7 +2156,8 @@ mod integration_tests {
             vec![shard_snapshot],
             vec!["id".to_string()],
         )
-        .limit(2, None);
+        .limit(Some(2), None)
+        .unwrap();
         let batches: Vec<RecordBatch> = scanner
             .try_into_stream()
             .await

@@ -20,6 +20,6 @@ mod vector;
 pub use brute_force_vector::MemTableBruteForceVectorExec;
 pub use btree::BTreeIndexExec;
 pub use dedup_scan::MemTableDedupScanExec;
-pub use fts::FtsIndexExec;
+pub use fts::{FtsIndexExec, SCORE_COLUMN};
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;
