@@ -6690,7 +6690,18 @@ mod tests {
             )
             .into_reader_rows(RowCount::from(20), BatchCount::from(2));
 
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
 
         let field_id = dataset.schema().field("vector").unwrap().id;
         let original = write_vector_segment_metadata(
