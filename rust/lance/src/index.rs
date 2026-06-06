@@ -1221,7 +1221,8 @@ impl DatasetIndexExt for Dataset {
                     .is_none_or(|(details, expected)| details.type_url == expected)
             })
             .map(|idx| -> Result<Option<IndexMetadata>> {
-                let Some(existing_fragments) = idx.fragment_bitmap.as_ref() else {
+                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
+                else {
                     if incoming_fragments != dataset_fragments {
                         return Err(Error::invalid_input(format!(
                             "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",

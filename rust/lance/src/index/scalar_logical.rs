@@ -894,6 +894,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_then_commit_zonemap_segment_ignores_retired_fragment_coverage() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(64),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::ZoneMap, &params)
+                .name("value_zonemap_replace_retired".to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let original_coverage = segment.fragment_bitmap.as_ref().unwrap().clone();
+        assert!(original_coverage.contains(0));
+        assert!(original_coverage.contains(1));
+
+        dataset
+            .commit_existing_index_segments("value_zonemap_replace_retired", "value", vec![segment])
+            .await
+            .unwrap();
+
+        dataset.delete("value < 16").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 64,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let live_frags = dataset.fragment_bitmap.as_ref().clone();
+        assert!(!live_frags.contains(0), "compaction should retire frag 0");
+
+        let merged = dataset
+            .merge_existing_index_segments(
+                dataset
+                    .load_indices_by_name("value_zonemap_replace_retired")
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let merged_coverage = merged.fragment_bitmap.as_ref().unwrap().clone();
+
+        dataset
+            .commit_existing_index_segments("value_zonemap_replace_retired", "value", vec![merged])
+            .await
+            .unwrap();
+
+        let combined_bitmap =
+            scalar_index_fragment_bitmap(&dataset, "value", "value_zonemap_replace_retired")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(combined_bitmap, merged_coverage);
+    }
+
+    #[tokio::test]
     async fn test_merge_existing_index_segments_rejects_mismatched_zonemap_params() {
         let dataset = lance_datagen::gen_batch()
             .col("value", array::step::<Int32Type>())

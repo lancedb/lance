@@ -106,11 +106,11 @@ or merged into larger segments:
 
 Within a single commit, built segments must have disjoint fragment coverage.
 
-`merge_existing_index_segments(...)` currently supports vector, inverted, bitmap,
-and zone map segments. Other scalar index families can still commit multiple
-compatible segments directly when their build path supports fragment-scoped
-segments, but cannot be merged into a larger physical segment until they add a
-merge implementation.
+`merge_existing_index_segments(...)` currently supports vector, inverted,
+bitmap, BTree, and zone map segments. Other scalar index families can still
+commit multiple compatible segments directly when their build path supports
+fragment-scoped segments, but cannot be merged into a larger physical segment
+until they add a merge implementation.
 
 ## Internal Finalize Model
 
