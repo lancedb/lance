@@ -24,8 +24,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
-    TRACE_DATASET_EVENTS,
+    DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -104,7 +103,7 @@ use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
+use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -1201,8 +1200,15 @@ impl Dataset {
         &self,
         policy: CleanupPolicy,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        cleanup::cleanup_old_versions(self, policy).boxed()
+        async move { self.cleanup(policy).execute().await }.boxed()
+    }
+
+    /// Creates a cleanup operation for this dataset.
+    ///
+    /// The returned operation can be explained without deleting files, or
+    /// executed to re-evaluate the current dataset state and remove files.
+    pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
+        CleanupOperation::new(self, policy)
     }
 
     #[allow(clippy::too_many_arguments)]
