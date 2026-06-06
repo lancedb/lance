@@ -432,7 +432,8 @@ impl LsmScanner {
         let collector = self.build_collector();
         let base_schema = self.schema();
         let mut planner =
-            super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema);
+            super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema)
+                .with_filter(self.filter.clone());
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }

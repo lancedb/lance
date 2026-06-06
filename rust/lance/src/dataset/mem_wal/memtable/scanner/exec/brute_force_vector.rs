@@ -15,7 +15,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
+use arrow_array::{Array, BooleanArray, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -27,7 +27,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
@@ -53,6 +53,10 @@ pub struct MemTableBruteForceVectorExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     with_row_id: bool,
+    /// Optional prefilter predicate, compiled against the memtable schema.
+    /// Applied per row before the top-k cut so the KNN only ranks matching
+    /// rows (true prefilter, not a lossy post-filter on the top-k).
+    filter: Option<PhysicalExprRef>,
 }
 
 impl Debug for MemTableBruteForceVectorExec {
@@ -108,7 +112,39 @@ impl MemTableBruteForceVectorExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
+            filter: None,
         })
+    }
+
+    /// Attach an optional prefilter predicate (compiled against the memtable
+    /// schema). Rows that fail the predicate are excluded before the top-k cut.
+    pub fn with_filter(mut self, filter: Option<PhysicalExprRef>) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Evaluate the prefilter predicate against a memtable batch, returning a
+    /// keep-mask (`true` = retain). `Ok(None)` when no filter is configured.
+    fn filter_mask(&self, batch: &RecordBatch) -> Result<Option<BooleanArray>> {
+        let Some(ref predicate) = self.filter else {
+            return Ok(None);
+        };
+        let values = predicate
+            .evaluate(batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .map_err(|e| {
+                Error::invalid_input(format!("vector prefilter evaluation failed: {}", e))
+            })?;
+        let mask = values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "vector prefilter predicate did not evaluate to boolean".to_string(),
+                )
+            })?
+            .clone();
+        Ok(Some(mask))
     }
 
     /// Last row position visible under `max_visible_batch_position`, or `None`
@@ -207,10 +243,19 @@ impl MemTableBruteForceVectorExec {
                 ))
             })?;
 
+            // Prefilter: drop rows that fail the predicate before they reach the
+            // top-k heap (a NULL predicate result excludes the row, matching SQL).
+            let filter_mask = self.filter_mask(&stored_batch.data)?;
+
             for row in 0..n {
                 let pos = current_row + row as u64;
                 if pos > max_visible_row {
                     break;
+                }
+                if let Some(ref mask) = filter_mask
+                    && (!mask.is_valid(row) || !mask.value(row))
+                {
+                    continue;
                 }
                 if distances.is_null(row) {
                     continue;

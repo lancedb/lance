@@ -11,6 +11,7 @@ use datafusion::common::{ScalarValue, ToDFSchema};
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
+use datafusion_physical_expr::PhysicalExprRef;
 use futures::TryStreamExt;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
@@ -913,31 +914,53 @@ impl MemTableScanner {
     /// hasn't reached this writer yet (cold-start, or rows written between an
     /// index commit and the next memtable rotation), KNN must still produce
     /// correct, distance-bearing results so the LSM-level merge stays sound.
+    /// Compile the optional logical `filter` into a physical predicate against
+    /// the memtable schema. Shared by the vector and FTS search arms; mirrors the
+    /// compilation in [`Self::plan_full_scan`] (`optimize_expr` before
+    /// `create_physical_expr` for literal type coercion).
+    fn filter_predicate(&self) -> Result<Option<PhysicalExprRef>> {
+        let Some(ref filter) = self.filter else {
+            return Ok(None);
+        };
+        let planner = Planner::new(self.schema.clone());
+        let optimized = planner.optimize_expr(filter.clone())?;
+        Ok(Some(planner.create_physical_expr(&optimized)?))
+    }
+
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
         let max_visible = self.max_visible_batch_position;
         let projection_indices = self.compute_projection_indices()?;
         let base_schema = self.base_output_schema();
+        let filter_predicate = self.filter_predicate()?;
 
-        let exec: Arc<dyn ExecutionPlan> = if self.has_vector_index(&query.column) {
-            Arc::new(VectorIndexExec::new(
-                self.batch_store.clone(),
-                self.indexes.clone(),
-                query.clone(),
-                max_visible,
-                projection_indices,
-                base_schema,
-                self.with_row_id,
-            )?)
-        } else {
-            Arc::new(MemTableBruteForceVectorExec::new(
-                self.batch_store.clone(),
-                query.clone(),
-                max_visible,
-                projection_indices,
-                base_schema,
-                self.with_row_id,
-            )?)
-        };
+        // With a prefilter we use brute force (which masks rows before the
+        // top-k cut) rather than the HNSW arm, whose graph traversal cannot
+        // honor an arbitrary predicate. Memtables are bounded, so an exact
+        // filtered brute-force scan is cheap.
+        let exec: Arc<dyn ExecutionPlan> =
+            if filter_predicate.is_none() && self.has_vector_index(&query.column) {
+                Arc::new(VectorIndexExec::new(
+                    self.batch_store.clone(),
+                    self.indexes.clone(),
+                    query.clone(),
+                    max_visible,
+                    projection_indices,
+                    base_schema,
+                    self.with_row_id,
+                )?)
+            } else {
+                Arc::new(
+                    MemTableBruteForceVectorExec::new(
+                        self.batch_store.clone(),
+                        query.clone(),
+                        max_visible,
+                        projection_indices,
+                        base_schema,
+                        self.with_row_id,
+                    )?
+                    .with_filter(filter_predicate),
+                )
+            };
         self.apply_post_index_ops(exec).await
     }
 
@@ -952,6 +975,7 @@ impl MemTableScanner {
 
         let max_visible = self.max_visible_batch_position;
         let projection_indices = self.compute_projection_indices()?;
+        let filter_predicate = self.filter_predicate()?;
 
         let index_exec = FtsIndexExec::new(
             self.batch_store.clone(),
@@ -961,7 +985,8 @@ impl MemTableScanner {
             projection_indices,
             self.base_output_schema(),
             self.with_row_id,
-        )?;
+        )?
+        .with_filter(filter_predicate);
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
 

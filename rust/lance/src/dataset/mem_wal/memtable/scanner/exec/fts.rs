@@ -7,7 +7,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{BooleanArray, Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -19,7 +19,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
@@ -54,6 +54,10 @@ pub struct FtsIndexExec {
     max_visible_row: Option<u64>,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
+    /// Optional prefilter predicate, compiled against the memtable schema.
+    /// Applied to the materialized full-schema hits before projection so the
+    /// FTS arm only returns rows matching the predicate.
+    filter: Option<PhysicalExprRef>,
 }
 
 impl Debug for FtsIndexExec {
@@ -162,7 +166,15 @@ impl FtsIndexExec {
             batch_ranges,
             max_visible_row,
             with_row_id,
+            filter: None,
         })
+    }
+
+    /// Attach an optional prefilter predicate (compiled against the memtable
+    /// schema). Hits that fail the predicate are dropped before projection.
+    pub fn with_filter(mut self, filter: Option<PhysicalExprRef>) -> Self {
+        self.filter = filter;
+        self
     }
 
     /// Find batch for a row position using binary search. O(log n).
@@ -296,6 +308,51 @@ impl FtsIndexExec {
                 let concatenated = arrow_select::concat::concat(&refs)?;
                 final_columns.push(concatenated);
             }
+        }
+
+        // Prefilter: evaluate the predicate against the full-schema hits and drop
+        // non-matching rows before scoring/projection (a NULL result excludes the
+        // row, matching SQL). The active FTS arm has no internal top-k, so this is
+        // an exact prefilter, not a lossy post-filter.
+        let (mut final_columns, all_scores, all_row_positions) =
+            if let Some(ref predicate) = self.filter {
+                let Some(first) = self.batch_store.get(0) else {
+                    return Ok(vec![]);
+                };
+                let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
+                let mask = predicate
+                    .evaluate(&data_batch)?
+                    .into_array(data_batch.num_rows())?;
+                let mask = mask
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(
+                            "FTS prefilter predicate did not evaluate to boolean".to_string(),
+                        )
+                    })?;
+                let filtered_columns = data_batch
+                    .columns()
+                    .iter()
+                    .map(|c| arrow_select::filter::filter(c.as_ref(), mask))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let filtered_scores: Vec<f32> = all_scores
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(s, keep)| keep.unwrap_or(false).then_some(*s))
+                    .collect();
+                let filtered_positions: Vec<u64> = all_row_positions
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(p, keep)| keep.unwrap_or(false).then_some(*p))
+                    .collect();
+                (filtered_columns, filtered_scores, filtered_positions)
+            } else {
+                (final_columns, all_scores, all_row_positions)
+            };
+
+        if all_scores.is_empty() {
+            return Ok(vec![]);
         }
 
         // Add score column

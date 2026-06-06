@@ -18,6 +18,7 @@ use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
+use datafusion::prelude::Expr;
 use lance_core::Result;
 use lance_core::datatypes::OnMissing;
 use tracing::instrument;
@@ -96,6 +97,11 @@ pub struct LsmVectorSearchPlanner {
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
     warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Optional prefilter predicate applied to every source arm before its KNN
+    /// search, so rows failing the predicate never enter the top-k. Base and
+    /// flushed arms use the dataset scanner's native prefilter; memtable arms
+    /// route to a filtered brute-force scan.
+    filter: Option<Expr>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -125,7 +131,16 @@ impl LsmVectorSearchPlanner {
             session: None,
             flushed_cache: None,
             warmer: None,
+            filter: None,
         }
+    }
+
+    /// Attach an optional prefilter predicate. Every source arm restricts its
+    /// KNN to rows matching the predicate (true prefilter), so results match a
+    /// normal filtered vector scan over base ∪ flushed ∪ in-memory data.
+    pub fn with_filter(mut self, filter: Option<Expr>) -> Self {
+        self.filter = filter;
+        self
     }
 
     /// Thread a session into flushed-generation opens so the first open
@@ -450,6 +465,15 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                if let Some(ref filter) = self.filter {
+                    // Native scanner prefilter: the ANN runs over rows matching
+                    // the predicate, so the top-k holds only matching rows.
+                    // `prefilter(true)` is required — without it the scanner
+                    // post-filters the unfiltered top-k, dropping matching rows
+                    // that ranked below non-matching ones.
+                    scanner.filter_expr(filter.clone());
+                    scanner.prefilter(true);
+                }
                 // Only the base produces a meaningful `_rowid`. `_rowaddr`
                 // can't be combined with `fast_search()` — the IVF index
                 // doesn't preserve it and `TakeExec` refuses to insert it
@@ -482,6 +506,12 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                if let Some(ref filter) = self.filter {
+                    // See the base arm: `prefilter(true)` makes this a true
+                    // prefilter rather than a lossy post-filter on the top-k.
+                    scanner.filter_expr(filter.clone());
+                    scanner.prefilter(true);
+                }
                 // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
@@ -505,6 +535,11 @@ impl LsmVectorSearchPlanner {
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                if let Some(ref filter) = self.filter {
+                    // Routed to filtered brute-force (see `plan_vector_search`):
+                    // the predicate masks rows before the memtable top-k cut.
+                    scanner.filter_expr(filter.clone());
+                }
                 // Expose `_rowid` (BatchStore row offset, monotonic with
                 // insert order) so `NewestPkFilterExec` can compare each hit's
                 // position against the PK-position index. The value is
@@ -840,6 +875,185 @@ mod tests {
             dist_col.value(0).abs() < 1e-3,
             "expected near-zero distance for self-match, got {}",
             dist_col.value(0)
+        );
+    }
+
+    /// A prefilter on a vector search must restrict the KNN to rows matching the
+    /// predicate, even though the nearest (and second-nearest) rows fail it. The
+    /// active memtable has an HNSW index, but a filtered search routes to the
+    /// brute-force arm, which masks rows before the top-k cut.
+    #[tokio::test]
+    async fn test_vector_search_prefilter_restricts_to_matching_rows() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::{SessionContext, col, lit};
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        // Base rows are far from the query and unindexed, so `fast_search`
+        // contributes nothing; the test isolates the memtable prefilter.
+        let base_dataset = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[100, 200])]).await,
+        );
+
+        // Active memtable with ids 0..=3 (id=1 is the exact match, id=0 ties id=2).
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let batch = create_test_batch(&schema, &[0, 1, 2, 3]);
+        batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        )
+        // `id >= 2` excludes the two nearest rows (id=1 exact, id=0 tie).
+        .with_filter(Some(col("id").gt_eq(lit(2i32))));
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 10, 1, None, false, 1.0)
+            .await
+            .expect("planner should produce a filtered plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+
+        // Only id=2 and id=3 satisfy `id >= 2`; the nearer id=0/id=1 are excluded.
+        assert_eq!(
+            ids.first().copied(),
+            Some(2),
+            "nearest matching row is id=2"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![2, 3],
+            "prefilter must drop id=0 and id=1 (nearer but failing `id >= 2`)"
+        );
+    }
+
+    /// The *base* arm must apply the filter as a true prefilter, not a
+    /// post-filter on the unfiltered top-k. The base is vector-indexed (so
+    /// `fast_search` uses the index); the two rows nearest the query (id=1, id=2)
+    /// fail the predicate while matching rows (id>=3) are farther. Without
+    /// `scanner.prefilter(true)` the base arm runs the ANN unfiltered, takes the
+    /// top-`k`, then post-filters — dropping every row. A true prefilter restricts
+    /// the ANN to matching rows. Regression for a missing base-arm `prefilter(true)`.
+    #[tokio::test]
+    async fn test_vector_search_base_prefilter_is_not_a_lossy_postfilter() {
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::{SessionContext, col, lit};
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // L2 distance to the query grows monotonically with id (id=1 is the exact
+        // match), so the two nearest rows are id=1, id=2 — both excluded by `id>=3`.
+        let base_batch = create_test_batch(&schema, &[1, 2, 3, 4, 5, 6]);
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        let collector = LsmDataSourceCollector::new(base_dataset.clone(), vec![]);
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        )
+        .with_dataset(base_dataset)
+        // Keeps only id>=3, the *farther* matches. A post-filter on the
+        // unfiltered top-2 (id=1, id=2) would drop everything.
+        .with_filter(Some(col("id").gt_eq(lit(3i32))));
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 2, 1, None, false, 1.0)
+            .await
+            .expect("planner should produce a filtered base plan");
+
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        assert_eq!(
+            ids.first().copied(),
+            Some(3),
+            "nearest matching base row is id=3; got {ids:?}"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![3, 4],
+            "base prefilter must return the two nearest matches (id=3, id=4), not \
+             post-filter the unfiltered top-2 (id=1, id=2) down to nothing; got {ids:?}"
         );
     }
 
