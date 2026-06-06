@@ -1986,50 +1986,14 @@ mod tests {
     /// Regression test for <https://github.com/lance-format/lance/issues/6944>.
     #[tokio::test]
     async fn test_open_index_file_skips_head_when_size_known() {
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
         use lance_index::INDEX_FILE_NAME;
-        use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore};
+        use lance_io::assert_io_eq;
+        use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 
-        /// Counts metadata reads (`get_opts`) against the index file.
-        #[derive(Debug)]
-        struct HeadCounter(Arc<AtomicUsize>);
-
-        impl WrappingObjectStore for HeadCounter {
-            fn wrap(
-                &self,
-                _store_prefix: &str,
-                original: Arc<dyn object_store::ObjectStore>,
-            ) -> Arc<dyn object_store::ObjectStore> {
-                let counter = self.0.clone();
-                let mut policy = ProxyObjectStorePolicy::new();
-                policy.set_before_policy(
-                    "count_index_metadata_reads",
-                    Arc::new(move |method: &str, path: &Path| {
-                        if method == "get_opts" && path.as_ref().ends_with(INDEX_FILE_NAME) {
-                            counter.fetch_add(1, Ordering::SeqCst);
-                        }
-                        Ok(())
-                    }),
-                );
-                Arc::new(ProxyObjectStore::new(
-                    original,
-                    Arc::new(Mutex::new(policy)),
-                ))
-            }
-        }
-
-        let heads = Arc::new(AtomicUsize::new(0));
-        let params = ObjectStoreParams {
-            object_store_wrapper: Some(Arc::new(HeadCounter(heads.clone()))),
-            ..Default::default()
-        };
         let (store, base) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             "memory:///",
-            &params,
+            &ObjectStoreParams::default(),
         )
         .await
         .unwrap();
@@ -2042,25 +2006,29 @@ mod tests {
         let file_sizes = HashMap::from([(INDEX_FILE_NAME.to_string(), data.len() as u64)]);
 
         // Size recorded in the manifest, so reading the size issues no HEAD.
-        heads.store(0, Ordering::SeqCst);
+        let _ = store.io_stats_incremental(); // reset
         let reader = open_index_file(store.as_ref(), &path, INDEX_FILE_NAME, &file_sizes)
             .await
             .unwrap();
         assert_eq!(reader.size().await.unwrap(), data.len());
-        assert_eq!(
-            heads.load(Ordering::SeqCst),
+        let stats = store.io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
             0,
             "a known file size must not trigger a HEAD request"
         );
 
         // Size unknown, as in an older index, so it falls back to a HEAD.
-        heads.store(0, Ordering::SeqCst);
+        let _ = store.io_stats_incremental(); // reset
         let reader = open_index_file(store.as_ref(), &path, INDEX_FILE_NAME, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(reader.size().await.unwrap(), data.len());
-        assert_eq!(
-            heads.load(Ordering::SeqCst),
+        let stats = store.io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
             1,
             "an unknown file size must fall back to exactly one HEAD request"
         );
