@@ -16,7 +16,7 @@ use opendal::{Operator, services::S3};
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
-    ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
+    BackoffConfig, ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
     StaticCredentialProvider,
     aws::{
         AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
@@ -48,7 +48,11 @@ impl AwsStoreProvider {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
-            backoff: Default::default(),
+            backoff: BackoffConfig {
+                init_backoff: Duration::from_millis(storage_options.client_backoff_init_ms()),
+                max_backoff: Duration::from_millis(storage_options.client_backoff_max_ms()),
+                base: storage_options.client_backoff_base(),
+            },
             max_retries: storage_options.client_max_retries(),
             retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
