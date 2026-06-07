@@ -1221,6 +1221,13 @@ impl DatasetIndexExt for Dataset {
                     return Ok(Some(idx));
                 };
 
+                // A zero-fragment segment can be used to create an index while
+                // deferring the actual build. Such a segment is disjoint from every
+                // other segment but should still be removed.
+                if existing_fragments.is_empty() {
+                    return Ok(Some(idx));
+                }
+
                 if existing_fragments.is_disjoint(&incoming_fragments) {
                     return Ok(None);
                 }
@@ -6711,6 +6718,69 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("would orphan fragments"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_removes_empty_segment() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let uuid = Uuid::new_v4();
+
+        // Commit a 0-fragment segment, then a real segment covering the dataset.
+        let empty = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            uuid,
+            std::iter::empty::<u32>(),
+            b"empty",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&empty)],
+            )
+            .await
+            .unwrap();
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+
+        // The real segment covers the dataset, so the redundant empty one is removed.
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            committed.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
+            HashSet::from([seg.uuid]),
+            "empty segment should be removed once a real segment covers the dataset",
+        );
     }
 
     #[tokio::test]
