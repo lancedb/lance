@@ -73,6 +73,7 @@ mod branch_location;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
+pub mod files;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;

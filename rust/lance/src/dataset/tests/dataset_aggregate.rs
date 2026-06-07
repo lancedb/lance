@@ -1351,6 +1351,9 @@ async fn test_scanner_count_rows_with_partial_index_coverage() {
     scanner
         .aggregate(AggregateExpr::builder().count_star().build())
         .unwrap();
+    // Pin target_parallelism=1 so EnforceDistribution produces a deterministic
+    // plan snapshot regardless of the machine's CPU count.
+    scanner.target_parallelism(1);
     let plan = scanner.create_plan().await.unwrap();
 
     assert_plan_node_equals(

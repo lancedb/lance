@@ -13,7 +13,9 @@ use super::{
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
+use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
@@ -1842,7 +1844,15 @@ pub(crate) async fn remap_index_file(
     let old_path = dataset.indices_dir().join(old_uuid).join(INDEX_FILE_NAME);
     let new_path = dataset.indices_dir().join(new_uuid).join(INDEX_FILE_NAME);
 
-    let reader: Arc<dyn Reader> = object_store.open(&old_path).await?.into();
+    let file_sizes = dataset
+        .load_index(old_uuid)
+        .await?
+        .map(|index| index.file_size_map())
+        .unwrap_or_default();
+    let reader: Arc<dyn Reader> =
+        open_index_file(object_store, &old_path, INDEX_FILE_NAME, &file_sizes)
+            .await?
+            .into();
     let mut writer = object_store.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;

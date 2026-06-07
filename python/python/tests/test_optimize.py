@@ -330,11 +330,9 @@ def test_describe_indices_matches_list_indices_for_frag_reuse(tmp_path: Path):
     string for every index, including the __lance_frag_reuse system index
     that defer_index_remap produces.
 
-    list_indices() special-cases system indices via infer_system_index_type()
-    in python/src/dataset.rs. describe_indices() in
-    rust/lance/src/index.rs::IndexDescriptionImpl::try_new does not, so it
-    falls through to a plugin lookup that has no entry for
-    FragmentReuseIndexDetails and reports 'Unknown' instead.
+    list_indices() is a wrapper over describe_indices(), so the two must stay
+    in sync. System indices are identified by name via infer_system_index_type()
+    in rust/lance/src/index.rs::IndexDescriptionImpl::try_new.
     """
     base_dir = tmp_path / "dataset"
     data = pa.table({"i": range(6_000), "val": range(6_000)})
