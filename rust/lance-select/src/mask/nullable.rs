@@ -62,7 +62,13 @@ impl NullableRowAddrSet {
         &self.nulls
     }
 
-    /// Get the selected rows (True and Null)
+    /// Get the raw `selected` bitmap.
+    ///
+    /// This is the backing field, **not** a semantic "TRUE ∪ NULL" set: a NULL
+    /// row may be stored only in `nulls` without appearing in `selected`. Use
+    /// this when you want a zero-copy view of the raw representation (e.g.
+    /// wire serialization that sends `selected` and `nulls` as separate sets).
+    /// For "TRUE rows only", use [`Self::true_rows`].
     pub fn selected_rows(&self) -> &RowAddrTreeMap {
         &self.selected
     }
@@ -98,9 +104,11 @@ impl NullableRowAddrSet {
 
 impl PartialEq for NullableRowAddrSet {
     fn eq(&self, other: &Self) -> bool {
-        // `selected` is the union of TRUE and NULL rows; combined with `nulls`,
-        // equality of these two fields implies equality of TRUE rows too.
-        self.selected == other.selected && self.nulls == other.nulls
+        // Semantic equality: two sets are equal iff they decode to the same
+        // Kleene state on every row. Comparing raw `selected` would be wrong
+        // because a NULL row can be represented either inside or outside the
+        // `selected` bitmap.
+        self.true_rows() == other.true_rows() && self.nulls == other.nulls
     }
 }
 
@@ -483,6 +491,20 @@ mod tests {
         // [T, T, T, T, N, N, T, N, F]
         assert_eq!(&result.true_rows(), &rows(&[1, 2, 3, 4, 7]));
         assert_eq!(result.null_rows(), &rows(&[5, 6, 8]));
+    }
+
+    #[test]
+    fn test_partial_eq_semantic_equivalence() {
+        // Two representations of "row 5 is NULL, nothing is TRUE":
+        //   a: selected={5}, nulls={5}  (NULL row also in selected)
+        //   b: selected={},  nulls={5}  (NULL row only in nulls)
+        // Both decode to the same Kleene state on every row, so they must
+        // compare equal under semantic PartialEq.
+        let a = NullableRowAddrSet::new(rows(&[5]), rows(&[5]));
+        let b = NullableRowAddrSet::new(rows(&[]), rows(&[5]));
+        assert_eq!(a, b);
+        assert_eq!(a.true_rows(), b.true_rows());
+        assert_eq!(a.null_rows(), b.null_rows());
     }
 
     #[test]
