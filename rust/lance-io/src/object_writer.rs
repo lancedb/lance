@@ -393,20 +393,17 @@ impl AsyncWrite for ObjectWriter {
                     part_idx,
                     futures,
                     ..
-                } => {
-                    // TODO: Make max concurrency configurable from storage options.
-                    if futures.len() < max_upload_parallelism() {
-                        let data = Self::next_part_buffer(
-                            &mut mut_self.buffer,
-                            *part_idx,
-                            mut_self.use_constant_size_upload_parts,
-                        );
-                        futures.spawn(
-                            Self::put_part(upload.as_mut(), data, *part_idx, None)
-                                .instrument(tracing::Span::current()),
-                        );
-                        *part_idx += 1;
-                    }
+                } if futures.len() < max_upload_parallelism() => {
+                    let data = Self::next_part_buffer(
+                        &mut mut_self.buffer,
+                        *part_idx,
+                        mut_self.use_constant_size_upload_parts,
+                    );
+                    futures.spawn(
+                        Self::put_part(upload.as_mut(), data, *part_idx, None)
+                            .instrument(tracing::Span::current()),
+                    );
+                    *part_idx += 1;
                 }
                 _ => {}
             }
