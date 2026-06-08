@@ -21,6 +21,7 @@ fn main() -> Result<()> {
             "./protos/index.proto",
             "./protos/index_old.proto",
             "./protos/cache_fts.proto",
+            "./protos/cache_scalar.proto",
         ],
         &["./protos"],
     )?;

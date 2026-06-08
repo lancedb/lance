@@ -442,6 +442,50 @@ pub fn read_ipc_section_at(data: &Bytes, offset: &mut usize) -> Result<RecordBat
     read_ipc_stream_single_at(data, offset)
 }
 
+/// Write `batches` as a single 64-byte-aligned multi-batch Arrow IPC section.
+///
+/// Like [`write_ipc_section`] but emits every batch from `iter` into one IPC
+/// stream (schema + N batches + EOS). `iter` must yield at least one batch.
+/// Paired with [`read_ipc_section_batches_at`].
+pub fn write_ipc_section_batches<I>(
+    writer: &mut dyn Write,
+    pos: &mut usize,
+    iter: I,
+) -> Result<(), ArrowError>
+where
+    I: IntoIterator<Item = RecordBatch>,
+{
+    let pad = section_padding(*pos);
+    if pad > 0 {
+        const ZEROS: [u8; IPC_SECTION_ALIGNMENT] = [0u8; IPC_SECTION_ALIGNMENT];
+        writer
+            .write_all(&ZEROS[..pad])
+            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+        *pos += pad;
+    }
+
+    let mut counting = CountingWriter {
+        inner: writer,
+        count: 0,
+    };
+    write_ipc_stream_batches(iter, &mut counting)?;
+    *pos += counting.count;
+    Ok(())
+}
+
+/// Read all [`RecordBatch`]es from an aligned multi-batch IPC section at
+/// `offset`, advancing `offset` past the section (padding + stream + EOS).
+///
+/// Zero-copy: array buffers borrow from `data`'s allocation when `data`'s base
+/// address is at least 64-byte aligned (see [`write_ipc_section_batches`]).
+pub fn read_ipc_section_batches_at(
+    data: &Bytes,
+    offset: &mut usize,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    *offset += section_padding(*offset);
+    read_ipc_stream_at(data, offset)
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{ArrayRef, record_batch};
@@ -541,6 +585,36 @@ mod tests {
                      [{data_base:#x}..{data_end:#x}) — misaligned section",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_aligned_multi_batch_section_roundtrip_zero_copy() {
+        // A multi-batch section (e.g. IVF SQ storage chunks) must round-trip
+        // every batch and decode the first batch's buffers zero-copy.
+        let b1 = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
+        let b2 = record_batch!(("v", Int64, [4i64, 5])).unwrap();
+        let b3 = record_batch!(("v", Int64, [6i64])).unwrap();
+
+        let mut buf = vec![0xCDu8; 5];
+        let mut pos = buf.len();
+        write_ipc_section_batches(&mut buf, &mut pos, [b1.clone(), b2.clone(), b3.clone()])
+            .unwrap();
+
+        let data = aligned_bytes(&buf);
+        let mut offset = 5;
+        let read = read_ipc_section_batches_at(&data, &mut offset).unwrap();
+        assert_eq!(read, vec![b1, b2, b3]);
+        assert_eq!(offset, buf.len(), "offset should land at section end");
+
+        let data_base = data.as_ptr() as usize;
+        let data_end = data_base + data.len();
+        for buffer in read[0].column(0).to_data().buffers() {
+            let ptr = buffer.as_ptr() as usize;
+            assert!(
+                ptr >= data_base && ptr < data_end,
+                "first batch buffer at {ptr:#x} was realigned out of the input",
+            );
         }
     }
 }

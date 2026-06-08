@@ -15,6 +15,7 @@ use super::{
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
+use crate::cache_scalar_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -52,7 +53,6 @@ use futures::{
     future::BoxFuture,
     stream::{self},
 };
-use lance_arrow::ipc::{read_ipc_stream_single_at, write_ipc_stream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -1408,107 +1408,53 @@ impl CacheCodecImpl for BTreeIndexState {
     const TYPE_ID: &'static str = "lance.scalar.BTreeIndexState";
     const CURRENT_VERSION: u32 = 1;
 
-    /// Wire format (no stability guarantees yet — the cache is rebuilt from
-    /// source on any version mismatch):
+    /// Wire format:
     /// ```text
-    /// u64 batch_size (LE)
-    /// u8  has_ranges (0 = None, 1 = Some)
-    /// if has_ranges:
-    ///   u32 entry_count (LE)
-    ///   per entry: u32 start | u32 end | u32 offset | u32 path_len | path bytes
-    /// lookup batch (Arrow IPC stream)
+    /// HEADER    : BTreeIndexHeader proto (batch_size + page-range mapping)
+    /// ARROW_IPC : page-lookup batch
     /// ```
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        let writer = w.raw_writer();
-        writer.write_all(&self.batch_size.to_le_bytes())?;
-        match &self.ranges_to_files {
-            None => writer.write_all(&[0u8])?,
-            Some(ranges) => {
-                writer.write_all(&[1u8])?;
-                let count = u32::try_from(ranges.len()).map_err(|_| {
-                    Error::io("BTreeIndexState: ranges_to_files exceeds u32::MAX entries")
-                })?;
-                writer.write_all(&count.to_le_bytes())?;
-                for (range, (path, page_offset)) in ranges.iter() {
-                    writer.write_all(&range.start().to_le_bytes())?;
-                    writer.write_all(&range.end().to_le_bytes())?;
-                    writer.write_all(&page_offset.to_le_bytes())?;
-                    let path_len = u32::try_from(path.len()).map_err(|_| {
-                        Error::io("BTreeIndexState: ranges_to_files path exceeds u32::MAX bytes")
-                    })?;
-                    writer.write_all(&path_len.to_le_bytes())?;
-                    writer.write_all(path.as_bytes())?;
-                }
-            }
-        }
-        write_ipc_stream(&self.lookup_batch, writer)?;
+        let ranges_to_files = match &self.ranges_to_files {
+            None => Vec::new(),
+            Some(ranges) => ranges
+                .iter()
+                .map(|(range, (path, page_offset))| RangeToFile {
+                    start: *range.start(),
+                    end: *range.end(),
+                    page_offset: *page_offset,
+                    path: path.clone(),
+                })
+                .collect(),
+        };
+        let header = BTreeIndexHeader {
+            batch_size: self.batch_size,
+            has_ranges_to_files: self.ranges_to_files.is_some(),
+            ranges_to_files,
+        };
+        w.write_header(&header)?;
+        w.write_ipc(&self.lookup_batch)?;
         Ok(())
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
-        let body = r.body();
-        let data = &body;
-        let mut offset = 0;
-        let batch_size = read_u64_le(data, &mut offset)?;
-        let has_ranges = read_u8(data, &mut offset)?;
-        let ranges_to_files = match has_ranges {
-            0 => None,
-            1 => {
-                let count = read_u32_le(data, &mut offset)? as usize;
-                let mut entries = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let start = read_u32_le(data, &mut offset)?;
-                    let end = read_u32_le(data, &mut offset)?;
-                    let page_offset = read_u32_le(data, &mut offset)?;
-                    let path_len = read_u32_le(data, &mut offset)? as usize;
-                    let path = read_bytes(data, &mut offset, path_len)?;
-                    let path = std::str::from_utf8(&path)
-                        .map_err(|e| Error::io(format!("BTreeIndexState path: {e}")))?
-                        .to_string();
-                    entries.push((start..=end, (path, page_offset)));
-                }
-                Some(Arc::new(entries.into_iter().collect()))
-            }
-            other => {
-                return Err(Error::io(format!(
-                    "BTreeIndexState: invalid has_ranges tag {other}"
-                )));
-            }
+        let header: BTreeIndexHeader = r.read_header()?;
+        let ranges_to_files = if header.has_ranges_to_files {
+            let map: RangeInclusiveMap<u32, (String, u32)> = header
+                .ranges_to_files
+                .into_iter()
+                .map(|entry| (entry.start..=entry.end, (entry.path, entry.page_offset)))
+                .collect();
+            Some(Arc::new(map))
+        } else {
+            None
         };
-        let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let lookup_batch = r.read_ipc()?;
         Ok(Self {
             lookup_batch,
-            batch_size,
+            batch_size: header.batch_size,
             ranges_to_files,
         })
     }
-}
-
-fn read_bytes(data: &bytes::Bytes, offset: &mut usize, len: usize) -> Result<bytes::Bytes> {
-    if data.len() < *offset + len {
-        return Err(Error::io(format!(
-            "BTreeIndexState: short read of {len} bytes at offset {offset} (have {})",
-            data.len()
-        )));
-    }
-    let slice = data.slice(*offset..*offset + len);
-    *offset += len;
-    Ok(slice)
-}
-
-fn read_u8(data: &bytes::Bytes, offset: &mut usize) -> Result<u8> {
-    let bytes = read_bytes(data, offset, 1)?;
-    Ok(bytes[0])
-}
-
-fn read_u32_le(data: &bytes::Bytes, offset: &mut usize) -> Result<u32> {
-    let bytes = read_bytes(data, offset, 4)?;
-    Ok(u32::from_le_bytes(bytes.as_ref().try_into().unwrap()))
-}
-
-fn read_u64_le(data: &bytes::Bytes, offset: &mut usize) -> Result<u64> {
-    let bytes = read_bytes(data, offset, 8)?;
-    Ok(u64::from_le_bytes(bytes.as_ref().try_into().unwrap()))
 }
 
 /// Cache key for a [`BTreeIndexState`]. The cache it is used with is already
@@ -6018,18 +5964,57 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    /// The lookup batch must decode zero-copy through the full envelope even
+    /// though the proto header pushes the IPC section to a non-aligned offset.
     #[test]
-    fn test_btree_index_state_rejects_invalid_has_ranges_tag() {
-        // u64 batch_size (any) then a bad has_ranges tag.
+    fn test_btree_index_state_lookup_is_zero_copy() {
+        use lance_core::cache::CacheCodec;
+        const ALIGN: usize = 64;
+
+        let ranges: RangeInclusiveMap<u32, (String, u32)> =
+            [(0..=99, ("part_0_page_file.lance".to_string(), 0))]
+                .into_iter()
+                .collect();
+        let state = BTreeIndexState {
+            lookup_batch: sample_lookup_batch(),
+            batch_size: 8192,
+            ranges_to_files: Some(Arc::new(ranges)),
+        };
+
+        let codec = CacheCodec::from_impl::<BTreeIndexState>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(state);
         let mut buf = Vec::new();
-        buf.extend_from_slice(&1000u64.to_le_bytes());
-        buf.push(7u8);
-        let err = deserialize_state(buf).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("has_ranges") && msg.contains("7"),
-            "expected error to mention the bad has_ranges tag, got: {msg}"
-        );
+        codec.serialize(&any, &mut buf).unwrap();
+
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = bytes::Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).unwrap().hit().unwrap();
+        let restored = restored.downcast::<BTreeIndexState>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.lookup_batch.columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "lookup batch buffer was realigned out of the input — misaligned IPC section",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_btree_index_state_rejects_truncated_header() {
+        // A header length prefix that overruns the buffer must error rather
+        // than panic or silently misread it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes()); // claims a 100-byte header
+        buf.extend_from_slice(&[0u8; 4]); // but only 4 bytes follow
+        assert!(deserialize_state(buf).is_err());
     }
 
     #[tokio::test]

@@ -13,7 +13,6 @@ use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
 use lance_arrow::RecordBatchExt;
-use lance_arrow::ipc::{read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream};
 use lance_core::Result;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::deepsize::DeepSizeOf;
@@ -241,15 +240,18 @@ impl CacheCodecImpl for FlatIndex {
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         // Format:
-        // [len-prefixed all_addrs_map][len-prefixed null_addrs_map][batch IPC stream]
-        let writer = w.raw_writer();
-        writer.write_all(&(self.all_addrs_map.serialized_size() as u64).to_le_bytes())?;
-        self.all_addrs_map.serialize_into(&mut *writer)?;
+        // RAW_BLOB  : all_addrs_map (roaring tree map)
+        // RAW_BLOB  : null_addrs_map (roaring tree map)
+        // ARROW_IPC : data batch
+        let mut all_addrs_bytes = Vec::with_capacity(self.all_addrs_map.serialized_size());
+        self.all_addrs_map.serialize_into(&mut all_addrs_bytes)?;
+        w.write_raw(&all_addrs_bytes)?;
 
-        writer.write_all(&(self.null_addrs_map.serialized_size() as u64).to_le_bytes())?;
-        self.null_addrs_map.serialize_into(&mut *writer)?;
+        let mut null_addrs_bytes = Vec::with_capacity(self.null_addrs_map.serialized_size());
+        self.null_addrs_map.serialize_into(&mut null_addrs_bytes)?;
+        w.write_raw(&null_addrs_bytes)?;
 
-        write_ipc_stream(self.data.as_ref(), writer)?;
+        w.write_ipc(self.data.as_ref())?;
 
         Ok(())
     }
@@ -258,16 +260,13 @@ impl CacheCodecImpl for FlatIndex {
     where
         Self: Sized,
     {
-        let body = r.body();
-        let data = &body;
-        let mut offset = 0;
-        let all_addrs_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let all_addrs_bytes = r.read_raw()?;
         let all_addrs_map = RowAddrTreeMap::deserialize_from(all_addrs_bytes.as_ref())?;
 
-        let null_addrs_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let null_addrs_bytes = r.read_raw()?;
         let null_addrs_map = RowAddrTreeMap::deserialize_from(null_addrs_bytes.as_ref())?;
 
-        let batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let batch = r.read_ipc()?;
 
         let df_schema = DFSchema::try_from(batch.schema())?;
 
@@ -343,6 +342,41 @@ mod tests {
         // Empty index
         let empty = RecordBatch::new_empty(example_index().data.schema());
         assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
+    }
+
+    /// The data batch must decode zero-copy through the full envelope-bearing
+    /// [`CacheCodec`], even though the two roaring blobs and the envelope push
+    /// the IPC section to a non-aligned starting offset.
+    #[test]
+    fn test_flat_index_data_is_zero_copy() {
+        use lance_core::cache::CacheCodec;
+        const ALIGN: usize = 64;
+
+        let index = example_index();
+        let codec = CacheCodec::from_impl::<FlatIndex>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(index);
+        let mut buf = Vec::new();
+        codec.serialize(&any, &mut buf).unwrap();
+
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = bytes::Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).unwrap().hit().unwrap();
+        let restored = restored.downcast::<FlatIndex>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.data.columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "data batch buffer was realigned out of the input — misaligned IPC section",
+                );
+            }
+        }
     }
 
     #[tokio::test]

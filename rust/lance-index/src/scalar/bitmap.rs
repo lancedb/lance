@@ -18,10 +18,6 @@ use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_arrow::ipc::{
-    read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
-    write_len_prefixed_bytes,
-};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -215,6 +211,32 @@ impl BitmapIndexState {
             frag_reuse_index,
         )))
     }
+
+    /// Build a state directly from its parts, for codec tests in sibling
+    /// modules (e.g. the label-list index, which nests a bitmap state).
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        index_map: BTreeMap<OrderableScalarValue, usize>,
+        null_map: RowAddrTreeMap,
+        value_type: DataType,
+    ) -> Result<Self> {
+        Ok(Self {
+            lookup_batch: build_lookup_batch(&index_map, &value_type)?,
+            null_map: Arc::new(null_map),
+            value_type,
+            index_map: Arc::new(index_map),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup_batch(&self) -> &RecordBatch {
+        &self.lookup_batch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn null_map(&self) -> &RowAddrTreeMap {
+        &self.null_map
+    }
 }
 
 fn build_lookup_batch(
@@ -259,26 +281,22 @@ impl CacheCodecImpl for BitmapIndexState {
 
     /// Wire format:
     /// ```text
-    /// [u64 null_map_len][null_map bytes]
-    /// [arrow IPC stream: (keys: <value_type>, offsets: UInt64)]
+    /// RAW_BLOB  : null_map (roaring tree map, portable encoding)
+    /// ARROW_IPC : (keys: <value_type>, offsets: UInt64)
     /// ```
-    /// The value type is recovered from the IPC stream schema.
+    /// The value type is recovered from the IPC section schema.
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        let writer = w.raw_writer();
         let mut null_bytes = Vec::with_capacity(self.null_map.serialized_size());
         self.null_map.serialize_into(&mut null_bytes)?;
-        write_len_prefixed_bytes(writer, &null_bytes)?;
-        write_ipc_stream(&self.lookup_batch, writer)?;
+        w.write_raw(&null_bytes)?;
+        w.write_ipc(&self.lookup_batch)?;
         Ok(())
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
-        let body = r.body();
-        let data = &body;
-        let mut offset = 0;
-        let null_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let null_bytes = r.read_raw()?;
         let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
-        let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let lookup_batch = r.read_ipc()?;
         let value_type = lookup_batch.schema().field(0).data_type().clone();
         let index_map = Arc::new(parse_lookup_batch(&lookup_batch)?);
         Ok(Self {
@@ -1867,6 +1885,53 @@ mod tests {
             index_map: Arc::new(BTreeMap::new()),
         };
         assert_state_roundtrips(&empty_state);
+    }
+
+    /// The lookup batch must decode zero-copy through the full envelope-bearing
+    /// [`CacheCodec`] even though the envelope pushes the IPC section to a
+    /// non-aligned starting offset.
+    #[test]
+    fn test_bitmap_index_state_lookup_is_zero_copy() {
+        const ALIGN: usize = 64;
+        let mut index_map = BTreeMap::new();
+        for k in 0..32i32 {
+            index_map.insert(
+                OrderableScalarValue(ScalarValue::Int32(Some(k))),
+                k as usize,
+            );
+        }
+        let state = BitmapIndexState {
+            lookup_batch: build_lookup_batch(&index_map, &DataType::Int32).unwrap(),
+            null_map: Arc::new(RowAddrTreeMap::new()),
+            value_type: DataType::Int32,
+            index_map: Arc::new(index_map),
+        };
+
+        let codec = CacheCodec::from_impl::<BitmapIndexState>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(state);
+        let mut buf = Vec::new();
+        codec.serialize(&any, &mut buf).unwrap();
+
+        // Model a backend reading into a 64-byte-aligned buffer.
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = bytes::Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).unwrap().hit().unwrap();
+        let restored = restored.downcast::<BitmapIndexState>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.lookup_batch.columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "lookup batch buffer was realigned out of the input — misaligned IPC section",
+                );
+            }
+        }
     }
 
     #[tokio::test]

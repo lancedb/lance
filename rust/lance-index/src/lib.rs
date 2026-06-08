@@ -74,6 +74,12 @@ pub mod cache_pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.cache.fts.rs"));
 }
 
+/// Protobuf headers for serialized scalar-index cache entries (e.g. BTree).
+pub mod cache_scalar_pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.scalar.rs"));
+}
+
 /// Generic methods common across all types of secondary indices
 ///
 #[async_trait]

@@ -7,18 +7,21 @@
 //! cache backends, behind the stabilized envelope written by
 //! [`CacheCodec`](lance_core::cache::CacheCodec).
 //!
-//! The compressed posting list uses a protobuf header (see
-//! `protos/cache_fts.proto`, with the tail/position codecs and position-storage
-//! kind as proto enums) followed by 64-byte-aligned Arrow IPC sections for the
-//! `blocks` and shared block-offsets, plus a raw blob for the
-//! [`SharedPositionStream`] byte buffer (which already has its own portable
-//! encoding). The plain posting list and the standalone [`Positions`] codec
-//! still use the older JSON-header + `u8`-tag framing pending their own
-//! migration; both read back zero-copy via [`lance_arrow::ipc`].
+//! Every variant uses a protobuf header (see `protos/cache_fts.proto`, with the
+//! tail/position codecs and position-storage kind as proto enums) followed by
+//! 64-byte-aligned Arrow IPC sections and, where applicable, raw blobs:
 //!
-//! This is the FTS counterpart of `partition_serde.rs` for vector indices.
+//! - the compressed posting list: an IPC section for `blocks`, then the
+//!   position sections (legacy IPC, or shared block-offsets IPC + a raw blob of
+//!   the [`SharedPositionStream`] byte buffer, which has its own portable
+//!   encoding);
+//! - the plain posting list: an IPC section of `(row_ids, frequencies)`, then
+//!   an optional legacy position IPC section;
+//! - the standalone [`Positions`] codec: the position sections alone.
+//!
+//! All sections read back zero-copy via [`lance_arrow::ipc`]. This is the FTS
+//! counterpart of `partition_serde.rs` for vector indices.
 
-use std::io::Write;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -27,18 +30,14 @@ use arrow_array::{
     Array, Float32Array, LargeBinaryArray, ListArray, RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use bytes::Bytes;
-use lance_arrow::ipc::{
-    read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
-    write_len_prefixed_bytes,
-};
+use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
 
 use crate::cache_pb::{
-    CompressedPostingHeader, PositionStorage as PbPositionStorage,
-    PositionStreamCodec as PbPositionStreamCodec, PostingTailCodec as PbPostingTailCodec,
+    CompressedPostingHeader, PlainPostingHeader, PositionStorage as PbPositionStorage,
+    PositionStreamCodec as PbPositionStreamCodec, PositionsHeader,
+    PostingTailCodec as PbPostingTailCodec,
 };
 
 use super::index::{
@@ -53,19 +52,12 @@ use super::index::{
 const POSTING_VARIANT_PLAIN: u8 = 0;
 const POSTING_VARIANT_COMPRESSED: u8 = 1;
 
-const POSITIONS_TAG_NONE: u8 = 0;
-const POSITIONS_TAG_LEGACY: u8 = 1;
-const POSITIONS_TAG_SHARED: u8 = 2;
-
-const POSITION_STREAM_CODEC_VARINT_DOC_DELTA: u8 = 0;
-const POSITION_STREAM_CODEC_PACKED_DELTA: u8 = 1;
-
 // ---------------------------------------------------------------------------
 // Codec enum mappings
 // ---------------------------------------------------------------------------
 
-// Compressed posting lists carry their discriminants as protobuf enums in the
-// header; these map to/from the in-memory Rust enums.
+// Posting lists carry their discriminants as protobuf enums in the header;
+// these map to/from the in-memory Rust enums.
 
 fn posting_tail_codec_to_proto(c: PostingTailCodec) -> PbPostingTailCodec {
     match c {
@@ -95,60 +87,8 @@ fn proto_to_position_stream_codec(c: PbPositionStreamCodec) -> PositionStreamCod
     }
 }
 
-// The legacy (JSON + u8 tag) position storage encoding is still used by the
-// plain posting list and the standalone `Positions` codec.
-
-fn position_stream_codec_to_u8(c: PositionStreamCodec) -> u8 {
-    match c {
-        PositionStreamCodec::VarintDocDelta => POSITION_STREAM_CODEC_VARINT_DOC_DELTA,
-        PositionStreamCodec::PackedDelta => POSITION_STREAM_CODEC_PACKED_DELTA,
-    }
-}
-
-fn u8_to_position_stream_codec(v: u8) -> Result<PositionStreamCodec> {
-    match v {
-        POSITION_STREAM_CODEC_VARINT_DOC_DELTA => Ok(PositionStreamCodec::VarintDocDelta),
-        POSITION_STREAM_CODEC_PACKED_DELTA => Ok(PositionStreamCodec::PackedDelta),
-        _ => Err(Error::io(format!("unknown position stream codec: {v}"))),
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Header / tag I/O helpers (mirrors partition_serde.rs)
-// ---------------------------------------------------------------------------
-
-fn write_json_header(writer: &mut dyn Write, header: &impl Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec(header)?;
-    write_len_prefixed_bytes(writer, &bytes)?;
-    Ok(())
-}
-
-fn read_json_header<T: serde::de::DeserializeOwned>(data: &Bytes, offset: &mut usize) -> Result<T> {
-    let bytes = read_len_prefixed_bytes_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| Error::io(format!("failed to deserialize cache header: {e}")))
-}
-
-fn write_u8(writer: &mut dyn Write, value: u8) -> Result<()> {
-    writer
-        .write_all(&[value])
-        .map_err(|e| Error::io(format!("failed to write tag byte: {e}")))
-}
-
-fn read_u8(data: &Bytes, offset: &mut usize) -> Result<u8> {
-    let bytes = data.as_ref();
-    if *offset >= bytes.len() {
-        return Err(Error::io(
-            "truncated cache entry: missing tag byte".to_string(),
-        ));
-    }
-    let v = bytes[*offset];
-    *offset += 1;
-    Ok(v)
-}
-
-// ---------------------------------------------------------------------------
-// Position storage serde (shared by PostingList variants and Positions)
+// Position storage sections (shared by PostingList variants and Positions)
 // ---------------------------------------------------------------------------
 
 const POSITION_LIST_COLUMN: &str = "position_list";
@@ -157,33 +97,36 @@ const ROW_IDS_COLUMN: &str = "row_ids";
 const FREQUENCIES_COLUMN: &str = "frequencies";
 const BLOCKS_COLUMN: &str = "blocks";
 
-#[derive(Serialize, Deserialize)]
-struct SharedPositionsHeader {
-    codec: u8,
+fn legacy_positions_batch(list: &ListArray) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        POSITION_LIST_COLUMN,
+        list.data_type().clone(),
+        list.is_nullable(),
+    )]));
+    Ok(RecordBatch::try_new(schema, vec![Arc::new(list.clone())])?)
 }
 
-fn write_position_storage(
-    writer: &mut dyn Write,
+fn read_legacy_positions(r: &mut CacheEntryReader<'_>) -> Result<ListArray> {
+    let batch = r.read_ipc()?;
+    Ok(batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| Error::io("legacy position column is not a ListArray".to_string()))?
+        .clone())
+}
+
+/// Write the position sections (the bytes after the header) for `storage`. The
+/// caller's header proto carries the storage kind and shared-stream codec.
+fn write_position_sections(
+    w: &mut CacheEntryWriter<'_>,
     storage: &CompressedPositionStorage,
 ) -> Result<()> {
     match storage {
         CompressedPositionStorage::LegacyPerDoc(list) => {
-            write_u8(writer, POSITIONS_TAG_LEGACY)?;
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                POSITION_LIST_COLUMN,
-                list.data_type().clone(),
-                list.is_nullable(),
-            )]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(list.clone())])?;
-            write_ipc_stream(&batch, writer)?;
+            w.write_ipc(&legacy_positions_batch(list)?)?;
         }
         CompressedPositionStorage::SharedStream(stream) => {
-            write_u8(writer, POSITIONS_TAG_SHARED)?;
-            let header = SharedPositionsHeader {
-                codec: position_stream_codec_to_u8(stream.codec()),
-            };
-            write_json_header(writer, &header)?;
-
             let offsets = UInt32Array::from(stream.block_offsets().to_vec());
             let schema = Arc::new(Schema::new(vec![Field::new(
                 BLOCK_OFFSETS_COLUMN,
@@ -191,66 +134,48 @@ fn write_position_storage(
                 false,
             )]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(offsets)])?;
-            write_ipc_stream(&batch, writer)?;
-
-            write_len_prefixed_bytes(writer, stream.bytes())?;
+            w.write_ipc(&batch)?;
+            w.write_raw(stream.bytes())?;
         }
     }
     Ok(())
 }
 
-fn read_position_storage(
-    data: &Bytes,
-    offset: &mut usize,
-    tag: u8,
-) -> Result<CompressedPositionStorage> {
-    match tag {
-        POSITIONS_TAG_LEGACY => {
-            let batch =
-                read_ipc_stream_single_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
-            let list = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::io("legacy position column is not a ListArray".to_string()))?
-                .clone();
-            Ok(CompressedPositionStorage::LegacyPerDoc(list))
-        }
-        POSITIONS_TAG_SHARED => {
-            let header: SharedPositionsHeader = read_json_header(data, offset)?;
-            let codec = u8_to_position_stream_codec(header.codec)?;
-
-            let batch =
-                read_ipc_stream_single_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
+/// Read the position sections for the given `storage` kind and (for shared
+/// streams) `stream_codec`. Returns `None` only when `storage` is
+/// [`PbPositionStorage::None`].
+fn read_position_sections(
+    r: &mut CacheEntryReader<'_>,
+    storage: PbPositionStorage,
+    stream_codec: PositionStreamCodec,
+) -> Result<Option<CompressedPositionStorage>> {
+    match storage {
+        PbPositionStorage::None => Ok(None),
+        PbPositionStorage::Legacy => Ok(Some(CompressedPositionStorage::LegacyPerDoc(
+            read_legacy_positions(r)?,
+        ))),
+        PbPositionStorage::Shared => {
+            let batch = r.read_ipc()?;
             let block_offsets = batch
                 .column(0)
                 .as_primitive_opt::<UInt32Type>()
                 .ok_or_else(|| Error::io("block_offsets column is not UInt32".to_string()))?
                 .values()
                 .to_vec();
-
-            // Zero copy: read_len_prefixed_bytes_at returns a Bytes slice
-            // backed by the same allocation as `data`, and SharedPositionStream
-            // now stores its byte buffer as Bytes -- no copy on read.
-            let bytes =
-                read_len_prefixed_bytes_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
-
-            Ok(CompressedPositionStorage::SharedStream(
-                SharedPositionStream::new(codec, block_offsets, bytes),
-            ))
+            // Zero copy: read_raw returns a Bytes slice backed by the same
+            // allocation as the input, and SharedPositionStream stores its byte
+            // buffer as Bytes -- no copy on read.
+            let bytes = r.read_raw()?;
+            Ok(Some(CompressedPositionStorage::SharedStream(
+                SharedPositionStream::new(stream_codec, block_offsets, bytes),
+            )))
         }
-        other => Err(Error::io(format!("unknown positions tag: {other}"))),
     }
 }
 
 // ---------------------------------------------------------------------------
 // PostingList codec
 // ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize)]
-struct PlainPostingHeader {
-    max_score: Option<f32>,
-}
 
 impl CacheCodecImpl for PostingList {
     const TYPE_ID: &'static str = "lance.fts.PostingList";
@@ -260,7 +185,7 @@ impl CacheCodecImpl for PostingList {
         match self {
             Self::Plain(plain) => {
                 w.write_u8(POSTING_VARIANT_PLAIN)?;
-                serialize_plain(w.raw_writer(), plain)
+                serialize_plain(w, plain)
             }
             Self::Compressed(compressed) => {
                 w.write_u8(POSTING_VARIANT_COMPRESSED)?;
@@ -272,22 +197,25 @@ impl CacheCodecImpl for PostingList {
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
         let variant = r.read_u8()?;
         match variant {
-            POSTING_VARIANT_PLAIN => {
-                let body = r.body();
-                let mut offset = 0;
-                Ok(Self::Plain(deserialize_plain(&body, &mut offset)?))
-            }
+            POSTING_VARIANT_PLAIN => Ok(Self::Plain(deserialize_plain(r)?)),
             POSTING_VARIANT_COMPRESSED => Ok(Self::Compressed(deserialize_compressed(r)?)),
             other => Err(Error::io(format!("unknown PostingList variant: {other}"))),
         }
     }
 }
 
-fn serialize_plain(writer: &mut dyn Write, plain: &PlainPostingList) -> Result<()> {
+fn serialize_plain(w: &mut CacheEntryWriter<'_>, plain: &PlainPostingList) -> Result<()> {
+    // Plain postings carry only per-doc legacy positions (or none).
+    let position_storage = if plain.positions.is_some() {
+        PbPositionStorage::Legacy
+    } else {
+        PbPositionStorage::None
+    };
     let header = PlainPostingHeader {
         max_score: plain.max_score,
+        position_storage: position_storage as i32,
     };
-    write_json_header(writer, &header)?;
+    w.write_header(&header)?;
 
     let row_ids = UInt64Array::new(plain.row_ids.clone(), None);
     let frequencies = Float32Array::new(plain.frequencies.clone(), None);
@@ -296,26 +224,18 @@ fn serialize_plain(writer: &mut dyn Write, plain: &PlainPostingList) -> Result<(
         Field::new(FREQUENCIES_COLUMN, DataType::Float32, false),
     ]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(frequencies)])?;
-    write_ipc_stream(&batch, writer)?;
+    w.write_ipc(&batch)?;
 
-    match &plain.positions {
-        Some(list) => {
-            // Plain postings can only carry per-doc legacy positions; reuse
-            // the shared encoder.
-            write_position_storage(
-                writer,
-                &CompressedPositionStorage::LegacyPerDoc(list.clone()),
-            )?;
-        }
-        None => write_u8(writer, POSITIONS_TAG_NONE)?,
+    if let Some(list) = &plain.positions {
+        w.write_ipc(&legacy_positions_batch(list)?)?;
     }
     Ok(())
 }
 
-fn deserialize_plain(data: &Bytes, offset: &mut usize) -> Result<PlainPostingList> {
-    let header: PlainPostingHeader = read_json_header(data, offset)?;
+fn deserialize_plain(r: &mut CacheEntryReader<'_>) -> Result<PlainPostingList> {
+    let header: PlainPostingHeader = r.read_header()?;
 
-    let batch = read_ipc_stream_single_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
+    let batch = r.read_ipc()?;
     let row_ids = batch
         .column(0)
         .as_primitive_opt::<UInt64Type>()
@@ -329,19 +249,13 @@ fn deserialize_plain(data: &Bytes, offset: &mut usize) -> Result<PlainPostingLis
         .values()
         .clone();
 
-    let positions_tag = read_u8(data, offset)?;
-    let positions = match positions_tag {
-        POSITIONS_TAG_NONE => None,
-        POSITIONS_TAG_LEGACY => match read_position_storage(data, offset, positions_tag)? {
-            CompressedPositionStorage::LegacyPerDoc(list) => Some(list),
-            CompressedPositionStorage::SharedStream(_) => {
-                unreachable!("shared stream tag was read as legacy variant (this is a bug)")
-            }
-        },
-        other => {
-            return Err(Error::io(format!(
-                "Plain posting list cannot have positions tag {other}"
-            )));
+    let positions = match header.position_storage() {
+        PbPositionStorage::None => None,
+        PbPositionStorage::Legacy => Some(read_legacy_positions(r)?),
+        PbPositionStorage::Shared => {
+            return Err(Error::io(
+                "Plain posting list cannot have a shared position stream".to_string(),
+            ));
         }
     };
 
@@ -389,28 +303,8 @@ fn serialize_compressed(
     let batch = RecordBatch::try_new(schema, vec![Arc::new(posting.blocks.clone())])?;
     w.write_ipc(&batch)?;
 
-    match &posting.positions {
-        None => {}
-        Some(CompressedPositionStorage::LegacyPerDoc(list)) => {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                POSITION_LIST_COLUMN,
-                list.data_type().clone(),
-                list.is_nullable(),
-            )]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(list.clone())])?;
-            w.write_ipc(&batch)?;
-        }
-        Some(CompressedPositionStorage::SharedStream(stream)) => {
-            let offsets = UInt32Array::from(stream.block_offsets().to_vec());
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                BLOCK_OFFSETS_COLUMN,
-                DataType::UInt32,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(offsets)])?;
-            w.write_ipc(&batch)?;
-            w.write_raw(stream.bytes())?;
-        }
+    if let Some(storage) = &posting.positions {
+        write_position_sections(w, storage)?;
     }
     Ok(())
 }
@@ -427,33 +321,8 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
         .ok_or_else(|| Error::io("blocks column is not a LargeBinaryArray".to_string()))?
         .clone();
 
-    let positions = match header.position_storage() {
-        PbPositionStorage::None => None,
-        PbPositionStorage::Legacy => {
-            let batch = r.read_ipc()?;
-            let list = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| Error::io("legacy position column is not a ListArray".to_string()))?
-                .clone();
-            Some(CompressedPositionStorage::LegacyPerDoc(list))
-        }
-        PbPositionStorage::Shared => {
-            let codec = proto_to_position_stream_codec(header.position_stream_codec());
-            let batch = r.read_ipc()?;
-            let block_offsets = batch
-                .column(0)
-                .as_primitive_opt::<UInt32Type>()
-                .ok_or_else(|| Error::io("block_offsets column is not UInt32".to_string()))?
-                .values()
-                .to_vec();
-            let bytes = r.read_raw()?;
-            Some(CompressedPositionStorage::SharedStream(
-                SharedPositionStream::new(codec, block_offsets, bytes),
-            ))
-        }
-    };
+    let stream_codec = proto_to_position_stream_codec(header.position_stream_codec());
+    let positions = read_position_sections(r, header.position_storage(), stream_codec)?;
 
     Ok(CompressedPostingList::new(
         blocks,
@@ -524,21 +393,31 @@ impl CacheCodecImpl for Positions {
     const CURRENT_VERSION: u32 = 1;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        write_position_storage(w.raw_writer(), &self.0)
+        let (position_storage, position_stream_codec) = match &self.0 {
+            CompressedPositionStorage::LegacyPerDoc(_) => {
+                (PbPositionStorage::Legacy, PbPositionStreamCodec::default())
+            }
+            CompressedPositionStorage::SharedStream(stream) => (
+                PbPositionStorage::Shared,
+                position_stream_codec_to_proto(stream.codec()),
+            ),
+        };
+        let header = PositionsHeader {
+            position_storage: position_storage as i32,
+            position_stream_codec: position_stream_codec as i32,
+        };
+        w.write_header(&header)?;
+        write_position_sections(w, &self.0)
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
-        let body = r.body();
-        let data = &body;
-        let mut offset = 0;
-        let tag = read_u8(data, &mut offset)?;
-        if tag == POSITIONS_TAG_NONE {
-            return Err(Error::io(
-                "Positions cache entry cannot encode the None variant".to_string(),
-            ));
-        }
-        let storage = read_position_storage(data, &mut offset, tag)?;
-        Ok(Self(storage))
+        let header: PositionsHeader = r.read_header()?;
+        let stream_codec = proto_to_position_stream_codec(header.position_stream_codec());
+        read_position_sections(r, header.position_storage(), stream_codec)?
+            .map(Self)
+            .ok_or_else(|| {
+                Error::io("Positions cache entry cannot encode the None variant".to_string())
+            })
     }
 }
 
@@ -932,6 +811,33 @@ mod tests {
                 panic!("expected shared stream");
             };
             assert!(points_in(stream.bytes().as_ptr() as usize));
+        }
+
+        /// The plain posting's row-id/frequency IPC section must also decode
+        /// zero-copy through the envelope + proto header.
+        #[test]
+        fn plain_sections_are_zero_copy_through_envelope() {
+            let plain = PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from((0u64..64).collect::<Vec<_>>()),
+                ScalarBuffer::from(vec![1.0f32; 64]),
+                Some(2.0),
+                None,
+            ));
+            let serialized = aligned_bytes(&serialize_entry(plain));
+            let restored = codec().deserialize(&serialized).unwrap().hit().unwrap();
+            let restored = restored.downcast::<PostingList>().unwrap();
+            let PostingList::Plain(restored) = restored.as_ref() else {
+                panic!("expected Plain");
+            };
+
+            let base = serialized.as_ptr() as usize;
+            let end = base + serialized.len();
+            // The row_ids ScalarBuffer must borrow from the input allocation.
+            let ptr = restored.row_ids.as_ptr() as usize;
+            assert!(
+                ptr >= base && ptr < end,
+                "row_ids buffer was realigned out of the input — misaligned IPC section",
+            );
         }
 
         /// Additive proto fields (lever #1) must not break decoding: an unknown

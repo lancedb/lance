@@ -75,6 +75,16 @@ impl<'a> CacheEntryWriter<'a> {
             .map_err(|e| Error::io(e.to_string()))
     }
 
+    /// Write `batches` as a single 64-byte-aligned multi-batch Arrow IPC
+    /// section. The iterator must yield at least one batch.
+    pub fn write_ipc_batches<I>(&mut self, batches: I) -> Result<()>
+    where
+        I: IntoIterator<Item = RecordBatch>,
+    {
+        lance_arrow::ipc::write_ipc_section_batches(self.writer, &mut self.pos, batches)
+            .map_err(|e| Error::io(e.to_string()))
+    }
+
     /// Write a raw blob as `[len: u64 LE][bytes]`.
     ///
     /// Only for byte payloads that already have their own stable, portable
@@ -155,6 +165,13 @@ impl<'a> CacheEntryReader<'a> {
     /// Read one [`RecordBatch`] from a 64-byte-aligned IPC section.
     pub fn read_ipc(&mut self) -> Result<RecordBatch> {
         lance_arrow::ipc::read_ipc_section_at(self.data, &mut self.offset)
+            .map_err(|e| Error::io(e.to_string()))
+    }
+
+    /// Read all [`RecordBatch`]es from a 64-byte-aligned multi-batch IPC
+    /// section written by [`CacheEntryWriter::write_ipc_batches`].
+    pub fn read_ipc_batches(&mut self) -> Result<Vec<RecordBatch>> {
+        lance_arrow::ipc::read_ipc_section_batches_at(self.data, &mut self.offset)
             .map_err(|e| Error::io(e.to_string()))
     }
 

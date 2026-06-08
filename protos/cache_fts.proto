@@ -20,6 +20,27 @@ message CompressedPostingHeader {
   PositionStreamCodec position_stream_codec = 5;
 }
 
+// Header for a serialized `PlainPostingList` cache entry. Followed by an Arrow
+// IPC section of (row_ids: UInt64, frequencies: Float32), then — when
+// position_storage == POSITION_STORAGE_LEGACY — an IPC section of the per-doc
+// position list. Plain postings never carry a shared position stream.
+message PlainPostingHeader {
+  // Absent when the posting has no precomputed block-max score (the in-memory
+  // `max_score` is `None`); present otherwise.
+  optional float max_score = 1;
+  // POSITION_STORAGE_NONE or POSITION_STORAGE_LEGACY only.
+  PositionStorage position_storage = 2;
+}
+
+// Header for a serialized standalone `Positions` cache entry. Followed by the
+// position sections framed per `position_storage`, which is never
+// POSITION_STORAGE_NONE for a standalone entry.
+message PositionsHeader {
+  PositionStorage position_storage = 1;
+  // Only meaningful when position_storage == POSITION_STORAGE_SHARED.
+  PositionStreamCodec position_stream_codec = 2;
+}
+
 // Tail-block encoding of a compressed posting list.
 enum PostingTailCodec {
   POSTING_TAIL_CODEC_FIXED32 = 0;

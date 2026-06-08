@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.vector.cache;
+
+// Headers for serialized IVF partition cache entries (`PartitionEntry<S, Q>`).
+//
+// Each header is followed by 64-byte-aligned Arrow IPC sections in a fixed,
+// version-keyed order (sub-index, then any quantizer-specific arrays, then the
+// quantizer storage batches). Field numbers and enum values are append-only:
+// never renumber or reuse them. A change the proto cannot express transparently
+// (adding/removing/reordering the IPC sections) must bump the codec's
+// `CURRENT_VERSION` instead.
+
+// Distance metric a quantizer's storage was built for.
+enum DistanceType {
+  DISTANCE_TYPE_L2 = 0;
+  DISTANCE_TYPE_COSINE = 1;
+  DISTANCE_TYPE_DOT = 2;
+  DISTANCE_TYPE_HAMMING = 3;
+}
+
+// Rotation applied by a RabitQ quantizer.
+enum RotationType {
+  ROTATION_TYPE_MATRIX = 0;
+  ROTATION_TYPE_FAST = 1;
+}
+
+// Product quantizer. Sections: sub-index IPC, codebook IPC, storage IPC.
+message PqPartitionHeader {
+  DistanceType distance_type = 1;
+  uint32 nbits = 2;
+  uint64 num_sub_vectors = 3;
+  uint64 dimension = 4;
+  bool transposed = 5;
+}
+
+// Flat (float) and flat-binary quantizers. Sections: sub-index IPC, storage IPC.
+message FlatPartitionHeader {
+  DistanceType distance_type = 1;
+  uint64 dim = 2;
+}
+
+// Scalar quantizer. Sections: sub-index IPC, storage IPC (possibly multi-batch).
+message SqPartitionHeader {
+  DistanceType distance_type = 1;
+  uint32 num_bits = 2;
+  uint64 dim = 3;
+  double bounds_start = 4;
+  double bounds_end = 5;
+}
+
+// Header for a serialized IVF index state (`IvfIndexState<Q>`), followed by
+// three raw blobs: the IVF model protobuf, the quantizer's extra-metadata
+// buffer (may be empty), and the auxiliary IVF model protobuf.
+message IvfStateHeader {
+  string index_file_path = 1;
+  string uuid = 2;
+  string distance_type = 3;
+  repeated string sub_index_metadata = 4;
+  string sub_index_type = 5;
+  string quantization_type = 6;
+  // Per-quantizer `Q::Metadata` as JSON. Kept as a string because the metadata
+  // type is generic over the quantizer; the proto envelope still provides
+  // additive evolution for the surrounding fields.
+  string quantizer_metadata_json = 7;
+  string cache_key_prefix = 8;
+  uint64 index_file_size = 9;
+  uint64 aux_file_size = 10;
+}
+
+// RabitQ quantizer. Sections: sub-index IPC, rotate-matrix IPC (Matrix rotation
+// only), storage IPC.
+message RabitPartitionHeader {
+  DistanceType distance_type = 1;
+  uint32 num_bits = 2;
+  uint32 code_dim = 3;
+  RotationType rotation_type = 4;
+  // Fast-rotation sign vector; present only when rotation_type ==
+  // ROTATION_TYPE_FAST (the Matrix case stores its rotation as an IPC section).
+  optional bytes fast_rotation_signs = 5;
+}
