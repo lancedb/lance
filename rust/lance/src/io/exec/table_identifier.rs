@@ -393,14 +393,14 @@ mod tests {
         assert!(Arc::ptr_eq(&out, &dataset));
     }
 
-    /// Deterministic, non-Azure repro of GEN-571.
+    /// Deterministic, non-cloud repro of the per-plan re-open amplification.
     ///
     /// A serialized `FilteredReadExec`/ANN proto carries no live `Arc<Dataset>`,
     /// so each distributed plan_run deserialized on a worker calls
     /// `DatasetBuilder::load()` from scratch — one `ObjectStore` init + manifest
-    /// read per plan_run (the `dataset_events event="loading"` the 5B run
-    /// emitted 4,813 times for a 4,800-fragment table). We count opens by
-    /// instrumenting the cache-miss opener: one opener call == one such load.
+    /// read per plan_run (one `dataset_events event="loading"` each). On a
+    /// many-fragment table that is thousands of redundant opens. We count opens
+    /// by instrumenting the cache-miss opener: one opener call == one such load.
     /// With the cache, N plan_runs collapse to a single open per
     /// `(uri, version, etag)`.
     #[tokio::test]
