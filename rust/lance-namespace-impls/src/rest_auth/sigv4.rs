@@ -21,6 +21,9 @@ use url::Url;
 
 pub const REGION_KEY: &str = "rest.auth.sigv4.region";
 pub const SERVICE_KEY: &str = "rest.auth.sigv4.service";
+pub const ACCESS_KEY_ID_KEY: &str = "rest.auth.sigv4.access-key-id";
+pub const SECRET_ACCESS_KEY_KEY: &str = "rest.auth.sigv4.secret-access-key";
+pub const SESSION_TOKEN_KEY: &str = "rest.auth.sigv4.session-token";
 const DEFAULT_SERVICE: &str = "execute-api";
 
 /// Injectable time source; tests use a fixed clock.
@@ -40,6 +43,7 @@ impl Clock for SystemClock {
 pub struct SigV4AuthProvider {
     region: String,
     service: String,
+    static_credentials: Option<Credentials>,
     credentials_provider: OnceCell<SharedCredentialsProvider>,
     clock: Arc<dyn Clock>,
 }
@@ -50,8 +54,14 @@ impl std::fmt::Debug for SigV4AuthProvider {
             .field("region", &self.region)
             .field("service", &self.service)
             .field(
-                "credentials_provider",
-                &self.credentials_provider.get().map(|_| "resolved"),
+                "credential_source",
+                &if self.static_credentials.is_some() {
+                    "static"
+                } else if self.credentials_provider.get().is_some() {
+                    "resolved"
+                } else {
+                    "default-chain (pending)"
+                },
             )
             .finish()
     }
@@ -70,9 +80,32 @@ impl SigV4AuthProvider {
             .get(SERVICE_KEY)
             .cloned()
             .unwrap_or_else(|| DEFAULT_SERVICE.to_string());
+
+        let ak = properties.get(ACCESS_KEY_ID_KEY);
+        let sk = properties.get(SECRET_ACCESS_KEY_KEY);
+        let static_credentials = match (ak, sk) {
+            (Some(ak), Some(sk)) => Some(Credentials::new(
+                ak.clone(),
+                sk.clone(),
+                properties.get(SESSION_TOKEN_KEY).cloned(),
+                None,
+                "lance-sigv4-static",
+            )),
+            (None, None) => None,
+            _ => {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "{ACCESS_KEY_ID_KEY} and {SECRET_ACCESS_KEY_KEY} must both be set or both be omitted"
+                    ),
+                }
+                .into());
+            }
+        };
+
         Ok(Self {
             region,
             service,
+            static_credentials,
             credentials_provider: OnceCell::new(),
             clock: Arc::new(SystemClock),
         })
@@ -96,6 +129,9 @@ impl SigV4AuthProvider {
     async fn ensure_credentials_provider(&self) -> Result<&SharedCredentialsProvider> {
         self.credentials_provider
             .get_or_try_init(|| async {
+                if let Some(creds) = &self.static_credentials {
+                    return Ok(SharedCredentialsProvider::new(creds.clone()));
+                }
                 // aws_config::load panics inside an existing tokio runtime.
                 let region = self.region.clone();
                 let provider = tokio::task::spawn_blocking(move || {
@@ -444,6 +480,134 @@ mod tests {
              SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, \
              Signature=d690ca83bd782879e22797e35b2e25958c0d19696a92cfb479b73428e4d950f4",
             "session token signature must match botocore cross-verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_credentials_via_properties_match_injected() {
+        let mut props = HashMap::new();
+        props.insert(REGION_KEY.to_string(), VECTOR_REGION.to_string());
+        props.insert(SERVICE_KEY.to_string(), VECTOR_SERVICE.to_string());
+        props.insert(ACCESS_KEY_ID_KEY.to_string(), VECTOR_ACCESS_KEY.to_string());
+        props.insert(
+            SECRET_ACCESS_KEY_KEY.to_string(),
+            VECTOR_SECRET_KEY.to_string(),
+        );
+        let provider = SigV4AuthProvider::from_properties(&props)
+            .unwrap()
+            .with_clock(Arc::new(FixedClock(
+                UNIX_EPOCH + Duration::from_secs(VECTOR_UNIX_SECS),
+            )));
+
+        let ctx = RequestContext {
+            method: "GET".to_string(),
+            url: "https://example.amazonaws.com/".to_string(),
+            headers: HashMap::new(),
+            body_sha256: Some(crate::rest::EMPTY_BODY_SHA256.to_string()),
+        };
+        let headers = provider.authenticate(&ctx).await.unwrap();
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(auth, VECTOR_EXPECTED_AUTHORIZATION);
+    }
+
+    #[tokio::test]
+    async fn explicit_session_token_via_properties() {
+        let mut props = HashMap::new();
+        props.insert(REGION_KEY.to_string(), VECTOR_REGION.to_string());
+        props.insert(SERVICE_KEY.to_string(), VECTOR_SERVICE.to_string());
+        props.insert(ACCESS_KEY_ID_KEY.to_string(), VECTOR_ACCESS_KEY.to_string());
+        props.insert(
+            SECRET_ACCESS_KEY_KEY.to_string(),
+            VECTOR_SECRET_KEY.to_string(),
+        );
+        props.insert(
+            SESSION_TOKEN_KEY.to_string(),
+            "FakeSessionToken123".to_string(),
+        );
+        let provider = SigV4AuthProvider::from_properties(&props)
+            .unwrap()
+            .with_clock(Arc::new(FixedClock(
+                UNIX_EPOCH + Duration::from_secs(VECTOR_UNIX_SECS),
+            )));
+
+        let ctx = RequestContext {
+            method: "GET".to_string(),
+            url: "https://example.amazonaws.com/".to_string(),
+            headers: HashMap::new(),
+            body_sha256: Some(crate::rest::EMPTY_BODY_SHA256.to_string()),
+        };
+        let headers = provider.authenticate(&ctx).await.unwrap();
+
+        let token = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-security-token"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(token, Some("FakeSessionToken123"));
+
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(
+            auth,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, \
+             Signature=d690ca83bd782879e22797e35b2e25958c0d19696a92cfb479b73428e4d950f4",
+            "session-token signature mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_provider_takes_precedence_over_static_credentials() {
+        let injected_creds = Credentials::new(
+            VECTOR_ACCESS_KEY,
+            VECTOR_SECRET_KEY,
+            None,
+            None,
+            "injected",
+        );
+        let mut props = HashMap::new();
+        props.insert(REGION_KEY.to_string(), VECTOR_REGION.to_string());
+        props.insert(SERVICE_KEY.to_string(), VECTOR_SERVICE.to_string());
+        props.insert(ACCESS_KEY_ID_KEY.to_string(), "WRONG_AK".to_string());
+        props.insert(SECRET_ACCESS_KEY_KEY.to_string(), "WRONG_SK".to_string());
+        let provider = SigV4AuthProvider::from_properties(&props)
+            .unwrap()
+            .with_clock(Arc::new(FixedClock(
+                UNIX_EPOCH + Duration::from_secs(VECTOR_UNIX_SECS),
+            )))
+            .with_credentials_provider(SharedCredentialsProvider::new(injected_creds));
+
+        let ctx = RequestContext {
+            method: "GET".to_string(),
+            url: "https://example.amazonaws.com/".to_string(),
+            headers: HashMap::new(),
+            body_sha256: Some(crate::rest::EMPTY_BODY_SHA256.to_string()),
+        };
+        let headers = provider.authenticate(&ctx).await.unwrap();
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(auth, VECTOR_EXPECTED_AUTHORIZATION);
+        assert!(!auth.contains("WRONG_AK"));
+    }
+
+    #[test]
+    fn from_properties_rejects_partial_credentials() {
+        let mut props = HashMap::new();
+        props.insert(REGION_KEY.to_string(), "us-east-1".to_string());
+        props.insert(ACCESS_KEY_ID_KEY.to_string(), "AKID".to_string());
+        let err = SigV4AuthProvider::from_properties(&props).unwrap_err();
+        assert!(
+            err.to_string().contains(SECRET_ACCESS_KEY_KEY),
+            "error must mention missing key: {err}"
         );
     }
 }

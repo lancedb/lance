@@ -123,6 +123,9 @@ import java.util.Optional;
  *   <li>rest.auth.type (optional): Authentication type — "sigv4" or "none" (default: none)
  *   <li>rest.auth.sigv4.region (required if sigv4): AWS region
  *   <li>rest.auth.sigv4.service (optional): AWS service name (default: "execute-api")
+ *   <li>rest.auth.sigv4.access-key-id (optional): Explicit AWS access key ID
+ *   <li>rest.auth.sigv4.secret-access-key (optional): Explicit AWS secret access key
+ *   <li>rest.auth.sigv4.session-token (optional): STS session token
  * </ul>
  *
  * <p>Note: {@code rest.auth.*} and {@code header.Authorization} are mutually exclusive.

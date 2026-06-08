@@ -228,10 +228,17 @@ impl RestClient {
 /// - `rest.auth.type` — `"sigv4"` or `"none"` (default: none)
 /// - `rest.auth.sigv4.region` — AWS region (required for sigv4)
 /// - `rest.auth.sigv4.service` — AWS service name (default: `"execute-api"`)
+/// - `rest.auth.sigv4.access-key-id` — explicit AWS access key ID (optional)
+/// - `rest.auth.sigv4.secret-access-key` — explicit AWS secret access key (optional)
+/// - `rest.auth.sigv4.session-token` — STS session token (optional)
 ///
-/// Credentials are resolved via the standard AWS chain (env vars, profile,
-/// IMDS). Alternatively, use [`auth_provider()`](Self::auth_provider) to
-/// inject a custom provider (takes precedence over properties).
+/// When explicit `access-key-id` and `secret-access-key` are set, they
+/// are used directly; otherwise credentials fall back to the AWS default
+/// chain (env vars, profile, IMDS). The two keys must both be present or
+/// both be absent.
+///
+/// [`auth_provider()`](Self::auth_provider) overrides all property-based
+/// auth — when set, `rest.auth.*` properties are ignored.
 ///
 /// `rest.auth.*` and `header.Authorization` are mutually exclusive —
 /// setting both will return an error at build time.

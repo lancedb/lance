@@ -66,6 +66,9 @@ public class SigV4AuthTest {
       clientConfig.put("rest.auth.type", "sigv4");
       clientConfig.put("rest.auth.sigv4.region", "us-east-1");
       clientConfig.put("rest.auth.sigv4.service", "execute-api");
+      clientConfig.put("rest.auth.sigv4.access-key-id", "AKIAIOSFODNN7EXAMPLE");
+      clientConfig.put(
+          "rest.auth.sigv4.secret-access-key", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
 
       RestNamespace ns = new RestNamespace();
       ns.initialize(clientConfig, allocator);
@@ -101,6 +104,191 @@ public class SigV4AuthTest {
     }
   }
 
+  @Test
+  void testSigV4ExplicitCredentials() throws IOException {
+    List<String> capturedAuth = new ArrayList<>();
+
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          String auth = exchange.getRequestHeaders().getFirst("Authorization");
+          if (auth != null) {
+            capturedAuth.add(auth);
+          }
+          byte[] body = "{\"namespaces\":[]}".getBytes();
+          exchange.sendResponseHeaders(200, body.length);
+          try (OutputStream os = exchange.getResponseBody()) {
+            os.write(body);
+          }
+        });
+    server.start();
+    int port = server.getAddress().getPort();
+
+    try {
+      Map<String, String> clientConfig = new HashMap<>();
+      clientConfig.put("uri", "http://127.0.0.1:" + port);
+      clientConfig.put("rest.auth.type", "sigv4");
+      clientConfig.put("rest.auth.sigv4.region", "us-east-1");
+      clientConfig.put("rest.auth.sigv4.service", "execute-api");
+      clientConfig.put("rest.auth.sigv4.access-key-id", "AKIAIOSFODNN7EXAMPLE");
+      clientConfig.put(
+          "rest.auth.sigv4.secret-access-key", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+
+      RestNamespace ns = new RestNamespace();
+      ns.initialize(clientConfig, allocator);
+
+      try {
+        ns.listNamespaces(new ListNamespacesRequest());
+      } catch (Exception ignored) {
+      }
+
+      ns.close();
+
+      assertFalse(capturedAuth.isEmpty(), "no Authorization header captured");
+      String auth = capturedAuth.get(0);
+      assertTrue(auth.startsWith("AWS4-HMAC-SHA256"), "expected SigV4 header, got: " + auth);
+      assertTrue(auth.contains("Credential=AKIAIOSFODNN7EXAMPLE/"), "wrong access key in: " + auth);
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  void testSigV4ExplicitCredentialsWithSessionToken() throws IOException {
+    List<String> capturedAuth = new ArrayList<>();
+    List<String> capturedToken = new ArrayList<>();
+
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          String auth = exchange.getRequestHeaders().getFirst("Authorization");
+          if (auth != null) {
+            capturedAuth.add(auth);
+          }
+          String token = exchange.getRequestHeaders().getFirst("x-amz-security-token");
+          if (token != null) {
+            capturedToken.add(token);
+          }
+          byte[] body = "{\"namespaces\":[]}".getBytes();
+          exchange.sendResponseHeaders(200, body.length);
+          try (OutputStream os = exchange.getResponseBody()) {
+            os.write(body);
+          }
+        });
+    server.start();
+    int port = server.getAddress().getPort();
+
+    try {
+      Map<String, String> clientConfig = new HashMap<>();
+      clientConfig.put("uri", "http://127.0.0.1:" + port);
+      clientConfig.put("rest.auth.type", "sigv4");
+      clientConfig.put("rest.auth.sigv4.region", "us-east-1");
+      clientConfig.put("rest.auth.sigv4.service", "execute-api");
+      clientConfig.put("rest.auth.sigv4.access-key-id", "AKIAIOSFODNN7EXAMPLE");
+      clientConfig.put(
+          "rest.auth.sigv4.secret-access-key", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+      clientConfig.put("rest.auth.sigv4.session-token", "FakeSessionToken123");
+
+      RestNamespace ns = new RestNamespace();
+      ns.initialize(clientConfig, allocator);
+
+      try {
+        ns.listNamespaces(new ListNamespacesRequest());
+      } catch (Exception ignored) {
+      }
+
+      ns.close();
+
+      assertFalse(capturedAuth.isEmpty(), "no Authorization header captured");
+      String auth = capturedAuth.get(0);
+      assertTrue(auth.startsWith("AWS4-HMAC-SHA256"), "expected SigV4 header, got: " + auth);
+
+      assertFalse(capturedToken.isEmpty(), "no x-amz-security-token header captured");
+      assertEquals("FakeSessionToken123", capturedToken.get(0));
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  // Precedence (properties > env) is verified by Python/Rust; JVM cannot mutate env at runtime.
+  @Test
+  void testSigV4ExplicitCredentialsUsedRegardlessOfEnv() throws IOException {
+    List<String> capturedAuth = new ArrayList<>();
+
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          String auth = exchange.getRequestHeaders().getFirst("Authorization");
+          if (auth != null) {
+            capturedAuth.add(auth);
+          }
+          byte[] body = "{\"namespaces\":[]}".getBytes();
+          exchange.sendResponseHeaders(200, body.length);
+          try (OutputStream os = exchange.getResponseBody()) {
+            os.write(body);
+          }
+        });
+    server.start();
+    int port = server.getAddress().getPort();
+
+    try {
+      Map<String, String> clientConfig = new HashMap<>();
+      clientConfig.put("uri", "http://127.0.0.1:" + port);
+      clientConfig.put("rest.auth.type", "sigv4");
+      clientConfig.put("rest.auth.sigv4.region", "us-east-1");
+      clientConfig.put("rest.auth.sigv4.service", "execute-api");
+      clientConfig.put("rest.auth.sigv4.access-key-id", "AKIAIOSFODNN7EXAMPLE");
+      clientConfig.put(
+          "rest.auth.sigv4.secret-access-key", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+
+      RestNamespace ns = new RestNamespace();
+      ns.initialize(clientConfig, allocator);
+
+      try {
+        ns.listNamespaces(new ListNamespacesRequest());
+      } catch (Exception ignored) {
+      }
+
+      ns.close();
+
+      assertFalse(capturedAuth.isEmpty(), "no Authorization header captured");
+      String auth = capturedAuth.get(0);
+      assertTrue(
+          auth.contains("Credential=AKIAIOSFODNN7EXAMPLE/"),
+          "properties credentials must be used, got: " + auth);
+    } finally {
+      server.stop(0);
+    }
+  }
+
+  @Test
+  void testSigV4PartialCredentialsRejected() {
+    Map<String, String> backendConfig = new HashMap<>();
+    backendConfig.put("root", tempDir.toString());
+
+    RestAdapter adapter = new RestAdapter("dir", backendConfig, "127.0.0.1", 0);
+    adapter.start();
+    try {
+      Map<String, String> clientConfig = new HashMap<>();
+      clientConfig.put("uri", "http://127.0.0.1:" + adapter.getPort());
+      clientConfig.put("rest.auth.type", "sigv4");
+      clientConfig.put("rest.auth.sigv4.region", "us-east-1");
+      clientConfig.put("rest.auth.sigv4.access-key-id", "AKIAIOSFODNN7EXAMPLE");
+
+      RestNamespace ns = new RestNamespace();
+      RuntimeException ex =
+          assertThrows(RuntimeException.class, () -> ns.initialize(clientConfig, allocator));
+      assertTrue(
+          ex.getMessage().contains("rest.auth.sigv4.secret-access-key"),
+          "error must mention missing key: " + ex.getMessage());
+    } finally {
+      adapter.close();
+    }
+  }
+
   // Signature correctness is verified at the Rust layer (AWS test vectors + botocore).
   @Test
   void testSigV4SignatureHeadersPresent() throws IOException {
@@ -129,6 +317,9 @@ public class SigV4AuthTest {
       clientConfig.put("rest.auth.type", "sigv4");
       clientConfig.put("rest.auth.sigv4.region", "us-east-1");
       clientConfig.put("rest.auth.sigv4.service", "execute-api");
+      clientConfig.put("rest.auth.sigv4.access-key-id", "AKIAIOSFODNN7EXAMPLE");
+      clientConfig.put(
+          "rest.auth.sigv4.secret-access-key", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
 
       RestNamespace ns = new RestNamespace();
       ns.initialize(clientConfig, allocator);
@@ -143,7 +334,7 @@ public class SigV4AuthTest {
       assertFalse(capturedAuth.isEmpty(), "no Authorization header captured");
       String auth = capturedAuth.get(0);
       assertTrue(auth.startsWith("AWS4-HMAC-SHA256"), "expected SigV4 header, got: " + auth);
-      assertTrue(auth.contains("Credential="), "missing Credential in: " + auth);
+      assertTrue(auth.contains("Credential=AKIAIOSFODNN7EXAMPLE/"), "wrong access key in: " + auth);
       assertTrue(auth.contains("SignedHeaders="), "missing SignedHeaders in: " + auth);
       assertTrue(auth.matches(".*Signature=[a-f0-9]{64}.*"), "missing Signature in: " + auth);
     } finally {
