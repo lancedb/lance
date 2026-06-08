@@ -634,6 +634,9 @@ pub struct PyIndexSegmentDescription {
     /// The total size in bytes of all files in this segment
     /// (None for backward compatibility with indices created before file tracking)
     pub size_bytes: Option<u64>,
+    /// The id of the dataset base path that stores this segment
+    /// (None when the segment is stored in the dataset's default base path)
+    pub base_id: Option<i64>,
 }
 
 impl PyIndexSegmentDescription {
@@ -652,18 +655,20 @@ impl PyIndexSegmentDescription {
             index_version: segment.index_version,
             created_at: segment.created_at,
             size_bytes,
+            base_id: segment.base_id.map(|id| id as i64),
         }
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
             self.fragment_ids,
             self.index_version,
             self.created_at,
-            self.size_bytes
+            self.size_bytes,
+            self.base_id
         )
     }
 }
@@ -678,7 +683,8 @@ pub struct PyIndexDescription {
     pub index_type: String,
     /// The ids of the fields that the index is built on
     pub fields: Vec<u32>,
-    /// The names of the fields that the index is built on
+    /// The full paths of the fields that the index is built on
+    /// (dotted, with backtick-quoted segments for non-identifier names)
     pub field_names: Vec<String>,
     /// The number of rows indexed by the index
     pub num_rows_indexed: u64,
@@ -699,9 +705,8 @@ impl PyIndexDescription {
             .map(|field| {
                 dataset
                     .schema()
-                    .field_by_id(*field as i32)
-                    .map(|f| f.name.clone())
-                    .unwrap_or("<unknown>".to_string())
+                    .field_path(*field as i32)
+                    .unwrap_or_else(|_| "<unknown>".to_string())
             })
             .collect();
 

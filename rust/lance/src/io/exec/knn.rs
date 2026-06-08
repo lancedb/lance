@@ -637,11 +637,9 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.is_batch {
-            vec![Distribution::SinglePartition]
-        } else {
-            vec![Distribution::UnspecifiedDistribution]
-        }
+        // Both batch and non-batch modes execute a single input partition at a time,
+        // so all input must be coalesced to one partition before distance computation.
+        vec![Distribution::SinglePartition]
     }
 }
 

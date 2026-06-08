@@ -247,6 +247,9 @@ pub(crate) struct ScannerOptions<'a> {
     pub use_scalar_index: jboolean,
     pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
+    pub include_deleted_rows: jboolean,
+    pub strict_batch_size: jboolean,
+    pub disable_scoring_autoprojection: jboolean,
 }
 
 /// Build a scanner with options applied - shared by blocking and async scanners
@@ -394,6 +397,16 @@ pub(crate) fn build_scanner_with_options<'a>(
         scanner.aggregate(AggregateExpr::substrait(substrait_aggregate))?;
     }
 
+    if options.include_deleted_rows == JNI_TRUE {
+        scanner.include_deleted_rows();
+    }
+
+    scanner.strict_batch_size(options.strict_batch_size == JNI_TRUE);
+
+    if options.disable_scoring_autoprojection == JNI_TRUE {
+        scanner.disable_scoring_autoprojection();
+    }
+
     Ok(scanner)
 }
 
@@ -423,6 +436,9 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     fast_search: jboolean,             // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
     collect_stats: jboolean,           // boolean
+    include_deleted_rows: jboolean,    // boolean
+    strict_batch_size: jboolean,       // boolean
+    disable_scoring_autoprojection: jboolean, // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -447,6 +463,9 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             fast_search,
             substrait_aggregate_obj,
             collect_stats,
+            include_deleted_rows,
+            strict_batch_size,
+            disable_scoring_autoprojection,
         )
     )
 }
@@ -473,6 +492,9 @@ fn inner_create_scanner<'local>(
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     collect_stats: jboolean,
+    include_deleted_rows: jboolean,
+    strict_batch_size: jboolean,
+    disable_scoring_autoprojection: jboolean,
 ) -> Result<JObject<'local>> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
@@ -497,6 +519,9 @@ fn inner_create_scanner<'local>(
         use_scalar_index,
         fast_search,
         substrait_aggregate_obj,
+        include_deleted_rows,
+        strict_batch_size,
+        disable_scoring_autoprojection,
     };
 
     let scanner = build_scanner_with_options(env, &dataset, options)?;

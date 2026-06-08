@@ -1822,7 +1822,7 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
     assert results == results_no_scalar_index
 
 
-def test_load_indices(dataset):
+def test_describe_indices(dataset):
     indices = dataset.describe_indices()
     assert len(indices) == 0
 
@@ -2166,7 +2166,7 @@ def test_nested_field_vector_index(tmp_path):
     # Verify index was created
     indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["embedding"]
+    assert indices[0].field_names == ["data.embedding"]
 
     # Test querying with the index
     query_vec = vectors[0]

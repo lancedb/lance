@@ -17,9 +17,9 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
+use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
-use lance_index::scalar::bloomfilter::sbbf::Sbbf;
 use tracing::instrument;
 
 use crate::dataset::mem_wal::index::IndexStore;

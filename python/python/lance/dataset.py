@@ -958,14 +958,14 @@ class LanceDataset(pa.dataset.Dataset):
         """Check out the latest version of the current branch."""
         self._ds.checkout_latest()
 
-    def list_indices(self) -> List[Index]:
+    def list_indices(self) -> List[IndexInformation]:
         """
         Returns index information for all indices in the dataset.
 
-        This method is deprecated as it requires loading the statistics for each index
-        which can be a very expensive operation.  Instead use describe_indices() to
-        list index information and index_statistics() to get the statistics for
-        individual indexes of interest.
+        This method is deprecated.  Use describe_indices() instead, which returns
+        richer per-index information.
+
+        Each returned :class:`IndexInformation` describes one index segment.
         """
         warnings.warn(
             "The 'list_indices' method is deprecated. It may be removed in a future "
@@ -973,7 +973,19 @@ class LanceDataset(pa.dataset.Dataset):
             DeprecationWarning,
         )
 
-        return self._ds.load_indices()
+        return [
+            {
+                "name": desc.name,
+                "type": desc.index_type,
+                "uuid": segment.uuid,
+                "fields": desc.field_names,
+                "version": segment.dataset_version_at_last_update,
+                "fragment_ids": segment.fragment_ids,
+                "base_id": segment.base_id,
+            }
+            for desc in self.describe_indices()
+            for segment in desc.segments
+        ]
 
     def describe_indices(self) -> List[IndexDescription]:
         """Returns index information for all indices in the dataset."""
@@ -3789,6 +3801,17 @@ class LanceDataset(pa.dataset.Dataset):
             to the dataset. The returned metadata can be passed to
             ``merge_existing_index_segments(...)`` if grouping is needed and then
             committed with ``commit_existing_index_segments(...)``.
+
+            Vector segments support both shared and independent model scopes. If
+            the caller provides the same IVF centroids, and for IVF_PQ the same
+            PQ codebook, to each worker, the resulting segments share model
+            semantics and are suitable for workflows that physically merge
+            compatible segments. If those artifacts are omitted, each segment can
+            train its own IVF/PQ model for its assigned fragments. Such segments
+            can be committed together and are queried independently by segment
+            UUID; partition ids are interpreted within each segment's own model.
+            Keep independently trained segments as separate physical segments
+            unless the merge workflow can preserve or reconcile the model state.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
@@ -4005,6 +4028,15 @@ class LanceDataset(pa.dataset.Dataset):
         requirement:
 
         - ``fragment_ids`` must be provided
+        - Vector segments support both shared and independent model scopes. Pass
+          the same IVF centroids, and for IVF_PQ the same PQ codebook, to each
+          worker when segments need shared model semantics or physical merge
+          compatibility. If these artifacts are omitted, each segment may train
+          its own IVF/PQ model and can be committed with other segments as one
+          logical index; query execution searches each segment by UUID and
+          interprets partition ids within that segment. Keep independently
+          trained segments as separate physical segments unless the merge
+          workflow can preserve or reconcile the model state.
         - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
@@ -5067,6 +5099,65 @@ class LanceDataset(pa.dataset.Dataset):
         raw = self._ds.mem_wal_writer(shard_id, **kwargs)
         return _mw.ShardWriter(raw)
 
+    def tracked_files(
+        self,
+        *,
+        min_version: Optional[int] = None,
+        progress: Optional[Callable] = None,
+    ) -> pa.RecordBatchReader:
+        """Stream all files referenced by any manifest version of this dataset.
+
+        Parameters
+        ----------
+        min_version : int, optional
+            If set, only include manifests with version >= min_version.
+        progress : callable, optional
+            Called after each manifest is processed with two arguments:
+            ``(manifests_processed: int, manifests_total: Optional[int])``.
+            ``manifests_total`` is ``None`` until all manifest locations
+            have been listed. Works well with ``tqdm``::
+
+                from tqdm import tqdm
+                pbar = tqdm(unit="manifest")
+                def on_progress(processed, total):
+                    if total is not None:
+                        pbar.total = total
+                    pbar.update(1)
+                reader = ds.tracked_files(progress=on_progress)
+                table = reader.read_all()
+                pbar.close()
+
+        Returns
+        -------
+        pyarrow.RecordBatchReader
+            Schema:
+
+            - **version** (int64): manifest version number
+            - **base_uri** (dictionary<int32, utf8>): storage root URI
+            - **path** (utf8): file path relative to ``base_uri``
+            - **type** (dictionary<int8, utf8>): one of ``manifest``,
+              ``data file``, ``deletion file``, ``transaction file``,
+              ``index file``
+
+            Output order is non-deterministic.
+        """
+        return self._ds.tracked_files(min_version=min_version, progress=progress)
+
+    def all_files(self) -> pa.RecordBatchReader:
+        """Stream all files physically present at this dataset's base URI.
+
+        Returns a :class:`pyarrow.RecordBatchReader` with schema:
+
+        - **base_uri** (dictionary<int32, utf8>): storage root URI
+        - **path** (utf8): file path relative to ``base_uri``
+        - **size_bytes** (int64): file size in bytes
+        - **last_modified** (timestamp[us, UTC]): last modification time
+
+        Only the primary object store is scanned; alternate ``base_paths``
+        entries are not included.
+        """
+        return self._ds.all_files()
+
 
 class SqlQuery:
     """
@@ -5299,6 +5390,19 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+
+
+class IndexInformation(TypedDict):
+    """Information about a single index segment, as returned by
+    :meth:`LanceDataset.list_indices`."""
+
+    name: str
+    type: str
+    uuid: str
+    fields: List[str]
+    version: int
+    fragment_ids: Set[int]
+    base_id: Optional[int]
 
 
 class AutoCleanupConfig(TypedDict):

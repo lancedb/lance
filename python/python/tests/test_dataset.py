@@ -5657,4 +5657,33 @@ def test_default_scan_options_nearest(tmp_path: Path) -> None:
     distances = result["_distance"].to_pylist()
     assert distances == sorted(distances)
 
-    assert "id" in result.column_names
+
+def test_tracked_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+    ds.delete("x = 2")  # adds a deletion file
+
+    reader = ds.tracked_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("version").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+
+    types = set(result.column("type").to_pylist())
+    assert "manifest" in types
+    assert "data file" in types
+    assert "deletion file" in types
+
+
+def test_all_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+
+    reader = ds.all_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("size_bytes").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+    assert all(s > 0 for s in result.column("size_bytes").to_pylist())

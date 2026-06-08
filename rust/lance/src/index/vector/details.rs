@@ -503,7 +503,15 @@ pub async fn infer_vector_index_details(
     let index_dir = dataset.indice_files_dir(index)?;
     let file_dir = index_dir.clone().join(uuid.as_str());
     let index_file = file_dir.clone().join(INDEX_FILE_NAME);
-    let reader: Arc<dyn Reader> = dataset.object_store.open(&index_file).await?.into();
+    let file_sizes = index.file_size_map();
+    let reader: Arc<dyn Reader> = super::open_index_file(
+        dataset.object_store.as_ref(),
+        &index_file,
+        INDEX_FILE_NAME,
+        &file_sizes,
+    )
+    .await?
+    .into();
 
     let tailing_bytes = read_last_block(reader.as_ref()).await?;
     let (major_version, minor_version) = read_version(&tailing_bytes)?;

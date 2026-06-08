@@ -147,12 +147,160 @@ def btree_comparison_datasets(tmp_path):
     }
 
 
-def test_load_indices(indexed_dataset: lance.LanceDataset):
+def test_describe_indices_vector_and_scalar(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.describe_indices()
     vec_idx = next(idx for idx in indices if "VectorIndex" in idx.type_url)
     scalar_idx = next(idx for idx in indices if idx.index_type == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None
+
+
+def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
+    """Lock down the backwards-compatible shape of the deprecated list_indices().
+
+    list_indices() returns a list of plain dicts (one per index segment), not
+    Index dataclasses. This characterization test guards the dict keys and
+    values so the deprecated method stays backwards compatible.
+    """
+    with pytest.warns(DeprecationWarning):
+        indices = indexed_dataset.list_indices()
+
+    assert len(indices) == 2
+    by_name = {idx["name"]: idx for idx in indices}
+    assert set(by_name) == {"vector_idx", "meta_idx"}
+
+    expected_keys = {
+        "name",
+        "type",
+        "uuid",
+        "fields",
+        "version",
+        "fragment_ids",
+        "base_id",
+    }
+    for idx in indices:
+        assert set(idx) == expected_keys
+        assert isinstance(idx["uuid"], str) and len(idx["uuid"]) > 0
+        assert isinstance(idx["fields"], list)
+        assert isinstance(idx["fragment_ids"], set)
+        assert isinstance(idx["version"], int)
+        assert idx["type"] != "Unknown"
+        assert idx["base_id"] is None
+
+    vector_idx = by_name["vector_idx"]
+    assert vector_idx["type"] == "IVF_PQ"
+    assert vector_idx["fields"] == ["vector"]
+    assert vector_idx["fragment_ids"] == {0}
+
+    meta_idx = by_name["meta_idx"]
+    assert meta_idx["type"] == "BTree"
+    assert meta_idx["fields"] == ["meta"]
+    assert meta_idx["fragment_ids"] == {0}
+
+
+def test_list_indices_nested_field_path(tmp_path):
+    """list_indices() reports nested fields as full dotted paths."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("meta", pa.struct([pa.field("lang", pa.string())])),
+        ]
+    )
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "meta": [{"lang": "en"}, {"lang": "fr"}, {"lang": "en"}],
+        },
+        schema=schema,
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index(column="meta.lang", index_type="BTREE")
+
+    with pytest.warns(DeprecationWarning):
+        indices = ds.list_indices()
+
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["meta.lang"]
+
+
+def _commit_index(ds, index):
+    """Commit a single raw Index entry via the CreateIndex operation."""
+    return lance.LanceDataset.commit(
+        ds.uri,
+        lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+        read_version=ds.version,
+    )
+
+
+def test_list_indices_index_without_details(tmp_path):
+    """An index whose manifest entry has no index details (e.g. committed by an
+    older writer) is still reported on a best-effort basis: describe_indices()
+    does not error, and the type is reported as "Unknown"."""
+    from lance.dataset import Index
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].name == "legacy_idx"
+    assert described[0].index_type == "Unknown"
+    assert described[0].type_url == ""
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert len(listed) == 1
+    assert listed[0]["name"] == "legacy_idx"
+    assert listed[0]["type"] == "Unknown"
+
+
+def test_list_indices_legacy_vector_index_without_details(tmp_path):
+    """A legacy vector index predates VectorIndexDetails: it has no index
+    details but stores a monolithic index file. Its type is recognized as
+    "Vector" from the index file rather than reported as "Unknown"."""
+    from lance.dataset import Index, IndexFile
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_vector_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+            # "index.idx" is the legacy monolithic index file name; its presence
+            # is how a pre-details vector index is recognized.
+            files=[IndexFile(path="index.idx", size_bytes=0)],
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].index_type == "Vector"
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert listed[0]["type"] == "Vector"
 
 
 def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa.Table):
@@ -4187,7 +4335,7 @@ def test_nested_field_btree_index(tmp_path):
     # Verify index was created
     indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["lang"]
+    assert indices[0].field_names == ["meta.lang"]
     assert indices[0].index_type == "BTree"
 
     # Test query using the index - filter for English language
@@ -4288,7 +4436,7 @@ def test_nested_field_fts_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["text"]
+    assert indices[0].field_names == ["data.text"]
     assert indices[0].index_type == "Inverted"
 
     # Test full text search on nested field
@@ -4362,7 +4510,7 @@ def test_nested_field_bitmap_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["color"]
+    assert indices[0].field_names == ["attributes.color"]
     assert indices[0].index_type == "Bitmap"
 
     # Test equality query

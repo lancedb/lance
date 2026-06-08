@@ -24,6 +24,8 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+#[cfg(feature = "goosefs")]
+pub mod goosefs;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
@@ -327,6 +329,8 @@ impl Default for ObjectStoreRegistry {
         }
         #[cfg(feature = "gcp")]
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
+        #[cfg(feature = "goosefs")]
+        providers.insert("goosefs".into(), Arc::new(goosefs::GooseFsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
         #[cfg(feature = "tencent")]

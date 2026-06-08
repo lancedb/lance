@@ -47,6 +47,7 @@ use lance_index::{INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector:
 use lance_index::{
     IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
+    registry::display_type_from_url,
     scalar::btree::BTREE_LOOKUP_NAME,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -680,7 +681,10 @@ struct IndexDescriptionImpl {
     field_ids: Vec<u32>,
     segments: Vec<IndexMetadata>,
     index_type: String,
-    details: IndexDetails,
+    /// Index details, or `None` for indices created before details were
+    /// persisted in the manifest. Such indices are still described on a
+    /// best-effort basis rather than rejected.
+    details: Option<IndexDetails>,
     rows_indexed: u64,
 }
 
@@ -708,57 +712,52 @@ impl IndexDescriptionImpl {
         }
         let field_ids_vec: Vec<u32> = field_ids.iter().map(|id| *id as u32).collect();
 
-        // This should not fail as we have already filtered out indexes without index details.
-        let index_details = example_metadata.index_details.as_ref().ok_or_else(|| {
-            let fields = field_ids
-                .iter()
-                .map(|id| {
-                    dataset
-                        .schema()
-                        .field_by_id(*id)
-                        .map(|f| format!("{}({})", f.name, id))
-                        .unwrap_or_else(|| format!("<unknown>({})", id))
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            Error::index(format!(
-                "Index details are required for index description. This index must be retrained to support this method. (index_name={}, uuid={}, fields=[{}])",
-                name,
-                example_metadata.uuid,
-                fields
-            ))
-        })?;
-        let type_url = &index_details.type_url;
-        if !segments.iter().all(|shard| {
-            shard
-                .index_details
-                .as_ref()
-                .map(|d| d.type_url == *type_url)
-                .unwrap_or(false)
-        }) {
-            return Err(Error::index(
-                "Index type URL should be present and identical across all segments".to_string(),
-            ));
+        // Index details may be absent on indices created before details were
+        // persisted in the manifest. We describe such indices on a best-effort
+        // basis rather than erroring, so callers can still see they exist.
+        let details = example_metadata.index_details.clone().map(IndexDetails);
+        if let Some(details) = details.as_ref() {
+            let type_url = &details.0.type_url;
+            if !segments.iter().all(|shard| {
+                shard
+                    .index_details
+                    .as_ref()
+                    .map(|d| d.type_url == *type_url)
+                    .unwrap_or(false)
+            }) {
+                return Err(Error::index(
+                    "Index type URL should be present and identical across all segments"
+                        .to_string(),
+                ));
+            }
         }
 
-        let details = IndexDetails(index_details.clone());
-
-        let index_type = if details.is_vector() {
-            derive_vector_index_type(index_details)
-        } else if let Some(system_type) = lance_index::infer_system_index_type(example_metadata) {
-            // System indices (frag-reuse, mem-wal) are identified by name, not
-            // by a plugin entry, so the plugin lookup below would return
-            // "Unknown" otherwise.
-            system_type.to_string()
-        } else {
-            // We attempted to infer the index type when we loaded the indices,
-            // so if we hit this branch the index type is truly unknown.
-            details
-                .get_plugin()
-                .map(|p| p.name().to_string())
-                .unwrap_or_else(|_| "Unknown".to_string())
-        };
+        let index_type =
+            if let Some(system_type) = lance_index::infer_system_index_type(example_metadata) {
+                // System indices (frag-reuse, mem-wal) are identified by name, not
+                // by index details, so this must be checked before the plugin lookup.
+                system_type.to_string()
+            } else if let Some(details) = details.as_ref() {
+                if details.is_vector() {
+                    derive_vector_index_type(&details.0)
+                } else {
+                    // Fall back to a name derived from the type URL when no plugin
+                    // is registered, so a known type URL is never reported as the
+                    // opaque "Unknown".
+                    details
+                        .get_plugin()
+                        .map(|p| p.name().to_string())
+                        .unwrap_or_else(|_| {
+                            display_type_from_url(details.0.type_url.as_str()).to_string()
+                        })
+                }
+            } else if segment_has_vector_details(example_metadata) {
+                // Legacy vector indices predate VectorIndexDetails and are
+                // recognized by their monolithic index file name.
+                "Vector".to_string()
+            } else {
+                "Unknown".to_string()
+            };
 
         let mut fragment_rows = HashMap::with_capacity(dataset.manifest.fragments.len());
         for fragment in dataset.iter_fragments() {
@@ -835,7 +834,10 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 
     fn type_url(&self) -> &str {
-        self.details.0.type_url.as_str()
+        self.details
+            .as_ref()
+            .map(|d| d.0.type_url.as_str())
+            .unwrap_or("")
     }
 
     fn rows_indexed(&self) -> u64 {
@@ -843,13 +845,14 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 
     fn details(&self) -> Result<String> {
-        if self.details.is_vector() {
-            vector_details_as_json(&self.details.0)
+        let Some(details) = self.details.as_ref() else {
+            return Ok("{}".to_string());
+        };
+        if details.is_vector() {
+            vector_details_as_json(&details.0)
         } else {
-            let plugin = self.details.get_plugin()?;
-            plugin
-                .details_as_json(&self.details.0)
-                .map(|v| v.to_string())
+            let plugin = details.get_plugin()?;
+            plugin.details_as_json(&details.0).map(|v| v.to_string())
         }
     }
 
@@ -1885,7 +1888,15 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
-        let reader: Arc<dyn Reader> = object_store.open(&index_file).await?.into();
+        let file_sizes = index_meta.file_size_map();
+        let reader: Arc<dyn Reader> = vector::open_index_file(
+            object_store.as_ref(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?
+        .into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
@@ -1952,7 +1963,6 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file_sizes = index_meta.file_size_map();
                 let cached_size = file_sizes
                     .get(INDEX_FILE_NAME)
                     .map(|&size| CachedFileSize::new(size))
@@ -4472,6 +4482,81 @@ mod tests {
         );
         let descriptions = dataset.describe_indices(None).await.unwrap();
         assert_eq!(descriptions[0].index_type(), inferred_type);
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_tolerates_missing_index_details() {
+        // An index whose manifest entry has no index details (e.g. created
+        // before details were persisted) is still described on a best-effort
+        // basis rather than causing describe_indices to error.
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let field_id = dataset.schema().field("id").unwrap().id;
+
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "mystery_idx".to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(std::iter::once(0_u32).collect()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
+            .await
+            .unwrap();
+        assert_eq!(desc.index_type(), "Unknown");
+        assert_eq!(desc.type_url(), "");
+        assert_eq!(desc.details().unwrap(), "{}");
+        assert_eq!(desc.rows_indexed(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_derives_type_from_url_without_plugin() {
+        // When index details exist but no plugin is registered for the type
+        // URL, the index type is derived from the type URL rather than being
+        // reported as the opaque "Unknown".
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let field_id = dataset.schema().field("id").unwrap().id;
+
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "mystery_idx".to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(std::iter::once(0_u32).collect()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.index.pb.MysteryIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
+            .await
+            .unwrap();
+        assert_eq!(desc.index_type(), "Mystery");
+        assert_eq!(desc.type_url(), "/lance.index.pb.MysteryIndexDetails");
     }
 
     #[rstest]

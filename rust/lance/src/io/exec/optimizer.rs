@@ -179,5 +179,8 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
         Arc::new(crate::io::exec::optimizer::SimplifyProjection),
         // Push down limit into FilteredReadExec and other Execs via with_fetch()
         Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
+        // Insert exchange nodes (RepartitionExec, CoalescePartitionsExec) where needed
+        // to satisfy distribution requirements as exec nodes migrate to multi-partition output.
+        Arc::new(datafusion::physical_optimizer::enforce_distribution::EnforceDistribution::new()),
     ])
 }

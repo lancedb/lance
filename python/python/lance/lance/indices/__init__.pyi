@@ -72,6 +72,7 @@ class IndexSegmentDescription:
     index_version: int
     created_at: Optional[datetime]
     size_bytes: Optional[int]
+    base_id: Optional[int]
 
     def __repr__(self) -> str: ...
 
