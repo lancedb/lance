@@ -955,11 +955,19 @@ mod tests {
             .await
             .unwrap();
         let merged_coverage = merged.fragment_bitmap.as_ref().unwrap().clone();
+        let merged_uuid = merged.uuid;
 
         dataset
             .commit_existing_index_segments("value_zonemap_replace_retired", "value", vec![merged])
             .await
             .unwrap();
+
+        let committed = dataset
+            .load_indices_by_name("value_zonemap_replace_retired")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].uuid, merged_uuid);
 
         let combined_bitmap =
             scalar_index_fragment_bitmap(&dataset, "value", "value_zonemap_replace_retired")

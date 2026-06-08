@@ -1235,6 +1235,10 @@ impl DatasetIndexExt for Dataset {
                     return Ok(Some(idx));
                 };
 
+                if existing_fragments.is_empty() {
+                    return Ok(Some(idx));
+                }
+
                 if existing_fragments.is_disjoint(&incoming_fragments) {
                     return Ok(None);
                 }
