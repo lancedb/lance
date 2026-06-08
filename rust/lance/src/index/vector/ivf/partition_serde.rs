@@ -1098,7 +1098,9 @@ mod tests {
 
     #[test]
     fn test_ivf_index_state_roundtrip() {
-        use crate::index::vector::ivf::v2::{IvfIndexState, IvfStateEntryBox};
+        use crate::index::vector::ivf::v2::{
+            IvfIndexState, IvfStateEntryBox, empty_rabit_search_cache_cell,
+        };
         use lance_index::vector::flat::index::FlatQuantizer;
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::quantizer::QuantizationType;
@@ -1123,6 +1125,7 @@ mod tests {
             cache_key_prefix: "prefix/".to_string(),
             index_file_size: 1024,
             aux_file_size: 512,
+            rq_search_cache: empty_rabit_search_cache_cell(),
         };
 
         let entry = IvfStateEntryBox(Arc::new(state));

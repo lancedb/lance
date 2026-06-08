@@ -531,6 +531,25 @@ impl RabitQuantizationStorage {
         }
     }
 
+    fn uses_raw_query_lower_bound_gating(&self) -> bool {
+        self.metadata.query_estimator == RabitQueryEstimator::RawQuery
+            && self.metadata.num_bits > 1
+            && self.error_factors.is_some()
+    }
+
+    fn raw_query_error_for_gating(
+        &self,
+        dist_q_c: f32,
+        rotated_query: &[f32],
+        rotated_centroid: Option<&[f32]>,
+    ) -> f32 {
+        if self.uses_raw_query_lower_bound_gating() {
+            self.raw_query_error(dist_q_c, rotated_query, rotated_centroid)
+        } else {
+            0.0
+        }
+    }
+
     fn distance_calculator_from_parts<'a>(
         &'a self,
         dim: usize,
@@ -860,6 +879,79 @@ impl<'a> RabitDistCalculator<'a> {
                 );
             });
         simd_len
+    }
+
+    #[inline]
+    fn binary_distance_factor_params(&self) -> (f32, f32) {
+        match self.query_estimator {
+            RabitQueryEstimator::ResidualQuery => (2.0 / self.sqrt_d, -self.sum_q / self.sqrt_d),
+            RabitQueryEstimator::RawQuery => (1.0, -0.5 * self.sum_q),
+        }
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn one_bit_distances_with_scratch(
+        &self,
+        n: usize,
+        code_len: usize,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+    ) {
+        let (qmin, qmax) = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
+        let remainder = n % BATCH_SIZE;
+        let simd_len = n - remainder;
+        quantized_dists.clear();
+        quantized_dists.reserve(simd_len);
+        // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
+        unsafe {
+            quantized_dists.set_len(simd_len);
+        }
+        simd::dist_table::sum_4bit_dist_table(
+            simd_len,
+            code_len,
+            self.codes,
+            quantized_dists_table,
+            quantized_dists,
+        );
+
+        let range = (qmax - qmin) / 255.0;
+        let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
+        let sum_min = num_tables as f32 * qmin;
+        let (binary_distance_multiplier, binary_distance_offset) =
+            self.binary_distance_factor_params();
+        dists.clear();
+        dists.reserve(n);
+        // SAFETY: the SIMD section below writes [0, simd_len), and the
+        // remainder section writes [simd_len, n).
+        unsafe {
+            dists.set_len(n);
+        }
+        let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
+        simd_dists
+            .iter_mut()
+            .zip(quantized_dists.iter())
+            .enumerate()
+            .for_each(|(id, (dist, q_dist))| {
+                let binary_dist = (*q_dist as f32) * range + sum_min;
+                *dist = (binary_dist * binary_distance_multiplier + binary_distance_offset)
+                    * self.scale_factors[id]
+                    + self.add_factors[id]
+                    + self.query_factor;
+            });
+
+        remainder_dists
+            .iter_mut()
+            .enumerate()
+            .for_each(|(offset, dist)| {
+                let id = simd_len + offset;
+                let binary_dist =
+                    compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table);
+                *dist = (binary_dist * binary_distance_multiplier + binary_distance_offset)
+                    * self.scale_factors[id]
+                    + self.add_factors[id]
+                    + self.query_factor;
+            });
     }
 
     #[allow(clippy::uninit_vec)]
@@ -1442,6 +1534,17 @@ impl DistCalculator for RabitDistCalculator<'_> {
             return;
         }
 
+        if self.query_estimator == RabitQueryEstimator::ResidualQuery || self.num_bits == 1 {
+            self.one_bit_distances_with_scratch(
+                n,
+                code_len,
+                dists,
+                quantized_dists,
+                quantized_dists_table,
+            );
+            return;
+        }
+
         let simd_len = self.binary_distances_with_scratch(
             n,
             code_len,
@@ -1450,33 +1553,12 @@ impl DistCalculator for RabitDistCalculator<'_> {
             quantized_dists_table,
         );
 
-        if self.query_estimator == RabitQueryEstimator::RawQuery && self.num_bits > 1 {
-            self.apply_raw_query_multi_bit_distances(
-                simd_len,
-                dists,
-                quantized_dists,
-                quantized_dists_table,
-            );
-            return;
-        }
-
-        dists
-            .iter_mut()
-            .enumerate()
-            .for_each(|(id, dist)| match self.query_estimator {
-                RabitQueryEstimator::ResidualQuery => {
-                    let dist_vq_qr = (2.0 * *dist - self.sum_q) / self.sqrt_d;
-                    *dist = dist_vq_qr * self.scale_factors[id]
-                        + self.add_factors[id]
-                        + self.query_factor;
-                }
-                RabitQueryEstimator::RawQuery => {
-                    let binary_dot = *dist - 0.5 * self.sum_q;
-                    *dist = binary_dot * self.scale_factors[id]
-                        + self.add_factors[id]
-                        + self.query_factor;
-                }
-            });
+        self.apply_raw_query_multi_bit_distances(
+            simd_len,
+            dists,
+            quantized_dists,
+            quantized_dists_table,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1675,7 +1757,9 @@ impl VectorStore for RabitQuantizationStorage {
         };
         let query_error = match self.metadata.query_estimator {
             RabitQueryEstimator::ResidualQuery => 0.0,
-            RabitQueryEstimator::RawQuery => self.raw_query_error(dist_q_c, &rotated_qr, None),
+            RabitQueryEstimator::RawQuery => {
+                self.raw_query_error_for_gating(dist_q_c, &rotated_qr, None)
+            }
         };
         let sum_q = rotated_qr.into_iter().sum();
 
@@ -1711,8 +1795,11 @@ impl VectorStore for RabitQuantizationStorage {
             debug_assert_eq!(raw_query.ex_bits, self.metadata.num_bits - 1);
             let query_factor =
                 self.raw_query_factor(dist_q_c, &raw_query.rotated_query, rotated_centroid);
-            let query_error =
-                self.raw_query_error(dist_q_c, &raw_query.rotated_query, rotated_centroid);
+            let query_error = self.raw_query_error_for_gating(
+                dist_q_c,
+                &raw_query.rotated_query,
+                rotated_centroid,
+            );
             return self.distance_calculator_from_parts(
                 code_dim,
                 Cow::Borrowed(&raw_query.dist_table),
@@ -1769,9 +1856,9 @@ impl VectorStore for RabitQuantizationStorage {
                     Some(QueryResidual::RabitRawQuery {
                         rotated_centroid, ..
                     }),
-                ) => self.raw_query_error(dist_q_c, rotated_qr, rotated_centroid),
+                ) => self.raw_query_error_for_gating(dist_q_c, rotated_qr, rotated_centroid),
                 (RabitQueryEstimator::RawQuery, _) => {
-                    self.raw_query_error(dist_q_c, rotated_qr, None)
+                    self.raw_query_error_for_gating(dist_q_c, rotated_qr, None)
                 }
             };
             build_dist_table_direct_into::<Float32Type>(rotated_qr, dist_table);
@@ -1958,6 +2045,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
         distance_type: DistanceType,
         _fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let distance_type = match (metadata.query_estimator, distance_type) {
+            (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
+            _ => distance_type,
+        };
         validate_rq_num_bits(metadata.num_bits)?;
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
@@ -3001,6 +3092,39 @@ mod tests {
         let stored_codes = stored_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
         let expected_codes = pack_codes(&original_codes);
         assert_codes_eq(stored_codes, &expected_codes);
+    }
+
+    #[test]
+    fn test_try_from_batch_uses_l2_for_cosine() {
+        let original_codes = make_test_codes(50, 64);
+        let metadata = make_test_metadata(original_codes.value_length() as usize * 8);
+
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(original_codes),
+            &metadata,
+            DistanceType::Cosine,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(storage.distance_type(), DistanceType::L2);
+    }
+
+    #[test]
+    fn test_try_from_batch_keeps_cosine_for_legacy_residual_query() {
+        let original_codes = make_test_codes(50, 64);
+        let mut metadata = make_test_metadata(original_codes.value_length() as usize * 8);
+        metadata.query_estimator = RabitQueryEstimator::ResidualQuery;
+
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(original_codes),
+            &metadata,
+            DistanceType::Cosine,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(storage.distance_type(), DistanceType::Cosine);
     }
 
     #[test]
