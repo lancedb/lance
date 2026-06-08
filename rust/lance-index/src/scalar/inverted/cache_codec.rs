@@ -7,7 +7,7 @@
 //! cache backends, behind the stabilized envelope written by
 //! [`CacheCodec`](lance_core::cache::CacheCodec).
 //!
-//! Every variant uses a protobuf header (see `protos/cache_fts.proto`, with the
+//! Every variant uses a protobuf header (see `protos-cache/cache.proto`, with the
 //! tail/position codecs and position-storage kind as proto enums) followed by
 //! 64-byte-aligned Arrow IPC sections and, where applicable, raw blobs:
 //!

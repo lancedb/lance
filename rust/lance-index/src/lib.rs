@@ -68,16 +68,11 @@ pub mod pbold {
     include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
 }
 
-/// Protobuf headers for serialized cache entries (e.g. FTS posting lists).
+/// Protobuf headers for serialized index cache entries (FTS posting lists,
+/// scalar indices, and IVF vector partitions).
 pub mod cache_pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.fts.rs"));
-}
-
-/// Protobuf headers for serialized scalar-index cache entries (e.g. BTree).
-pub mod cache_scalar_pb {
-    #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.scalar.rs"));
+    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.rs"));
 }
 
 /// Generic methods common across all types of secondary indices

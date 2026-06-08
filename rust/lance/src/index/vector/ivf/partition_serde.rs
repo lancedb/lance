@@ -3,7 +3,7 @@
 
 //! Serialization and zero-copy deserialization for IVF partition cache entries.
 //!
-//! Each entry is a protobuf header (see `protos/cache_vector.proto`, with the
+//! Each entry is a protobuf header (see `lance-index/protos-cache/cache.proto`, with the
 //! distance and rotation types as proto enums) followed by 64-byte-aligned
 //! Arrow IPC sections in a fixed, version-keyed order: the sub-index, then any
 //! quantizer-specific arrays (PQ codebook, RabitQ Matrix rotation), then the
@@ -27,7 +27,7 @@ use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
 
-use crate::cache_pb::{
+use lance_index::cache_pb::{
     DistanceType as PbDistanceType, FlatPartitionHeader, PqPartitionHeader, RabitPartitionHeader,
     RotationType as PbRotationType, SqPartitionHeader,
 };

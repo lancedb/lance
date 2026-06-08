@@ -6,6 +6,9 @@ use std::io::Result;
 
 fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=protos");
+    // Cache-entry protos are library-internal serialization, not part of the
+    // on-disk format spec, so they live here rather than in the shared `protos/`.
+    println!("cargo:rerun-if-changed=protos-cache");
 
     #[cfg(feature = "protoc")]
     // Use vendored protobuf compiler if requested.
@@ -20,10 +23,9 @@ fn main() -> Result<()> {
         &[
             "./protos/index.proto",
             "./protos/index_old.proto",
-            "./protos/cache_fts.proto",
-            "./protos/cache_scalar.proto",
+            "./protos-cache/cache.proto",
         ],
-        &["./protos"],
+        &["./protos", "./protos-cache"],
     )?;
 
     let rust_toolchain = env::var("RUSTUP_TOOLCHAIN")

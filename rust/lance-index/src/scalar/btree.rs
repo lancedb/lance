@@ -15,7 +15,7 @@ use super::{
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
-use crate::cache_scalar_pb::{BTreeIndexHeader, RangeToFile};
+use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
 use crate::{
     frag_reuse::FragReuseIndex,

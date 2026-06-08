@@ -90,12 +90,6 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
 }
 
-/// Protobuf headers for serialized vector-index cache entries (IVF partitions).
-pub mod cache_pb {
-    #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.vector.cache.rs"));
-}
-
 pub use blob::{BlobArrayBuilder, blob_field};
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;
