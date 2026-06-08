@@ -26,7 +26,7 @@ use crate::vector::bq::transform::{
 };
 use crate::vector::bq::{
     RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
-    rotation::{apply_fast_rotation, random_fast_rotation_signs},
+    rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
     validate_rq_num_bits,
 };
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
@@ -264,6 +264,65 @@ impl RabitQuantizer {
 
     pub fn metadata_ref(&self) -> &RabitQuantizationMetadata {
         &self.metadata
+    }
+
+    fn from_supplied_rotation(params: &RQBuildParams, dim: usize) -> Result<Option<Self>> {
+        let Some(metadata) = params.rotation.as_ref() else {
+            return Ok(None);
+        };
+
+        if metadata.num_bits != params.num_bits {
+            return Err(Error::invalid_input(format!(
+                "rabitq_model num_bits={} does not match requested num_bits={}",
+                metadata.num_bits, params.num_bits
+            )));
+        }
+
+        let rotated_dim = metadata.rotated_dim();
+        if rotated_dim != dim {
+            return Err(Error::invalid_input(format!(
+                "rabitq_model dimension={} does not match vector dimension={}",
+                rotated_dim, dim
+            )));
+        }
+
+        match metadata.rotation_type {
+            RQRotationType::Fast => {
+                let signs = metadata.fast_rotation_signs.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "rabitq_model fast rotation is missing fast_rotation_signs".to_string(),
+                    )
+                })?;
+                let expected_len = fast_rotation_signs_len(dim);
+                if signs.len() != expected_len {
+                    return Err(Error::invalid_input(format!(
+                        "rabitq_model fast_rotation_signs length={} does not match expected length={} for dimension={}",
+                        signs.len(),
+                        expected_len,
+                        dim
+                    )));
+                }
+            }
+            RQRotationType::Matrix => {
+                let rotate_mat = metadata.rotate_mat.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "rabitq_model matrix rotation is missing rotate_mat".to_string(),
+                    )
+                })?;
+                if rotate_mat.len() != dim || rotate_mat.value_length() != dim as i32 {
+                    return Err(Error::invalid_input(format!(
+                        "rabitq_model matrix rotation shape=({}, {}) does not match vector dimension={}",
+                        rotate_mat.len(),
+                        rotate_mat.value_length(),
+                        dim
+                    )));
+                }
+            }
+        }
+
+        Ok(Some(Self {
+            metadata: metadata.clone(),
+        }))
     }
 
     #[inline]
@@ -640,6 +699,9 @@ impl Quantization for RabitQuantizer {
                 "vector dimension must be divisible by 8 for IVF_RQ",
             ));
         }
+        if let Some(q) = Self::from_supplied_rotation(params, dim)? {
+            return Ok(q);
+        }
 
         let q = match data.as_fixed_size_list().value_type() {
             DataType::Float16 => Self::new_with_rotation::<Float16Type>(
@@ -947,6 +1009,58 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn test_rabit_quantizer_reuses_supplied_rotation() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+        let supplied =
+            RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
+                .metadata(None);
+        let supplied_signs = supplied.fast_rotation_signs.clone();
+
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(supplied);
+
+        let quantizer = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap();
+        let metadata = quantizer.metadata_ref();
+        assert_eq!(metadata.num_bits, 3);
+        assert_eq!(metadata.rotation_type, RQRotationType::Fast);
+        assert_eq!(metadata.fast_rotation_signs, supplied_signs);
+    }
+
+    #[test]
+    fn test_rabit_quantizer_validates_supplied_rotation() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+        let supplied =
+            RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
+                .metadata(None);
+
+        let mut wrong_num_bits = supplied.clone();
+        wrong_num_bits.num_bits = 1;
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(wrong_num_bits);
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match requested num_bits")
+        );
+
+        let mut wrong_dim = supplied.clone();
+        wrong_dim.code_dim = 64;
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(wrong_dim);
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(err.to_string().contains("does not match vector dimension"));
+
+        let mut wrong_sign_len = supplied;
+        wrong_sign_len.fast_rotation_signs.as_mut().unwrap().pop();
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(wrong_sign_len);
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(err.to_string().contains("fast_rotation_signs length"));
     }
 
     #[test]
