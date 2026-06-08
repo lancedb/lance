@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::refs::check_valid_branch;
 use lance::dataset::scanner::Scanner;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
@@ -1160,6 +1161,54 @@ impl DirectoryNamespace {
         ObjectStore::extract_path_from_uri(registry, uri)
     }
 
+    /// Normalize and validate a branch selector: `None`, empty, and `main` mean
+    /// the main branch; any other name is validated with lance's
+    /// `check_valid_branch` (lance skips this on the open path) so it cannot
+    /// escape the table root via `..`.
+    fn normalized_branch(branch: Option<&str>) -> Result<Option<&str>> {
+        match branch.filter(|b| !b.is_empty() && *b != "main") {
+            Some(branch) => {
+                check_valid_branch(branch).map_err(|e| {
+                    lance_core::Error::from(NamespaceError::InvalidInput {
+                        message: format!("invalid branch name '{}': {}", branch, e),
+                    })
+                })?;
+                Ok(Some(branch))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn open_validated_branch(&self, table_uri: &str, branch: &str) -> Result<Dataset> {
+        let dataset = self
+            .configured_builder(table_uri)
+            .with_branch(branch, None)
+            .load()
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::TableNotFound {
+                    message: format!(
+                        "branch '{}' not found for table at '{}': {}",
+                        branch, table_uri, e
+                    ),
+                })
+            })?;
+        dataset.branches().get(branch).await.map_err(|_| {
+            lance_core::Error::from(NamespaceError::TableNotFound {
+                message: format!("branch '{}' not found for table at '{}'", branch, table_uri),
+            })
+        })?;
+        Ok(dataset)
+    }
+
+    async fn resolve_branch_location(&self, table_uri: &str, branch: &str) -> Result<String> {
+        Ok(self
+            .open_validated_branch(table_uri, branch)
+            .await?
+            .branch_location()
+            .uri)
+    }
+
     fn validate_dir_only_properties(
         properties: Option<&HashMap<String, String>>,
         operation: &str,
@@ -1217,6 +1266,13 @@ impl DirectoryNamespace {
         Ok(dataset)
     }
 
+    /// Logical table version parsed from a manifest filename, or `None` for
+    /// non-manifest / detached entries. Delegates to lance's scheme detection so
+    /// version listing and deletion stay consistent with the on-disk format.
+    fn manifest_version_from_filename(filename: &str) -> Option<u64> {
+        ManifestNamingScheme::detect_scheme(filename)?.parse_version(filename)
+    }
+
     async fn list_table_versions_from_storage(
         &self,
         table_uri: &str,
@@ -1247,17 +1303,7 @@ impl DirectoryNamespace {
             .into_iter()
             .filter_map(|meta| {
                 let filename = meta.location.filename()?;
-                let version_str = filename.strip_suffix(".manifest")?;
-                if version_str.starts_with('d') {
-                    return None;
-                }
-                let file_version: u64 = version_str.parse().ok()?;
-
-                let actual_version = if file_version > u64::MAX / 2 {
-                    u64::MAX - file_version
-                } else {
-                    file_version
-                };
+                let actual_version = Self::manifest_version_from_filename(filename)?;
 
                 Some(TableVersion {
                     version: actual_version as i64,
@@ -1525,6 +1571,19 @@ impl DirectoryNamespace {
         }
     }
 
+    /// Build a `DatasetBuilder` for `table_uri` with this namespace's storage
+    /// options and session applied. Callers add version/branch scoping.
+    fn configured_builder(&self, table_uri: &str) -> DatasetBuilder {
+        let mut builder = DatasetBuilder::from_uri(table_uri);
+        if let Some(opts) = &self.storage_options {
+            builder = builder.with_storage_options(opts.clone());
+        }
+        if let Some(sess) = &self.session {
+            builder = builder.with_session(sess.clone());
+        }
+        builder
+    }
+
     async fn load_dataset(
         &self,
         table_uri: &str,
@@ -1543,13 +1602,7 @@ impl DirectoryNamespace {
             .into());
         }
 
-        let mut builder = DatasetBuilder::from_uri(table_uri);
-        if let Some(opts) = &self.storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
-        if let Some(sess) = &self.session {
-            builder = builder.with_session(sess.clone());
-        }
+        let builder = self.configured_builder(table_uri);
 
         let dataset = builder.load().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::TableNotFound {
@@ -2130,40 +2183,66 @@ impl DirectoryNamespace {
         &self,
         table_entries: &[TableDeleteEntry],
         best_effort: bool,
+        branch: Option<&str>,
     ) -> Result<i64> {
         let mut deleted_count = 0i64;
         for te in table_entries {
             let table_uri = self.resolve_table_location(&te.table_id).await?;
+            let table_uri = match branch {
+                Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+                None => table_uri,
+            };
             let table_path = self.object_store_path_from_uri(&table_uri)?;
             let versions_dir_path = table_path.clone().join(VERSIONS_DIR);
 
-            for (start, end) in &te.ranges {
-                for version in *start..=*end {
-                    let version_path = versions_dir_path
-                        .clone()
-                        .join(format!("{}.manifest", version as u64));
-                    match self.object_store.inner.delete(&version_path).await {
-                        Ok(_) => {
-                            deleted_count += 1;
-                        }
-                        Err(object_store::Error::NotFound { .. }) => {}
-                        Err(e) => {
-                            if best_effort {
-                                log::warn!(
-                                    "Failed to delete manifest file for version {} of table {:?}: {:?}",
-                                    version,
-                                    te.table_id,
-                                    e
-                                );
-                            } else {
-                                return Err(NamespaceError::Internal {
-                                    message: format!(
-                                        "Failed to delete version {} for table at '{}': {}",
-                                        version, table_uri, e
-                                    ),
-                                }
-                                .into());
+            // Match listed files, not constructed names (`{version}.manifest` misses V2).
+            let manifest_metas: Vec<_> = self
+                .object_store
+                .read_dir_all(&versions_dir_path, None)
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to list manifest files for table at '{}': {}",
+                            table_uri, e
+                        ),
+                    })
+                })?;
+            let location_by_version: HashMap<u64, Path> = manifest_metas
+                .into_iter()
+                .filter_map(|meta| {
+                    let version = Self::manifest_version_from_filename(meta.location.filename()?)?;
+                    Some((version, meta.location))
+                })
+                .collect();
+
+            for (&v, version_path) in &location_by_version {
+                let vi = v as i64;
+                if !te.ranges.iter().any(|&(s, e)| vi >= s && vi <= e) {
+                    continue;
+                }
+                match self.object_store.inner.delete(version_path).await {
+                    Ok(_) => {
+                        deleted_count += 1;
+                    }
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => {
+                        if best_effort {
+                            log::warn!(
+                                "Failed to delete manifest file for version {} of table {:?}: {:?}",
+                                v,
+                                te.table_id,
+                                e
+                            );
+                        } else {
+                            return Err(NamespaceError::Internal {
+                                message: format!(
+                                    "Failed to delete version {} for table at '{}': {}",
+                                    v, table_uri, e
+                                ),
                             }
+                            .into());
                         }
                     }
                 }
@@ -2807,8 +2886,11 @@ impl LanceNamespace for DirectoryNamespace {
         request: ListTableVersionsRequest,
     ) -> Result<ListTableVersionsResponse> {
         self.record_op("list_table_versions");
-        // When table_version_storage_enabled, query from __manifest
-        if self.table_version_storage_enabled
+        let branch = Self::normalized_branch(request.branch.as_deref())?;
+        // The manifest catalog has no branch concept, so a branch lists its own
+        // version chain from storage under its tree path instead.
+        if branch.is_none()
+            && self.table_version_storage_enabled
             && let Some(ref manifest_ns) = self.manifest_ns
         {
             let table_id = request.id.clone().unwrap_or_default();
@@ -2820,6 +2902,10 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Fallback when table_version_storage is not enabled: list from _versions/ directory
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let table_uri = match branch {
+            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            None => table_uri,
+        };
         let want_descending = request.descending == Some(true);
         let table_versions = self
             .list_table_versions_from_storage(&table_uri, want_descending, request.limit)
@@ -2836,7 +2922,12 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateTableVersionRequest,
     ) -> Result<CreateTableVersionResponse> {
         self.record_op("create_table_version");
+        let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let table_uri = match branch {
+            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            None => table_uri,
+        };
 
         let staging_manifest_path = &request.manifest_path;
         let version = request.version as u64;
@@ -2956,8 +3047,10 @@ impl LanceNamespace for DirectoryNamespace {
             );
         }
 
-        // If table_version_storage_enabled is enabled, also record in __manifest (best-effort)
-        if self.table_version_storage_enabled
+        // Also record in __manifest (best-effort). Branches aren't tracked there,
+        // so for a branch the storage manifest above is the only record.
+        if branch.is_none()
+            && self.table_version_storage_enabled
             && let Some(ref manifest_ns) = self.manifest_ns
         {
             let table_id_str =
@@ -3009,9 +3102,12 @@ impl LanceNamespace for DirectoryNamespace {
         request: DescribeTableVersionRequest,
     ) -> Result<DescribeTableVersionResponse> {
         self.record_op("describe_table_version");
+        let branch = Self::normalized_branch(request.branch.as_deref())?;
         // When table_version_storage_enabled and a specific version is requested,
-        // query from __manifest to avoid opening the entire dataset
-        if self.table_version_storage_enabled
+        // query from __manifest to avoid opening the entire dataset. A branch has
+        // no manifest-catalog entry, so it resolves from storage instead.
+        if branch.is_none()
+            && self.table_version_storage_enabled
             && let (Some(manifest_ns), Some(version)) = (&self.manifest_ns, request.version)
         {
             let table_id = request.id.clone().unwrap_or_default();
@@ -3020,6 +3116,10 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Fallback when table_version_storage is not enabled: inspect physical manifests directly.
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let table_uri = match branch {
+            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            None => table_uri,
+        };
         let versions = self
             .list_table_versions_from_storage(&table_uri, true, None)
             .await?;
@@ -3057,6 +3157,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: BatchDeleteTableVersionsRequest,
     ) -> Result<BatchDeleteTableVersionsResponse> {
         self.record_op("batch_delete_table_versions");
+        let branch = Self::normalized_branch(request.branch.as_deref())?;
         // Single-table mode: use `id` (from path parameter) + `ranges` to delete
         // versions from one table.
         let ranges: Vec<(i64, i64)> = request
@@ -3072,6 +3173,24 @@ impl LanceNamespace for DirectoryNamespace {
                 (start, end)
             })
             .collect();
+
+        // Reject pathological ranges up front: the manifest path below builds one
+        // id per version, so (0, i64::MAX) would exhaust memory.
+        const MAX_VERSIONS_PER_REQUEST: i128 = 1_000_000;
+        let requested: i128 = ranges
+            .iter()
+            .map(|(s, e)| (*e as i128 - *s as i128 + 1).max(0))
+            .sum();
+        if requested > MAX_VERSIONS_PER_REQUEST {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "batch_delete requested {} versions; limit is {}",
+                    requested, MAX_VERSIONS_PER_REQUEST
+                ),
+            }
+            .into());
+        }
+
         let table_entries = vec![TableDeleteEntry {
             table_id: request.id.clone(),
             ranges,
@@ -3079,7 +3198,10 @@ impl LanceNamespace for DirectoryNamespace {
 
         let mut total_deleted_count = 0i64;
 
-        if self.table_version_storage_enabled
+        // Branches are not tracked in the manifest catalog, so a branch skips the
+        // __manifest phase entirely and deletes its physical manifests directly.
+        if branch.is_none()
+            && self.table_version_storage_enabled
             && let Some(ref manifest_ns) = self.manifest_ns
         {
             // Phase 1 (atomic commit point): Delete version records from __manifest
@@ -3115,7 +3237,7 @@ impl LanceNamespace for DirectoryNamespace {
             // __manifest, so they won't be visible to readers. Leftover files are
             // orphaned but harmless and can be cleaned up later.
             let _ = self
-                .delete_physical_version_files(&table_entries, true)
+                .delete_physical_version_files(&table_entries, true, branch)
                 .await;
 
             return Ok(BatchDeleteTableVersionsResponse {
@@ -3124,9 +3246,10 @@ impl LanceNamespace for DirectoryNamespace {
             });
         }
 
-        // Fallback when table_version_storage is not enabled: delete physical files directly (no __manifest)
+        // Direct path: delete physical files (no __manifest). Reached when storage
+        // tracking is off, or for any branch (which has no __manifest entries).
         total_deleted_count = self
-            .delete_physical_version_files(&table_entries, false)
+            .delete_physical_version_files(&table_entries, false, branch)
             .await?;
 
         Ok(BatchDeleteTableVersionsResponse {
@@ -3462,8 +3585,12 @@ impl LanceNamespace for DirectoryNamespace {
             ));
         }
 
+        let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let mut dataset = self.load_dataset(&table_uri, None, "restore_table").await?;
+        let mut dataset = match branch {
+            Some(branch) => self.open_validated_branch(&table_uri, branch).await?,
+            None => self.load_dataset(&table_uri, None, "restore_table").await?,
+        };
 
         dataset = dataset
             .checkout_version(version as u64)
@@ -4563,6 +4690,594 @@ mod tests {
             .await
             .unwrap()
             .transaction_id
+    }
+
+    /// Fork `branch_name` from the table's current version and append
+    /// `extra_versions` commits to it (each a new version on the branch, written
+    /// with the default V2 naming). The main branch is left untouched. Returns
+    /// the branch's storage URI (`<root>/tree/<branch>`).
+    async fn create_branch_with_commits(
+        namespace: &DirectoryNamespace,
+        table_name: &str,
+        branch_name: &str,
+        extra_versions: usize,
+    ) -> String {
+        let mut main = open_dataset(namespace, table_name).await;
+        let fork_version = main.version().version;
+        let branch = main
+            .create_branch(branch_name, fork_version, None)
+            .await
+            .unwrap();
+        let branch_uri = branch.uri().to_string();
+        for i in 0..extra_versions {
+            append_scalar_version(&branch_uri, (i as i32 + 1) * 100).await;
+        }
+        branch_uri
+    }
+
+    /// Append one scalar-schema batch to the dataset at `uri`, creating a new
+    /// version (default V2 naming). Shared by branch and main chain setup.
+    async fn append_scalar_version(uri: &str, seed: i32) {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![seed, seed + 1])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("y")])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// List a table's versions on `branch` (None == main) via the namespace.
+    async fn list_versions(
+        namespace: &DirectoryNamespace,
+        table_name: &str,
+        branch: Option<&str>,
+    ) -> Result<Vec<TableVersion>> {
+        let req = ListTableVersionsRequest {
+            id: Some(vec![table_name.to_string()]),
+            branch: branch.map(|b| b.to_string()),
+            ..Default::default()
+        };
+        namespace.list_table_versions(req).await.map(|r| r.versions)
+    }
+
+    #[tokio::test]
+    async fn test_list_table_versions_on_branch() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        create_branch_with_commits(&namespace, "users", "exp", 2).await;
+
+        // The branch lists its own chain, and every version resolves to a
+        // manifest under the branch's tree path.
+        let branch_versions = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap();
+        assert!(branch_versions.len() >= 2);
+        assert!(
+            branch_versions
+                .iter()
+                .all(|v| v.manifest_path.contains("tree/exp")),
+            "branch versions must resolve to branch manifests: {:?}",
+            branch_versions
+        );
+
+        // Unset and "main" behave identically and never see the tree path.
+        let main_versions = list_versions(&namespace, "users", None).await.unwrap();
+        let main_explicit = list_versions(&namespace, "users", Some("main"))
+            .await
+            .unwrap();
+        assert_eq!(main_versions.len(), main_explicit.len());
+        assert!(
+            main_versions
+                .iter()
+                .all(|v| !v.manifest_path.contains("tree/"))
+        );
+
+        // A non-existent branch is a clean not-found, not an empty list.
+        let missing = list_versions(&namespace, "users", Some("does-not-exist")).await;
+        assert!(missing.is_err());
+        assert!(missing.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_version_on_branch() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        create_branch_with_commits(&namespace, "users", "exp", 2).await;
+
+        let branch_versions = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap();
+        let latest = branch_versions.iter().map(|v| v.version).max().unwrap();
+
+        // Describe latest on the branch returns the branch's manifest_path.
+        let req = DescribeTableVersionRequest {
+            id: Some(vec!["users".to_string()]),
+            branch: Some("exp".to_string()),
+            ..Default::default()
+        };
+        let resp = namespace.describe_table_version(req).await.unwrap();
+        assert_eq!(resp.version.version, latest);
+        assert!(resp.version.manifest_path.contains("tree/exp"));
+
+        // A specific existing branch version resolves.
+        let req = DescribeTableVersionRequest {
+            id: Some(vec!["users".to_string()]),
+            version: Some(latest),
+            branch: Some("exp".to_string()),
+            ..Default::default()
+        };
+        assert!(namespace.describe_table_version(req).await.is_ok());
+
+        // A version absent on the branch is not found.
+        let req = DescribeTableVersionRequest {
+            id: Some(vec!["users".to_string()]),
+            version: Some(999_999),
+            branch: Some("exp".to_string()),
+            ..Default::default()
+        };
+        assert!(namespace.describe_table_version(req).await.is_err());
+
+        // A non-existent branch is not found.
+        let req = DescribeTableVersionRequest {
+            id: Some(vec!["users".to_string()]),
+            branch: Some("nope".to_string()),
+            ..Default::default()
+        };
+        let err = namespace.describe_table_version(req).await;
+        assert!(err.is_err() && err.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_restore_table_on_branch() {
+        use lance_namespace::models::RestoreTableRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        create_branch_with_commits(&namespace, "users", "exp", 2).await;
+
+        let before = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap();
+        let branch_latest = before.iter().map(|v| v.version).max().unwrap();
+        let earliest = before.iter().map(|v| v.version).min().unwrap();
+        let main_before = list_versions(&namespace, "users", None)
+            .await
+            .unwrap()
+            .len();
+
+        // Restoring the branch to an earlier version commits a NEW version on
+        // the branch (restore is itself a commit), and must not touch main.
+        let req = RestoreTableRequest {
+            id: Some(vec!["users".to_string()]),
+            version: earliest,
+            branch: Some("exp".to_string()),
+            ..Default::default()
+        };
+        let resp = namespace.restore_table(req).await.unwrap();
+        assert!(resp.transaction_id.is_some());
+
+        let after = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap();
+        let new_latest = after.iter().map(|v| v.version).max().unwrap();
+        assert!(
+            new_latest > branch_latest,
+            "restore should add a branch version"
+        );
+
+        let main_after = list_versions(&namespace, "users", None)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(main_after, main_before, "main must be unaffected");
+    }
+
+    #[tokio::test]
+    async fn test_batch_delete_table_versions_on_branch() {
+        use lance_namespace::models::{BatchDeleteTableVersionsRequest, VersionRange};
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        create_branch_with_commits(&namespace, "users", "exp", 2).await;
+
+        let before = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap();
+        let min_v = before.iter().map(|v| v.version).min().unwrap();
+        let max_v = before.iter().map(|v| v.version).max().unwrap();
+        let main_before = list_versions(&namespace, "users", None).await.unwrap();
+
+        // Delete the branch's whole version range. The branch manifests use V2
+        // naming (inverted, zero-padded), so a nonzero deleted_count proves the
+        // V2 fix: the old code constructed "{version}.manifest" and silently
+        // matched nothing.
+        let req = BatchDeleteTableVersionsRequest {
+            id: Some(vec!["users".to_string()]),
+            branch: Some("exp".to_string()),
+            ranges: vec![VersionRange::new(min_v, max_v)],
+            ..Default::default()
+        };
+        let resp = namespace.batch_delete_table_versions(req).await.unwrap();
+        assert_eq!(
+            resp.deleted_count,
+            Some(before.len() as i64),
+            "every branch manifest should be physically deleted"
+        );
+
+        // The emptied branch now reads as not-found, and main is untouched.
+        assert!(
+            list_versions(&namespace, "users", Some("exp"))
+                .await
+                .is_err()
+        );
+        let main_after = list_versions(&namespace, "users", None).await.unwrap();
+        assert_eq!(
+            main_after.len(),
+            main_before.len(),
+            "main must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_version_on_branch() {
+        use futures::TryStreamExt;
+        use lance_namespace::models::CreateTableVersionRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let branch_uri = create_branch_with_commits(&namespace, "users", "exp", 1).await;
+
+        // Stage a manifest by copying one of the branch's existing manifests.
+        let branch_ds = Dataset::open(&branch_uri).await.unwrap();
+        let versions_dir = branch_ds.versions_dir();
+        let store = branch_ds.object_store(None).await.unwrap();
+        let existing = store
+            .inner
+            .list(Some(&versions_dir))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.location
+                    .filename()
+                    .map(|f| f.ends_with(".manifest"))
+                    .unwrap_or(false)
+            })
+            .expect("a branch manifest");
+        let bytes = store
+            .inner
+            .get(&existing.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let staging = versions_dir.join("staging_manifest");
+        store.inner.put(&staging, bytes.into()).await.unwrap();
+
+        let main_before = list_versions(&namespace, "users", None)
+            .await
+            .unwrap()
+            .len();
+        let new_version = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .max()
+            .unwrap()
+            + 1;
+
+        let req = CreateTableVersionRequest {
+            id: Some(vec!["users".to_string()]),
+            version: new_version,
+            manifest_path: staging.to_string(),
+            naming_scheme: Some("V2".to_string()),
+            branch: Some("exp".to_string()),
+            ..Default::default()
+        };
+        let resp = namespace.create_table_version(req).await.unwrap();
+        let info = resp.version.expect("version info");
+        // The new manifest must land under the branch's tree path.
+        assert!(
+            info.manifest_path.contains("tree/exp"),
+            "got {}",
+            info.manifest_path
+        );
+
+        // It is visible on the branch, and main did not gain a version.
+        let after = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap();
+        assert!(after.iter().any(|v| v.version == new_version));
+        let main_after = list_versions(&namespace, "users", None)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(main_after, main_before, "main must be unaffected");
+    }
+
+    #[tokio::test]
+    async fn test_branch_name_validation_rejects_traversal() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // A traversal-style branch name is rejected as invalid input before any
+        // storage path is built from it.
+        let err = list_versions(&namespace, "users", Some("../evil")).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("invalid branch name"));
+    }
+
+    #[tokio::test]
+    async fn test_branch_ops_reject_zombie_branch() {
+        use futures::TryStreamExt;
+        use lance_namespace::models::{
+            BatchDeleteTableVersionsRequest, CreateTableVersionRequest, RestoreTableRequest,
+            VersionRange,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // Stage a real (loadable) manifest under tree/ghost/_versions/ without
+        // create_branch, so the path exists but has no BranchContents ref.
+        let dataset = open_dataset(&namespace, "users").await;
+        let store = dataset.object_store(None).await.unwrap();
+        let manifest = store
+            .inner
+            .list(Some(&dataset.versions_dir()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.location
+                    .filename()
+                    .map(|f| f.ends_with(".manifest"))
+                    .unwrap_or(false)
+            })
+            .expect("a manifest");
+        let bytes = store
+            .inner
+            .get(&manifest.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let zombie = Path::from(format!(
+            "{}/tree/ghost/_versions/{}",
+            dataset.branch_location().path,
+            manifest.location.filename().unwrap()
+        ));
+        store.inner.put(&zombie, bytes.into()).await.unwrap();
+
+        // The directory is physically present, but the source of truth has no
+        // such branch -- this is what makes every op below reject it.
+        assert!(dataset.branches().get("ghost").await.is_err());
+
+        fn rejected<T: std::fmt::Debug>(label: &str, r: Result<T>) {
+            match r {
+                Ok(v) => panic!("{label} must reject the zombie branch, got Ok({v:?})"),
+                Err(e) => assert!(e.to_string().contains("not found"), "{label}: {e}"),
+            }
+        }
+
+        rejected(
+            "list",
+            list_versions(&namespace, "users", Some("ghost")).await,
+        );
+        rejected(
+            "describe",
+            namespace
+                .describe_table_version(DescribeTableVersionRequest {
+                    id: Some(vec!["users".to_string()]),
+                    branch: Some("ghost".to_string()),
+                    ..Default::default()
+                })
+                .await,
+        );
+        rejected(
+            "create",
+            namespace
+                .create_table_version(CreateTableVersionRequest {
+                    id: Some(vec!["users".to_string()]),
+                    version: 2,
+                    manifest_path: zombie.to_string(),
+                    branch: Some("ghost".to_string()),
+                    ..Default::default()
+                })
+                .await,
+        );
+        rejected(
+            "restore",
+            namespace
+                .restore_table(RestoreTableRequest {
+                    id: Some(vec!["users".to_string()]),
+                    version: 1,
+                    branch: Some("ghost".to_string()),
+                    ..Default::default()
+                })
+                .await,
+        );
+        rejected(
+            "batch_delete",
+            namespace
+                .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
+                    id: Some(vec!["users".to_string()]),
+                    branch: Some("ghost".to_string()),
+                    ranges: vec![VersionRange::new(1, 1)],
+                    ..Default::default()
+                })
+                .await,
+        );
+    }
+
+    /// V2 is the default naming scheme, and the pre-rewrite delete path
+    /// constructed `{version}.manifest` (a V1 name) and silently matched nothing
+    /// on a V2 table, returning deleted_count 0. This pins the fix on the main
+    /// chain (branch=None), which previously had no batch_delete coverage at all.
+    #[tokio::test]
+    async fn test_batch_delete_table_versions_main_v2() {
+        use lance_namespace::models::{BatchDeleteTableVersionsRequest, VersionRange};
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await; // version 1
+        let main_uri = open_dataset(&namespace, "users").await.uri().to_string();
+        append_scalar_version(&main_uri, 100).await; // version 2
+        append_scalar_version(&main_uri, 200).await; // version 3
+
+        let before = list_versions(&namespace, "users", None).await.unwrap();
+        assert!(before.len() >= 3);
+        // Confirm these really are V2-named manifests (20-digit inverted version
+        // + ".manifest" == 29 chars), i.e. the case the old code skipped.
+        assert!(
+            before
+                .iter()
+                .all(|v| v.manifest_path.rsplit('/').next().unwrap().len() == 29),
+            "expected V2-named manifests: {:?}",
+            before
+        );
+        let min_v = before.iter().map(|v| v.version).min().unwrap();
+        let max_v = before.iter().map(|v| v.version).max().unwrap();
+
+        // Delete everything except the latest version.
+        let req = BatchDeleteTableVersionsRequest {
+            id: Some(vec!["users".to_string()]),
+            ranges: vec![VersionRange::new(min_v, max_v - 1)],
+            ..Default::default()
+        };
+        let resp = namespace.batch_delete_table_versions(req).await.unwrap();
+        assert_eq!(
+            resp.deleted_count,
+            Some((before.len() - 1) as i64),
+            "V2 manifests must actually be deleted (was 0 before the fix)"
+        );
+
+        let after = list_versions(&namespace, "users", None).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].version, max_v);
+    }
+
+    #[tokio::test]
+    async fn test_batch_delete_rejects_unbounded_range() {
+        use lance_namespace::models::{BatchDeleteTableVersionsRequest, VersionRange};
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // An unbounded range must be rejected up front, not turned into ~10^19
+        // iterations / an unbounded id list.
+        let req = BatchDeleteTableVersionsRequest {
+            id: Some(vec!["users".to_string()]),
+            ranges: vec![VersionRange::new(0, i64::MAX)],
+            ..Default::default()
+        };
+        let err = namespace.batch_delete_table_versions(req).await;
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err().to_string().contains("limit"),
+            "expected a range-too-large error"
+        );
+    }
+
+    /// The shared parser must decode both naming schemes; this is the cheap
+    /// V1 no-regression guard (creating a real V1 table is not exposed here).
+    #[test]
+    fn test_manifest_version_from_filename() {
+        // V1: the plain version number.
+        assert_eq!(
+            DirectoryNamespace::manifest_version_from_filename("5.manifest"),
+            Some(5)
+        );
+        assert_eq!(
+            DirectoryNamespace::manifest_version_from_filename("0.manifest"),
+            Some(0)
+        );
+        // V2: version stored as u64::MAX - version, zero-padded to 20 digits.
+        let v2_five = format!("{:020}.manifest", u64::MAX - 5);
+        assert_eq!(
+            DirectoryNamespace::manifest_version_from_filename(&v2_five),
+            Some(5)
+        );
+        let v2_zero = format!("{:020}.manifest", u64::MAX);
+        assert_eq!(
+            DirectoryNamespace::manifest_version_from_filename(&v2_zero),
+            Some(0)
+        );
+        // Non-manifest and detached (`d`-prefixed) entries are ignored.
+        assert_eq!(
+            DirectoryNamespace::manifest_version_from_filename("data.lance"),
+            None
+        );
+        assert_eq!(
+            DirectoryNamespace::manifest_version_from_filename("d5.manifest"),
+            None
+        );
+    }
+
+    /// With the manifest store enabled, branch ops must still bypass the catalog
+    /// fast-path and read the chain from `tree/<branch>/_versions/`. Without the
+    /// `branch.is_none()` guard this would query `__manifest` (which has no
+    /// branch entries) and return the wrong result. The other branch tests use a
+    /// store-disabled namespace, so this pins the enabled path specifically.
+    #[tokio::test]
+    async fn test_branch_ops_skip_manifest_store_when_enabled() {
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(true)
+            .table_version_storage_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        create_scalar_table(&namespace, "users").await;
+        create_branch_with_commits(&namespace, "users", "exp", 2).await;
+
+        // list resolves the branch chain from storage despite storage tracking
+        // being on (a successful result with tree/exp paths proves the bypass:
+        // the catalog has no "exp" entry, so the fast-path would not return these).
+        let branch_versions = list_versions(&namespace, "users", Some("exp"))
+            .await
+            .unwrap();
+        assert!(branch_versions.len() >= 2);
+        assert!(
+            branch_versions
+                .iter()
+                .all(|v| v.manifest_path.contains("tree/exp")),
+            "branch versions must come from branch storage with the store enabled: {:?}",
+            branch_versions
+        );
+
+        // describe likewise resolves from the branch's storage.
+        let req = DescribeTableVersionRequest {
+            id: Some(vec!["users".to_string()]),
+            branch: Some("exp".to_string()),
+            ..Default::default()
+        };
+        let resp = namespace.describe_table_version(req).await.unwrap();
+        assert!(resp.version.manifest_path.contains("tree/exp"));
     }
 
     #[tokio::test]

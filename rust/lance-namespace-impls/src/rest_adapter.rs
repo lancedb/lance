@@ -302,6 +302,7 @@ struct PaginationQuery {
     limit: Option<i32>,
     include_declared: Option<bool>,
     descending: Option<bool>,
+    branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -847,6 +848,7 @@ async fn list_table_versions(
         page_token: params.page_token,
         limit: params.limit,
         descending: params.descending,
+        branch: params.branch,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -872,6 +874,7 @@ async fn create_table_version(
         manifest_size: body.manifest_size,
         e_tag: body.e_tag,
         metadata: body.metadata,
+        branch: body.branch,
         ..Default::default()
     };
 
@@ -891,6 +894,7 @@ async fn describe_table_version(
     let request = DescribeTableVersionRequest {
         id: Some(parse_id(&id, query.delimiter.as_deref())),
         version: body.version,
+        branch: body.branch,
         identity: extract_identity(&headers),
         ..Default::default()
     };
@@ -912,6 +916,7 @@ async fn batch_delete_table_versions(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
         ranges: body.ranges,
+        branch: body.branch,
         ..Default::default()
     };
 
@@ -3187,6 +3192,79 @@ mod tests {
                 "Failed to list table versions with ascending: {:?}",
                 result
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_branch_param_forwarded_end_to_end() {
+            let fixture = RestServerFixture::new().await;
+
+            fixture
+                .namespace
+                .create_namespace(CreateNamespaceRequest {
+                    id: Some(vec!["branch_fwd_ns".to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table(
+                    CreateTableRequest {
+                        id: Some(vec![
+                            "branch_fwd_ns".to_string(),
+                            "branch_fwd_table".to_string(),
+                        ]),
+                        mode: Some("create".to_string()),
+                        ..Default::default()
+                    },
+                    create_test_arrow_data(),
+                )
+                .await
+                .unwrap();
+
+            let id = vec!["branch_fwd_ns".to_string(), "branch_fwd_table".to_string()];
+
+            // Control: no branch succeeds (resolves the main chain).
+            assert!(
+                fixture
+                    .namespace
+                    .list_table_versions(ListTableVersionsRequest {
+                        id: Some(id.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .is_ok()
+            );
+
+            // list forwards branch as a query param; a bogus branch 404s at the backend.
+            assert!(
+                fixture
+                    .namespace
+                    .list_table_versions(ListTableVersionsRequest {
+                        id: Some(id.clone()),
+                        branch: Some("ghost".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err(),
+                "branch must be forwarded as a query param and honored by the backend"
+            );
+
+            // describe carries branch in the request body; a bogus branch likewise 404s.
+            assert!(
+                fixture
+                    .namespace
+                    .describe_table_version(DescribeTableVersionRequest {
+                        id: Some(id.clone()),
+                        branch: Some("ghost".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err(),
+                "branch must be forwarded in the request body and honored by the backend"
+            );
+
+            fixture.server_handle.shutdown();
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

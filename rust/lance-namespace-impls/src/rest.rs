@@ -1294,6 +1294,13 @@ impl LanceNamespace for RestNamespace {
             descending_str = descending.to_string();
             query.push(("descending", descending_str.as_str()));
         }
+        // Forward branch as a query param (this op sends no body).
+        // describe_table_version differs: branch rides its body, already serialized.
+        let branch_str;
+        if let Some(ref branch) = request.branch {
+            branch_str = branch.clone();
+            query.push(("branch", branch_str.as_str()));
+        }
         self.post_json(&path, &query, &(), "list_table_versions", &id)
             .await
     }
