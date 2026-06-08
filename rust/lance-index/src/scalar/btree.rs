@@ -615,18 +615,20 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-    /// Pages where the value may be null (does not include all_null_pages)
-    null_pages: Vec<u32>,
-    /// Pages that are entirely null
-    all_null_pages: Vec<u32>,
+    /// Pages where the value may be null (does not include all_null_pages),
+    /// keyed by page number with the exact null count in that page.
+    null_pages: HashMap<u32, u32>,
+    /// Pages that are entirely null, keyed by page number with the exact null
+    /// count in that page.
+    all_null_pages: HashMap<u32, u32>,
 }
 
 impl BTreeLookup {
     fn empty() -> Self {
         Self {
             tree: BTreeMap::new(),
-            null_pages: Vec::new(),
-            all_null_pages: Vec::new(),
+            null_pages: HashMap::new(),
+            all_null_pages: HashMap::new(),
         }
     }
 }
@@ -649,8 +651,8 @@ impl Matches {
 impl BTreeLookup {
     fn new(
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-        null_pages: Vec<u32>,
-        all_null_pages: Vec<u32>,
+        null_pages: HashMap<u32, u32>,
+        all_null_pages: HashMap<u32, u32>,
     ) -> Self {
         Self {
             tree,
@@ -823,9 +825,10 @@ impl BTreeLookup {
 
     fn pages_null(&self) -> Vec<Matches> {
         self.null_pages
-            .iter()
-            .map(|page_id| Matches::Some(*page_id))
-            .chain(self.all_null_pages.iter().copied().map(Matches::All))
+            .keys()
+            .copied()
+            .map(Matches::Some)
+            .chain(self.all_null_pages.keys().copied().map(Matches::All))
             .collect()
     }
 }
@@ -1025,8 +1028,8 @@ fn parse_btree_lookup(data: &RecordBatch) -> Result<(Arc<BTreeLookup>, DataType)
         .ok_or_else(|| Error::internal("BTree lookup page_idx column must be UInt32"))?;
 
     let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
-    let mut null_pages = Vec::<u32>::new();
-    let mut all_null_pages = Vec::<u32>::new();
+    let mut null_pages = HashMap::<u32, u32>::new();
+    let mut all_null_pages = HashMap::<u32, u32>::new();
 
     for idx in 0..data.num_rows() {
         let min = OrderableScalarValue(ScalarValue::try_from_array(&mins, idx)?);
@@ -1036,7 +1039,7 @@ fn parse_btree_lookup(data: &RecordBatch) -> Result<(Arc<BTreeLookup>, DataType)
 
         // If the page is entirely null don't even bother putting it in the tree.
         if max.0.is_null() {
-            all_null_pages.push(page_number);
+            all_null_pages.insert(page_number, null_count);
             continue;
         } else {
             map.entry(min)
@@ -1045,7 +1048,7 @@ fn parse_btree_lookup(data: &RecordBatch) -> Result<(Arc<BTreeLookup>, DataType)
         }
 
         if null_count > 0 {
-            null_pages.push(page_number);
+            null_pages.insert(page_number, null_count);
         }
     }
 
@@ -1063,23 +1066,38 @@ fn btree_lookup_as_batch(lookup: &BTreeLookup, data_type: &DataType) -> Result<R
     let mut maxs = Vec::new();
     let mut null_counts = Vec::new();
     let mut page_numbers = Vec::new();
-    let null_pages = lookup.null_pages.iter().copied().collect::<HashSet<_>>();
 
+    // Keep all-null rows first so the regenerated lookup batch remains sorted
+    // with NULLs before non-NULL values. `parse_btree_lookup` adds a sentinel
+    // from the final row's max value, and that sentinel must not be NULL when
+    // the lookup also has non-null pages.
+    let null_value = ScalarValue::try_new_null(data_type)?;
+    let mut all_null_pages = lookup.all_null_pages.iter().collect::<Vec<_>>();
+    all_null_pages.sort_by_key(|(page_number, _)| **page_number);
+    for (page_number, null_count) in all_null_pages {
+        mins.push(null_value.clone());
+        maxs.push(null_value.clone());
+        null_counts.push(*null_count);
+        page_numbers.push(*page_number);
+    }
+
+    // Preserve the exact null_count from the lookup batch. Query execution only
+    // needs `null_count > 0` to route IS NULL queries, but the lookup wire
+    // format stores exact counts and future costing / selectivity logic may use
+    // them.
     for (min, page_records) in &lookup.tree {
         for page_record in page_records {
             mins.push(min.0.clone());
             maxs.push(page_record.max.0.clone());
-            null_counts.push(u32::from(null_pages.contains(&page_record.page_number)));
+            null_counts.push(
+                lookup
+                    .null_pages
+                    .get(&page_record.page_number)
+                    .copied()
+                    .unwrap_or(0),
+            );
             page_numbers.push(page_record.page_number);
         }
-    }
-
-    let null_value = ScalarValue::try_new_null(data_type)?;
-    for page_number in &lookup.all_null_pages {
-        mins.push(null_value.clone());
-        maxs.push(null_value.clone());
-        null_counts.push(1);
-        page_numbers.push(*page_number);
     }
 
     let min_array = if mins.is_empty() {
@@ -1115,7 +1133,10 @@ fn btree_lookup_as_batch(lookup: &BTreeLookup, data_type: &DataType) -> Result<R
 /// A `BTreeIndex` also holds non-serializable infrastructure such as an
 /// `IndexStore`, a cache handle, and an optional fragment-reuse index. This
 /// state keeps only the parsed lookup tree and small routing metadata needed to
-/// rebuild the index without re-reading or reparsing `page_lookup.lance`.
+/// rebuild the index without re-reading from blob storage. Once this state is
+/// resident in memory, reconstructing a `BTreeIndex` does not reparse the
+/// lookup. Restoring this state from a persistent cache still parses the
+/// embedded IPC lookup payload into this parsed form.
 #[derive(Debug, Clone)]
 struct BTreeIndexState {
     page_lookup: Arc<BTreeLookup>,
@@ -1833,8 +1854,8 @@ impl ScalarIndex for BTreeIndex {
             for &page_id in self
                 .page_lookup
                 .null_pages
-                .iter()
-                .chain(self.page_lookup.all_null_pages.iter())
+                .keys()
+                .chain(self.page_lookup.all_null_pages.keys())
             {
                 if !existing.contains(&page_id) {
                     pages.push(Matches::Some(page_id));
@@ -5018,6 +5039,16 @@ mod tests {
         .unwrap()
     }
 
+    fn mixed_null_lookup_batch() -> RecordBatch {
+        record_batch!(
+            ("min", Int32, [None, Some(0), Some(10)]),
+            ("max", Int32, [None, Some(9), Some(19)]),
+            ("null_count", UInt32, [1, 0, 2]),
+            ("page_idx", UInt32, [42, 0, 1])
+        )
+        .unwrap()
+    }
+
     fn btree_state(
         lookup_batch: RecordBatch,
         batch_size: u64,
@@ -5081,6 +5112,14 @@ mod tests {
         // Empty index keeps its data type even though it has no lookup rows.
         assert_state_roundtrips(&btree_state(
             RecordBatch::new_empty(sample_lookup_batch().schema()),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+        ));
+
+        // Mixed all-null and non-null pages must round-trip without creating a
+        // NULL sentinel in a non-empty lookup tree.
+        assert_state_roundtrips(&btree_state(
+            mixed_null_lookup_batch(),
             DEFAULT_BTREE_BATCH_SIZE,
             None,
         ));
