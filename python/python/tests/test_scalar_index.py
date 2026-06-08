@@ -745,7 +745,7 @@ def test_fts_custom_stop_words(tmp_path):
 def test_rowid_order(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     results = dataset.scanner(
-        columns=["doc"],
+        columns=["doc", "_score"],
         full_text_query="hello",
         with_row_id=True,
     ).to_table()

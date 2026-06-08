@@ -5889,7 +5889,7 @@ mod test {
             if let Some((lower, upper)) = distance_range {
                 scan.distance_range(lower, upper);
             }
-            scan.project(&["i"]).unwrap();
+            scan.project(&["i", "_distance"]).unwrap();
             let single = scan.try_into_batch().await.unwrap();
 
             let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
@@ -5922,7 +5922,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, k).unwrap();
         scan.use_index(false);
-        scan.project(&["i"]).unwrap();
+        scan.project(&["i", "_distance"]).unwrap();
 
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
@@ -5974,7 +5974,7 @@ mod test {
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries_one, k).unwrap();
         scan.use_index(false);
-        scan.project(&["i"]).unwrap();
+        scan.project(&["i", "_distance"]).unwrap();
 
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
@@ -6106,7 +6106,7 @@ mod test {
             .unwrap()
             .use_index(false)
             .distance_range(Some(1.0), None)
-            .project(&["i"])
+            .project(&["i", "_distance"])
             .unwrap()
             .try_into_batch()
             .await
@@ -6138,7 +6138,7 @@ mod test {
 
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, 2).unwrap();
-        scan.project(&["i"]).unwrap();
+        scan.project(&["i", "_distance"]).unwrap();
 
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
@@ -6164,7 +6164,7 @@ mod test {
             .nearest("vec", &queries, 2)
             .unwrap()
             .distance_range(Some(1.0), None)
-            .project(&["i"])
+            .project(&["i", "_distance"])
             .unwrap()
             .try_into_batch()
             .await
@@ -6302,7 +6302,7 @@ mod test {
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
         scan.filter("i > 100").unwrap();
         scan.prefilter(true);
-        scan.project(&["i", "vec"]).unwrap();
+        scan.project(&["i", "vec", "_distance"]).unwrap();
         scan.nearest("vec", &key, 5).unwrap();
         scan.use_index(false);
 
@@ -6435,7 +6435,7 @@ mod test {
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
         scan.nearest("vec", &key, 5).unwrap();
         scan.filter("i > 100").unwrap();
-        scan.project(&["i", "vec"]).unwrap();
+        scan.project(&["i", "vec", "_distance"]).unwrap();
         scan.refine(5);
 
         let results = scan
@@ -7958,12 +7958,9 @@ mod test {
             let batch = scan.try_into_batch().await.unwrap();
 
             if params.use_projection {
-                // 1 projected column
+                // 1 projected column ("indexed"); _distance is not auto-added
+                // for explicit projections.
                 let mut expected_columns = 1;
-                if vector.is_some() {
-                    // distance column if included always (TODO: it shouldn't)
-                    expected_columns += 1;
-                }
                 if params.with_row_id {
                     expected_columns += 1;
                 }
