@@ -1968,9 +1968,8 @@ mod test {
 
         // Finally, case list column to show we can handle children.
         dataset
-            .alter_columns(&[ColumnAlteration::new("l".into()).cast_to(
-                DataType::new_list(DataType::Int64, true),
-            )])
+            .alter_columns(&[ColumnAlteration::new("l".into())
+                .cast_to(DataType::new_list(DataType::Int64, true))])
             .await?;
         dataset.validate().await?;
 
