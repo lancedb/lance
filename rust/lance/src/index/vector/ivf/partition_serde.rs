@@ -28,7 +28,7 @@ use lance_arrow::ipc::{
     read_ipc_stream_at, read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
     write_ipc_stream_batches, write_len_prefixed_bytes,
 };
-use lance_core::cache::CacheCodecImpl;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -68,7 +68,7 @@ type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
 
 fn serialize_partition_entry<S, Concrete>(
     any: &ArcAny,
-    writer: &mut dyn Write,
+    writer: &mut CacheEntryWriter<'_>,
 ) -> lance_core::Result<()>
 where
     S: IvfSubIndex + 'static,
@@ -81,14 +81,16 @@ where
     concrete.serialize(writer)
 }
 
-fn deserialize_partition_entry<S, Q, Concrete>(data: &Bytes) -> lance_core::Result<ArcAny>
+fn deserialize_partition_entry<S, Q, Concrete>(
+    reader: &mut CacheEntryReader<'_>,
+) -> lance_core::Result<ArcAny>
 where
     S: IvfSubIndex + 'static,
     Q: Quantization + 'static,
     Concrete: Quantization + 'static,
     PartitionEntry<S, Concrete>: CacheCodecImpl,
 {
-    let concrete = PartitionEntry::<S, Concrete>::deserialize(data)?;
+    let concrete = PartitionEntry::<S, Concrete>::deserialize(reader)?;
     let any: ArcAny = Arc::new(concrete);
     Ok(any
         .downcast::<PartitionEntry<S, Q>>()
@@ -109,6 +111,8 @@ where
     PartitionEntry<S, Concrete>: CacheCodecImpl,
 {
     lance_core::cache::CacheCodec::new(
+        <PartitionEntry<S, Concrete> as CacheCodecImpl>::TYPE_ID,
+        <PartitionEntry<S, Concrete> as CacheCodecImpl>::CURRENT_VERSION,
         serialize_partition_entry::<S, Concrete>,
         deserialize_partition_entry::<S, Q, Concrete>,
     )
@@ -212,7 +216,11 @@ struct PqPartitionHeader {
 }
 
 impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ProductQuantizer> {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.vector.ivf.PartitionEntry.PQ";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -236,7 +244,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ProductQuantizer> {
         Ok(())
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let header: PqPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
@@ -283,7 +293,11 @@ struct FlatPartitionHeader {
 }
 
 impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatQuantizer> {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.vector.ivf.PartitionEntry.Flat";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -299,7 +313,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatQuantizer> {
         Ok(())
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let header: FlatPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
@@ -327,7 +343,11 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatQuantizer> {
 // ---------------------------------------------------------------------------
 
 impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatBinQuantizer> {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.vector.ivf.PartitionEntry.FlatBin";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -343,7 +363,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatBinQuantizer> {
         Ok(())
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let header: FlatPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
@@ -380,7 +402,11 @@ struct SqPartitionHeader {
 }
 
 impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ScalarQuantizer> {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.vector.ivf.PartitionEntry.SQ";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -400,7 +426,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ScalarQuantizer> {
         Ok(())
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let header: SqPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
@@ -450,7 +478,11 @@ fn default_rabit_query_estimator() -> RabitQueryEstimator {
 }
 
 impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.vector.ivf.PartitionEntry.Rabit";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -483,7 +515,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
         Ok(())
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let header: RabitPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
@@ -550,6 +584,21 @@ mod tests {
     use lance_index::vector::flat::index::FlatIndex;
     use lance_index::vector::flat::storage::FlatFloatStorage;
     use lance_index::vector::sq::storage::ScalarQuantizationStorage;
+
+    /// Serialize a codec body (no envelope) for tests.
+    fn ser_body<T: CacheCodecImpl>(entry: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        entry
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        buf
+    }
+
+    /// Deserialize a codec body (no envelope) at the current build's version.
+    fn de_body<T: CacheCodecImpl>(bytes: Vec<u8>) -> Result<T> {
+        let data = bytes::Bytes::from(bytes);
+        T::deserialize(&mut CacheEntryReader::new(&data, 0, T::CURRENT_VERSION))
+    }
 
     // ----- PQ helpers -------------------------------------------------------
 
@@ -618,12 +667,9 @@ mod tests {
             storage,
         };
 
-        let mut serialized = Vec::new();
-        entry.serialize(&mut serialized).unwrap();
-        let deserialized = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
-            &bytes::Bytes::from(serialized),
-        )
-        .unwrap();
+        let serialized = ser_body(&entry);
+        let deserialized =
+            de_body::<PartitionEntry<FlatIndex, ProductQuantizer>>(serialized).unwrap();
 
         assert_eq!(entry.storage, deserialized.storage);
     }
@@ -671,12 +717,8 @@ mod tests {
                 storage,
             };
 
-            let mut bytes = Vec::new();
-            entry.serialize(&mut bytes).unwrap();
-            let restored = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
-                &bytes::Bytes::from(bytes),
-            )
-            .unwrap();
+            let bytes = ser_body(&entry);
+            let restored = de_body::<PartitionEntry<FlatIndex, ProductQuantizer>>(bytes).unwrap();
             assert_eq!(
                 restored.storage.distance_type(),
                 entry.storage.distance_type()
@@ -694,12 +736,9 @@ mod tests {
             storage,
         };
 
-        let mut serialized = Vec::new();
-        entry.serialize(&mut serialized).unwrap();
-        let deserialized = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
-            &bytes::Bytes::from(serialized),
-        )
-        .unwrap();
+        let serialized = ser_body(&entry);
+        let deserialized =
+            de_body::<PartitionEntry<FlatIndex, ProductQuantizer>>(serialized).unwrap();
         assert_eq!(entry.storage, deserialized.storage);
     }
 
@@ -712,13 +751,9 @@ mod tests {
             index: FlatIndex::default(),
             storage,
         };
-        let mut bytes = Vec::new();
-        entry.serialize(&mut bytes).unwrap();
+        let mut bytes = ser_body(&entry);
         bytes.truncate(3);
-        assert!(
-            PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                .is_err()
-        );
+        assert!(de_body::<PartitionEntry<FlatIndex, ProductQuantizer>>(bytes).is_err());
     }
 
     // ----- Flat helpers -----------------------------------------------------
@@ -756,11 +791,8 @@ mod tests {
             storage,
         };
 
-        let mut bytes = Vec::new();
-        entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                .unwrap();
+        let bytes = ser_body(&entry);
+        let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
 
         assert_eq!(
             restored.storage.metadata().dim,
@@ -786,11 +818,8 @@ mod tests {
                 index: FlatIndex::default(),
                 storage,
             };
-            let mut bytes = Vec::new();
-            entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                    .unwrap();
+            let bytes = ser_body(&entry);
+            let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -803,11 +832,8 @@ mod tests {
             storage,
         };
 
-        let mut bytes = Vec::new();
-        entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                .unwrap();
+        let bytes = ser_body(&entry);
+        let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
 
         let restored_batch = restored.storage.to_batches().unwrap().next().unwrap();
         let schema = restored_batch.schema();
@@ -828,11 +854,8 @@ mod tests {
             storage,
         };
 
-        let mut bytes = Vec::new();
-        entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                .unwrap();
+        let bytes = ser_body(&entry);
+        let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
 
         let restored_batch = restored.storage.to_batches().unwrap().next().unwrap();
         let schema = restored_batch.schema();
@@ -884,11 +907,8 @@ mod tests {
             storage,
         };
 
-        let mut bytes = Vec::new();
-        entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                .unwrap();
+        let bytes = ser_body(&entry);
+        let restored = de_body::<PartitionEntry<FlatIndex, ScalarQuantizer>>(bytes).unwrap();
 
         let m = entry.storage.metadata();
         let rm = restored.storage.metadata();
@@ -914,12 +934,8 @@ mod tests {
                 index: FlatIndex::default(),
                 storage,
             };
-            let mut bytes = Vec::new();
-            entry.serialize(&mut bytes).unwrap();
-            let restored = PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(
-                &bytes::Bytes::from(bytes),
-            )
-            .unwrap();
+            let bytes = ser_body(&entry);
+            let restored = de_body::<PartitionEntry<FlatIndex, ScalarQuantizer>>(bytes).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -960,11 +976,8 @@ mod tests {
             index: FlatIndex::default(),
             storage,
         };
-        let mut bytes = Vec::new();
-        entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                .unwrap();
+        let bytes = ser_body(&entry);
+        let restored = de_body::<PartitionEntry<FlatIndex, ScalarQuantizer>>(bytes).unwrap();
 
         assert_eq!(restored.storage.len(), 30);
         let orig_ids: Vec<u64> = entry.storage.row_ids().copied().collect();
@@ -1044,11 +1057,8 @@ mod tests {
             storage,
         };
 
-        let mut bytes = Vec::new();
-        entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(&bytes::Bytes::from(bytes))
-                .unwrap();
+        let bytes = ser_body(&entry);
+        let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
 
         let m = entry.storage.metadata();
         let rm = restored.storage.metadata();
@@ -1091,12 +1101,8 @@ mod tests {
                 index: FlatIndex::default(),
                 storage,
             };
-            let mut bytes = Vec::new();
-            entry.serialize(&mut bytes).unwrap();
-            let restored = PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(
-                &bytes::Bytes::from(bytes),
-            )
-            .unwrap();
+            let bytes = ser_body(&entry);
+            let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
             assert_eq!(restored.storage.distance_type(), expected_distance_type);
         }
     }
@@ -1135,17 +1141,12 @@ mod tests {
 
         let entry = IvfStateEntryBox(Arc::new(state));
 
-        let mut bytes = Vec::new();
-        CacheCodecImpl::serialize(&entry, &mut bytes).unwrap();
-
-        let restored =
-            <IvfStateEntryBox as CacheCodecImpl>::deserialize(&bytes::Bytes::from(bytes.clone()))
-                .unwrap();
+        let bytes = ser_body(&entry);
+        let restored = de_body::<IvfStateEntryBox>(bytes.clone()).unwrap();
 
         // Re-serialize the restored entry and compare bytes — a stronger check
         // than field-by-field comparison and avoids needing to downcast.
-        let mut restored_bytes = Vec::new();
-        CacheCodecImpl::serialize(&restored, &mut restored_bytes).unwrap();
+        let restored_bytes = ser_body(&restored);
         assert_eq!(bytes, restored_bytes);
     }
 }

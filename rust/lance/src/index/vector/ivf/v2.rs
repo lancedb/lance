@@ -27,7 +27,10 @@ use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
-use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+    WeakLanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
@@ -271,15 +274,20 @@ impl DeepSizeOf for IvfStateEntryBox {
 /// `[header_json_len: u64 LE][header JSON][ivf_pb_len: u64 LE][ivf protobuf]
 ///  [extra_len: u64 LE][extra bytes][aux_ivf_pb_len: u64 LE][aux_ivf protobuf]`
 impl CacheCodecImpl for IvfStateEntryBox {
-    fn serialize(&self, writer: &mut dyn IoWrite) -> Result<()> {
-        self.0.serialize_state(writer)
+    const TYPE_ID: &'static str = "lance.vector.ivf.IvfState";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        self.0.serialize_state(w.raw_writer())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
         use lance_arrow::ipc::read_len_prefixed_bytes_at;
 
         // Parse the common wire format, then dispatch on quantization_type to
         // construct the right IvfIndexState<Q>.
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let header_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
         let header: IvfIndexStateHeader = serde_json::from_slice(&header_bytes)
@@ -6220,11 +6228,10 @@ mod tests {
             // Try serialized store first
             let guard = self.serialized.lock().await;
             if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return Some(
-                    stored_codec
-                        .deserialize(&bytes::Bytes::copy_from_slice(bytes))
-                        .expect("deserialization should succeed"),
-                );
+                return stored_codec
+                    .deserialize(&bytes::Bytes::copy_from_slice(bytes))
+                    .expect("deserialization should succeed")
+                    .hit();
             }
             drop(guard);
             // Fall through to passthrough

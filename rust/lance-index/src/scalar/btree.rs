@@ -56,7 +56,10 @@ use lance_arrow::ipc::{read_ipc_stream_single_at, write_ipc_stream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
-    cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
+    cache::{
+        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+        WeakLanceCache,
+    },
     error::LanceOptionExt,
     utils::{
         tokio::get_num_compute_intensive_cpus,
@@ -1402,6 +1405,9 @@ impl BTreeIndexState {
 }
 
 impl CacheCodecImpl for BTreeIndexState {
+    const TYPE_ID: &'static str = "lance.scalar.BTreeIndexState";
+    const CURRENT_VERSION: u32 = 1;
+
     /// Wire format (no stability guarantees yet — the cache is rebuilt from
     /// source on any version mismatch):
     /// ```text
@@ -1412,7 +1418,8 @@ impl CacheCodecImpl for BTreeIndexState {
     ///   per entry: u32 start | u32 end | u32 offset | u32 path_len | path bytes
     /// lookup batch (Arrow IPC stream)
     /// ```
-    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         writer.write_all(&self.batch_size.to_le_bytes())?;
         match &self.ranges_to_files {
             None => writer.write_all(&[0u8])?,
@@ -1438,7 +1445,9 @@ impl CacheCodecImpl for BTreeIndexState {
         Ok(())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let batch_size = read_u64_le(data, &mut offset)?;
         let has_ranges = read_u8(data, &mut offset)?;
@@ -3286,7 +3295,23 @@ mod tests {
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use arrow_array::RecordBatch;
-    use lance_core::cache::{CacheCodecImpl, CacheKey};
+    use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey};
+
+    /// Serialize a `BTreeIndexState` body (no envelope) for tests.
+    fn serialize_state(state: &BTreeIndexState) -> Vec<u8> {
+        let mut buf = Vec::new();
+        state
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        buf
+    }
+
+    /// Deserialize a `BTreeIndexState` body (no envelope) for tests.
+    fn deserialize_state(buf: Vec<u8>) -> lance_core::Result<BTreeIndexState> {
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, BTreeIndexState::CURRENT_VERSION);
+        BTreeIndexState::deserialize(&mut reader)
+    }
     use rangemap::RangeInclusiveMap;
 
     lance_testing::define_stage_event_progress!(
@@ -5888,9 +5913,7 @@ mod tests {
     }
 
     fn assert_state_roundtrips(state: &BTreeIndexState) {
-        let mut buf = Vec::new();
-        state.serialize(&mut buf).unwrap();
-        let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        let restored = deserialize_state(serialize_state(state)).unwrap();
         assert_eq!(restored.lookup_batch, state.lookup_batch);
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
@@ -5959,9 +5982,7 @@ mod tests {
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
         };
-        let mut buf = Vec::new();
-        state.serialize(&mut buf).unwrap();
-        let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        let restored = deserialize_state(serialize_state(&state)).unwrap();
         let reconstructed = restored
             .reconstruct(test_store.clone(), &LanceCache::no_cache(), None)
             .unwrap();
@@ -6003,7 +6024,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1000u64.to_le_bytes());
         buf.push(7u8);
-        let err = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap_err();
+        let err = deserialize_state(buf).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("has_ranges") && msg.contains("7"),

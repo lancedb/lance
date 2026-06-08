@@ -68,6 +68,12 @@ pub mod pbold {
     include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
 }
 
+/// Protobuf headers for serialized cache entries (e.g. FTS posting lists).
+pub mod cache_pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.fts.rs"));
+}
+
 /// Generic methods common across all types of secondary indices
 ///
 #[async_trait]

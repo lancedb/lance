@@ -17,7 +17,11 @@ fn main() -> Result<()> {
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
     prost_build.enable_type_names();
     prost_build.compile_protos(
-        &["./protos/index.proto", "./protos/index_old.proto"],
+        &[
+            "./protos/index.proto",
+            "./protos/index_old.proto",
+            "./protos/cache_fts.proto",
+        ],
         &["./protos"],
     )?;
 

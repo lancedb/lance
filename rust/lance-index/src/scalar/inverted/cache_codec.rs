@@ -4,12 +4,17 @@
 //! Cache codec impls for FTS index entries.
 //!
 //! Serializes [`PostingList`] and [`Positions`] cache values for persistent
-//! cache backends. The format is a small variant tag plus a JSON header for
-//! scalar metadata, with Arrow-backed payload sections written as zero-copy
-//! Arrow IPC streams via [`lance_arrow::ipc`]. The raw byte buffer inside
-//! [`SharedPositionStream`] is written via [`write_len_prefixed_bytes`] and
-//! read back via [`read_len_prefixed_bytes_at`] -- both zero-copy slices into
-//! the input `Bytes` allocation.
+//! cache backends, behind the stabilized envelope written by
+//! [`CacheCodec`](lance_core::cache::CacheCodec).
+//!
+//! The compressed posting list uses a protobuf header (see
+//! `protos/cache_fts.proto`, with the tail/position codecs and position-storage
+//! kind as proto enums) followed by 64-byte-aligned Arrow IPC sections for the
+//! `blocks` and shared block-offsets, plus a raw blob for the
+//! [`SharedPositionStream`] byte buffer (which already has its own portable
+//! encoding). The plain posting list and the standalone [`Positions`] codec
+//! still use the older JSON-header + `u8`-tag framing pending their own
+//! migration; both read back zero-copy via [`lance_arrow::ipc`].
 //!
 //! This is the FTS counterpart of `partition_serde.rs` for vector indices.
 
@@ -27,9 +32,14 @@ use lance_arrow::ipc::{
     read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
     write_len_prefixed_bytes,
 };
-use lance_core::cache::CacheCodecImpl;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::cache_pb::{
+    CompressedPostingHeader, PositionStorage as PbPositionStorage,
+    PositionStreamCodec as PbPositionStreamCodec, PostingTailCodec as PbPostingTailCodec,
+};
 
 use super::index::{
     CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
@@ -47,30 +57,46 @@ const POSITIONS_TAG_NONE: u8 = 0;
 const POSITIONS_TAG_LEGACY: u8 = 1;
 const POSITIONS_TAG_SHARED: u8 = 2;
 
-const POSTING_TAIL_CODEC_FIXED32: u8 = 0;
-const POSTING_TAIL_CODEC_VARINT_DELTA: u8 = 1;
-
 const POSITION_STREAM_CODEC_VARINT_DOC_DELTA: u8 = 0;
 const POSITION_STREAM_CODEC_PACKED_DELTA: u8 = 1;
 
 // ---------------------------------------------------------------------------
-// Codec enum byte mappings
+// Codec enum mappings
 // ---------------------------------------------------------------------------
 
-fn posting_tail_codec_to_u8(c: PostingTailCodec) -> u8 {
+// Compressed posting lists carry their discriminants as protobuf enums in the
+// header; these map to/from the in-memory Rust enums.
+
+fn posting_tail_codec_to_proto(c: PostingTailCodec) -> PbPostingTailCodec {
     match c {
-        PostingTailCodec::Fixed32 => POSTING_TAIL_CODEC_FIXED32,
-        PostingTailCodec::VarintDelta => POSTING_TAIL_CODEC_VARINT_DELTA,
+        PostingTailCodec::Fixed32 => PbPostingTailCodec::Fixed32,
+        PostingTailCodec::VarintDelta => PbPostingTailCodec::VarintDelta,
     }
 }
 
-fn u8_to_posting_tail_codec(v: u8) -> Result<PostingTailCodec> {
-    match v {
-        POSTING_TAIL_CODEC_FIXED32 => Ok(PostingTailCodec::Fixed32),
-        POSTING_TAIL_CODEC_VARINT_DELTA => Ok(PostingTailCodec::VarintDelta),
-        _ => Err(Error::io(format!("unknown posting tail codec: {v}"))),
+fn proto_to_posting_tail_codec(c: PbPostingTailCodec) -> PostingTailCodec {
+    match c {
+        PbPostingTailCodec::Fixed32 => PostingTailCodec::Fixed32,
+        PbPostingTailCodec::VarintDelta => PostingTailCodec::VarintDelta,
     }
 }
+
+fn position_stream_codec_to_proto(c: PositionStreamCodec) -> PbPositionStreamCodec {
+    match c {
+        PositionStreamCodec::VarintDocDelta => PbPositionStreamCodec::VarintDocDelta,
+        PositionStreamCodec::PackedDelta => PbPositionStreamCodec::PackedDelta,
+    }
+}
+
+fn proto_to_position_stream_codec(c: PbPositionStreamCodec) -> PositionStreamCodec {
+    match c {
+        PbPositionStreamCodec::VarintDocDelta => PositionStreamCodec::VarintDocDelta,
+        PbPositionStreamCodec::PackedDelta => PositionStreamCodec::PackedDelta,
+    }
+}
+
+// The legacy (JSON + u8 tag) position storage encoding is still used by the
+// plain posting list and the standalone `Positions` codec.
 
 fn position_stream_codec_to_u8(c: PositionStreamCodec) -> u8 {
     match c {
@@ -226,35 +252,32 @@ struct PlainPostingHeader {
     max_score: Option<f32>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct CompressedPostingHeader {
-    max_score: f32,
-    length: u32,
-    posting_tail_codec: u8,
-}
-
 impl CacheCodecImpl for PostingList {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.fts.PostingList";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         match self {
             Self::Plain(plain) => {
-                write_u8(writer, POSTING_VARIANT_PLAIN)?;
-                serialize_plain(writer, plain)
+                w.write_u8(POSTING_VARIANT_PLAIN)?;
+                serialize_plain(w.raw_writer(), plain)
             }
             Self::Compressed(compressed) => {
-                write_u8(writer, POSTING_VARIANT_COMPRESSED)?;
-                serialize_compressed(writer, compressed)
+                w.write_u8(POSTING_VARIANT_COMPRESSED)?;
+                serialize_compressed(w, compressed)
             }
         }
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
-        let mut offset = 0;
-        let variant = read_u8(data, &mut offset)?;
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let variant = r.read_u8()?;
         match variant {
-            POSTING_VARIANT_PLAIN => Ok(Self::Plain(deserialize_plain(data, &mut offset)?)),
-            POSTING_VARIANT_COMPRESSED => {
-                Ok(Self::Compressed(deserialize_compressed(data, &mut offset)?))
+            POSTING_VARIANT_PLAIN => {
+                let body = r.body();
+                let mut offset = 0;
+                Ok(Self::Plain(deserialize_plain(&body, &mut offset)?))
             }
+            POSTING_VARIANT_COMPRESSED => Ok(Self::Compressed(deserialize_compressed(r)?)),
             other => Err(Error::io(format!("unknown PostingList variant: {other}"))),
         }
     }
@@ -330,13 +353,33 @@ fn deserialize_plain(data: &Bytes, offset: &mut usize) -> Result<PlainPostingLis
     ))
 }
 
-fn serialize_compressed(writer: &mut dyn Write, posting: &CompressedPostingList) -> Result<()> {
+/// The compressed posting list is serialized with a protobuf header followed
+/// by 64-byte-aligned Arrow IPC sections (for the `blocks`, and for shared
+/// position block-offsets) and a raw blob (for the shared position byte
+/// stream, which already has its own portable encoding).
+fn serialize_compressed(
+    w: &mut CacheEntryWriter<'_>,
+    posting: &CompressedPostingList,
+) -> Result<()> {
+    let (position_storage, position_stream_codec) = match &posting.positions {
+        None => (PbPositionStorage::None, PbPositionStreamCodec::default()),
+        Some(CompressedPositionStorage::LegacyPerDoc(_)) => {
+            (PbPositionStorage::Legacy, PbPositionStreamCodec::default())
+        }
+        Some(CompressedPositionStorage::SharedStream(stream)) => (
+            PbPositionStorage::Shared,
+            position_stream_codec_to_proto(stream.codec()),
+        ),
+    };
+
     let header = CompressedPostingHeader {
         max_score: posting.max_score,
         length: posting.length,
-        posting_tail_codec: posting_tail_codec_to_u8(posting.posting_tail_codec),
+        posting_tail_codec: posting_tail_codec_to_proto(posting.posting_tail_codec) as i32,
+        position_storage: position_storage as i32,
+        position_stream_codec: position_stream_codec as i32,
     };
-    write_json_header(writer, &header)?;
+    w.write_header(&header)?;
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         BLOCKS_COLUMN,
@@ -344,20 +387,39 @@ fn serialize_compressed(writer: &mut dyn Write, posting: &CompressedPostingList)
         false,
     )]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(posting.blocks.clone())])?;
-    write_ipc_stream(&batch, writer)?;
+    w.write_ipc(&batch)?;
 
     match &posting.positions {
-        Some(storage) => write_position_storage(writer, storage)?,
-        None => write_u8(writer, POSITIONS_TAG_NONE)?,
+        None => {}
+        Some(CompressedPositionStorage::LegacyPerDoc(list)) => {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                POSITION_LIST_COLUMN,
+                list.data_type().clone(),
+                list.is_nullable(),
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(list.clone())])?;
+            w.write_ipc(&batch)?;
+        }
+        Some(CompressedPositionStorage::SharedStream(stream)) => {
+            let offsets = UInt32Array::from(stream.block_offsets().to_vec());
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                BLOCK_OFFSETS_COLUMN,
+                DataType::UInt32,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(offsets)])?;
+            w.write_ipc(&batch)?;
+            w.write_raw(stream.bytes())?;
+        }
     }
     Ok(())
 }
 
-fn deserialize_compressed(data: &Bytes, offset: &mut usize) -> Result<CompressedPostingList> {
-    let header: CompressedPostingHeader = read_json_header(data, offset)?;
-    let posting_tail_codec = u8_to_posting_tail_codec(header.posting_tail_codec)?;
+fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPostingList> {
+    let header: CompressedPostingHeader = r.read_header()?;
+    let posting_tail_codec = proto_to_posting_tail_codec(header.posting_tail_codec());
 
-    let batch = read_ipc_stream_single_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
+    let batch = r.read_ipc()?;
     let blocks = batch
         .column(0)
         .as_any()
@@ -365,11 +427,32 @@ fn deserialize_compressed(data: &Bytes, offset: &mut usize) -> Result<Compressed
         .ok_or_else(|| Error::io("blocks column is not a LargeBinaryArray".to_string()))?
         .clone();
 
-    let positions_tag = read_u8(data, offset)?;
-    let positions = if positions_tag == POSITIONS_TAG_NONE {
-        None
-    } else {
-        Some(read_position_storage(data, offset, positions_tag)?)
+    let positions = match header.position_storage() {
+        PbPositionStorage::None => None,
+        PbPositionStorage::Legacy => {
+            let batch = r.read_ipc()?;
+            let list = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::io("legacy position column is not a ListArray".to_string()))?
+                .clone();
+            Some(CompressedPositionStorage::LegacyPerDoc(list))
+        }
+        PbPositionStorage::Shared => {
+            let codec = proto_to_position_stream_codec(header.position_stream_codec());
+            let batch = r.read_ipc()?;
+            let block_offsets = batch
+                .column(0)
+                .as_primitive_opt::<UInt32Type>()
+                .ok_or_else(|| Error::io("block_offsets column is not UInt32".to_string()))?
+                .values()
+                .to_vec();
+            let bytes = r.read_raw()?;
+            Some(CompressedPositionStorage::SharedStream(
+                SharedPositionStream::new(codec, block_offsets, bytes),
+            ))
+        }
     };
 
     Ok(CompressedPostingList::new(
@@ -390,7 +473,11 @@ fn deserialize_compressed(data: &Bytes, offset: &mut usize) -> Result<Compressed
 /// reused per entry (and its byte buffers read back zero-copy). See issue
 /// #7040.
 impl CacheCodecImpl for PostingListGroup {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.fts.PostingListGroup";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         let count = u32::try_from(self.posting_lists.len())
             .map_err(|_| Error::io("posting list group too large to serialize".to_string()))?;
         writer
@@ -398,13 +485,16 @@ impl CacheCodecImpl for PostingListGroup {
             .map_err(|e| Error::io(format!("failed to write group count: {e}")))?;
         for posting in &self.posting_lists {
             let mut buf = Vec::new();
-            posting.serialize(&mut buf)?;
+            let mut sub = CacheEntryWriter::new(&mut buf);
+            posting.serialize(&mut sub)?;
             write_len_prefixed_bytes(writer, &buf)?;
         }
         Ok(())
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         if data.len() < 4 {
             return Err(Error::io(
@@ -413,11 +503,13 @@ impl CacheCodecImpl for PostingListGroup {
         }
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
         offset += 4;
+        let version = r.version();
         let mut posting_lists = Vec::with_capacity(count);
         for _ in 0..count {
             let entry = read_len_prefixed_bytes_at(data, &mut offset)
                 .map_err(|e| Error::io(e.to_string()))?;
-            posting_lists.push(PostingList::deserialize(&entry)?);
+            let mut sub = CacheEntryReader::new(&entry, 0, version);
+            posting_lists.push(PostingList::deserialize(&mut sub)?);
         }
         Ok(Self::new(posting_lists))
     }
@@ -428,11 +520,16 @@ impl CacheCodecImpl for PostingListGroup {
 // ---------------------------------------------------------------------------
 
 impl CacheCodecImpl for Positions {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
-        write_position_storage(writer, &self.0)
+    const TYPE_ID: &'static str = "lance.fts.Positions";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        write_position_storage(w.raw_writer(), &self.0)
     }
 
-    fn deserialize(data: &Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let tag = read_u8(data, &mut offset)?;
         if tag == POSITIONS_TAG_NONE {
@@ -455,7 +552,8 @@ mod tests {
     use arrow_array::LargeBinaryArray;
     use arrow_array::builder::{Int32Builder, ListBuilder};
     use bytes::Bytes;
-    use lance_core::cache::CacheCodecImpl;
+    use lance_core::Result;
+    use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 
     use super::super::index::{
         CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
@@ -502,16 +600,26 @@ mod tests {
         }
     }
 
-    fn roundtrip_posting_list(entry: &PostingList) -> PostingList {
+    /// Serialize a codec body (no envelope) into a standalone buffer.
+    fn body_bytes<T: CacheCodecImpl>(entry: &T) -> Bytes {
         let mut buf = Vec::new();
-        entry.serialize(&mut buf).unwrap();
-        PostingList::deserialize(&Bytes::from(buf)).unwrap()
+        let mut w = CacheEntryWriter::new(&mut buf);
+        entry.serialize(&mut w).unwrap();
+        Bytes::from(buf)
+    }
+
+    /// Deserialize a codec body (no envelope) at the current build's version.
+    fn from_body<T: CacheCodecImpl>(data: &Bytes) -> Result<T> {
+        let mut r = CacheEntryReader::new(data, 0, T::CURRENT_VERSION);
+        T::deserialize(&mut r)
+    }
+
+    fn roundtrip_posting_list(entry: &PostingList) -> PostingList {
+        from_body::<PostingList>(&body_bytes(entry)).unwrap()
     }
 
     fn roundtrip_positions(entry: &Positions) -> Positions {
-        let mut buf = Vec::new();
-        entry.serialize(&mut buf).unwrap();
-        Positions::deserialize(&Bytes::from(buf)).unwrap()
+        from_body::<Positions>(&body_bytes(entry)).unwrap()
     }
 
     fn assert_slice_points_into_bytes(slice: &[u8], bytes: &Bytes) {
@@ -652,13 +760,9 @@ mod tests {
                 expected_stream.clone(),
             )),
         );
-        let mut buf = Vec::new();
-        PostingList::Compressed(posting)
-            .serialize(&mut buf)
-            .unwrap();
-        let serialized = Bytes::from(buf);
+        let serialized = body_bytes(&PostingList::Compressed(posting));
 
-        let restored = PostingList::deserialize(&serialized).unwrap();
+        let restored = from_body::<PostingList>(&serialized).unwrap();
         let PostingList::Compressed(restored) = restored else {
             panic!("expected Compressed variant");
         };
@@ -695,9 +799,7 @@ mod tests {
             vec![plain.clone(), compressed, plain],
         ] {
             let group = PostingListGroup::new(members.clone());
-            let mut buf = Vec::new();
-            group.serialize(&mut buf).unwrap();
-            let restored = PostingListGroup::deserialize(&Bytes::from(buf)).unwrap();
+            let restored = from_body::<PostingListGroup>(&body_bytes(&group)).unwrap();
             assert_eq!(restored.posting_lists.len(), members.len());
             for (a, b) in members.iter().zip(restored.posting_lists.iter()) {
                 match (a, b) {
@@ -743,9 +845,147 @@ mod tests {
             None,
         );
         let entry = PostingList::Plain(plain);
-        let mut buf = Vec::new();
-        entry.serialize(&mut buf).unwrap();
+        let mut buf = body_bytes(&entry).to_vec();
         buf.truncate(buf.len() / 2);
-        assert!(PostingList::deserialize(&Bytes::from(buf)).is_err());
+        assert!(from_body::<PostingList>(&Bytes::from(buf)).is_err());
+    }
+
+    /// Tests covering the stabilized envelope + compressed proto format,
+    /// exercised through the full type-erased [`CacheCodec`] (envelope + body).
+    mod stable_format {
+        use std::sync::Arc;
+
+        use arrow_array::Array;
+        use lance_core::cache::CacheCodec;
+        use prost::Message;
+
+        use super::*;
+        use crate::cache_pb::{CompressedPostingHeader, PostingTailCodec as PbPostingTailCodec};
+
+        type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
+
+        fn codec() -> CacheCodec {
+            CacheCodec::from_impl::<PostingList>()
+        }
+
+        /// Serialize an entry through the full codec (envelope + body).
+        fn serialize_entry(entry: PostingList) -> Vec<u8> {
+            let any: ArcAny = Arc::new(entry);
+            let mut buf = Vec::new();
+            codec().serialize(&any, &mut buf).unwrap();
+            buf
+        }
+
+        /// A `Bytes` whose base address is 64-byte aligned, modelling a backend
+        /// that reads cache entries into an aligned buffer.
+        fn aligned_bytes(payload: &[u8]) -> Bytes {
+            const ALIGN: usize = 64;
+            let mut v = vec![0u8; payload.len() + ALIGN];
+            let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+            v[pad..pad + payload.len()].copy_from_slice(payload);
+            Bytes::from(v).slice(pad..pad + payload.len())
+        }
+
+        fn compressed_with_shared_positions() -> PostingList {
+            let blocks =
+                LargeBinaryArray::from_opt_vec(vec![Some(&[9u8; 48][..]), Some(&[1u8; 48])]);
+            let stream = SharedPositionStream::new(
+                PositionStreamCodec::PackedDelta,
+                vec![0u32, 4, 11],
+                Bytes::from((0u8..64).collect::<Vec<_>>()),
+            );
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                7.0,
+                3,
+                PostingTailCodec::VarintDelta,
+                Some(CompressedPositionStorage::SharedStream(stream)),
+            ))
+        }
+
+        /// The compressed `blocks` (an aligned IPC section) and the shared
+        /// position blob (a raw section) must both be borrowed zero-copy from
+        /// the input even though the envelope pushes them to a non-zero,
+        /// non-aligned starting offset.
+        #[test]
+        fn compressed_sections_are_zero_copy_through_envelope() {
+            let serialized = aligned_bytes(&serialize_entry(compressed_with_shared_positions()));
+            let restored = codec().deserialize(&serialized).unwrap().hit().unwrap();
+            let restored = restored.downcast::<PostingList>().unwrap();
+            let PostingList::Compressed(restored) = restored.as_ref() else {
+                panic!("expected Compressed");
+            };
+
+            let base = serialized.as_ptr() as usize;
+            let end = base + serialized.len();
+            let points_in = |ptr: usize| ptr >= base && ptr < end;
+
+            // blocks IPC section decoded in place (no realigning memcpy).
+            for buf in restored.blocks.to_data().buffers() {
+                assert!(
+                    points_in(buf.as_ptr() as usize),
+                    "blocks buffer was realigned out of the input — misaligned IPC section",
+                );
+            }
+            // shared position raw blob borrowed in place.
+            let Some(CompressedPositionStorage::SharedStream(stream)) = &restored.positions else {
+                panic!("expected shared stream");
+            };
+            assert!(points_in(stream.bytes().as_ptr() as usize));
+        }
+
+        /// Additive proto fields (lever #1) must not break decoding: an unknown
+        /// field number appended to the header is ignored.
+        #[test]
+        fn header_proto_ignores_unknown_fields() {
+            let header = CompressedPostingHeader {
+                max_score: 1.5,
+                length: 9,
+                posting_tail_codec: PbPostingTailCodec::VarintDelta as i32,
+                ..Default::default()
+            };
+            let mut bytes = header.encode_to_vec();
+            // Append an unknown field #15, varint wire type (0), value 7.
+            bytes.push(15 << 3);
+            bytes.push(7);
+            let decoded = CompressedPostingHeader::decode(bytes.as_slice()).unwrap();
+            assert_eq!(decoded.length, 9);
+            assert_eq!(decoded.max_score, 1.5);
+        }
+
+        /// An entry written by a different codec (foreign TYPE_ID) misses.
+        #[test]
+        fn foreign_type_id_is_miss() {
+            // A PostingListGroup entry carries a different TYPE_ID in its
+            // envelope; reading it as a PostingList must miss, not misread it.
+            let group = PostingListGroup::new(vec![]);
+            let any: ArcAny = Arc::new(group);
+            let mut buf = Vec::new();
+            CacheCodec::from_impl::<PostingListGroup>()
+                .serialize(&any, &mut buf)
+                .unwrap();
+            assert!(codec().deserialize(&Bytes::from(buf)).unwrap().is_miss());
+        }
+
+        /// An entry written by a newer build (higher type_version) misses.
+        #[test]
+        fn future_type_version_is_miss() {
+            let mut buf = serialize_entry(compressed_with_shared_positions());
+            // Patch the envelope's type_version (magic[4] + ver[1] + len[2] +
+            // type_id[N]) to a value beyond what this build understands.
+            let type_id_len = u16::from_le_bytes([buf[5], buf[6]]) as usize;
+            let version_off = 4 + 1 + 2 + type_id_len;
+            buf[version_off..version_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(codec().deserialize(&Bytes::from(buf)).unwrap().is_miss());
+        }
+
+        /// A pre-stabilization blob (no magic) self-heals to a miss.
+        #[test]
+        fn pre_stabilization_blob_is_miss() {
+            // Old format led with a u64 LE length prefix, never our magic.
+            let mut blob = (30u64).to_le_bytes().to_vec();
+            blob.extend_from_slice(&[0u8; 30]);
+            assert!(codec().deserialize(&Bytes::from(blob)).unwrap().is_miss());
+        }
     }
 }

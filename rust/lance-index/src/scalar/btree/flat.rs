@@ -15,7 +15,7 @@ use datafusion_physical_expr::create_physical_expr;
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::{read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream};
 use lance_core::Result;
-use lance_core::cache::CacheCodecImpl;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -236,9 +236,13 @@ impl FlatIndex {
 }
 
 impl CacheCodecImpl for FlatIndex {
-    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.scalar.FlatIndex";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         // Format:
         // [len-prefixed all_addrs_map][len-prefixed null_addrs_map][batch IPC stream]
+        let writer = w.raw_writer();
         writer.write_all(&(self.all_addrs_map.serialized_size() as u64).to_le_bytes())?;
         self.all_addrs_map.serialize_into(&mut *writer)?;
 
@@ -250,10 +254,12 @@ impl CacheCodecImpl for FlatIndex {
         Ok(())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self>
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self>
     where
         Self: Sized,
     {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let all_addrs_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
         let all_addrs_map = RowAddrTreeMap::deserialize_from(all_addrs_bytes.as_ref())?;
@@ -309,8 +315,12 @@ mod tests {
 
     fn assert_roundtrips(index: &FlatIndex) {
         let mut buf = Vec::new();
-        index.serialize(&mut buf).unwrap();
-        let restored = FlatIndex::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        index
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, FlatIndex::CURRENT_VERSION);
+        let restored = FlatIndex::deserialize(&mut reader).unwrap();
 
         assert_eq!(restored.data, index.data);
         assert_eq!(restored.all_addrs_map, index.all_addrs_map);

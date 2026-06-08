@@ -47,10 +47,12 @@
 
 pub mod backend;
 pub mod codec;
+mod entry_io;
 mod moka;
 
 pub use backend::{CacheBackend, CacheEntry, InternalCacheKey};
-pub use codec::{CacheCodec, CacheCodecImpl};
+pub use codec::{CacheCodec, CacheCodecImpl, CacheDecode};
+pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use moka::MokaCacheBackend;
 
 use std::borrow::Cow;

@@ -18,8 +18,9 @@ use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
-use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
-use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::{Error, ROW_ID, Result};
@@ -532,27 +533,30 @@ impl LabelListIndexState {
 }
 
 impl CacheCodecImpl for LabelListIndexState {
+    const TYPE_ID: &'static str = "lance.scalar.LabelListIndexState";
+    const CURRENT_VERSION: u32 = 1;
+
     /// Wire format:
     /// ```text
     /// [u64 list_nulls_len][list_nulls bytes]
     /// [bitmap state bytes (self-delimiting)]
     /// ```
-    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let mut nulls_bytes = Vec::with_capacity(self.list_nulls.serialized_size());
         self.list_nulls.serialize_into(&mut nulls_bytes)?;
-        write_len_prefixed_bytes(writer, &nulls_bytes)?;
-        self.bitmap_state.serialize(writer)?;
+        w.write_raw(&nulls_bytes)?;
+        // The bitmap state writes its own self-delimiting body inline.
+        self.bitmap_state.serialize(w)?;
         Ok(())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
-        let mut offset = 0;
-        let nulls_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let nulls_bytes = r.read_raw()?;
         let list_nulls = Arc::new(RowAddrTreeMap::deserialize_from(nulls_bytes.as_ref())?);
         // The bitmap state is self-delimiting (length-prefixed null map +
-        // Arrow IPC stream with EOS marker), so we can hand the remaining
-        // tail to it directly.
-        let bitmap_state = BitmapIndexState::deserialize(&data.slice(offset..))?;
+        // Arrow IPC stream with EOS marker); it continues reading the body
+        // from where the null map left off.
+        let bitmap_state = BitmapIndexState::deserialize(r)?;
         Ok(Self {
             bitmap_state,
             list_nulls,

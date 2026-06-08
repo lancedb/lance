@@ -25,7 +25,10 @@ use lance_arrow::ipc::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
-    cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
+    cache::{
+        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+        WeakLanceCache,
+    },
     error::LanceOptionExt,
     utils::tokio::get_num_compute_intensive_cpus,
 };
@@ -251,13 +254,17 @@ fn parse_lookup_batch(batch: &RecordBatch) -> Result<BTreeMap<OrderableScalarVal
 }
 
 impl CacheCodecImpl for BitmapIndexState {
+    const TYPE_ID: &'static str = "lance.scalar.BitmapIndexState";
+    const CURRENT_VERSION: u32 = 1;
+
     /// Wire format:
     /// ```text
     /// [u64 null_map_len][null_map bytes]
     /// [arrow IPC stream: (keys: <value_type>, offsets: UInt64)]
     /// ```
     /// The value type is recovered from the IPC stream schema.
-    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let writer = w.raw_writer();
         let mut null_bytes = Vec::with_capacity(self.null_map.serialized_size());
         self.null_map.serialize_into(&mut null_bytes)?;
         write_len_prefixed_bytes(writer, &null_bytes)?;
@@ -265,7 +272,9 @@ impl CacheCodecImpl for BitmapIndexState {
         Ok(())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let body = r.body();
+        let data = &body;
         let mut offset = 0;
         let null_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
         let null_map = Arc::new(RowAddrTreeMap::deserialize_from(null_bytes.as_ref())?);
@@ -1821,8 +1830,12 @@ mod tests {
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
         let mut buf = Vec::new();
-        state.serialize(&mut buf).unwrap();
-        let restored = BitmapIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        state
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, BitmapIndexState::CURRENT_VERSION);
+        let restored = BitmapIndexState::deserialize(&mut reader).unwrap();
         assert_eq!(restored.lookup_batch, state.lookup_batch);
         assert_eq!(&*restored.null_map, &*state.null_map);
         assert_eq!(restored.value_type, state.value_type);
