@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
-use crate::frag_reuse::FragReuseIndex;
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 pub trait Quantization:
     Send
@@ -235,7 +235,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self>;
 
     fn metadata(&self) -> &Self::Metadata;
@@ -280,7 +280,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self>;
 }
 

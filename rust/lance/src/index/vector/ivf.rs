@@ -500,7 +500,10 @@ pub(crate) async fn optimize_vector_indices_v2(
     let distance_type = existing_indices[0].metric_type();
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
-    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let frag_reuse_index = dataset
+        .open_frag_reuse_index(&NoOpMetricsCollector)
+        .await?
+        .map(|f| f as Arc<dyn lance_index::RowIdRemapper>);
 
     let format_version = dataset_format_version(dataset);
 
@@ -1086,10 +1089,6 @@ impl Index for IVFIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
     }
 
     fn index_type(&self) -> IndexType {

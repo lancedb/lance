@@ -33,15 +33,15 @@ use lance_core::{Error, ROW_ID, Result, cache::LanceCache, error::LanceOptionExt
 
 use crate::{
     Index, IndexType,
-    frag_reuse::FragReuseIndex,
     metrics::MetricsCollector,
-    registry::IndexPluginRegistry,
+    registry::PluginRegistry,
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME},
     },
 };
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 const JSON_INDEX_VERSION: u32 = 0;
 
@@ -74,10 +74,6 @@ impl Index for JsonIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        unimplemented!()
     }
 
     fn index_type(&self) -> IndexType {
@@ -380,7 +376,7 @@ impl TrainingRequest for JsonTrainingRequest {
 /// Plugin implementation for a [`JsonIndex`]
 #[derive(Default)]
 pub struct JsonIndexPlugin {
-    registry: Mutex<Option<Arc<IndexPluginRegistry>>>,
+    registry: Mutex<Option<Arc<dyn PluginRegistry>>>,
 }
 
 impl std::fmt::Debug for JsonIndexPlugin {
@@ -390,7 +386,7 @@ impl std::fmt::Debug for JsonIndexPlugin {
 }
 
 impl JsonIndexPlugin {
-    fn registry(&self) -> Result<Arc<IndexPluginRegistry>> {
+    fn registry(&self) -> Result<Arc<dyn PluginRegistry>> {
         Ok(self.registry.lock().unwrap().as_ref().expect_ok()?.clone())
     }
 
@@ -705,7 +701,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         true
     }
 
-    fn attach_registry(&self, registry: Arc<IndexPluginRegistry>) {
+    fn attach_registry(&self, registry: Arc<dyn PluginRegistry>) {
         let mut reg_ref = self.registry.lock().unwrap();
         *reg_ref = Some(registry);
     }
@@ -793,7 +789,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let registry = self.registry().unwrap();

@@ -42,7 +42,6 @@ use super::{
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
-    frag_reuse::FragReuseIndex,
     progress::IndexBuildProgress,
     scalar::{
         CreatedIndex, UpdateCriteria,
@@ -54,6 +53,7 @@ use crate::{
     },
 };
 use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
@@ -125,7 +125,7 @@ pub struct BitmapIndex {
 
     index_cache: WeakLanceCache,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 
     lazy_reader: LazyIndexReader,
 }
@@ -200,7 +200,7 @@ impl BitmapIndexState {
         &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<BitmapIndex>> {
         Ok(Arc::new(BitmapIndex::new(
             self.index_map.clone(),
@@ -335,7 +335,7 @@ impl BitmapIndex {
         value_type: DataType,
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         let lazy_reader = LazyIndexReader::new(store.clone());
         Self {
@@ -351,7 +351,7 @@ impl BitmapIndex {
 
     pub(crate) async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
@@ -549,12 +549,6 @@ impl Index for BitmapIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "BitmapIndex is not a vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -1766,7 +1760,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
@@ -1775,7 +1769,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {

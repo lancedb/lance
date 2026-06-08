@@ -22,7 +22,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::RowIdRemapper;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{ProductQuantizationStorage, transpose};
@@ -67,7 +67,7 @@ pub struct PQIndex {
     /// Metric type.
     metric_type: MetricType,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
 
 impl DeepSizeOf for PQIndex {
@@ -115,7 +115,7 @@ impl PQIndex {
     pub(crate) fn new(
         pq: ProductQuantizer,
         metric_type: MetricType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         Self {
             code: None,
@@ -178,10 +178,6 @@ impl Index for PQIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
     }
 
     fn index_type(&self) -> IndexType {

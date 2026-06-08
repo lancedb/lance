@@ -14,7 +14,6 @@ use crate::scalar::registry::{
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
 };
-use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
 use arrow_schema::{DataType, Field};
 use lance_arrow_stats::StatisticsAccumulator;
@@ -27,9 +26,7 @@ use std::sync::LazyLock;
 use datafusion::execution::SendableRecordBatchStream;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::scalar::FragReuseIndex;
 use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -37,6 +34,7 @@ use lance_core::Error;
 use lance_core::Result;
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_index_core::row_id_remap::RowIdRemapper;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -90,7 +88,7 @@ impl DeepSizeOf for BloomFilterIndex {
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
@@ -375,12 +373,6 @@ impl Index for BloomFilterIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "BloomFilter is not a vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -1107,7 +1099,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(

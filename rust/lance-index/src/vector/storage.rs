@@ -28,7 +28,6 @@ use std::{
 
 use crossbeam_queue::ArrayQueue;
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::{
     pb,
     vector::{
@@ -36,6 +35,7 @@ use crate::{
         quantizer::Quantization,
     },
 };
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
@@ -448,7 +448,7 @@ pub struct StorageBuilder<Q: Quantization> {
     distance_type: DistanceType,
     quantizer: Q,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -456,7 +456,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
         vector_column: String,
         distance_type: DistanceType,
         quantizer: Q,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         Ok(Self {
             vector_column,
@@ -504,7 +504,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -519,7 +519,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ///
     pub async fn try_new(
         reader: FileReader,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let schema = reader.schema();
 
@@ -576,7 +576,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         ivf: IvfModel,
         metadata: Q::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         Self {
             reader,

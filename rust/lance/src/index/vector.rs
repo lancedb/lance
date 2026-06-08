@@ -24,7 +24,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::RowIdRemapper;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
@@ -589,7 +589,7 @@ pub(crate) async fn build_distributed_vector_index(
     _name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
@@ -941,7 +941,7 @@ pub(crate) async fn build_vector_index(
     name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
@@ -1215,7 +1215,7 @@ pub(crate) async fn build_vector_index_incremental(
     uuid: Uuid,
     params: &VectorIndexParams,
     existing_index: Arc<dyn VectorIndex>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<VectorIndexBuildSummary> {
     let stages = &params.stages;
@@ -1537,7 +1537,7 @@ pub(crate) async fn open_vector_index(
     uuid: &Uuid,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
@@ -1632,7 +1632,7 @@ pub(crate) async fn open_vector_index_v2(
     column: &str,
     uuid: &Uuid,
     reader: PreviousFileReader,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
         .schema()
@@ -1841,7 +1841,8 @@ pub async fn initialize_vector_index(
     let new_uuid = Uuid::new_v4();
     let frag_reuse_index = target_dataset
         .open_frag_reuse_index(&NoOpMetricsCollector)
-        .await?;
+        .await?
+        .map(|f| f as Arc<dyn RowIdRemapper>);
 
     let summary = build_vector_index_incremental(
         target_dataset,

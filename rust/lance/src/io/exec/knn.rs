@@ -2020,10 +2020,6 @@ mod tests {
             self
         }
 
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
-        }
-
         fn statistics(&self) -> Result<serde_json::Value> {
             Ok(serde_json::json!({}))
         }
@@ -2142,10 +2138,6 @@ mod tests {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         fn statistics(&self) -> Result<serde_json::Value> {

@@ -12,7 +12,6 @@
 //! false positives that require rechecking.
 //!
 //!
-use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -25,6 +24,7 @@ use crate::scalar::{
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::sync::LazyLock;
 
 use arrow_array::{
@@ -36,13 +36,12 @@ use datafusion_common::ScalarValue;
 use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::scalar::FragReuseIndex;
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
+use lance_index_core::row_id_remap::RowIdRemapper;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -108,7 +107,7 @@ pub struct ZoneMapIndex {
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
     store: Arc<dyn IndexStore>,
-    fri: Option<Arc<FragReuseIndex>>,
+    fri: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
 }
 
@@ -410,7 +409,7 @@ impl ZoneMapIndex {
     /// Load the scalar index from storage
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -439,7 +438,7 @@ impl ZoneMapIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         rows_per_zone: u64,
     ) -> Result<Self> {
@@ -546,12 +545,6 @@ impl Index for ZoneMapIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "ZoneMapIndex is not a vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -1037,7 +1030,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)

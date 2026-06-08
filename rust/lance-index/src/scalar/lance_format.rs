@@ -13,10 +13,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_encoding::version::LanceFileVersion;
-use lance_file::previous::{
-    reader::FileReader as PreviousFileReader,
-    writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
-};
+use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -119,33 +116,8 @@ impl LanceIndexStore {
     }
 }
 
-#[async_trait]
-impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWriter<M> {
-    async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
-        let offset = self.tell().await?;
-        self.write(&[batch]).await?;
-        Ok(offset as u64)
-    }
-
-    async fn finish(&mut self) -> Result<IndexFile> {
-        Self::finish(self).await?;
-        Ok(IndexFile {
-            path: String::new(),
-            size_bytes: self.tell().await? as u64,
-        })
-    }
-
-    async fn finish_with_metadata(
-        &mut self,
-        metadata: HashMap<String, String>,
-    ) -> Result<IndexFile> {
-        Self::finish_with_metadata(self, &metadata).await?;
-        Ok(IndexFile {
-            path: String::new(),
-            size_bytes: self.tell().await? as u64,
-        })
-    }
-}
+struct LancePreviousReader(PreviousFileReader);
+struct LanceCurrentReader(current_reader::FileReader);
 
 struct LanceIndexWriter {
     path: String,
@@ -188,9 +160,10 @@ impl IndexWriter for LanceIndexWriter {
 }
 
 #[async_trait]
-impl IndexReader for PreviousFileReader {
+impl IndexReader for LancePreviousReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
-        self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
+        self.0
+            .read_batch(offset as i32, ReadBatchParams::RangeFull, self.0.schema())
             .await
     }
 
@@ -200,36 +173,36 @@ impl IndexReader for PreviousFileReader {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
         let projection = match projection {
-            Some(projection) => self.schema().project(projection)?,
-            None => self.schema().clone(),
+            Some(projection) => self.0.schema().project(projection)?,
+            None => self.0.schema().clone(),
         };
-        self.read_range(range, &projection).await
+        self.0.read_range(range, &projection).await
     }
 
     async fn num_batches(&self, _batch_size: u64) -> u32 {
-        self.num_batches() as u32
+        self.0.num_batches() as u32
     }
 
     fn num_rows(&self) -> usize {
-        self.len()
+        self.0.len()
     }
 
     fn schema(&self) -> &lance_core::datatypes::Schema {
-        Self::schema(self)
+        self.0.schema()
     }
 }
 
 #[async_trait]
-impl IndexReader for current_reader::FileReader {
+impl IndexReader for LanceCurrentReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let start = offset * batch_size;
         let end = start + batch_size;
-        let end = end.min(self.num_rows());
+        let end = end.min(self.num_rows() as u64);
         self.read_range(start as usize..end as usize, None).await
     }
 
     async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
-        Self::read_global_buffer(self, n).await
+        self.0.read_global_buffer(n).await
     }
 
     async fn read_range(
@@ -239,19 +212,20 @@ impl IndexReader for current_reader::FileReader {
     ) -> Result<RecordBatch> {
         if range.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(
-                self.schema().as_ref().into(),
+                self.0.schema().as_ref().into(),
             )));
         }
         let projection = if let Some(projection) = projection {
             ReaderProjection::from_column_names(
-                self.metadata().version(),
-                self.schema(),
+                self.0.metadata().version(),
+                self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
         };
         let batches = self
+            .0
             .read_stream_projected(
                 ReadBatchParams::Range(range),
                 u32::MAX,
@@ -271,22 +245,19 @@ impl IndexReader for current_reader::FileReader {
         ranges: &[std::ops::Range<usize>],
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
-        let empty_batch = || {
-            Ok(RecordBatch::new_empty(Arc::new(
-                self.schema().as_ref().into(),
-            )))
-        };
+        let schema: Arc<arrow_schema::Schema> = Arc::new(self.0.schema().as_ref().into());
+        let empty_batch = || Ok(RecordBatch::new_empty(schema.clone()));
         if ranges.is_empty() {
             return empty_batch();
         }
         let projection = if let Some(projection) = projection {
             ReaderProjection::from_column_names(
-                self.metadata().version(),
-                self.schema(),
+                self.0.metadata().version(),
+                self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
         };
         // `DecodeBatchScheduler::schedule_ranges` requires sorted,
         // non-overlapping ranges; sort internally and permute the
@@ -300,6 +271,7 @@ impl IndexReader for current_reader::FileReader {
             .collect();
         let total_rows: u64 = sorted_ranges.iter().map(|r| r.end - r.start).sum();
         let batches = self
+            .0
             .read_stream_projected(
                 ReadBatchParams::Ranges(sorted_ranges),
                 (total_rows as u32).max(1),
@@ -352,41 +324,42 @@ impl IndexReader for current_reader::FileReader {
     ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
         if range.is_empty() {
             return Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
-                Arc::new(self.schema().as_ref().into()),
+                Arc::new(self.0.schema().as_ref().into()),
                 futures::stream::empty(),
             )));
         }
         let projection = if let Some(projection) = projection {
             ReaderProjection::from_column_names(
-                self.metadata().version(),
-                self.schema(),
+                self.0.metadata().version(),
+                self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            ReaderProjection::from_whole_schema(self.0.schema(), self.0.metadata().version())
         };
-        self.read_stream_projected(
-            ReadBatchParams::Range(range),
-            4096,
-            2,
-            projection,
-            FilterExpression::no_filter(),
-        )
-        .await
+        self.0
+            .read_stream_projected(
+                ReadBatchParams::Range(range),
+                4096,
+                2,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
     }
 
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self, batch_size: u64) -> u32 {
-        Self::num_rows(self).div_ceil(batch_size) as u32
+        self.0.num_rows().div_ceil(batch_size) as u32
     }
 
     fn num_rows(&self) -> usize {
-        Self::num_rows(self) as usize
+        self.0.num_rows() as usize
     }
 
     fn schema(&self) -> &lance_core::datatypes::Schema {
-        Self::schema(self)
+        self.0.schema()
     }
 
     fn file_size_bytes(&self) -> Option<u64> {
@@ -450,7 +423,7 @@ impl IndexStore for LanceIndexStore {
         )
         .await
         {
-            Ok(reader) => Ok(Arc::new(reader)),
+            Ok(reader) => Ok(Arc::new(LanceCurrentReader(reader))),
             Err(e) => {
                 // If the error is a version conflict we can try to read the file with v1 reader
                 if let Error::VersionConflict { .. } = e {
@@ -461,7 +434,7 @@ impl IndexStore for LanceIndexStore {
                         Some(&self.metadata_cache),
                     )
                     .await?;
-                    Ok(Arc::new(file_reader))
+                    Ok(Arc::new(LancePreviousReader(file_reader)))
                 } else {
                     Err(e)
                 }
@@ -535,7 +508,14 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
-        list_index_files_with_sizes(&self.object_store, &self.index_dir).await
+        let files = list_index_files_with_sizes(&self.object_store, &self.index_dir).await?;
+        Ok(files
+            .into_iter()
+            .map(|f| IndexFile {
+                path: f.path,
+                size_bytes: f.size_bytes,
+            })
+            .collect())
     }
 }
 

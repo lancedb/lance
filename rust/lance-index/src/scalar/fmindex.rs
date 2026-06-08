@@ -34,7 +34,6 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ADDR, Result};
 use roaring::RoaringBitmap;
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::MetricsCollector;
 use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
@@ -46,8 +45,8 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
@@ -1258,7 +1257,7 @@ impl FMIndexScalarIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let files = store.list_files_with_sizes().await?;
@@ -1294,11 +1293,6 @@ impl Index for FMIndexScalarIndex {
     }
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "Fm is not a vector index".into(),
-        ))
     }
     async fn prewarm(&self) -> Result<()> {
         Ok(())
@@ -1737,7 +1731,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
-        fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let _ = details

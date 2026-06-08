@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{collections::HashMap, sync::Arc};
 
-use lance_core::{Error, Result};
+use std::sync::Arc;
 
 #[cfg(feature = "geo")]
 use crate::scalar::rtree::RTreeIndexPlugin;
@@ -11,8 +10,7 @@ use crate::{
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
         fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
-        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
-        zonemap::ZoneMapIndexPlugin,
+        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, zonemap::ZoneMapIndexPlugin,
     },
 };
 
@@ -31,101 +29,28 @@ pub fn display_type_from_url(type_url: &str) -> &str {
         .unwrap_or(segment)
 }
 
-/// A registry of index plugins
-pub struct IndexPluginRegistry {
-    plugins: HashMap<String, Box<dyn ScalarIndexPlugin>>,
-}
+pub use lance_index_core::registry::{IndexPluginRegistry, PluginRegistry};
 
-impl IndexPluginRegistry {
-    fn normalize_plugin_name(name: &str) -> String {
-        name.to_lowercase()
-    }
+/// Create a registry populated with all built-in index plugins.
+pub fn with_default_plugins() -> Arc<IndexPluginRegistry> {
+    let mut registry = IndexPluginRegistry::new();
+    registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
+    registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
+    registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
+    registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
+    registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
+    registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
+    registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
+    registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
+    registry.add_plugin::<pb::FmIndexIndexDetails, FMIndexPlugin>();
+    #[cfg(feature = "geo")]
+    registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 
-    fn get_plugin_name_from_details_name(&self, details_name: &str) -> String {
-        let details_name = Self::normalize_plugin_name(details_name);
-        if details_name.ends_with("indexdetails") {
-            let plugin_name = details_name.replace("indexdetails", "");
-            if plugin_name == "fmindex" {
-                "fm".to_string()
-            } else {
-                plugin_name
-            }
-        } else {
-            details_name
-        }
-    }
+    let registry = Arc::new(registry);
+    let registry_dyn: Arc<dyn PluginRegistry> = registry.clone();
+    registry.for_each_plugin(|p| p.attach_registry(registry_dyn.clone()));
 
-    /// Adds a plugin to the registry, using the name of the details message to determine
-    /// the plugin name.
-    ///
-    /// The plugin name will be the lowercased name of the details message with any trailing
-    /// "indexdetails" removed.
-    ///
-    /// For example, if the details message is `BTreeIndexDetails`, the plugin name will be
-    /// `btree`.
-    pub fn add_plugin<
-        DetailsType: prost::Message + prost::Name,
-        PluginType: ScalarIndexPlugin + std::default::Default + 'static,
-    >(
-        &mut self,
-    ) {
-        let plugin_name = self.get_plugin_name_from_details_name(DetailsType::NAME);
-        self.plugins
-            .insert(plugin_name, Box::new(PluginType::default()));
-    }
-
-    /// Create a registry with the default plugins
-    pub fn with_default_plugins() -> Arc<Self> {
-        let mut registry = Self {
-            plugins: HashMap::new(),
-        };
-        registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
-        registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
-        registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
-        registry.add_plugin::<pbold::NGramIndexDetails, NGramIndexPlugin>();
-        registry.add_plugin::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>();
-        registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
-        registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
-        registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
-        registry.add_plugin::<pb::FmIndexIndexDetails, FMIndexPlugin>();
-        #[cfg(feature = "geo")]
-        registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
-
-        let registry = Arc::new(registry);
-        for plugin in registry.plugins.values() {
-            plugin.attach_registry(registry.clone());
-        }
-
-        registry
-    }
-
-    /// Get an index plugin suitable for training an index with the given parameters
-    pub fn get_plugin_by_name(&self, name: &str) -> Result<&dyn ScalarIndexPlugin> {
-        let plugin_name = Self::normalize_plugin_name(name);
-        self.plugins
-            .get(&plugin_name)
-            .map(|plugin| plugin.as_ref())
-            .ok_or_else(|| {
-                let hint = if plugin_name == "rtree" {
-                    ". The 'rtree' index requires the `geo` feature. \
-                     Rebuild with `--features geo` to enable geospatial support"
-                } else {
-                    ""
-                };
-                Error::invalid_input_source(
-                    format!("No scalar index plugin found for name '{name}'{hint}").into(),
-                )
-            })
-    }
-
-    pub fn get_plugin_by_details(
-        &self,
-        details: &prost_types::Any,
-    ) -> Result<&dyn ScalarIndexPlugin> {
-        let details_name = details.type_url.split('.').next_back().unwrap();
-        let plugin_name = self.get_plugin_name_from_details_name(details_name);
-        self.get_plugin_by_name(&plugin_name)
-    }
+    registry
 }
 
 #[cfg(test)]
@@ -152,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_get_plugin_by_name_accepts_case_insensitive_builtin_names() {
-        let registry = IndexPluginRegistry::with_default_plugins();
+        let registry = with_default_plugins();
 
         for (requested_name, expected_name) in [
             ("BTREE", "BTree"),

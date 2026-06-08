@@ -96,6 +96,24 @@ use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
 
+pub(crate) fn index_file_to_table(
+    f: lance_index::scalar::IndexFile,
+) -> lance_table::format::IndexFile {
+    lance_table::format::IndexFile {
+        path: f.path,
+        size_bytes: f.size_bytes,
+    }
+}
+
+pub(crate) fn index_file_from_table(
+    f: lance_table::format::IndexFile,
+) -> lance_index::scalar::IndexFile {
+    lance_index::scalar::IndexFile {
+        path: f.path,
+        size_bytes: f.size_bytes,
+    }
+}
+
 fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     if segments.is_empty() {
         return Err(Error::invalid_input(
@@ -604,7 +622,7 @@ pub(crate) async fn remap_index(
                 )
                 .unwrap(),
                 index_version,
-                files,
+                files: Some(files.into_iter().map(index_file_from_table).collect()),
             }
         }
         _ => {
@@ -620,7 +638,9 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
-        files: Some(created_index.files),
+        files: created_index
+            .files
+            .map(|files| files.into_iter().map(index_file_to_table).collect()),
     }))
 }
 
@@ -1916,6 +1936,7 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+        let frag_reuse_index = frag_reuse_index.map(|f| f as Arc<dyn lance_index::RowIdRemapper>);
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir
             .clone()

@@ -38,7 +38,6 @@ use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::vector::ApproxMode;
 use crate::vector::bq::dist_table_quant::{
@@ -64,6 +63,7 @@ use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{
     DistCalculator, DistanceCalculatorOptions, QueryResidual, RabitRawQueryContext, VectorStore,
 };
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
@@ -2422,7 +2422,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
@@ -2548,7 +2548,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema).await?;

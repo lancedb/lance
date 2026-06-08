@@ -165,7 +165,8 @@ impl<'a> CreateIndexBuilder<'a> {
         let fri = self
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
-            .await?;
+            .await?
+            .map(|f| f as Arc<dyn lance_index::RowIdRemapper>);
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
@@ -407,7 +408,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 CreatedIndex {
                     index_details: vector_index_details(vec_params),
                     index_version,
-                    files,
+                    files: Some(
+                        files
+                            .into_iter()
+                            .map(crate::index::index_file_from_table)
+                            .collect(),
+                    ),
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -446,7 +452,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
-                    files,
+                    files: Some(
+                        files
+                            .into_iter()
+                            .map(crate::index::index_file_from_table)
+                            .collect(),
+                    ),
                 }
             }
             (IndexType::FragmentReuse, _) => {
@@ -479,7 +490,12 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: Some(created_index.files),
+            files: created_index.files.map(|files| {
+                files
+                    .into_iter()
+                    .map(crate::index::index_file_to_table)
+                    .collect()
+            }),
         })
     }
 

@@ -36,8 +36,8 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
+use lance_index::RowIdRemapper;
 use lance_index::cache_pb::IvfStateHeader;
-use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -969,7 +969,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         uuid: Uuid,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
         file_sizes: HashMap<String, u64>,
@@ -1286,10 +1286,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -1952,13 +1948,17 @@ mod tests {
         dataset::optimize::{CompactionOptions, compact_files},
         index::vector::IndexFileVersion,
     };
+    use arrow::compute::concat_batches;
+    use futures::TryStreamExt;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
+    use lance_encoding::decoder::FilterExpression;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
     use lance_index::IndexType;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -1975,6 +1975,7 @@ mod tests {
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_io::{
+        ReadBatchParams,
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
         utils::CachedFileSize,
@@ -5148,9 +5149,18 @@ mod tests {
 
         // Rewrite auxiliary file with PQ codebook inlined into schema metadata.
         let mut metadata = reader.schema().metadata.clone();
-        let batch = reader
-            .read_range(0..reader.num_rows() as usize, None)
+        let reader_schema: Arc<arrow_schema::Schema> = Arc::new(reader.schema().as_ref().into());
+        let batches = reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                u32::MAX,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
             .await?;
+        let batch = concat_batches(&reader_schema, batches.iter())?;
         let new_aux_path = new_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let mut writer = FileWriter::try_new(
             obj_store.create(&new_aux_path).await?,

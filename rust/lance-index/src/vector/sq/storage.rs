@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{ScalarQuantizer, scale_to_u8};
-use crate::frag_reuse::FragReuseIndex;
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata,
     vector::{
@@ -33,6 +32,7 @@ use crate::{
         transform::Transformer,
     },
 };
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 pub const SQ_METADATA_KEY: &str = "lance:sq";
 
@@ -171,7 +171,7 @@ impl ScalarQuantizationStorage {
         distance_type: DistanceType,
         bounds: Range<f64>,
         batches: impl IntoIterator<Item = RecordBatch>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
         let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
@@ -211,7 +211,7 @@ impl ScalarQuantizationStorage {
     pub async fn load(
         object_store: &ObjectStore,
         path: &Path,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let reader = PreviousFileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
@@ -263,7 +263,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -294,7 +294,7 @@ impl QuantizerStorage for ScalarQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema).await?;

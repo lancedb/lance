@@ -17,8 +17,9 @@ use super::{
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
+use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
+use crate::{pbold, scalar::btree::flat::FlatIndex};
 use crate::{
-    frag_reuse::FragReuseIndex,
     progress::{IndexBuildProgress, noop_progress},
     scalar::{
         CreatedIndex, UpdateCriteria,
@@ -26,8 +27,6 @@ use crate::{
         registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME},
     },
 };
-use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
-use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
 use arrow_array::{
     Array, ArrayAccessor, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
@@ -73,7 +72,8 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_select::{NullableRowAddrSet, RowSetOps};
+use lance_index_core::row_id_remap::RowIdRemapper;
+use lance_select::NullableRowAddrSet;
 use log::{debug, warn};
 use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
@@ -1393,7 +1393,7 @@ impl BTreeIndexState {
         &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index = BTreeIndex::try_from_serialized(
             self.lookup_batch.clone(),
@@ -1519,7 +1519,18 @@ pub struct BTreeIndex {
     /// - The local page_idx is calculated: `142 - 100 = 42`.
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+
+    /// The raw lookup batch this index was built from (the contents of
+    /// `page_lookup.lance`). Retained so the index can be serialized into a
+    /// cache as a [`BTreeIndexState`] without re-reading it from storage.
+    ///
+    /// TODO: this duplicates the min/max values already held in `page_lookup`.
+    /// A follow-up could rewrite `BTreeLookup` to query this batch directly
+    /// (binary search on the sorted `min` column + linear scan, type-dispatched
+    /// per column type), eliminating the duplication and making this batch the
+    /// single source of truth.
+    lookup_batch: RecordBatch,
 }
 
 impl DeepSizeOf for BTreeIndex {
@@ -1540,7 +1551,8 @@ impl BTreeIndex {
         index_cache: WeakLanceCache,
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        lookup_batch: RecordBatch,
     ) -> Self {
         Self {
             page_lookup,
@@ -1550,6 +1562,7 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
+            lookup_batch,
         }
     }
 
@@ -1696,9 +1709,10 @@ impl BTreeIndex {
         index_cache: &LanceCache,
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let data_type = data.column(0).data_type().clone();
+        let lookup_batch = data.clone();
         let page_lookup = Arc::new(BTreeLookup::try_new(data)?);
 
         Ok(Self::new(
@@ -1709,12 +1723,13 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
+            lookup_batch,
         ))
     }
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let (page_lookup_file, standalone_partition_page_file) =
@@ -1996,12 +2011,6 @@ impl Index for BTreeIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "BTreeIndex is not vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -2554,9 +2563,7 @@ pub async fn train_btree_index(
     Ok(vec![pages_file, lookup_file])
 }
 
-fn find_single_partition_files(
-    files: &[lance_table::format::IndexFile],
-) -> Result<Option<(&str, &str)>> {
+fn find_single_partition_files(files: &[crate::scalar::IndexFile]) -> Result<Option<(&str, &str)>> {
     let lookup_files = files
         .iter()
         .filter_map(|file| {
@@ -3291,7 +3298,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
@@ -3300,7 +3307,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&BTreeIndexStateKey).await else {
@@ -6261,6 +6268,7 @@ mod tests {
     #[tokio::test]
     async fn test_btree_index_state_reconstruct_applies_frag_reuse_index() {
         use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use lance_index_core::row_id_remap::RowIdRemapper;
         use std::collections::HashMap;
         use uuid::Uuid;
 
@@ -6292,7 +6300,7 @@ mod tests {
         // Remap row 0 -> row 5000 (outside the original [0, 1000) range so no collision).
         // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
         // the FragReuseIndex through to the rebuilt BTreeIndex.
-        let frag_reuse_index = Arc::new(FragReuseIndex::new(
+        let frag_reuse_index: Arc<dyn RowIdRemapper> = Arc::new(FragReuseIndex::new(
             Uuid::new_v4(),
             vec![HashMap::from([(0u64, Some(5000u64))])],
             FragReuseIndexDetails { versions: vec![] },

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
 use crate::scalar::lance_format::LanceIndexStore;
@@ -13,7 +12,6 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
     IndexWriter, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType, pb};
 use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
@@ -38,6 +36,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
+use lance_index_core::row_id_remap::RowIdRemapper;
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -259,7 +258,7 @@ impl CacheKey for RTreeCacheKey {
 pub struct RTreeIndex {
     pub(crate) metadata: Arc<RTreeMetadata>,
     store: Arc<dyn IndexStore>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
     pages_reader: Arc<dyn IndexReader>,
     nulls_reader: Arc<dyn IndexReader>,
@@ -277,7 +276,7 @@ impl std::fmt::Debug for RTreeIndex {
 impl RTreeIndex {
     pub async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
@@ -447,12 +446,6 @@ impl Index for RTreeIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::not_supported_source(
-            "RTreeIndex is not vector index".into(),
-        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -997,7 +990,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(RTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)

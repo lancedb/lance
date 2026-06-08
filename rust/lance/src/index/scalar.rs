@@ -39,7 +39,7 @@ use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
 };
 use lance_index::progress::IndexBuildProgress;
-use lance_index::registry::IndexPluginRegistry;
+use lance_index::registry::{IndexPluginRegistry, with_default_plugins};
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::label_list::{
@@ -236,7 +236,7 @@ pub(crate) async fn load_training_data(
 
 // TODO: Allow users to register their own plugins
 static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(with_default_plugins);
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 
@@ -448,8 +448,12 @@ pub async fn open_scalar_index(
         .index_cache
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
+    let remapper = frag_reuse_index
+        .clone()
+        .map(|f| f as Arc<dyn lance_index::RowIdRemapper>);
+
     if let Some(index) = plugin
-        .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
+        .get_from_cache(index_store.clone(), remapper.clone(), &index_cache)
         .await?
     {
         // Compatibility check is only needed on first load; a cache hit means
@@ -463,7 +467,7 @@ pub async fn open_scalar_index(
     }
 
     let index = plugin
-        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+        .load_index(index_store, &index_details, remapper, &index_cache)
         .await?;
 
     tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());

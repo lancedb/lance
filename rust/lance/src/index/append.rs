@@ -509,7 +509,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: Some(
+                        files
+                            .into_iter()
+                            .map(crate::index::index_file_from_table)
+                            .collect(),
+                    ),
                 },
             ))
         } else {
@@ -572,7 +577,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // index_version <= our max supported version, so we can safely
                     // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: Some(
+                        files
+                            .into_iter()
+                            .map(crate::index::index_file_from_table)
+                            .collect(),
+                    ),
                 },
             ))
         }
@@ -656,7 +666,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
                         new_index_version: created_index.index_version as i32,
                         new_index_details: created_index.index_details,
-                        files: created_index.files,
+                        files: created_index.files.map(|files| {
+                            files
+                                .into_iter()
+                                .map(crate::index::index_file_to_table)
+                                .collect()
+                        }),
                     }));
                 }
 
@@ -772,7 +787,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
-        files: created_index.files,
+        files: created_index.files.map(|files| {
+            files
+                .into_iter()
+                .map(crate::index::index_file_to_table)
+                .collect()
+        }),
     }))
 }
 

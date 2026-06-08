@@ -15,7 +15,6 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
@@ -24,7 +23,6 @@ use crate::scalar::registry::{
     VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
@@ -42,6 +40,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
+use lance_index_core::row_id_remap::RowIdRemapper;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowAddrTreeMap;
 use lance_tokenizer::{
@@ -187,7 +186,7 @@ impl CacheKey for NGramPostingListKey {
 impl NGramPostingList {
     fn try_from_batch(
         batch: RecordBatch,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
         let mut bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
@@ -214,7 +213,7 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
 }
 
@@ -299,7 +298,7 @@ impl DeepSizeOf for NGramIndex {
 impl NGramIndex {
     async fn from_store(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
@@ -375,7 +374,7 @@ impl NGramIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -395,12 +394,6 @@ impl Index for NGramIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "NGramIndex is not a vector index".into(),
-        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -1358,7 +1351,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(NGramIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)

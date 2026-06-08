@@ -4,7 +4,6 @@
 use std::{borrow::Cow, sync::Arc};
 
 use super::index::FlatMetadata;
-use crate::frag_reuse::FragReuseIndex;
 use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
@@ -20,6 +19,7 @@ use arrow_schema::{DataType, SchemaRef};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_index_core::row_id_remap::RowIdRemapper;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
 
@@ -51,7 +51,7 @@ impl QuantizerStorage for FlatFloatStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
@@ -91,7 +91,7 @@ impl QuantizerStorage for FlatFloatStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
-        _: Option<Arc<FragReuseIndex>>,
+        _: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
@@ -213,7 +213,7 @@ impl QuantizerStorage for FlatBinStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
@@ -253,7 +253,7 @@ impl QuantizerStorage for FlatBinStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
-        _: Option<Arc<FragReuseIndex>>,
+        _: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }

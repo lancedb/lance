@@ -37,7 +37,6 @@ use serde::{Deserialize, Serialize};
 
 use super::ProductQuantizer;
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
-use crate::frag_reuse::FragReuseIndex;
 use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
@@ -49,6 +48,7 @@ use crate::{
         transform::Transformer,
     },
 };
+use lance_index_core::row_id_remap::RowIdRemapper;
 
 pub const PQ_METADATA_KEY: &str = "lance:pq";
 
@@ -202,7 +202,7 @@ impl ProductQuantizationStorage {
         dimension: usize,
         distance_type: DistanceType,
         transposed: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         if batch.num_columns() != 2 {
             log::warn!(
@@ -341,7 +341,7 @@ impl ProductQuantizationStorage {
         quantizer: ProductQuantizer,
         batch: &RecordBatch,
         vector_col: &str,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let codebook = quantizer.codebook.clone();
         let num_bits = quantizer.num_bits;
@@ -384,7 +384,7 @@ impl ProductQuantizationStorage {
     pub async fn load(
         object_store: &ObjectStore,
         path: &Path,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let reader = PreviousFileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
@@ -511,7 +511,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -619,7 +619,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         // Hard coded to float32 for now
         let codebook = metadata

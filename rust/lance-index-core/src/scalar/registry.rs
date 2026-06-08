@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use arrow_schema::Field;
+use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use lance_core::{
+    Result,
+    cache::{LanceCache, UnsizedCacheKey},
+};
+
+use crate::progress::IndexBuildProgress;
+use crate::registry::PluginRegistry;
+use crate::row_id_remap::RowIdRemapper;
+use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+
+pub const VALUE_COLUMN_NAME: &str = "value";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingOrdering {
+    /// The input will arrive sorted by the value column in ascending order
+    Values,
+    /// The input will arrive sorted by the address column in ascending order
+    Addresses,
+    /// The input will arrive in an arbitrary order
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrainingCriteria {
+    pub ordering: TrainingOrdering,
+    pub needs_row_ids: bool,
+    pub needs_row_addrs: bool,
+}
+
+impl TrainingCriteria {
+    pub fn new(ordering: TrainingOrdering) -> Self {
+        Self {
+            ordering,
+            needs_row_ids: false,
+            needs_row_addrs: false,
+        }
+    }
+
+    pub fn with_row_id(mut self) -> Self {
+        self.needs_row_ids = true;
+        self
+    }
+
+    pub fn with_row_addr(mut self) -> Self {
+        self.needs_row_addrs = true;
+        self
+    }
+}
+
+/// A trait that describes what criteria is needed to train an index
+///
+/// The training process has two steps.  First, the parameters are given to the
+/// plugin and it creates a TrainingRequest.  Then, the caller prepares the training
+/// data and calls train_index.
+///
+/// The call to train_index will include the training request.  This allows the plugin
+/// to stash any deserialized parameter info in the request and fetch it later during
+/// training by downcasting to the appropriate type.
+pub trait TrainingRequest: std::any::Any + Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn criteria(&self) -> &TrainingCriteria;
+}
+
+/// A default training request impl for indexes that don't need any parameters
+pub struct DefaultTrainingRequest {
+    criteria: TrainingCriteria,
+}
+
+impl DefaultTrainingRequest {
+    pub fn new(criteria: TrainingCriteria) -> Self {
+        Self { criteria }
+    }
+}
+
+impl TrainingRequest for DefaultTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
+/// A trait for scalar index plugins
+#[async_trait]
+pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
+    /// Creates a new training request from the given parameters
+    ///
+    /// This training request specifies the criteria that the data must satisfy to train the index.
+    /// For example, does the index require the input data to be sorted?
+    fn new_training_request(&self, params: &str, field: &Field)
+    -> Result<Box<dyn TrainingRequest>>;
+
+    /// Train a new index
+    ///
+    /// The provided data must fulfill all the criteria returned by `training_criteria`.
+    /// It is the caller's responsibility to ensure this.
+    ///
+    /// Returns index details that describe the index.  These details can potentially be
+    /// useful for planning (although this will currently require inside information on
+    /// the index type) and they will need to be provided when loading the index.
+    ///
+    /// It is the caller's responsibility to store these details somewhere.
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex>;
+
+    /// A short name for the index
+    ///
+    /// This is a friendly name for display purposes and also can be used as an alias for
+    /// the index type URL.  If multiple plugins have the same name, then the first one
+    /// found will be used.
+    ///
+    /// By convention this is MixedCase with no spaces.  When used as an alias, it will be
+    /// compared case-insensitively.
+    fn name(&self) -> &str;
+
+    /// Returns true if the index returns an exact answer (e.g. not AtMost)
+    fn provides_exact_answer(&self) -> bool;
+
+    /// The version of the index plugin
+    ///
+    /// We assume that indexes are not forwards compatible.  If an index was written with a
+    /// newer version than this, it cannot be read
+    fn version(&self) -> u32;
+
+    /// Returns a new query parser for the index
+    ///
+    /// Can return None if this index cannot participate in query optimization
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>>;
+
+    /// Load an index from storage
+    ///
+    /// The index details should match the details that were returned when the index was
+    /// originally trained.
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Look up a previously-opened index in the cache.
+    ///
+    /// `cache` is already per-index namespaced by the caller, so a plugin's key
+    /// only needs to disambiguate entries within a single index.
+    ///
+    /// The default implementation reads an in-memory `Arc<dyn ScalarIndex>` entry.
+    /// Plugins whose index has a serializable representation should override this
+    /// (together with [`put_in_cache`](Self::put_in_cache)) to store that
+    /// representation under a sized [`CacheKey`](lance_core::cache::CacheKey) with
+    /// a codec, and reconstruct the index here. `index_store` and
+    /// `row_id_remapper` are provided so the override can rebuild the index
+    /// without re-reading metadata.
+    async fn get_from_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Ok(cache.get_unsized_with_key(&ScalarIndexCacheKey).await)
+    }
+
+    /// Store a freshly-opened index in the cache.
+    ///
+    /// `cache` is already per-index namespaced; see
+    /// [`get_from_cache`](Self::get_from_cache).
+    ///
+    /// The default implementation stores the `Arc<dyn ScalarIndex>` in-memory.
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, index)
+            .await;
+        Ok(())
+    }
+
+    /// Optional hook allowing a plugin to provide statistics without loading the index.
+    async fn load_statistics(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    /// Optional hook that plugins can use if they need to be aware of the registry
+    fn attach_registry(&self, _registry: Arc<dyn PluginRegistry>) {}
+
+    /// Returns a JSON string representation of the provided index details
+    ///
+    /// These details will be user-visible and should be considered part of the public
+    /// API.  As a result, efforts should be made to ensure the information is backwards
+    /// compatible and avoid breaking changes.
+    fn details_as_json(&self, _details: &prost_types::Any) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({}))
+    }
+}
+
+/// In-memory cache key for a whole `Arc<dyn ScalarIndex>`.
+///
+/// Used by the default [`ScalarIndexPlugin::get_from_cache`] /
+/// [`ScalarIndexPlugin::put_in_cache`] implementations. The cache is already
+/// per-index namespaced by the caller, so a constant key suffices. Trait objects
+/// cannot be serialized, so this is an [`UnsizedCacheKey`] with no codec —
+/// plugins that want a persistable cache entry override those methods with a
+/// sized key.
+pub struct ScalarIndexCacheKey;
+
+impl UnsizedCacheKey for ScalarIndexCacheKey {
+    type ValueType = dyn ScalarIndex;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("scalar_index")
+    }
+
+    fn type_name() -> &'static str {
+        "ScalarIndex"
+    }
+}
