@@ -8,8 +8,8 @@ use super::{
     Dataset,
     transaction::{Operation, Transaction},
 };
-use crate::{Error, Result, io::exec::Planner};
 use crate::index::DatasetIndexExt;
+use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
@@ -616,18 +616,19 @@ pub(super) async fn alter_columns(
         let indices = dataset.load_indices().await?;
         let affected: Vec<&lance_table::format::IndexMetadata> = indices
             .iter()
-            .filter(|idx| cast_fields.iter().any(|(old, _)| idx.fields.contains(&old.id)))
+            .filter(|idx| {
+                cast_fields
+                    .iter()
+                    .any(|(old, _)| idx.fields.contains(&old.id))
+            })
             .collect();
         if !affected.is_empty() {
             let affected_cols: Vec<String> = cast_fields
                 .iter()
-                .filter(|(old, _)| {
-                    affected.iter().any(|i| i.fields.contains(&old.id))
-                })
+                .filter(|(old, _)| affected.iter().any(|i| i.fields.contains(&old.id)))
                 .map(|(old, _)| old.name.clone())
                 .collect();
-            let affected_idx_names: Vec<String> =
-                affected.iter().map(|i| i.name.clone()).collect();
+            let affected_idx_names: Vec<String> = affected.iter().map(|i| i.name.clone()).collect();
             return Err(Error::invalid_input(format!(
                 "Cannot cast column(s) [{}] to a new type: they have {} index(es) \
                  attached: [{}]. Cast rewrites column data and invalidates any index \
@@ -1819,7 +1820,6 @@ mod test {
     ) -> Result<()> {
         // Create a table with 2 scalar columns, 1 vector column
 
-        use crate::index::DatasetIndexExt;
         use arrow::datatypes::{Int32Type, Int64Type};
         use arrow_array::{Float16Array, Float32Array, Int64Array, ListArray};
         use half::f16;
@@ -1968,8 +1968,9 @@ mod test {
 
         // Finally, case list column to show we can handle children.
         dataset
-            .alter_columns(&[ColumnAlteration::new("l".into())
-                .cast_to(DataType::new_list(DataType::Int64, true))])
+            .alter_columns(&[ColumnAlteration::new("l".into()).cast_to(
+                DataType::new_list(DataType::Int64, true),
+            )])
             .await?;
         dataset.validate().await?;
 
@@ -2034,7 +2035,6 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
-        use crate::index::DatasetIndexExt;
         use lance_arrow::FixedSizeListArrayExt;
         use lance_index::IndexType;
         use lance_linalg::distance::MetricType;
@@ -2087,11 +2087,12 @@ mod test {
         // Attempting to cast the indexed column must fail with a clear message
         // that names the offending index(es).
         let result = dataset
-            .alter_columns(&[ColumnAlteration::new("vec".into())
-                .cast_to(DataType::FixedSizeList(
+            .alter_columns(&[
+                ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
                     Arc::new(ArrowField::new("item", DataType::Float16, true)),
                     64,
-                ))])
+                )),
+            ])
             .await;
         let err = result.expect_err("cast on indexed column should fail");
         let msg = err.to_string();
@@ -2119,11 +2120,12 @@ mod test {
         // Sanity check: after dropping the index, the same cast should succeed.
         dataset.drop_index(&index_name).await?;
         dataset
-            .alter_columns(&[ColumnAlteration::new("vec".into())
-                .cast_to(DataType::FixedSizeList(
+            .alter_columns(&[
+                ColumnAlteration::new("vec".into()).cast_to(DataType::FixedSizeList(
                     Arc::new(ArrowField::new("item", DataType::Float16, true)),
                     64,
-                ))])
+                )),
+            ])
             .await?;
         assert_eq!(
             dataset.schema().field("vec").unwrap().data_type(),
