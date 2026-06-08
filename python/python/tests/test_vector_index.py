@@ -1067,7 +1067,7 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
-def test_create_ivf_rq_multi_bit_searches_l2_and_gates_cosine():
+def test_create_ivf_rq_multi_bit_searches_l2_and_cosine():
     ds = lance.write_dataset(create_table(), "memory://")
 
     ds = ds.create_index(
@@ -1090,14 +1090,26 @@ def test_create_ivf_rq_multi_bit_searches_l2_and_gates_cosine():
     assert result.num_rows == 10
 
     cosine_ds = lance.write_dataset(create_table(), "memory://")
-    with pytest.raises(NotImplementedError, match="num_bits>1 cosine index creation"):
-        cosine_ds.create_index(
-            "vector",
-            index_type="IVF_RQ",
-            metric="cosine",
-            num_partitions=4,
-            num_bits=9,
-        )
+    cosine_ds = cosine_ds.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        metric="cosine",
+        num_partitions=4,
+        num_bits=9,
+    )
+    cosine_stats = cosine_ds.stats.index_stats("vector_idx")
+    assert cosine_stats["indices"][0]["sub_index"]["num_bits"] == 9
+    assert cosine_stats["indices"][0]["sub_index"]["query_estimator"] == "raw_query"
+
+    cosine_result = cosine_ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128).astype(np.float32),
+            "k": 10,
+            "metric": "cosine",
+        }
+    )
+    assert cosine_result.num_rows == 10
 
 
 def test_create_ivf_rq_requires_dim_divisible_by_8():

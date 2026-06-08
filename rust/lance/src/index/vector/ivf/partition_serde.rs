@@ -1082,6 +1082,11 @@ mod tests {
     fn test_rabitq_distance_types() {
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             let storage = make_rabit_storage_fast(10, 32, dt);
+            let expected_distance_type = if dt == DistanceType::Cosine {
+                DistanceType::L2
+            } else {
+                dt
+            };
             let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
                 index: FlatIndex::default(),
                 storage,
@@ -1092,7 +1097,7 @@ mod tests {
                 &bytes::Bytes::from(bytes),
             )
             .unwrap();
-            assert_eq!(restored.storage.distance_type(), dt);
+            assert_eq!(restored.storage.distance_type(), expected_distance_type);
         }
     }
 
