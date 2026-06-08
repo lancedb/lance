@@ -947,11 +947,13 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     ivf_mut.write(&mut writer).await?;
-    let index_size = writer.finish().await? as u64;
+    let index_size = writer.tell().await? as u64;
+    writer.finish().await?;
 
     // Write the aux file
     aux_ivf.write(&mut aux_writer).await?;
-    let aux_size = aux_writer.finish().await? as u64;
+    let aux_size = aux_writer.tell().await? as u64;
+    aux_writer.finish().await?;
 
     Ok((
         existing_indices.len() - start_pos,
