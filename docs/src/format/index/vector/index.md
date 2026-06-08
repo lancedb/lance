@@ -198,6 +198,7 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 | `_rabit_codes`       | list<uint8>[dimension / 8]                       | false                    | Binary quantized codes (1 bit per dimension, packed into bytes) |
 | `__add_factors`      | float32                                          | false                    | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | false                    | Scale correction factors for distance computation               |
+| `__error_factors`    | float32                                          | false for `raw_query`    | Error factors for raw-query lower-bound pruning                 |
 | `__ex_codes`         | list<uint8>[ceil(dimension * (num_bits - 1) / 8)] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ                         |
 | `__add_factors_ex`   | float32                                          | false for `num_bits > 1` | Additive correction factors for ex-code distance computation    |
 | `__scale_factors_ex` | float32                                          | false for `num_bits > 1` | Scale correction factors for ex-code distance computation       |
@@ -358,6 +359,7 @@ pa.schema([
     pa.field("_rabit_codes", pa.list(pa.uint8(), list_size=16)), # dimension/8 = 128/8 = 16 bytes
     pa.field("__add_factors", pa.float32()),
     pa.field("__scale_factors", pa.float32()),
+    pa.field("__error_factors", pa.float32()),
 ])
 ```
 

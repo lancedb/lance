@@ -38,8 +38,8 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::rabit_ex_bits;
-use lance_index::vector::bq::storage::RabitQueryEstimator;
+use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
+use lance_index::vector::bq::{rabit_ex_bits, rabit_ex_code_bytes};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
@@ -161,6 +161,19 @@ fn rabit_ex_dist_table_len(dim: usize, num_bits: u8) -> usize {
             }
         })
         .unwrap_or(dim * 256)
+}
+
+fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
+    let binary_dist_table_len = dim * 4;
+    let ex_dist_table_len = rabit_ex_bits(num_bits)
+        .ok()
+        .and_then(|ex_bits| match ex_bits {
+            2 | 4 | 8 => rabit_ex_code_bytes(dim, ex_bits).ok(),
+            _ => None,
+        })
+        .map(|ex_code_len| ex_code_len * 2 * SEGMENT_NUM_CODES)
+        .unwrap_or_default();
+    binary_dist_table_len.max(ex_dist_table_len)
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
@@ -921,9 +934,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
         let dim = ivf.dimension();
         let dist_table_len = dim * 4;
-        let ex_dist_table_len = match storage.quantizer() {
-            Ok(Quantizer::Rabit(rq)) => rabit_ex_dist_table_len(dim, rq.metadata_ref().num_bits),
-            _ => dim * 256,
+        let (ex_dist_table_len, u8_scratch_len) = match storage.quantizer() {
+            Ok(Quantizer::Rabit(rq)) => {
+                let num_bits = rq.metadata_ref().num_bits;
+                (
+                    rabit_ex_dist_table_len(dim, num_bits),
+                    rabit_u8_scratch_len(dim, num_bits),
+                )
+            }
+            _ => (dim * 256, dim * 32),
         };
         let max_partition_len = ivf.lengths.iter().copied().max().unwrap_or_default() as usize;
 
@@ -931,7 +950,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             max_partition_len,
             dim + dist_table_len + ex_dist_table_len,
             max_partition_len,
-            dist_table_len,
+            u8_scratch_len,
         )
     }
 
@@ -1957,6 +1976,17 @@ mod tests {
         assert_eq!(super::rabit_ex_dist_table_len(dim, 5), dim * 16);
         assert_eq!(super::rabit_ex_dist_table_len(dim, 7), dim * 64);
         assert_eq!(super::rabit_ex_dist_table_len(dim, 9), dim * 256);
+    }
+
+    #[test]
+    fn test_rabit_u8_scratch_len_includes_ex_fastscan_tables() {
+        let dim = 960;
+
+        assert_eq!(super::rabit_u8_scratch_len(dim, 1), dim * 4);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 3), dim * 8);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 5), dim * 16);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 7), dim * 4);
+        assert_eq!(super::rabit_u8_scratch_len(dim, 9), dim * 32);
     }
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
@@ -4239,15 +4269,7 @@ mod tests {
         assert!(schema.field(EX_ADD_FACTORS_COLUMN).is_some());
         assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
 
-        let query = vectors.value(0);
-        let results = dataset
-            .scan()
-            .nearest("vector", query.as_primitive::<Float32Type>(), 10)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert_eq!(results.num_rows(), 10);
+        test_recall::<Float32Type>(params, 4, 0.5, "vector", &dataset, vectors).await;
     }
 
     #[rstest]
