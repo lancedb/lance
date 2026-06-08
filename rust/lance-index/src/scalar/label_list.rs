@@ -538,8 +538,8 @@ impl CacheCodecImpl for LabelListIndexState {
 
     /// Wire format:
     /// ```text
-    /// [u64 list_nulls_len][list_nulls bytes]
-    /// [bitmap state bytes (self-delimiting)]
+    /// RAW_BLOB : list_nulls (roaring tree map, portable encoding)
+    /// <nested BitmapIndexState body (self-delimiting)>
     /// ```
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let mut nulls_bytes = Vec::with_capacity(self.list_nulls.serialized_size());

@@ -870,7 +870,13 @@ mod tests {
             CacheCodec::from_impl::<PostingListGroup>()
                 .serialize(&any, &mut buf)
                 .unwrap();
-            assert!(codec().deserialize(&Bytes::from(buf)).unwrap().is_miss());
+            assert!(
+                codec()
+                    .deserialize(&Bytes::from(buf))
+                    .unwrap()
+                    .hit()
+                    .is_none()
+            );
         }
 
         /// An entry written by a newer build (higher type_version) misses.
@@ -882,7 +888,13 @@ mod tests {
             let type_id_len = u16::from_le_bytes([buf[5], buf[6]]) as usize;
             let version_off = 4 + 1 + 2 + type_id_len;
             buf[version_off..version_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            assert!(codec().deserialize(&Bytes::from(buf)).unwrap().is_miss());
+            assert!(
+                codec()
+                    .deserialize(&Bytes::from(buf))
+                    .unwrap()
+                    .hit()
+                    .is_none()
+            );
         }
 
         /// A pre-stabilization blob (no magic) self-heals to a miss.
@@ -891,7 +903,13 @@ mod tests {
             // Old format led with a u64 LE length prefix, never our magic.
             let mut blob = (30u64).to_le_bytes().to_vec();
             blob.extend_from_slice(&[0u8; 30]);
-            assert!(codec().deserialize(&Bytes::from(blob)).unwrap().is_miss());
+            assert!(
+                codec()
+                    .deserialize(&Bytes::from(blob))
+                    .unwrap()
+                    .hit()
+                    .is_none()
+            );
         }
     }
 }

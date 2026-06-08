@@ -146,10 +146,6 @@ impl<T> CacheDecode<T> {
             Self::Miss => None,
         }
     }
-
-    pub fn is_miss(&self) -> bool {
-        matches!(self, Self::Miss)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,11 +323,6 @@ impl CacheCodec {
             }
         }
     }
-
-    /// The stable type identifier this codec reads and writes.
-    pub fn type_id(&self) -> &'static str {
-        self.type_id
-    }
 }
 
 #[cfg(test)]
@@ -396,7 +387,7 @@ mod tests {
     fn wrong_magic_is_miss() {
         let mut bytes = serialize_widget(&Widget { n: 7 }).to_vec();
         bytes[0] = b'X';
-        assert!(deserialize_widget(&Bytes::from(bytes)).is_miss());
+        assert!(deserialize_widget(&Bytes::from(bytes)).hit().is_none());
     }
 
     #[test]
@@ -406,17 +397,21 @@ mod tests {
         let mut blob = Vec::new();
         blob.extend_from_slice(&(42u64).to_le_bytes());
         blob.extend_from_slice(&[0u8; 42]);
-        assert!(deserialize_widget(&Bytes::from(blob)).is_miss());
+        assert!(deserialize_widget(&Bytes::from(blob)).hit().is_none());
 
         // A different unstable shape led with a small u8 tag (0/1/2).
-        assert!(deserialize_widget(&Bytes::from(vec![0u8, 1, 2, 3])).is_miss());
+        assert!(
+            deserialize_widget(&Bytes::from(vec![0u8, 1, 2, 3]))
+                .hit()
+                .is_none()
+        );
     }
 
     #[test]
     fn unknown_envelope_version_is_miss() {
         let mut bytes = serialize_widget(&Widget { n: 7 }).to_vec();
         bytes[4] = 0xFF; // envelope_version byte
-        assert!(deserialize_widget(&Bytes::from(bytes)).is_miss());
+        assert!(deserialize_widget(&Bytes::from(bytes)).hit().is_none());
     }
 
     #[test]
@@ -426,7 +421,7 @@ mod tests {
         write_envelope(&mut buf, "some.OtherType", 1).unwrap();
         buf.extend_from_slice(&(4u64).to_le_bytes());
         buf.extend_from_slice(&99u32.to_le_bytes());
-        assert!(deserialize_widget(&Bytes::from(buf)).is_miss());
+        assert!(deserialize_widget(&Bytes::from(buf)).hit().is_none());
     }
 
     #[test]
@@ -436,7 +431,7 @@ mod tests {
         let mut buf = Vec::new();
         write_envelope(&mut buf, Widget::TYPE_ID, Widget::CURRENT_VERSION + 1).unwrap();
         lance_arrow::ipc::write_len_prefixed_bytes(&mut buf, &9u32.to_le_bytes()).unwrap();
-        assert!(deserialize_widget(&Bytes::from(buf)).is_miss());
+        assert!(deserialize_widget(&Bytes::from(buf)).hit().is_none());
     }
 
     #[test]
@@ -444,7 +439,9 @@ mod tests {
         let bytes = serialize_widget(&Widget { n: 7 });
         for cut in [0, 1, 4, 5, 7, 9] {
             assert!(
-                deserialize_widget(&bytes.slice(..cut.min(bytes.len()))).is_miss(),
+                deserialize_widget(&bytes.slice(..cut.min(bytes.len())))
+                    .hit()
+                    .is_none(),
                 "truncating to {cut} bytes should miss"
             );
         }
@@ -457,7 +454,7 @@ mod tests {
         write_envelope(&mut buf, Widget::TYPE_ID, Widget::CURRENT_VERSION).unwrap();
         buf.extend_from_slice(&(1u64).to_le_bytes());
         buf.push(0u8);
-        assert!(deserialize_widget(&Bytes::from(buf)).is_miss());
+        assert!(deserialize_widget(&Bytes::from(buf)).hit().is_none());
     }
 
     #[test]

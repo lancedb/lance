@@ -270,7 +270,7 @@ pub fn read_ipc_stream_single_at(
 /// Modern IPC streams have an 8-byte prefix `[continuation: 4][size: 4]`.
 /// Legacy streams have a 4-byte prefix `[size: 4]`. Returns `(prefix_len, meta_size)`.
 fn parse_ipc_message_prefix(buf: &Buffer) -> Result<(usize, usize), ArrowError> {
-    let has_continuation = buf.len() >= 4 && buf[..4] == [0xff; 4];
+    let has_continuation = buf.len() >= 4 && buf[..4] == IPC_CONTINUATION;
     if has_continuation {
         if buf.len() < 8 {
             return Err(ArrowError::ParseError(
