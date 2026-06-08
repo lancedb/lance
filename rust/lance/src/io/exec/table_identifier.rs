@@ -3,15 +3,65 @@
 
 //! Helpers for converting between [`Dataset`] and [`TableIdentifier`](pb::TableIdentifier) proto.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_datafusion::pb;
 use lance_io::object_store::StorageOptions;
 use prost::Message;
 
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
+
+/// Cache key for a dataset opened from a serialized proto. A pinned dataset
+/// version is an immutable snapshot, uniquely identified by
+/// `(uri, version, manifest_etag)`.
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+struct DatasetCacheKey {
+    uri: String,
+    version: u64,
+    etag: Option<String>,
+}
+
+/// Max distinct `(uri, version, etag)` datasets cached per process. Override
+/// via `LANCE_PROTO_DATASET_CACHE_SIZE`; set to `0` to disable caching and
+/// restore cold-open-per-plan_run behavior.
+static PROTO_DATASET_CACHE_CAPACITY: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_PROTO_DATASET_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+});
+
+/// Idle eviction window. Re-opening an evicted snapshot is always correct (the
+/// version is immutable); this just bounds memory and how long the storage
+/// credentials captured at first open are retained.
+const PROTO_DATASET_CACHE_TTI: Duration = Duration::from_secs(300);
+
+/// Process-global cache of datasets opened from serialized protos.
+///
+/// Serialized `FilteredReadExec` / ANN protos cannot carry a live
+/// `Arc<Dataset>`, so without this every distributed plan_run cold-opens the
+/// dataset from scratch (full `ObjectStore` init + manifest GET). On a
+/// many-fragment table that is thousands of redundant opens; the cache collapses
+/// them to one per `(uri, version, etag)` per worker process, and moka's
+/// single-flight `try_get_with` coalesces concurrent first-misses into one open.
+///
+/// Correctness: reusing a cached `Arc<Dataset>` for a pinned version is always
+/// safe — different versions/manifests get distinct keys, and a new write
+/// produces a new version (and etag) rather than mutating a cached entry, so the
+/// cache never serves stale data, breaks version pinning, or affects time-travel
+/// reads. Storage options are intentionally excluded from the key: credentials
+/// may be re-vended per plan_run, but the bytes (identified by etag) are the
+/// same, so a cached entry reuses the `ObjectStore` configured at first open.
+static PROTO_DATASET_CACHE: LazyLock<moka::future::Cache<DatasetCacheKey, Arc<Dataset>>> =
+    LazyLock::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(*PROTO_DATASET_CACHE_CAPACITY)
+            .time_to_idle(PROTO_DATASET_CACHE_TTI)
+            .build()
+    });
 
 /// Build a [`TableIdentifier`] from a [`Dataset`].
 ///
@@ -68,22 +118,78 @@ pub async fn open_dataset_from_table_identifier(
 
 /// Resolve a dataset from an optional pre-loaded instance or from a table identifier.
 ///
-/// If `dataset` is `Some`, returns it directly. Otherwise, opens the dataset
-/// from the table identifier proto.
+/// If `dataset` is `Some`, returns it directly. Otherwise opens the dataset from
+/// the table identifier proto, sharing one `Arc<Dataset>` per
+/// `(uri, version, etag)` across the worker process via [`PROTO_DATASET_CACHE`]
+/// (unless caching is disabled with `LANCE_PROTO_DATASET_CACHE_SIZE=0`).
 pub async fn resolve_dataset(
     dataset: Option<Arc<Dataset>>,
     table_id: Option<&pb::TableIdentifier>,
 ) -> Result<Arc<Dataset>> {
-    use lance_core::Error;
     match dataset {
         Some(ds) => Ok(ds),
         None => {
             let table_id = table_id.ok_or_else(|| {
                 Error::invalid_input_source("Missing TableIdentifier in proto".into())
             })?;
-            open_dataset_from_table_identifier(table_id).await
+            if *PROTO_DATASET_CACHE_CAPACITY == 0 {
+                // Caching disabled: preserve cold-open-per-call behavior.
+                return open_dataset_from_table_identifier(table_id).await;
+            }
+            resolve_dataset_cached(&PROTO_DATASET_CACHE, table_id).await
         }
     }
+}
+
+/// Open a dataset for `table_id` through `cache`, sharing one open per
+/// `(uri, version, etag)`. Split out so tests can inject an isolated cache.
+async fn resolve_dataset_cached(
+    cache: &moka::future::Cache<DatasetCacheKey, Arc<Dataset>>,
+    table_id: &pb::TableIdentifier,
+) -> Result<Arc<Dataset>> {
+    resolve_dataset_cached_with(cache, table_id, |tid| async move {
+        open_dataset_from_table_identifier(&tid).await
+    })
+    .await
+}
+
+/// [`resolve_dataset_cached`] with an injectable `open` for the cache-miss
+/// path. The production opener is [`open_dataset_from_table_identifier`]; tests
+/// substitute a counting opener to assert how many times a serialized proto
+/// actually re-opens the dataset (each open == one manifest read == one
+/// `lance::events dataset_events event="loading"`).
+async fn resolve_dataset_cached_with<Open, Fut>(
+    cache: &moka::future::Cache<DatasetCacheKey, Arc<Dataset>>,
+    table_id: &pb::TableIdentifier,
+    open: Open,
+) -> Result<Arc<Dataset>>
+where
+    Open: FnOnce(pb::TableIdentifier) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Arc<Dataset>>> + Send + 'static,
+{
+    let key = DatasetCacheKey {
+        uri: table_id.uri.clone(),
+        version: table_id.version,
+        etag: table_id.manifest_etag.clone(),
+    };
+    // Own the proto so the single-flight init future is self-contained.
+    let table_id = table_id.clone();
+    cache
+        .try_get_with(key, async move {
+            // Logged at the open (cache-miss) site so a heavy distributed plan
+            // is greppable without enabling `lance::events` tracing.
+            log::info!(
+                "resolve_dataset: opening dataset (cache miss) uri={} version={}",
+                table_id.uri,
+                table_id.version
+            );
+            open(table_id).await
+        })
+        .await
+        // `try_get_with` hands losing racers an `Arc<Error>`; collapse it back
+        // to an owned `Error` (full context on the winner, `Error::Cloned`
+        // otherwise).
+        .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
 }
 
 #[cfg(test)]
@@ -182,5 +288,184 @@ mod tests {
         let back = open_dataset_from_table_identifier(&id).await.unwrap();
         assert_eq!(back.uri(), dataset.uri());
         assert_eq!(back.manifest.version, dataset.manifest.version);
+    }
+
+    fn test_cache() -> moka::future::Cache<DatasetCacheKey, Arc<Dataset>> {
+        moka::future::Cache::builder().max_capacity(16).build()
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dataset_cached_returns_same_arc() {
+        let (dataset, _dir) = make_test_dataset().await;
+        let id = table_identifier_from_dataset(&dataset).await.unwrap();
+
+        let cache = test_cache();
+        let a = resolve_dataset_cached(&cache, &id).await.unwrap();
+        let b = resolve_dataset_cached(&cache, &id).await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "a cache hit must reuse the Arc<Dataset>, not re-open"
+        );
+        assert_eq!(a.manifest.version, dataset.manifest.version);
+
+        cache.run_pending_tasks().await;
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dataset_cached_single_flight() {
+        // moka's `try_get_with` must collapse concurrent first-misses on the
+        // same (uri, version, etag) into exactly one open.
+        let (dataset, _dir) = make_test_dataset().await;
+        let id = table_identifier_from_dataset(&dataset).await.unwrap();
+
+        let cache = Arc::new(test_cache());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                resolve_dataset_cached(&cache, &id).await.unwrap()
+            }));
+        }
+        let datasets: Vec<Arc<Dataset>> = futures::future::try_join_all(handles).await.unwrap();
+
+        let first = &datasets[0];
+        for ds in &datasets {
+            assert!(
+                Arc::ptr_eq(first, ds),
+                "all concurrent callers must share one opened dataset"
+            );
+        }
+        cache.run_pending_tasks().await;
+        assert_eq!(cache.entry_count(), 1, "exactly one entry cached");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dataset_cached_distinct_versions() {
+        use crate::dataset::{WriteMode, WriteParams};
+
+        let (v1, _dir) = make_test_dataset().await;
+        let uri = v1.uri().to_string();
+
+        // Append to create version 2 at the same uri.
+        let batch = gen_batch()
+            .col("x", array::step::<UInt32Type>())
+            .col("y", array::step::<UInt32Type>())
+            .into_batch_rows(lance_datagen::RowCount::from(50))
+            .unwrap();
+        let v2 = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                &uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(v2.manifest.version > v1.manifest.version);
+
+        let id1 = table_identifier_from_dataset(&v1).await.unwrap();
+        let id2 = table_identifier_from_dataset(&v2).await.unwrap();
+
+        let cache = test_cache();
+        let a = resolve_dataset_cached(&cache, &id1).await.unwrap();
+        let b = resolve_dataset_cached(&cache, &id2).await.unwrap();
+
+        // Version pinning is preserved: different versions never alias.
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(a.manifest.version, v1.manifest.version);
+        assert_eq!(b.manifest.version, v2.manifest.version);
+
+        cache.run_pending_tasks().await;
+        assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dataset_some_returns_passed_arc() {
+        // The `Some` arm bypasses the cache and returns the supplied handle.
+        let (dataset, _dir) = make_test_dataset().await;
+        let out = resolve_dataset(Some(dataset.clone()), None).await.unwrap();
+        assert!(Arc::ptr_eq(&out, &dataset));
+    }
+
+    /// Deterministic, non-Azure repro of GEN-571.
+    ///
+    /// A serialized `FilteredReadExec`/ANN proto carries no live `Arc<Dataset>`,
+    /// so each distributed plan_run deserialized on a worker calls
+    /// `DatasetBuilder::load()` from scratch — one `ObjectStore` init + manifest
+    /// read per plan_run (the `dataset_events event="loading"` the 5B run
+    /// emitted 4,813 times for a 4,800-fragment table). We count opens by
+    /// instrumenting the cache-miss opener: one opener call == one such load.
+    /// With the cache, N plan_runs collapse to a single open per
+    /// `(uri, version, etag)`.
+    #[tokio::test]
+    async fn test_resolve_dataset_opens_once_across_plan_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const PLAN_RUNS: usize = 50;
+
+        let (dataset, _dir) = make_test_dataset().await;
+        let id = table_identifier_from_dataset(&dataset).await.unwrap();
+
+        // --- Buggy baseline: no cache => one cold open per plan_run. ---
+        let cold_opens = Arc::new(AtomicUsize::new(0));
+        for _ in 0..PLAN_RUNS {
+            cold_opens.fetch_add(1, Ordering::SeqCst);
+            let ds = open_dataset_from_table_identifier(&id).await.unwrap();
+            assert_eq!(ds.manifest.version, dataset.manifest.version);
+        }
+        assert_eq!(
+            cold_opens.load(Ordering::SeqCst),
+            PLAN_RUNS,
+            "without the cache, every plan_run cold-opens (the bug)"
+        );
+
+        // --- Fixed: the cache collapses N plan_runs to a single open. ---
+        let cache = test_cache();
+        let opens = Arc::new(AtomicUsize::new(0));
+        for _ in 0..PLAN_RUNS {
+            let opens = opens.clone();
+            let ds = resolve_dataset_cached_with(&cache, &id, move |tid| async move {
+                opens.fetch_add(1, Ordering::SeqCst);
+                open_dataset_from_table_identifier(&tid).await
+            })
+            .await
+            .unwrap();
+            assert_eq!(ds.manifest.version, dataset.manifest.version);
+        }
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "with the cache, {PLAN_RUNS} plan_runs open the dataset exactly once"
+        );
+
+        // Concurrent first-misses must also collapse to one open (single-flight).
+        let cache = Arc::new(test_cache());
+        let concurrent_opens = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..PLAN_RUNS {
+            let cache = cache.clone();
+            let id = id.clone();
+            let concurrent_opens = concurrent_opens.clone();
+            handles.push(tokio::spawn(async move {
+                resolve_dataset_cached_with(&cache, &id, move |tid| async move {
+                    concurrent_opens.fetch_add(1, Ordering::SeqCst);
+                    open_dataset_from_table_identifier(&tid).await
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        futures::future::try_join_all(handles).await.unwrap();
+        assert_eq!(
+            concurrent_opens.load(Ordering::SeqCst),
+            1,
+            "concurrent plan_runs single-flight to one open"
+        );
     }
 }
