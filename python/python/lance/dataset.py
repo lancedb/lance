@@ -3801,6 +3801,17 @@ class LanceDataset(pa.dataset.Dataset):
             to the dataset. The returned metadata can be passed to
             ``merge_existing_index_segments(...)`` if grouping is needed and then
             committed with ``commit_existing_index_segments(...)``.
+
+            Vector segments support both shared and independent model scopes. If
+            the caller provides the same IVF centroids, and for IVF_PQ the same
+            PQ codebook, to each worker, the resulting segments share model
+            semantics and are suitable for workflows that physically merge
+            compatible segments. If those artifacts are omitted, each segment can
+            train its own IVF/PQ model for its assigned fragments. Such segments
+            can be committed together and are queried independently by segment
+            UUID; partition ids are interpreted within each segment's own model.
+            Keep independently trained segments as separate physical segments
+            unless the merge workflow can preserve or reconcile the model state.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
@@ -4017,6 +4028,15 @@ class LanceDataset(pa.dataset.Dataset):
         requirement:
 
         - ``fragment_ids`` must be provided
+        - Vector segments support both shared and independent model scopes. Pass
+          the same IVF centroids, and for IVF_PQ the same PQ codebook, to each
+          worker when segments need shared model semantics or physical merge
+          compatibility. If these artifacts are omitted, each segment may train
+          its own IVF/PQ model and can be committed with other segments as one
+          logical index; query execution searches each segment by UUID and
+          interprets partition ids within that segment. Keep independently
+          trained segments as separate physical segments unless the merge
+          workflow can preserve or reconcile the model state.
         - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
