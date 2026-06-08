@@ -28,6 +28,7 @@ use datafusion::{
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
         analyze::AnalyzeExec,
+        coalesce_partitions::CoalescePartitionsExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
@@ -606,9 +607,15 @@ pub fn execute_plan(
 
     let session_ctx = get_session_context(&options);
 
-    // NOTE: we are only executing the first partition here. Therefore, if
-    // the plan has more than one partition, we will be missing data.
-    assert_eq!(plan.properties().partitioning.partition_count(), 1);
+    // Coalesce to a single partition if the optimizer left more than one.
+    // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
+    // declares UnspecifiedDistribution, leaving multi-partition plans here.
+    let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
+        plan
+    } else {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    };
+
     let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
 
     let schema = stream.schema();

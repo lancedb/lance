@@ -16,6 +16,7 @@ use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -46,7 +47,9 @@ use lance_index::vector::quantizer::{
     QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
 };
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::vector::storage::VectorStore;
+use lance_index::vector::storage::{
+    QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool, VectorStore,
+};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
@@ -527,6 +530,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     index_cache: WeakLanceCache,
 
     io_parallelism: usize,
+    scratch_pool: Arc<QueryScratchPool>,
+    use_residual_scratch: bool,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -539,11 +544,28 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
             + self.storage.deep_size_of_children(context)
+            + self.scratch_pool.deep_size_of_children(context)
         // Skipping session since it is a weak ref
     }
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
+    fn ensure_search_supported(&self) -> Result<()> {
+        if Q::quantization_type() == QuantizationType::Rabit {
+            let metadata = serde_json::to_value(self.storage.metadata())?;
+            let num_bits = metadata
+                .get("num_bits")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1);
+            if num_bits > 1 {
+                return Err(Error::not_supported(
+                    "IVF_RQ num_bits>1 search is not supported until split-code query support is implemented",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn prepare_partition(
         &self,
         partition_id: usize,
@@ -585,8 +607,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     fn run_prepared_partition_search(
         distance_type: DistanceType,
+        use_residual_scratch: bool,
         prepared: PreparedPartitionSearch<S, Q>,
         metrics: &dyn MetricsCollector,
+        scratch: &mut QueryScratch,
     ) -> Result<RecordBatch> {
         let PreparedPartitionSearch {
             query,
@@ -596,11 +620,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             part_entry,
             _marker: _,
         } = prepared;
-        let query = Self::preprocess_partition_query(
-            distance_type,
+        let residual = Self::residual_for_scratch(
+            use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
-            &query,
+        )?;
+        let query = Self::preprocess_partition_query_owned(
+            distance_type,
+            use_residual_scratch,
+            partition_id,
+            partition_centroid.as_ref(),
+            query,
         )?;
         let param = (&query).into();
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
@@ -611,19 +641,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::internal(
                 "failed to downcast partition entry".to_string(),
             ))?;
-        let batch = part
-            .index
-            .search(query.key, k, param, &part.storage, pre_filter, metrics)?;
+        let batch = part.index.search_with_scratch(
+            query.key,
+            k,
+            param,
+            &part.storage,
+            pre_filter,
+            metrics,
+            residual,
+            scratch,
+        )?;
         Ok(batch)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_prepared_partition_search(
         distance_type: DistanceType,
+        use_residual_scratch: bool,
         prepared: PreparedPartitionSearch<S, Q>,
         heap: &mut BinaryHeap<OrderedNode<u64>>,
-        distance_scratch: &mut Vec<f32>,
-        u16_scratch: &mut Vec<u16>,
-        u8_scratch: &mut Vec<u8>,
+        scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let PreparedPartitionSearch {
@@ -634,11 +671,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             part_entry,
             _marker: _,
         } = prepared;
-        let query = Self::preprocess_partition_query(
-            distance_type,
+        let residual = Self::residual_for_scratch(
+            use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
-            &query,
+        )?;
+        let query = Self::preprocess_partition_query_owned(
+            distance_type,
+            use_residual_scratch,
+            partition_id,
+            partition_centroid.as_ref(),
+            query,
         )?;
         let param = (&query).into();
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
@@ -656,11 +699,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             &part.storage,
             pre_filter,
             heap,
-            distance_scratch,
-            u16_scratch,
-            u8_scratch,
+            residual,
+            scratch,
             metrics,
         )
+    }
+
+    fn residual_for_scratch<'a>(
+        use_residual_scratch: bool,
+        partition_id: usize,
+        partition_centroid: Option<&'a ArrayRef>,
+    ) -> Result<Option<QueryResidual<'a>>> {
+        if use_residual_scratch {
+            let partition_centroid = partition_centroid.ok_or_else(|| {
+                Error::index(format!("partition centroid {partition_id} does not exist"))
+            })?;
+            Ok(Some(QueryResidual::Centroid(partition_centroid.as_ref())))
+        } else {
+            Ok(None)
+        }
     }
 
     fn global_heap_to_batch(heap: BinaryHeap<OrderedNode<u64>>) -> Result<RecordBatch> {
@@ -676,21 +733,71 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     fn preprocess_partition_query(
         distance_type: DistanceType,
+        use_residual_scratch: bool,
         partition_id: usize,
         partition_centroid: Option<&ArrayRef>,
         query: &Query,
+    ) -> Result<Query> {
+        Self::preprocess_partition_query_owned(
+            distance_type,
+            use_residual_scratch,
+            partition_id,
+            partition_centroid,
+            query.clone(),
+        )
+    }
+
+    fn preprocess_partition_query_owned(
+        distance_type: DistanceType,
+        use_residual_scratch: bool,
+        partition_id: usize,
+        partition_centroid: Option<&ArrayRef>,
+        mut query: Query,
     ) -> Result<Query> {
         if Q::use_residual(distance_type) {
             let partition_centroid = partition_centroid.ok_or_else(|| {
                 Error::index(format!("partition centroid {partition_id} does not exist"))
             })?;
+            if use_residual_scratch {
+                return Ok(query);
+            }
             let residual_key = sub(&query.key, partition_centroid)?;
-            let mut part_query = query.clone();
-            part_query.key = residual_key;
-            Ok(part_query)
-        } else {
-            Ok(query.clone())
+            query.key = residual_key;
         }
+        Ok(query)
+    }
+
+    fn query_scratch_capacity(ivf: &IvfModel) -> QueryScratchCapacity {
+        if Q::quantization_type() != QuantizationType::Rabit {
+            return QueryScratchCapacity::default();
+        }
+
+        let dim = ivf.dimension();
+        let dist_table_len = dim * 4;
+        let max_partition_len = ivf.lengths.iter().copied().max().unwrap_or_default() as usize;
+
+        QueryScratchCapacity::new(
+            max_partition_len,
+            dim + dist_table_len,
+            max_partition_len,
+            dist_table_len,
+        )
+    }
+
+    fn use_residual_scratch(ivf: &IvfModel, distance_type: DistanceType) -> bool {
+        Q::quantization_type() == QuantizationType::Rabit
+            && Q::use_residual(distance_type)
+            && ivf
+                .centroids_array()
+                .map(|centroids| centroids.value_type() == DataType::Float32)
+                .unwrap_or(false)
+    }
+
+    fn query_scratch_pool(ivf: &IvfModel) -> QueryScratchPool {
+        QueryScratchPool::with_capacity(
+            get_num_compute_intensive_cpus(),
+            Self::query_scratch_capacity(ivf),
+        )
     }
 
     /// Create a new IVF index.
@@ -796,10 +903,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             )
             .await;
 
+        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf));
+        let use_residual_scratch = Self::use_residual_scratch(&ivf, distance_type);
+
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
             uuid,
+            scratch_pool,
+            use_residual_scratch,
             ivf,
             reader: index_reader,
             storage,
@@ -825,10 +937,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
         io_parallelism: usize,
     ) -> Self {
+        let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf));
+        let use_residual_scratch = Self::use_residual_scratch(&ivf, distance_type);
         Self {
             uri,
             index_path,
             uuid,
+            scratch_pool,
+            use_residual_scratch,
             ivf,
             reader,
             storage,
@@ -924,6 +1040,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         Self::preprocess_partition_query(
             self.distance_type,
+            self.use_residual_scratch,
             partition_id,
             self.ivf.centroid(partition_id).as_ref(),
             query,
@@ -1104,10 +1221,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        self.ensure_search_supported()?;
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         pre_filter.wait_for_ready().await?;
 
+        let residual_centroid = if self.use_residual_scratch {
+            Some(self.ivf.centroid(partition_id).ok_or_else(|| {
+                Error::index(format!("partition centroid {partition_id} does not exist"))
+            })?)
+        } else {
+            None
+        };
         let query = self.preprocess_query(partition_id, query)?;
+        let scratch_pool = self.scratch_pool.clone();
         let (batch, local_metrics) = spawn_cpu(move || {
             let param = (&query).into();
             let refine_factor = query.refine_factor.unwrap_or(1) as usize;
@@ -1119,14 +1245,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 .ok_or(Error::internal(
                     "failed to downcast partition entry".to_string(),
                 ))?;
-            let batch = part.index.search(
-                query.key,
-                k,
-                param,
-                &part.storage,
-                pre_filter,
-                &local_metrics,
-            )?;
+            let residual = residual_centroid.as_deref().map(QueryResidual::Centroid);
+            let batch = scratch_pool.with_scratch(|scratch| {
+                part.index.search_with_scratch(
+                    query.key,
+                    k,
+                    param,
+                    &part.storage,
+                    pre_filter,
+                    &local_metrics,
+                    residual,
+                    scratch,
+                )
+            })?;
             Result::Ok((batch, local_metrics))
         })
         .await?;
@@ -1143,6 +1274,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<PreparedPartitionSearchHandle> {
+        self.ensure_search_supported()?;
         Ok(Box::new(
             self.prepare_partition(partition_id, query, pre_filter, metrics)
                 .await?,
@@ -1154,10 +1286,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         prepared: PreparedPartitionSearchHandle,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        self.ensure_search_supported()?;
         let prepared = prepared
             .downcast::<PreparedPartitionSearch<S, Q>>()
             .map_err(|_| Error::internal("failed to downcast prepared partition search"))?;
-        Self::run_prepared_partition_search(self.distance_type, *prepared, metrics)
+        self.scratch_pool.with_scratch(|scratch| {
+            Self::run_prepared_partition_search(
+                self.distance_type,
+                self.use_residual_scratch,
+                *prepared,
+                metrics,
+                scratch,
+            )
+        })
     }
 
     fn supports_prepared_partition_search(&self) -> bool {
@@ -1184,6 +1325,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         control: Option<Arc<dyn PartitionSearchControl>>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
+        self.ensure_search_supported()?;
         if partitions.len() != q_c_dists.len() {
             return Err(Error::invalid_input(format!(
                 "partition count {} does not match centroid distance count {}",
@@ -1229,24 +1371,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                 .await?;
 
             let distance_type = self.distance_type;
+            let use_residual_scratch = self.use_residual_scratch;
             let search_metrics = metrics.clone();
+            let scratch_pool = self.scratch_pool.clone();
             let batch = spawn_cpu(move || -> DataFusionResult<RecordBatch> {
                 let mut heap = BinaryHeap::with_capacity(heap_capacity);
-                let mut distance_scratch = Vec::new();
-                let mut u16_scratch = Vec::new();
-                let mut u8_scratch = Vec::new();
-                for prepared in prepared {
-                    Self::accumulate_prepared_partition_search(
-                        distance_type,
-                        prepared,
-                        &mut heap,
-                        &mut distance_scratch,
-                        &mut u16_scratch,
-                        &mut u8_scratch,
-                        search_metrics.as_ref(),
-                    )
-                    .map_err(DataFusionError::from)?;
-                }
+                scratch_pool.with_scratch(|scratch| -> DataFusionResult<()> {
+                    for prepared in prepared {
+                        Self::accumulate_prepared_partition_search(
+                            distance_type,
+                            use_residual_scratch,
+                            prepared,
+                            &mut heap,
+                            scratch,
+                            search_metrics.as_ref(),
+                        )
+                        .map_err(DataFusionError::from)?;
+                    }
+                    Ok(())
+                })?;
                 Self::global_heap_to_batch(heap).map_err(DataFusionError::from)
             })
             .await?;
@@ -1295,50 +1438,58 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         });
 
         let distance_type = self.distance_type;
+        let use_residual_scratch = self.use_residual_scratch;
         let search_metrics = metrics.clone();
         let batch_tx_for_search = batch_tx.clone();
         let search_control = control.clone();
+        let scratch_pool = self.scratch_pool.clone();
         tokio::spawn(async move {
             let search_result = spawn_cpu(move || -> DataFusionResult<()> {
-                while let Some(prepared) = prepared_rx.blocking_recv() {
-                    let prepared = match prepared {
-                        Ok(prepared) => prepared,
-                        Err(err) => {
-                            let _ =
-                                batch_tx_for_search.blocking_send(Err(DataFusionError::from(err)));
+                scratch_pool.with_scratch(|scratch| {
+                    while let Some(prepared) = prepared_rx.blocking_recv() {
+                        let prepared = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                let _ = batch_tx_for_search
+                                    .blocking_send(Err(DataFusionError::from(err)));
+                                return Ok(());
+                            }
+                        };
+
+                        if search_control
+                            .as_ref()
+                            .is_some_and(|control| control.should_stop())
+                        {
                             return Ok(());
                         }
-                    };
 
-                    if search_control
-                        .as_ref()
-                        .is_some_and(|control| control.should_stop())
-                    {
-                        return Ok(());
-                    }
-
-                    let batch = Self::run_prepared_partition_search(
-                        distance_type,
-                        prepared,
-                        search_metrics.as_ref(),
-                    )
-                    .map_err(DataFusionError::from);
-                    match batch {
-                        Ok(batch) => {
-                            if let Some(control) = search_control.as_ref() {
-                                control.record_batch(&batch);
+                        let batch = {
+                            Self::run_prepared_partition_search(
+                                distance_type,
+                                use_residual_scratch,
+                                prepared,
+                                search_metrics.as_ref(),
+                                scratch,
+                            )
+                        }
+                        .map_err(DataFusionError::from);
+                        match batch {
+                            Ok(batch) => {
+                                if let Some(control) = search_control.as_ref() {
+                                    control.record_batch(&batch);
+                                }
+                                if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
+                                    return Ok(());
+                                }
                             }
-                            if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
+                            Err(err) => {
+                                let _ = batch_tx_for_search.blocking_send(Err(err));
                                 return Ok(());
                             }
                         }
-                        Err(err) => {
-                            let _ = batch_tx_for_search.blocking_send(Err(err));
-                            return Ok(());
-                        }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })
             })
             .await;
 
@@ -1544,7 +1695,9 @@ mod tests {
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
-        RQBuildParams, RQRotationType, storage::RabitQuantizationMetadata,
+        RQBuildParams, RQRotationType,
+        storage::{RABIT_EX_CODE_COLUMN, RabitQuantizationMetadata},
+        transform::EX_SCALE_FACTORS_COLUMN,
     };
     use lance_index::vector::storage::VectorStore;
 
@@ -1563,13 +1716,14 @@ mod tests {
     };
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{ROW_ID, Result};
+    use lance_core::{Error, ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
     use lance_index::IndexType;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::PQBuildParams;
@@ -1582,7 +1736,6 @@ mod tests {
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
-    use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -1659,11 +1812,11 @@ mod tests {
         vectors
     }
 
-    async fn get_rq_metadata(
+    async fn open_rq_aux_reader(
         dataset: &Dataset,
         scheduler: Arc<ScanScheduler>,
         index_uuid: &str,
-    ) -> RabitQuantizationMetadata {
+    ) -> FileReader {
         let index_path = dataset
             .indices_dir()
             .join(index_uuid)
@@ -1672,7 +1825,7 @@ mod tests {
             .open_file(&index_path, &CachedFileSize::unknown())
             .await
             .unwrap();
-        let reader = FileReader::try_open(
+        FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
@@ -1680,7 +1833,15 @@ mod tests {
             FileReaderOptions::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn get_rq_metadata(
+        dataset: &Dataset,
+        scheduler: Arc<ScanScheduler>,
+        index_uuid: &str,
+    ) -> RabitQuantizationMetadata {
+        let reader = open_rq_aux_reader(dataset, scheduler, index_uuid).await;
         let metadata = reader.schema().metadata.get(STORAGE_METADATA_KEY).unwrap();
         let metadata_entries: Vec<String> = serde_json::from_str(metadata).unwrap();
         serde_json::from_str(&metadata_entries[0]).unwrap()
@@ -2631,16 +2792,9 @@ mod tests {
     async fn build_distributed_segments(
         dataset: &mut Dataset,
         segments: Vec<IndexMetadata>,
-        index_type: IndexType,
+        _index_type: IndexType,
         index_name: &str,
-    ) -> Vec<crate::index::api::IndexSegment> {
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(index_type)
-            .with_segments(segments)
-            .build_all()
-            .await
-            .unwrap();
+    ) -> Vec<IndexMetadata> {
         dataset
             .commit_existing_index_segments(index_name, "vector", segments.clone())
             .await
@@ -2863,7 +3017,7 @@ mod tests {
             let segment_index = ds_split
                 .indices_dir()
                 .clone()
-                .join(segment.uuid().to_string())
+                .join(segment.uuid.to_string())
                 .join(crate::index::INDEX_FILE_NAME);
             assert!(
                 ds_split
@@ -3050,7 +3204,14 @@ mod tests {
         assert_eq!(grouped_segments.len(), expected_fragment_coverage.len());
         let mut actual_fragment_coverage = grouped_segments
             .iter()
-            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
+            .map(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .expect("segment should have fragment coverage")
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         actual_fragment_coverage.sort();
         assert_eq!(
@@ -3179,14 +3340,6 @@ mod tests {
             segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(IndexType::IvfHnswFlat)
-            .with_segments(segments)
-            .build_all()
-            .await
-            .unwrap();
-
         dataset
             .commit_existing_index_segments("vector_idx", "vector", segments)
             .await
@@ -3256,15 +3409,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let merged_segment = dataset
-            .create_index_segment_builder()
-            .with_index_type(params.index_type())
-            .with_segments(vec![merged_segment])
-            .build_all()
-            .await
-            .unwrap();
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", merged_segment)
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
             .await
             .unwrap();
 
@@ -3850,6 +3996,54 @@ mod tests {
         test_remap(params.clone(), nlist, recall_requirement).await;
     }
 
+    #[tokio::test]
+    #[ignore = "IVF_RQ num_bits>1 creation is gated until split-code search support is implemented"]
+    async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_gates_search() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let ivf_params = IvfBuildParams::new(4);
+        let rq_params = RQBuildParams::with_rotation_type(9, RQRotationType::Fast);
+        let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let obj_store = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+        let index_uuid = indices[0].uuid.to_string();
+        let rq_meta = get_rq_metadata(&dataset, scheduler.clone(), &index_uuid).await;
+        assert_eq!(rq_meta.num_bits, 9);
+
+        let reader = open_rq_aux_reader(&dataset, scheduler, &index_uuid).await;
+        let schema = reader.schema();
+        let ex_field = schema.field(RABIT_EX_CODE_COLUMN).unwrap();
+        let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
+            panic!("RQ ex-code field should be FixedSizeList");
+        };
+        assert_eq!(ex_code_bytes, 32);
+        assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
+
+        let query = vectors.value(0);
+        let err = dataset
+            .scan()
+            .nearest("vector", query.as_primitive::<Float32Type>(), 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Execution { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("num_bits>1 search is not supported"),
+            "{err}"
+        );
+    }
+
     #[rstest]
     #[case::fast(RQRotationType::Fast)]
     #[case::matrix(RQRotationType::Matrix)]
@@ -4318,17 +4512,41 @@ mod tests {
         // don't verify the number of results and row ids for hamming distance,
         // because there are many vectors with the same distance
         if dist_type != DistanceType::Hamming {
-            assert_eq!(left_res.num_rows(), part_idx);
-            assert_eq!(right_res.num_rows(), k - part_idx);
+            // Tolerate a single tied pair at the partition boundary. When
+            // dists[part_idx - 1] == part_dist, the strict-less left filter
+            // excludes both tied vectors and the inclusive right filter
+            // includes both, shifting one row from left to right and dropping
+            // row_ids[k - 1] off right_res's limit. Observed for Dot distance
+            // on ARM where SIMD FMA yields tied float32 dot products that x86
+            // does not. The distance-value assertions below still cover
+            // partition correctness in both cases.
+            let boundary_tie = part_idx > 0 && dists[part_idx - 1] == part_dist;
             let left_row_ids = left_res[ROW_ID].as_primitive::<UInt64Type>().values();
             let right_row_ids = right_res[ROW_ID].as_primitive::<UInt64Type>().values();
-            row_ids.iter().enumerate().for_each(|(i, id)| {
-                if i < part_idx {
-                    assert_eq!(left_row_ids[i], *id,);
-                } else {
-                    assert_eq!(right_row_ids[i - part_idx], *id,);
+            if boundary_tie {
+                assert_eq!(left_res.num_rows(), part_idx - 1);
+                for i in 0..(part_idx - 1) {
+                    assert_eq!(left_row_ids[i], row_ids[i]);
                 }
-            });
+                assert_eq!(right_res.num_rows(), k - part_idx);
+                // right_row_ids[0..2] are the two tied vectors in tiebreaker
+                // order; their identity is not pinned. right_row_ids[i] for
+                // i >= 2 aligns with row_ids[part_idx + i - 1] because the
+                // tie shifts one vector from left to right.
+                for i in 2..(k - part_idx) {
+                    assert_eq!(right_row_ids[i], row_ids[part_idx + i - 1]);
+                }
+            } else {
+                assert_eq!(left_res.num_rows(), part_idx);
+                assert_eq!(right_res.num_rows(), k - part_idx);
+                row_ids.iter().enumerate().for_each(|(i, id)| {
+                    if i < part_idx {
+                        assert_eq!(left_row_ids[i], *id,);
+                    } else {
+                        assert_eq!(right_row_ids[i - part_idx], *id,);
+                    }
+                });
+            }
         }
         let left_dists = left_res[DIST_COL].as_primitive::<Float32Type>().values();
         let right_dists = right_res[DIST_COL].as_primitive::<Float32Type>().values();
@@ -4521,7 +4739,10 @@ mod tests {
             STORAGE_METADATA_KEY.to_owned(),
             serde_json::to_string(&vec![pq_metadata])?,
         );
-        writer.finish_with_metadata(metadata).await?;
+        for (key, value) in metadata {
+            writer.add_schema_metadata(key, value);
+        }
+        writer.finish().await?;
 
         // Build new IndexMetadata with the new UUID and file sizes.
         let new_files =

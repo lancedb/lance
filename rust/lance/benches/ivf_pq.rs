@@ -20,7 +20,7 @@ use lance_index::IndexType;
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
     let schema = Arc::new(Schema::new(vec![Field::new(

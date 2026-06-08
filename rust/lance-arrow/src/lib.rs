@@ -56,18 +56,7 @@ pub const BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY: &str =
 type Result<T> = std::result::Result<T, ArrowError>;
 
 pub trait DataTypeExt {
-    /// Returns true if the data type is binary-like, such as (Large)Utf8 and (Large)Binary.
-    ///
-    /// ```
-    /// use lance_arrow::*;
-    /// use arrow_schema::DataType;
-    ///
-    /// assert!(DataType::Utf8.is_binary_like());
-    /// assert!(DataType::Binary.is_binary_like());
-    /// assert!(DataType::LargeUtf8.is_binary_like());
-    /// assert!(DataType::LargeBinary.is_binary_like());
-    /// assert!(!DataType::Int32.is_binary_like());
-    /// ```
+    /// Returns true if the data type is binary-like, such as Utf8, Binary, or the large and/or view variants.
     fn is_binary_like(&self) -> bool;
 
     /// Returns true if the data type is a struct.
@@ -94,7 +83,10 @@ pub trait DataTypeExt {
 impl DataTypeExt for DataType {
     fn is_binary_like(&self) -> bool {
         use DataType::*;
-        matches!(self, Utf8 | Binary | LargeUtf8 | LargeBinary)
+        matches!(
+            self,
+            Utf8 | Binary | LargeUtf8 | LargeBinary | Utf8View | BinaryView
+        )
     }
 
     fn is_struct(&self) -> bool {

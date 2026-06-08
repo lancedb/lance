@@ -7,7 +7,9 @@ use std::iter::repeat_n;
 
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{FixedSizeListArray, UInt8Array};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::distance::*;
@@ -16,7 +18,7 @@ use lance_testing::datagen::generate_random_array_with_seed;
 use rand::{Rng, SeedableRng, prelude::StdRng};
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 const DIM: usize = 128;
 const PQ: usize = DIM / 8;

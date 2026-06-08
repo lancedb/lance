@@ -49,7 +49,6 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::noop_progress;
-use lance_index::scalar::btree::BTreeParameters;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -369,11 +368,13 @@ impl BlockingDataset {
         max_retries: u32,
         skip_auto_cleanup: bool,
         commit_handler: Option<Arc<dyn CommitHandler>>,
+        commit_timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
             .with_detached(detached)
-            .enable_v2_manifest_paths(enable_v2_manifest_paths);
+            .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_timeout(commit_timeout);
         if let Some(use_stable) = use_stable_row_ids {
             builder = builder.use_stable_row_ids(use_stable);
         }
@@ -973,6 +974,7 @@ fn inner_create_index<'local>(
         | IndexType::NGram
         | IndexType::ZoneMap
         | IndexType::BloomFilter
+        | IndexType::FMIndex
         | IndexType::RTree => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
@@ -980,7 +982,7 @@ fn inner_create_index<'local>(
                 index_type: index_type_str,
                 params: params_opt.clone(),
             };
-            skip_commit = skip_commit || should_skip_commit(index_type, &params_opt)?;
+            skip_commit = skip_commit || (index_type == IndexType::BTree && batch_reader.is_some());
             Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
@@ -1060,20 +1062,6 @@ fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> R
     Ok(())
 }
 
-fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
-    match index_type {
-        IndexType::BTree => {
-            // Should defer the commit if we are building range-based BTree index
-            if let Some(params) = params_opt {
-                let btree_parameters = serde_json::from_str::<BTreeParameters>(params)?;
-                return Ok(btree_parameters.range_id.is_some());
-            }
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_innerMergeIndexMetadata<'local>(
     mut env: JNIEnv<'local>,
@@ -1117,61 +1105,6 @@ fn inner_merge_index_metadata(
             .await
     })?;
     Ok(())
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_nativeBuildIndexSegments<'local>(
-    mut env: JNIEnv<'local>,
-    java_dataset: JObject,
-    java_segments: JObject,
-    index_type: jint,
-    target_segment_bytes_jobj: JObject,
-) -> JObject<'local> {
-    ok_or_throw!(
-        env,
-        inner_build_index_segments(
-            &mut env,
-            java_dataset,
-            java_segments,
-            index_type,
-            target_segment_bytes_jobj
-        )
-    )
-}
-
-fn inner_build_index_segments<'local>(
-    env: &mut JNIEnv<'local>,
-    java_dataset: JObject,
-    java_segments: JObject,
-    index_type: jint,
-    target_segment_bytes_jobj: JObject,
-) -> Result<JObject<'local>> {
-    let segments = import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
-    let index_type = IndexType::try_from(index_type)?;
-    let target_segment_bytes = env
-        .get_long_opt(&target_segment_bytes_jobj)?
-        .map(|v| v as u64);
-    let template = segment_template(&segments)?;
-
-    let built_segments = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let mut builder = dataset_guard
-            .inner
-            .create_index_segment_builder()
-            .with_index_type(index_type)
-            .with_segments(segments);
-        if let Some(target_segment_bytes) = target_segment_bytes {
-            builder = builder.with_target_segment_bytes(target_segment_bytes);
-        }
-        RT.block_on(builder.build_all())?
-    };
-
-    let built_metadata = built_segments
-        .into_iter()
-        .map(|segment| index_segment_to_metadata(&template, segment))
-        .collect::<Vec<_>>();
-    export_vec(env, &built_metadata)
 }
 
 #[unsafe(no_mangle)]
@@ -1250,44 +1183,6 @@ fn inner_commit_existing_index_segments<'local>(
     export_vec(env, &committed)
 }
 
-struct SegmentTemplate {
-    name: String,
-    fields: Vec<i32>,
-    dataset_version: u64,
-}
-
-fn segment_template(segments: &[IndexMetadata]) -> Result<SegmentTemplate> {
-    let first = segments
-        .first()
-        .ok_or_else(|| Error::input_error("segments cannot be empty".to_string()))?;
-    for segment in &segments[1..] {
-        if segment.name != first.name {
-            return Err(Error::input_error(format!(
-                "All segments must share the same index name, got '{}' and '{}'",
-                first.name, segment.name
-            )));
-        }
-        if segment.fields != first.fields {
-            return Err(Error::input_error(format!(
-                "All segments must target the same field ids, got {:?} and {:?}",
-                first.fields, segment.fields
-            )));
-        }
-        if segment.dataset_version != first.dataset_version {
-            return Err(Error::input_error(format!(
-                "All segments must share the same dataset version, got {} and {}",
-                first.dataset_version, segment.dataset_version
-            )));
-        }
-    }
-
-    Ok(SegmentTemplate {
-        name: first.name.clone(),
-        fields: first.fields.clone(),
-        dataset_version: first.dataset_version,
-    })
-}
-
 fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
     let fragment_bitmap = metadata.fragment_bitmap.clone().ok_or_else(|| {
         Error::input_error(format!(
@@ -1308,22 +1203,6 @@ fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
         index_details,
         metadata.index_version,
     ))
-}
-
-fn index_segment_to_metadata(template: &SegmentTemplate, segment: IndexSegment) -> IndexMetadata {
-    let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-    IndexMetadata {
-        uuid,
-        fields: template.fields.clone(),
-        name: template.name.clone(),
-        dataset_version: template.dataset_version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(index_details),
-        index_version,
-        created_at: Some(Utc::now()),
-        base_id: None,
-        files: None,
-    }
 }
 
 #[unsafe(no_mangle)]

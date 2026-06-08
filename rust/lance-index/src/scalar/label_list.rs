@@ -27,7 +27,7 @@ use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
-use super::{AnyQuery, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
+use super::{AnyQuery, IndexFile, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
@@ -228,7 +228,7 @@ impl ScalarIndex for LabelListIndex {
                     .copied()
                     .unwrap_or(Some(addr_as_u64))
             }));
-        write_label_list_bitmap_index(
+        let file = write_label_list_bitmap_index(
             remapped_state,
             dest_store,
             self.values_index.value_type(),
@@ -240,7 +240,7 @@ impl ScalarIndex for LabelListIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -262,13 +262,15 @@ impl ScalarIndex for LabelListIndex {
         if !new_nulls.is_empty() {
             merged_nulls |= &new_nulls;
         }
-        write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls).await?;
+        let file =
+            write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls)
+                .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -475,7 +477,7 @@ async fn write_label_list_bitmap_index(
     store: &dyn IndexStore,
     value_type: &DataType,
     list_nulls: &RowAddrTreeMap,
-) -> Result<()> {
+) -> Result<IndexFile> {
     BitmapIndexPlugin::write_bitmap_index_with_extras(
         state,
         store,
@@ -524,7 +526,7 @@ impl LabelListIndexState {
     ) -> Result<Arc<LabelListIndex>> {
         let bitmap = self
             .bitmap_state
-            .into_bitmap_index(store, index_cache, frag_reuse_index)?;
+            .to_bitmap_index(store, index_cache, frag_reuse_index)?;
         Ok(Arc::new(LabelListIndex::new(bitmap, self.list_nulls)))
     }
 }
@@ -672,12 +674,13 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         let (state, value_type) =
             BitmapIndexPlugin::build_bitmap_index_state(data, HashMap::new()).await?;
         let list_nulls = list_nulls.lock().unwrap().clone();
-        write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
+        let file =
+            write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 

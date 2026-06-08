@@ -18,7 +18,7 @@ mod fixture_test;
 
 use self::{ivf::*, pq::PQIndex};
 use arrow_schema::{DataType, Schema};
-use builder::IvfIndexBuilder;
+use builder::{IvfIndexBuilder, VectorIndexBuildSummary};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
@@ -29,7 +29,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::{RQBuildParams, RQRotationType};
+use lance_index::vector::bq::{RQBuildParams, RQRotationType, validate_supported_rq_num_bits};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
@@ -52,9 +52,10 @@ use lance_index::vector::{
     sq::{ScalarQuantizer, builder::SQBuildParams},
 };
 use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType};
+use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata};
 use serde::Serialize;
 use tracing::instrument;
 use utils::get_vector_type;
@@ -543,8 +544,21 @@ async fn prepare_vector_segment_build(
         )));
     }
 
-    let num_rows = dataset.count_rows(None).await?;
     let index_type = params.index_type();
+    if index_type == IndexType::IvfRq {
+        let Some(StageParams::RQ(rq_params)) = stages.last() else {
+            return Err(Error::index(format!(
+                "{mode}: invalid stages: {:?}",
+                stages
+            )));
+        };
+        // Multi-bit RQ quantization/storage internals are kept available for
+        // split-code preparation, but public index creation stays binary-only
+        // until multi-bit search support lands.
+        validate_supported_rq_num_bits(rq_params.num_bits)?;
+    }
+
+    let num_rows = dataset.count_rows(None).await?;
     let num_partitions = ivf_params0.num_partitions.unwrap_or_else(|| {
         recommended_num_partitions(
             num_rows,
@@ -581,7 +595,7 @@ pub(crate) async fn build_distributed_vector_index(
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<Uuid> {
+) -> Result<(Uuid, Vec<IndexFile>)> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -647,7 +661,7 @@ pub(crate) async fn build_distributed_vector_index(
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 let ivf_model = make_ivf_model();
 
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     filtered_dataset,
                     column.to_owned(),
                     index_dir.clone(),
@@ -663,11 +677,12 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                return Ok((segment_uuid, summary.files));
             }
             DataType::UInt8 => {
                 let ivf_model = make_ivf_model();
 
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     filtered_dataset,
                     column.to_owned(),
                     index_dir.clone(),
@@ -683,6 +698,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                return Ok((segment_uuid, summary.files));
             }
             _ => {
                 return Err(Error::index(format!(
@@ -711,7 +727,7 @@ pub(crate) async fn build_distributed_vector_index(
                     let ivf_model = make_ivf_model();
                     let global_pq = make_global_pq(pq_params)?;
 
-                    IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
+                    let summary = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -731,6 +747,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
             }
         }
@@ -742,7 +759,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -757,6 +774,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfHnswFlat => {
@@ -769,7 +787,7 @@ pub(crate) async fn build_distributed_vector_index(
 
             match element_type {
                 DataType::UInt8 => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -784,9 +802,10 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
                 _ => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                         filtered_dataset,
                         column.to_owned(),
                         index_dir.clone(),
@@ -801,6 +820,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok((segment_uuid, summary.files));
                 }
             }
         }
@@ -822,7 +842,7 @@ pub(crate) async fn build_distributed_vector_index(
             let ivf_model = make_ivf_model();
             let global_pq = make_global_pq(pq_params)?;
 
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -842,6 +862,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfHnswSq => {
@@ -857,7 +878,7 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -872,6 +893,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         IndexType::IvfRq => {
@@ -884,7 +906,7 @@ pub(crate) async fn build_distributed_vector_index(
 
             let ivf_model = make_ivf_model();
 
-            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
                 index_dir.clone(),
@@ -903,6 +925,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok((segment_uuid, summary.files));
         }
 
         _ => {
@@ -911,9 +934,7 @@ pub(crate) async fn build_distributed_vector_index(
                 index_type
             )));
         }
-    };
-
-    Ok(segment_uuid)
+    }
 }
 
 /// Build a Vector Index
@@ -926,7 +947,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -941,7 +962,7 @@ pub(crate) async fn build_vector_index(
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
                     dataset.indices_dir().clone().join(uuid),
@@ -955,9 +976,10 @@ pub(crate) async fn build_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                return Ok(summary.files);
             }
             DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),
                     dataset.indices_dir().clone().join(uuid),
@@ -971,6 +993,7 @@ pub(crate) async fn build_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+                return Ok(summary.files);
             }
             _ => {
                 return Err(Error::index(format!(
@@ -990,7 +1013,7 @@ pub(crate) async fn build_vector_index(
 
             match params.version {
                 IndexFileVersion::Legacy => {
-                    build_ivf_pq_index(
+                    let files = build_ivf_pq_index(
                         dataset,
                         column,
                         name,
@@ -1001,6 +1024,7 @@ pub(crate) async fn build_vector_index(
                         progress.clone(),
                     )
                     .await?;
+                    return Ok(files);
                 }
                 IndexFileVersion::V3 => {
                     let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
@@ -1015,11 +1039,12 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?;
 
-                    builder
+                    let summary = builder
                         .with_transpose(!params.skip_transpose)
                         .with_progress(progress.clone())
                         .build()
                         .await?;
+                    return Ok(summary.files);
                 }
             }
         }
@@ -1031,7 +1056,7 @@ pub(crate) async fn build_vector_index(
                 )));
             };
 
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().clone().join(uuid),
@@ -1045,6 +1070,7 @@ pub(crate) async fn build_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary.files);
         }
         IndexType::IvfRq => {
             let StageParams::RQ(rq_params) = &stages[1] else {
@@ -1066,11 +1092,12 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?;
 
-            builder
+            let summary = builder
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+            return Ok(summary.files);
         }
         IndexType::IvfHnswFlat => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1081,7 +1108,7 @@ pub(crate) async fn build_vector_index(
             };
             match element_type {
                 DataType::UInt8 => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().clone().join(uuid),
@@ -1095,9 +1122,10 @@ pub(crate) async fn build_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary.files);
                 }
                 _ => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().clone().join(uuid),
@@ -1111,6 +1139,7 @@ pub(crate) async fn build_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary.files);
                 }
             }
         }
@@ -1127,7 +1156,7 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().clone().join(uuid),
@@ -1141,6 +1170,7 @@ pub(crate) async fn build_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary.files);
         }
         IndexType::IvfHnswSq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -1155,7 +1185,7 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
+            let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 dataset.clone(),
                 column.to_owned(),
                 dataset.indices_dir().clone().join(uuid),
@@ -1169,6 +1199,7 @@ pub(crate) async fn build_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary.files);
         }
         _ => {
             return Err(Error::index(format!(
@@ -1176,8 +1207,7 @@ pub(crate) async fn build_vector_index(
                 index_type
             )));
         }
-    };
-    Ok(())
+    }
 }
 
 /// Build a Vector Index incrementally using an existing index's IVF model and quantizer
@@ -1191,7 +1221,7 @@ pub(crate) async fn build_vector_index_incremental(
     existing_index: Arc<dyn VectorIndex>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<VectorIndexBuildSummary> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -1251,7 +1281,7 @@ pub(crate) async fn build_vector_index_incremental(
     match (sub_index_type, quantization_type) {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
-            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1266,9 +1296,10 @@ pub(crate) async fn build_vector_index_incremental(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary);
         }
         (SubIndexType::Flat, QuantizationType::FlatBin) => {
-            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1283,6 +1314,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary);
         }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
@@ -1296,17 +1328,18 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?;
-            builder
+            let summary = builder
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+            return Ok(summary);
         }
         // IVF_SQ
         (SubIndexType::Flat, QuantizationType::Scalar) => {
-            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+            let summary = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
                 dataset.clone(),
                 column.to_owned(),
                 index_dir,
@@ -1321,6 +1354,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_progress(progress.clone())
             .build()
             .await?;
+            return Ok(summary);
         }
         // IVF_RQ
         (SubIndexType::Flat, QuantizationType::Rabit) => {
@@ -1334,13 +1368,14 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?;
-            builder
+            let summary = builder
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
                 .build()
                 .await?;
+            return Ok(summary);
         }
         // IVF_HNSW variants
         (SubIndexType::Hnsw, quantization_type) => {
@@ -1353,7 +1388,7 @@ pub(crate) async fn build_vector_index_incremental(
 
             match quantization_type {
                 QuantizationType::Flat => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1368,9 +1403,10 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::FlatBin => {
-                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1385,9 +1421,10 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Product => {
-                    IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1402,9 +1439,10 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Scalar => {
-                    IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
+                    let summary = IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_incremental(
                         dataset.clone(),
                         column.to_owned(),
                         index_dir,
@@ -1419,6 +1457,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
+                    return Ok(summary);
                 }
                 QuantizationType::Rabit => {
                     return Err(Error::index(
@@ -1428,8 +1467,6 @@ pub(crate) async fn build_vector_index_incremental(
             }
         }
     }
-
-    Ok(())
 }
 
 /// Build an empty vector index without training on data
@@ -1440,7 +1477,7 @@ pub(crate) async fn build_empty_vector_index(
     name: &str,
     _uuid: &str,
     _params: &VectorIndexParams,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed
     Err(Error::not_supported_source(
@@ -1461,13 +1498,13 @@ pub(crate) async fn remap_vector_index(
     new_uuid: &Uuid,
     old_metadata: &IndexMetadata,
     mapping: &HashMap<u64, Option<u64>>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     let old_index = dataset
         .open_vector_index(column, &old_uuid.to_string(), &NoOpMetricsCollector)
         .await?;
 
     if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
-        remap_index_file(
+        let file = remap_index_file(
             dataset.as_ref(),
             &old_uuid.to_string(),
             &new_uuid.to_string(),
@@ -1482,9 +1519,10 @@ pub(crate) async fn remap_vector_index(
             vec![],
         )
         .await?;
+        Ok(vec![file])
     } else {
         // it's v3 index
-        remap_index_file_v3(
+        let files = remap_index_file_v3(
             dataset.as_ref(),
             &new_uuid.to_string(),
             old_index,
@@ -1492,9 +1530,8 @@ pub(crate) async fn remap_vector_index(
             column.to_string(),
         )
         .await?;
+        Ok(files)
     }
-
-    Ok(())
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
@@ -1575,6 +1612,24 @@ pub(crate) async fn open_vector_index(
     Ok(idx)
 }
 
+/// Open an index file without a HEAD request when the size is already known.
+///
+/// `file_sizes` maps a file name to its size in bytes (see
+/// `IndexMetadata::file_size_map`). If `file_name` is missing, which is the case
+/// for older indices that did not record sizes, this falls back to `open`, which
+/// issues a HEAD to learn the size.
+pub(crate) async fn open_index_file(
+    object_store: &ObjectStore,
+    path: &Path,
+    file_name: &str,
+    file_sizes: &HashMap<String, u64>,
+) -> Result<Box<dyn Reader>> {
+    match file_sizes.get(file_name) {
+        Some(&size) => object_store.open_with_size(path, size as usize).await,
+        None => object_store.open(path).await,
+    }
+}
+
 #[instrument(level = "debug", skip(dataset, reader))]
 pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
@@ -1599,11 +1654,18 @@ pub(crate) async fn open_vector_index_v2(
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
     let index_dir = dataset.indice_files_dir(&index_meta)?;
     let object_store = dataset.object_store_for_index(&index_meta).await?;
+    let file_sizes = index_meta.file_size_map();
 
     let index: Arc<dyn VectorIndex> = match index_metadata.index_type.as_str() {
         "IVF_HNSW_PQ" => {
             let aux_path = index_dir.clone().join(uuid).join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = object_store.open(&aux_path).await?;
+            let aux_reader = open_index_file(
+                object_store.as_ref(),
+                &aux_path,
+                INDEX_AUXILIARY_FILE_NAME,
+                &file_sizes,
+            )
+            .await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions { use_residual: true };
@@ -1630,7 +1692,13 @@ pub(crate) async fn open_vector_index_v2(
 
         "IVF_HNSW_SQ" => {
             let aux_path = index_dir.clone().join(uuid).join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = object_store.open(&aux_path).await?;
+            let aux_reader = open_index_file(
+                object_store.as_ref(),
+                &aux_path,
+                INDEX_AUXILIARY_FILE_NAME,
+                &file_sizes,
+            )
+            .await?;
 
             let ivf_data = IvfModel::load(&reader).await?;
             let options = HNSWIndexOptions {
@@ -1777,7 +1845,7 @@ pub async fn initialize_vector_index(
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?;
 
-    build_vector_index_incremental(
+    let summary = build_vector_index_incremental(
         target_dataset,
         column_name,
         &new_uuid.to_string(),
@@ -1787,10 +1855,6 @@ pub async fn initialize_vector_index(
         noop_progress(),
     )
     .await?;
-
-    // Capture file sizes for the new vector index
-    let index_dir = target_dataset.indices_dir().join(new_uuid.to_string());
-    let files = list_index_files_with_sizes(&target_dataset.object_store, &index_dir).await?;
 
     let field = target_dataset.schema().field(column_name).ok_or_else(|| {
         Error::index(format!(
@@ -1811,7 +1875,7 @@ pub async fn initialize_vector_index(
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(files),
+        files: Some(summary.files),
     };
 
     let transaction = Transaction::new(
@@ -1841,6 +1905,9 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         #[allow(deprecated)]
         retrain: false, // Don't retrain since we have centroids
         sample_rate: 256, // Default
+        streaming_sample_rate: None,
+        streaming_coreset_rate: None,
+        streaming_refine_passes: 0,
         precomputed_partitions_file: None,
         precomputed_shuffle_buffers: None,
         shuffle_partition_batches: 1024 * 10, // Default
@@ -1877,6 +1944,7 @@ fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
     RQBuildParams {
         num_bits: rabit_quantizer.num_bits(),
         rotation_type: rabit_quantizer.rotation_type(),
+        rotation: None,
     }
 }
 
@@ -1942,6 +2010,125 @@ mod tests {
     use lance_file::writer::FileWriterOptions;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_linalg::distance::MetricType;
+
+    /// `open_index_file` skips the HEAD when the size is known and still falls
+    /// back to a HEAD for older indices that did not record sizes. A HEAD is
+    /// issued as a `get_opts` call with `head = true`, so a proxy store counts
+    /// those against the index file.
+    ///
+    /// Regression test for <https://github.com/lance-format/lance/issues/6944>.
+    #[tokio::test]
+    async fn test_open_index_file_skips_head_when_size_known() {
+        use lance_index::INDEX_FILE_NAME;
+        use lance_io::assert_io_eq;
+        use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
+
+        let (store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &ObjectStoreParams::default(),
+        )
+        .await
+        .unwrap();
+
+        let path = base.join(INDEX_FILE_NAME);
+        // Larger than the block size so size discovery needs a separate HEAD.
+        let data = vec![7u8; 2 * store.block_size()];
+        store.put(&path, &data).await.unwrap();
+
+        let file_sizes = HashMap::from([(INDEX_FILE_NAME.to_string(), data.len() as u64)]);
+
+        // Size recorded in the manifest, so reading the size issues no HEAD.
+        let _ = store.io_stats_incremental(); // reset
+        let reader = open_index_file(store.as_ref(), &path, INDEX_FILE_NAME, &file_sizes)
+            .await
+            .unwrap();
+        assert_eq!(reader.size().await.unwrap(), data.len());
+        let stats = store.io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "a known file size must not trigger a HEAD request"
+        );
+
+        // Size unknown, as in an older index, so it falls back to a HEAD.
+        let _ = store.io_stats_incremental(); // reset
+        let reader = open_index_file(store.as_ref(), &path, INDEX_FILE_NAME, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(reader.size().await.unwrap(), data.len());
+        let stats = store.io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            1,
+            "an unknown file size must fall back to exactly one HEAD request"
+        );
+    }
+
+    /// `open_index_file` looks up sizes in `IndexMetadata::file_size_map()` by
+    /// bare file name. This pins that a freshly created HNSW index records both
+    /// the main and auxiliary files under those exact names with nonzero sizes,
+    /// which is what lets the open path skip the HEAD.
+    #[tokio::test]
+    async fn test_hnsw_index_records_file_sizes() {
+        use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME};
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(400), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            MetricType::L2,
+            IvfBuildParams {
+                num_partitions: Some(8),
+                ..Default::default()
+            },
+            HnswBuildParams {
+                max_level: 6,
+                m: 24,
+                ef_construction: 120,
+                prefetch_distance: None,
+            },
+            PQBuildParams {
+                num_sub_vectors: 8,
+                num_bits: 8,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("hnsw".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|idx| idx.name == "hnsw").unwrap();
+        let file_sizes = index.file_size_map();
+
+        assert!(
+            file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0) > 0,
+            "manifest should record a nonzero {INDEX_FILE_NAME} size, got {file_sizes:?}"
+        );
+        assert!(
+            file_sizes
+                .get(INDEX_AUXILIARY_FILE_NAME)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "manifest should record a nonzero {INDEX_AUXILIARY_FILE_NAME} size, got {file_sizes:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_pq() {

@@ -69,6 +69,7 @@ use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
+use lance_table::format::IndexFile;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
@@ -170,6 +171,11 @@ type BuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
 
 type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin + 'static>;
+
+pub struct VectorIndexBuildSummary {
+    pub indices_merged: usize,
+    pub files: Vec<IndexFile>,
+}
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
     #[allow(clippy::too_many_arguments)]
@@ -282,9 +288,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    // build the index with the all data in the dataset,
-    // return the number of indices merged
-    pub async fn build(&mut self) -> Result<usize> {
+    // build the index and return the files created by the writer.
+    pub async fn build(&mut self) -> Result<VectorIndexBuildSummary> {
         let progress = self.progress.clone();
 
         // step 1. train IVF & quantizer
@@ -318,13 +323,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
-        self.merge_partitions(build_idx_stream).await?;
+        let files = self.merge_partitions(build_idx_stream).await?;
         progress.stage_complete("merge_partitions").await?;
 
-        Ok(self.merged_num)
+        Ok(VectorIndexBuildSummary {
+            indices_merged: self.merged_num,
+            files,
+        })
     }
 
-    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -359,13 +367,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
             });
 
-        self.merge_partitions(
-            stream::iter(build_iter)
-                .buffered(get_num_compute_intensive_cpus())
-                .boxed(),
-        )
-        .await?;
-        Ok(())
+        let files = self
+            .merge_partitions(
+                stream::iter(build_iter)
+                    .buffered(get_num_compute_intensive_cpus())
+                    .boxed(),
+            )
+            .await?;
+        Ok(files)
     }
 
     pub fn with_ivf(&mut self, ivf: IvfModel) -> &mut Self {
@@ -1108,7 +1117,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
-    async fn merge_partitions(&mut self, mut build_stream: BuildStream<S, Q>) -> Result<()> {
+    async fn merge_partitions(
+        &mut self,
+        mut build_stream: BuildStream<S, Q>,
+    ) -> Result<Vec<IndexFile>> {
         let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input("IVF not set before merge partitions"));
         };
@@ -1347,12 +1359,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             serde_json::to_string(&partition_index_metadata)?,
         );
 
-        storage_writer.finish().await?;
-        index_writer.finish().await?;
+        let storage_summary = storage_writer.finish().await?;
+        let index_summary = index_writer.finish().await?;
 
         log::info!("merging {} partitions done", ivf.num_partitions());
 
-        Ok(())
+        Ok(vec![
+            IndexFile {
+                path: INDEX_AUXILIARY_FILE_NAME.to_string(),
+                size_bytes: storage_summary.size_bytes,
+            },
+            IndexFile {
+                path: INDEX_FILE_NAME.to_string(),
+                size_bytes: index_summary.size_bytes,
+            },
+        ])
     }
 
     // take raw vectors from the dataset

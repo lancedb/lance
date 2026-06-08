@@ -457,7 +457,15 @@ async fn run_prepare(args: &Args) -> Result<()> {
 
     let write_start = Instant::now();
     let reader = RecordBatchIterator::new(batches_with_id.into_iter(), schema);
-    let mut dataset = Dataset::write(reader, &args.uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        &args.uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     println!(
         "  wrote base dataset in {:.1}s",
         write_start.elapsed().as_secs_f64()
@@ -696,18 +704,15 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     let ctx = SessionContext::new();
     let mut latencies_us = Vec::with_capacity(args.queries);
 
-    let refine = if args.refine_factor > 0 {
-        Some(args.refine_factor)
-    } else {
-        None
-    };
+    let refine_base_table = args.refine_factor > 0;
 
     let mut all_result_ids: Vec<Vec<i64>> = Vec::with_capacity(args.queries);
     for (qi, qv) in query_vecs.iter().enumerate().take(args.queries) {
         let fsl = wrap_query(qv, VECTOR_DIM);
         let t0 = Instant::now();
+        // overfetch_factor 0.0 leaves stale filtering off (raw search, as before).
         let plan = planner
-            .plan_search(&fsl, args.k, args.nprobes, None, refine)
+            .plan_search(&fsl, args.k, args.nprobes, None, refine_base_table, 0.0)
             .await?;
         let stream = plan.execute(0, ctx.task_ctx())?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;

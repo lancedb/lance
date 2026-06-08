@@ -79,7 +79,11 @@ public class AsyncScanner implements AutoCloseable {
             options.getBatchReadahead(),
             options.getColumnOrderings(),
             options.isUseScalarIndex(),
-            options.getSubstraitAggregate());
+            options.isFastSearch(),
+            options.getSubstraitAggregate(),
+            options.isIncludeDeletedRows(),
+            options.isStrictBatchSize(),
+            options.isDisableScoringAutoprojection());
     scanner.allocator = allocator;
     return scanner;
   }
@@ -101,7 +105,11 @@ public class AsyncScanner implements AutoCloseable {
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
-      Optional<ByteBuffer> substraitAggregate);
+      boolean fastSearch,
+      Optional<ByteBuffer> substraitAggregate,
+      boolean includeDeletedRows,
+      boolean strictBatchSize,
+      boolean disableScoringAutoprojection);
 
   /**
    * Asynchronously scan batches and return a CompletableFuture.

@@ -21,6 +21,7 @@ dir-aws = ["lance-io/aws", "lance/aws"]
 dir-azure = ["lance-io/azure", "lance/azure"]
 dir-oss = ["lance-io/oss", "lance/oss"]
 dir-huggingface = ["lance-io/huggingface", "lance/huggingface"]
+dir-goosefs = ["lance-io/goosefs", "lance/goosefs"]
 # Credential vending features
 credential-vendor-aws = ["dep:aws-sdk-sts", "dep:aws-config", "dep:sha2", "dep:base64"]
 credential-vendor-gcp = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:base64", "dep:ring", "dep:rustls-pki-types"]
@@ -84,13 +85,17 @@ hmac = { version = "0.12", optional = true }
 quick-xml = { version = "0.38", optional = true }
 
 [dev-dependencies]
+opendal = { workspace = true, features = ["services-goosefs"] }
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 wiremock.workspace = true
 arrow = { workspace = true }
+arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 rstest.workspace = true
 lance-table.workspace = true
+lance-arrow = { workspace = true }
+lance = { workspace = true }
 
 [lints]
 workspace = true

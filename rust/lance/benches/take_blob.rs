@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use arrow_array::{LargeBinaryArray, RecordBatch, RecordBatchIterator, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, ProjectionRequest, ReadParams, WriteParams};
@@ -15,7 +17,7 @@ use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 

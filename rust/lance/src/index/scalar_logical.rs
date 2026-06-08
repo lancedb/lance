@@ -323,6 +323,7 @@ mod tests {
     use lance_datagen::array;
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 
     use crate::index::create::CreateIndexBuilder;
@@ -496,6 +497,112 @@ mod tests {
             searched_fragments.into_iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([1, 2])
         );
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_segments_commit_and_query_as_logical_index() {
+        let test_dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        let mut staged = Vec::new();
+
+        for fragment_group in fragments.chunks(2) {
+            let fragment_ids = fragment_group
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>();
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::Bitmap, &params)
+                    .name("value_bitmap".to_string())
+                    .fragments(fragment_ids.clone())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            assert_eq!(
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                fragment_ids
+            );
+            let files = segment.files.as_ref().unwrap();
+            assert!(files.iter().any(|file| file.path == BITMAP_LOOKUP_NAME));
+            assert!(files.iter().all(|file| !file.path.starts_with("part_")));
+            staged.push(segment);
+        }
+
+        let staged_uuids = staged
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+        assert!(!staged_uuids.contains(&merged.uuid));
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            fragments
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>()
+        );
+        let files = merged.files.as_ref().unwrap();
+        assert!(files.iter().any(|file| file.path == BITMAP_LOOKUP_NAME));
+        assert!(files.iter().all(|file| !file.path.starts_with("part_")));
+
+        dataset
+            .commit_existing_index_segments("value_bitmap", "value", vec![merged])
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("value_bitmap").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(
+            scalar_index_fragment_bitmap(&dataset, "value", "value_bitmap")
+                .await
+                .unwrap()
+                .unwrap(),
+            dataset.fragment_bitmap.as_ref().clone()
+        );
+
+        let logical =
+            open_named_scalar_index(&dataset, "value", "value_bitmap", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        assert_eq!(logical.index_type(), IndexType::Bitmap);
+
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(20)));
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!(
+                "expected exact result from segmented bitmap, got {:?}",
+                other
+            ),
+        };
+
+        let searched_fragments = row_addrs
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+            .collect::<Vec<_>>();
+        assert_eq!(searched_fragments, vec![1]);
     }
 
     #[tokio::test]

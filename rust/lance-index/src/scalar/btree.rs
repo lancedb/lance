@@ -11,7 +11,7 @@ use std::{
 };
 
 use super::{
-    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
@@ -58,10 +58,9 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_io::object_store::ObjectStore;
 use lance_select::NullableRowAddrSet;
 use log::{debug, warn};
-use object_store::{Error as ObjectStoreError, path::Path};
+use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -69,7 +68,7 @@ use tracing::{info, instrument};
 
 mod flat;
 
-const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
+pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
@@ -1490,7 +1489,7 @@ impl BTreeIndex {
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
-    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+    async fn data_stream(&self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = lazy_reader.get().await?;
         let new_schema = Arc::new(self.train_schema());
@@ -1513,25 +1512,51 @@ impl BTreeIndex {
         )))
     }
 
-    async fn combine_old_new(
-        self,
+    /// Merge N source BTree segments plus an additional `new_data` stream into
+    /// a single BTree under `dest_store`, without re-reading the dataset.
+    pub async fn merge_segments(
+        segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
-        chunk_size: u64,
+        dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
-    ) -> Result<SendableRecordBatchStream> {
-        let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
-
-        let new_input = Arc::new(OneShotExec::new(new_data));
-        let old_stream = self.into_data_stream().await?;
-        let old_stream = match old_data_filter {
-            Some(filter) => filter_row_ids(old_stream, filter),
-            None => old_stream,
+    ) -> Result<CreatedIndex> {
+        let Some(first) = segments.first() else {
+            return Err(Error::invalid_input(
+                "cannot merge BTree index without at least one source segment".to_string(),
+            ));
         };
-        let old_input = Arc::new(OneShotExec::new(old_stream));
-        debug_assert_eq!(
-            old_input.schema().flattened_fields().len(),
-            new_input.schema().flattened_fields().len()
-        );
+
+        for segment in segments.iter().skip(1) {
+            if segment.data_type != first.data_type {
+                return Err(Error::index(format!(
+                    "cannot merge BTree segments with different value types ({:?} vs {:?})",
+                    first.data_type, segment.data_type
+                )));
+            }
+        }
+
+        let new_schema = new_data.schema();
+        let value_column_index = new_schema.index_of(VALUE_COLUMN_NAME)?;
+        let new_value_type = new_schema.field(value_column_index).data_type();
+        if new_value_type != &first.data_type {
+            return Err(Error::invalid_input(format!(
+                "BTree merge: new_data value column type {:?} does not match \
+                 segment value type {:?}",
+                new_value_type, first.data_type
+            )));
+        }
+
+        let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
+        for segment in segments {
+            let stream = segment.data_stream().await?;
+            let stream = match old_data_filter.clone() {
+                Some(filter) => filter_row_ids(stream, filter),
+                None => stream,
+            };
+            let exec = Arc::new(OneShotExec::new(stream));
+            inputs.push(exec);
+        }
+        inputs.push(Arc::new(OneShotExec::new(new_data)));
 
         let sort_expr = PhysicalSortExpr {
             expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
@@ -1540,11 +1565,10 @@ impl BTreeIndex {
                 nulls_first: true,
             },
         };
-        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
-        // them back into a single partition.
-        let all_data = UnionExec::try_new(vec![old_input, new_input])?;
-        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
-
+        // UnionExec yields multiple partitions; SortPreservingMergeExec merges
+        // them back into a single partition while preserving value-ordering.
+        let unioned = UnionExec::try_new(inputs)?;
+        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), unioned));
         let unchunked = execute_plan(
             ordered,
             LanceExecutionOptions {
@@ -1552,7 +1576,17 @@ impl BTreeIndex {
                 ..Default::default()
             },
         )?;
-        Ok(chunk_concat_stream(unchunked, chunk_size as usize))
+        let merged_stream = chunk_concat_stream(unchunked, first.batch_size as usize);
+
+        let files =
+            train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
+            index_version: BTREE_INDEX_VERSION,
+            files,
+        })
     }
 }
 
@@ -1831,6 +1865,7 @@ impl ScalarIndex for BTreeIndex {
 
         let mapping = Arc::new(mapping.clone());
         let train_schema = Arc::new(self.train_schema());
+        let mut remapped_files = Vec::new();
 
         // TODO: Could potentially parallelize this across parts, unclear it would be worth it
         for (part_id, page_file) in part_page_files {
@@ -1861,7 +1896,10 @@ impl ScalarIndex for BTreeIndex {
                 remapped_stream,
             ));
 
-            train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id).await?;
+            let mut files =
+                train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id)
+                    .await?;
+            remapped_files.append(&mut files);
         }
 
         if let Some(ranges_to_files) = &self.ranges_to_files {
@@ -1873,7 +1911,7 @@ impl ScalarIndex for BTreeIndex {
             let lookup_files = (0..num_parts)
                 .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
                 .collect::<Vec<_>>();
-            merge_metadata_files(
+            let merged_files = merge_metadata_files(
                 dest_store,
                 &page_files,
                 &lookup_files,
@@ -1881,13 +1919,15 @@ impl ScalarIndex for BTreeIndex {
                 noop_progress(),
             )
             .await?;
+            remapped_files.retain(|file| file.path.ends_with("_page_data.lance"));
+            remapped_files.extend(merged_files);
         }
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: remapped_files,
         })
     }
 
@@ -1897,19 +1937,15 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Merge the existing index data with the new data and then retrain the index on the merged stream
-        let merged_data_source = self
-            .clone()
-            .combine_old_new(new_data, self.batch_size, old_data_filter)
-            .await?;
-        train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
-                .unwrap(),
-            index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
-        })
+        // Updating is the single-segment case of a segment merge: union this
+        // index's data with `new_data`, re-sort on value, and retrain.
+        Self::merge_segments(
+            &[Arc::new(self.clone())],
+            new_data,
+            dest_store,
+            old_data_filter,
+        )
+        .await
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
@@ -2046,7 +2082,7 @@ pub async fn train_btree_index(
     batch_size: u64,
     fragment_ids: Option<Vec<u32>>,
     range_id: Option<u32>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create `partition_id` for distributed index building.
     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
     // that index partitions generated by different workers do not conflict.
@@ -2111,7 +2147,7 @@ pub async fn train_btree_index(
         );
         batch_idx += 1;
     }
-    sub_index_file.finish().await?;
+    let pages_file = sub_index_file.finish().await?;
     let record_batch = btree_stats_as_batch(encoded_batches, &value_type)?;
     let mut file_schema = record_batch.schema().as_ref().clone();
     file_schema
@@ -2137,68 +2173,8 @@ pub async fn train_btree_index(
         }
     };
     btree_index_file.write_record_batch(record_batch).await?;
-    btree_index_file.finish().await?;
-    Ok(())
-}
-
-pub async fn merge_index_files(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-    store: Arc<dyn IndexStore>,
-    batch_readhead: Option<usize>,
-    progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
-    // List all partition page / lookup files in the index directory
-    let (part_page_files, part_lookup_files) =
-        list_page_lookup_files(object_store, index_dir).await?;
-    merge_metadata_files(
-        store.as_ref(),
-        &part_page_files,
-        &part_lookup_files,
-        batch_readhead,
-        progress,
-    )
-    .await
-}
-
-/// List and filter files from the index directory
-/// Returns (page_files, lookup_files)
-async fn list_page_lookup_files(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let mut part_page_files = Vec::new();
-    let mut part_lookup_files = Vec::new();
-
-    let mut list_stream = object_store.list(Some(index_dir.clone()));
-
-    while let Some(item) = list_stream.next().await {
-        match item {
-            Ok(meta) => {
-                let file_name = meta.location.filename().unwrap_or_default();
-                // Filter files matching the pattern part_*_page_data.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_page_data.lance") {
-                    part_page_files.push(file_name.to_string());
-                }
-                // Filter files matching the pattern part_*_page_lookup.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance") {
-                    part_lookup_files.push(file_name.to_string());
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-
-    if part_page_files.is_empty() || part_lookup_files.is_empty() {
-        return Err(Error::internal(format!(
-            "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-            index_dir,
-            part_page_files.len(),
-            part_lookup_files.len()
-        )));
-    }
-
-    Ok((part_page_files, part_lookup_files))
+    let lookup_file = btree_index_file.finish().await?;
+    Ok(vec![pages_file, lookup_file])
 }
 
 fn find_single_partition_files(
@@ -2256,7 +2232,7 @@ async fn merge_metadata_files(
     part_lookup_files: &[String],
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
         return Err(Error::internal(
             "No partition files provided for merging".to_string(),
@@ -2332,6 +2308,7 @@ async fn merge_metadata_files(
             progress,
         )
         .await
+        .map(|file| vec![file])
     } else {
         merge_pages_and_lookups(
             store,
@@ -2385,7 +2362,7 @@ async fn merge_range_partitioned_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<IndexFile> {
     let sorted_part_lookup_files = sort_files_by_partition_id(part_lookup_files)?;
     let mut lookup_file = store
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
@@ -2425,12 +2402,12 @@ async fn merge_range_partitioned_lookups(
         serde_json::to_string(&pages_per_file)?,
     );
 
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_complete("merge_lookups").await?;
 
     // In this mode, we only clean up lookup files, and page files are untouched.
     cleanup_partition_files(store, part_lookup_files, &[]).await;
-    Ok(())
+    Ok(lookup_file)
 }
 
 /// Merges partition files using a K-way sort-merge algorithm.
@@ -2449,7 +2426,7 @@ async fn merge_pages_and_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create a new global page file
     let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
     let page_file = page_files_map.get(&partition_id).unwrap();
@@ -2472,7 +2449,7 @@ async fn merge_pages_and_lookups(
         progress.clone(),
     )
     .await?;
-    page_file.finish().await?;
+    let page_file = page_file.finish().await?;
     progress.stage_complete("merge_pages").await?;
 
     let lookup_batch = RecordBatch::try_new(
@@ -2497,7 +2474,7 @@ async fn merge_pages_and_lookups(
         .stage_start("write_lookup_file", Some(1), "files")
         .await?;
     lookup_file.write_record_batch(lookup_batch).await?;
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_progress("write_lookup_file", 1).await?;
     progress.stage_complete("write_lookup_file").await?;
 
@@ -2505,7 +2482,7 @@ async fn merge_pages_and_lookups(
     // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
     cleanup_partition_files(store, part_lookup_files, part_page_files).await;
 
-    Ok(())
+    Ok(vec![page_file, lookup_file])
 }
 
 // Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
@@ -2803,29 +2780,19 @@ pub struct BTreeParameters {
     /// The number of rows to include in each zone
     pub zone_size: Option<u64>,
 
-    /// The ordinal ID of a data partition for building a large, distributed BTree index.
+    /// DEPRECATED: range-based distributed BTree building has been retired.
+    /// Setting this to `Some(..)` now emits a warning and is ignored at build time
+    /// (see `BTreeIndexPlugin::train_index`). Build one segment per worker and
+    /// commit them with `commit_existing_index_segments(...)`, optionally
+    /// consolidating with `merge_existing_index_segments(...)`. The field is
+    /// retained (rather than removed) so the plugin can detect stale `range_id`
+    /// inputs and warn loudly instead of serde silently dropping an unknown field.
     ///
-    /// When building an index from multiple, pre-partitioned data chunks (for example,
-    /// in a distributed environment), this ID specifies which partition this particular
-    /// build operation corresponds to.
-    ///
-    /// # Data Distribution Requirements
-    ///
-    /// If this parameter is `Some(id)`, the caller **must** guarantee that the input data
-    /// is strictly global sorted. The input data, when considered as a whole across all
-    /// partitions ordered by `range_id`, must be sorted.
-    ///
-    /// Concretely, this means:
-    ///
-    /// All values in the data provided for `range_id: N` must be **less than or equal to**
-    /// all values in the data for `range_id: N+1`.
-    ///
-    /// Lance relies on this precondition to ensure the final, merged index is valid and
-    /// correctly ordered.
-    ///
-    /// # `None` Case
-    ///
-    /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
+    /// Historically, this was the ordinal ID of a globally sorted range
+    /// partition. Lance used it to write `part_*` BTree files that were later
+    /// merged by `merge_index_metadata`. That flow has been retired. A
+    /// pre-sorted training stream is still accepted, but this field no longer
+    /// affects file names, commit behavior, or query semantics.
     pub range_id: Option<u32>,
 }
 
@@ -2903,29 +2870,43 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
             .downcast_ref::<BTreeTrainingRequest>()
             .unwrap();
-        train_btree_index(
+        if request.parameters.range_id.is_some() {
+            // `range_id` is deprecated and now ignored. A pre-sorted data stream is
+            // still supported (pass it as the training data), but `range_id` no longer
+            // needs to be set: each build now produces one canonical segment, and
+            // distribution is handled by the segmented-index APIs. The field will be
+            // removed in a future release.
+            warn!(
+                "BTree `range_id` is deprecated and now ignored; a pre-sorted data \
+                 stream is still supported, but `range_id` no longer needs to be passed. \
+                 Use the segmented-index APIs instead (build per-fragment segments, then \
+                 commit_existing_index_segments(...) / merge_existing_index_segments(...)). \
+                 The `range_id` field will be removed in a future release."
+            );
+        }
+        let files = train_btree_index(
             data,
             index_store,
             request
                 .parameters
                 .zone_size
                 .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
-            fragment_ids,
-            request.parameters.range_id,
+            None,
+            None,
         )
         .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files,
         })
     }
 

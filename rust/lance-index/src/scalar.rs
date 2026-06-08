@@ -17,8 +17,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::Expr;
-use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::{Expr, expr::ScalarFunction};
 use deepsize::DeepSizeOf;
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::{Error, Result};
@@ -36,6 +35,7 @@ pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
+pub mod fmindex;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
@@ -68,6 +68,7 @@ pub enum BuiltinIndexType {
     BloomFilter,
     RTree,
     Inverted,
+    FMIndex,
 }
 
 impl BuiltinIndexType {
@@ -81,6 +82,7 @@ impl BuiltinIndexType {
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
+            Self::FMIndex => "fmindex",
         }
     }
 }
@@ -98,6 +100,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
+            IndexType::FMIndex => Ok(Self::FMIndex),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
@@ -183,9 +186,12 @@ pub trait IndexWriter: Send {
         ))
     }
     /// Finishes writing the file and closes the file
-    async fn finish(&mut self) -> Result<()>;
+    async fn finish(&mut self) -> Result<IndexFile>;
     /// Finishes writing the file and closes the file with additional metadata
-    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()>;
+    async fn finish_with_metadata(
+        &mut self,
+        metadata: HashMap<String, String>,
+    ) -> Result<IndexFile>;
 }
 
 /// Trait for reading an index (or parts of an index) from storage
@@ -208,6 +214,23 @@ pub trait IndexReader: Send + Sync {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
+    /// Read multiple ranges and concatenate into a single batch.
+    /// Default impl runs `read_range`s in parallel via `try_join_all`.
+    async fn read_ranges(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        if ranges.is_empty() {
+            return self.read_range(0..0, projection).await;
+        }
+        let futures = ranges
+            .iter()
+            .map(|r| self.read_range(r.clone(), projection));
+        let batches = futures::future::try_join_all(futures).await?;
+        let schema = batches[0].schema();
+        Ok(arrow_select::concat::concat_batches(&schema, &batches)?)
+    }
     /// Read a range of rows as a stream of record batches.
     ///
     /// This allows the caller to process rows incrementally without loading the
@@ -258,10 +281,10 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
-    async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
+    async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<IndexFile>;
 
     /// Rename an index file
-    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()>;
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile>;
 
     /// Delete an index file (used in the tmp spill store to keep tmp size down)
     async fn delete_index_file(&self, name: &str) -> Result<()>;
@@ -849,7 +872,7 @@ pub struct CreatedIndex {
     ///
     /// This enables skipping HEAD calls when opening indices and provides
     /// visibility into index storage size via describe_indices().
-    pub files: Option<Vec<IndexFile>>,
+    pub files: Vec<IndexFile>,
 }
 
 /// The criteria that specifies how to update an index

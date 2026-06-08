@@ -125,14 +125,17 @@ impl Scanner {
         Ok(res)
     }
 
-    #[pyo3(signature = (*))]
-    fn analyze_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
+    #[pyo3(signature = (*, count_rows = false))]
+    fn analyze_plan(self_: PyRef<'_, Self>, count_rows: bool) -> PyResult<String> {
         let scanner = self_.scanner.clone();
         let res = rt()
-            .spawn(
-                Some(self_.py()),
-                async move { scanner.analyze_plan().await },
-            )?
+            .spawn(Some(self_.py()), async move {
+                if count_rows {
+                    scanner.analyze_count_plan().await
+                } else {
+                    scanner.analyze_plan().await
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(res)

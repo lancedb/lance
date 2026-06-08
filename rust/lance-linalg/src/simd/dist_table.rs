@@ -37,18 +37,22 @@ pub fn sum_4bit_dist_table(
     debug_assert!(n.is_multiple_of(BATCH_SIZE));
 
     match *SIMD_SUPPORT {
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
+        #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16
+            if std::arch::is_x86_feature_detected!("avx512bw") =>
+        {
             for i in (0..n).step_by(BATCH_SIZE) {
                 let codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
-                sum_4bit_dist_table_32bytes_batch_avx512(
-                    codes.as_ptr(),
-                    codes.len(),
-                    dist_table.as_ptr(),
-                    dists[i..i + BATCH_SIZE].as_mut_ptr(),
-                )
+                unsafe {
+                    sum_4bit_dist_table_32bytes_batch_avx512(
+                        codes.as_ptr(),
+                        codes.len(),
+                        dist_table.as_ptr(),
+                        dists[i..i + BATCH_SIZE].as_mut_ptr(),
+                    )
+                }
             }
-        },
+        }
         #[cfg(target_arch = "x86_64")]
         SimdSupport::Avx2 => unsafe {
             for i in (0..n).step_by(BATCH_SIZE) {
@@ -81,6 +85,9 @@ pub fn sum_4bit_dist_table_scalar(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
+    let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
+    dists[..num_full_vectors].fill(0);
+
     for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
         for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
             let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
@@ -250,7 +257,7 @@ unsafe fn sum_dist_table_32bytes_batch_neon(codes: &[u8], dist_table: &[u8], dis
 // We implement the AVX512 version in C because AVX512 is not stable yet in Rust,
 // implement it in Rust once we upgrade rust to 1.89.0.
 unsafe extern "C" {
-    #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+    #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
     pub fn sum_4bit_dist_table_32bytes_batch_avx512(
         codes: *const u8,
         code_length: usize,
@@ -301,6 +308,23 @@ mod tests {
 
         // so the distance is 2 * (dist_table[0x6] + dist_table[0xb + 16]) = 2*(7 + 12) = 38
         assert_eq!(dists[1], 38);
+    }
+
+    #[test]
+    fn test_sum_4bit_dist_table_overwrites_output() {
+        let n = BATCH_SIZE;
+        let code_len = 16;
+        let codes = vec![0x12; n * code_len];
+        let dist_table = vec![1u8; BATCH_SIZE * code_len];
+
+        let mut expected = vec![u16::MAX; n];
+        sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
+
+        let mut actual = vec![u16::MAX; n];
+        sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
+
+        assert_eq!(actual, expected);
+        assert!(actual.iter().all(|dist| *dist != u16::MAX));
     }
 
     /// Test that the SIMD path (NEON on ARM, AVX2 on x86) produces identical

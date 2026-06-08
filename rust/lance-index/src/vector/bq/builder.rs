@@ -18,11 +18,15 @@ use rayon::prelude::*;
 
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
+    rabit_binary_code_field, rabit_ex_code_field,
 };
-use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
+use crate::vector::bq::transform::{
+    ADD_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
+};
 use crate::vector::bq::{
-    RQBuildParams, RQRotationType,
-    rotation::{apply_fast_rotation, random_fast_rotation_signs},
+    RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
+    rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
+    validate_rq_num_bits,
 };
 use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
 
@@ -55,6 +59,14 @@ pub struct RabitQuantizer {
     metadata: RabitQuantizationMetadata,
 }
 
+pub(crate) struct RabitQuantizedBatch {
+    pub binary_codes: ArrayRef,
+    pub ex_codes: Option<ArrayRef>,
+    pub ex_res_dot_dists: Option<Vec<f32>>,
+    pub rotated_residuals: Option<Vec<f32>>,
+    pub ex_code_values: Option<Vec<u8>>,
+}
+
 #[inline]
 fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
     codes.fill(0);
@@ -63,6 +75,132 @@ fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
             codes[bit_idx / u8::BITS as usize] |= 1u8 << (bit_idx % u8::BITS as usize);
         }
     }
+}
+
+#[inline]
+fn pack_ex_code_bits(codes: &mut [u8], ex_values: &[u8], ex_bits: u8) {
+    codes.fill(0);
+    let ex_bits = ex_bits as usize;
+    for (dim_idx, &value) in ex_values.iter().enumerate() {
+        let bit_offset = dim_idx * ex_bits;
+        for bit_idx in 0..ex_bits {
+            if (value >> bit_idx) & 1 != 0 {
+                let dst_bit = bit_offset + bit_idx;
+                codes[dst_bit / u8::BITS as usize] |= 1u8 << (dst_bit % u8::BITS as usize);
+            }
+        }
+    }
+}
+
+const EX_QUANTIZATION_EPSILON: f32 = 1.0e-5;
+const EX_TIGHT_START: [f32; 9] = [0.0, 0.15, 0.20, 0.52, 0.59, 0.71, 0.75, 0.77, 0.81];
+
+fn best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
+    let max_value = abs_normalized
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0f32, f32::max);
+    if max_value <= 0.0 {
+        return 0.0;
+    }
+
+    let max_code = (1usize << ex_bits) - 1;
+    let t_end = ((max_code + 10) as f32) / max_value;
+    let t_start = t_end * EX_TIGHT_START[ex_bits as usize];
+
+    let mut current_codes = Vec::with_capacity(abs_normalized.len());
+    let mut squared_denominator = abs_normalized.len() as f32 * 0.25;
+    let mut numerator = 0.0f32;
+    let mut thresholds = Vec::with_capacity(abs_normalized.len() * max_code);
+
+    for (idx, &value) in abs_normalized.iter().enumerate() {
+        if value <= 0.0 || !value.is_finite() {
+            current_codes.push(0usize);
+            continue;
+        }
+
+        let current = ((t_start * value) + EX_QUANTIZATION_EPSILON)
+            .floor()
+            .clamp(0.0, max_code as f32) as usize;
+        current_codes.push(current);
+        squared_denominator += (current * current + current) as f32;
+        numerator += (current as f32 + 0.5) * value;
+
+        let mut next = current + 1;
+        while next <= max_code {
+            let threshold = next as f32 / value;
+            if threshold < t_end {
+                thresholds.push((threshold, idx));
+            }
+            next += 1;
+        }
+    }
+
+    thresholds.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+
+    let mut best_inner_product = numerator / squared_denominator.sqrt();
+    let mut best_t = t_start;
+    for (threshold, idx) in thresholds {
+        current_codes[idx] += 1;
+        let updated = current_codes[idx];
+        squared_denominator += (2 * updated) as f32;
+        numerator += abs_normalized[idx];
+
+        let current_inner_product = numerator / squared_denominator.sqrt();
+        if current_inner_product > best_inner_product {
+            best_inner_product = current_inner_product;
+            best_t = threshold;
+        }
+    }
+
+    best_t
+}
+
+fn quantize_ex_code(
+    rotated: &[f32],
+    ex_bits: u8,
+    ex_code_dst: &mut [u8],
+    ex_code_values_dst: &mut [u8],
+) -> f32 {
+    debug_assert_eq!(rotated.len(), ex_code_values_dst.len());
+    let norm_squared = rotated.iter().map(|value| value * value).sum::<f32>();
+    if norm_squared <= f32::EPSILON || !norm_squared.is_finite() {
+        ex_code_dst.fill(0);
+        ex_code_values_dst.fill(0);
+        return 0.0;
+    }
+
+    let norm = norm_squared.sqrt();
+    let abs_normalized = rotated
+        .iter()
+        .map(|value| value.abs() / norm)
+        .collect::<Vec<_>>();
+    let t = best_ex_rescale_factor(&abs_normalized, ex_bits);
+    let max_code = ((1u16 << ex_bits) - 1) as u8;
+    let mask = max_code;
+    let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
+    let mut residual_dot_code = 0.0f32;
+
+    for ((&value, &abs_value), ex_code_value) in rotated
+        .iter()
+        .zip(abs_normalized.iter())
+        .zip(ex_code_values_dst.iter_mut())
+    {
+        let mut ex_code = ((t * abs_value) + EX_QUANTIZATION_EPSILON)
+            .floor()
+            .clamp(0.0, max_code as f32) as u8;
+        if value.is_sign_negative() {
+            ex_code = (!ex_code) & mask;
+        }
+        let sign_code = u8::from(value.is_sign_positive());
+        let full_code = ((sign_code as u32) << ex_bits) + ex_code as u32;
+        residual_dot_code += value * (full_code as f32 + code_bias);
+        *ex_code_value = ex_code;
+    }
+
+    pack_ex_code_bits(ex_code_dst, ex_code_values_dst, ex_bits);
+    residual_dot_code
 }
 
 impl RabitQuantizer {
@@ -75,7 +213,8 @@ impl RabitQuantizer {
         dim: i32,
         rotation_type: RQRotationType,
     ) -> Self {
-        let code_dim = (dim * num_bits as i32) as usize;
+        debug_assert!(dim >= 0, "RabitQ dimension should be non-negative");
+        let code_dim = dim as usize;
         let metadata = match rotation_type {
             RQRotationType::Matrix => {
                 // we don't need to calculate the inverse of P, just take generated Q as P^{-1}
@@ -185,8 +324,62 @@ impl RabitQuantizer {
         }
     }
 
+    pub(crate) fn rotate_fsl_to_f32(&self, vectors: &FixedSizeListArray) -> Result<Vec<f32>> {
+        match vectors.value_type() {
+            DataType::Float16 => self.rotate_fsl_to_f32_typed::<Float16Type>(vectors),
+            DataType::Float32 => self.rotate_fsl_to_f32_typed::<Float32Type>(vectors),
+            DataType::Float64 => self.rotate_fsl_to_f32_typed::<Float64Type>(vectors),
+            value_type => Err(Error::invalid_input(format!(
+                "Unsupported data type: {:?}",
+                value_type
+            ))),
+        }
+    }
+
+    fn rotate_fsl_to_f32_typed<T: ArrowFloatType>(
+        &self,
+        vectors: &FixedSizeListArray,
+    ) -> Result<Vec<f32>>
+    where
+        T::Native: AsPrimitive<f32> + Sync,
+    {
+        let dim = self.dim();
+        if vectors.value_length() as usize != dim {
+            return Err(Error::invalid_input(format!(
+                "Vector dimension mismatch: {} != {}",
+                vectors.value_length(),
+                dim
+            )));
+        }
+        let values = vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Vector values have unexpected data type: {}",
+                    vectors.value_type()
+                ))
+            })?
+            .as_slice();
+        let vec_mat = ndarray::ArrayView2::from_shape((vectors.len(), dim), values)
+            .map_err(|e| Error::invalid_input(e.to_string()))?;
+        let rotated = self.rotate_vectors::<T>(vec_mat.t());
+        let code_dim = self.code_dim();
+        let mut row_major = vec![0.0f32; vectors.len() * code_dim];
+        for row_idx in 0..vectors.len() {
+            for (dst, value) in row_major[row_idx * code_dim..(row_idx + 1) * code_dim]
+                .iter_mut()
+                .zip(rotated.column(row_idx).iter())
+            {
+                *dst = *value;
+            }
+        }
+        Ok(row_major)
+    }
+
     pub fn dim(&self) -> usize {
-        self.code_dim() / self.metadata.num_bits as usize
+        self.code_dim()
     }
 
     // compute the dot product of v_q * v_r
@@ -206,7 +399,7 @@ impl RabitQuantizer {
             )));
         }
 
-        let sqrt_dim = (dim as f32 * self.metadata.num_bits as f32).sqrt();
+        let sqrt_dim = (dim as f32).sqrt();
         let values = residual_vectors
             .values()
             .as_any()
@@ -264,7 +457,7 @@ impl RabitQuantizer {
             .unwrap()
             .as_slice();
         let code_dim = self.code_dim();
-        let code_bytes = code_dim / u8::BITS as usize;
+        let code_bytes = rabit_binary_code_bytes(code_dim);
 
         match self.rotation_type() {
             RQRotationType::Matrix => {
@@ -280,7 +473,7 @@ impl RabitQuantizer {
                 debug_assert_eq!(codes.len(), n * code_bytes);
                 Ok(Arc::new(FixedSizeListArray::try_new_from_values(
                     codes,
-                    code_bytes as i32, // num_bits -> num_bytes
+                    code_bytes as i32,
                 )?))
             }
             RQRotationType::Fast => {
@@ -305,6 +498,131 @@ impl RabitQuantizer {
             }
         }
     }
+
+    pub(crate) fn quantize_split(
+        &self,
+        vectors: &FixedSizeListArray,
+    ) -> Result<RabitQuantizedBatch> {
+        match vectors.value_type() {
+            DataType::Float16 => self.transform_split::<Float16Type>(vectors),
+            DataType::Float32 => self.transform_split::<Float32Type>(vectors),
+            DataType::Float64 => self.transform_split::<Float64Type>(vectors),
+            value_type => Err(Error::invalid_input(format!(
+                "Unsupported data type: {:?}",
+                value_type
+            ))),
+        }
+    }
+
+    fn transform_split<T: ArrowFloatType>(
+        &self,
+        residual_vectors: &FixedSizeListArray,
+    ) -> Result<RabitQuantizedBatch>
+    where
+        T::Native: AsPrimitive<f32> + Sync,
+    {
+        let ex_bits = rabit_ex_bits(self.metadata.num_bits)?;
+        if ex_bits == 0 {
+            return Ok(RabitQuantizedBatch {
+                binary_codes: self.transform::<T>(residual_vectors)?,
+                ex_codes: None,
+                ex_res_dot_dists: None,
+                rotated_residuals: None,
+                ex_code_values: None,
+            });
+        }
+
+        let n = residual_vectors.len();
+        let dim = self.dim();
+        debug_assert_eq!(residual_vectors.values().len(), n * dim);
+        let values = residual_vectors
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice();
+        let code_dim = self.code_dim();
+        let code_bytes = rabit_binary_code_bytes(code_dim);
+        let ex_code_bytes = rabit_ex_code_bytes(code_dim, ex_bits)?;
+
+        let mut encoded_codes = vec![0u8; n * code_bytes];
+        let mut encoded_ex_codes = vec![0u8; n * ex_code_bytes];
+        let mut ex_res_dot_dists = vec![0.0f32; n];
+        let mut rotated_residuals = vec![0.0f32; n * code_dim];
+        let mut ex_code_values = vec![0u8; n * code_dim];
+
+        match self.rotation_type() {
+            RQRotationType::Matrix => {
+                let vectors = ndarray::ArrayView2::from_shape((n, dim), values)
+                    .map_err(|e| Error::invalid_input(e.to_string()))?;
+                let vectors = vectors.t();
+                let rotated_vectors = self.rotate_vectors::<T>(vectors);
+
+                encoded_codes
+                    .chunks_mut(code_bytes)
+                    .zip(encoded_ex_codes.chunks_mut(ex_code_bytes))
+                    .zip(rotated_residuals.chunks_mut(code_dim))
+                    .zip(ex_code_values.chunks_mut(code_dim))
+                    .zip(ex_res_dot_dists.iter_mut())
+                    .enumerate()
+                    .for_each(
+                        |(
+                            row_idx,
+                            ((((code_dst, ex_dst), rotated_dst), ex_values_dst), ex_dot_dst),
+                        )| {
+                            for (dst, value) in rotated_dst
+                                .iter_mut()
+                                .zip(rotated_vectors.column(row_idx).iter())
+                            {
+                                *dst = *value;
+                            }
+                            pack_sign_bits(code_dst, rotated_dst);
+                            *ex_dot_dst =
+                                quantize_ex_code(rotated_dst, ex_bits, ex_dst, ex_values_dst);
+                        },
+                    );
+            }
+            RQRotationType::Fast => {
+                let signs = self.fast_rotation_signs();
+                encoded_codes
+                    .par_chunks_mut(code_bytes)
+                    .zip(encoded_ex_codes.par_chunks_mut(ex_code_bytes))
+                    .zip(rotated_residuals.par_chunks_mut(code_dim))
+                    .zip(ex_code_values.par_chunks_mut(code_dim))
+                    .zip(ex_res_dot_dists.par_iter_mut())
+                    .zip(values.par_chunks_exact(dim))
+                    .for_each_init(
+                        || (),
+                        |_,
+                         (
+                            ((((code_dst, ex_dst), rotated_dst), ex_values_dst), ex_dot_dst),
+                            input,
+                        )| {
+                            apply_fast_rotation(input, rotated_dst, signs);
+                            pack_sign_bits(code_dst, rotated_dst);
+                            *ex_dot_dst =
+                                quantize_ex_code(rotated_dst, ex_bits, ex_dst, ex_values_dst);
+                        },
+                    );
+            }
+        }
+
+        let binary_codes = UInt8Array::from(encoded_codes);
+        let ex_codes = UInt8Array::from(encoded_ex_codes);
+        Ok(RabitQuantizedBatch {
+            binary_codes: Arc::new(FixedSizeListArray::try_new_from_values(
+                binary_codes,
+                code_bytes as i32,
+            )?),
+            ex_codes: Some(Arc::new(FixedSizeListArray::try_new_from_values(
+                ex_codes,
+                ex_code_bytes as i32,
+            )?)),
+            ex_res_dot_dists: Some(ex_res_dot_dists),
+            rotated_residuals: Some(rotated_residuals),
+            ex_code_values: Some(ex_code_values),
+        })
+    }
 }
 
 impl Quantization for RabitQuantizer {
@@ -317,11 +635,53 @@ impl Quantization for RabitQuantizer {
         _: lance_linalg::distance::DistanceType,
         params: &Self::BuildParams,
     ) -> Result<Self> {
+        validate_rq_num_bits(params.num_bits)?;
+
         let dim = data.as_fixed_size_list().value_length() as usize;
         if !dim.is_multiple_of(u8::BITS as usize) {
             return Err(Error::invalid_input(
                 "vector dimension must be divisible by 8 for IVF_RQ",
             ));
+        }
+
+        // Reuse a supplied rotation instead of generating a fresh random one.
+        if let Some(meta) = &params.rotation {
+            let expected_code_dim = dim * params.num_bits as usize;
+            if meta.num_bits != params.num_bits || meta.code_dim as usize != expected_code_dim {
+                return Err(Error::invalid_input(format!(
+                    "supplied RaBitQ rotation does not match build params: rotation \
+                     num_bits={}, code_dim={}; expected num_bits={}, code_dim={}",
+                    meta.num_bits, meta.code_dim, params.num_bits, expected_code_dim
+                )));
+            }
+
+            match meta.rotation_type {
+                RQRotationType::Fast => {
+                    let signs = meta.fast_rotation_signs.as_ref().ok_or_else(|| {
+                        Error::invalid_input("supplied fast RaBitQ rotation is missing signs")
+                    })?;
+                    let expected_len = fast_rotation_signs_len(meta.code_dim as usize);
+                    if signs.len() != expected_len {
+                        return Err(Error::invalid_input(format!(
+                            "supplied fast RaBitQ rotation signs length {} does not match \
+                             expected {} for code_dim={}",
+                            signs.len(),
+                            expected_len,
+                            meta.code_dim
+                        )));
+                    }
+                }
+                RQRotationType::Matrix => {
+                    if meta.rotate_mat.is_none() {
+                        return Err(Error::invalid_input(
+                            "use the fast rotation for distributed builds",
+                        ));
+                    }
+                }
+            }
+            return Ok(Self {
+                metadata: meta.clone(),
+            });
         }
 
         let q = match data.as_fixed_size_list().value_type() {
@@ -408,24 +768,26 @@ impl Quantization for RabitQuantizer {
         metadata: &Self::Metadata,
         _: lance_linalg::distance::DistanceType,
     ) -> Result<Quantizer> {
+        validate_rq_num_bits(metadata.num_bits)?;
         Ok(Quantizer::Rabit(Self {
             metadata: metadata.clone(),
         }))
     }
 
     fn field(&self) -> Field {
-        Field::new(
-            RABIT_CODE_COLUMN,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, true)),
-                self.code_dim() as i32 / u8::BITS as i32, // num_bits -> num_bytes
-            ),
-            true,
-        )
+        rabit_binary_code_field(self.code_dim())
     }
 
     fn extra_fields(&self) -> Vec<Field> {
-        vec![ADD_FACTORS_FIELD.clone(), SCALE_FACTORS_FIELD.clone()]
+        let mut fields = vec![ADD_FACTORS_FIELD.clone(), SCALE_FACTORS_FIELD.clone()];
+        if let Some(ex_code_field) = rabit_ex_code_field(self.code_dim(), self.metadata.num_bits)
+            .expect("RabitQ num_bits should be validated")
+        {
+            fields.push(ex_code_field);
+            fields.push(EX_ADD_FACTORS_FIELD.clone());
+            fields.push(EX_SCALE_FACTORS_FIELD.clone());
+        }
+        fields
     }
 }
 
@@ -561,11 +923,23 @@ mod tests {
         let fast_q = RabitQuantizer::new_with_rotation::<Float32Type>(1, 128, RQRotationType::Fast);
         assert_eq!(fast_q.rotation_type(), RQRotationType::Fast);
         assert_eq!(fast_q.dim(), 128);
+        assert_eq!(fast_q.code_dim(), 128);
 
         let matrix_q =
             RabitQuantizer::new_with_rotation::<Float32Type>(1, 128, RQRotationType::Matrix);
         assert_eq!(matrix_q.rotation_type(), RQRotationType::Matrix);
         assert_eq!(matrix_q.dim(), 128);
+        assert_eq!(matrix_q.code_dim(), 128);
+    }
+
+    #[test]
+    fn test_rabit_quantizer_field_uses_binary_code_size() {
+        let q = RabitQuantizer::new_with_rotation::<Float32Type>(1, 128, RQRotationType::Fast);
+        let field = q.field();
+        let DataType::FixedSizeList(_, code_bytes) = field.data_type() else {
+            panic!("RabitQ code field should be FixedSizeList");
+        };
+        assert_eq!(*code_bytes, 16);
     }
 
     #[test]
@@ -578,6 +952,169 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("vector dimension must be divisible by 8 for IVF_RQ"),
+            "{}",
+            err
+        );
+    }
+
+    fn sample_fsl(n: usize, dim: usize) -> FixedSizeListArray {
+        let values: Vec<f32> = (0..n * dim).map(|i| ((i * 31 % 17) as f32) - 8.0).collect();
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
+    }
+
+    fn quantized_codes(q: &RabitQuantizer, data: &FixedSizeListArray) -> Vec<u8> {
+        use arrow::datatypes::UInt8Type;
+        q.quantize(data)
+            .unwrap()
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt8Type>()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn test_shared_fast_rotation_gives_identical_codes() {
+        let dim = 32;
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Fast);
+        let json = serde_json::to_string(&seed.metadata(None)).unwrap();
+        let meta: RabitQuantizationMetadata = serde_json::from_str(&json).unwrap();
+
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Fast,
+            rotation: Some(meta),
+        };
+        let data = sample_fsl(8, dim as usize);
+        let q_a = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+        let q_b = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+
+        assert_eq!(
+            quantized_codes(&q_a, &data),
+            quantized_codes(&q_b, &data),
+            "shared rotation must yield identical codes"
+        );
+    }
+
+    #[test]
+    fn test_unpinned_rotation_gives_different_codes() {
+        let dim = 32;
+        let params = RQBuildParams::new(1);
+        let data = sample_fsl(8, dim as usize);
+        let q_a = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+        let q_b = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
+
+        assert_ne!(
+            quantized_codes(&q_a, &data),
+            quantized_codes(&q_b, &data),
+            "independent unpinned rotations must yield different codes"
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_rotation_with_mismatched_code_dim() {
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, 16, RQRotationType::Fast);
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Fast,
+            rotation: Some(seed.metadata(None)),
+        };
+        let data = sample_fsl(4, 32);
+        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match build params"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_fast_rotation_with_bad_signs_length() {
+        let dim = 16;
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Fast);
+        let mut meta = seed.metadata(None);
+        // Corrupt the signs to the wrong length (valid would be 4 * ceil(16/8) = 8).
+        meta.fast_rotation_signs = Some(vec![0u8; 7]);
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Fast,
+            rotation: Some(meta),
+        };
+        let data = sample_fsl(4, dim as usize);
+        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        assert!(err.to_string().contains("signs length"), "{}", err);
+    }
+
+    #[test]
+    fn test_matrix_rotation_lost_through_json_is_rejected() {
+        let dim = 16;
+        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Matrix);
+        let meta = seed.metadata(None);
+        assert!(meta.rotate_mat.is_some());
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: RabitQuantizationMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rotation_type, RQRotationType::Matrix);
+        assert!(
+            parsed.rotate_mat.is_none(),
+            "matrix is expected to be dropped by JSON serialization"
+        );
+
+        let params = RQBuildParams {
+            num_bits: 1,
+            rotation_type: RQRotationType::Matrix,
+            rotation: Some(parsed),
+        };
+        let data = sample_fsl(4, dim as usize);
+        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fast rotation for distributed builds"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_rabit_quantizer_accepts_multi_bit_range() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+
+        let err =
+            RabitQuantizer::build(&fsl, DistanceType::L2, &RQBuildParams::new(0)).unwrap_err();
+        assert!(
+            err.to_string().contains("IVF_RQ num_bits must be in"),
+            "{}",
+            err
+        );
+
+        for rotation_type in [RQRotationType::Fast, RQRotationType::Matrix] {
+            let quantizer = RabitQuantizer::build(
+                &fsl,
+                DistanceType::L2,
+                &RQBuildParams::with_rotation_type(9, rotation_type),
+            )
+            .unwrap();
+            let quantized = quantizer.quantize_split(&fsl).unwrap();
+            assert!(quantized.ex_codes.is_some());
+            assert_eq!(
+                quantized.binary_codes.as_fixed_size_list().value_length(),
+                4
+            );
+            assert_eq!(
+                quantized
+                    .ex_codes
+                    .unwrap()
+                    .as_fixed_size_list()
+                    .value_length(),
+                32
+            );
+        }
+
+        let err =
+            RabitQuantizer::build(&fsl, DistanceType::L2, &RQBuildParams::new(10)).unwrap_err();
+        assert!(
+            err.to_string().contains("IVF_RQ num_bits must be in"),
             "{}",
             err
         );

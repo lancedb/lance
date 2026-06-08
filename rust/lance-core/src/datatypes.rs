@@ -70,6 +70,26 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
 
+/// Blob v2 user-view struct fields used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+    ])
+});
+
+/// Blob v2 user-view struct type used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_USER_FIELDS.clone()));
+
 pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
 /// LogicalType is a string presentation of arrow type.
@@ -165,8 +185,8 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float64 => "double".to_string(),
             DataType::Decimal128(precision, scale) => format!("decimal:128:{precision}:{scale}"),
             DataType::Decimal256(precision, scale) => format!("decimal:256:{precision}:{scale}"),
-            DataType::Utf8 => "string".to_string(),
-            DataType::Binary => "binary".to_string(),
+            DataType::Utf8 | DataType::Utf8View => "string".to_string(),
+            DataType::Binary | DataType::BinaryView => "binary".to_string(),
             DataType::LargeUtf8 => "large_string".to_string(),
             DataType::LargeBinary => "large_binary".to_string(),
             DataType::Date32 => "date32:day".to_string(),

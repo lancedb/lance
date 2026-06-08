@@ -12,7 +12,7 @@ use lance_datagen::{
     generator::ArrayGenerator,
 };
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 const NUM_BATCHES: u32 = 100;
 const KB_PER_BATCH: u64 = 128;

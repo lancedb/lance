@@ -18,7 +18,9 @@ use std::{
 };
 
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -27,9 +29,9 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::{SargableQuery, ScalarIndex, bitmap::BitmapIndexPlugin};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 
 // Lazy static runtime - only created once
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();

@@ -39,6 +39,33 @@ pub struct IvfBuildParams {
 
     pub sample_rate: usize,
 
+    /// Optional per-step sample rate for streaming IVF kmeans training.
+    ///
+    /// When set, IVF training loads at most `num_partitions * streaming_sample_rate`
+    /// vectors at a time. For `num_partitions > 256`, each chunk is compressed into
+    /// a weighted coreset and final centroids are trained with weighted hierarchical
+    /// kmeans over the coreset. The coreset budget is also bounded by this rate by
+    /// default so large partition counts can control peak memory by lowering
+    /// `streaming_sample_rate`. The total number of sampled vectors remains bounded
+    /// by `num_partitions * sample_rate`.
+    pub streaming_sample_rate: Option<usize>,
+
+    /// Optional coreset rate for streaming IVF kmeans training.
+    ///
+    /// When set, the final weighted coreset budget is
+    /// `num_partitions * streaming_coreset_rate`, independent of
+    /// `streaming_sample_rate`. The streaming chunk size is still controlled by
+    /// `streaming_sample_rate`.
+    pub streaming_coreset_rate: Option<usize>,
+
+    /// Number of extra streaming Lloyd refinement passes to run after streaming
+    /// coreset training.
+    ///
+    /// Each pass reuses the same sampled vectors and only loads
+    /// `num_partitions * streaming_sample_rate` raw vectors at a time.  This is
+    /// experimental and defaults to 0 to preserve existing behavior.
+    pub streaming_refine_passes: usize,
+
     /// Precomputed partitions file (row_id -> partition_id)
     /// mutually exclusive with `precomputed_shuffle_buffers`
     pub precomputed_partitions_file: Option<String>,
@@ -67,6 +94,9 @@ impl Default for IvfBuildParams {
             centroids: None,
             retrain: false,
             sample_rate: 256, // See faiss
+            streaming_sample_rate: None,
+            streaming_coreset_rate: None,
+            streaming_refine_passes: 0,
             precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
             shuffle_partition_batches: 1024 * 10,

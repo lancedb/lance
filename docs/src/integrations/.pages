@@ -1,4 +1,5 @@
 nav:
+  - Overview: index.md
   - Apache DataFusion: datafusion.md
   - PostgreSQL: https://github.com/lancedb/pglance
   - PyTorch: pytorch.md

@@ -138,13 +138,18 @@ fn sign_bytes_per_round(dim: usize) -> usize {
     dim.div_ceil(8)
 }
 
+pub(crate) fn fast_rotation_signs_len(dim: usize) -> usize {
+    FAST_ROTATION_ROUNDS * sign_bytes_per_round(dim)
+}
+
 pub fn random_fast_rotation_signs(dim: usize) -> Vec<u8> {
     // Each round needs one random sign bit per dimension.
-    let mut signs = vec![0u8; FAST_ROTATION_ROUNDS * sign_bytes_per_round(dim)];
+    let mut signs = vec![0u8; fast_rotation_signs_len(dim)];
     rand::rng().fill_bytes(&mut signs);
     signs
 }
 
+#[inline]
 pub fn apply_fast_rotation<T: AsPrimitive<f32>>(input: &[T], output: &mut [f32], signs: &[u8]) {
     // Fast random rotation pipeline, aligned with RaBitQ-Library's FhtKacRotator:
     // - power-of-two dims: repeat [random signs -> FWHT -> scale] for 4 rounds
@@ -152,8 +157,6 @@ pub fn apply_fast_rotation<T: AsPrimitive<f32>>(input: &[T], output: &mut [f32],
     //
     // This keeps the fast path matrix-free: no dense orthogonal matrix materialization.
     let dim = output.len();
-    let bytes_per_round = sign_bytes_per_round(dim);
-    debug_assert_eq!(signs.len(), FAST_ROTATION_ROUNDS * bytes_per_round);
     let input_len = input.len().min(dim);
     output[..input_len]
         .iter_mut()
@@ -163,6 +166,14 @@ pub fn apply_fast_rotation<T: AsPrimitive<f32>>(input: &[T], output: &mut [f32],
         output[input_len..].fill(0.0);
     }
 
+    apply_fast_rotation_in_place(output, signs);
+}
+
+#[inline]
+pub fn apply_fast_rotation_in_place(output: &mut [f32], signs: &[u8]) {
+    let dim = output.len();
+    let bytes_per_round = sign_bytes_per_round(dim);
+    debug_assert_eq!(signs.len(), FAST_ROTATION_ROUNDS * bytes_per_round);
     if dim == 0 {
         return;
     }

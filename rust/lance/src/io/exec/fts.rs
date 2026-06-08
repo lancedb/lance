@@ -24,7 +24,7 @@ use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::future::try_join_all;
 use futures::stream::{self};
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -496,7 +496,11 @@ impl ExecutionPlan for MatchQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(build_global_bm25_scorer(&indices, &tokens, &params)?),
+                None => Arc::new(
+                    build_global_bm25_scorer(&indices, &tokens, &params)
+                        .boxed()
+                        .await?,
+                ),
             };
 
             pre_filter.wait_for_ready().await?;
@@ -1041,7 +1045,9 @@ impl ExecutionPlan for FlatMatchQueryExec {
                                 &indices,
                                 &query_tokens,
                                 &FtsSearchParams::new(),
-                            )?
+                            )
+                            .boxed()
+                            .await?
                         }
                     };
                     (tokenizer, Some(base_scorer))
@@ -1352,7 +1358,11 @@ impl ExecutionPlan for PhraseQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(build_global_bm25_scorer(&indices, &tokens, &params)?),
+                None => Arc::new(
+                    build_global_bm25_scorer(&indices, &tokens, &params)
+                        .boxed()
+                        .await?,
+                ),
             };
 
             pre_filter.wait_for_ready().await?;
@@ -2354,14 +2364,7 @@ mod tests {
                 .fragments(vec![fragment_id]);
             metadatas.push(builder.execute_uncommitted().await.unwrap());
         }
-        let segments = ds
-            .create_index_segment_builder()
-            .with_index_type(IndexType::Inverted)
-            .with_segments(metadatas.clone())
-            .build_all()
-            .await
-            .unwrap();
-        ds.commit_existing_index_segments("seg_fts", "text", segments)
+        ds.commit_existing_index_segments("seg_fts", "text", metadatas.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -2411,8 +2414,11 @@ mod tests {
         );
         let mut tokenizer = indices[0].tokenizer();
         let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-        let global_scorer =
-            Arc::new(build_global_bm25_scorer(&indices, &tokens, &search_params).unwrap());
+        let global_scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &tokens, &search_params)
+                .await
+                .unwrap(),
+        );
 
         let override_exec = MatchQueryExec::new_with_segments(
             dataset.clone(),

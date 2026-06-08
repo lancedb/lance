@@ -48,6 +48,7 @@ rand.workspace = true
 rstest.workspace = true
 test-log.workspace = true
 criterion = { workspace = true }
+lance-testing.workspace = true
 rand_xoshiro = { workspace = true }
 proptest.workspace = true
 serial_test.workspace = true
@@ -55,9 +56,6 @@ serial_test.workspace = true
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { workspace = true }
 
 [features]
 default = ["lz4", "zstd", "bitpacking"]

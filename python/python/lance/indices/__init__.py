@@ -10,7 +10,6 @@ from .pq import PqModel
 
 IndexSegmentDescription = _lance.indices.IndexSegmentDescription
 IndexSegment = _lance.indices.IndexSegment
-IndexSegmentPlan = _lance.indices.IndexSegmentPlan
 
 __all__ = [
     "IndicesBuilder",
@@ -19,7 +18,6 @@ __all__ = [
     "IvfModel",
     "IndexFileVersion",
     "IndexSegment",
-    "IndexSegmentPlan",
     "IndexSegmentDescription",
 ]
 
@@ -32,7 +30,6 @@ class IndexFileVersion(str, Enum):
 class SupportedDistributedIndices(str, Enum):
     # Scalar index types
     BTREE = "BTREE"
-    BITMAP = "BITMAP"
     INVERTED = "INVERTED"
 
     # Precise vector index types supported by distributed merge

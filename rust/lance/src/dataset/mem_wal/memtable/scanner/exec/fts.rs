@@ -23,7 +23,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
-use super::super::builder::{DEFAULT_WAND_FACTOR, FtsQuery, FtsQueryType};
+use super::super::builder::{FtsQuery, FtsQueryType};
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -106,7 +106,12 @@ impl FtsIndexExec {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.push(Field::new(SCORE_COLUMN, DataType::Float32, false));
+        // `_score` is nullable here to stay schema-compatible with
+        // `lance_index::scalar::inverted::FTS_SCHEMA` (the schema base/flushed
+        // FTS exec nodes emit). The LSM `full_text_search` planner unions the
+        // active arm with base/flushed arms; UnionExec requires schema equality
+        // including nullability. The actual emitted column is always populated.
+        fields.push(Field::new(SCORE_COLUMN, DataType::Float32, true));
         if with_row_id {
             fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
         }
@@ -204,14 +209,12 @@ impl FtsIndexExec {
             } => FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *max_expansions),
         };
 
-        // Search the index using the query expression
-        // Use search_with_options if wand_factor is set (< 1.0)
-        let entries = if self.query.wand_factor < DEFAULT_WAND_FACTOR {
-            let options = SearchOptions::new().with_wand_factor(self.query.wand_factor);
-            index.search_with_options(&query_expr, options)
-        } else {
-            index.search_query(&query_expr)
-        };
+        // Search the index using the query expression. `include_tail` selects
+        // read-your-writes vs immutable-only; `wand_factor` adds pruning.
+        let options = SearchOptions::new()
+            .with_wand_factor(self.query.wand_factor)
+            .with_include_tail(self.query.include_tail);
+        let entries = index.search_with_options(&query_expr, options);
 
         // Convert to (row_position, score) pairs
         entries

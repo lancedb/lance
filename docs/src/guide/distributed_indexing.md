@@ -65,7 +65,7 @@ indices/<physical_segment_uuid_1>/
 
 These physical segments are then committed together as one logical index. In the
 common no-merge case, the input segments are already the physical
-segments and `build_all()` returns them unchanged.
+segments and can be committed directly.
 
 ## Roles
 
@@ -73,9 +73,8 @@ There are two parties involved in distributed indexing:
 
 - **Workers** build segments
 - **The caller** launches workers, chooses how those segments should be turned
-  into physical segments, provides any additional inputs requested by the
-  segment build APIs, and
-  commits the final result
+  into final segments, optionally merges caller-defined groups, and commits the
+  final result
 
 Lance does not provide a distributed scheduler. The caller is responsible for
 launching workers and driving the overall workflow.
@@ -105,6 +104,37 @@ or merged into larger segments:
 3. commit the final segment list with `commit_existing_index_segments(...)`
 
 Within a single commit, built segments must have disjoint fragment coverage.
+
+### Vector Model Scope
+
+Distributed vector builds support two model scopes.
+
+**Shared model artifacts**: the caller trains or provides IVF centroids once and
+passes the same artifacts to every worker. For IVF-PQ segments that should be
+physically mergeable, workers should also use the same PQ codebook. This makes
+partition ids and quantizer state have the same meaning across segments.
+
+**Independent segment models**: each worker trains the IVF/PQ model for its own
+`fragment_ids`. The resulting segments can be committed together as one logical
+index without sharing centroids or codebooks.
+
+At query time, Lance searches each physical segment independently:
+
+1. Lance opens each segment by index UUID
+2. each segment ranks IVF partitions using its own centroids
+3. each segment searches the selected partitions using its own quantizer storage
+4. Lance merges the candidate rows from all segments by `_distance`
+
+Because partition ids are interpreted only within a segment during this fanout
+query path, independently trained committed segments can return valid results.
+For L2 and cosine IVF-PQ, each segment computes residuals against its own IVF
+centroid during both build and query, so distances remain estimates of the
+original query-to-vector metric.
+
+Physical merge is a separate operation. It rewrites several segment artifacts
+into one artifact with one model metadata scope. Use shared compatible model
+artifacts for segments you plan to merge physically, or keep independently
+trained segments as separate physical segments.
 
 ## Internal Finalize Model
 

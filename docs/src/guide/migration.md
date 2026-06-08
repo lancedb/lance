@@ -6,6 +6,25 @@ stable and breaking changes should generally be communicated (via warnings) for 
 give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
 migrate.
 
+## 7.2.0
+
+* The `IndexSegmentBuilder` API has been removed from Rust, Python, and Java.
+  This API was deprecated by the distributed indexing flow based on
+  `create_index_uncommitted`, `merge_existing_index_segments`, and
+  `commit_existing_index_segments`, but remained in the codebase as a parallel
+  way to plan and publish staged index segments.
+
+* Callers should now publish staged segment outputs directly with
+  `commit_existing_index_segments(...)`. If multiple staged outputs should be
+  combined into a larger physical segment first, callers should explicitly group
+  those outputs and call `merge_existing_index_segments(...)` for each group
+  before committing the final segment list.
+
+* The old builder's `target_segment_bytes` automatic size-based grouping has no
+  direct replacement. Distributed index drivers that used it should choose
+  segment groups themselves, then pass each group to
+  `merge_existing_index_segments(...)`.
+
 ## 5.0.0
 
 * The default data storage version changed from 2.0 to 2.1. This affects the `column_indices`

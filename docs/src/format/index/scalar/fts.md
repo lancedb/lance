@@ -80,8 +80,20 @@ The full text search index supports multiple tokenizer types for different text 
 | **whitespace** | Splits only on whitespace characters                                      | Preserve punctuation   |
 | **raw**        | No tokenization, treats entire text as single token                       | Exact matching         |
 | **ngram**      | Breaks text into overlapping character sequences                          | Substring/fuzzy search |
+| **icu**        | ICU dictionary-based Unicode word segmentation                            | Mixed-language text    |
 | **jieba/***    | Chinese text tokenizer with word segmentation                             | Chinese text           |
 | **lindera/***  | Japanese text tokenizer with morphological analysis                       | Japanese text          |
+
+#### ICU Tokenizer (Mixed-language text)
+
+The ICU tokenizer uses Unicode word boundary rules and dictionary-based segmentation for complex scripts. It is useful for mixed-language text where the default `simple` tokenizer would keep an unspaced CJK span as one large token.
+
+- **Models**: Uses compiled ICU4X segmenter data bundled with Lance
+- **Usage**: Specify as `icu`
+- **Features**:
+  - Unicode-aware word boundary detection
+  - Dictionary-based segmentation for Chinese, Japanese, Khmer, Lao, Myanmar, and Thai
+  - No external language model download required
 
 #### Jieba Tokenizer (Chinese)
 

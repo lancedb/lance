@@ -28,14 +28,6 @@ class IndexSegment:
 
     def __repr__(self) -> str: ...
 
-class IndexSegmentPlan:
-    segment: IndexSegment
-    segments: list[object]
-    estimated_bytes: int
-    requested_index_type: Optional[str]
-
-    def __repr__(self) -> str: ...
-
 def train_ivf_model(
     dataset,
     column: str,
@@ -67,6 +59,11 @@ def transform_vectors(
     pq_codebook: pa.Array,
     dst_uri: str,
 ): ...
+def build_rq_model(
+    dimension: int,
+    num_bits: int = 1,
+    dtype: str = "float32",
+) -> str: ...
 
 class IndexSegmentDescription:
     uuid: str
@@ -75,6 +72,7 @@ class IndexSegmentDescription:
     index_version: int
     created_at: Optional[datetime]
     size_bytes: Optional[int]
+    base_id: Optional[int]
 
     def __repr__(self) -> str: ...
 

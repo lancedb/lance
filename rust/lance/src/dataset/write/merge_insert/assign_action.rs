@@ -125,6 +125,12 @@ pub fn merge_insert_action(
                 ));
             }
         }
+        WhenMatched::UpdateIfExpr(condition) => {
+            cases.push((
+                matched.and(condition.clone()),
+                Action::UpdateAll.as_literal_expr(),
+            ));
+        }
         WhenMatched::DoNothing => {}
         WhenMatched::Fail => {
             cases.push((matched, Action::Fail.as_literal_expr()));

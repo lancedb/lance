@@ -125,6 +125,7 @@ exceptions = [
     # Each entry is the crate and version constraint, and its specific allow
     # list
     #{ allow = ["Zlib"], crate = "adler32" },
+    { allow = ["CDDL-1.0"], crate = "inferno" },
 ]
 
 # Some crates don't have (easily) machine readable licensing information,
