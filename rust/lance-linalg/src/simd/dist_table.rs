@@ -149,6 +149,10 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dis
         accu2 = _mm256_add_epi16(accu2, res_hi);
         accu3 = _mm256_add_epi16(accu3, _mm256_srli_epi16(res_hi, 8));
 
+        if i + 32 >= codes.len() {
+            continue;
+        }
+
         // load the left 32 bytes of codes and lut
         c = _mm256_loadu_si256(codes.as_ptr().add(i + 32) as *const __m256i);
         lut_vec = _mm256_loadu_si256(dist_table.as_ptr().add(i + 32) as *const __m256i);
@@ -352,7 +356,7 @@ mod tests {
         // directly since that's what the function sees.
         // code_len=16 → DIM=128, code_len=192 → DIM=1536,
         // code_len=512 → DIM=4096, code_len=8192 → DIM=65536
-        for code_len in [2, 16, 96, 192, 512, 1024, 8192] {
+        for code_len in [1, 2, 3, 16, 95, 96, 192, 512, 1024, 8192] {
             let n = BATCH_SIZE; // 32 vectors per batch
 
             // Each code byte produces 2 lookups; cap values so
@@ -386,7 +390,7 @@ mod tests {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
 
-        for code_len in [16, 192, 1024] {
+        for code_len in [1, 3, 16, 191, 192, 1024] {
             let n = BATCH_SIZE * 10; // 320 vectors = 10 batches
 
             let max_val = (u16::MAX as usize / (2 * code_len)).min(255) as u8;
