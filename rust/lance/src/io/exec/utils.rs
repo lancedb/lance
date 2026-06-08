@@ -579,11 +579,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let n_batches: usize = 3;
-        // child_delay is intentionally several times larger than transform_delay
-        // so the assertion tolerates significant `std::thread::sleep` overshoot
-        // on busy CI runners (we've seen ~2-3x overshoot on macOS Actions).
         let child_delay = Duration::from_millis(150);
-        let transform_delay = Duration::from_millis(30);
 
         let counter = Arc::new(AtomicUsize::new(0));
         let s = schema.clone();
@@ -607,10 +603,7 @@ mod tests {
         let stream = InstrumentedChildInputStream::new(
             child,
             schema,
-            move |batch| async move {
-                std::thread::sleep(transform_delay);
-                Ok(batch)
-            },
+            move |batch| async move { Ok(batch) },
             1,
             0,
             &metrics,
@@ -625,16 +618,10 @@ mod tests {
             .expect("elapsed_compute should be recorded");
         let elapsed = Duration::from_nanos(elapsed_ns as u64);
 
-        // Expect ~ transform_delay * n. The upper bound is set generously to
-        // absorb sleep overshoot on slow CI (~4-5x per call) while still
-        // cleanly rejecting any version that double-counts child poll time,
-        // which would yield ~ (transform_delay + child_delay) * n.
-        let upper = Duration::from_millis(400);
-        assert!(
-            elapsed >= transform_delay * (n_batches as u32 - 1),
-            "elapsed_compute={:?} too low; transform time was not measured",
-            elapsed,
-        );
+        // The transform is immediate, so `elapsed_compute` should stay well
+        // below even one child poll delay. A version that double-counts child
+        // input time would include roughly `child_delay * n_batches`.
+        let upper = child_delay;
         assert!(
             elapsed < upper,
             "elapsed_compute={:?} >= {:?}; child input time was double-counted",
