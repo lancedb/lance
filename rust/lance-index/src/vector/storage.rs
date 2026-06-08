@@ -7,9 +7,9 @@ use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
-use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
@@ -102,7 +102,7 @@ impl Default for QueryScratch {
 }
 
 impl DeepSizeOf for QueryScratch {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.distances.capacity() * size_of::<f32>()
             + self.query_f32.capacity() * size_of::<f32>()
             + self.u16.capacity() * size_of::<u16>()
@@ -224,7 +224,7 @@ impl Drop for QueryScratchGuard<'_> {
 }
 
 impl DeepSizeOf for QueryScratchPool {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut total = self.scratches.capacity() * size_of::<QueryScratch>();
         let mut scratches = Vec::new();
         while let Some(scratch) = self.scratches.pop() {
@@ -381,7 +381,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
     }
 }
@@ -531,7 +531,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{QueryScratchCapacity, QueryScratchPool};
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
 
     #[test]
     fn test_query_scratch_pool_reuses_buffers() {

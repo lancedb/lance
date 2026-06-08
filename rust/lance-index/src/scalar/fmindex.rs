@@ -28,9 +28,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
@@ -42,8 +42,8 @@ use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, IndexStore, OldIndexDataFilter, ScalarIndex,
-    ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
+    ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
@@ -631,7 +631,7 @@ pub struct FMIndex {
 }
 
 impl DeepSizeOf for FMIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.wavelet.deep_size()
             + self.row_ids.len() * 8
             + self.sa_samples.len() * 8
@@ -1139,7 +1139,7 @@ pub struct FMIndexScalarIndex {
 }
 
 impl DeepSizeOf for FMIndexScalarIndex {
-    fn deep_size_of_children(&self, _ctx: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _ctx: &mut lance_core::deepsize::Context) -> usize {
         self.partitions.iter().map(|p| p.fm.deep_size()).sum()
     }
 }
@@ -1330,11 +1330,11 @@ impl ScalarIndex for FMIndexScalarIndex {
         _: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let texts = collect_texts(new_data).await?;
-        write_partitioned_fmindex(&texts, dest).await?;
+        let files = write_partitioned_fmindex(&texts, dest).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
-            files: Some(dest.list_files_with_sizes().await?),
+            files,
         })
     }
     fn update_criteria(&self) -> UpdateCriteria {
@@ -1449,7 +1449,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 ///   - Wavelet block rows (BWT nodes)
 ///   - SA sample blocks (packed u64 in LargeBinary)
 ///   - Metadata: c_table, huffman_codes, tree_topology, row_ids, doc_start_positions
-async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> Result<()> {
+async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> Result<IndexFile> {
     let schema = Arc::new(FMIndex::block_schema());
 
     let mut writer = store.new_index_file(filename, schema.clone()).await?;
@@ -1519,22 +1519,26 @@ async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> 
         .collect();
     metadata.insert("doc_start_positions".into(), hex_encode(&doc_starts_bytes));
 
-    writer.finish_with_metadata(metadata).await?;
-    Ok(())
+    writer.finish_with_metadata(metadata).await
 }
 
-async fn write_partitioned_fmindex(texts: &[(u64, Vec<u8>)], store: &dyn IndexStore) -> Result<()> {
+async fn write_partitioned_fmindex(
+    texts: &[(u64, Vec<u8>)],
+    store: &dyn IndexStore,
+) -> Result<Vec<IndexFile>> {
     let refs: Vec<(u64, &[u8])> = texts.iter().map(|(id, t)| (*id, t.as_slice())).collect();
     if refs.is_empty() {
         let fm = FMIndex::build(&[])?;
-        write_fmindex(&fm, store, &fmindex_partition_path(0)).await?;
-        return Ok(());
+        return Ok(vec![
+            write_fmindex(&fm, store, &fmindex_partition_path(0)).await?,
+        ]);
     }
+    let mut files = Vec::new();
     for (pid, chunk) in refs.chunks(PARTITION_SIZE).enumerate() {
         let fm = FMIndex::build(chunk)?;
-        write_fmindex(&fm, store, &fmindex_partition_path(pid as u64)).await?;
+        files.push(write_fmindex(&fm, store, &fmindex_partition_path(pid as u64)).await?);
     }
-    Ok(())
+    Ok(files)
 }
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
@@ -1574,11 +1578,11 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let texts = collect_texts(data).await?;
-        write_partitioned_fmindex(&texts, store).await?;
+        let files = write_partitioned_fmindex(&texts, store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
-            files: Some(store.list_files_with_sizes().await?),
+            files,
         })
     }
     fn provides_exact_answer(&self) -> bool {

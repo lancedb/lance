@@ -188,6 +188,6 @@ pub(crate) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: created_index.files,
+        files: Some(created_index.files),
     })
 }

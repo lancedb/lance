@@ -12,7 +12,7 @@ use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
-    BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
+    BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
 };
 use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
@@ -33,10 +33,10 @@ use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
 use lance_core::cache::LanceCache;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -58,7 +58,7 @@ struct BloomFilterStatistics {
 }
 
 impl DeepSizeOf for BloomFilterStatistics {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Estimate the size of the bloom filter
         // We could try to get the actual size from the Sbbf if it has a method for that,
         // but for now we'll estimate based on the number of bytes it serializes to
@@ -82,7 +82,7 @@ pub struct BloomFilterIndex {
 }
 
 impl DeepSizeOf for BloomFilterIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.zones.deep_size_of_children(context)
     }
 }
@@ -458,13 +458,13 @@ impl ScalarIndex for BloomFilterIndex {
         // Write the combined zones back to storage
         let mut builder = BloomFilterIndexBuilder::try_new(params)?;
         builder.blocks = updated_blocks;
-        builder.write_index(dest_store).await?;
+        let file = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -620,7 +620,7 @@ impl BloomFilterIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
         let record_batch = self.bloomfilter_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -638,8 +638,7 @@ impl BloomFilterIndexBuilder {
             .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await?;
-        Ok(())
+        index_file.finish().await
     }
 }
 
@@ -986,13 +985,12 @@ impl BloomFilterIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<BloomFilterIndexBuilderParams>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let mut builder = BloomFilterIndexBuilder::try_new(options.unwrap_or_default())?;
 
         builder.train(batches_source).await?;
 
-        builder.write_index(index_store).await?;
-        Ok(())
+        builder.write_index(index_store).await
     }
 }
 
@@ -1076,12 +1074,12 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
+        let file = Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 

@@ -11,7 +11,7 @@ use std::{
 };
 
 use super::{
-    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
@@ -38,13 +38,13 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
 };
 use lance_arrow::ipc::{read_ipc_stream_single_at, write_ipc_stream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
@@ -84,7 +84,7 @@ pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
 pub struct OrderableScalarValue(pub ScalarValue);
 
 impl DeepSizeOf for OrderableScalarValue {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // deepsize and size both factor in the size of the ScalarValue
         self.0.size() - std::mem::size_of::<ScalarValue>()
     }
@@ -1125,7 +1125,7 @@ struct BTreeIndexState {
 }
 
 impl DeepSizeOf for BTreeIndexState {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`.
         // The parsed lookup tree is the resident memory we need to charge.
         self.page_lookup.deep_size_of_children(context)
@@ -1318,7 +1318,7 @@ pub struct BTreeIndex {
 }
 
 impl DeepSizeOf for BTreeIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We don't include the index cache, or anything stored in it. For example:
         // sub_index and fri.
         self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
@@ -1608,13 +1608,14 @@ impl BTreeIndex {
         )?;
         let merged_stream = chunk_concat_stream(unchunked, first.batch_size as usize);
 
-        train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
+        let files =
+            train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 }
@@ -1894,6 +1895,7 @@ impl ScalarIndex for BTreeIndex {
 
         let mapping = Arc::new(mapping.clone());
         let train_schema = Arc::new(self.train_schema());
+        let mut remapped_files = Vec::new();
 
         // TODO: Could potentially parallelize this across parts, unclear it would be worth it
         for (part_id, page_file) in part_page_files {
@@ -1924,7 +1926,10 @@ impl ScalarIndex for BTreeIndex {
                 remapped_stream,
             ));
 
-            train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id).await?;
+            let mut files =
+                train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id)
+                    .await?;
+            remapped_files.append(&mut files);
         }
 
         if let Some(ranges_to_files) = &self.ranges_to_files {
@@ -1936,7 +1941,7 @@ impl ScalarIndex for BTreeIndex {
             let lookup_files = (0..num_parts)
                 .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
                 .collect::<Vec<_>>();
-            merge_metadata_files(
+            let merged_files = merge_metadata_files(
                 dest_store,
                 &page_files,
                 &lookup_files,
@@ -1944,13 +1949,15 @@ impl ScalarIndex for BTreeIndex {
                 noop_progress(),
             )
             .await?;
+            remapped_files.retain(|file| file.path.ends_with("_page_data.lance"));
+            remapped_files.extend(merged_files);
         }
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: remapped_files,
         })
     }
 
@@ -2105,7 +2112,7 @@ pub async fn train_btree_index(
     batch_size: u64,
     fragment_ids: Option<Vec<u32>>,
     range_id: Option<u32>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create `partition_id` for distributed index building.
     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
     // that index partitions generated by different workers do not conflict.
@@ -2170,7 +2177,7 @@ pub async fn train_btree_index(
         );
         batch_idx += 1;
     }
-    sub_index_file.finish().await?;
+    let pages_file = sub_index_file.finish().await?;
     let record_batch = btree_stats_as_batch(encoded_batches, &value_type)?;
     let mut file_schema = record_batch.schema().as_ref().clone();
     file_schema
@@ -2196,8 +2203,8 @@ pub async fn train_btree_index(
         }
     };
     btree_index_file.write_record_batch(record_batch).await?;
-    btree_index_file.finish().await?;
-    Ok(())
+    let lookup_file = btree_index_file.finish().await?;
+    Ok(vec![pages_file, lookup_file])
 }
 
 fn find_single_partition_files(
@@ -2255,7 +2262,7 @@ async fn merge_metadata_files(
     part_lookup_files: &[String],
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
         return Err(Error::internal(
             "No partition files provided for merging".to_string(),
@@ -2331,6 +2338,7 @@ async fn merge_metadata_files(
             progress,
         )
         .await
+        .map(|file| vec![file])
     } else {
         merge_pages_and_lookups(
             store,
@@ -2384,7 +2392,7 @@ async fn merge_range_partitioned_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<IndexFile> {
     let sorted_part_lookup_files = sort_files_by_partition_id(part_lookup_files)?;
     let mut lookup_file = store
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
@@ -2424,12 +2432,12 @@ async fn merge_range_partitioned_lookups(
         serde_json::to_string(&pages_per_file)?,
     );
 
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_complete("merge_lookups").await?;
 
     // In this mode, we only clean up lookup files, and page files are untouched.
     cleanup_partition_files(store, part_lookup_files, &[]).await;
-    Ok(())
+    Ok(lookup_file)
 }
 
 /// Merges partition files using a K-way sort-merge algorithm.
@@ -2448,7 +2456,7 @@ async fn merge_pages_and_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create a new global page file
     let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
     let page_file = page_files_map.get(&partition_id).unwrap();
@@ -2471,7 +2479,7 @@ async fn merge_pages_and_lookups(
         progress.clone(),
     )
     .await?;
-    page_file.finish().await?;
+    let page_file = page_file.finish().await?;
     progress.stage_complete("merge_pages").await?;
 
     let lookup_batch = RecordBatch::try_new(
@@ -2496,7 +2504,7 @@ async fn merge_pages_and_lookups(
         .stage_start("write_lookup_file", Some(1), "files")
         .await?;
     lookup_file.write_record_batch(lookup_batch).await?;
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_progress("write_lookup_file", 1).await?;
     progress.stage_complete("write_lookup_file").await?;
 
@@ -2504,7 +2512,7 @@ async fn merge_pages_and_lookups(
     // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
     cleanup_partition_files(store, part_lookup_files, part_page_files).await;
 
-    Ok(())
+    Ok(vec![page_file, lookup_file])
 }
 
 // Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
@@ -2913,7 +2921,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
                  The `range_id` field will be removed in a future release."
             );
         }
-        train_btree_index(
+        let files = train_btree_index(
             data,
             index_store,
             request
@@ -2928,7 +2936,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -2988,10 +2996,10 @@ mod tests {
     };
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
-    use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use futures::stream;
     use lance_core::cache::LanceCache;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};

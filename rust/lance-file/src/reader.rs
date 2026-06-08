@@ -13,8 +13,8 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use deepsize::{Context, DeepSizeOf};
 use futures::{Stream, StreamExt, stream::BoxStream};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_encoding::{
     EncodingsIo,
     decoder::{
@@ -2511,7 +2511,7 @@ mod tests {
         // column_metadatas and column_infos, otherwise the moka cache weigher
         // dramatically underestimates entry sizes and never evicts, causing
         // unbounded memory growth on random-access workloads.
-        use deepsize::DeepSizeOf;
+        use lance_core::deepsize::DeepSizeOf;
 
         let fs = FsFixture::default();
         let _written = create_some_file(&fs, version).await;

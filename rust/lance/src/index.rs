@@ -340,7 +340,7 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
 
 /// Wrapper that stores a live VectorIndex in the cache.
 /// Used for v0.1/v0.2 indices that don't support serializable caching.
-#[derive(Debug, deepsize::DeepSizeOf)]
+#[derive(Debug, lance_core::deepsize::DeepSizeOf)]
 pub(crate) struct CachedLegacyVectorIndex(Arc<dyn VectorIndex>);
 
 #[derive(Debug, Clone)]
@@ -568,7 +568,7 @@ pub(crate) async fn remap_index(
                     matched.index_version, matched.name
                 ))
             })?;
-            remap_vector_index(
+            let files = remap_vector_index(
                 Arc::new(dataset.clone()),
                 &field_path,
                 index_id,
@@ -578,17 +578,13 @@ pub(crate) async fn remap_index(
             )
             .await?;
 
-            // Capture file sizes for the vector index
-            let index_dir = dataset.indices_dir().join(new_id.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
-
             CreatedIndex {
                 index_details: prost_types::Any::from_msg(
                     &lance_index::pb::VectorIndexDetails::default(),
                 )
                 .unwrap(),
                 index_version,
-                files: Some(files),
+                files,
             }
         }
         _ => {
@@ -604,7 +600,7 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
-        files: created_index.files,
+        files: Some(created_index.files),
     }))
 }
 
@@ -1224,6 +1220,13 @@ impl DatasetIndexExt for Dataset {
                     return Ok(Some(idx));
                 };
 
+                // A zero-fragment segment can be used to create an index while
+                // deferring the actual build. Such a segment is disjoint from every
+                // other segment but should still be removed.
+                if existing_fragments.is_empty() {
+                    return Ok(Some(idx));
+                }
+
                 if existing_fragments.is_disjoint(&incoming_fragments) {
                     return Ok(None);
                 }
@@ -1376,7 +1379,7 @@ impl DatasetIndexExt for Dataset {
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.
-                files: res.files,
+                files: Some(res.files),
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
@@ -2587,7 +2590,7 @@ mod tests {
         kmeans::{KMeansParams, train_kmeans},
         sq::builder::SQBuildParams,
     };
-    use lance_io::{assert_io_eq, assert_io_lt};
+    use lance_io::{assert_io_eq, assert_io_lt, utils::tracking_store::IoStats};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
@@ -2626,6 +2629,20 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+        }
+    }
+
+    fn list_io_stats(stats: &IoStats) -> IoStats {
+        let requests = stats
+            .requests
+            .iter()
+            .filter(|request| request.method == "list")
+            .cloned()
+            .collect::<Vec<_>>();
+        IoStats {
+            read_iops: requests.len() as u64,
+            requests,
+            ..Default::default()
         }
     }
 
@@ -6799,6 +6816,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_existing_index_segments_removes_empty_segment() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let uuid = Uuid::new_v4();
+
+        // Commit a 0-fragment segment, then a real segment covering the dataset.
+        let empty = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            uuid,
+            std::iter::empty::<u32>(),
+            b"empty",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&empty)],
+            )
+            .await
+            .unwrap();
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+
+        // The real segment covers the dataset, so the redundant empty one is removed.
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            committed.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
+            HashSet::from([seg.uuid]),
+            "empty segment should be removed once a real segment covers the dataset",
+        );
+    }
+
+    #[tokio::test]
     async fn test_resolve_index_column_error_cases() {
         use lance_datagen::{BatchCount, RowCount, array};
 
@@ -7268,6 +7348,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_create_does_not_list_files() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Int32, false),
+        ]));
+        let ids = Int32Array::from_iter_values(0..128);
+        let categories = Int32Array::from_iter_values((0..128).map(|value| value % 8));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(categories)])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+
+        io_tracker.incremental_stats();
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Bitmap,
+                Some("category_bitmap".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        let list_stats = list_io_stats(&stats);
+        assert_io_eq!(
+            list_stats,
+            read_iops,
+            0,
+            "new scalar index files should be reported by writer return values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_create_does_not_list_files() {
+        let test_dir = TempStrDir::default();
+        let dimension = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+        let ids = Int32Array::from_iter_values(0..256);
+        let vectors = (0..256)
+            .map(|row| {
+                Some(
+                    (0..dimension)
+                        .map(|dim| Some((row * dimension + dim) as f32))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let vector_array =
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, dimension);
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vector_array)])
+                .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+
+        io_tracker.incremental_stats();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_flat".to_string()),
+                &VectorIndexParams::ivf_flat(4, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        let list_stats = list_io_stats(&stats);
+        assert_io_eq!(
+            list_stats,
+            read_iops,
+            0,
+            "new V3 vector index files should be reported by builder return values"
+        );
     }
 
     #[tokio::test]

@@ -14,9 +14,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::{DistanceType, Dot};
@@ -201,10 +201,10 @@ impl RabitQuantizationMetadata {
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.rotate_mat
             .as_ref()
-            .map(|inv_p| inv_p.get_array_memory_size())
+            .map(|inv_p| (inv_p as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
             + self
                 .fast_rotation_signs
@@ -288,8 +288,8 @@ pub struct RabitQuantizationStorage {
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.metadata.deep_size_of_children(context) + self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.metadata.deep_size_of_children(context) + self.batch.deep_size_of_children(context)
     }
 }
 

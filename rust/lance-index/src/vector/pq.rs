@@ -10,9 +10,9 @@ use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{Array, FixedSizeListArray, UInt8Array, cast::AsArray};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::{DataType, Field};
-use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, assume_eq};
 use lance_linalg::distance::{DistanceType, Dot, L2, l2::L2Prepared};
 use lance_table::utils::LanceIteratorExtension;
@@ -54,7 +54,7 @@ pub struct ProductQuantizer {
 }
 
 impl DeepSizeOf for ProductQuantizer {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.codebook.get_array_memory_size()
             + self.num_sub_vectors.deep_size_of_children(_context)
             + self.num_bits.deep_size_of_children(_context)

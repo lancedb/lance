@@ -21,13 +21,13 @@ use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
@@ -119,7 +119,7 @@ struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.index_file_path.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
@@ -178,7 +178,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
 pub(crate) struct IvfStateEntryBox(pub(crate) Arc<dyn IvfStateEntry>);
 
 impl DeepSizeOf for IvfStateEntryBox {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.0.deep_size_of_children(context)
     }
 }
@@ -394,8 +394,8 @@ struct CachedIndexReaders {
     aux_reader: Arc<FileReader>,
 }
 
-impl deepsize::DeepSizeOf for CachedIndexReaders {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+impl lance_core::deepsize::DeepSizeOf for CachedIndexReaders {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // FileReader doesn't impl DeepSizeOf. We approximate by counting the
         // fixed struct size for each reader plus the Arc<CachedFileMetadata>
         // heap contents. The metadata Arcs are also held by FileMetadataCacheKey
@@ -537,7 +537,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 }
 
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.uri.deep_size_of_children(context)
             + self.index_path.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
@@ -1723,6 +1723,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::PQBuildParams;
@@ -1735,7 +1736,6 @@ mod tests {
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
-    use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -4739,7 +4739,10 @@ mod tests {
             STORAGE_METADATA_KEY.to_owned(),
             serde_json::to_string(&vec![pq_metadata])?,
         );
-        writer.finish_with_metadata(metadata).await?;
+        for (key, value) in metadata {
+            writer.add_schema_metadata(key, value);
+        }
+        writer.finish().await?;
 
         // Build new IndexMetadata with the new UUID and file sizes.
         let new_files =

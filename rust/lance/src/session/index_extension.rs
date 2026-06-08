@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use deepsize::DeepSizeOf;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::{IndexParams, IndexType, vector::VectorIndex};
 
@@ -69,7 +69,7 @@ mod test {
     use arrow_array::{Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_file::previous::writer::{
         FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
     };
@@ -95,7 +95,7 @@ mod test {
     struct MockIndex;
 
     impl DeepSizeOf for MockIndex {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             0
         }
     }
@@ -230,7 +230,7 @@ mod test {
     }
 
     impl DeepSizeOf for MockIndexExtension {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             todo!()
         }
     }

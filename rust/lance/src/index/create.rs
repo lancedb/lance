@@ -8,8 +8,7 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        DatasetIndexExt, DatasetIndexInternalExt,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
@@ -366,12 +365,12 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
                 let index_version = vec_params.index_type().version() as u32;
 
-                if train {
+                let files = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = &self.fragments {
                         // For distributed indexing, build only on specified fragments
                         // This creates temporary index metadata without committing
-                        let segment_uuid = Box::pin(build_distributed_vector_index(
+                        let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -383,6 +382,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         ))
                         .await?;
                         output_index_uuid = segment_uuid;
+                        files
                     } else {
                         // Standard full dataset indexing
                         Box::pin(build_vector_index(
@@ -394,7 +394,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             fri,
                             self.progress.clone(),
                         ))
-                        .await?;
+                        .await?
                     }
                 } else {
                     // Create empty vector index
@@ -405,19 +405,12 @@ impl<'a> CreateIndexBuilder<'a> {
                         &index_id.to_string(),
                         vec_params,
                     )
-                    .await?;
-                }
-                // Capture file sizes after vector index creation
-                let index_dir = self
-                    .dataset
-                    .indices_dir()
-                    .join(output_index_uuid.to_string());
-                let files =
-                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                    .await?
+                };
                 CreatedIndex {
                     index_details: vector_index_details(vec_params),
                     index_version,
-                    files: Some(files),
+                    files,
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -456,7 +449,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
-                    files: Some(files),
+                    files,
                 }
             }
             (IndexType::FragmentReuse, _) => {
@@ -489,7 +482,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: created_index.files,
+            files: Some(created_index.files),
         })
     }
 
@@ -509,22 +502,11 @@ impl<'a> CreateIndexBuilder<'a> {
             vec![]
         };
         let transaction = if uses_segment_commit_path(self.index_type, self.params) {
-            let field_id = *new_idx.fields.first().ok_or_else(|| {
-                Error::internal(format!(
-                    "Index '{}' is missing field ids after build",
-                    new_idx.name
-                ))
-            })?;
-            let index_name = new_idx.name.clone();
             let dataset_version = new_idx.dataset_version;
-            let segments = vec![new_idx.into_index_segment()?];
-            let new_indices =
-                build_index_metadata_from_segments(self.dataset, &index_name, field_id, segments)
-                    .await?;
             TransactionBuilder::new(
                 dataset_version,
                 Operation::CreateIndex {
-                    new_indices,
+                    new_indices: vec![new_idx],
                     removed_indices,
                 },
             )

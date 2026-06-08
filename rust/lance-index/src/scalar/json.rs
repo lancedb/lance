@@ -21,8 +21,8 @@ use datafusion_physical_expr::{
     PhysicalExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
-use deepsize::DeepSizeOf;
 use futures::StreamExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
@@ -61,7 +61,7 @@ impl JsonIndex {
 }
 
 impl DeepSizeOf for JsonIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.target_index.deep_size_of_children(context) + self.path.deep_size_of_children(context)
     }
 }
@@ -130,7 +130,7 @@ impl ScalarIndex for JsonIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: target_created.files,
         })
     }
 
@@ -152,7 +152,7 @@ impl ScalarIndex for JsonIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: target_created.files,
         })
     }
 
@@ -785,7 +785,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
             index_version: JSON_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: target_index.files,
         })
     }
 

@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::lance_format::LanceIndexStore;
 use super::{
-    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
 use crate::frag_reuse::FragReuseIndex;
@@ -29,10 +29,10 @@ use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
@@ -155,7 +155,7 @@ pub struct NGramPostingList {
 }
 
 impl DeepSizeOf for NGramPostingList {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         self.bitmap.serialized_size()
     }
 }
@@ -213,7 +213,7 @@ struct NGramPostingListReader {
 }
 
 impl DeepSizeOf for NGramPostingListReader {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         0
     }
 }
@@ -285,7 +285,7 @@ impl std::fmt::Debug for NGramIndex {
 }
 
 impl DeepSizeOf for NGramIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.tokens.deep_size_of_children(context)
     }
 }
@@ -504,13 +504,13 @@ impl ScalarIndex for NGramIndex {
             offset += BATCH_SIZE;
         }
 
-        writer.finish().await?;
+        let file = writer.finish().await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -523,7 +523,7 @@ impl ScalarIndex for NGramIndex {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         let spill_files = builder.train(new_data).await?;
 
-        builder
+        let file = builder
             .write_index(dest_store, spill_files, Some(self.store.clone()))
             .await?;
 
@@ -531,7 +531,7 @@ impl ScalarIndex for NGramIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -1047,7 +1047,7 @@ impl NGramIndexBuilder {
         mut left_stream: impl Stream<Item = Result<NGramIndexSpillState>> + Unpin,
         mut right_stream: impl Stream<Item = Result<NGramIndexSpillState>> + Unpin,
         writer: &mut dyn IndexWriter,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let mut left_state = left_stream.try_next().await?;
         let mut right_state = right_stream.try_next().await?;
 
@@ -1079,8 +1079,7 @@ impl NGramIndexBuilder {
             }
         }
 
-        writer.finish().await?;
-        Ok(())
+        writer.finish().await
     }
 
     async fn merge_spill_files(
@@ -1182,7 +1181,7 @@ impl NGramIndexBuilder {
         store: &dyn IndexStore,
         spill_files: Vec<usize>,
         old_index: Option<Arc<dyn IndexStore>>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let mut writer = store
             .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
             .await?;
@@ -1190,15 +1189,14 @@ impl NGramIndexBuilder {
         if spill_files.is_empty() {
             if let Some(old_index) = old_index {
                 // An update with no new data, just copy the old index to the new store
-                old_index.copy_index_file(POSTINGS_FILENAME, store).await?;
+                return old_index.copy_index_file(POSTINGS_FILENAME, store).await;
             } else {
                 // Training an index with no data, make an empty index
                 let mut writer = store
                     .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
                     .await?;
-                writer.finish().await?;
+                return writer.finish().await;
             }
-            return Ok(());
         }
 
         let mut index_to_copy = self.merge_spills(spill_files).await?;
@@ -1222,8 +1220,7 @@ impl NGramIndexBuilder {
             offset += batch_size;
         }
 
-        writer.finish().await?;
-        Ok(())
+        writer.finish().await
     }
 }
 
@@ -1234,7 +1231,7 @@ impl NGramIndexPlugin {
     pub async fn train_ngram_index(
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
 
         let spill_files = builder.train(batches_source).await?;
@@ -1300,12 +1297,12 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             ));
         }
 
-        Self::train_ngram_index(data, index_store).await?;
+        let file = Self::train_ngram_index(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
             index_version: NGRAM_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 

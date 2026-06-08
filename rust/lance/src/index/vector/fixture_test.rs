@@ -18,8 +18,8 @@ mod test {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::execution::SendableRecordBatchStream;
-    use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::deepsize::{Context, DeepSizeOf};
     use lance_core::{cache::LanceCache, utils::tempfile::TempStdFile};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{Index, IndexType, vector::Query};
@@ -54,7 +54,8 @@ mod test {
 
     impl DeepSizeOf for ResidualCheckMockIndex {
         fn deep_size_of_children(&self, cx: &mut Context) -> usize {
-            self.assert_query_value.deep_size_of_children(cx) + self.ret_val.get_array_memory_size()
+            self.assert_query_value.deep_size_of_children(cx)
+                + self.ret_val.deep_size_of_children(cx)
         }
     }
 

@@ -5,8 +5,8 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
+use lance_core::deepsize::DeepSizeOf;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};

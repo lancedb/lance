@@ -7,8 +7,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deepsize::{Context, DeepSizeOf};
 use futures::future::try_join_all;
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};

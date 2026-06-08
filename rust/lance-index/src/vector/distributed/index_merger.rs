@@ -709,7 +709,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     aux_paths: &[object_store::path::Path],
     target_dir: &object_store::path::Path,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<lance_table::format::IndexFile> {
     if aux_paths.is_empty() {
         return Err(Error::index(
             "No partial auxiliary files were selected for merge".to_string(),
@@ -1498,16 +1498,18 @@ pub async fn merge_partial_vector_auxiliary_files(
         }
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;
-        w.finish().await?;
+        let summary = w.finish().await?;
         progress.stage_progress("write_auxiliary_index", 1).await?;
         progress.stage_complete("write_auxiliary_index").await?;
+        Ok(lance_table::format::IndexFile {
+            path: INDEX_AUXILIARY_FILE_NAME.to_string(),
+            size_bytes: summary.size_bytes,
+        })
     } else {
-        return Err(Error::index(
+        Err(Error::index(
             "Failed to initialize unified writer".to_string(),
-        ));
+        ))
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

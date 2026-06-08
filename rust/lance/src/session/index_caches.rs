@@ -12,8 +12,8 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use deepsize::{Context, DeepSizeOf};
 use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;

@@ -9,9 +9,8 @@ use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
@@ -23,14 +22,12 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
-use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
-use std::future::Future;
 
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
@@ -296,130 +293,6 @@ where
     }
 }
 
-/// Stream wrapper for an `ExecutionPlan` node that pulls from a child input and
-/// applies a per-batch async transform.
-///
-/// `elapsed_compute` measures only the time spent driving the transform
-/// futures — never the time spent polling the child input — so wrapping a
-/// chain of nodes does not double-count child CPU. `output_rows` and
-/// `output_batches` are recorded as the transform produces batches.
-///
-/// `concurrency` caps how many transform futures may be in flight at once.
-/// Use `1` for sequential transforms; larger values parallelize per-batch
-/// work (e.g., KNN distance computation).
-///
-/// For leaf nodes (no child input), use [`InstrumentedRecordBatchStreamAdapter`]
-/// instead.
-pub struct InstrumentedChildInputStream<F, Fut> {
-    schema: SchemaRef,
-    input: SendableRecordBatchStream,
-    transform: F,
-    concurrency: usize,
-    in_flight: FuturesUnordered<Fut>,
-    input_done: bool,
-    baseline_metrics: BaselineMetrics,
-    batch_count: Count,
-}
-
-impl<F, Fut> InstrumentedChildInputStream<F, Fut>
-where
-    F: FnMut(RecordBatch) -> Fut,
-    Fut: Future<Output = DataFusionResult<RecordBatch>>,
-{
-    pub fn new(
-        input: SendableRecordBatchStream,
-        schema: SchemaRef,
-        transform: F,
-        concurrency: usize,
-        partition: usize,
-        metrics: &ExecutionPlanMetricsSet,
-    ) -> Self {
-        assert!(concurrency >= 1, "concurrency must be >= 1");
-        let batch_count = Count::new();
-        MetricBuilder::new(metrics)
-            .with_partition(partition)
-            .build(MetricValue::OutputBatches(batch_count.clone()));
-        Self {
-            schema,
-            input,
-            transform,
-            concurrency,
-            in_flight: FuturesUnordered::new(),
-            input_done: false,
-            baseline_metrics: BaselineMetrics::new(metrics, partition),
-            batch_count,
-        }
-    }
-}
-
-impl<F, Fut> Stream for InstrumentedChildInputStream<F, Fut>
-where
-    F: FnMut(RecordBatch) -> Fut + Unpin,
-    Fut: Future<Output = DataFusionResult<RecordBatch>>,
-{
-    type Item = DataFusionResult<RecordBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        // Fill in-flight transforms up to `concurrency` from the input.
-        // Polling the input does NOT count toward `elapsed_compute`.
-        while !this.input_done && this.in_flight.len() < this.concurrency {
-            match this.input.poll_next_unpin(cx) {
-                Poll::Ready(Some(Ok(batch))) => {
-                    this.in_flight.push((this.transform)(batch));
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(e)));
-                }
-                Poll::Ready(None) => {
-                    this.input_done = true;
-                }
-                Poll::Pending => break,
-            }
-        }
-
-        // Drive in-flight transforms; their poll time IS counted.
-        if !this.in_flight.is_empty() {
-            let timer = this.baseline_metrics.elapsed_compute().timer();
-            let poll = this.in_flight.poll_next_unpin(cx);
-            timer.done();
-            match poll {
-                Poll::Ready(Some(result)) => {
-                    if result.is_ok() {
-                        this.batch_count.add(1);
-                    }
-                    return this.baseline_metrics.record_poll(Poll::Ready(Some(result)));
-                }
-                // Unreachable: `FuturesUnordered::poll_next` returns
-                // `Ready(None)` only when empty, and we just checked
-                // `!is_empty` above. A panic here is preferable to a
-                // silent infinite loop if the invariant ever breaks.
-                Poll::Ready(None) => {
-                    unreachable!("FuturesUnordered yielded None while non-empty")
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        if this.input_done {
-            return Poll::Ready(None);
-        }
-
-        Poll::Pending
-    }
-}
-
-impl<F, Fut> RecordBatchStream for InstrumentedChildInputStream<F, Fut>
-where
-    F: FnMut(RecordBatch) -> Fut + Unpin,
-    Fut: Future<Output = DataFusionResult<RecordBatch>>,
-{
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
 impl ExecutionPlan for ReplayExec {
     fn name(&self) -> &str {
         "ReplayExec"
@@ -564,136 +437,7 @@ mod tests {
     use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, RowCount, array};
 
-    use super::{InstrumentedChildInputStream, ReplayExec};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn instrumented_child_input_stream_excludes_child_poll_time() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::task::Poll;
-        use std::time::Duration;
-
-        use arrow_array::Int32Array;
-        use arrow_schema::{DataType, Field, Schema};
-        use datafusion::physical_plan::SendableRecordBatchStream;
-        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let n_batches: usize = 3;
-        // child_delay is intentionally several times larger than transform_delay
-        // so the assertion tolerates significant `std::thread::sleep` overshoot
-        // on busy CI runners (we've seen ~2-3x overshoot on macOS Actions).
-        let child_delay = Duration::from_millis(150);
-        let transform_delay = Duration::from_millis(30);
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let s = schema.clone();
-        let child = futures::stream::poll_fn(move |_cx| {
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            if n >= n_batches {
-                return Poll::Ready(None);
-            }
-            std::thread::sleep(child_delay);
-            let batch = arrow_array::RecordBatch::try_new(
-                s.clone(),
-                vec![Arc::new(Int32Array::from(vec![n as i32]))],
-            )
-            .unwrap();
-            Poll::Ready(Some(Ok(batch)))
-        });
-        let child: SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), child));
-
-        let metrics = ExecutionPlanMetricsSet::new();
-        let stream = InstrumentedChildInputStream::new(
-            child,
-            schema,
-            move |batch| async move {
-                std::thread::sleep(transform_delay);
-                Ok(batch)
-            },
-            1,
-            0,
-            &metrics,
-        );
-
-        let batches: Vec<_> = stream.try_collect().await.unwrap();
-        assert_eq!(batches.len(), n_batches);
-
-        let elapsed_ns = metrics
-            .clone_inner()
-            .elapsed_compute()
-            .expect("elapsed_compute should be recorded");
-        let elapsed = Duration::from_nanos(elapsed_ns as u64);
-
-        // Expect ~ transform_delay * n. The upper bound is set generously to
-        // absorb sleep overshoot on slow CI (~4-5x per call) while still
-        // cleanly rejecting any version that double-counts child poll time,
-        // which would yield ~ (transform_delay + child_delay) * n.
-        let upper = Duration::from_millis(400);
-        assert!(
-            elapsed >= transform_delay * (n_batches as u32 - 1),
-            "elapsed_compute={:?} too low; transform time was not measured",
-            elapsed,
-        );
-        assert!(
-            elapsed < upper,
-            "elapsed_compute={:?} >= {:?}; child input time was double-counted",
-            elapsed,
-            upper,
-        );
-    }
-
-    #[tokio::test]
-    async fn instrumented_child_input_stream_propagates_child_error() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::task::Poll;
-
-        use arrow_array::Int32Array;
-        use arrow_schema::{DataType, Field, Schema};
-        use datafusion::error::DataFusionError;
-        use datafusion::physical_plan::SendableRecordBatchStream;
-        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let s = schema.clone();
-        let step = Arc::new(AtomicUsize::new(0));
-        // Yield one OK batch, then an Err, then None.
-        let child = futures::stream::poll_fn(move |_cx| {
-            let n = step.fetch_add(1, Ordering::SeqCst);
-            match n {
-                0 => {
-                    let batch = arrow_array::RecordBatch::try_new(
-                        s.clone(),
-                        vec![Arc::new(Int32Array::from(vec![1]))],
-                    )
-                    .unwrap();
-                    Poll::Ready(Some(Ok(batch)))
-                }
-                1 => Poll::Ready(Some(Err(DataFusionError::Execution("boom".into())))),
-                _ => Poll::Ready(None),
-            }
-        });
-        let child: SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), child));
-
-        let metrics = ExecutionPlanMetricsSet::new();
-        let stream = InstrumentedChildInputStream::new(
-            child,
-            schema,
-            move |batch| async move { Ok(batch) },
-            1,
-            0,
-            &metrics,
-        );
-
-        let mut stream = Box::pin(stream);
-        let first = stream.next().await.expect("first item present");
-        assert!(first.is_ok(), "expected first batch ok, got {:?}", first);
-
-        let second = stream.next().await.expect("error item present");
-        let err = second.expect_err("expected propagated error");
-        assert!(err.to_string().contains("boom"), "got {}", err);
-    }
+    use super::ReplayExec;
 
     #[tokio::test]
     async fn test_replay() {

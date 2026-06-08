@@ -4,7 +4,7 @@
 use std::ops::{Range, RangeInclusive};
 
 use super::{bitmap::Bitmap, encoded_array::EncodedU64Array};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 
 /// Convert an estimated serialized byte cost from `u128` to `usize`, saturating
 /// at [`usize::MAX`] when the value does not fit (infeasible encodings).
@@ -70,7 +70,7 @@ pub enum U64Segment {
 }
 
 impl DeepSizeOf for U64Segment {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Range(_) => 0,
             Self::RangeWithHoles { holes, .. } => holes.deep_size_of_children(context),
