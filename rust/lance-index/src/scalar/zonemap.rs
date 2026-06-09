@@ -708,7 +708,7 @@ pub async fn merge_zonemap_indices(
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap(),
         index_version: ZONEMAP_INDEX_VERSION,
-        files: Some(dest_store.list_files_with_sizes().await?),
+        files: dest_store.list_files_with_sizes().await?,
     })
 }
 
