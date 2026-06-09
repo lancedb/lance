@@ -1411,8 +1411,8 @@ mod tests {
         path: Path,
     }
 
-    impl deepsize::DeepSizeOf for TrackingReader {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    impl lance_core::deepsize::DeepSizeOf for TrackingReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             0
         }
     }

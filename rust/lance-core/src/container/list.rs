@@ -3,7 +3,7 @@
 
 use std::collections::LinkedList;
 
-use deepsize::DeepSizeOf;
+use crate::deepsize::DeepSizeOf;
 
 /// A linked list that grows exponentially. It is used to store a large number of
 /// elements in a memory-efficient way. The list grows by doubling the capacity of
@@ -134,7 +134,7 @@ impl<T> ExpLinkedList<T> {
 }
 
 impl<T: DeepSizeOf> DeepSizeOf for ExpLinkedList<T> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut crate::deepsize::Context) -> usize {
         self.inner
             .iter()
             .map(|v| v.deep_size_of_children(context))

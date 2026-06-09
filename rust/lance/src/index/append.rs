@@ -16,7 +16,7 @@ use lance_index::{
     },
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::{Fragment, IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -37,7 +37,7 @@ pub struct IndexMergeResults<'a> {
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
     /// List of files and their sizes for the merged index
-    pub files: Option<Vec<lance_table::format::IndexFile>>,
+    pub files: Vec<lance_table::format::IndexFile>,
 }
 
 async fn build_stable_row_id_filter(
@@ -123,7 +123,7 @@ async fn rebuild_scalar_segment(
     reference_index: &Arc<dyn ScalarIndex>,
     field_path: &str,
     column_name: &str,
-    uuid: &str,
+    uuid: Uuid,
     fragment_ids: Vec<u32>,
 ) -> Result<CreatedIndex> {
     let params = reference_index.derive_index_params()?;
@@ -186,11 +186,7 @@ async fn merge_scalar_indices<'a>(
         .copied()
         .unwrap_or(old_indices[old_indices.len() - 1]);
     let reference_index = dataset
-        .open_scalar_index(
-            field_path,
-            &reference_idx.uuid.to_string(),
-            &NoOpMetricsCollector,
-        )
+        .open_scalar_index(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
 
     // Effective = bitmap ∩ live fragments; deleted = bitmap \ live fragments.
@@ -230,7 +226,7 @@ async fn merge_scalar_indices<'a>(
             &reference_index,
             field_path,
             column_name,
-            &new_uuid.to_string(),
+            new_uuid,
             frag_bitmap.iter().collect(),
         )
         .await?
@@ -239,7 +235,7 @@ async fn merge_scalar_indices<'a>(
         let new_data_stream =
             load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
                 .await?;
-        let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+        let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
         let old_data_filter =
             build_old_data_filter(dataset.as_ref(), &effective_old_frags, &deleted_old_frags)
                 .await?;
@@ -436,7 +432,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 vec![(selected_metadata, selected_index)],
             )?;
             let selected_ivf_view = selected_logical_index.as_ivf()?;
-            let (new_uuid, indices_merged) = Box::pin(optimize_vector_indices(
+            let (new_uuid, indices_merged, files) = Box::pin(optimize_vector_indices(
                 dataset.as_ref().clone(),
                 Option::<
                     lance_io::stream::RecordBatchStreamAdapter<
@@ -452,8 +448,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 return Ok(None);
             }
 
-            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
             let new_fragment_bitmap = removed_segment
                 .effective_fragment_bitmap(&dataset.fragment_bitmap)
                 .or_else(|| removed_segment.fragment_bitmap.clone())
@@ -466,7 +460,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files: Some(files),
+                    files,
                 },
             ))
         } else {
@@ -488,7 +482,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 Some(scanner.try_into_stream().await?)
             };
 
-            let (new_uuid, indices_merged) = optimize_vector_indices(
+            let (new_uuid, indices_merged, files) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
                 &field_path,
@@ -519,9 +513,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 .map(|d| d.as_ref().clone())
                 .unwrap_or_else(vector_index_details_default);
 
-            let index_dir = dataset.indices_dir().join(new_uuid.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
-
             Ok((
                 new_uuid,
                 removed_indices,
@@ -532,7 +523,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // index_version <= our max supported version, so we can safely
                     // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files: Some(files),
+                    files,
                 },
             ))
         }
@@ -540,7 +531,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         let mut indices = Vec::with_capacity(old_indices.len());
         for idx in old_indices {
             match dataset
-                .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
+                .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
                 .await
             {
                 Ok(index) => indices.push(index),
@@ -584,11 +575,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .copied()
                     .unwrap_or(old_indices[old_indices.len() - 1]);
                 let reference_index = dataset
-                    .open_scalar_index(
-                        &field_path,
-                        &reference_idx.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
+                    .open_scalar_index(&field_path, &reference_idx.uuid, &NoOpMetricsCollector)
                     .await?;
                 let update_criteria = reference_index.update_criteria();
                 if update_criteria.requires_old_data {
@@ -606,7 +593,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let created_index = super::scalar::build_scalar_index(
                         dataset.as_ref(),
                         column.name.as_str(),
-                        &new_uuid.to_string(),
+                        new_uuid,
                         &params,
                         true,
                         None,
@@ -645,11 +632,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         effective_old_frags |= &effective;
                     }
                     let scalar_index = dataset
-                        .open_scalar_index(
-                            &field_path,
-                            &idx.uuid.to_string(),
-                            &NoOpMetricsCollector,
-                        )
+                        .open_scalar_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
                         .await?;
                     let inverted_index = scalar_index
                         .as_any()
@@ -678,14 +661,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 };
 
                 let new_uuid = Uuid::new_v4();
-                let new_store =
-                    LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
                 let created_index = if selected_indices.is_empty() {
                     let params = reference_index.derive_index_params()?;
                     super::scalar::build_scalar_index(
                         dataset.as_ref(),
                         column.name.as_str(),
-                        &new_uuid.to_string(),
+                        new_uuid,
                         &params,
                         true,
                         None,
@@ -888,11 +870,7 @@ mod tests {
         let mut num_rows = 0;
         for index in indices.iter() {
             let index = dataset
-                .open_vector_index(
-                    "vector",
-                    index.uuid.to_string().as_str(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index("vector", &index.uuid, &NoOpMetricsCollector)
                 .await
                 .unwrap();
             num_rows += index.num_rows();

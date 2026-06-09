@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
 use crate::metrics::MetricsCollector;

@@ -1368,8 +1368,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // After finishing a candidate doc, convert the aligned iterators back
         // into lagging iterators. Entries that do not stay in `tail` are
         // advanced to `target` and returned to `head`.
-        let leads = std::mem::take(&mut self.lead);
-        for posting in leads {
+        // pop() drains in place, keeping self.lead's capacity for reuse.
+        while let Some(posting) = self.lead.pop() {
             let upper_bound = posting.approximate_upper_bound();
             if let Some(mut evicted) = self.insert_tail_with_overflow(posting, upper_bound) {
                 evicted.next(target);

@@ -10,7 +10,7 @@ use std::arch::x86_64::*;
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
 pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
-pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15];
+pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
 
 // This function is used to sum the distance table for 4-bit codes.
@@ -149,6 +149,10 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dis
         accu2 = _mm256_add_epi16(accu2, res_hi);
         accu3 = _mm256_add_epi16(accu3, _mm256_srli_epi16(res_hi, 8));
 
+        if i + 32 >= codes.len() {
+            continue;
+        }
+
         // load the left 32 bytes of codes and lut
         c = _mm256_loadu_si256(codes.as_ptr().add(i + 32) as *const __m256i);
         lut_vec = _mm256_loadu_si256(dist_table.as_ptr().add(i + 32) as *const __m256i);
@@ -271,6 +275,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_perm0_inverse_matches_perm0() {
+        for (idx, &value) in PERM0.iter().enumerate() {
+            assert_eq!(PERM0_INVERSE[value], idx);
+        }
+    }
+
+    #[test]
     fn test_sum_4bit_dist_table_basic() {
         // we have 32 vectors
         let n = 32;
@@ -345,7 +356,7 @@ mod tests {
         // directly since that's what the function sees.
         // code_len=16 → DIM=128, code_len=192 → DIM=1536,
         // code_len=512 → DIM=4096, code_len=8192 → DIM=65536
-        for code_len in [2, 16, 96, 192, 512, 1024, 8192] {
+        for code_len in [1, 2, 3, 16, 95, 96, 192, 512, 1024, 8192] {
             let n = BATCH_SIZE; // 32 vectors per batch
 
             // Each code byte produces 2 lookups; cap values so
@@ -379,7 +390,7 @@ mod tests {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
 
-        for code_len in [16, 192, 1024] {
+        for code_len in [1, 3, 16, 191, 192, 1024] {
             let n = BATCH_SIZE * 10; // 320 vectors = 10 batches
 
             let max_val = (u16::MAX as usize / (2 * code_len)).min(255) as u8;

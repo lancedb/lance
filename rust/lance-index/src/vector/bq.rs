@@ -128,14 +128,7 @@ pub fn validate_rq_num_bits(num_bits: u8) -> Result<()> {
 }
 
 pub fn validate_supported_rq_num_bits(num_bits: u8) -> Result<()> {
-    validate_rq_num_bits(num_bits)?;
-    if num_bits != RABIT_BINARY_NUM_BITS {
-        return Err(Error::not_supported(format!(
-            "IVF_RQ num_bits={} index creation is not supported until split-code search support is implemented",
-            num_bits
-        )));
-    }
-    Ok(())
+    validate_rq_num_bits(num_bits)
 }
 
 pub fn rabit_ex_bits(num_bits: u8) -> Result<u8> {
@@ -261,13 +254,7 @@ mod tests {
         );
 
         validate_supported_rq_num_bits(1).unwrap();
-        let err = validate_supported_rq_num_bits(9).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("num_bits=9 index creation is not supported"),
-            "{}",
-            err
-        );
+        validate_supported_rq_num_bits(9).unwrap();
     }
 
     #[test]

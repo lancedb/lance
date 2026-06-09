@@ -12,11 +12,11 @@ use arrow_array::{
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
-use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::{read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream};
 use lance_core::Result;
 use lance_core::cache::CacheCodecImpl;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -43,7 +43,7 @@ pub struct FlatIndex {
 }
 
 impl DeepSizeOf for FlatIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.data.get_array_memory_size()
     }
 }

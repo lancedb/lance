@@ -35,12 +35,12 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
@@ -251,7 +251,7 @@ impl FromStr for TokenSetFormat {
 }
 
 impl DeepSizeOf for TokenSetFormat {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         0
     }
 }
@@ -371,7 +371,7 @@ impl Debug for InvertedIndex {
 }
 
 impl DeepSizeOf for InvertedIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.partitions.deep_size_of_children(context)
     }
 }
@@ -538,7 +538,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version())
             .with_posting_tail_codec(first.posting_tail_codec());
-        builder
+        let files = builder
             .update_from_segments(new_data, dest_store, segments, old_data_filter)
             .await?;
 
@@ -547,7 +547,7 @@ impl InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: first.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -1107,7 +1107,8 @@ impl ScalarIndex for InvertedIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        self.to_builder()
+        let files = self
+            .to_builder()
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
@@ -1116,7 +1117,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: self.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -1126,7 +1127,8 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        self.to_builder()
+        let files = self
+            .to_builder()
             .update(new_data, dest_store, old_data_filter)
             .await?;
 
@@ -1135,7 +1137,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: self.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -1414,7 +1416,7 @@ impl Default for TokenMap {
 }
 
 impl DeepSizeOf for TokenMap {
-    fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, ctx: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::HashMap(map) => map.deep_size_of_children(ctx),
             Self::Fst(map) => map.as_fst().size(),
@@ -1853,7 +1855,7 @@ impl std::fmt::Debug for PostingListReader {
 }
 
 impl DeepSizeOf for PostingListReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let metadata_size = match &self.metadata {
             PostingMetadata::LegacyV1 {
                 offsets,
@@ -2618,7 +2620,7 @@ fn sliced_cache_bytes(array: &dyn Array) -> usize {
 }
 
 impl DeepSizeOf for Positions {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.0.deep_size_of_children(context)
     }
 }
@@ -2699,7 +2701,7 @@ pub enum CompressedPositionStorage {
 }
 
 impl DeepSizeOf for CompressedPositionStorage {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::LegacyPerDoc(positions) => sliced_cache_bytes(positions),
             Self::SharedStream(stream) => stream.size(),
@@ -2976,7 +2978,7 @@ pub struct PlainPostingList {
 }
 
 impl DeepSizeOf for PlainPostingList {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.row_ids.len() * std::mem::size_of::<u64>()
             + self.frequencies.len() * std::mem::size_of::<f32>()
             + self
@@ -3079,7 +3081,7 @@ pub struct CompressedPostingList {
 }
 
 impl DeepSizeOf for CompressedPostingList {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         sliced_cache_bytes(&self.blocks)
             + self
                 .positions
@@ -4953,6 +4955,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
+
+    // Pre-await synchronous work: query tokenization + chunk-stream setup.
+    let pre_await_start = std::time::Instant::now();
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
     // A query that tokenizes to no terms (e.g. only stop words) has no
@@ -4982,6 +4987,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
         ACCUMULATE_BYTES,
         SLICE_BYTES,
     );
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(pre_await_start.elapsed());
+    }
 
     // Phase 2 - For each row we need to know the total number of tokens and the count of each
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
@@ -4997,13 +5005,10 @@ pub async fn flat_bm25_search_stream_with_metrics(
     .await?;
 
     // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
-    // Synchronous and single-threaded, so we time it from this thread.
-    let scoring_start = std::time::Instant::now();
+    // All post-await work is synchronous; time the scorer + score + slicing loop together.
+    let post_await_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
-    if let Some(t) = &elapsed_compute {
-        t.add_duration(scoring_start.elapsed());
-    }
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -5012,6 +5017,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
         let start = i * target_batch_size;
         let len = (scores.num_rows() - start).min(target_batch_size);
         batches.push(Ok(scores.slice(start, len)));
+    }
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(post_await_start.elapsed());
     }
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         FTS_SCHEMA.clone(),
@@ -5911,7 +5919,7 @@ mod tests {
     }
 
     impl DeepSizeOf for CountingStore {
-        fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
             self.inner.deep_size_of_children(context)
         }
     }
@@ -5949,10 +5957,18 @@ mod tests {
                 Ok(reader)
             }
         }
-        async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
             self.inner.copy_index_file(name, dest_store).await
         }
-        async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()> {
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> Result<crate::scalar::IndexFile> {
             self.inner.rename_index_file(name, new_name).await
         }
         async fn delete_index_file(&self, name: &str) -> Result<()> {

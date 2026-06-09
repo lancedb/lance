@@ -177,13 +177,10 @@ pub trait DatasetIndexExt {
     ///
     /// Note that it is possible to have multiple indices with the same UUID,
     /// as they are the deltas of the same index.
-    async fn load_index(&self, uuid: &str) -> Result<Option<IndexMetadata>> {
-        self.load_indices().await.map(|indices| {
-            indices
-                .iter()
-                .find(|idx| idx.uuid.to_string() == uuid)
-                .cloned()
-        })
+    async fn load_index(&self, uuid: &Uuid) -> Result<Option<IndexMetadata>> {
+        self.load_indices()
+            .await
+            .map(|indices| indices.iter().find(|idx| idx.uuid == *uuid).cloned())
     }
 
     /// Loads a specific index with the given index name.

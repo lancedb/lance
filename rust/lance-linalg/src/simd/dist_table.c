@@ -23,8 +23,15 @@ void sum_4bit_dist_table_32bytes_batch_avx512(const uint8_t *codes,
   __m512i accu3 = _mm512_setzero_si512();
 
   for (size_t i = 0; i < code_length; i += 64) {
-    c = _mm512_loadu_si512(&codes[i]);
-    lut = _mm512_loadu_si512(&dist_table[i]);
+    const size_t remaining = code_length - i;
+    if (remaining >= 64) {
+      c = _mm512_loadu_si512(&codes[i]);
+      lut = _mm512_loadu_si512(&dist_table[i]);
+    } else {
+      const __mmask64 load_mask = (UINT64_C(1) << remaining) - 1;
+      c = _mm512_maskz_loadu_epi8(load_mask, &codes[i]);
+      lut = _mm512_maskz_loadu_epi8(load_mask, &dist_table[i]);
+    }
     lo = _mm512_and_si512(c, lo_mask);
     hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), lo_mask);
 

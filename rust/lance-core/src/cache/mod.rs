@@ -63,7 +63,7 @@ use futures::{Future, FutureExt};
 
 use crate::Result;
 
-pub use deepsize::{Context, DeepSizeOf};
+pub use crate::deepsize::{Context, DeepSizeOf};
 
 // ---------------------------------------------------------------------------
 // CacheKey / UnsizedCacheKey — typed key traits for cache users

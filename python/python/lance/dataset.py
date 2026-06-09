@@ -2283,9 +2283,9 @@ class LanceDataset(pa.dataset.Dataset):
                 not changed.
             - "nullable": bool, optional
                 Whether the column should be nullable. If not specified, the column
-                nullability is not changed. Only non-nullable columns can be changed
-                to nullable. Currently, you cannot change a nullable column to
-                non-nullable.
+                nullability is not changed. A non-nullable column can always be made
+                nullable. A nullable column can be made non-nullable only if it
+                contains no NULL values; otherwise an error is raised.
             - "data_type": pyarrow.DataType, optional
                 The new data type to cast the column to. If not specified, the column
                 data type is not changed.
