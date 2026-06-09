@@ -46,25 +46,27 @@ use std::sync::{Arc, Mutex};
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     AnalyzeTableQueryPlanRequest, BatchDeleteTableVersionsRequest,
-    BatchDeleteTableVersionsResponse, CountTableRowsRequest, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    BatchDeleteTableVersionsResponse, BranchContents as ModelBranchContents, CountTableRowsRequest,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableBranchRequest,
+    CreateTableBranchResponse, CreateTableIndexRequest, CreateTableIndexResponse,
+    CreateTableRequest, CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
     CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DeleteTableTagRequest, DeleteTableTagResponse,
-    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
-    DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
-    DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
-    DescribeTransactionResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableIndexRequest, DropTableIndexResponse, DropTableRequest, DropTableResponse,
-    ExplainTableQueryPlanRequest, FragmentStats, FragmentSummary, GetTableStatsRequest,
-    GetTableStatsResponse, GetTableTagVersionRequest, GetTableTagVersionResponse, Identity,
-    IndexContent, InsertIntoTableRequest, InsertIntoTableResponse, ListNamespacesRequest,
-    ListNamespacesResponse, ListTableIndicesRequest, ListTableIndicesResponse,
-    ListTableTagsRequest, ListTableTagsResponse, ListTableVersionsRequest,
-    ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, MergeInsertIntoTableRequest,
-    MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest,
-    QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest, RestoreTableResponse,
-    TableExistsRequest, TableVersion, TagContents as ModelTagContents,
+    DeclareTableRequest, DeclareTableResponse, DeleteTableBranchRequest, DeleteTableBranchResponse,
+    DeleteTableTagRequest, DeleteTableTagResponse, DescribeNamespaceRequest,
+    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
+    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DescribeTransactionRequest, DescribeTransactionResponse,
+    DropNamespaceRequest, DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse,
+    DropTableRequest, DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats,
+    FragmentSummary, GetTableStatsRequest, GetTableStatsResponse, GetTableTagVersionRequest,
+    GetTableTagVersionResponse, Identity, IndexContent, InsertIntoTableRequest,
+    InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
+    ListTableBranchesRequest, ListTableBranchesResponse, ListTableIndicesRequest,
+    ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
+    MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
+    QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
+    RestoreTableResponse, TableExistsRequest, TableVersion, TagContents as ModelTagContents,
     UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
     UpdateTableTagResponse,
 };
@@ -1057,6 +1059,44 @@ impl DirectoryNamespace {
                 message: format!(
                     "tag operation failed for tag '{}' on table at '{}': {}",
                     tag, table_uri, other
+                ),
+            }
+            .into(),
+        }
+    }
+
+    /// Map lance-core ref errors from branch operations to namespace errors.
+    ///
+    /// `RefConflict` is intentionally not handled here: create-time duplicates are rejected by
+    /// the existence pre-check before `create_branch` runs, and delete maps its own `RefConflict`
+    /// (branch still has dependents) inline.
+    fn map_branch_error(
+        err: lance_core::Error,
+        branch: &str,
+        table_uri: &str,
+    ) -> lance_core::Error {
+        match err {
+            lance_core::Error::RefNotFound { .. } => NamespaceError::TableBranchNotFound {
+                message: format!("branch '{}' for table at '{}'", branch, table_uri),
+            }
+            .into(),
+            lance_core::Error::InvalidRef { message } => NamespaceError::InvalidInput {
+                message: format!("invalid branch '{}': {}", branch, message),
+            }
+            .into(),
+            lance_core::Error::VersionNotFound { message } => {
+                NamespaceError::TableVersionNotFound {
+                    message: format!(
+                        "source version for branch '{}' not found for table at '{}': {}",
+                        branch, table_uri, message
+                    ),
+                }
+                .into()
+            }
+            other => NamespaceError::Internal {
+                message: format!(
+                    "branch operation failed for branch '{}' on table at '{}': {}",
+                    branch, table_uri, other
                 ),
             }
             .into(),
@@ -4400,6 +4440,156 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
+    async fn create_table_branch(
+        &self,
+        request: CreateTableBranchRequest,
+    ) -> Result<CreateTableBranchResponse> {
+        self.record_op("create_table_branch");
+        if request.name.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "branch name must not be empty for create_table_branch".to_string(),
+            }
+            .into());
+        }
+        let from_version = match request.from_version {
+            Some(v) if v <= 0 => {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "from_version must be a positive integer, got {} for create_table_branch",
+                        v
+                    ),
+                }
+                .into());
+            }
+            Some(v) => Some(v as u64),
+            None => None,
+        };
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "create_table_branch")
+            .await?;
+
+        // Best-effort pre-check: a duplicate returns a clean TableBranchAlreadyExists conflict
+        // instead of the opaque Internal error create_branch raises on a pre-existing branch. A
+        // concurrent create can still race past this window. Remove once lance-core create_branch
+        // returns RefConflict up front.
+        if dataset.branches().get(&request.name).await.is_ok() {
+            return Err(NamespaceError::TableBranchAlreadyExists {
+                message: format!("branch '{}' for table at '{}'", request.name, table_uri),
+            }
+            .into());
+        }
+
+        dataset
+            .create_branch(
+                &request.name,
+                (request.from_branch.as_deref(), from_version),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                // After load_dataset + the dup pre-check, a DatasetNotFound from create_branch
+                // means the requested fork source (from_branch/from_version) doesn't exist.
+                if matches!(e, lance_core::Error::DatasetNotFound { .. }) {
+                    NamespaceError::InvalidInput {
+                        message: format!(
+                            "from_branch/from_version for branch '{}' refers to a source that does not exist: {}",
+                            request.name, e
+                        ),
+                    }
+                    .into()
+                } else {
+                    Self::map_branch_error(e, &request.name, &table_uri)
+                }
+            })?;
+
+        Ok(CreateTableBranchResponse {
+            transaction_id: None,
+        })
+    }
+
+    async fn list_table_branches(
+        &self,
+        request: ListTableBranchesRequest,
+    ) -> Result<ListTableBranchesResponse> {
+        self.record_op("list_table_branches");
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "list_table_branches")
+            .await?;
+
+        let raw_branches = dataset.list_branches().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to list branches for table at '{}': {}",
+                    table_uri, e
+                ),
+            })
+        })?;
+
+        let branches = raw_branches
+            .into_iter()
+            .map(|(name, contents)| {
+                // The namespace `BranchContents` model has no `identifier` field, so the
+                // lance-core branch identifier is intentionally dropped here.
+                let mut branch_model = ModelBranchContents::new(
+                    contents.parent_version as i64,
+                    contents.create_at as i64,
+                    contents.manifest_size as i64,
+                );
+                branch_model.parent_branch = contents.parent_branch;
+                branch_model.metadata = if contents.metadata.is_empty() {
+                    None
+                } else {
+                    Some(contents.metadata)
+                };
+                (name, branch_model)
+            })
+            .collect();
+
+        Ok(ListTableBranchesResponse {
+            branches,
+            page_token: None,
+        })
+    }
+
+    async fn delete_table_branch(
+        &self,
+        request: DeleteTableBranchRequest,
+    ) -> Result<DeleteTableBranchResponse> {
+        self.record_op("delete_table_branch");
+        if request.name.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "branch name must not be empty for delete_table_branch".to_string(),
+            }
+            .into());
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "delete_table_branch")
+            .await?;
+
+        dataset
+            .delete_branch(&request.name)
+            .await
+            .map_err(|e| match e {
+                lance_core::Error::RefConflict { message } => NamespaceError::InvalidInput {
+                    message: format!(
+                        "branch '{}' for table at '{}': {}",
+                        request.name, table_uri, message
+                    ),
+                }
+                .into(),
+                other => Self::map_branch_error(other, &request.name, &table_uri),
+            })?;
+
+        Ok(DeleteTableBranchResponse {
+            transaction_id: None,
+        })
+    }
+
     fn namespace_id(&self) -> String {
         format!("DirectoryNamespace {{ root: {:?} }}", self.root)
     }
@@ -4414,6 +4604,7 @@ mod tests {
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_core::utils::testing::CountingObjectStore;
     use lance_io::object_store::{providers::local::FileStoreProvider, uri_to_url};
+    use lance_namespace::error::ErrorCode;
     use lance_namespace::models::{
         CreateTableRequest, JsonArrowDataType, JsonArrowField, JsonArrowSchema, ListTablesRequest,
         QueryTableRequestColumns,
@@ -10621,6 +10812,337 @@ mod tests {
         }
 
         (namespace, temp_dir, table_id)
+    }
+
+    /// Downcast a lance-core error to its NamespaceError code for precise assertions.
+    fn namespace_code(err: &Error) -> Option<ErrorCode> {
+        match err {
+            Error::Namespace { source, .. } => {
+                source.downcast_ref::<NamespaceError>().map(|e| e.code())
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_and_list_branches() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(3).await;
+
+        namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: "dev".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: "staging".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resp = namespace
+            .list_table_branches(ListTableBranchesRequest {
+                id: Some(table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.branches.len(),
+            2,
+            "expected 2 branches, got: {:?}",
+            resp.branches
+        );
+        assert!(resp.branches.contains_key("dev"));
+        assert!(resp.branches.contains_key("staging"));
+        assert!(resp.page_token.is_none());
+
+        // Deleting one branch is reflected in a subsequent list.
+        namespace
+            .delete_table_branch(DeleteTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: "dev".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resp = namespace
+            .list_table_branches(ListTableBranchesRequest {
+                id: Some(table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.branches.len(), 1, "expected 1 branch after delete");
+        assert!(!resp.branches.contains_key("dev"));
+        assert!(resp.branches.contains_key("staging"));
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_from_version() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(3).await;
+
+        // Fork explicitly from version 1 of main.
+        namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: "from-v1".to_string(),
+                from_version: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resp = namespace
+            .list_table_branches(ListTableBranchesRequest {
+                id: Some(table_id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let branch = resp
+            .branches
+            .get("from-v1")
+            .expect("forked branch should be listed");
+        assert_eq!(
+            branch.parent_version, 1,
+            "branch should fork from version 1"
+        );
+        assert!(
+            branch.parent_branch.is_none(),
+            "a branch forked from main has no parent branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_existing_branch_conflict() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: "dev".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id),
+                name: "dev".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            namespace_code(&err),
+            Some(ErrorCode::TableBranchAlreadyExists),
+            "expected TableBranchAlreadyExists, got: {}",
+            err
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("already exists"),
+            "expected already-exists message, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_unknown_branch() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let err = namespace
+            .delete_table_branch(DeleteTableBranchRequest {
+                id: Some(table_id),
+                name: "does-not-exist".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            namespace_code(&err),
+            Some(ErrorCode::TableBranchNotFound),
+            "expected TableBranchNotFound, got: {}",
+            err
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("not found"),
+            "expected not-found message, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_referenced_branch_conflict() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        // A child forked from `parent` (via from_branch) makes `parent` a referenced branch.
+        namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: "parent".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: "child".to_string(),
+                from_branch: Some("parent".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // from_branch resolution: the child records its parent branch as its fork point.
+        let listed = namespace
+            .list_table_branches(ListTableBranchesRequest {
+                id: Some(table_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let child = listed
+            .branches
+            .get("child")
+            .expect("child branch should be listed");
+        assert_eq!(
+            child.parent_branch.as_deref(),
+            Some("parent"),
+            "child should record parent branch as its fork point"
+        );
+        assert!(
+            child.parent_version >= 1,
+            "child should record the parent version it forked from, got {}",
+            child.parent_version
+        );
+
+        // Deleting a branch that still has dependents is refused. The delete spec has no 409,
+        // so it surfaces as a documented InvalidInput (400), not a conflict status.
+        let err = namespace
+            .delete_table_branch(DeleteTableBranchRequest {
+                id: Some(table_id),
+                name: "parent".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            namespace_code(&err),
+            Some(ErrorCode::InvalidInput),
+            "expected InvalidInput for deleting a referenced branch, got: {}",
+            err
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("referenced"),
+            "error should explain the branch is still referenced, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_branch_name_required() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let create_err = namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id.clone()),
+                name: String::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            namespace_code(&create_err),
+            Some(ErrorCode::InvalidInput),
+            "empty name on create should be InvalidInput, got: {}",
+            create_err
+        );
+        assert!(
+            create_err
+                .to_string()
+                .to_lowercase()
+                .contains("must not be empty")
+        );
+
+        let delete_err = namespace
+            .delete_table_branch(DeleteTableBranchRequest {
+                id: Some(table_id),
+                name: String::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            namespace_code(&delete_err),
+            Some(ErrorCode::InvalidInput),
+            "empty name on delete should be InvalidInput, got: {}",
+            delete_err
+        );
+        assert!(
+            delete_err
+                .to_string()
+                .to_lowercase()
+                .contains("must not be empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_rejects_negative_from_version() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        let err = namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id),
+                name: "dev".to_string(),
+                from_version: Some(-1),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            namespace_code(&err),
+            Some(ErrorCode::InvalidInput),
+            "negative from_version should be InvalidInput, got: {}",
+            err
+        );
+        assert!(err.to_string().to_lowercase().contains("from_version"));
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_nonexistent_from_version() {
+        let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+
+        // Version 999 does not exist (the table has 2 versions). create_branch's clone phase
+        // raises DatasetNotFound, which we map to a documented InvalidInput (400).
+        let err = namespace
+            .create_table_branch(CreateTableBranchRequest {
+                id: Some(table_id),
+                name: "dev".to_string(),
+                from_version: Some(999),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            namespace_code(&err),
+            Some(ErrorCode::InvalidInput),
+            "non-existent from_version should map to InvalidInput, got: {}",
+            err
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("does not exist"),
+            "error should name the missing source, got: {}",
+            err
+        );
     }
 
     #[tokio::test]

@@ -141,6 +141,10 @@ impl RestAdapter {
             .route("/v1/table/:id/tags/create", post(create_table_tag))
             .route("/v1/table/:id/tags/delete", post(delete_table_tag))
             .route("/v1/table/:id/tags/update", post(update_table_tag))
+            // Branch operations
+            .route("/v1/table/:id/branches/create", post(create_table_branch))
+            .route("/v1/table/:id/branches/list", post(list_table_branches))
+            .route("/v1/table/:id/branches/delete", post(delete_table_branch))
             // Query plan operations
             .route("/v1/table/:id/explain_plan", post(explain_table_query_plan))
             .route("/v1/table/:id/analyze_plan", post(analyze_table_query_plan))
@@ -326,11 +330,13 @@ fn error_code_to_status(code: u32) -> StatusCode {
         | Some(lance_namespace::error::ErrorCode::TableTagNotFound)
         | Some(lance_namespace::error::ErrorCode::TransactionNotFound)
         | Some(lance_namespace::error::ErrorCode::TableVersionNotFound)
-        | Some(lance_namespace::error::ErrorCode::TableColumnNotFound) => StatusCode::NOT_FOUND,
+        | Some(lance_namespace::error::ErrorCode::TableColumnNotFound)
+        | Some(lance_namespace::error::ErrorCode::TableBranchNotFound) => StatusCode::NOT_FOUND,
         Some(lance_namespace::error::ErrorCode::NamespaceAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::TableAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::TableIndexAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::TableTagAlreadyExists)
+        | Some(lance_namespace::error::ErrorCode::TableBranchAlreadyExists)
         | Some(lance_namespace::error::ErrorCode::ConcurrentModification) => StatusCode::CONFLICT,
         Some(lance_namespace::error::ErrorCode::NamespaceNotEmpty)
         | Some(lance_namespace::error::ErrorCode::InvalidTableState) => StatusCode::CONFLICT,
@@ -1261,6 +1267,62 @@ async fn update_table_tag(
     request.identity = extract_identity(&headers);
 
     match backend.update_table_tag(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+// ============================================================================
+// Branch Operation Handlers
+// ============================================================================
+
+async fn create_table_branch(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<CreateTableBranchRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.create_table_branch(request).await {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn list_table_branches(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<PaginationQuery>,
+) -> Response {
+    let request = ListTableBranchesRequest {
+        id: Some(parse_id(&id, params.delimiter.as_deref())),
+        page_token: params.page_token,
+        limit: params.limit,
+        identity: extract_identity(&headers),
+        ..Default::default()
+    };
+
+    match backend.list_table_branches(request).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
+async fn delete_table_branch(
+    State(backend): State<Arc<dyn LanceNamespace>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<DelimiterQuery>,
+    Json(mut request): Json<DeleteTableBranchRequest>,
+) -> Response {
+    request.id = Some(parse_id(&id, params.delimiter.as_deref()));
+    request.identity = extract_identity(&headers);
+
+    match backend.delete_table_branch(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => error_to_response(e),
     }
@@ -3262,6 +3324,198 @@ mod tests {
                     .await
                     .is_err(),
                 "branch must be forwarded in the request body and honored by the backend"
+            );
+
+            fixture.server_handle.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_branch_crud_end_to_end() {
+            let fixture = RestServerFixture::new().await;
+
+            fixture
+                .namespace
+                .create_namespace(CreateNamespaceRequest {
+                    id: Some(vec!["branch_crud_ns".to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table(
+                    CreateTableRequest {
+                        id: Some(vec![
+                            "branch_crud_ns".to_string(),
+                            "branch_crud_table".to_string(),
+                        ]),
+                        mode: Some("create".to_string()),
+                        ..Default::default()
+                    },
+                    create_test_arrow_data(),
+                )
+                .await
+                .unwrap();
+
+            let id = vec![
+                "branch_crud_ns".to_string(),
+                "branch_crud_table".to_string(),
+            ];
+
+            // create -> list shows it (client -> server -> directory backend)
+            fixture
+                .namespace
+                .create_table_branch(CreateTableBranchRequest {
+                    id: Some(id.clone()),
+                    name: "dev".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let listed = fixture
+                .namespace
+                .list_table_branches(ListTableBranchesRequest {
+                    id: Some(id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                listed.branches.contains_key("dev"),
+                "created branch should appear in list: {:?}",
+                listed.branches
+            );
+
+            // duplicate create -> 409 Conflict
+            let port = fixture.server_handle.port();
+            let client = reqwest::Client::new();
+            let table_path = "branch_crud_ns%24branch_crud_table";
+            let resp = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/{}/branches/create",
+                    port, table_path
+                ))
+                .query(&[("delimiter", "$")])
+                .json(&serde_json::json!({ "name": "dev" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                409,
+                "duplicate branch create should map to 409, got {}",
+                resp.status()
+            );
+
+            // delete -> list no longer shows it
+            fixture
+                .namespace
+                .delete_table_branch(DeleteTableBranchRequest {
+                    id: Some(id.clone()),
+                    name: "dev".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let listed = fixture
+                .namespace
+                .list_table_branches(ListTableBranchesRequest {
+                    id: Some(id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(
+                !listed.branches.contains_key("dev"),
+                "deleted branch must not appear in list: {:?}",
+                listed.branches
+            );
+
+            // delete missing -> 404 Not Found (raw HTTP validates TableBranchNotFound -> 404).
+            let resp = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/{}/branches/delete",
+                    port, table_path
+                ))
+                .query(&[("delimiter", "$")])
+                .json(&serde_json::json!({ "name": "dev" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                404,
+                "deleting a missing branch should map to 404, got {}",
+                resp.status()
+            );
+
+            fixture.server_handle.shutdown();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_list_branches_bodyless_post() {
+            let fixture = RestServerFixture::new().await;
+
+            fixture
+                .namespace
+                .create_namespace(CreateNamespaceRequest {
+                    id: Some(vec!["list_post_ns".to_string()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table(
+                    CreateTableRequest {
+                        id: Some(vec![
+                            "list_post_ns".to_string(),
+                            "list_post_table".to_string(),
+                        ]),
+                        mode: Some("create".to_string()),
+                        ..Default::default()
+                    },
+                    create_test_arrow_data(),
+                )
+                .await
+                .unwrap();
+            fixture
+                .namespace
+                .create_table_branch(CreateTableBranchRequest {
+                    id: Some(vec![
+                        "list_post_ns".to_string(),
+                        "list_post_table".to_string(),
+                    ]),
+                    name: "dev".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            let port = fixture.server_handle.port();
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/table/list_post_ns%24list_post_table/branches/list",
+                    port
+                ))
+                .query(&[("delimiter", "$")])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "bodyless list POST should succeed, got {}",
+                resp.status()
+            );
+            let body: ListTableBranchesResponse = resp.json().await.unwrap();
+            assert!(
+                body.branches.contains_key("dev"),
+                "bodyless list should return the branch, got: {:?}",
+                body.branches
             );
 
             fixture.server_handle.shutdown();
