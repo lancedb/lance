@@ -62,6 +62,38 @@ impl BranchLocation {
         Ok(root_path_str)
     }
 
+    /// The branch a location under `root` targets: the inverse of
+    /// [`Self::find_branch`]. `location` must be either `root` itself (main)
+    /// or `<root>/tree/<branch>`; anything else is rejected so a caller never
+    /// misattributes an unrelated location to a branch.
+    pub fn branch_of(root: &str, location: &str) -> Result<Option<String>> {
+        if location == root {
+            return Ok(None);
+        }
+        // Require the `/` component boundary after the root so a sibling path
+        // that merely shares the root as a string prefix is rejected.
+        let branch = location
+            .strip_prefix(root)
+            .and_then(|rel| {
+                if root.is_empty() {
+                    Some(rel)
+                } else {
+                    rel.strip_prefix('/')
+                }
+            })
+            .and_then(|rel| rel.strip_prefix(BRANCH_DIR))
+            .and_then(|rel| rel.strip_prefix('/'))
+            .filter(|name| !name.is_empty());
+
+        match branch {
+            Some(name) => Ok(Some(name.to_string())),
+            None => Err(Error::invalid_input(format!(
+                "cannot derive a branch for location '{}': expected the table root '{}' or a branch chain under '{}/{}'",
+                location, root, root, BRANCH_DIR
+            ))),
+        }
+    }
+
     /// Find the target branch location
     pub fn find_branch(&self, branch_name: Option<&str>) -> Result<Self> {
         if branch_name == self.branch.as_deref() {
@@ -221,6 +253,35 @@ mod tests {
             format!("{}/tree/bugfix/issue-123", main_location.uri)
         );
         assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
+    }
+
+    #[test]
+    fn test_branch_of() {
+        let derive = |root: &str, location: &str| BranchLocation::branch_of(root, location);
+
+        // The table root targets main.
+        assert_eq!(derive("data/t.lance", "data/t.lance").unwrap(), None);
+
+        // Branch chains, including multi-segment branch names.
+        assert_eq!(
+            derive("data/t.lance", "data/t.lance/tree/exp").unwrap(),
+            Some("exp".to_string())
+        );
+        assert_eq!(
+            derive("data/t.lance", "data/t.lance/tree/bugfix/issue-123").unwrap(),
+            Some("bugfix/issue-123".to_string())
+        );
+
+        // A sibling path sharing the root as a string prefix is not a branch.
+        assert!(derive("data/t", "data/tx/tree/exp").is_err());
+        // Neither is a sub-path outside the branch directory.
+        assert!(derive("data/t.lance", "data/t.lance/other/exp").is_err());
+        // Nor a path missing the component boundary after the branch dir.
+        assert!(derive("data/t.lance", "data/t.lance/treex").is_err());
+        // An empty branch name is invalid.
+        assert!(derive("data/t.lance", "data/t.lance/tree").is_err());
+        // An unrelated location is invalid.
+        assert!(derive("data/t.lance", "elsewhere/u.lance").is_err());
     }
 
     #[test]

@@ -565,6 +565,65 @@ async fn test_fragment_id_never_reset() {
     assert_eq!(dataset.manifest.max_fragment_id(), Some(4));
 }
 
+/// create_branch and shallow_clone must read the SOURCE ref's chain, not the
+/// receiver's. Both chains get a version 2 with diverged row counts so a clone
+/// that wrongly resolves the version under the receiver succeeds silently with
+/// the wrong data.
+#[tokio::test]
+async fn test_create_branch_and_shallow_clone_from_other_branch() {
+    let tempdir = TempDir::default();
+    let test_uri = tempdir.path_str();
+
+    let gen_rows = |start: i32, rows: u64| {
+        gen_batch()
+            .col("id", array::step_custom::<Int32Type>(start, 1))
+            .into_reader_rows(RowCount::from(rows), BatchCount::from(1))
+    };
+    let write = |uri: String, start: i32, rows: u64, mode: WriteMode| async move {
+        Dataset::write(
+            gen_rows(start, rows),
+            uri.as_str(),
+            Some(WriteParams {
+                mode,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    };
+
+    // main v1: 50 rows.
+    let mut main_ds = write(test_uri.clone(), 0, 50, WriteMode::Create).await;
+    // dev: forked at v1, appended 30 rows -> dev v2 has 80 rows.
+    let dev_ds = main_ds.create_branch("dev", 1, None).await.unwrap();
+    write(dev_ds.uri().to_string(), 1000, 30, WriteMode::Append).await;
+    // Diverge main to the same version number with a different row count.
+    let mut main_ds = write(test_uri.clone(), 5000, 10, WriteMode::Append).await; // main v2: 60 rows
+
+    // Cross-source create_branch: receiver is main, source is dev.
+    let child_ds = main_ds
+        .create_branch("child", ("dev", 2), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        child_ds.count_rows(None).await.unwrap(),
+        80,
+        "child must clone dev@2, not main@2"
+    );
+
+    // Cross-source shallow_clone: same rule.
+    let clone_uri = format!("{}_clone", test_uri);
+    let cloned_ds = main_ds
+        .shallow_clone(&clone_uri, ("dev", 2), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        cloned_ds.count_rows(None).await.unwrap(),
+        80,
+        "shallow clone must read dev@2, not main@2"
+    );
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
@@ -796,6 +855,86 @@ async fn test_branch() {
         checkout_branch1.manifest.branch.as_deref().unwrap(),
         "branch1"
     );
+
+    // Opening at a branch-pointing tag through the builder must check out the
+    // tag's branch chain, not main's chain at the tag's version number.
+    let tag_open = DatasetBuilder::from_uri(&test_uri)
+        .with_tag("tag1")
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(tag_open.manifest.branch.as_deref(), Some("dev/branch2"));
+    assert_eq!(tag_open.version().version, 3);
+    assert_eq!(tag_open.count_rows(None).await.unwrap(), 100);
+
+    // Malformed branch names are rejected at the boundary
+    for bad_name in ["", "branch1/"] {
+        let err = main_dataset
+            .checkout_version((Some(bad_name), None::<u64>))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRef { .. }),
+            "checkout of {:?} must be rejected as InvalidRef, got: {}",
+            bad_name,
+            err
+        );
+        let err = DatasetBuilder::from_uri(&test_uri)
+            .with_branch(bad_name, None)
+            .load()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRef { .. }),
+            "open of {:?} must be rejected as InvalidRef, got: {}",
+            bad_name,
+            err
+        );
+    }
+
+    // "main" stays a valid spelling of the main branch on checkout; the JNI
+    // bindings construct Ref::Version(Some("main"), _) directly.
+    let main_by_name = checkout_branch1.checkout_branch("main").await.unwrap();
+    assert_eq!(main_by_name.manifest.branch, None);
+    assert_eq!(main_by_name.version().version, 1);
+    let main_by_ref = checkout_branch1
+        .checkout_version(crate::dataset::refs::Ref::Version(
+            Some("main".to_string()),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(main_by_ref.manifest.branch, None);
+
+    // A checkout whose resolved manifest is not on the requested branch must
+    // error loudly instead of handing back another branch's data: stage main's
+    // manifest under a branch path that was never created, so resolution finds
+    // a manifest belonging to main.
+    use object_store::ObjectStoreExt as _;
+    let staged_manifest = main_dataset.manifest_location().path.clone();
+    let staged_copy = Path::parse(format!(
+        "{}/tree/ghost/_versions/{}",
+        test_uri,
+        staged_manifest.filename().unwrap()
+    ))
+    .unwrap();
+    main_dataset
+        .object_store
+        .inner
+        .copy(&staged_manifest, &staged_copy)
+        .await
+        .unwrap();
+    let err = main_dataset.checkout_branch("ghost").await.unwrap_err();
+    assert!(
+        err.to_string().contains("resolved a manifest belonging to"),
+        "expected the branch-mismatch guardrail, got: {}",
+        err
+    );
+    main_dataset
+        .object_store
+        .remove_dir_all(Path::parse(format!("{}/tree/ghost", test_uri)).unwrap())
+        .await
+        .unwrap();
 
     let mut dataset = main_dataset;
     // Finally delete all branches

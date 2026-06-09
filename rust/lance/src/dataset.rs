@@ -69,7 +69,7 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
-mod branch_location;
+pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
@@ -500,11 +500,14 @@ impl Dataset {
     ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
+        let source_location = self
+            .branch_location()
+            .find_branch(source_branch.as_deref())?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: source_branch.clone(),
             ref_version: version_number,
-            ref_path: String::from(self.uri()),
+            ref_path: source_location.uri,
             branch_name: Some(branch.to_string()),
         };
         let transaction = Transaction::new(version_number, clone_op, None);
@@ -556,6 +559,15 @@ impl Dataset {
         version_number: Option<u64>,
         branch: Option<&str>,
     ) -> Result<Self> {
+        // Reject malformed names at the boundary (mirroring the branch CRUD
+        // paths) so they fail as InvalidRef instead of tripping the wrong-chain
+        // check below
+        if let Some(branch_name) = branch
+            && !Branches::is_main_branch(branch)
+        {
+            refs::check_valid_branch(branch_name)?;
+        }
+
         let new_location = self.branch_location().find_branch(branch)?;
 
         let manifest_location = if let Some(version_number) = version_number {
@@ -583,6 +595,21 @@ impl Dataset {
             self.session.as_ref(),
         )
         .await?;
+
+        // The resolved manifest must belong to the requested branch. A mismatch
+        // means the commit handler resolved against a different chain (for
+        // example an external manifest store that ignores branch-qualified
+        // paths); error loudly rather than hand back another branch's data.
+        let requested_branch = branch.and_then(refs::standardize_branch);
+        if manifest.branch.as_deref() != requested_branch.as_deref() {
+            return Err(Error::internal(format!(
+                "checkout of branch '{}' at version {} resolved a manifest belonging to branch '{}'",
+                refs::normalize_branch(branch),
+                manifest.version,
+                refs::normalize_branch(manifest.branch.as_deref()),
+            )));
+        }
+
         Self::checkout_manifest(
             self.object_store.clone(),
             new_location.path,
@@ -779,12 +806,50 @@ impl Dataset {
         batches: impl RecordBatchReader + Send + 'static,
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        Self::write_into_namespace_impl(batches, namespace_client, table_id, None, params).await
+    }
+
+    /// Write into a branch of a namespace client-managed table.
+    ///
+    /// Behaves like [`write_into_namespace`](Self::write_into_namespace), but APPEND and
+    /// OVERWRITE open and commit against `branch` instead of main. CREATE is rejected,
+    /// since a branch forks from an existing version.
+    pub async fn write_into_namespace_on_branch(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        branch: &str,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        Self::write_into_namespace_impl(
+            batches,
+            namespace_client,
+            table_id,
+            Some(branch.to_string()),
+            params,
+        )
+        .await
+    }
+
+    async fn write_into_namespace_impl(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        branch: Option<String>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut write_params = params.take().unwrap_or_default();
 
         match write_params.mode {
             WriteMode::Create => {
+                if branch.is_some() {
+                    return Err(Error::not_supported_source(
+                        "cannot create a table on a branch; create on main first, then branch it"
+                            .into(),
+                    ));
+                }
                 let declare_request = DeclareTableRequest {
                     id: Some(table_id.clone()),
                     ..Default::default()
@@ -802,10 +867,13 @@ impl Dataset {
 
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
+                    // The store derives the branch a request targets from the
+                    // base path it is handed, resolved against the table root.
+                    let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
                         namespace_client.clone(),
                         table_id.clone(),
-                    );
+                        &uri,
+                    )?;
                     let commit_handler: Arc<dyn CommitHandler> =
                         Arc::new(ExternalManifestCommitHandler {
                             external_manifest_store: Arc::new(external_store),
@@ -857,18 +925,25 @@ impl Dataset {
                     )))
                 })?;
 
-                // Set up commit handler when managed_versioning is enabled
-                if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace_client.clone(),
-                        table_id.clone(),
-                    );
-                    let commit_handler: Arc<dyn CommitHandler> =
-                        Arc::new(ExternalManifestCommitHandler {
+                // Set up commit handler when managed_versioning is enabled.
+                // It must ride on the dataset opened below: InsertBuilder
+                // commits through the destination dataset's handler and does
+                // not consult write params for Dataset destinations.
+                let commit_handler: Option<Arc<dyn CommitHandler>> =
+                    if response.managed_versioning == Some(true) {
+                        // The store derives the branch a request targets from the
+                        // base path it is handed, resolved against the table root.
+                        let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                            namespace_client.clone(),
+                            table_id.clone(),
+                            uri.as_str(),
+                        )?;
+                        Some(Arc::new(ExternalManifestCommitHandler {
                             external_manifest_store: Arc::new(external_store),
-                        });
-                    write_params.commit_handler = Some(commit_handler);
-                }
+                        }))
+                    } else {
+                        None
+                    };
 
                 // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
@@ -906,6 +981,12 @@ impl Dataset {
                     && let Some(accessor) = &store_params.storage_options_accessor
                 {
                     builder = builder.with_storage_options_accessor(accessor.clone());
+                }
+                if let Some(commit_handler) = commit_handler {
+                    builder = builder.with_commit_handler(commit_handler);
+                }
+                if let Some(branch) = &branch {
+                    builder = builder.with_branch(branch, None);
                 }
                 let dataset = Arc::new(builder.load().await?);
 
@@ -2510,11 +2591,12 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
+        let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: self.uri.clone(),
+            ref_path: source_location.uri,
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None);

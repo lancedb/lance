@@ -1523,15 +1523,28 @@ mod tests {
 
         impl RestServerFixture {
             async fn new() -> Self {
+                Self::build(false).await
+            }
+
+            /// Like [`Self::new`], with managed versioning (table version
+            /// tracking through the `__manifest` catalog) enabled on the
+            /// backend.
+            async fn new_managed() -> Self {
+                Self::build(true).await
+            }
+
+            async fn build(managed_versioning: bool) -> Self {
                 let temp_dir = TempDir::new().unwrap();
                 let temp_path = temp_dir.path().to_str().unwrap().to_string();
 
                 // Create DirectoryNamespace backend with manifest enabled
-                let backend = DirectoryNamespaceBuilder::new(&temp_path)
-                    .manifest_enabled(true)
-                    .build()
-                    .await
-                    .unwrap();
+                let mut builder = DirectoryNamespaceBuilder::new(&temp_path).manifest_enabled(true);
+                if managed_versioning {
+                    builder = builder
+                        .table_version_tracking_enabled(true)
+                        .table_version_storage_enabled(true);
+                }
+                let backend = builder.build().await.unwrap();
                 let backend = Arc::new(backend);
 
                 // Start REST server with port 0 (OS assigns available port)
@@ -3450,6 +3463,190 @@ mod tests {
                 "deleting a missing branch should map to 404, got {}",
                 resp.status()
             );
+
+            fixture.server_handle.shutdown();
+        }
+
+        /// The managed (manifest-tracked) branch flow over REST: create a
+        /// managed table and a branch through the RestNamespace client, open
+        /// the branch via `from_namespace(...).with_branch`, commit on it,
+        /// check out across branches at an overlapping version number, and
+        /// round-trip a branch-pointing tag. Mirrors the DirectoryNamespace
+        /// e2e to prove the REST layer forwards everything the managed commit
+        /// store needs.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_namespace_managed_branch_e2e() {
+            use arrow::array::Int32Array;
+            use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+            use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+            use futures::TryStreamExt;
+            use lance::dataset::builder::DatasetBuilder;
+            use lance::dataset::refs::Ref;
+            use lance::dataset::{Dataset, WriteMode, WriteParams};
+            use lance_namespace::LanceNamespace;
+
+            async fn scan_ids(ds: &Dataset) -> Vec<i32> {
+                let batches: Vec<RecordBatch> = ds
+                    .scan()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let mut ids: Vec<i32> = batches
+                    .iter()
+                    .flat_map(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                ids.sort();
+                ids
+            }
+
+            let fixture = RestServerFixture::new_managed().await;
+            let namespace = Arc::new(fixture.namespace.clone()) as Arc<dyn LanceNamespace>;
+            let table_id = vec!["mb_table".to_string()];
+
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                DataType::Int32,
+                false,
+            )]));
+            let batch = |seed: i32| {
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![seed]))])
+                    .unwrap()
+            };
+
+            // Managed main: v1 (id=1), v2 (id=2).
+            let mut main_ds = Dataset::write_into_namespace(
+                RecordBatchIterator::new(vec![Ok(batch(1))], schema.clone()),
+                namespace.clone(),
+                table_id.clone(),
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            main_ds
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch(2))], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // The REST layer must surface managed versioning for the deferred
+            // commit handler to engage.
+            let described = namespace
+                .describe_table(DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                described.managed_versioning,
+                Some(true),
+                "managed_versioning must survive the REST round trip"
+            );
+            let main_chain_len = |ns: Arc<dyn LanceNamespace>, table_id: Vec<String>| async move {
+                ns.list_table_versions(ListTableVersionsRequest {
+                    id: Some(table_id),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .versions
+                .len()
+            };
+            assert_eq!(main_chain_len(namespace.clone(), table_id.clone()).await, 2);
+
+            // Branch via the REST client, then open and commit on it.
+            namespace
+                .create_table_branch(CreateTableBranchRequest {
+                    id: Some(table_id.clone()),
+                    name: "exp".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let mut branch_ds = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+                .await
+                .unwrap()
+                .with_branch("exp", None)
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(branch_ds.manifest().branch.as_deref(), Some("exp"));
+            assert!(
+                branch_ds
+                    .branch_location()
+                    .path
+                    .as_ref()
+                    .ends_with("tree/exp"),
+                "the branch dataset must be rooted at the branch chain"
+            );
+            branch_ds
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch(3))], schema.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(branch_ds.manifest().branch.as_deref(), Some("exp"));
+            assert_eq!(scan_ids(&branch_ds).await, vec![1, 2, 3]);
+            assert_eq!(
+                main_chain_len(namespace.clone(), table_id.clone()).await,
+                2,
+                "a branch commit must not advance main's chain"
+            );
+
+            // Cross-branch checkout at an overlapping version number must land
+            // on the branch chain (branch numbering continues from the fork
+            // point, so both chains have this version).
+            let overlap_version = branch_ds.version().version;
+            while main_ds.version().version < overlap_version {
+                main_ds
+                    .append(
+                        RecordBatchIterator::new(vec![Ok(batch(100))], schema.clone()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let on_branch = main_ds
+                .checkout_version(Ref::Version(Some("exp".to_string()), Some(overlap_version)))
+                .await
+                .unwrap();
+            assert_eq!(on_branch.manifest().branch.as_deref(), Some("exp"));
+            assert_eq!(scan_ids(&on_branch).await, vec![1, 2, 3]);
+            let on_branch_latest = main_ds.checkout_branch("exp").await.unwrap();
+            assert_eq!(on_branch_latest.manifest().branch.as_deref(), Some("exp"));
+
+            // Branch-pointing tag round trip through the builder.
+            main_ds
+                .tags()
+                .create("exp-tag", ("exp", Some(overlap_version)))
+                .await
+                .unwrap();
+            let tag_open = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+                .await
+                .unwrap()
+                .with_tag("exp-tag")
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(tag_open.manifest().branch.as_deref(), Some("exp"));
+            assert_eq!(tag_open.version().version, overlap_version);
+            assert_eq!(scan_ids(&tag_open).await, vec![1, 2, 3]);
 
             fixture.server_handle.shutdown();
         }
