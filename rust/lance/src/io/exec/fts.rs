@@ -971,6 +971,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
         vec![&self.unindexed_input]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // `execute()` only reads `unindexed_input.execute(partition)` for the single
+        // output partition, so the input must be coalesced to one partition. Without
+        // this, EnforceDistribution may round-robin the scan across `target_partitions`
+        // and only partition 0 is consumed, silently dropping the other fragments.
+        vec![Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
