@@ -6281,7 +6281,10 @@ class ScannerBuilder:
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently only affects
             RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-            setting.
+            setting. ``fast`` uses one RQ bit for query-time scoring.
+            ``normal`` uses all RQ bits with u8-quantized lookup tables.
+            ``accurate`` uses all RQ bits with u16-quantized lookup tables to
+            reduce estimator quantization error.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7465,7 +7468,10 @@ def _build_vector_search_query(
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently only affects
         RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-        setting.
+        setting. ``fast`` uses one RQ bit for query-time scoring. ``normal``
+        uses all RQ bits with u8-quantized lookup tables. ``accurate`` uses all
+        RQ bits with u16-quantized lookup tables to reduce estimator
+        quantization error.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper

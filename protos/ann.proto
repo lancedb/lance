@@ -14,11 +14,12 @@ import "index.proto";
 // This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
 // Other index types ignore this setting.
 enum VectorApproxMode {
-  // Use the default Lance search path.
+  // Use all RQ bits for query-time scoring with u8-quantized lookup tables.
   Normal = 0;
-  // Prefer lower latency by forcing 1-bit RQ scoring at query time.
+  // Use only one RQ bit for query-time scoring, even for multi-bit indexes.
   Fast = 1;
-  // Prefer higher accuracy by using the high-accuracy RQ estimator.
+  // Use all RQ bits for query-time scoring with u16-quantized lookup tables
+  // to reduce estimator quantization error.
   Accurate = 2;
 }
 
