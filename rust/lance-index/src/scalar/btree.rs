@@ -741,8 +741,9 @@ impl BTreeLookup {
         // single value cannot cover an entire page's range, so every candidate is
         // `Matches::Some`. Refining this for low-cardinality data is the TODO in
         // `pages_between`.
+        let values = values.into_iter();
         let mut has_null = false;
-        let mut non_null = Vec::new();
+        let mut non_null = Vec::with_capacity(values.size_hint().0);
         for val in values {
             if val.0.is_null() {
                 has_null = true;
@@ -797,7 +798,9 @@ impl BTreeLookup {
         let cmp_max = make_comparator(maxs, query, opts)?;
         let cmp_min_min = make_comparator(mins, mins, opts)?;
 
-        let mut pages = Vec::new();
+        // High-cardinality lookups hit ~one page per value; presize to avoid the
+        // element-by-element `RawVec` growth that profiling flagged.
+        let mut pages = Vec::with_capacity(query.len());
         for j in 0..query.len() {
             // Start row: peek a little to the left of the value. A query for 7 must
             // still reach a page like [5, 10], so we include every page whose `min`
