@@ -6279,7 +6279,9 @@ class ScannerBuilder:
             CPU pool size.
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
-            when supported by the selected index.
+            when supported by the selected index. This currently only affects
+            RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
+            setting.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7461,7 +7463,9 @@ def _build_vector_search_query(
         the partition-parallel path and are clamped to the CPU pool size.
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
-        when supported by the selected index.
+        when supported by the selected index. This currently only affects
+        RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
+        setting.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper

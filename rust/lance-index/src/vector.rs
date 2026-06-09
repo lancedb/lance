@@ -83,16 +83,19 @@ pub static CENTROID_DIST_FIELD: LazyLock<arrow_schema::Field> = LazyLock::new(||
 pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 
 /// Controls the speed / accuracy tradeoff for approximate vector search.
+///
+/// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
+/// Other index types ignore this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApproxMode {
-    /// Prefer faster approximate scoring when supported by the index.
+    /// Prefer faster approximate scoring when supported by the RQ index.
     Fast,
 
     /// Use the index's default approximation behavior.
     #[default]
     Normal,
 
-    /// Prefer more accurate approximate scoring when supported by the index.
+    /// Prefer more accurate approximate scoring when supported by the RQ index.
     Accurate,
 }
 
@@ -157,6 +160,9 @@ pub struct Query {
     pub dist_q_c: f32,
 
     /// Controls the speed / accuracy tradeoff for approximate vector search.
+    ///
+    /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
+    /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
 }
 

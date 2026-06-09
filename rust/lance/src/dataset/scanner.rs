@@ -1763,8 +1763,8 @@ impl Scanner {
 
     /// Configure the speed / accuracy tradeoff for approximate vector search.
     ///
-    /// This setting is only used by index implementations that support multiple
-    /// approximation modes.
+    /// This setting is currently only used by RQ-quantized indexes, such as
+    /// IVF_RQ. Other index types ignore this setting.
     pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.approx_mode = approx_mode;

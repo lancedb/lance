@@ -32,6 +32,8 @@ message VectorQueryProto {
   bool use_index = 11;
   optional float dist_q_c = 12;
   optional int32 query_parallelism = 13;
+  // Currently only affects RQ-quantized vector indexes, such as IVF_RQ.
+  // Other index types ignore this setting.
   VectorApproxMode approx_mode = 14;
 }
 
