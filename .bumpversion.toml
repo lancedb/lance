@@ -57,6 +57,11 @@ replace = 'lance-datagen = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-derive = {{ version = "={current_version}"'
+replace = 'lance-derive = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'lance-encoding = {{ version = "={current_version}"'
 replace = 'lance-encoding = {{ version = "={new_version}"'
 
