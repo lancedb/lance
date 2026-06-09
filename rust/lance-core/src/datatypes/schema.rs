@@ -9,9 +9,9 @@ use std::{
     sync::Arc,
 };
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use deepsize::DeepSizeOf;
 use lance_arrow::*;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};

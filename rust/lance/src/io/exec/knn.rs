@@ -58,6 +58,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -67,8 +68,8 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedChildInputStream,
-    InstrumentedRecordBatchStreamAdapter, PreFilterSource, SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
+    SelectionVectorToPrefilter,
 };
 
 pub const QUERY_INDEX_COL: &str = "query_index";
@@ -533,43 +534,35 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 &self.metrics,
             )) as SendableRecordBatchStream);
         }
-        let input_schema = self.input.schema();
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
         let schema = self.schema();
 
         // Empty batches don't have a vector column to score; filter them out
-        // before reaching the helper so the transform always sees real work.
-        let filtered_input = Box::pin(RecordBatchStreamAdapter::new(
-            input_schema,
-            input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0)),
-        )) as SendableRecordBatchStream;
+        // before the transform so it always sees real work.
+        let filtered_input = input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0));
 
-        // Mirror of the helper's elapsed_compute counter; used to attribute
-        // wall-clock from the spawn_blocking distance kernel back onto the
-        // node's `elapsed_compute` metric.
-        let elapsed_compute = BaselineMetrics::new(&self.metrics, partition)
-            .elapsed_compute()
-            .clone();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
 
-        let stream = InstrumentedChildInputStream::new(
-            filtered_input,
-            schema,
-            move |batch| {
+        let stream = filtered_input
+            .map(move |batch_result| {
                 let key = key.clone();
                 let column = column.clone();
                 let elapsed_compute = elapsed_compute.clone();
                 async move {
+                    let batch = batch_result?;
                     // Time around the .await to capture the spawn_blocking
                     // distance work, which otherwise runs while this future is
-                    // Pending and is missed by the helper's own poll timer.
+                    // Pending and is missed by a poll-time timer.
                     let start = Instant::now();
                     let batch = compute_distance(key, dt, &column, batch)
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     elapsed_compute.add_duration(start.elapsed());
 
+                    let _t = elapsed_compute.timer();
                     let distances = batch[DIST_COL].as_primitive::<Float32Type>();
                     let distance_values = distances.values();
                     let mask = BooleanArray::from_iter((0..distances.len()).map(|row_index| {
@@ -578,12 +571,17 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                     arrow::compute::filter_record_batch(&batch, &mask)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
-            },
-            get_num_compute_intensive_cpus(),
-            partition,
-            &self.metrics,
-        );
-        Ok(Box::pin(stream) as SendableRecordBatchStream)
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus());
+
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
@@ -717,7 +715,7 @@ pub fn new_knn_exec(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
-        indices.iter().map(|idx| idx.uuid.to_string()).collect_vec(),
+        indices.iter().map(|idx| idx.uuid).collect_vec(),
         query.clone(),
     )?;
 
@@ -763,7 +761,7 @@ pub struct ANNIvfPartitionExec {
     pub query: Query,
 
     /// The UUIDs of the indices to search.
-    pub index_uuids: Vec<String>,
+    pub index_uuids: Vec<Uuid>,
 
     pub properties: Arc<PlanProperties>,
 
@@ -771,7 +769,7 @@ pub struct ANNIvfPartitionExec {
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<Uuid>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
@@ -913,7 +911,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     dist_q_c_list_builder.append_value(dist_q_c.iter());
                     let dist_q_c_col = dist_q_c_list_builder.finish();
 
-                    let uuid_col = StringArray::from(vec![uuid.as_str()]);
+                    let uuid_col = StringArray::from(vec![uuid.to_string()]);
                     let batch = RecordBatch::try_new(
                         KNN_PARTITION_SCHEMA.clone(),
                         vec![
@@ -1552,7 +1550,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             Arc::new(part_id.unwrap().as_primitive::<UInt32Type>().clone());
                         let dist_q_c =
                             Arc::new(dist_q_c.unwrap().as_primitive::<Float32Type>().clone());
-                        let uuid = uuid.unwrap().to_string();
+                        let uuid = Uuid::parse_str(uuid.unwrap()).map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Invalid UUID in __index_uuid column: {e}"
+                            ))
+                        })?;
                         Ok((partitions, dist_q_c, uuid))
                     })
                     .collect_vec();
@@ -1895,7 +1897,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;

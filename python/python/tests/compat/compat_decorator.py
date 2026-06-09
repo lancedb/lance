@@ -153,6 +153,10 @@ class UpgradeDowngradeTest:
         """Return True to skip the old-version read after current-version writes."""
         return False
 
+    def skip_write_after_current_write(self, version: str) -> bool:
+        """Return True to skip the old-version write after current-version writes."""
+        return False
+
     def skip_downgrade(self, version: str) -> bool:
         """Return True to skip the current-write -> old-read downgrade test."""
         return False
@@ -333,8 +337,10 @@ def test_func({sig_params}):
         obj.create()
     # Old version: verify can read
     venv = venv_factory.get_venv(version)
-    venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
-    venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
+    if not obj.skip_read_after_current_write(version):
+        venv.execute_method(obj, "check_read", obj.compat_env(version, "check_read"))
+    if not obj.skip_write_after_current_write(version):
+        venv.execute_method(obj, "check_write", obj.compat_env(version, "check_write"))
 '''
     else:  # upgrade_downgrade
         func_body = f'''

@@ -12,7 +12,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::object_store::ObjectStore;
@@ -44,7 +44,7 @@ pub struct ScalarQuantizationMetadata {
 }
 
 impl DeepSizeOf for ScalarQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0
     }
 }
@@ -138,8 +138,8 @@ impl SQStorageChunk {
 }
 
 impl DeepSizeOf for SQStorageChunk {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.batch.deep_size_of_children(context)
     }
 }
 
@@ -155,7 +155,7 @@ pub struct ScalarQuantizationStorage {
 }
 
 impl DeepSizeOf for ScalarQuantizationStorage {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.chunks
             .iter()
             .map(|c| c.deep_size_of_children(context))

@@ -13,9 +13,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use deepsize::DeepSizeOf;
 use futures::{FutureExt, Stream};
 use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
@@ -153,7 +153,7 @@ pub struct ObjectStore {
 }
 
 impl DeepSizeOf for ObjectStore {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We aren't counting `inner` here which is problematic but an ObjectStore
         // shouldn't be too big.  The only exception might be the write cache but, if
         // the writer cache has data, it means we're using it somewhere else that isn't

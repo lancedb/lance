@@ -7,8 +7,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deepsize::{Context, DeepSizeOf};
 use futures::future::try_join_all;
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};
@@ -292,13 +292,15 @@ pub async fn open_named_scalar_index(
             index_name, column
         ))),
         1 => {
-            let uuid = indices[0].uuid.to_string();
-            dataset.open_scalar_index(column, &uuid, metrics).await
+            dataset
+                .open_scalar_index(column, &indices[0].uuid, metrics)
+                .await
         }
         _ => {
-            let segments = try_join_all(indices.iter().map(|index| {
-                let uuid = index.uuid.to_string();
-                async move { dataset.open_scalar_index(column, &uuid, metrics).await }
+            let segments = try_join_all(indices.iter().map(|index| async move {
+                dataset
+                    .open_scalar_index(column, &index.uuid, metrics)
+                    .await
             }))
             .await?;
 

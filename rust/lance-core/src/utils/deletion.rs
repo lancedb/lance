@@ -3,8 +3,8 @@
 
 use std::{collections::HashSet, ops::Range, sync::Arc};
 
+use crate::deepsize::{Context, DeepSizeOf};
 use arrow_array::BooleanArray;
-use deepsize::{Context, DeepSizeOf};
 use roaring::RoaringBitmap;
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
@@ -296,7 +296,7 @@ impl From<RoaringBitmap> for DeletionVector {
 #[cfg_attr(coverage, coverage(off))]
 mod test {
     use super::*;
-    use deepsize::DeepSizeOf;
+    use crate::deepsize::DeepSizeOf;
     use rstest::rstest;
 
     fn set_dv(vals: impl IntoIterator<Item = u32>) -> DeletionVector {

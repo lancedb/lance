@@ -11,7 +11,7 @@ use std::{
 };
 
 use super::{
-    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
@@ -38,13 +38,13 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
 };
 use lance_arrow::ipc::{read_ipc_stream_single_at, write_ipc_stream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
@@ -84,7 +84,7 @@ pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
 pub struct OrderableScalarValue(pub ScalarValue);
 
 impl DeepSizeOf for OrderableScalarValue {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // deepsize and size both factor in the size of the ScalarValue
         self.0.size() - std::mem::size_of::<ScalarValue>()
     }
@@ -615,18 +615,20 @@ impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
 #[derive(Debug, DeepSizeOf, PartialEq, Eq)]
 pub struct BTreeLookup {
     tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-    /// Pages where the value may be null (does not include all_null_pages)
-    null_pages: Vec<u32>,
-    /// Pages that are entirely null
-    all_null_pages: Vec<u32>,
+    /// Pages where the value may be null (does not include all_null_pages),
+    /// keyed by page number with the exact null count in that page.
+    null_pages: HashMap<u32, u32>,
+    /// Pages that are entirely null, keyed by page number with the exact null
+    /// count in that page.
+    all_null_pages: HashMap<u32, u32>,
 }
 
 impl BTreeLookup {
     fn empty() -> Self {
         Self {
             tree: BTreeMap::new(),
-            null_pages: Vec::new(),
-            all_null_pages: Vec::new(),
+            null_pages: HashMap::new(),
+            all_null_pages: HashMap::new(),
         }
     }
 }
@@ -649,8 +651,8 @@ impl Matches {
 impl BTreeLookup {
     fn new(
         tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-        null_pages: Vec<u32>,
-        all_null_pages: Vec<u32>,
+        null_pages: HashMap<u32, u32>,
+        all_null_pages: HashMap<u32, u32>,
     ) -> Self {
         Self {
             tree,
@@ -823,9 +825,10 @@ impl BTreeLookup {
 
     fn pages_null(&self) -> Vec<Matches> {
         self.null_pages
-            .iter()
-            .map(|page_id| Matches::Some(*page_id))
-            .chain(self.all_null_pages.iter().copied().map(Matches::All))
+            .keys()
+            .copied()
+            .map(Matches::Some)
+            .chain(self.all_null_pages.keys().copied().map(Matches::All))
             .collect()
     }
 }
@@ -1005,25 +1008,148 @@ impl CacheKey for BTreePageKey {
     }
 }
 
+fn parse_btree_lookup(data: &RecordBatch) -> Result<(Arc<BTreeLookup>, DataType)> {
+    let data_type = data.column(0).data_type().clone();
+    if data.num_rows() == 0 {
+        return Ok((Arc::new(BTreeLookup::empty()), data_type));
+    }
+
+    let mins = data.column(0);
+    let maxs = data.column(1);
+    let null_counts = data
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| Error::internal("BTree lookup null_count column must be UInt32"))?;
+    let page_numbers = data
+        .column(3)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| Error::internal("BTree lookup page_idx column must be UInt32"))?;
+
+    let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
+    let mut null_pages = HashMap::<u32, u32>::new();
+    let mut all_null_pages = HashMap::<u32, u32>::new();
+
+    for idx in 0..data.num_rows() {
+        let min = OrderableScalarValue(ScalarValue::try_from_array(&mins, idx)?);
+        let max = OrderableScalarValue(ScalarValue::try_from_array(&maxs, idx)?);
+        let null_count = null_counts.values()[idx];
+        let page_number = page_numbers.values()[idx];
+
+        // If the page is entirely null don't even bother putting it in the tree.
+        if max.0.is_null() {
+            all_null_pages.insert(page_number, null_count);
+            continue;
+        } else {
+            map.entry(min)
+                .or_default()
+                .push(PageRecord { max, page_number });
+        }
+
+        if null_count > 0 {
+            null_pages.insert(page_number, null_count);
+        }
+    }
+
+    let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
+    map.entry(OrderableScalarValue(last_max)).or_default();
+
+    Ok((
+        Arc::new(BTreeLookup::new(map, null_pages, all_null_pages)),
+        data_type,
+    ))
+}
+
+fn btree_lookup_as_batch(lookup: &BTreeLookup, data_type: &DataType) -> Result<RecordBatch> {
+    let mut mins = Vec::new();
+    let mut maxs = Vec::new();
+    let mut null_counts = Vec::new();
+    let mut page_numbers = Vec::new();
+
+    // Keep all-null rows first so the regenerated lookup batch remains sorted
+    // with NULLs before non-NULL values. `parse_btree_lookup` adds a sentinel
+    // from the final row's max value, and that sentinel must not be NULL when
+    // the lookup also has non-null pages.
+    let null_value = ScalarValue::try_new_null(data_type)?;
+    let mut all_null_pages = lookup.all_null_pages.iter().collect::<Vec<_>>();
+    all_null_pages.sort_by_key(|(page_number, _)| **page_number);
+    for (page_number, null_count) in all_null_pages {
+        mins.push(null_value.clone());
+        maxs.push(null_value.clone());
+        null_counts.push(*null_count);
+        page_numbers.push(*page_number);
+    }
+
+    // Preserve the exact null_count from the lookup batch. Query execution only
+    // needs `null_count > 0` to route IS NULL queries, but the lookup wire
+    // format stores exact counts and future costing / selectivity logic may use
+    // them.
+    for (min, page_records) in &lookup.tree {
+        for page_record in page_records {
+            mins.push(min.0.clone());
+            maxs.push(page_record.max.0.clone());
+            null_counts.push(
+                lookup
+                    .null_pages
+                    .get(&page_record.page_number)
+                    .copied()
+                    .unwrap_or(0),
+            );
+            page_numbers.push(page_record.page_number);
+        }
+    }
+
+    let min_array = if mins.is_empty() {
+        new_empty_array(data_type)
+    } else {
+        ScalarValue::iter_to_array(mins)?
+    };
+    let max_array = if maxs.is_empty() {
+        new_empty_array(data_type)
+    } else {
+        ScalarValue::iter_to_array(maxs)?
+    };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("min", data_type.clone(), true),
+        Field::new("max", data_type.clone(), true),
+        Field::new("null_count", DataType::UInt32, false),
+        Field::new("page_idx", DataType::UInt32, false),
+    ]));
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            min_array,
+            max_array,
+            Arc::new(UInt32Array::from_iter_values(null_counts)),
+            Arc::new(UInt32Array::from_iter_values(page_numbers)),
+        ],
+    )?)
+}
+
 /// The serializable state of a [`BTreeIndex`].
 ///
-/// A `BTreeIndex` holds non-serializable infrastructure (an `IndexStore`, a
-/// cache handle, a fragment-reuse index). `BTreeIndexState` captures just the
-/// data needed to rebuild it: the `page_lookup.lance` batch (from which
-/// `BTreeIndex::try_from_serialized` reconstructs the in-memory lookup with
-/// no IO) plus the page batch size and range-partition map.
+/// A `BTreeIndex` also holds non-serializable infrastructure such as an
+/// `IndexStore`, a cache handle, and an optional fragment-reuse index. This
+/// state keeps only the parsed lookup tree and small routing metadata needed to
+/// rebuild the index without re-reading from blob storage. Once this state is
+/// resident in memory, reconstructing a `BTreeIndex` does not reparse the
+/// lookup. Restoring this state from a persistent cache still parses the
+/// embedded IPC lookup payload into this parsed form.
 #[derive(Debug, Clone)]
-pub struct BTreeIndexState {
-    lookup_batch: RecordBatch,
+struct BTreeIndexState {
+    page_lookup: Arc<BTreeLookup>,
+    data_type: DataType,
     batch_size: u64,
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
 }
 
 impl DeepSizeOf for BTreeIndexState {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`;
-        // the lookup batch dominates, matching how `BTreeIndex` accounts for itself.
-        self.lookup_batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`.
+        // The parsed lookup tree is the resident memory we need to charge.
+        self.page_lookup.deep_size_of_children(context)
     }
 }
 
@@ -1034,28 +1160,28 @@ impl BTreeIndexState {
         index_cache: &LanceCache,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let index = BTreeIndex::try_from_serialized(
-            self.lookup_batch.clone(),
+        let index = BTreeIndex::new(
+            self.page_lookup.clone(),
             store,
-            index_cache,
+            self.data_type.clone(),
+            WeakLanceCache::from(index_cache),
             self.batch_size,
             self.ranges_to_files.clone(),
             frag_reuse_index,
-        )?;
+        );
         Ok(Arc::new(index) as Arc<dyn ScalarIndex>)
     }
 }
 
 impl CacheCodecImpl for BTreeIndexState {
-    /// Wire format (no stability guarantees yet — the cache is rebuilt from
-    /// source on any version mismatch):
+    /// Wire format (cache-internal, no stability guarantee):
     /// ```text
     /// u64 batch_size (LE)
     /// u8  has_ranges (0 = None, 1 = Some)
     /// if has_ranges:
     ///   u32 entry_count (LE)
     ///   per entry: u32 start | u32 end | u32 offset | u32 path_len | path bytes
-    /// lookup batch (Arrow IPC stream)
+    /// lookup batch regenerated from the parsed BTreeLookup (Arrow IPC stream)
     /// ```
     fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
         writer.write_all(&self.batch_size.to_le_bytes())?;
@@ -1079,7 +1205,8 @@ impl CacheCodecImpl for BTreeIndexState {
                 }
             }
         }
-        write_ipc_stream(&self.lookup_batch, writer)?;
+        let lookup_batch = btree_lookup_as_batch(&self.page_lookup, &self.data_type)?;
+        write_ipc_stream(&lookup_batch, writer)?;
         Ok(())
     }
 
@@ -1112,8 +1239,10 @@ impl CacheCodecImpl for BTreeIndexState {
             }
         };
         let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let (page_lookup, data_type) = parse_btree_lookup(&lookup_batch)?;
         Ok(Self {
-            lookup_batch,
+            page_lookup,
+            data_type,
             batch_size,
             ranges_to_files,
         })
@@ -1207,26 +1336,13 @@ pub struct BTreeIndex {
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
-
-    /// The raw lookup batch this index was built from (the contents of
-    /// `page_lookup.lance`). Retained so the index can be serialized into a
-    /// cache as a [`BTreeIndexState`] without re-reading it from storage.
-    ///
-    /// TODO: this duplicates the min/max values already held in `page_lookup`.
-    /// A follow-up could rewrite `BTreeLookup` to query this batch directly
-    /// (binary search on the sorted `min` column + linear scan, type-dispatched
-    /// per column type), eliminating the duplication and making this batch the
-    /// single source of truth.
-    lookup_batch: RecordBatch,
 }
 
 impl DeepSizeOf for BTreeIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We don't include the index cache, or anything stored in it. For example:
         // sub_index and fri.
-        self.page_lookup.deep_size_of_children(context)
-            + self.store.deep_size_of_children(context)
-            + self.lookup_batch.get_array_memory_size()
+        self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
 
@@ -1240,7 +1356,6 @@ impl BTreeIndex {
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        lookup_batch: RecordBatch,
     ) -> Self {
         Self {
             page_lookup,
@@ -1250,7 +1365,6 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-            lookup_batch,
         }
     }
 
@@ -1323,69 +1437,7 @@ impl BTreeIndex {
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
-        // Pages that have at least one null value
-        let mut null_pages = Vec::<u32>::new();
-        // Pages that are entirely null
-        let mut all_null_pages = Vec::<u32>::new();
-
-        if data.num_rows() == 0 {
-            let data_type = data.column(0).data_type().clone();
-            let page_lookup = Arc::new(BTreeLookup::empty());
-            return Ok(Self::new(
-                page_lookup,
-                store,
-                data_type,
-                WeakLanceCache::from(index_cache),
-                batch_size,
-                ranges_to_files,
-                frag_reuse_index,
-                data,
-            ));
-        }
-
-        let mins = data.column(0);
-        let maxs = data.column(1);
-        let null_counts = data
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let page_numbers = data
-            .column(3)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-
-        for idx in 0..data.num_rows() {
-            let min = OrderableScalarValue(ScalarValue::try_from_array(&mins, idx)?);
-            let max = OrderableScalarValue(ScalarValue::try_from_array(&maxs, idx)?);
-            let null_count = null_counts.values()[idx];
-            let page_number = page_numbers.values()[idx];
-
-            // If the page is entirely null don't even bother putting it in the tree
-            if max.0.is_null() {
-                all_null_pages.push(page_number);
-                // continue so we don't add it to the null_pages
-                continue;
-            } else {
-                map.entry(min)
-                    .or_default()
-                    .push(PageRecord { max, page_number });
-            }
-
-            if null_count > 0 {
-                null_pages.push(page_number);
-            }
-        }
-
-        let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
-        map.entry(OrderableScalarValue(last_max)).or_default();
-
-        let data_type = mins.data_type().clone();
-
-        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
-
+        let (page_lookup, data_type) = parse_btree_lookup(&data)?;
         Ok(Self::new(
             page_lookup,
             store,
@@ -1394,7 +1446,6 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-            data,
         ))
     }
 
@@ -1578,13 +1629,14 @@ impl BTreeIndex {
         )?;
         let merged_stream = chunk_concat_stream(unchunked, first.batch_size as usize);
 
-        train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
+        let files =
+            train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 }
@@ -1802,8 +1854,8 @@ impl ScalarIndex for BTreeIndex {
             for &page_id in self
                 .page_lookup
                 .null_pages
-                .iter()
-                .chain(self.page_lookup.all_null_pages.iter())
+                .keys()
+                .chain(self.page_lookup.all_null_pages.keys())
             {
                 if !existing.contains(&page_id) {
                     pages.push(Matches::Some(page_id));
@@ -1864,6 +1916,7 @@ impl ScalarIndex for BTreeIndex {
 
         let mapping = Arc::new(mapping.clone());
         let train_schema = Arc::new(self.train_schema());
+        let mut remapped_files = Vec::new();
 
         // TODO: Could potentially parallelize this across parts, unclear it would be worth it
         for (part_id, page_file) in part_page_files {
@@ -1894,7 +1947,10 @@ impl ScalarIndex for BTreeIndex {
                 remapped_stream,
             ));
 
-            train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id).await?;
+            let mut files =
+                train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id)
+                    .await?;
+            remapped_files.append(&mut files);
         }
 
         if let Some(ranges_to_files) = &self.ranges_to_files {
@@ -1906,7 +1962,7 @@ impl ScalarIndex for BTreeIndex {
             let lookup_files = (0..num_parts)
                 .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
                 .collect::<Vec<_>>();
-            merge_metadata_files(
+            let merged_files = merge_metadata_files(
                 dest_store,
                 &page_files,
                 &lookup_files,
@@ -1914,13 +1970,15 @@ impl ScalarIndex for BTreeIndex {
                 noop_progress(),
             )
             .await?;
+            remapped_files.retain(|file| file.path.ends_with("_page_data.lance"));
+            remapped_files.extend(merged_files);
         }
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: remapped_files,
         })
     }
 
@@ -2075,7 +2133,7 @@ pub async fn train_btree_index(
     batch_size: u64,
     fragment_ids: Option<Vec<u32>>,
     range_id: Option<u32>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create `partition_id` for distributed index building.
     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
     // that index partitions generated by different workers do not conflict.
@@ -2140,7 +2198,7 @@ pub async fn train_btree_index(
         );
         batch_idx += 1;
     }
-    sub_index_file.finish().await?;
+    let pages_file = sub_index_file.finish().await?;
     let record_batch = btree_stats_as_batch(encoded_batches, &value_type)?;
     let mut file_schema = record_batch.schema().as_ref().clone();
     file_schema
@@ -2166,8 +2224,8 @@ pub async fn train_btree_index(
         }
     };
     btree_index_file.write_record_batch(record_batch).await?;
-    btree_index_file.finish().await?;
-    Ok(())
+    let lookup_file = btree_index_file.finish().await?;
+    Ok(vec![pages_file, lookup_file])
 }
 
 fn find_single_partition_files(
@@ -2225,7 +2283,7 @@ async fn merge_metadata_files(
     part_lookup_files: &[String],
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
         return Err(Error::internal(
             "No partition files provided for merging".to_string(),
@@ -2301,6 +2359,7 @@ async fn merge_metadata_files(
             progress,
         )
         .await
+        .map(|file| vec![file])
     } else {
         merge_pages_and_lookups(
             store,
@@ -2354,7 +2413,7 @@ async fn merge_range_partitioned_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<IndexFile> {
     let sorted_part_lookup_files = sort_files_by_partition_id(part_lookup_files)?;
     let mut lookup_file = store
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
@@ -2394,12 +2453,12 @@ async fn merge_range_partitioned_lookups(
         serde_json::to_string(&pages_per_file)?,
     );
 
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_complete("merge_lookups").await?;
 
     // In this mode, we only clean up lookup files, and page files are untouched.
     cleanup_partition_files(store, part_lookup_files, &[]).await;
-    Ok(())
+    Ok(lookup_file)
 }
 
 /// Merges partition files using a K-way sort-merge algorithm.
@@ -2418,7 +2477,7 @@ async fn merge_pages_and_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create a new global page file
     let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
     let page_file = page_files_map.get(&partition_id).unwrap();
@@ -2441,7 +2500,7 @@ async fn merge_pages_and_lookups(
         progress.clone(),
     )
     .await?;
-    page_file.finish().await?;
+    let page_file = page_file.finish().await?;
     progress.stage_complete("merge_pages").await?;
 
     let lookup_batch = RecordBatch::try_new(
@@ -2466,7 +2525,7 @@ async fn merge_pages_and_lookups(
         .stage_start("write_lookup_file", Some(1), "files")
         .await?;
     lookup_file.write_record_batch(lookup_batch).await?;
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_progress("write_lookup_file", 1).await?;
     progress.stage_complete("write_lookup_file").await?;
 
@@ -2474,7 +2533,7 @@ async fn merge_pages_and_lookups(
     // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
     cleanup_partition_files(store, part_lookup_files, part_page_files).await;
 
-    Ok(())
+    Ok(vec![page_file, lookup_file])
 }
 
 // Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
@@ -2883,7 +2942,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
                  The `range_id` field will be removed in a future release."
             );
         }
-        train_btree_index(
+        let files = train_btree_index(
             data,
             index_store,
             request
@@ -2898,7 +2957,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -2933,7 +2992,8 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             Error::internal("BTreeIndexPlugin::put_in_cache called with a non-BTree index")
         })?;
         let state = BTreeIndexState {
-            lookup_batch: btree.lookup_batch.clone(),
+            page_lookup: btree.page_lookup.clone(),
+            data_type: btree.data_type.clone(),
             batch_size: btree.batch_size,
             ranges_to_files: btree.ranges_to_files.clone(),
         };
@@ -2950,23 +3010,24 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
-    use arrow_array::{FixedSizeListArray, record_batch};
+    use arrow_array::{FixedSizeListArray, RecordBatch, record_batch};
     use datafusion::{
         execution::{SendableRecordBatchStream, TaskContext},
         physical_plan::{ExecutionPlan, sorts::sort::SortExec, stream::RecordBatchStreamAdapter},
     };
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
-    use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use futures::stream;
     use lance_core::cache::LanceCache;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
     use lance_select::{RowAddrTreeMap, RowSetOps};
     use object_store::path::Path;
+    use rangemap::RangeInclusiveMap;
 
     use crate::metrics::LocalMetricsCollector;
     use crate::progress::{IndexBuildProgress, noop_progress};
@@ -2980,13 +3041,12 @@ mod tests {
     };
 
     use super::{
-        BTreeIndexPlugin, BTreeIndexState, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        OrderableScalarValue, part_lookup_file_path, part_page_data_file_path, train_btree_index,
+        BTreeIndexPlugin, BTreeIndexState, BTreeIndexStateKey, BTreePageKey,
+        DEFAULT_BTREE_BATCH_SIZE, OrderableScalarValue, btree_lookup_as_batch, parse_btree_lookup,
+        part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
     use crate::scalar::registry::ScalarIndexPlugin;
-    use arrow_array::RecordBatch;
     use lance_core::cache::{CacheCodecImpl, CacheKey};
-    use rangemap::RangeInclusiveMap;
 
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
@@ -4963,6 +5023,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_btree_page_key_codec() {
+        // FlatIndex pages can be serialized by a persistent cache backend.
+        assert!(BTreePageKey::codec().is_some());
+    }
+
     fn sample_lookup_batch() -> RecordBatch {
         record_batch!(
             ("min", Int32, [Some(0), Some(10), Some(20)]),
@@ -4973,29 +5039,62 @@ mod tests {
         .unwrap()
     }
 
+    fn mixed_null_lookup_batch() -> RecordBatch {
+        record_batch!(
+            ("min", Int32, [None, Some(0), Some(10)]),
+            ("max", Int32, [None, Some(9), Some(19)]),
+            ("null_count", UInt32, [1, 0, 2]),
+            ("page_idx", UInt32, [42, 0, 1])
+        )
+        .unwrap()
+    }
+
+    fn btree_state(
+        lookup_batch: RecordBatch,
+        batch_size: u64,
+        ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
+    ) -> BTreeIndexState {
+        let (page_lookup, data_type) = parse_btree_lookup(&lookup_batch).unwrap();
+        BTreeIndexState {
+            page_lookup,
+            data_type,
+            batch_size,
+            ranges_to_files,
+        }
+    }
+
+    fn btree_state_from_index(index: &BTreeIndex) -> BTreeIndexState {
+        BTreeIndexState {
+            page_lookup: index.page_lookup.clone(),
+            data_type: index.data_type.clone(),
+            batch_size: index.batch_size,
+            ranges_to_files: index.ranges_to_files.clone(),
+        }
+    }
+
     fn assert_state_roundtrips(state: &BTreeIndexState) {
         let mut buf = Vec::new();
         state.serialize(&mut buf).unwrap();
         let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
-        assert_eq!(restored.lookup_batch, state.lookup_batch);
+        assert_eq!(restored.page_lookup, state.page_lookup);
+        assert_eq!(restored.data_type, state.data_type);
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
-    }
 
-    #[test]
-    fn test_btree_page_key_codec() {
-        // FlatIndex pages can be serialized by a persistent cache backend.
-        assert!(BTreePageKey::codec().is_some());
+        let restored_batch =
+            btree_lookup_as_batch(&restored.page_lookup, &restored.data_type).unwrap();
+        let (parsed_again, _) = parse_btree_lookup(&restored_batch).unwrap();
+        assert_eq!(parsed_again, restored.page_lookup);
     }
 
     #[test]
     fn test_btree_index_state_roundtrip() {
         // Not range-partitioned.
-        assert_state_roundtrips(&BTreeIndexState {
-            lookup_batch: sample_lookup_batch(),
-            batch_size: DEFAULT_BTREE_BATCH_SIZE,
-            ranges_to_files: None,
-        });
+        assert_state_roundtrips(&btree_state(
+            sample_lookup_batch(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+        ));
 
         // Range-partitioned across multiple files.
         let ranges: RangeInclusiveMap<u32, (String, u32)> = [
@@ -5004,22 +5103,30 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_state_roundtrips(&BTreeIndexState {
-            lookup_batch: sample_lookup_batch(),
-            batch_size: 8192,
-            ranges_to_files: Some(Arc::new(ranges)),
-        });
+        assert_state_roundtrips(&btree_state(
+            sample_lookup_batch(),
+            8192,
+            Some(Arc::new(ranges)),
+        ));
 
-        // Empty index.
-        assert_state_roundtrips(&BTreeIndexState {
-            lookup_batch: RecordBatch::new_empty(sample_lookup_batch().schema()),
-            batch_size: DEFAULT_BTREE_BATCH_SIZE,
-            ranges_to_files: None,
-        });
+        // Empty index keeps its data type even though it has no lookup rows.
+        assert_state_roundtrips(&btree_state(
+            RecordBatch::new_empty(sample_lookup_batch().schema()),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+        ));
+
+        // Mixed all-null and non-null pages must round-trip without creating a
+        // NULL sentinel in a non-empty lookup tree.
+        assert_state_roundtrips(&btree_state(
+            mixed_null_lookup_batch(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+        ));
     }
 
     #[tokio::test]
-    async fn test_btree_index_state_reconstruct_and_plugin_cache() {
+    async fn test_btree_plugin_cache_returns_deserialized_index() {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -5038,37 +5145,23 @@ mod tests {
         let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-
-        // Round-trip the state through the codec and reconstruct an index from it.
-        let state = BTreeIndexState {
-            lookup_batch: index.lookup_batch.clone(),
-            batch_size: index.batch_size,
-            ranges_to_files: index.ranges_to_files.clone(),
-        };
-        let mut buf = Vec::new();
-        state.serialize(&mut buf).unwrap();
-        let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
-        let reconstructed = restored
-            .reconstruct(test_store.clone(), &LanceCache::no_cache(), None)
-            .unwrap();
-        assert_eq!(
-            reconstructed
-                .as_any()
-                .downcast_ref::<BTreeIndex>()
-                .unwrap()
-                .page_lookup,
-            index.page_lookup
-        );
-
-        // The plugin's put/get hooks round-trip through a real cache + the codec.
+        let index_dyn: Arc<dyn ScalarIndex> = index.clone();
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+        plugin
+            .put_in_cache(&cache, index_dyn.clone())
+            .await
+            .unwrap();
         let from_cache = plugin
             .get_from_cache(test_store.clone(), None, &cache)
             .await
             .unwrap()
             .expect("index should be served from the cache");
+        let cached_btree = from_cache.as_any().downcast_ref::<BTreeIndex>().unwrap();
+        assert!(
+            Arc::ptr_eq(&cached_btree.page_lookup, &index.page_lookup),
+            "BTree cache should reuse the parsed lookup tree"
+        );
 
         // Searches against the cached index match the original.
         let query = SargableQuery::Range(
@@ -5083,9 +5176,51 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    #[tokio::test]
+    async fn test_btree_index_state_cache_size_includes_parsed_lookup() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(1000), BatchCount::from(5));
+        train_btree_index(stream, test_store.as_ref(), 1000, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+        let plugin = BTreeIndexPlugin;
+        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+
+        let cached_state = cache
+            .get_with_key(&BTreeIndexStateKey)
+            .await
+            .expect("state should be cached");
+        assert!(
+            Arc::ptr_eq(&cached_state.page_lookup, &index.page_lookup),
+            "cached state should retain the parsed lookup tree"
+        );
+
+        let arc_overhead = std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2;
+        let expected_size = cached_state.deep_size_of() + arc_overhead;
+        let charged_size = cache.size_bytes().await;
+        let size_diff = charged_size.abs_diff(expected_size);
+        assert!(
+            size_diff <= std::mem::size_of::<usize>() * 2,
+            "cache charged {charged_size} bytes, expected about {expected_size} bytes"
+        );
+    }
+
     #[test]
     fn test_btree_index_state_rejects_invalid_has_ranges_tag() {
-        // u64 batch_size (any) then a bad has_ranges tag.
         let mut buf = Vec::new();
         buf.extend_from_slice(&1000u64.to_le_bytes());
         buf.push(7u8);
@@ -5094,6 +5229,67 @@ mod tests {
         assert!(
             msg.contains("has_ranges") && msg.contains("7"),
             "expected error to mention the bad has_ranges tag, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_btree_load_applies_frag_reuse_index() {
+        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // value == _rowid for all rows in [0, 1000).
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(1000), BatchCount::from(1));
+        train_btree_index(stream, test_store.as_ref(), 1000, None, None)
+            .await
+            .unwrap();
+
+        // Remap row 0 -> row 5000 (outside the original [0, 1000) range so no collision).
+        // Querying for value == 0 should now return row 5000, confirming the
+        // BTree load path threads the FragReuseIndex into the index.
+        let frag_reuse_index = Arc::new(FragReuseIndex::new(
+            Uuid::new_v4(),
+            vec![HashMap::from([(0u64, Some(5000u64))])],
+            FragReuseIndexDetails { versions: vec![] },
+        ));
+        let index = BTreeIndex::load(
+            test_store.clone(),
+            Some(frag_reuse_index),
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(0))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let row_ids: Vec<u64> = match &result {
+            SearchResult::Exact(set) => set
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect(),
+            other => panic!("expected Exact, got {other:?}"),
+        };
+        assert_eq!(
+            row_ids,
+            vec![5000],
+            "frag_reuse_index remap was not applied"
         );
     }
 
@@ -5122,15 +5318,8 @@ mod tests {
         let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
-        let state = BTreeIndexState {
-            lookup_batch: index.lookup_batch.clone(),
-            batch_size: index.batch_size,
-            ranges_to_files: index.ranges_to_files.clone(),
-        };
+        let state = btree_state_from_index(&index);
 
-        // Remap row 0 -> row 5000 (outside the original [0, 1000) range so no collision).
-        // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
-        // the FragReuseIndex through to the rebuilt BTreeIndex.
         let frag_reuse_index = Arc::new(FragReuseIndex::new(
             Uuid::new_v4(),
             vec![HashMap::from([(0u64, Some(5000u64))])],
@@ -5168,10 +5357,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_btree_index_state_range_partitioned_plugin_cache_roundtrip() {
+    async fn test_btree_range_partitioned_plugin_cache_roundtrip() {
         // Build a range-partitioned BTree (two range partitions merged into one index) and
         // round-trip it through the plugin's cache hooks. This exercises the
-        // `ranges_to_files = Some` path end-to-end through serialize/deserialize/reconstruct.
+        // `ranges_to_files = Some` path end-to-end.
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),

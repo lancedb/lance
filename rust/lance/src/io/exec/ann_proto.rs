@@ -20,6 +20,7 @@ use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb as table_pb;
+use uuid::Uuid;
 
 use crate::Dataset;
 use crate::pb;
@@ -146,7 +147,7 @@ pub async fn ann_ivf_partition_exec_to_proto(
     Ok(pb::AnnIvfPartitionExecProto {
         query: Some(query),
         table: Some(table),
-        index_uuids: exec.index_uuids.clone(),
+        index_uuids: exec.index_uuids.iter().map(Uuid::to_string).collect(),
     })
 }
 
@@ -168,7 +169,17 @@ pub async fn ann_ivf_partition_exec_from_proto(
         ));
     }
 
-    ANNIvfPartitionExec::try_new(dataset, proto.index_uuids, query)
+    let index_uuids: Vec<Uuid> = proto
+        .index_uuids
+        .iter()
+        .map(|s| Uuid::parse_str(s))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| {
+            Error::invalid_input_source(
+                format!("Invalid UUID in AnnIvfPartitionExecProto: {e}").into(),
+            )
+        })?;
+    ANNIvfPartitionExec::try_new(dataset, index_uuids, query)
 }
 
 // =============================================================================
@@ -437,7 +448,7 @@ mod tests {
 
         let exec = ANNIvfPartitionExec::try_new(
             dataset.clone(),
-            indices.iter().map(|idx| idx.uuid.to_string()).collect(),
+            indices.iter().map(|idx| idx.uuid).collect(),
             query,
         )
         .unwrap();

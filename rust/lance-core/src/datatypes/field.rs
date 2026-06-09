@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::{
     ArrayRef,
     cast::AsArray,
@@ -18,7 +19,6 @@ use arrow_array::{
     },
 };
 use arrow_schema::{DataType, Field as ArrowField};
-use deepsize::DeepSizeOf;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     json::{is_arrow_json_field, is_json_field},

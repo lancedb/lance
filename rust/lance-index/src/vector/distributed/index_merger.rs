@@ -20,11 +20,12 @@ use std::sync::Arc;
 use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::bq::storage::{
-    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, pack_codes,
-    rabit_binary_code_field, rabit_ex_code_field,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
+    pack_codes, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
-    ADD_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
+    ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
+    SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::validate_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
@@ -307,6 +308,9 @@ pub async fn init_writer_for_rq(
         ADD_FACTORS_FIELD.clone(),
         SCALE_FACTORS_FIELD.clone(),
     ];
+    if rq_meta.query_estimator == RabitQueryEstimator::RawQuery {
+        fields.push(ERROR_FACTORS_FIELD.clone());
+    }
     if let Some(ex_code_field) = rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)? {
         fields.push(ex_code_field);
         fields.push(EX_ADD_FACTORS_FIELD.clone());
@@ -709,7 +713,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     aux_paths: &[object_store::path::Path],
     target_dir: &object_store::path::Path,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<lance_table::format::IndexFile> {
     if aux_paths.is_empty() {
         return Err(Error::index(
             "No partial auxiliary files were selected for merge".to_string(),
@@ -1498,16 +1502,18 @@ pub async fn merge_partial_vector_auxiliary_files(
         }
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;
-        w.finish().await?;
+        let summary = w.finish().await?;
         progress.stage_progress("write_auxiliary_index", 1).await?;
         progress.stage_complete("write_auxiliary_index").await?;
+        Ok(lance_table::format::IndexFile {
+            path: INDEX_AUXILIARY_FILE_NAME.to_string(),
+            size_bytes: summary.size_bytes,
+        })
     } else {
-        return Err(Error::index(
+        Err(Error::index(
             "Failed to initialize unified writer".to_string(),
-        ));
+        ))
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1531,7 +1537,7 @@ mod tests {
     use prost::Message;
 
     use crate::vector::bq::RQRotationType;
-    use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
+    use crate::vector::bq::storage::{RABIT_EX_CODE_COLUMN, RabitQueryEstimator};
     use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
@@ -2083,6 +2089,9 @@ mod tests {
             ADD_FACTORS_FIELD.clone(),
             SCALE_FACTORS_FIELD.clone(),
         ];
+        if metadata.query_estimator == RabitQueryEstimator::RawQuery {
+            fields.push(ERROR_FACTORS_FIELD.clone());
+        }
         if let Some(field) = ex_code_field {
             fields.push(field);
             fields.push(EX_ADD_FACTORS_FIELD.clone());
@@ -2117,6 +2126,7 @@ mod tests {
         let mut codes = Vec::with_capacity(total_rows * num_bytes);
         let mut add_factors = Vec::with_capacity(total_rows);
         let mut scale_factors = Vec::with_capacity(total_rows);
+        let mut error_factors = Vec::with_capacity(total_rows);
         let mut ex_codes =
             ex_code_bytes.map(|num_bytes| Vec::with_capacity(total_rows * num_bytes));
         let mut ex_add_factors = Vec::with_capacity(total_rows);
@@ -2132,6 +2142,7 @@ mod tests {
                 }
                 add_factors.push(pid as f32 + row_offset as f32 * 0.1);
                 scale_factors.push(pid as f32 + row_offset as f32 * 0.2);
+                error_factors.push(pid as f32 + row_offset as f32 * 0.3);
                 if let (Some(ex_codes), Some(ex_code_bytes)) = (ex_codes.as_mut(), ex_code_bytes) {
                     for b in 0..ex_code_bytes {
                         ex_codes.push((17 + pid + row_offset + b) as u8);
@@ -2151,6 +2162,9 @@ mod tests {
             Arc::new(Float32Array::from(add_factors)),
             Arc::new(Float32Array::from(scale_factors)),
         ];
+        if metadata.query_estimator == RabitQueryEstimator::RawQuery {
+            columns.push(Arc::new(Float32Array::from(error_factors)));
+        }
         if let (Some(ex_codes), Some(ex_code_bytes)) = (ex_codes, ex_code_bytes) {
             columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
                 UInt8Array::from(ex_codes),
@@ -2317,6 +2331,7 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
         };
 
         write_rq_partial_aux(
@@ -2452,6 +2467,7 @@ mod tests {
             code_dim: 16,
             num_bits: 4,
             packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
         };
 
         write_rq_partial_aux(
@@ -2528,6 +2544,7 @@ mod tests {
                     panic!("RQ ex-code field should be FixedSizeList");
                 };
                 assert_eq!(*ex_code_bytes, 6);
+                assert!(schema.field_with_name(ERROR_FACTORS_FIELD.name()).is_ok());
                 assert!(schema.field_with_name(EX_ADD_FACTORS_COLUMN).is_ok());
                 assert!(schema.field_with_name(EX_SCALE_FACTORS_COLUMN).is_ok());
                 checked_split_columns = true;

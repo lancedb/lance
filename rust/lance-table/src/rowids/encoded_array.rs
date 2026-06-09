@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 
 /// Encoded array of u64 values.
 ///

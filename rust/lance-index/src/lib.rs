@@ -14,7 +14,7 @@ use std::{any::Any, sync::Arc};
 use crate::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::mem_wal::MEM_WAL_INDEX_NAME;
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};

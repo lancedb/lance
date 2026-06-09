@@ -8,8 +8,8 @@ use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 use arrow_schema::{DataType, Field};
 use bitvec::prelude::{BitVec, Lsb0};
-use deepsize::DeepSizeOf;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use ndarray::{Axis, ShapeBuilder, s};
 use num_traits::{AsPrimitive, FromPrimitive};
@@ -18,10 +18,11 @@ use rayon::prelude::*;
 
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
-    rabit_binary_code_field, rabit_ex_code_field,
+    RabitQueryEstimator, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
-    ADD_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD, SCALE_FACTORS_FIELD,
+    ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
+    SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::{
     RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
@@ -236,6 +237,7 @@ impl RabitQuantizer {
                     code_dim: code_dim as u32,
                     num_bits,
                     packed: false,
+                    query_estimator: RabitQueryEstimator::RawQuery,
                 }
             }
             RQRotationType::Fast => RabitQuantizationMetadata {
@@ -246,6 +248,7 @@ impl RabitQuantizer {
                 code_dim: code_dim as u32,
                 num_bits,
                 packed: false,
+                query_estimator: RabitQueryEstimator::RawQuery,
             },
         };
         Self { metadata }
@@ -257,6 +260,69 @@ impl RabitQuantizer {
 
     pub fn rotation_type(&self) -> RQRotationType {
         self.metadata.rotation_type
+    }
+
+    pub fn metadata_ref(&self) -> &RabitQuantizationMetadata {
+        &self.metadata
+    }
+
+    fn from_supplied_rotation(params: &RQBuildParams, dim: usize) -> Result<Option<Self>> {
+        let Some(metadata) = params.rotation.as_ref() else {
+            return Ok(None);
+        };
+
+        if metadata.num_bits != params.num_bits {
+            return Err(Error::invalid_input(format!(
+                "rabitq_model num_bits={} does not match requested num_bits={}",
+                metadata.num_bits, params.num_bits
+            )));
+        }
+
+        let rotated_dim = metadata.rotated_dim();
+        if rotated_dim != dim {
+            return Err(Error::invalid_input(format!(
+                "rabitq_model dimension={} does not match vector dimension={}",
+                rotated_dim, dim
+            )));
+        }
+
+        match metadata.rotation_type {
+            RQRotationType::Fast => {
+                let signs = metadata.fast_rotation_signs.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "rabitq_model fast rotation is missing fast_rotation_signs".to_string(),
+                    )
+                })?;
+                let expected_len = fast_rotation_signs_len(dim);
+                if signs.len() != expected_len {
+                    return Err(Error::invalid_input(format!(
+                        "rabitq_model fast_rotation_signs length={} does not match expected length={} for dimension={}",
+                        signs.len(),
+                        expected_len,
+                        dim
+                    )));
+                }
+            }
+            RQRotationType::Matrix => {
+                let rotate_mat = metadata.rotate_mat.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        "rabitq_model matrix rotation is missing rotate_mat".to_string(),
+                    )
+                })?;
+                if rotate_mat.len() != dim || rotate_mat.value_length() != dim as i32 {
+                    return Err(Error::invalid_input(format!(
+                        "rabitq_model matrix rotation shape=({}, {}) does not match vector dimension={}",
+                        rotate_mat.len(),
+                        rotate_mat.value_length(),
+                        dim
+                    )));
+                }
+            }
+        }
+
+        Ok(Some(Self {
+            metadata: metadata.clone(),
+        }))
     }
 
     #[inline]
@@ -324,7 +390,7 @@ impl RabitQuantizer {
         }
     }
 
-    pub(crate) fn rotate_fsl_to_f32(&self, vectors: &FixedSizeListArray) -> Result<Vec<f32>> {
+    pub fn rotate_fsl_to_f32(&self, vectors: &FixedSizeListArray) -> Result<Vec<f32>> {
         match vectors.value_type() {
             DataType::Float16 => self.rotate_fsl_to_f32_typed::<Float16Type>(vectors),
             DataType::Float32 => self.rotate_fsl_to_f32_typed::<Float32Type>(vectors),
@@ -522,16 +588,6 @@ impl RabitQuantizer {
         T::Native: AsPrimitive<f32> + Sync,
     {
         let ex_bits = rabit_ex_bits(self.metadata.num_bits)?;
-        if ex_bits == 0 {
-            return Ok(RabitQuantizedBatch {
-                binary_codes: self.transform::<T>(residual_vectors)?,
-                ex_codes: None,
-                ex_res_dot_dists: None,
-                rotated_residuals: None,
-                ex_code_values: None,
-            });
-        }
-
         let n = residual_vectors.len();
         let dim = self.dim();
         debug_assert_eq!(residual_vectors.values().len(), n * dim);
@@ -546,10 +602,10 @@ impl RabitQuantizer {
         let ex_code_bytes = rabit_ex_code_bytes(code_dim, ex_bits)?;
 
         let mut encoded_codes = vec![0u8; n * code_bytes];
-        let mut encoded_ex_codes = vec![0u8; n * ex_code_bytes];
-        let mut ex_res_dot_dists = vec![0.0f32; n];
+        let mut encoded_ex_codes = (ex_bits != 0).then(|| vec![0u8; n * ex_code_bytes]);
+        let mut ex_res_dot_dists = (ex_bits != 0).then(|| vec![0.0f32; n]);
         let mut rotated_residuals = vec![0.0f32; n * code_dim];
-        let mut ex_code_values = vec![0u8; n * code_dim];
+        let mut ex_code_values = (ex_bits != 0).then(|| vec![0u8; n * code_dim]);
 
         match self.rotation_type() {
             RQRotationType::Matrix => {
@@ -560,67 +616,67 @@ impl RabitQuantizer {
 
                 encoded_codes
                     .chunks_mut(code_bytes)
-                    .zip(encoded_ex_codes.chunks_mut(ex_code_bytes))
                     .zip(rotated_residuals.chunks_mut(code_dim))
-                    .zip(ex_code_values.chunks_mut(code_dim))
-                    .zip(ex_res_dot_dists.iter_mut())
                     .enumerate()
-                    .for_each(
-                        |(
-                            row_idx,
-                            ((((code_dst, ex_dst), rotated_dst), ex_values_dst), ex_dot_dst),
-                        )| {
-                            for (dst, value) in rotated_dst
-                                .iter_mut()
-                                .zip(rotated_vectors.column(row_idx).iter())
-                            {
-                                *dst = *value;
-                            }
-                            pack_sign_bits(code_dst, rotated_dst);
-                            *ex_dot_dst =
-                                quantize_ex_code(rotated_dst, ex_bits, ex_dst, ex_values_dst);
-                        },
-                    );
+                    .for_each(|(row_idx, (code_dst, rotated_dst))| {
+                        for (dst, value) in rotated_dst
+                            .iter_mut()
+                            .zip(rotated_vectors.column(row_idx).iter())
+                        {
+                            *dst = *value;
+                        }
+                        pack_sign_bits(code_dst, rotated_dst);
+                    });
             }
             RQRotationType::Fast => {
                 let signs = self.fast_rotation_signs();
                 encoded_codes
                     .par_chunks_mut(code_bytes)
-                    .zip(encoded_ex_codes.par_chunks_mut(ex_code_bytes))
                     .zip(rotated_residuals.par_chunks_mut(code_dim))
-                    .zip(ex_code_values.par_chunks_mut(code_dim))
-                    .zip(ex_res_dot_dists.par_iter_mut())
                     .zip(values.par_chunks_exact(dim))
-                    .for_each_init(
-                        || (),
-                        |_,
-                         (
-                            ((((code_dst, ex_dst), rotated_dst), ex_values_dst), ex_dot_dst),
-                            input,
-                        )| {
-                            apply_fast_rotation(input, rotated_dst, signs);
-                            pack_sign_bits(code_dst, rotated_dst);
-                            *ex_dot_dst =
-                                quantize_ex_code(rotated_dst, ex_bits, ex_dst, ex_values_dst);
-                        },
-                    );
+                    .for_each(|((code_dst, rotated_dst), input)| {
+                        apply_fast_rotation(input, rotated_dst, signs);
+                        pack_sign_bits(code_dst, rotated_dst);
+                    });
             }
         }
 
+        if ex_bits != 0 {
+            let encoded_ex_codes = encoded_ex_codes
+                .as_mut()
+                .expect("ex-code buffer should exist for multi-bit RQ");
+            let ex_res_dot_dists = ex_res_dot_dists
+                .as_mut()
+                .expect("ex dot buffer should exist for multi-bit RQ");
+            let ex_code_values = ex_code_values
+                .as_mut()
+                .expect("ex-code value buffer should exist for multi-bit RQ");
+            encoded_ex_codes
+                .par_chunks_mut(ex_code_bytes)
+                .zip(ex_code_values.par_chunks_mut(code_dim))
+                .zip(ex_res_dot_dists.par_iter_mut())
+                .zip(rotated_residuals.par_chunks(code_dim))
+                .for_each(|(((ex_dst, ex_values_dst), ex_dot_dst), rotated)| {
+                    *ex_dot_dst = quantize_ex_code(rotated, ex_bits, ex_dst, ex_values_dst);
+                });
+        }
+
         let binary_codes = UInt8Array::from(encoded_codes);
-        let ex_codes = UInt8Array::from(encoded_ex_codes);
+        let ex_codes = encoded_ex_codes.map(UInt8Array::from);
         Ok(RabitQuantizedBatch {
             binary_codes: Arc::new(FixedSizeListArray::try_new_from_values(
                 binary_codes,
                 code_bytes as i32,
             )?),
-            ex_codes: Some(Arc::new(FixedSizeListArray::try_new_from_values(
-                ex_codes,
-                ex_code_bytes as i32,
-            )?)),
-            ex_res_dot_dists: Some(ex_res_dot_dists),
+            ex_codes: ex_codes
+                .map(|ex_codes| {
+                    FixedSizeListArray::try_new_from_values(ex_codes, ex_code_bytes as i32)
+                        .map(|array| Arc::new(array) as ArrayRef)
+                })
+                .transpose()?,
+            ex_res_dot_dists,
             rotated_residuals: Some(rotated_residuals),
-            ex_code_values: Some(ex_code_values),
+            ex_code_values,
         })
     }
 }
@@ -643,45 +699,8 @@ impl Quantization for RabitQuantizer {
                 "vector dimension must be divisible by 8 for IVF_RQ",
             ));
         }
-
-        // Reuse a supplied rotation instead of generating a fresh random one.
-        if let Some(meta) = &params.rotation {
-            let expected_code_dim = dim * params.num_bits as usize;
-            if meta.num_bits != params.num_bits || meta.code_dim as usize != expected_code_dim {
-                return Err(Error::invalid_input(format!(
-                    "supplied RaBitQ rotation does not match build params: rotation \
-                     num_bits={}, code_dim={}; expected num_bits={}, code_dim={}",
-                    meta.num_bits, meta.code_dim, params.num_bits, expected_code_dim
-                )));
-            }
-
-            match meta.rotation_type {
-                RQRotationType::Fast => {
-                    let signs = meta.fast_rotation_signs.as_ref().ok_or_else(|| {
-                        Error::invalid_input("supplied fast RaBitQ rotation is missing signs")
-                    })?;
-                    let expected_len = fast_rotation_signs_len(meta.code_dim as usize);
-                    if signs.len() != expected_len {
-                        return Err(Error::invalid_input(format!(
-                            "supplied fast RaBitQ rotation signs length {} does not match \
-                             expected {} for code_dim={}",
-                            signs.len(),
-                            expected_len,
-                            meta.code_dim
-                        )));
-                    }
-                }
-                RQRotationType::Matrix => {
-                    if meta.rotate_mat.is_none() {
-                        return Err(Error::invalid_input(
-                            "use the fast rotation for distributed builds",
-                        ));
-                    }
-                }
-            }
-            return Ok(Self {
-                metadata: meta.clone(),
-            });
+        if let Some(q) = Self::from_supplied_rotation(params, dim)? {
+            return Ok(q);
         }
 
         let q = match data.as_fixed_size_list().value_type() {
@@ -780,6 +799,9 @@ impl Quantization for RabitQuantizer {
 
     fn extra_fields(&self) -> Vec<Field> {
         let mut fields = vec![ADD_FACTORS_FIELD.clone(), SCALE_FACTORS_FIELD.clone()];
+        if self.metadata.query_estimator == RabitQueryEstimator::RawQuery {
+            fields.push(ERROR_FACTORS_FIELD.clone());
+        }
         if let Some(ex_code_field) = rabit_ex_code_field(self.code_dim(), self.metadata.num_bits)
             .expect("RabitQ num_bits should be validated")
         {
@@ -879,6 +901,8 @@ mod tests {
     use lance_linalg::distance::DistanceType;
     use rstest::rstest;
 
+    use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
+
     #[rstest]
     #[case(8)]
     #[case(16)]
@@ -943,6 +967,36 @@ mod tests {
     }
 
     #[test]
+    fn test_rabit_quantizer_extra_fields_include_raw_query_error_factor() {
+        let q = RabitQuantizer::new_with_rotation::<Float32Type>(1, 128, RQRotationType::Fast);
+        let fields = q.extra_fields();
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name() == ERROR_FACTORS_FIELD.name())
+        );
+        assert!(
+            !fields
+                .iter()
+                .any(|field| field.name() == RABIT_EX_CODE_COLUMN)
+        );
+
+        let q = RabitQuantizer::new_with_rotation::<Float32Type>(3, 128, RQRotationType::Fast);
+        let fields = q.extra_fields();
+        for expected in [
+            ERROR_FACTORS_FIELD.name().as_str(),
+            RABIT_EX_CODE_COLUMN,
+            EX_ADD_FACTORS_FIELD.name().as_str(),
+            EX_SCALE_FACTORS_FIELD.name().as_str(),
+        ] {
+            assert!(
+                fields.iter().any(|field| field.name().as_str() == expected),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn test_rabit_quantizer_requires_dim_divisible_by_8() {
         let vectors = Float32Array::from(vec![0.0f32; 4 * 30]);
         let fsl = FixedSizeListArray::try_new_from_values(vectors, 30).unwrap();
@@ -957,122 +1011,56 @@ mod tests {
         );
     }
 
-    fn sample_fsl(n: usize, dim: usize) -> FixedSizeListArray {
-        let values: Vec<f32> = (0..n * dim).map(|i| ((i * 31 % 17) as f32) - 8.0).collect();
-        FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
-    }
+    #[test]
+    fn test_rabit_quantizer_reuses_supplied_rotation() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+        let supplied =
+            RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
+                .metadata(None);
+        let supplied_signs = supplied.fast_rotation_signs.clone();
 
-    fn quantized_codes(q: &RabitQuantizer, data: &FixedSizeListArray) -> Vec<u8> {
-        use arrow::datatypes::UInt8Type;
-        q.quantize(data)
-            .unwrap()
-            .as_fixed_size_list()
-            .values()
-            .as_primitive::<UInt8Type>()
-            .values()
-            .to_vec()
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(supplied);
+
+        let quantizer = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap();
+        let metadata = quantizer.metadata_ref();
+        assert_eq!(metadata.num_bits, 3);
+        assert_eq!(metadata.rotation_type, RQRotationType::Fast);
+        assert_eq!(metadata.fast_rotation_signs, supplied_signs);
     }
 
     #[test]
-    fn test_shared_fast_rotation_gives_identical_codes() {
-        let dim = 32;
-        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Fast);
-        let json = serde_json::to_string(&seed.metadata(None)).unwrap();
-        let meta: RabitQuantizationMetadata = serde_json::from_str(&json).unwrap();
+    fn test_rabit_quantizer_validates_supplied_rotation() {
+        let vectors = Float32Array::from(vec![0.0f32; 4 * 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, 32).unwrap();
+        let supplied =
+            RabitQuantizer::new_with_rotation::<Float32Type>(3, 32, RQRotationType::Fast)
+                .metadata(None);
 
-        let params = RQBuildParams {
-            num_bits: 1,
-            rotation_type: RQRotationType::Fast,
-            rotation: Some(meta),
-        };
-        let data = sample_fsl(8, dim as usize);
-        let q_a = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
-        let q_b = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
-
-        assert_eq!(
-            quantized_codes(&q_a, &data),
-            quantized_codes(&q_b, &data),
-            "shared rotation must yield identical codes"
-        );
-    }
-
-    #[test]
-    fn test_unpinned_rotation_gives_different_codes() {
-        let dim = 32;
-        let params = RQBuildParams::new(1);
-        let data = sample_fsl(8, dim as usize);
-        let q_a = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
-        let q_b = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap();
-
-        assert_ne!(
-            quantized_codes(&q_a, &data),
-            quantized_codes(&q_b, &data),
-            "independent unpinned rotations must yield different codes"
-        );
-    }
-
-    #[test]
-    fn test_build_rejects_rotation_with_mismatched_code_dim() {
-        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, 16, RQRotationType::Fast);
-        let params = RQBuildParams {
-            num_bits: 1,
-            rotation_type: RQRotationType::Fast,
-            rotation: Some(seed.metadata(None)),
-        };
-        let data = sample_fsl(4, 32);
-        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
-        assert!(
-            err.to_string().contains("does not match build params"),
-            "{}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_build_rejects_fast_rotation_with_bad_signs_length() {
-        let dim = 16;
-        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Fast);
-        let mut meta = seed.metadata(None);
-        // Corrupt the signs to the wrong length (valid would be 4 * ceil(16/8) = 8).
-        meta.fast_rotation_signs = Some(vec![0u8; 7]);
-        let params = RQBuildParams {
-            num_bits: 1,
-            rotation_type: RQRotationType::Fast,
-            rotation: Some(meta),
-        };
-        let data = sample_fsl(4, dim as usize);
-        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
-        assert!(err.to_string().contains("signs length"), "{}", err);
-    }
-
-    #[test]
-    fn test_matrix_rotation_lost_through_json_is_rejected() {
-        let dim = 16;
-        let seed = RabitQuantizer::new_with_rotation::<Float32Type>(1, dim, RQRotationType::Matrix);
-        let meta = seed.metadata(None);
-        assert!(meta.rotate_mat.is_some());
-
-        let json = serde_json::to_string(&meta).unwrap();
-        let parsed: RabitQuantizationMetadata = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.rotation_type, RQRotationType::Matrix);
-        assert!(
-            parsed.rotate_mat.is_none(),
-            "matrix is expected to be dropped by JSON serialization"
-        );
-
-        let params = RQBuildParams {
-            num_bits: 1,
-            rotation_type: RQRotationType::Matrix,
-            rotation: Some(parsed),
-        };
-        let data = sample_fsl(4, dim as usize);
-        let err = RabitQuantizer::build(&data, DistanceType::L2, &params).unwrap_err();
+        let mut wrong_num_bits = supplied.clone();
+        wrong_num_bits.num_bits = 1;
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(wrong_num_bits);
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
         assert!(
             err.to_string()
-                .contains("fast rotation for distributed builds"),
-            "{}",
-            err
+                .contains("does not match requested num_bits")
         );
+
+        let mut wrong_dim = supplied.clone();
+        wrong_dim.code_dim = 64;
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(wrong_dim);
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(err.to_string().contains("does not match vector dimension"));
+
+        let mut wrong_sign_len = supplied;
+        wrong_sign_len.fast_rotation_signs.as_mut().unwrap().pop();
+        let mut params = RQBuildParams::with_rotation_type(3, RQRotationType::Fast);
+        params.rotation = Some(wrong_sign_len);
+        let err = RabitQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(err.to_string().contains("fast_rotation_signs length"));
     }
 
     #[test]

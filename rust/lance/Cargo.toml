@@ -56,7 +56,6 @@ crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
-deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 # Fast non-cryptographic hasher for the hot FTS mem-index insert path.

@@ -17,17 +17,17 @@ use bytes::Bytes;
 use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
-use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::{Error, ROW_ID, Result};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
-use super::{AnyQuery, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
+use super::{AnyQuery, IndexFile, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
@@ -228,7 +228,7 @@ impl ScalarIndex for LabelListIndex {
                     .copied()
                     .unwrap_or(Some(addr_as_u64))
             }));
-        write_label_list_bitmap_index(
+        let file = write_label_list_bitmap_index(
             remapped_state,
             dest_store,
             self.values_index.value_type(),
@@ -240,7 +240,7 @@ impl ScalarIndex for LabelListIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -262,13 +262,15 @@ impl ScalarIndex for LabelListIndex {
         if !new_nulls.is_empty() {
             merged_nulls |= &new_nulls;
         }
-        write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls).await?;
+        let file =
+            write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls)
+                .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -475,7 +477,7 @@ async fn write_label_list_bitmap_index(
     store: &dyn IndexStore,
     value_type: &DataType,
     list_nulls: &RowAddrTreeMap,
-) -> Result<()> {
+) -> Result<IndexFile> {
     BitmapIndexPlugin::write_bitmap_index_with_extras(
         state,
         store,
@@ -502,7 +504,7 @@ pub struct LabelListIndexState {
 }
 
 impl DeepSizeOf for LabelListIndexState {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.bitmap_state.deep_size_of_children(context)
             + self.list_nulls.deep_size_of_children(context)
     }
@@ -672,12 +674,13 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         let (state, value_type) =
             BitmapIndexPlugin::build_bitmap_index_state(data, HashMap::new()).await?;
         let list_nulls = list_nulls.lock().unwrap().clone();
-        write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
+        let file =
+            write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 

@@ -6,8 +6,8 @@ use std::ops::Range;
 
 use crate::datatypes::{Fields, FieldsWithMeta};
 use crate::format::pb;
-use deepsize::DeepSizeOf;
 use lance_core::datatypes::Schema;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_io::traits::ProtoStruct;
 
