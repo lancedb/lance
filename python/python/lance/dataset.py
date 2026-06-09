@@ -3074,6 +3074,38 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
+    @staticmethod
+    def _normalized_index_type(
+        index_type: Union[str, IndexConfig],
+    ) -> str:
+        if isinstance(index_type, IndexConfig):
+            index_type = index_type.index_type
+        return index_type.upper()
+
+    @classmethod
+    def _is_segment_native_scalar_index_type(
+        cls,
+        index_type: Union[str, IndexConfig],
+    ) -> bool:
+        return cls._normalized_index_type(index_type) in {
+            "BTREE",
+            "BITMAP",
+            "INVERTED",
+            "FTS",
+            "ZONEMAP",
+        }
+
+    @classmethod
+    def _requires_uncommitted_scalar_index(
+        cls,
+        index_type: Union[str, IndexConfig],
+    ) -> bool:
+        return cls._normalized_index_type(index_type) in {
+            "BTREE",
+            "BITMAP",
+            "ZONEMAP",
+        }
+
     def create_scalar_index(
         self,
         column: str,
@@ -3291,7 +3323,9 @@ class LanceDataset(pa.dataset.Dataset):
             column, index_type, kwargs
         )
 
-        if fragment_ids is not None and logical_index_type in {"BTREE", "BITMAP"}:
+        if fragment_ids is not None and self._requires_uncommitted_scalar_index(
+            logical_index_type
+        ):
             raise ValueError(
                 f"{logical_index_type} distributed indexing uses "
                 "create_index_uncommitted(..., "
@@ -4004,7 +4038,8 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, and INVERTED scalar index construction. Unlike
+        canonical bitmap scalar, INVERTED scalar, and ZONEMAP scalar index
+        construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4020,7 +4055,7 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP and INVERTED segments may
+        BTREE, BITMAP, INVERTED, and ZONEMAP segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
@@ -4047,12 +4082,8 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
-        is_scalar_segment_request = (
-            isinstance(index_type, str)
-            and index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
-        ) or (
-            isinstance(index_type, IndexConfig)
-            and index_type.index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
+        is_scalar_segment_request = self._is_segment_native_scalar_index_type(
+            index_type
         )
         if is_scalar_segment_request:
             if fragment_ids is None:
