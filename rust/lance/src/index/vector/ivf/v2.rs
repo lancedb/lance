@@ -177,6 +177,23 @@ fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
     binary_dist_table_len.max(ex_dist_table_len)
 }
 
+fn rabit_query_scratch_capacity(
+    dim: usize,
+    max_partition_len: usize,
+    num_bits: u8,
+) -> QueryScratchCapacity {
+    let dist_table_len = dim * 4;
+    let ex_dist_table_len = rabit_ex_dist_table_len(dim, num_bits);
+    let u8_scratch_len = rabit_u8_scratch_len(dim, num_bits);
+
+    QueryScratchCapacity::new(
+        max_partition_len,
+        dim + dist_table_len + ex_dist_table_len,
+        max_partition_len.max(dist_table_len),
+        u8_scratch_len,
+    )
+}
+
 impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.index_file_path.deep_size_of_children(context)
@@ -934,26 +951,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
 
         let dim = ivf.dimension();
-        let dist_table_len = dim * 4;
-        let (ex_dist_table_len, u8_scratch_len) = match storage.quantizer() {
-            Ok(Quantizer::Rabit(rq)) => {
-                let num_bits = rq.metadata_ref().num_bits;
-                (
-                    rabit_ex_dist_table_len(dim, num_bits),
-                    rabit_u8_scratch_len(dim, num_bits),
-                )
-            }
-            _ => (dim * 256, dim * 32),
-        };
         let max_partition_len = ivf.lengths.iter().copied().max().unwrap_or_default() as usize;
+        let num_bits = match storage.quantizer() {
+            Ok(Quantizer::Rabit(rq)) => rq.metadata_ref().num_bits,
+            _ => 9,
+        };
 
-        QueryScratchCapacity::new_with_u32(
-            max_partition_len,
-            dim + dist_table_len + ex_dist_table_len,
-            max_partition_len.max(dist_table_len),
-            u8_scratch_len,
-            max_partition_len,
-        )
+        rabit_query_scratch_capacity(dim, max_partition_len, num_bits)
     }
 
     fn use_residual_scratch(ivf: &IvfModel, use_query_residual: bool) -> bool {
@@ -1998,6 +2002,20 @@ mod tests {
         assert_eq!(super::rabit_u8_scratch_len(dim, 5), dim * 16);
         assert_eq!(super::rabit_u8_scratch_len(dim, 7), dim * 4);
         assert_eq!(super::rabit_u8_scratch_len(dim, 9), dim * 32);
+    }
+
+    #[test]
+    fn test_rabit_query_scratch_capacity_does_not_preallocate_u32() {
+        let dim = 960;
+        let max_partition_len = 4096;
+
+        let capacity = super::rabit_query_scratch_capacity(dim, max_partition_len, 5);
+
+        assert_eq!(capacity.distances, max_partition_len);
+        assert_eq!(capacity.query_f32, dim + dim * 4 + dim * 16);
+        assert_eq!(capacity.u16, max_partition_len);
+        assert_eq!(capacity.u8, dim * 16);
+        assert_eq!(capacity.u32, 0);
     }
 
     async fn generate_test_dataset<T: ArrowPrimitiveType>(
