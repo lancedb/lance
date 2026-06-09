@@ -68,7 +68,7 @@ pub enum BuiltinIndexType {
     BloomFilter,
     RTree,
     Inverted,
-    FMIndex,
+    Fm,
 }
 
 impl BuiltinIndexType {
@@ -82,7 +82,7 @@ impl BuiltinIndexType {
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
-            Self::FMIndex => "fmindex",
+            Self::Fm => "fm",
         }
     }
 }
@@ -100,7 +100,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
-            IndexType::FMIndex => Ok(Self::FMIndex),
+            IndexType::Fm => Ok(Self::Fm),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }

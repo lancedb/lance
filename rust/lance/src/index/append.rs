@@ -1487,11 +1487,11 @@ mod tests {
         .await
         .unwrap();
 
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         dataset
             .create_index(
                 &["text"],
-                IndexType::FMIndex,
+                IndexType::Fm,
                 Some("text_fmindex".to_string()),
                 &params,
                 true,

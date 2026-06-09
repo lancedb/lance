@@ -44,7 +44,12 @@ impl IndexPluginRegistry {
     fn get_plugin_name_from_details_name(&self, details_name: &str) -> String {
         let details_name = Self::normalize_plugin_name(details_name);
         if details_name.ends_with("indexdetails") {
-            details_name.replace("indexdetails", "")
+            let plugin_name = details_name.replace("indexdetails", "");
+            if plugin_name == "fmindex" {
+                "fm".to_string()
+            } else {
+                plugin_name
+            }
         } else {
             details_name
         }
@@ -156,6 +161,7 @@ mod tests {
             ("NGRAM", "NGram"),
             ("ZONEMAP", "ZoneMap"),
             ("BLOOMFILTER", "BloomFilter"),
+            ("FM", "Fm"),
             ("JSON", "Json"),
         ] {
             let plugin = registry.get_plugin_by_name(requested_name).unwrap();

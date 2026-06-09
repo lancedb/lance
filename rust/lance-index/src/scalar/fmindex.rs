@@ -58,7 +58,7 @@ const SENTINEL_BYTE: u8 = 0xFF;
 const SA_SAMPLE_RATE: usize = 32;
 
 fn fmindex_partition_path(partition_id: u64) -> String {
-    format!("part_{partition_id}_fmindex.lance")
+    format!("part_{partition_id}_fm.lance")
 }
 
 // ── Bitvector with O(1) rank ─────────────────────────────────────────────────
@@ -1267,7 +1267,7 @@ impl FMIndexScalarIndex {
             if let Some(id) = f
                 .path
                 .strip_prefix("part_")
-                .and_then(|r| r.strip_suffix("_fmindex.lance"))
+                .and_then(|r| r.strip_suffix("_fm.lance"))
                 .and_then(|s| s.parse::<u64>().ok())
             {
                 pfiles.push((id, f.path.clone()));
@@ -1297,7 +1297,7 @@ impl Index for FMIndexScalarIndex {
     }
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
         Err(Error::invalid_input_source(
-            "FMIndex is not a vector index".into(),
+            "Fm is not a vector index".into(),
         ))
     }
     async fn prewarm(&self) -> Result<()> {
@@ -1305,14 +1305,14 @@ impl Index for FMIndexScalarIndex {
     }
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "type": "FMIndex",
+            "type": "Fm",
             "num_partitions": self.partitions.len(),
             "total_bwt_len": self.partitions.iter().map(|p| p.fm.wavelet.len).sum::<usize>(),
             "total_docs": self.partitions.iter().map(|p| p.fm.row_ids.len()).sum::<usize>(),
         }))
     }
     fn index_type(&self) -> IndexType {
-        IndexType::FMIndex
+        IndexType::Fm
     }
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frags = RoaringBitmap::new();
@@ -1335,7 +1335,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         let tq = query
             .as_any()
             .downcast_ref::<TextQuery>()
-            .ok_or_else(|| Error::invalid_input("FMIndex only supports TextQuery"))?;
+            .ok_or_else(|| Error::invalid_input("Fm only supports TextQuery"))?;
         match tq {
             TextQuery::StringContains(pattern) => {
                 let pb = pattern.as_bytes();
@@ -1362,7 +1362,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         _: &HashMap<u64, Option<u64>>,
         _: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::not_supported("FMIndex does not support remap"))
+        Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(
         &self,
@@ -1384,7 +1384,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         )
     }
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Fm))
     }
 }
 
@@ -1401,7 +1401,7 @@ async fn collect_texts(mut stream: SendableRecordBatchStream) -> Result<Vec<(u64
             .or_else(|| batch.column_by_name("_rowid"))
             .and_then(|c| c.as_any().downcast_ref())
             .ok_or_else(|| {
-                Error::invalid_input("FMIndex training data must include _rowaddr or _rowid column")
+                Error::invalid_input("Fm training data must include _rowaddr or _rowid column")
             })?;
         // Use the named value column; fall back to column(0) for legacy streams
         let value_col = batch
@@ -1467,7 +1467,7 @@ fn extract_text_bytes(array: &dyn arrow_array::Array, index: usize) -> Result<Op
                 .to_vec(),
         )),
         _ => Err(Error::invalid_input(format!(
-            "FMIndex does not support data type: {:?}",
+            "Fm does not support data type: {:?}",
             array.data_type()
         ))),
     }
@@ -1595,7 +1595,7 @@ pub struct FMIndexPlugin;
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
     fn name(&self) -> &str {
-        "FMIndex"
+        "Fm"
     }
     fn new_training_request(
         &self,
@@ -2199,7 +2199,7 @@ mod tests {
                 .unwrap();
 
             let stats = index.statistics().unwrap();
-            assert_eq!(stats["type"], "FMIndex");
+            assert_eq!(stats["type"], "Fm");
             assert_eq!(stats["total_docs"], 10);
             assert!(stats["total_bwt_len"].as_u64().unwrap() > 0);
         });

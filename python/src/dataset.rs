@@ -2159,7 +2159,7 @@ impl Dataset {
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "FMINDEX" => IndexType::FMIndex,
+            "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -2199,7 +2199,7 @@ impl Dataset {
                 index_type: "rtree".to_string(),
                 params: None,
             }),
-            "FMINDEX" => {
+            "FM" => {
                 let mut params_json = serde_json::Map::new();
                 if let Some(kwargs) = kwargs
                     && let Some(num_segments) = kwargs.get_item("num_segments")?
@@ -2216,7 +2216,7 @@ impl Dataset {
                     Some(serde_json::Value::Object(params_json).to_string())
                 };
                 Box::new(ScalarIndexParams {
-                    index_type: "FMIndex".to_string(),
+                    index_type: "fm".to_string(),
                     params,
                 })
             }

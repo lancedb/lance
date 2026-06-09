@@ -1129,16 +1129,15 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
 
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         let mut segments = Vec::new();
         for fragment in &fragments {
-            let segment =
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::FMIndex, &params)
-                    .name("text_fmindex".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap();
+            let segment = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
+                .name("text_fmindex".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
 
             assert_eq!(
                 segment
@@ -1164,7 +1163,7 @@ mod tests {
             open_named_scalar_index(&dataset, "text", "text_fmindex", &NoOpMetricsCollector)
                 .await
                 .unwrap();
-        assert_eq!(logical.index_type(), IndexType::FMIndex);
+        assert_eq!(logical.index_type(), IndexType::Fm);
 
         let query = lance_index::scalar::TextQuery::StringContains("quick".to_string());
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
@@ -1230,16 +1229,15 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
 
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         let mut staged = Vec::new();
         for fragment in &fragments {
-            let segment =
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::FMIndex, &params)
-                    .name("text_fmindex_merge".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap();
+            let segment = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
+                .name("text_fmindex_merge".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
             staged.push(segment);
         }
         assert_eq!(staged.len(), 2);
@@ -1277,7 +1275,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(logical.index_type(), IndexType::FMIndex);
+        assert_eq!(logical.index_type(), IndexType::Fm);
 
         let query = lance_index::scalar::TextQuery::StringContains("delta".to_string());
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
@@ -1339,16 +1337,15 @@ mod tests {
         assert_eq!(fragments.len(), 2);
 
         // Build per-fragment FM-Index segments and commit
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
         let mut staged = Vec::new();
         for fragment in &fragments {
-            let segment =
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::FMIndex, &params)
-                    .name("text_fmindex_compact".to_string())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap();
+            let segment = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
+                .name("text_fmindex_compact".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
             staged.push(segment);
         }
         dataset

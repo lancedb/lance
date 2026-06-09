@@ -50,9 +50,9 @@ pub(in crate::index) async fn merge_segments(
         let created_index = super::build_scalar_index(
             dataset,
             &column,
-            &new_uuid.to_string(),
+            new_uuid,
             &lance_index::scalar::ScalarIndexParams::for_builtin(
-                lance_index::scalar::BuiltinIndexType::FMIndex,
+                lance_index::scalar::BuiltinIndexType::Fm,
             ),
             false,
             None,
@@ -70,7 +70,7 @@ pub(in crate::index) async fn merge_segments(
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: created_index.files,
+            files: Some(created_index.files),
             ..segments[0].clone()
         });
     }
@@ -81,9 +81,9 @@ pub(in crate::index) async fn merge_segments(
     let created_index = super::build_scalar_index(
         dataset,
         &column,
-        &new_uuid.to_string(),
+        new_uuid,
         &lance_index::scalar::ScalarIndexParams::for_builtin(
-            lance_index::scalar::BuiltinIndexType::FMIndex,
+            lance_index::scalar::BuiltinIndexType::Fm,
         ),
         true,
         Some(fragment_ids),
@@ -101,7 +101,7 @@ pub(in crate::index) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: created_index.files,
+        files: Some(created_index.files),
         ..segments[0].clone()
     })
 }

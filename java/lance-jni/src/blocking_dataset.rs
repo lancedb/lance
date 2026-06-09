@@ -981,7 +981,7 @@ fn inner_create_index<'local>(
         | IndexType::NGram
         | IndexType::ZoneMap
         | IndexType::BloomFilter
-        | IndexType::FMIndex
+        | IndexType::Fm
         | IndexType::RTree => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
