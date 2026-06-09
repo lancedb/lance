@@ -28,7 +28,7 @@ use crate::{
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
-use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
+use arrow_array::{Array, ArrayAccessor, RecordBatch, UInt32Array, cast::AsArray, new_empty_array};
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
@@ -613,6 +613,26 @@ fn partition_point(lo: usize, hi: usize, mut pred: impl FnMut(usize) -> bool) ->
     lo
 }
 
+/// Builds a comparator over two array accessors of the same `Ord` item type,
+/// matching arrow's NULLs-first ascending order (`null < non-null`, `null == null`).
+///
+/// Unlike [`make_comparator`], the returned closure is generic (not boxed), so the
+/// element comparison inlines into the scan instead of dispatching through a vtable
+/// on every call.
+fn accessor_cmp<'a, T, L, R>(left: L, right: R) -> impl Fn(usize, usize) -> Ordering + 'a
+where
+    T: Ord,
+    L: ArrayAccessor<Item = T> + 'a,
+    R: ArrayAccessor<Item = T> + 'a,
+{
+    move |i, j| match (left.is_null(i), right.is_null(j)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => left.value(i).cmp(&right.value(j)),
+    }
+}
+
 /// Satisfies scalar queries by searching the `page_lookup.lance` batch directly.
 ///
 /// The batch holds one row per page with columns `min | max | null_count | page_idx`,
@@ -783,25 +803,83 @@ impl BTreeLookup {
 
         let mins = self.batch.column(0).as_ref();
         let maxs = self.batch.column(1).as_ref();
-        let page_numbers = self.page_numbers()?;
+        let page_ids = self.page_numbers()?.values();
 
-        // The batch is sorted ascending by `min` with NULLs first; compare the
-        // query values the same way so the binary searches stay consistent.
-        let opts = SortOptions {
-            descending: false,
-            nulls_first: true,
-        };
-        // `cmp_min(i, j)` compares page `i`'s `min` against query value `j`;
-        // `cmp_max` likewise for `max`. `cmp_min_min` compares two page `min`s and
-        // is used to expand left onto a straddling page.
-        let cmp_min = make_comparator(mins, query, opts)?;
-        let cmp_max = make_comparator(maxs, query, opts)?;
-        let cmp_min_min = make_comparator(mins, mins, opts)?;
+        // For byte-like columns we downcast once and compare with native `Ord`
+        // closures that inline into the scan, instead of going through the boxed
+        // `DynComparator` (one vtable call per comparison). The query array always
+        // matches the column type, so a single match on its type covers both columns.
+        match query.data_type() {
+            DataType::Utf8 => {
+                let mins = mins.as_string::<i32>();
+                let maxs = maxs.as_string::<i32>();
+                let query = query.as_string::<i32>();
+                Ok(self.scan_equality_pages(
+                    query.len(),
+                    page_ids,
+                    |idx| maxs.is_null(idx),
+                    accessor_cmp(mins, query),
+                    accessor_cmp(maxs, query),
+                    accessor_cmp(mins, mins),
+                ))
+            }
+            DataType::LargeUtf8 => {
+                let mins = mins.as_string::<i64>();
+                let maxs = maxs.as_string::<i64>();
+                let query = query.as_string::<i64>();
+                Ok(self.scan_equality_pages(
+                    query.len(),
+                    page_ids,
+                    |idx| maxs.is_null(idx),
+                    accessor_cmp(mins, query),
+                    accessor_cmp(maxs, query),
+                    accessor_cmp(mins, mins),
+                ))
+            }
+            _ => {
+                // The batch is sorted ascending by `min` with NULLs first; compare the
+                // query values the same way so the binary searches stay consistent.
+                let opts = SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                };
+                let cmp_min = make_comparator(mins, query, opts)?;
+                let cmp_max = make_comparator(maxs, query, opts)?;
+                let cmp_min_min = make_comparator(mins, mins, opts)?;
+                Ok(self.scan_equality_pages(
+                    query.len(),
+                    page_ids,
+                    |idx| maxs.is_null(idx),
+                    cmp_min,
+                    cmp_max,
+                    cmp_min_min,
+                ))
+            }
+        }
+    }
 
+    /// Binary-search + forward-scan the page batch for equality candidates.
+    ///
+    /// Monomorphized over the comparator closures so a typed-native comparator
+    /// inlines (no per-call vtable dispatch). The closures encode NULLs-first,
+    /// ascending order:
+    ///   * `cmp_min(i, j)` — page `i`'s `min` vs query value `j`
+    ///   * `cmp_max(i, j)` — page `i`'s `max` vs query value `j`
+    ///   * `cmp_min_min(i, anchor)` — two page `min`s, to expand left onto a straddle
+    fn scan_equality_pages(
+        &self,
+        num_query: usize,
+        page_ids: &[u32],
+        max_is_null: impl Fn(usize) -> bool,
+        cmp_min: impl Fn(usize, usize) -> Ordering,
+        cmp_max: impl Fn(usize, usize) -> Ordering,
+        cmp_min_min: impl Fn(usize, usize) -> Ordering,
+    ) -> Vec<u32> {
+        let num_rows = self.batch.num_rows();
         // High-cardinality lookups hit ~one page per value; presize to avoid the
         // element-by-element `RawVec` growth that profiling flagged.
-        let mut pages = Vec::with_capacity(query.len());
-        for j in 0..query.len() {
+        let mut pages = Vec::with_capacity(num_query);
+        for j in 0..num_query {
             // Start row: peek a little to the left of the value. A query for 7 must
             // still reach a page like [5, 10], so we include every page whose `min`
             // equals the largest `min` strictly less than the value.
@@ -825,16 +903,16 @@ impl BTreeLookup {
             //     min == value`) and can't have a null `max` (all-null pages sort to
             //     the front, before `search_start <= start`), so we copy them in one
             //     slice instead of pushing per row.
-            let page_ids = page_numbers.values();
             let bulk_start = p.max(start);
-            for idx in start..bulk_start {
+            for (offset, &page_id) in page_ids[start..bulk_start].iter().enumerate() {
+                let idx = start + offset;
                 // All-null pages are only matched by IS NULL queries.
-                if maxs.is_null(idx) {
+                if max_is_null(idx) {
                     continue;
                 }
                 // Candidate when the page's `max` reaches the value (`max >= value`).
                 if cmp_max(idx, j) != Ordering::Less {
-                    pages.push(page_ids[idx]);
+                    pages.push(page_id);
                 }
             }
             pages.extend_from_slice(&page_ids[bulk_start..end]);
@@ -842,7 +920,7 @@ impl BTreeLookup {
 
         pages.sort_unstable();
         pages.dedup();
-        Ok(pages)
+        pages
     }
 
     // All pages that could have a value in the range
