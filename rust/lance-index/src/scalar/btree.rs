@@ -4,7 +4,7 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
@@ -726,7 +726,9 @@ impl BTreeLookup {
         if query.0.is_null() {
             Ok(self.pages_null())
         } else {
-            self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+            let query_arr = query.0.to_array_of_size(1)?;
+            let pages = self.candidate_pages_for_values(query_arr.as_ref())?;
+            Ok(pages.into_iter().map(Matches::Some).collect())
         }
     }
 
@@ -735,26 +737,98 @@ impl BTreeLookup {
         &self,
         values: impl IntoIterator<Item = OrderableScalarValue>,
     ) -> Result<Vec<Matches>> {
-        // TODO: Right now we convert all Matches::All into Matches::Some.  We could refine this.
-        // It would improve performance on low cardinality data.
-        let page_lists = values
-            .into_iter()
-            .map(|val| {
-                Ok(self
-                    .pages_eq(&val)?
-                    .into_iter()
-                    .map(|matches| matches.page_id())
-                    .collect::<Vec<_>>())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let total_size = page_lists.iter().map(|set| set.len()).sum();
-        let mut heap = BinaryHeap::with_capacity(total_size);
-        for page_list in page_lists {
-            heap.extend(page_list);
+        // Equality lookups never produce a full-page (`Matches::All`) match because a
+        // single value cannot cover an entire page's range, so every candidate is
+        // `Matches::Some`. Refining this for low-cardinality data is the TODO in
+        // `pages_between`.
+        let mut has_null = false;
+        let mut non_null = Vec::new();
+        for val in values {
+            if val.0.is_null() {
+                has_null = true;
+            } else {
+                non_null.push(val.0);
+            }
         }
-        let mut all_pages = heap.into_sorted_vec();
+
+        // Build a single array holding every queried value so the comparators are
+        // constructed once and reused across all of them, rather than per value.
+        let mut all_pages = if non_null.is_empty() {
+            Vec::new()
+        } else {
+            let query_arr = ScalarValue::iter_to_array(non_null)?;
+            self.candidate_pages_for_values(query_arr.as_ref())?
+        };
+        if has_null {
+            all_pages.extend(self.pages_null().into_iter().map(|m| m.page_id()));
+        }
+        all_pages.sort_unstable();
         all_pages.dedup();
         Ok(all_pages.into_iter().map(Matches::Some).collect())
+    }
+
+    /// Candidate page numbers (deduped, ascending) for an equality search against
+    /// every value in `query`. A page is a candidate when its `[min, max]` range
+    /// could contain the value, i.e. `min <= value <= max`.
+    ///
+    /// The comparators are built once over the whole `query` array and reused for
+    /// each value, so an N-value `IN` costs three comparator constructions instead
+    /// of three per value.
+    fn candidate_pages_for_values(&self, query: &dyn Array) -> Result<Vec<u32>> {
+        let num_rows = self.batch.num_rows();
+        if self.search_start >= num_rows || query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mins = self.batch.column(0).as_ref();
+        let maxs = self.batch.column(1).as_ref();
+        let page_numbers = self.page_numbers()?;
+
+        // The batch is sorted ascending by `min` with NULLs first; compare the
+        // query values the same way so the binary searches stay consistent.
+        let opts = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        // `cmp_min(i, j)` compares page `i`'s `min` against query value `j`;
+        // `cmp_max` likewise for `max`. `cmp_min_min` compares two page `min`s and
+        // is used to expand left onto a straddling page.
+        let cmp_min = make_comparator(mins, query, opts)?;
+        let cmp_max = make_comparator(maxs, query, opts)?;
+        let cmp_min_min = make_comparator(mins, mins, opts)?;
+
+        let mut pages = Vec::new();
+        for j in 0..query.len() {
+            // Start row: peek a little to the left of the value. A query for 7 must
+            // still reach a page like [5, 10], so we include every page whose `min`
+            // equals the largest `min` strictly less than the value.
+            let p = partition_point(0, num_rows, |i| cmp_min(i, j) == Ordering::Less);
+            let start = if p == 0 {
+                self.search_start
+            } else {
+                let anchor = p - 1;
+                partition_point(0, p, |i| cmp_min_min(i, anchor) == Ordering::Less)
+            }
+            .max(self.search_start);
+
+            // End row: pages whose `min` exceeds the value cannot match.
+            let end = partition_point(start, num_rows, |i| cmp_min(i, j) != Ordering::Greater);
+
+            for idx in start..end {
+                // All-null pages are only matched by IS NULL queries.
+                if maxs.is_null(idx) {
+                    continue;
+                }
+                // Candidate when the page's `max` reaches the value (`max >= value`).
+                if cmp_max(idx, j) != Ordering::Less {
+                    pages.push(page_numbers.values()[idx]);
+                }
+            }
+        }
+
+        pages.sort_unstable();
+        pages.dedup();
+        Ok(pages)
     }
 
     // All pages that could have a value in the range
