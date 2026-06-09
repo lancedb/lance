@@ -1373,8 +1373,8 @@ impl ScalarIndex for FMIndexScalarIndex {
         let mut texts = collect_texts(new_data).await?;
         if let Some(filter) = old_data_filter {
             texts.retain(|(row_addr, _)| match &filter {
-                OldIndexDataFilter::Fragments { to_keep, .. } => {
-                    to_keep.contains((*row_addr >> 32) as u32)
+                OldIndexDataFilter::Fragments { to_remove, .. } => {
+                    !to_remove.contains((*row_addr >> 32) as u32)
                 }
                 OldIndexDataFilter::RowIds(valid) => valid.contains(*row_addr),
             });
