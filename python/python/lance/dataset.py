@@ -4004,7 +4004,7 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        and canonical bitmap scalar index construction. Unlike
+        canonical bitmap scalar, and INVERTED scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4022,7 +4022,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         BTREE segments do not yet support merging; collect the returned
         segments and pass them straight to
-        :meth:`commit_existing_index_segments`.
+        :meth:`commit_existing_index_segments`. BITMAP and INVERTED segments may
+        be merged with :meth:`merge_existing_index_segments` before commit.
 
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
@@ -4050,10 +4051,11 @@ class LanceDataset(pa.dataset.Dataset):
             Metadata for the segment that was written by this call.
         """
         is_scalar_segment_request = (
-            isinstance(index_type, str) and index_type.upper() in {"BTREE", "BITMAP"}
+            isinstance(index_type, str)
+            and index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
         ) or (
             isinstance(index_type, IndexConfig)
-            and index_type.index_type.upper() in {"BTREE", "BITMAP"}
+            and index_type.index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
         )
         if is_scalar_segment_request:
             if fragment_ids is None:
