@@ -555,14 +555,17 @@ impl RabitQuantizationStorage {
 
     fn distance_calculator_from_parts<'a>(
         &'a self,
-        dim: usize,
-        dist_table: Cow<'a, [f32]>,
-        ex_dist_table: Cow<'a, [f32]>,
-        sum_q: f32,
-        query_factor: f32,
-        query_error: f32,
-        approx_mode: ApproxMode,
+        parts: RabitDistCalculatorParts<'a>,
     ) -> RabitDistCalculator<'a> {
+        let RabitDistCalculatorParts {
+            dim,
+            dist_table,
+            ex_dist_table,
+            sum_q,
+            query_factor,
+            query_error,
+            approx_mode,
+        } = parts;
         let ex_codes = self
             .ex_codes
             .as_ref()
@@ -759,6 +762,16 @@ fn copy_subtract_f32(lhs: &[f32], rhs: &[f32], output: &mut [f32]) {
     if input_len < output.len() {
         output[input_len..].fill(0.0);
     }
+}
+
+struct RabitDistCalculatorParts<'a> {
+    dim: usize,
+    dist_table: Cow<'a, [f32]>,
+    ex_dist_table: Cow<'a, [f32]>,
+    sum_q: f32,
+    query_factor: f32,
+    query_error: f32,
+    approx_mode: ApproxMode,
 }
 
 pub struct RabitDistCalculator<'a> {
@@ -1863,15 +1876,15 @@ impl VectorStore for RabitQuantizationStorage {
         };
         let sum_q = rotated_qr.into_iter().sum();
 
-        self.distance_calculator_from_parts(
-            code_dim,
-            Cow::Owned(dist_table),
-            Cow::Owned(ex_dist_table),
+        self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: code_dim,
+            dist_table: Cow::Owned(dist_table),
+            ex_dist_table: Cow::Owned(ex_dist_table),
             sum_q,
             query_factor,
             query_error,
-            ApproxMode::Normal,
-        )
+            approx_mode: ApproxMode::Normal,
+        })
     }
 
     // qr = (q-c)
@@ -1902,15 +1915,15 @@ impl VectorStore for RabitQuantizationStorage {
                 &raw_query.rotated_query,
                 rotated_centroid,
             );
-            return self.distance_calculator_from_parts(
-                code_dim,
-                Cow::Borrowed(&raw_query.dist_table),
-                Cow::Borrowed(&raw_query.ex_dist_table),
-                raw_query.sum_q,
+            return self.distance_calculator_from_parts(RabitDistCalculatorParts {
+                dim: code_dim,
+                dist_table: Cow::Borrowed(&raw_query.dist_table),
+                ex_dist_table: Cow::Borrowed(&raw_query.ex_dist_table),
+                sum_q: raw_query.sum_q,
                 query_factor,
                 query_error,
-                options.approx_mode,
-            );
+                approx_mode: options.approx_mode,
+            });
         }
 
         let dist_table_len = code_dim * 4;
@@ -1969,18 +1982,18 @@ impl VectorStore for RabitQuantizationStorage {
             rotated_qr.iter().copied().sum()
         };
 
-        self.distance_calculator_from_parts(
-            code_dim,
-            Cow::Borrowed(&f32_scratch[code_dim..code_dim + dist_table_len]),
-            Cow::Borrowed(
+        self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: code_dim,
+            dist_table: Cow::Borrowed(&f32_scratch[code_dim..code_dim + dist_table_len]),
+            ex_dist_table: Cow::Borrowed(
                 &f32_scratch
                     [code_dim + dist_table_len..code_dim + dist_table_len + ex_dist_table_len],
             ),
             sum_q,
             query_factor,
             query_error,
-            options.approx_mode,
-        )
+            approx_mode: options.approx_mode,
+        })
     }
 
     // TODO: implement this
