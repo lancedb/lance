@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::utils::SchemaAdapter;
 use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases_with_primary};
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
@@ -106,6 +107,12 @@ impl<'a> FragmentCreateBuilder<'a> {
         id: Option<u64>,
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
+        // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
+        // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
+        // multi-fragment and dataset write paths perform this through `do_write_fragments`;
+        // the single-fragment create path must do the same or the raw UTF-8 string bytes
+        // would be written into a column whose schema declares JSONB, corrupting reads.
+        let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
         self.write_impl(stream, schema, id).await
     }
 
