@@ -257,17 +257,38 @@ with `COS_` or `TENCENTCLOUD_` (for example, `COS_ENDPOINT`, `COS_SECRET_ID`,
 Alternatively, credentials can be passed as parameters to the `storage_options`
 parameter; explicit `storage_options` override environment variables:
 
-```python
-import lance
-ds = lance.dataset(
-    "cos://bucket/path",
-    storage_options={
-        "cos_endpoint": "https://cos.ap-guangzhou.myqcloud.com",
-        "cos_secret_id": "my-secret-id",
-        "cos_secret_key": "my-secret-key",
-    }
-)
-```
+=== "Python"
+
+    ```python
+    import lance
+    ds = lance.dataset(
+        "cos://bucket/path",
+        storage_options={
+            "cos_endpoint": "https://cos.ap-guangzhou.myqcloud.com",
+            "cos_secret_id": "my-secret-id",
+            "cos_secret_key": "my-secret-key",
+        }
+    )
+    ```
+
+=== "Rust"
+
+    In this Lance distribution, `tencent` is already part of the **default
+    features** of the `lance` crate, so simply depending on `lance` is enough:
+
+    ```toml
+    [dependencies]
+    lance = "*"
+    ```
+
+    You only need to enable the `tencent` feature explicitly in the following
+    cases:
+
+    - You opted out of default features, e.g.
+      `lance = { version = "*", default-features = false, features = ["tencent", ...] }`.
+    - You depend on `lance-io` directly (without `lance`); `tencent` is **not**
+      a default feature of `lance-io`:
+      `lance-io = { version = "*", features = ["tencent"] }`.
 
 | Key | Description |
 |-----|-------------|
@@ -323,8 +344,8 @@ is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
       a default feature of `lance-io`:
       `lance-io = { version = "*", features = ["goosefs"] }`.
 
-    Open the underlying `ObjectStore` directly (mirrors the integration test in
-    `rust/lance-io/tests/goosefs_integration.rs`):
+    Open the underlying `lance_io::object_store::ObjectStore` directly (mirrors
+    the integration test in `rust/lance-io/tests/goosefs_integration.rs`):
 
     ```rust
     use lance_io::object_store::ObjectStore;
@@ -332,8 +353,8 @@ is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
     let uri = "goosefs://10.0.0.1:9200/lance-test/lance-io";
     let (store, path) = ObjectStore::from_uri(uri).await?;
 
-    // Read / write through the object_store API
-    store.inner.put(&path, bytes::Bytes::from("hello").into()).await?;
+    // Read / write through the underlying `object_store::ObjectStore` API
+    store.inner.put(&path, (&b"hello"[..]).into()).await?;
     let result = store.inner.get(&path).await?;
     let bytes = result.bytes().await?;
     ```
