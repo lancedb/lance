@@ -88,15 +88,14 @@ pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 /// Other index types ignore this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApproxMode {
-    /// Use only one RQ bit for query-time scoring, even for multi-bit indexes.
+    /// Prefer lower query latency, which can reduce recall.
     Fast,
 
-    /// Use all RQ bits for query-time scoring with u8-quantized lookup tables.
+    /// Use the default balance between query latency and recall.
     #[default]
     Normal,
 
-    /// Use all RQ bits for query-time scoring with u16-quantized lookup tables
-    /// to reduce estimator quantization error.
+    /// Prefer higher recall, which can increase query latency.
     Accurate,
 }
 
