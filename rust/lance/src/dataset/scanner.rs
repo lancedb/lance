@@ -10370,6 +10370,41 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_query_index_field(&batch);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fts_multiple_unindexed_appends() {
+        // An FTS query over an indexed dataset plus more than one unindexed append
+        // must return matches from every unindexed fragment, not just the first. The
+        // flat search over unindexed data reads only a single input partition, so when
+        // the default parallelism splits the scan across partitions it used to drop
+        // every append but the first.
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        // Two separate appends -> two unindexed fragments, each large enough that the
+        // physical optimizer parallelizes the flat scan across partitions.
+        test_ds.append_data_with_range(400, 5400).await.unwrap();
+        test_ds.append_data_with_range(5400, 10400).await.unwrap();
+
+        // Every row's `s` value contains the token "s", so FTS("s") matches all rows.
+        let total = test_ds.dataset.count_rows(None).await.unwrap();
+        let returned = test_ds
+            .dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned, total);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_fast_search_scalar_index_skips_unindexed_fragments(
