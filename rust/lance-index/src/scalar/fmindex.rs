@@ -24,6 +24,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, OnceLock};
 
+use lance_select::RowSetOps;
+
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
@@ -1366,9 +1368,17 @@ impl ScalarIndex for FMIndexScalarIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest: &dyn IndexStore,
-        _: Option<OldIndexDataFilter>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let texts = collect_texts(new_data).await?;
+        let mut texts = collect_texts(new_data).await?;
+        if let Some(filter) = old_data_filter {
+            texts.retain(|(row_addr, _)| match &filter {
+                OldIndexDataFilter::Fragments { to_keep, .. } => {
+                    to_keep.contains((*row_addr >> 32) as u32)
+                }
+                OldIndexDataFilter::RowIds(valid) => valid.contains(*row_addr),
+            });
+        }
         let files = write_partitioned_fmindex(&texts, dest).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
@@ -1377,7 +1387,9 @@ impl ScalarIndex for FMIndexScalarIndex {
         })
     }
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None))
+        UpdateCriteria::requires_old_data(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+        )
     }
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex))
