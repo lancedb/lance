@@ -2399,9 +2399,9 @@ async fn write_root_vector_index_from_auxiliary(
     let ivf_bytes = pb_ivf.encode_to_vec().into();
 
     // Determine index metadata JSON from auxiliary or requested index type.
-    let index_meta_json =
+    let mut idx_meta: IndexMetadata =
         if let Some(idx_json) = meta.file_schema.metadata.get(INDEX_METADATA_SCHEMA_KEY) {
-            idx_json.clone()
+            serde_json::from_str(idx_json)?
         } else {
             let dt = meta
                 .file_schema
@@ -2415,11 +2415,25 @@ async fn write_root_vector_index_from_auxiliary(
                         .to_string(),
                 )
             })?;
-            serde_json::to_string(&IndexMetadata {
+            IndexMetadata {
                 index_type: index_type.to_string(),
                 distance_type: dt,
-            })?
+            }
         };
+    if let Some(source_hnsw_index_metadata) =
+        read_hnsw_index_metadata_from_sources(object_store, &scheduler, centroid_source_index_paths)
+            .await?
+    {
+        if idx_meta.index_type.starts_with("IVF_HNSW")
+            && !index_metadata_eq(&idx_meta, &source_hnsw_index_metadata)
+        {
+            return Err(Error::invalid_input(format!(
+                "HNSW index metadata mismatch while merging index segments: expected {:?}, got {:?}",
+                idx_meta, source_hnsw_index_metadata
+            )));
+        }
+        idx_meta = source_hnsw_index_metadata;
+    }
 
     // Write root index.idx via V2 writer so downstream opens through v2 path.
     let index_path = index_dir.clone().join(INDEX_FILE_NAME);
@@ -2442,7 +2456,6 @@ async fn write_root_vector_index_from_auxiliary(
 
     // For HNSW variants, attach per-partition metadata list; for FLAT-based
     // variants, attach minimal placeholder metadata.
-    let idx_meta: IndexMetadata = serde_json::from_str(&index_meta_json)?;
     let is_hnsw = idx_meta.index_type.starts_with("IVF_HNSW");
     let is_flat_based = matches!(
         idx_meta.index_type.as_str(),
@@ -2467,6 +2480,7 @@ async fn write_root_vector_index_from_auxiliary(
         .await?;
     } else {
         // Attach precise index metadata (type + distance).
+        let index_meta_json = serde_json::to_string(&idx_meta)?;
         v2_writer.add_schema_metadata(INDEX_METADATA_SCHEMA_KEY, &index_meta_json);
 
         // Add IVF protobuf as a global buffer and reference via IVF_METADATA_KEY.
@@ -2491,6 +2505,62 @@ async fn write_root_vector_index_from_auxiliary(
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
     })
+}
+
+async fn read_hnsw_index_metadata_from_sources(
+    object_store: &ObjectStore,
+    scheduler: &Arc<ScanScheduler>,
+    source_index_paths: &[Path],
+) -> Result<Option<IndexMetadata>> {
+    let mut index_metadata: Option<IndexMetadata> = None;
+
+    for source_index_path in source_index_paths {
+        if !object_store.exists(source_index_path).await? {
+            continue;
+        }
+
+        let fh = scheduler
+            .open_file(source_index_path, &CachedFileSize::unknown())
+            .await?;
+        let reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?;
+        let Some(metadata_json) = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+        else {
+            continue;
+        };
+        let metadata: IndexMetadata = serde_json::from_str(metadata_json)?;
+        if !metadata.index_type.starts_with("IVF_HNSW") {
+            continue;
+        }
+
+        if let Some(index_metadata) = index_metadata.as_ref() {
+            if !index_metadata_eq(index_metadata, &metadata) {
+                return Err(Error::invalid_input(format!(
+                    "HNSW index metadata mismatch while merging index segments: \
+                     expected {:?}, got {:?} in {}",
+                    index_metadata, metadata, source_index_path
+                )));
+            }
+        } else {
+            index_metadata = Some(metadata);
+        }
+    }
+
+    Ok(index_metadata)
+}
+
+fn index_metadata_eq(left: &IndexMetadata, right: &IndexMetadata) -> bool {
+    left.index_type == right.index_type && left.distance_type == right.distance_type
 }
 
 async fn read_hnsw_build_params_from_sources(

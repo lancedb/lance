@@ -795,20 +795,10 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Detect index type (first iteration only)
         if detected_index_type.is_none() {
             // Try to derive precise type from sibling partial index.idx metadata if available
-            // Try resolve sibling index.idx path by trimming the last component of aux path
-            let parent_str = {
-                let s = aux.as_ref();
-                if let Some((p, _)) = s.trim_end_matches('/').rsplit_once('/') {
-                    p.to_string()
-                } else {
-                    s.to_string()
-                }
-            };
-            let idx_path = object_store::path::Path::from(format!(
-                "{}/{}",
-                parent_str,
-                crate::INDEX_FILE_NAME
-            ));
+            let idx_path = aux
+                .parent()
+                .unwrap_or_default()
+                .join(crate::INDEX_FILE_NAME);
             if object_store.exists(&idx_path).await.unwrap_or(false) {
                 let fh2 = sched
                     .open_file(&idx_path, &CachedFileSize::unknown())
