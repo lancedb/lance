@@ -804,7 +804,7 @@ mod tests {
         v[pad..pad + buf.len()].copy_from_slice(&buf);
         let data = Bytes::from(v).slice(pad..pad + buf.len());
 
-        let restored = codec.deserialize(&data).unwrap().hit().unwrap();
+        let restored = codec.deserialize(&data).hit().unwrap();
         let restored = restored.downcast::<LabelListIndexState>().unwrap();
 
         let base = data.as_ptr() as usize;

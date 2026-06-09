@@ -789,7 +789,7 @@ mod tests {
         #[test]
         fn compressed_sections_are_zero_copy_through_envelope() {
             let serialized = aligned_bytes(&serialize_entry(compressed_with_shared_positions()));
-            let restored = codec().deserialize(&serialized).unwrap().hit().unwrap();
+            let restored = codec().deserialize(&serialized).hit().unwrap();
             let restored = restored.downcast::<PostingList>().unwrap();
             let PostingList::Compressed(restored) = restored.as_ref() else {
                 panic!("expected Compressed");
@@ -824,7 +824,7 @@ mod tests {
                 None,
             ));
             let serialized = aligned_bytes(&serialize_entry(plain));
-            let restored = codec().deserialize(&serialized).unwrap().hit().unwrap();
+            let restored = codec().deserialize(&serialized).hit().unwrap();
             let restored = restored.downcast::<PostingList>().unwrap();
             let PostingList::Plain(restored) = restored.as_ref() else {
                 panic!("expected Plain");
@@ -870,13 +870,7 @@ mod tests {
             CacheCodec::from_impl::<PostingListGroup>()
                 .serialize(&any, &mut buf)
                 .unwrap();
-            assert!(
-                codec()
-                    .deserialize(&Bytes::from(buf))
-                    .unwrap()
-                    .hit()
-                    .is_none()
-            );
+            assert!(codec().deserialize(&Bytes::from(buf)).hit().is_none());
         }
 
         /// An entry written by a newer build (higher type_version) misses.
@@ -888,13 +882,7 @@ mod tests {
             let type_id_len = u16::from_le_bytes([buf[5], buf[6]]) as usize;
             let version_off = 4 + 1 + 2 + type_id_len;
             buf[version_off..version_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            assert!(
-                codec()
-                    .deserialize(&Bytes::from(buf))
-                    .unwrap()
-                    .hit()
-                    .is_none()
-            );
+            assert!(codec().deserialize(&Bytes::from(buf)).hit().is_none());
         }
 
         /// A pre-stabilization blob (no magic) self-heals to a miss.
@@ -903,13 +891,7 @@ mod tests {
             // Old format led with a u64 LE length prefix, never our magic.
             let mut blob = (30u64).to_le_bytes().to_vec();
             blob.extend_from_slice(&[0u8; 30]);
-            assert!(
-                codec()
-                    .deserialize(&Bytes::from(blob))
-                    .unwrap()
-                    .hit()
-                    .is_none()
-            );
+            assert!(codec().deserialize(&Bytes::from(blob)).hit().is_none());
         }
     }
 }

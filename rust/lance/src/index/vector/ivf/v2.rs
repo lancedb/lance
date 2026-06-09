@@ -6197,7 +6197,6 @@ mod tests {
             if let Some((bytes, stored_codec, _)) = guard.get(key) {
                 return stored_codec
                     .deserialize(&bytes::Bytes::copy_from_slice(bytes))
-                    .expect("deserialization should succeed")
                     .hit();
             }
             drop(guard);

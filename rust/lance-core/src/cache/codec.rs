@@ -53,7 +53,21 @@ use super::{CacheEntryReader, CacheEntryWriter};
 /// An ASCII tag (`0x4C 0x43 0x45 0x31`) chosen so it cannot collide with any
 /// pre-stabilization blob: those began with either a small little-endian
 /// length (tens of bytes) or a small tag byte, never these values.
-const MAGIC: [u8; 4] = *b"LCE1";
+///
+/// Exported so backends can cheaply identify Lance cache entries (e.g. when
+/// scanning a persistent store at startup) without hardcoding the bytes —
+/// prefer [`has_cache_envelope`] over comparing against this directly.
+pub const MAGIC: [u8; 4] = *b"LCE1";
+
+/// Returns `true` if `data` begins with the cache-entry [`MAGIC`].
+///
+/// A cheap prefix check for backends that need to recognize Lance cache
+/// entries without fully [`deserialize`](CacheCodec::deserialize)-ing them. A
+/// `true` result only means the framing looks like ours; the entry can still
+/// decode to a [`Miss`](CacheDecode::Miss) (e.g. wrong `type_id`).
+pub fn has_cache_envelope(data: &[u8]) -> bool {
+    data.get(..MAGIC.len()) == Some(&MAGIC[..])
+}
 
 /// Version of the envelope framing itself. Bumped only if the outer frame
 /// (magic/version/type_id/type_version layout) ever changes — expected never.
@@ -127,23 +141,45 @@ fn write_envelope(writer: &mut dyn Write, type_id: &str, type_version: u32) -> R
 // CacheDecode — first-class cache-miss outcome
 // ---------------------------------------------------------------------------
 
+/// Why a cache entry could not be decoded into the expected type.
+///
+/// Carried by [`CacheDecode::Miss`] so backends can emit targeted metrics
+/// (e.g. distinguish "evicting due to a stale format" from "type collision")
+/// without re-parsing. Every reason maps to the same behavior — recompute via
+/// the loader — so callers that don't care can ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMissReason {
+    /// Absent or wrong magic, unknown `envelope_version`, truncated framing, or
+    /// a non-utf8 `type_id`. Typically an entry written by a pre-stabilization
+    /// or otherwise foreign build.
+    InvalidEnvelope,
+    /// Well-formed envelope, but its `type_id` names a different entry type than
+    /// the codec reading it.
+    TypeMismatch,
+    /// Written by a newer build whose `type_version` this build does not
+    /// understand and must not attempt to interpret.
+    VersionTooNew,
+    /// Envelope validated, but the body failed to decode (truncation, a
+    /// malformed protobuf header, an IPC error, etc.).
+    BodyError,
+}
+
 /// Outcome of deserializing a cache entry.
 ///
-/// `Miss` means the bytes could not be confidently decoded into `T` (wrong or
-/// absent magic, unknown envelope version, `type_id` mismatch, unsupported
-/// `type_version`, or a body decode error). A backend treats `Miss` exactly
-/// like a key that was never present: recompute via the loader.
+/// `Miss` means the bytes could not be confidently decoded into `T`; the
+/// [`CacheMissReason`] says why. A backend treats any `Miss` exactly like a key
+/// that was never present: recompute via the loader.
 #[derive(Debug)]
 pub enum CacheDecode<T> {
     Hit(T),
-    Miss,
+    Miss(CacheMissReason),
 }
 
 impl<T> CacheDecode<T> {
     pub fn hit(self) -> Option<T> {
         match self {
             Self::Hit(v) => Some(v),
-            Self::Miss => None,
+            Self::Miss(_) => None,
         }
     }
 }
@@ -279,13 +315,14 @@ impl CacheCodec {
 
     /// Deserialize an entry from `data`.
     ///
-    /// Returns [`CacheDecode::Miss`] for any non-fatal failure to interpret the
-    /// bytes (see [`CacheDecode`]). `Err` is reserved for genuine I/O faults,
-    /// which cannot arise reading from an in-memory [`Bytes`].
-    pub fn deserialize(&self, data: &Bytes) -> Result<CacheDecode<ArcAny>> {
+    /// Never fails: any non-fatal failure to interpret the bytes becomes a
+    /// [`CacheDecode::Miss`] with the reason why (see [`CacheMissReason`]).
+    /// Reading from an in-memory [`Bytes`] cannot do I/O, so there is no fault
+    /// channel — a miss is the only non-`Hit` outcome.
+    pub fn deserialize(&self, data: &Bytes) -> CacheDecode<ArcAny> {
         let Some(envelope) = parse_envelope(data) else {
             log::debug!("cache entry rejected: missing or invalid envelope");
-            return Ok(CacheDecode::Miss);
+            return CacheDecode::Miss(CacheMissReason::InvalidEnvelope);
         };
 
         if envelope.type_id != self.type_id {
@@ -294,7 +331,7 @@ impl CacheCodec {
                 envelope.type_id,
                 self.type_id
             );
-            return Ok(CacheDecode::Miss);
+            return CacheDecode::Miss(CacheMissReason::TypeMismatch);
         }
 
         // A version newer than this build writes was produced by a newer build
@@ -307,19 +344,19 @@ impl CacheCodec {
                 envelope.type_version,
                 self.version
             );
-            return Ok(CacheDecode::Miss);
+            return CacheDecode::Miss(CacheMissReason::VersionTooNew);
         }
 
         let mut reader = CacheEntryReader::new(data, envelope.body_offset, envelope.type_version);
         match (self.deserialize_body)(&mut reader) {
-            Ok(value) => Ok(CacheDecode::Hit(value)),
+            Ok(value) => CacheDecode::Hit(value),
             Err(e) => {
                 log::debug!(
                     "cache entry {:?} v{} failed to decode: {e}",
                     self.type_id,
                     envelope.type_version
                 );
-                Ok(CacheDecode::Miss)
+                CacheDecode::Miss(CacheMissReason::BodyError)
             }
         }
     }
@@ -364,13 +401,21 @@ mod tests {
         Bytes::from(buf)
     }
 
+    /// The miss reason, or `None` if the decode was a hit.
+    fn miss_reason(data: &Bytes) -> Option<CacheMissReason> {
+        match deserialize_widget(data) {
+            CacheDecode::Hit(_) => None,
+            CacheDecode::Miss(reason) => Some(reason),
+        }
+    }
+
     fn deserialize_widget(data: &Bytes) -> CacheDecode<Widget> {
         let codec = CacheCodec::from_impl::<Widget>();
-        match codec.deserialize(data).unwrap() {
+        match codec.deserialize(data) {
             CacheDecode::Hit(any) => {
                 CacheDecode::Hit(Arc::try_unwrap(any.downcast::<Widget>().unwrap()).unwrap())
             }
-            CacheDecode::Miss => CacheDecode::Miss,
+            CacheDecode::Miss(reason) => CacheDecode::Miss(reason),
         }
     }
 
@@ -384,10 +429,23 @@ mod tests {
     }
 
     #[test]
+    fn has_cache_envelope_detects_magic() {
+        let bytes = serialize_widget(&Widget { n: 1 });
+        assert!(has_cache_envelope(&bytes));
+        assert!(has_cache_envelope(&MAGIC)); // exactly the magic, nothing after
+        assert!(!has_cache_envelope(b"LCE")); // too short
+        assert!(!has_cache_envelope(b"JUNK and more"));
+        assert!(!has_cache_envelope(&[]));
+    }
+
+    #[test]
     fn wrong_magic_is_miss() {
         let mut bytes = serialize_widget(&Widget { n: 7 }).to_vec();
         bytes[0] = b'X';
-        assert!(deserialize_widget(&Bytes::from(bytes)).hit().is_none());
+        assert_eq!(
+            miss_reason(&Bytes::from(bytes)),
+            Some(CacheMissReason::InvalidEnvelope)
+        );
     }
 
     #[test]
@@ -397,13 +455,15 @@ mod tests {
         let mut blob = Vec::new();
         blob.extend_from_slice(&(42u64).to_le_bytes());
         blob.extend_from_slice(&[0u8; 42]);
-        assert!(deserialize_widget(&Bytes::from(blob)).hit().is_none());
+        assert_eq!(
+            miss_reason(&Bytes::from(blob)),
+            Some(CacheMissReason::InvalidEnvelope)
+        );
 
         // A different unstable shape led with a small u8 tag (0/1/2).
-        assert!(
-            deserialize_widget(&Bytes::from(vec![0u8, 1, 2, 3]))
-                .hit()
-                .is_none()
+        assert_eq!(
+            miss_reason(&Bytes::from(vec![0u8, 1, 2, 3])),
+            Some(CacheMissReason::InvalidEnvelope)
         );
     }
 
@@ -411,7 +471,10 @@ mod tests {
     fn unknown_envelope_version_is_miss() {
         let mut bytes = serialize_widget(&Widget { n: 7 }).to_vec();
         bytes[4] = 0xFF; // envelope_version byte
-        assert!(deserialize_widget(&Bytes::from(bytes)).hit().is_none());
+        assert_eq!(
+            miss_reason(&Bytes::from(bytes)),
+            Some(CacheMissReason::InvalidEnvelope)
+        );
     }
 
     #[test]
@@ -421,7 +484,10 @@ mod tests {
         write_envelope(&mut buf, "some.OtherType", 1).unwrap();
         buf.extend_from_slice(&(4u64).to_le_bytes());
         buf.extend_from_slice(&99u32.to_le_bytes());
-        assert!(deserialize_widget(&Bytes::from(buf)).hit().is_none());
+        assert_eq!(
+            miss_reason(&Bytes::from(buf)),
+            Some(CacheMissReason::TypeMismatch)
+        );
     }
 
     #[test]
@@ -431,18 +497,20 @@ mod tests {
         let mut buf = Vec::new();
         write_envelope(&mut buf, Widget::TYPE_ID, Widget::CURRENT_VERSION + 1).unwrap();
         lance_arrow::ipc::write_len_prefixed_bytes(&mut buf, &9u32.to_le_bytes()).unwrap();
-        assert!(deserialize_widget(&Bytes::from(buf)).hit().is_none());
+        assert_eq!(
+            miss_reason(&Bytes::from(buf)),
+            Some(CacheMissReason::VersionTooNew)
+        );
     }
 
     #[test]
     fn truncated_envelope_is_miss() {
         let bytes = serialize_widget(&Widget { n: 7 });
         for cut in [0, 1, 4, 5, 7, 9] {
-            assert!(
-                deserialize_widget(&bytes.slice(..cut.min(bytes.len())))
-                    .hit()
-                    .is_none(),
-                "truncating to {cut} bytes should miss"
+            assert_eq!(
+                miss_reason(&bytes.slice(..cut.min(bytes.len()))),
+                Some(CacheMissReason::InvalidEnvelope),
+                "truncating to {cut} bytes should miss as InvalidEnvelope"
             );
         }
     }
@@ -454,7 +522,10 @@ mod tests {
         write_envelope(&mut buf, Widget::TYPE_ID, Widget::CURRENT_VERSION).unwrap();
         buf.extend_from_slice(&(1u64).to_le_bytes());
         buf.push(0u8);
-        assert!(deserialize_widget(&Bytes::from(buf)).hit().is_none());
+        assert_eq!(
+            miss_reason(&Bytes::from(buf)),
+            Some(CacheMissReason::BodyError)
+        );
     }
 
     #[test]

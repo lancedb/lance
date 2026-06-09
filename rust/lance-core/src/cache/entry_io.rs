@@ -96,8 +96,15 @@ impl<'a> CacheEntryWriter<'a> {
         Ok(())
     }
 
-    /// Escape hatch returning the underlying writer, for codecs that have not
-    /// yet migrated to protobuf headers + aligned sections.
+    /// The underlying writer, for a payload that carries its own framing.
+    ///
+    /// Use this only when the codec writes a self-delimiting or whole-body
+    /// payload — e.g. streaming a roaring bitmap as the entire body, where the
+    /// length prefix of [`write_raw`](Self::write_raw) would be redundant and
+    /// buffering to measure that length would force an extra copy. For
+    /// structured bodies prefer [`write_header`](Self::write_header) /
+    /// [`write_ipc`](Self::write_ipc) / [`write_raw`](Self::write_raw), which
+    /// give you versioning and 64-byte IPC alignment.
     ///
     /// Bytes written through this do **not** advance the section-alignment
     /// position, so it must not be interleaved with [`write_ipc`](Self::write_ipc).
@@ -183,8 +190,11 @@ impl<'a> CacheEntryReader<'a> {
 
     /// The not-yet-consumed body bytes as a zero-copy slice.
     ///
-    /// Escape hatch for codecs that have not migrated to the section helpers
-    /// and parse the remaining body with their own cursor.
+    /// For a payload that carries its own framing and is parsed with the
+    /// codec's own cursor — the read counterpart of
+    /// [`CacheEntryWriter::raw_writer`]. For structured bodies prefer
+    /// [`read_header`](Self::read_header) / [`read_ipc`](Self::read_ipc) /
+    /// [`read_raw`](Self::read_raw).
     pub fn body(&self) -> Bytes {
         self.data.slice(self.offset..)
     }

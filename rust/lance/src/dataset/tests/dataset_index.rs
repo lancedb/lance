@@ -2078,10 +2078,7 @@ mod fts_serializing_backend {
         ) -> Option<CacheEntry> {
             let guard = self.serialized.lock().await;
             if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return stored_codec
-                    .deserialize(&bytes.clone())
-                    .expect("deserialization should succeed")
-                    .hit();
+                return stored_codec.deserialize(&bytes.clone()).hit();
             }
             drop(guard);
             self.passthrough.get(key, codec).await
