@@ -23,6 +23,7 @@ use crate::{
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use arrow::array::ArrayData;
+use arrow::compute::concat_batches;
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::Float32Array;
@@ -50,6 +51,7 @@ use lance_core::{
     utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
 };
+use lance_encoding::decoder::FilterExpression;
 use lance_file::{
     format::MAGIC,
     previous::writer::{
@@ -62,14 +64,18 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
+use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams};
-use lance_index::vector::pq::storage::transpose;
+use lance_index::vector::pq::storage::{
+    PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
+};
 use lance_index::vector::quantizer::QuantizationType;
+use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::v3::shuffler::create_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
@@ -84,13 +90,17 @@ use lance_index::{
             storage::IVF_PARTITION_KEY,
         },
         pq::{PQBuildParams, ProductQuantizer},
-        quantizer::{Quantization, QuantizationMetadata, Quantizer},
-        sq::ScalarQuantizer,
+        quantizer::{Quantization, QuantizationMetadata, Quantizer, QuantizerStorage},
+        sq::{
+            ScalarQuantizer,
+            storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata, ScalarQuantizationStorage},
+        },
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{
+    ReadBatchParams,
     encodings::plain::PlainEncoder,
     local::to_local_path,
     object_store::ObjectStore,
@@ -2430,13 +2440,6 @@ async fn write_root_vector_index_from_auxiliary(
         },
     )?;
 
-    // Attach precise index metadata (type + distance).
-    v2_writer.add_schema_metadata(INDEX_METADATA_SCHEMA_KEY, &index_meta_json);
-
-    // Add IVF protobuf as a global buffer and reference via IVF_METADATA_KEY.
-    let pos = v2_writer.add_global_buffer(ivf_bytes).await?;
-    v2_writer.add_schema_metadata(IVF_METADATA_KEY, pos.to_string());
-
     // For HNSW variants, attach per-partition metadata list; for FLAT-based
     // variants, attach minimal placeholder metadata.
     let idx_meta: IndexMetadata = serde_json::from_str(&index_meta_json)?;
@@ -2447,20 +2450,39 @@ async fn write_root_vector_index_from_auxiliary(
     );
 
     if is_hnsw {
-        let default_meta = HnswMetadata::default();
-        let meta_vec: Vec<String> = (0..nlist)
-            .map(|_| serde_json::to_string(&default_meta).unwrap())
-            .collect();
-        let meta_vec_json = serde_json::to_string(&meta_vec)?;
-        v2_writer.add_schema_metadata(HNSW_METADATA_KEY, meta_vec_json);
-    } else if is_flat_based {
-        let meta_vec: Vec<String> = (0..nlist).map(|_| "{}".to_string()).collect();
-        let meta_vec_json = serde_json::to_string(&meta_vec)?;
-        v2_writer.add_schema_metadata("lance:flat", meta_vec_json);
+        let hnsw_params = read_hnsw_build_params_from_sources(
+            object_store,
+            &scheduler,
+            centroid_source_index_paths,
+        )
+        .await?;
+        write_hnsw_root_index_from_auxiliary(
+            &mut v2_writer,
+            &aux_reader,
+            &ivf_model,
+            &hnsw_params,
+            &idx_meta,
+            progress.clone(),
+        )
+        .await?;
+    } else {
+        // Attach precise index metadata (type + distance).
+        v2_writer.add_schema_metadata(INDEX_METADATA_SCHEMA_KEY, &index_meta_json);
+
+        // Add IVF protobuf as a global buffer and reference via IVF_METADATA_KEY.
+        let pos = v2_writer.add_global_buffer(ivf_bytes).await?;
+        v2_writer.add_schema_metadata(IVF_METADATA_KEY, pos.to_string());
+
+        if is_flat_based {
+            let meta_vec: Vec<String> = (0..nlist).map(|_| "{}".to_string()).collect();
+            let meta_vec_json = serde_json::to_string(&meta_vec)?;
+            v2_writer.add_schema_metadata("lance:flat", meta_vec_json);
+        }
+
+        let empty_batch = RecordBatch::new_empty(arrow_schema);
+        v2_writer.write_batch(&empty_batch).await?;
     }
 
-    let empty_batch = RecordBatch::new_empty(arrow_schema);
-    v2_writer.write_batch(&empty_batch).await?;
     let summary = v2_writer.finish().await?;
     progress.stage_progress("write_root_index", 1).await?;
     progress.stage_complete("write_root_index").await?;
@@ -2469,6 +2491,261 @@ async fn write_root_vector_index_from_auxiliary(
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
     })
+}
+
+async fn read_hnsw_build_params_from_sources(
+    object_store: &ObjectStore,
+    scheduler: &Arc<ScanScheduler>,
+    source_index_paths: &[Path],
+) -> Result<HnswBuildParams> {
+    let mut build_params: Option<HnswBuildParams> = None;
+
+    for source_index_path in source_index_paths {
+        if !object_store.exists(source_index_path).await? {
+            continue;
+        }
+
+        let fh = scheduler
+            .open_file(source_index_path, &CachedFileSize::unknown())
+            .await?;
+        let reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?;
+        let Some(metadata_json) = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(HNSW_METADATA_KEY)
+        else {
+            continue;
+        };
+        let partition_metadata: Vec<String> = serde_json::from_str(metadata_json)?;
+        for metadata in partition_metadata {
+            if metadata.is_empty() {
+                continue;
+            }
+            let metadata: HnswMetadata = serde_json::from_str(&metadata)?;
+            if let Some(build_params) = build_params.as_ref() {
+                if !hnsw_build_params_eq(build_params, &metadata.params) {
+                    return Err(Error::invalid_input(format!(
+                        "HNSW build parameters mismatch while merging index segments: \
+                         expected {:?}, got {:?} in {}",
+                        build_params, metadata.params, source_index_path
+                    )));
+                }
+            } else {
+                build_params = Some(metadata.params);
+            }
+        }
+    }
+
+    Ok(build_params.unwrap_or_default())
+}
+
+fn hnsw_build_params_eq(left: &HnswBuildParams, right: &HnswBuildParams) -> bool {
+    left.max_level == right.max_level
+        && left.m == right.m
+        && left.ef_construction == right.ef_construction
+        && left.prefetch_distance == right.prefetch_distance
+}
+
+async fn write_hnsw_root_index_from_auxiliary(
+    writer: &mut V2Writer,
+    aux_reader: &V2Reader,
+    aux_ivf: &IvfModel,
+    hnsw_params: &HnswBuildParams,
+    index_metadata: &IndexMetadata,
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<()> {
+    let mut index_ivf = if let Some(centroids) = aux_ivf.centroids.clone() {
+        IvfModel::new(centroids, aux_ivf.loss)
+    } else {
+        IvfModel::empty()
+    };
+    let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
+    let mut partition_index_metadata = Vec::with_capacity(aux_ivf.num_partitions());
+
+    progress
+        .stage_start(
+            "rebuild_hnsw_graph",
+            Some(aux_ivf.num_partitions() as u64),
+            "partitions",
+        )
+        .await?;
+
+    for partition_id in 0..aux_ivf.num_partitions() {
+        let row_range = aux_ivf.row_range(partition_id);
+        if row_range.is_empty() {
+            index_ivf.add_partition(0);
+            partition_index_metadata.push(String::new());
+            progress
+                .stage_progress("rebuild_hnsw_graph", partition_id as u64 + 1)
+                .await?;
+            continue;
+        }
+
+        let batch = read_v2_partition_batch(aux_reader, row_range).await?;
+        let hnsw = build_hnsw_from_storage_batch(
+            &index_metadata.index_type,
+            batch,
+            aux_reader,
+            distance_type,
+            hnsw_params,
+        )
+        .await?;
+        let index_batch = hnsw.to_batch()?;
+
+        writer.write_batch(&index_batch).await?;
+        index_ivf.add_partition(index_batch.num_rows() as u32);
+        partition_index_metadata.push(serde_json::to_string(&hnsw.metadata())?);
+        progress
+            .stage_progress("rebuild_hnsw_graph", partition_id as u64 + 1)
+            .await?;
+    }
+
+    progress.stage_complete("rebuild_hnsw_graph").await?;
+
+    write_hnsw_index_metadata(writer, &index_ivf, distance_type, index_metadata).await?;
+    writer.add_schema_metadata(
+        HNSW_METADATA_KEY,
+        serde_json::to_string(&partition_index_metadata)?,
+    );
+
+    Ok(())
+}
+
+async fn read_v2_partition_batch(reader: &V2Reader, range: Range<usize>) -> Result<RecordBatch> {
+    let schema = Arc::new(reader.schema().as_ref().into());
+    let stream = reader
+        .read_stream(
+            ReadBatchParams::Range(range),
+            u32::MAX,
+            4,
+            FilterExpression::no_filter(),
+        )
+        .await?;
+    let batches = stream.try_collect::<Vec<_>>().await?;
+    if batches.is_empty() {
+        Ok(RecordBatch::new_empty(schema))
+    } else {
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+}
+
+async fn build_hnsw_from_storage_batch(
+    index_type: &str,
+    batch: RecordBatch,
+    aux_reader: &V2Reader,
+    distance_type: DistanceType,
+    hnsw_params: &HnswBuildParams,
+) -> Result<HNSW> {
+    match index_type {
+        "IVF_HNSW_FLAT" => {
+            let metadata = read_storage_metadata::<FlatMetadata>(aux_reader, "")?;
+            let vector_type = batch
+                .column_by_name(FLAT_COLUMN)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "{FLAT_COLUMN} column missing from HNSW_FLAT storage"
+                    ))
+                })?
+                .as_fixed_size_list()
+                .value_type();
+            if vector_type == DataType::UInt8 && distance_type == DistanceType::Hamming {
+                let storage =
+                    FlatBinStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+                HNSW::index_vectors(&storage, hnsw_params.clone())
+            } else {
+                let storage =
+                    FlatFloatStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+                HNSW::index_vectors(&storage, hnsw_params.clone())
+            }
+        }
+        "IVF_HNSW_PQ" => {
+            let metadata = read_pq_storage_metadata(aux_reader).await?;
+            let storage =
+                ProductQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+            HNSW::index_vectors(&storage, hnsw_params.clone())
+        }
+        "IVF_HNSW_SQ" => {
+            let metadata =
+                read_storage_metadata::<ScalarQuantizationMetadata>(aux_reader, SQ_METADATA_KEY)?;
+            let storage =
+                ScalarQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+            HNSW::index_vectors(&storage, hnsw_params.clone())
+        }
+        other => Err(Error::index(format!(
+            "Cannot rebuild HNSW graph for unsupported index type {other}"
+        ))),
+    }
+}
+
+async fn write_hnsw_index_metadata(
+    writer: &mut V2Writer,
+    ivf: &IvfModel,
+    distance_type: DistanceType,
+    index_metadata: &IndexMetadata,
+) -> Result<()> {
+    let pb_ivf: lance_index::pb::Ivf = ivf.try_into()?;
+    let pos = writer
+        .add_global_buffer(pb_ivf.encode_to_vec().into())
+        .await?;
+    writer.add_schema_metadata(IVF_METADATA_KEY, pos.to_string());
+    writer.add_schema_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        serde_json::to_string(&IndexMetadata {
+            index_type: index_metadata.index_type.clone(),
+            distance_type: distance_type.to_string(),
+        })?,
+    );
+    Ok(())
+}
+
+async fn read_pq_storage_metadata(reader: &V2Reader) -> Result<ProductQuantizationMetadata> {
+    let mut metadata =
+        read_storage_metadata::<ProductQuantizationMetadata>(reader, PQ_METADATA_KEY)?;
+    if metadata.codebook.is_none() {
+        let tensor_bytes = reader
+            .read_global_buffer(metadata.codebook_position as u32)
+            .await?;
+        let codebook_tensor: lance_index::pb::Tensor = Message::decode(tensor_bytes)?;
+        metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+    }
+    Ok(metadata)
+}
+
+fn read_storage_metadata<T>(reader: &V2Reader, storage_metadata_key: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if !storage_metadata_key.is_empty()
+        && let Some(metadata) = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(storage_metadata_key)
+    {
+        return Ok(serde_json::from_str(metadata)?);
+    }
+
+    let storage_metadata = reader
+        .metadata()
+        .file_schema
+        .metadata
+        .get(STORAGE_METADATA_KEY)
+        .ok_or_else(|| Error::index(format!("{STORAGE_METADATA_KEY} missing from storage file")))?;
+    let metadata_entries: Vec<String> = serde_json::from_str(storage_metadata)?;
+    let metadata = metadata_entries.first().ok_or_else(|| {
+        Error::index(format!(
+            "{STORAGE_METADATA_KEY} did not contain any storage metadata entries"
+        ))
+    })?;
+    Ok(serde_json::from_str(metadata)?)
 }
 
 async fn do_train_ivf_model<T: ArrowPrimitiveType>(

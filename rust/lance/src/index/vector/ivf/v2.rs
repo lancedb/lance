@@ -3613,6 +3613,147 @@ mod tests {
         assert!(result.num_rows() > 0);
     }
 
+    #[rstest]
+    #[case::flat("IVF_HNSW_FLAT")]
+    #[case::pq("IVF_HNSW_PQ")]
+    #[case::sq("IVF_HNSW_SQ")]
+    #[tokio::test]
+    async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/merge_hnsw_rebuilds_graph", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let params = match expected_index_type {
+            "IVF_HNSW_FLAT" => VectorIndexParams::ivf_hnsw(
+                DistanceType::L2,
+                prepare_global_ivf(&dataset, "vector").await,
+                HnswBuildParams::default(),
+            ),
+            "IVF_HNSW_PQ" => {
+                let (ivf_params, pq_params) = prepare_global_ivf_pq(&dataset, "vector").await;
+                VectorIndexParams::with_ivf_hnsw_pq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    HnswBuildParams::default(),
+                    pq_params,
+                )
+            }
+            "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
+                DistanceType::L2,
+                prepare_global_ivf(&dataset, "vector").await,
+                HnswBuildParams::default(),
+                SQBuildParams::default(),
+            ),
+            other => panic!("unexpected HNSW index type {other}"),
+        };
+        let mut segments = Vec::new();
+
+        for fragment in fragments.iter().take(2) {
+            let segment = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(segment);
+        }
+
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![merged])
+            .await
+            .unwrap();
+
+        let stats = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["index_type"].as_str().unwrap(), expected_index_type);
+        assert_eq!(
+            stats["indices"][0]["sub_index"]["index_type"]
+                .as_str()
+                .unwrap(),
+            "HNSW"
+        );
+
+        let query_batch = dataset
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(4), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = query_batch["vector"].as_fixed_size_list().value(0);
+        let result = dataset
+            .scan()
+            .project(&["_rowid"] as &[&str])
+            .unwrap()
+            .nearest("vector", q.as_ref(), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(result.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_merge_existing_hnsw_segments_rejects_mismatched_build_params() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/merge_hnsw_rejects_mismatched_params", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+
+        let ivf_params = prepare_global_ivf(&dataset, "vector").await;
+        let default_params = VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            ivf_params.clone(),
+            HnswBuildParams::default(),
+        );
+        let custom_params = VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            ivf_params,
+            HnswBuildParams::default().num_edges(16),
+        );
+
+        let first_segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &default_params)
+            .name("vector_idx".to_string())
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let second_segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &custom_params)
+            .name("vector_idx".to_string())
+            .fragments(vec![fragments[1].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let error = dataset
+            .merge_existing_index_segments(vec![first_segment, second_segment])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("HNSW build parameters mismatch while merging index segments"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_merge_index_metadata_reports_progress() {
         const INDEX_NAME: &str = "vector_idx";
