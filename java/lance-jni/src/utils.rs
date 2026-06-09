@@ -268,6 +268,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             use_index,
             dist_q_c: 0.0,
             query_parallelism,
+            approx_mode: Default::default(),
         })
     })?;
 
