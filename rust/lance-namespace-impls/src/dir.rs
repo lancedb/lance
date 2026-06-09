@@ -313,11 +313,10 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
-    /// Enable or disable inline optimization of the __manifest table.
+    /// Enable or disable replacement index maintenance for the __manifest table.
     ///
-    /// When enabled (default), performs compaction and indexing on the __manifest table
-    /// after every write operation to maintain optimal performance.
-    /// When disabled, manual optimization must be performed separately.
+    /// When enabled (default), copy-on-write manifest rewrites build replacement indices
+    /// for fast reads. When disabled, rewrites only replace data files.
     pub fn inline_optimization_enabled(mut self, enabled: bool) -> Self {
         self.inline_optimization_enabled = enabled;
         self
@@ -355,7 +354,7 @@ impl DirectoryNamespaceBuilder {
     /// - `root`: The root directory path (required)
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
-    /// - `inline_optimization_enabled`: Enable inline optimization of __manifest table (optional, default: true)
+    /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: true)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -2143,6 +2142,7 @@ impl DirectoryNamespace {
     /// to the manifest to enable manifest-only mode:
     ///
     /// ```no_run
+    /// #![recursion_limit = "256"]
     /// # use lance_namespace_impls::DirectoryNamespaceBuilder;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// // Create namespace with dual mode (manifest + directory listing)
@@ -3235,8 +3235,6 @@ impl LanceNamespace for DirectoryNamespace {
             ranges,
         }];
 
-        let mut total_deleted_count = 0i64;
-
         // Branches are not tracked in the manifest catalog, so a branch skips the
         // __manifest phase entirely and deletes its physical manifests directly.
         if branch.is_none()
@@ -3260,32 +3258,30 @@ impl LanceNamespace for DirectoryNamespace {
             }
 
             // Phase 1 (atomic commit point): Delete version records from __manifest
-            // for ALL tables in a single atomic operation. This is the authoritative
-            // source of truth — once __manifest entries are removed, the versions
-            // are logically deleted across all tables atomically.
-
-            // Collect all (table_id_str, ranges) for batch deletion
-            let mut all_object_ids: Vec<String> = Vec::new();
-            for te in &table_entries {
-                let table_id_str = manifest::ManifestNamespace::str_object_id(
-                    &te.table_id.clone().unwrap_or_default(),
-                );
-                for (start, end) in &te.ranges {
-                    for version in *start..*end {
-                        let object_id = manifest::ManifestNamespace::build_version_object_id(
-                            &table_id_str,
-                            version,
-                        );
-                        all_object_ids.push(object_id);
-                    }
-                }
-            }
-
-            if !all_object_ids.is_empty() {
-                total_deleted_count = manifest_ns
-                    .batch_delete_table_versions_by_object_ids(&all_object_ids)
-                    .await?;
-            }
+            // for ALL tables in a single atomic copy-on-write rewrite. This is the
+            // authoritative source of truth — once __manifest entries are removed,
+            // the versions are logically deleted across all tables atomically.
+            //
+            // Request `ranges` carry an exclusive end (`[start, end)`); the manifest
+            // rewrite API matches an inclusive `[start, end]`, so shift the end down
+            // by one. Empty ranges collapse to start > end and are dropped downstream.
+            let table_ranges = table_entries
+                .iter()
+                .map(|te| {
+                    let object_id = manifest::ManifestNamespace::str_object_id(
+                        &te.table_id.clone().unwrap_or_default(),
+                    );
+                    let inclusive_ranges = te
+                        .ranges
+                        .iter()
+                        .map(|&(start, end)| (start, end - 1))
+                        .collect::<Vec<_>>();
+                    (object_id, inclusive_ranges)
+                })
+                .collect::<Vec<_>>();
+            let total_deleted_count = manifest_ns
+                .batch_delete_table_versions_by_ranges(&table_ranges)
+                .await?;
 
             // Phase 2: Delete physical manifest files (best-effort).
             // Even if some file deletions fail, the versions are already removed from
@@ -3303,7 +3299,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Direct path: delete physical files (no __manifest). Reached when storage
         // tracking is off, or for any branch (which has no __manifest entries).
-        total_deleted_count = self
+        let total_deleted_count = self
             .delete_physical_version_files(&table_entries, false, branch)
             .await?;
 
