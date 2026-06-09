@@ -738,7 +738,7 @@ async fn load_vector_index_config(
     // bake this metric into their on-disk metadata, so a wrong default would
     // be durable corruption.
     let distance_type = dataset
-        .open_vector_index(&column, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+        .open_vector_index(&column, &index_meta.uuid, &NoOpMetricsCollector)
         .await
         .map_err(|e| {
             Error::invalid_input(format!(

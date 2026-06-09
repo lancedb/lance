@@ -17,12 +17,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_arrow::ipc::{
     read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
     write_len_prefixed_bytes,
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
@@ -36,7 +36,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use super::{AnyQuery, IndexStore, ScalarIndex};
+use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
 };
@@ -180,7 +180,7 @@ pub struct BitmapIndexState {
 }
 
 impl DeepSizeOf for BitmapIndexState {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.lookup_batch.get_array_memory_size()
             + self.null_map.deep_size_of_children(context)
             + self.index_map.deep_size_of_children(context)
@@ -473,7 +473,7 @@ impl BitmapIndex {
 }
 
 impl DeepSizeOf for BitmapIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.index_map.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
@@ -768,13 +768,15 @@ impl ScalarIndex for BitmapIndex {
     ) -> Result<CreatedIndex> {
         let state = self.load_bitmap_index_state().await?;
         let remapped_state = BitmapIndexPlugin::remap_bitmap_state(state, mapping);
-        BitmapIndexPlugin::write_bitmap_index(remapped_state, dest_store, &self.value_type).await?;
+        let file =
+            BitmapIndexPlugin::write_bitmap_index(remapped_state, dest_store, &self.value_type)
+                .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -785,7 +787,7 @@ impl ScalarIndex for BitmapIndex {
         dest_store: &dyn IndexStore,
         _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        BitmapIndexPlugin::streaming_build_and_write(
+        let file = BitmapIndexPlugin::streaming_build_and_write(
             new_data,
             Some(self),
             dest_store,
@@ -797,7 +799,7 @@ impl ScalarIndex for BitmapIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -870,7 +872,7 @@ impl BitmapBatchWriter {
     }
 
     /// Flush any remaining data, write index statistics, and finalize the file.
-    async fn finish(mut self) -> Result<()> {
+    async fn finish(mut self) -> Result<IndexFile> {
         self.flush().await?;
         let stats_json = serde_json::to_string(&BitmapStatistics {
             num_bitmaps: self.num_bitmaps,
@@ -878,8 +880,7 @@ impl BitmapBatchWriter {
         .map_err(|e| Error::internal(format!("failed to serialize bitmap statistics: {e}")))?;
         let mut metadata = HashMap::new();
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
-        self.file.finish_with_metadata(metadata).await?;
-        Ok(())
+        self.file.finish_with_metadata(metadata).await
     }
 }
 
@@ -1188,7 +1189,7 @@ impl BitmapIndexPlugin {
         state: HashMap<ScalarValue, RowAddrTreeMap>,
         index_store: &dyn IndexStore,
         value_type: &DataType,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         Self::write_bitmap_index_with_extras(
             state,
             index_store,
@@ -1206,7 +1207,7 @@ impl BitmapIndexPlugin {
         value_type: &DataType,
         mut metadata: HashMap<String, String>,
         global_buffers: Vec<(String, Bytes)>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let num_bitmaps = state.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("keys", value_type.clone(), true),
@@ -1270,9 +1271,7 @@ impl BitmapIndexPlugin {
             .map_err(|e| Error::internal(format!("failed to serialize bitmap statistics: {e}")))?;
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
 
-        bitmap_index_file.finish_with_metadata(metadata).await?;
-
-        Ok(())
+        bitmap_index_file.finish_with_metadata(metadata).await
     }
 
     /// Builds bitmap index state from a `(value, row_id)` stream without writing it.
@@ -1301,7 +1300,7 @@ impl BitmapIndexPlugin {
     pub async fn train_bitmap_index(
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME).await
     }
 
@@ -1311,15 +1310,15 @@ impl BitmapIndexPlugin {
         fragment_ids: &[u32],
         shard_id: Option<u32>,
         progress: Arc<dyn crate::progress::IndexBuildProgress>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
         let file_name = bitmap_shard_file_name(partition_id);
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
-        Self::streaming_build_and_write(data, None, index_store, &file_name).await?;
+        let file = Self::streaming_build_and_write(data, None, index_store, &file_name).await?;
         progress.stage_complete("build_bitmap_shard").await?;
-        Ok(())
+        Ok(file)
     }
 
     /// Builds and writes a bitmap index in a streaming fashion from value-sorted
@@ -1334,7 +1333,7 @@ impl BitmapIndexPlugin {
         old_index: Option<&BitmapIndex>,
         index_store: &dyn IndexStore,
         output_file_name: &str,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let value_type = data_source.schema().field(0).data_type().clone();
 
         let mut writer =
@@ -1427,9 +1426,7 @@ impl BitmapIndexPlugin {
             writer.emit(null_key, &idx.null_map).await?;
         }
 
-        writer.finish().await?;
-
-        Ok(())
+        writer.finish().await
     }
 
     /// Flush a completed value-run from the new data stream, emitting any
@@ -1520,7 +1517,7 @@ impl BitmapIndexPlugin {
         store: &dyn IndexStore,
         shard_files: &[String],
         progress: Arc<dyn IndexBuildProgress>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         progress
             .stage_start("merge_bitmap_shards", None, "bitmaps")
             .await?;
@@ -1570,10 +1567,10 @@ impl BitmapIndexPlugin {
         progress
             .stage_start("write_bitmap_index", Some(1), "files")
             .await?;
-        writer.finish().await?;
+        let file = writer.finish().await?;
         progress.stage_progress("write_bitmap_index", 1).await?;
         progress.stage_complete("write_bitmap_index").await?;
-        Ok(())
+        Ok(file)
     }
 }
 
@@ -1640,14 +1637,14 @@ pub async fn merge_bitmap_indices(
     progress
         .stage_start("write_bitmap_index", Some(1), "files")
         .await?;
-    BitmapIndexPlugin::write_bitmap_index(merged_state, dest_store, &value_type).await?;
+    let file = BitmapIndexPlugin::write_bitmap_index(merged_state, dest_store, &value_type).await?;
     progress.stage_progress("write_bitmap_index", 1).await?;
     progress.stage_complete("write_bitmap_index").await?;
 
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default()).unwrap(),
         index_version: BITMAP_INDEX_VERSION,
-        files: Some(dest_store.list_files_with_sizes().await?),
+        files: vec![file],
     })
 }
 
@@ -1712,7 +1709,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
                         .to_string(),
                 )
             })?;
-        if let Some(fragment_ids) = fragment_ids.as_ref() {
+        let file = if let Some(fragment_ids) = fragment_ids.as_ref() {
             Self::train_bitmap_shard(
                 data,
                 index_store,
@@ -1720,20 +1717,20 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
                 request.parameters.shard_id,
                 progress,
             )
-            .await?;
+            .await?
         } else if request.parameters.shard_id.is_some() {
             return Err(Error::invalid_input(
                 "Bitmap shard_id requires fragment_ids and is only supported for distributed shard builds"
                     .to_string(),
             ));
         } else {
-            Self::train_bitmap_index(data, index_store).await?;
-        }
+            Self::train_bitmap_index(data, index_store).await?
+        };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 

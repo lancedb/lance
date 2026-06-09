@@ -151,11 +151,11 @@ impl InvertedIndexPlugin {
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
                 .with_progress(progress);
-        inverted_index.update(data, index_store, None).await?;
+        let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: current_fts_format_version().index_version(),
-            files: Some(index_store.list_files_with_sizes().await?),
+            files,
         })
     }
 

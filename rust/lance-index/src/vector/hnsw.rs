@@ -7,8 +7,8 @@
 //!
 
 use arrow_schema::{DataType, Field};
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 
 use self::builder::HnswBuildParams;

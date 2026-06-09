@@ -28,7 +28,6 @@ aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
-deepsize.workspace = true
 futures.workspace = true
 log.workspace = true
 object_store.workspace = true

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::DistanceType;

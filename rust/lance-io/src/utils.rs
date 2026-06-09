@@ -10,8 +10,8 @@ use arrow_array::{
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use lance_arrow::*;
+use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 

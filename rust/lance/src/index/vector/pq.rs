@@ -17,8 +17,8 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -71,17 +71,29 @@ pub struct PQIndex {
 }
 
 impl DeepSizeOf for PQIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.pq.deep_size_of_children(context)
             + self
                 .code
                 .as_ref()
-                .map(|code| code.get_array_memory_size())
+                .map(|code| {
+                    if context.mark_seen(Arc::as_ptr(code) as *const () as usize) {
+                        (code.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
             + self
                 .row_ids
                 .as_ref()
-                .map(|row_ids| row_ids.get_array_memory_size())
+                .map(|row_ids| {
+                    if context.mark_seen(Arc::as_ptr(row_ids) as *const () as usize) {
+                        (row_ids.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
     }
 }

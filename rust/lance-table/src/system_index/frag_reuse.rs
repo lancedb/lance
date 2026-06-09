@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
-use deepsize::{Context, DeepSizeOf};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_select::RowAddrTreeMap;
 use roaring::{RoaringBitmap, RoaringTreemap};

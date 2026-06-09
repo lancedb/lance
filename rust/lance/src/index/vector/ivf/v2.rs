@@ -21,13 +21,13 @@ use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
@@ -76,6 +76,7 @@ use roaring::RoaringBitmap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, instrument};
+use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
@@ -177,7 +178,7 @@ fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.index_file_path.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
@@ -243,7 +244,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
 pub(crate) struct IvfStateEntryBox(pub(crate) Arc<dyn IvfStateEntry>);
 
 impl DeepSizeOf for IvfStateEntryBox {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.0.deep_size_of_children(context)
     }
 }
@@ -386,7 +387,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
 
         let header = IvfIndexStateHeader {
             index_file_path: self.index_file_path.clone(),
-            uuid: self.uuid.clone(),
+            uuid: self.uuid.to_string(),
             distance_type: self.distance_type.to_string(),
             sub_index_metadata: self.sub_index_metadata.clone(),
             sub_index_type: self.sub_index_type.to_string(),
@@ -460,8 +461,8 @@ struct CachedIndexReaders {
     aux_reader: Arc<FileReader>,
 }
 
-impl deepsize::DeepSizeOf for CachedIndexReaders {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+impl lance_core::deepsize::DeepSizeOf for CachedIndexReaders {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // FileReader doesn't impl DeepSizeOf. We approximate by counting the
         // fixed struct size for each reader plus the Arc<CachedFileMetadata>
         // heap contents. The metadata Arcs are also held by FileMetadataCacheKey
@@ -582,7 +583,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// Object-store path to the index file (forward-slash separated).
     /// Used by `cacheable_state()` for cross-platform reconstruction.
     index_path: String,
-    uuid: String,
+    uuid: Uuid,
 
     /// Ivf model
     ivf: IvfModel,
@@ -605,12 +606,12 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 }
 
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // `Uuid` is a fixed 16-byte struct with no heap children, so contributes 0.
         self.uri.deep_size_of_children(context)
             + self.index_path.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
-            + self.uuid.deep_size_of_children(context)
             + self.storage.deep_size_of_children(context)
             + self.scratch_pool.deep_size_of_children(context)
             + self
@@ -974,7 +975,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
         index_dir: Path,
-        uuid: String,
+        uuid: Uuid,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
@@ -984,7 +985,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
-        let uri = index_dir.clone().join(uuid.as_str()).join(INDEX_FILE_NAME);
+        let uuid_str = uuid.to_string();
+        let uri = index_dir
+            .clone()
+            .join(uuid_str.as_str())
+            .join(INDEX_FILE_NAME);
         let cached_size = file_sizes
             .get(INDEX_FILE_NAME)
             .map(|&size| CachedFileSize::new(size))
@@ -1033,7 +1038,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .open_file(
                     &index_dir
                         .clone()
-                        .join(uuid.as_str())
+                        .join(uuid_str.as_str())
                         .join(INDEX_AUXILIARY_FILE_NAME),
                     &aux_cached_size,
                 )
@@ -1055,7 +1060,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .await;
         let aux_path = index_dir
             .clone()
-            .join(uuid.as_str())
+            .join(uuid_str.as_str())
             .join(INDEX_AUXILIARY_FILE_NAME);
         file_metadata_cache
             .with_key_prefix(aux_path.as_ref())
@@ -1065,7 +1070,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         // Cache open readers so the first reconstruction also skips file opens.
         file_metadata_cache
             .insert_with_key(
-                &CachedIndexReadersKey { uuid: uuid.clone() },
+                &CachedIndexReadersKey {
+                    uuid: uuid_str.clone(),
+                },
                 Arc::new(CachedIndexReaders {
                     index_reader: Arc::new(index_reader.clone()),
                     aux_reader: Arc::new(storage.reader().clone()),
@@ -1102,7 +1109,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     pub(crate) fn from_cached_state(
         uri: String,
         index_path: String,
-        uuid: String,
+        uuid: Uuid,
         ivf: IvfModel,
         reader: FileReader,
         storage: IvfQuantizationStorage<Q>,
@@ -1230,7 +1237,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let (sub_index_type, quantization_type) = self.sub_index_type();
         IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
             index_file_path: self.index_path.clone(),
-            uuid: self.uuid.clone(),
+            uuid: self.uuid.to_string(),
             ivf: self.ivf.clone(),
             aux_ivf: self.storage.ivf().clone(),
             distance_type: self.distance_type,
@@ -1344,7 +1351,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type,
-            uuid: self.uuid.clone(),
+            uuid: self.uuid.to_string(),
             uri: self.uri.clone(),
             metric_type: self.distance_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
@@ -1859,10 +1866,12 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     );
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
+    let parsed_uuid = Uuid::parse_str(&state.uuid)
+        .map_err(|e| Error::index(format!("Invalid UUID in IvfIndexState: {e}")))?;
     let index = IVFIndex::<S, Q>::from_cached_state(
         to_local_path(&index_path),
         index_path.to_string(),
-        state.uuid.clone(),
+        parsed_uuid,
         state.ivf.clone(),
         index_reader,
         storage,
@@ -1921,6 +1930,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_index::vector::pq::PQBuildParams;
@@ -1933,7 +1943,6 @@ mod tests {
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
-    use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -1946,6 +1955,7 @@ mod tests {
     use rand::distr::uniform::SampleUniform;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
+    use uuid::Uuid;
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
@@ -2373,11 +2383,12 @@ mod tests {
     ) -> VectorIndexTestContext {
         let stats_json = dataset.index_statistics(index_name).await.unwrap();
         let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
-        let uuid = stats["indices"][0]["uuid"]
+        let uuid_str = stats["indices"][0]["uuid"]
             .as_str()
             .expect("Index uuid should be present");
+        let uuid = Uuid::parse_str(uuid_str).expect("uuid in stats should be a valid UUID");
         let index = dataset
-            .open_vector_index(column, uuid, &NoOpMetricsCollector)
+            .open_vector_index(column, &uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -4547,11 +4558,7 @@ mod tests {
         let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
         assert_eq!(indices.len(), 1); // v1 index should be replaced by v3 index
         let index = dataset
-            .open_vector_index(
-                "vector",
-                indices[0].uuid.to_string().as_str(),
-                &NoOpMetricsCollector,
-            )
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let v3_index = index.as_any().downcast_ref::<super::IvfPq>();
@@ -4967,7 +4974,10 @@ mod tests {
             STORAGE_METADATA_KEY.to_owned(),
             serde_json::to_string(&vec![pq_metadata])?,
         );
-        writer.finish_with_metadata(metadata).await?;
+        for (key, value) in metadata {
+            writer.add_schema_metadata(key, value);
+        }
+        writer.finish().await?;
 
         // Build new IndexMetadata with the new UUID and file sizes.
         let new_files =

@@ -9,6 +9,7 @@ use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -30,7 +31,6 @@ use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
-use std::future::Future;
 
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
@@ -300,7 +300,7 @@ where
 /// applies a per-batch async transform.
 ///
 /// `elapsed_compute` measures only the time spent driving the transform
-/// futures — never the time spent polling the child input — so wrapping a
+/// futures -- never the time spent polling the child input -- so wrapping a
 /// chain of nodes does not double-count child CPU. `output_rows` and
 /// `output_batches` are recorded as the transform produces batches.
 ///
@@ -363,7 +363,7 @@ where
         let this = self.get_mut();
 
         // Fill in-flight transforms up to `concurrency` from the input.
-        // Polling the input does NOT count toward `elapsed_compute`.
+        // Polling the input does not count toward `elapsed_compute`.
         while !this.input_done && this.in_flight.len() < this.concurrency {
             match this.input.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
@@ -379,7 +379,7 @@ where
             }
         }
 
-        // Drive in-flight transforms; their poll time IS counted.
+        // Drive in-flight transforms; their poll time is counted.
         if !this.in_flight.is_empty() {
             let timer = this.baseline_metrics.elapsed_compute().timer();
             let poll = this.in_flight.poll_next_unpin(cx);
@@ -391,13 +391,9 @@ where
                     }
                     return this.baseline_metrics.record_poll(Poll::Ready(Some(result)));
                 }
-                // Unreachable: `FuturesUnordered::poll_next` returns
-                // `Ready(None)` only when empty, and we just checked
-                // `!is_empty` above. A panic here is preferable to a
-                // silent infinite loop if the invariant ever breaks.
-                Poll::Ready(None) => {
-                    unreachable!("FuturesUnordered yielded None while non-empty")
-                }
+                // `FuturesUnordered::poll_next` returns `Ready(None)` only
+                // when empty, and we just checked `!is_empty` above.
+                Poll::Ready(None) => unreachable!("non-empty transform queue yielded None"),
                 Poll::Pending => return Poll::Pending,
             }
         }

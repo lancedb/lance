@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 use serde::de::Deserializer;
 use serde::ser::Serializer;

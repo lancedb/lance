@@ -8,10 +8,10 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{Duration, prelude::*};
-use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
@@ -128,6 +128,7 @@ pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
 pub use take::TakeBuilder;
+use uuid::Uuid;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched, WhenNotMatchedBySource,
@@ -3034,13 +3035,13 @@ impl Dataset {
     /// progress via the supplied callback.
     pub async fn merge_index_metadata(
         &self,
-        index_uuid: &str,
+        index_uuid: &Uuid,
         index_type: IndexType,
         _batch_readhead: Option<usize>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
-        let index_dir = self.indices_dir().join(index_uuid);
+        let index_dir = self.indices_dir().join(index_uuid.to_string());
         match index_type {
             IndexType::Inverted => {
                 // Call merge_index_files function for inverted index

@@ -11,7 +11,7 @@
 //! `RowDatasetVersionMeta::Inline` bytes across many fragments.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 
 use lance_table::format::pb;
