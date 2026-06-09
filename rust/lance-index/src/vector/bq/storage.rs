@@ -859,6 +859,7 @@ impl<'a> RabitDistCalculator<'a> {
                 code_len,
                 dists,
                 quantized_dists,
+                quantized_dists_table,
                 hacc_quantized_dists,
             );
         }
@@ -920,22 +921,24 @@ impl<'a> RabitDistCalculator<'a> {
         code_len: usize,
         dists: &mut Vec<f32>,
         quantized_dist_table: &mut Vec<u16>,
+        hacc_dist_table: &mut Vec<u8>,
         quantized_dists: &mut Vec<u32>,
     ) -> usize {
         let (qmin, qmax) = quantize_dist_table_u16_into(&self.dist_table, quantized_dist_table);
+        simd::dist_table::transfer_4bit_dist_table_u16(quantized_dist_table, hacc_dist_table);
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
         quantized_dists.clear();
         quantized_dists.reserve(simd_len);
-        // SAFETY: sum_4bit_dist_table_u16 overwrites each element in the batch range.
+        // SAFETY: sum_4bit_hacc_dist_table overwrites each element in the batch range.
         unsafe {
             quantized_dists.set_len(simd_len);
         }
-        simd::dist_table::sum_4bit_dist_table_u16(
+        simd::dist_table::sum_4bit_hacc_dist_table(
             simd_len,
             code_len,
             self.codes,
-            quantized_dist_table,
+            hacc_dist_table,
             quantized_dists,
         );
 
@@ -3007,7 +3010,7 @@ mod tests {
             distances
         };
 
-        let (accurate, hacc_table_len, hacc_accum_len) = {
+        let (accurate, hacc_table_len, hacc_packed_table_len, hacc_accum_len) = {
             let mut f32_scratch = Vec::new();
             let calc = storage.dist_calculator_with_scratch(
                 query,
@@ -3029,7 +3032,12 @@ mod tests {
                 &mut u8_scratch,
                 &mut u32_scratch,
             );
-            (distances, u16_scratch.len(), u32_scratch.len())
+            (
+                distances,
+                u16_scratch.len(),
+                u8_scratch.len(),
+                u32_scratch.len(),
+            )
         };
 
         let normal_error = normal
@@ -3049,6 +3057,7 @@ mod tests {
             "accurate_error={accurate_error}, normal_error={normal_error}"
         );
         assert_eq!(hacc_table_len, code_dim * 4);
+        assert_eq!(hacc_packed_table_len, code_dim * 8);
         assert_eq!(hacc_accum_len, num_rows);
     }
 
