@@ -26,6 +26,8 @@ pub mod azure;
 pub mod gcp;
 #[cfg(feature = "goosefs")]
 pub mod goosefs;
+#[cfg(feature = "hdfs")]
+pub mod hdfs;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
@@ -100,6 +102,7 @@ pub struct ObjectStoreRegistryStats {
 /// - `az`: An Azure Blob Storage object store.
 /// - `gs`: A Google Cloud Storage object store.
 /// - `tos`: A Volcengine TOS object store.
+/// - `hdfs`: A Hadoop FileSystem object store.
 ///
 /// Use [`Self::empty()`] to create an empty registry, with no providers registered.
 ///
@@ -339,6 +342,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         #[cfg(feature = "tos")]
         providers.insert("tos".into(), Arc::new(tos::TosStoreProvider));
+        #[cfg(feature = "hdfs")]
+        providers.insert("hdfs".into(), Arc::new(hdfs::HdfsStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
