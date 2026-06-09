@@ -817,16 +817,27 @@ impl BTreeLookup {
             // End row: pages whose `min` exceeds the value cannot match.
             let end = partition_point(start, num_rows, |i| cmp_min(i, j) != Ordering::Greater);
 
-            for idx in start..end {
+            // The window splits at `p` (first row with `min >= value`):
+            //   * `[start, p)` — the peek-left/straddle region (`min < value`). A page
+            //     here matches only if its `max` reaches the value, so it needs the
+            //     filter, and it may include a null-`min`/null-`max` straddle page.
+            //   * `[p, end)` — rows with `min == value`. These always match (`max >=
+            //     min == value`) and can't have a null `max` (all-null pages sort to
+            //     the front, before `search_start <= start`), so we copy them in one
+            //     slice instead of pushing per row.
+            let page_ids = page_numbers.values();
+            let bulk_start = p.max(start);
+            for idx in start..bulk_start {
                 // All-null pages are only matched by IS NULL queries.
                 if maxs.is_null(idx) {
                     continue;
                 }
                 // Candidate when the page's `max` reaches the value (`max >= value`).
                 if cmp_max(idx, j) != Ordering::Less {
-                    pages.push(page_numbers.values()[idx]);
+                    pages.push(page_ids[idx]);
                 }
             }
+            pages.extend_from_slice(&page_ids[bulk_start..end]);
         }
 
         pages.sort_unstable();
