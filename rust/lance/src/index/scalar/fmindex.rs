@@ -40,6 +40,41 @@ pub(in crate::index) async fn merge_segments(
         })?;
     }
 
+    // Intersect with the dataset's current live fragments to drop retired/compacted
+    // fragments, mirroring the btree merge behavior.
+    fragment_bitmap &= dataset.fragment_bitmap.as_ref();
+
+    if fragment_bitmap.is_empty() {
+        // All covered fragments have been retired; produce an empty index.
+        let new_uuid = Uuid::new_v4();
+        let created_index = super::build_scalar_index(
+            dataset,
+            &column,
+            &new_uuid.to_string(),
+            &lance_index::scalar::ScalarIndexParams::for_builtin(
+                lance_index::scalar::BuiltinIndexType::FMIndex,
+            ),
+            false,
+            None,
+            None,
+            Arc::new(lance_index::progress::NoopIndexBuildProgress),
+        )
+        .await?;
+
+        return Ok(IndexMetadata {
+            uuid: new_uuid,
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(fragment_bitmap),
+            index_details: Some(Arc::new(created_index.index_details)),
+            index_version: created_index.index_version as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: created_index.files,
+            ..segments[0].clone()
+        });
+    }
+
     let fragment_ids: Vec<u32> = fragment_bitmap.iter().collect();
     let new_uuid = Uuid::new_v4();
 

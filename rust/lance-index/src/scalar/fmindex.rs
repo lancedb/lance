@@ -31,7 +31,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::{Error, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use roaring::RoaringBitmap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -40,6 +40,7 @@ use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
@@ -775,6 +776,25 @@ impl FMIndex {
         result
     }
 
+    /// Search returning full u64 row addresses (preserving fragment ID in upper bits).
+    fn search_row_addrs(&self, pattern: &[u8]) -> Vec<u64> {
+        let (lo, hi) = self.backward_search(pattern);
+        if lo >= hi {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for i in lo..hi {
+            let text_pos = self.locate(i);
+            let doc_idx = self.doc_for_position(text_pos);
+            let row_addr = self.row_ids[doc_idx];
+            if seen.insert(row_addr) {
+                result.push(row_addr);
+            }
+        }
+        result
+    }
+
     fn serialize_huffman_codes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         for code in &self.wavelet.codes {
@@ -997,6 +1017,25 @@ impl LazyFMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             result.insert(self.row_ids[doc_idx] as u32);
+        }
+        result
+    }
+
+    /// Search returning full u64 row addresses (preserving fragment ID in upper bits).
+    fn search_row_addrs(&self, pattern: &[u8]) -> Vec<u64> {
+        let (lo, hi) = self.backward_search(pattern);
+        if lo >= hi {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for i in lo..hi {
+            let text_pos = self.locate(i);
+            let doc_idx = self.doc_for_position(text_pos);
+            let row_addr = self.row_ids[doc_idx];
+            if seen.insert(row_addr) {
+                result.push(row_addr);
+            }
         }
         result
     }
@@ -1302,8 +1341,8 @@ impl ScalarIndex for FMIndexScalarIndex {
                 let mut tree = RowAddrTreeMap::new();
                 for p in &self.partitions {
                     p.fm.prewarm().await?;
-                    for rid in p.fm.search(pb).iter() {
-                        tree.insert(rid as u64);
+                    for row_addr in p.fm.search_row_addrs(pb) {
+                        tree.insert(row_addr);
                     }
                 }
                 Ok(SearchResult::Exact(lance_select::NullableRowAddrSet::new(
@@ -1349,20 +1388,25 @@ impl ScalarIndex for FMIndexScalarIndex {
 
 async fn collect_texts(mut stream: SendableRecordBatchStream) -> Result<Vec<(u64, Vec<u8>)>> {
     let mut texts = Vec::new();
-    let mut next_id = 0u64;
     while let Some(batch) = stream.next().await {
         let batch = batch?;
-        let row_ids: Option<&arrow_array::UInt64Array> = batch
-            .column_by_name("_rowid")
-            .or_else(|| batch.column_by_name("_rowaddr"))
-            .and_then(|c| c.as_any().downcast_ref());
-        let value_col = batch.column(0);
+        // Prefer _rowaddr (global row address) over _rowid to ensure stable,
+        // globally unique identifiers across segments.
+        let row_addrs: &arrow_array::UInt64Array = batch
+            .column_by_name(ROW_ADDR)
+            .or_else(|| batch.column_by_name("_rowid"))
+            .and_then(|c| c.as_any().downcast_ref())
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "FMIndex training data must include _rowaddr or _rowid column",
+                )
+            })?;
+        // Use the named value column; fall back to column(0) for legacy streams
+        let value_col = batch
+            .column_by_name(VALUE_COLUMN_NAME)
+            .unwrap_or_else(|| batch.column(0));
         for i in 0..batch.num_rows() {
-            let rid = row_ids.map(|ids| ids.value(i)).unwrap_or_else(|| {
-                let id = next_id;
-                next_id += 1;
-                id
-            });
+            let rid = row_addrs.value(i);
             if let Some(bytes) = extract_text_bytes(value_col.as_ref(), i)? {
                 let sanitized: Vec<u8> = bytes
                     .iter()
@@ -1566,7 +1610,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             }
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
     async fn train_index(
@@ -2018,23 +2062,23 @@ mod tests {
         use arrow_array::{StringArray, UInt64Array};
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::stream;
-        use lance_core::ROW_ID;
+        use lance_core::ROW_ADDR;
 
         let docs = vec!["hello world", "hello rust", "goodbye world"];
-        let row_ids: Vec<u64> = vec![0, 1, 2];
+        let row_addrs: Vec<u64> = vec![0, 1, 2];
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(
                 crate::scalar::registry::VALUE_COLUMN_NAME,
                 DataType::Utf8,
                 false,
             ),
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(docs)),
-                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt64Array::from(row_addrs)),
             ],
         )
         .unwrap();

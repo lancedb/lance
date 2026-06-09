@@ -559,6 +559,13 @@ impl<'a> CreateIndexBuilder<'a> {
 
     /// Build FM-Index with multiple segments, each covering a subset of fragments.
     async fn execute_multi_segment_fmindex(&mut self, num_segments: u32) -> Result<IndexMetadata> {
+        // Validate column count: same check as execute_uncommitted
+        if self.columns.len() != 1 {
+            return Err(Error::index(
+                "Only support building index on 1 column at the moment".to_string(),
+            ));
+        }
+
         let column_input = &self.columns[0];
         let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
             return Err(Error::index(format!(
@@ -638,9 +645,35 @@ impl<'a> CreateIndexBuilder<'a> {
                 base_id: None,
                 files: created_index.files,
             };
+            let segments = vec![metadata.into_index_segment()?];
+            let new_indices =
+                build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
+                    .await?;
+
+            // Collect all same-name indices for removal when replace is set
+            let removed_indices = if self.replace {
+                existing_named_indices
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            };
+
+            let transaction = TransactionBuilder::new(
+                self.dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+            )
+            .transaction_properties(self.transaction_properties.clone())
+            .build();
+
             self.dataset
-                .commit_existing_index_segments(&index_name, &column, vec![metadata])
+                .apply_commit(transaction, &Default::default(), &Default::default())
                 .await?;
+
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
             return indices.into_iter().next().ok_or_else(|| {
                 Error::internal(format!(
@@ -683,8 +716,38 @@ impl<'a> CreateIndexBuilder<'a> {
             });
         }
 
+        // Convert to IndexSegments and build proper transaction metadata
+        let segments = segment_metadatas
+            .into_iter()
+            .map(IntoIndexSegment::into_index_segment)
+            .collect::<Result<Vec<_>>>()?;
+        let new_indices =
+            build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
+                .await?;
+
+        // Collect all same-name indices for removal when replace is set,
+        // matching the standard execute() path behavior.
+        let removed_indices = if self.replace {
+            existing_named_indices
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
+        let transaction = TransactionBuilder::new(
+            self.dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            },
+        )
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
+
         self.dataset
-            .commit_existing_index_segments(&index_name, &column, segment_metadatas)
+            .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;

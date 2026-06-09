@@ -1176,9 +1176,9 @@ mod tests {
             ),
         };
         let match_count = row_addrs.true_rows().row_addrs().unwrap().count();
-        assert!(
-            match_count >= 3,
-            "expected at least 3 matches for 'quick', got {match_count}"
+        assert_eq!(
+            match_count, 5,
+            "expected exactly 5 matches for 'quick', got {match_count}"
         );
 
         // Verify fragment coverage via manifest metadata (not calculate_included_frags,
@@ -1294,5 +1294,167 @@ mod tests {
             other => panic!("expected exact result from merged fmindex, got {:?}", other),
         };
         assert_eq!(row_addrs.true_rows().row_addrs().unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fmindex_merge_after_compaction_drops_retired_fragments() {
+        use crate::dataset::write::WriteParams;
+
+        let test_dir = TempStrDir::default();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        // Create two fragments with 4 rows each so compaction can retire one
+        let write_params = WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let batches = vec![arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "alpha beta gamma",
+                "beta gamma delta",
+                "gamma delta epsilon",
+                "delta epsilon zeta",
+                "epsilon zeta eta",
+                "zeta eta theta",
+                "eta theta iota",
+                "theta iota kappa",
+            ]))],
+        )
+        .unwrap()];
+        let reader =
+            arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+
+        // Build per-fragment FM-Index segments and commit
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        let mut staged = Vec::new();
+        for fragment in &fragments {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::FMIndex, &params)
+                    .name("text_fmindex_compact".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            staged.push(segment);
+        }
+        dataset
+            .commit_existing_index_segments("text_fmindex_compact", "text", staged)
+            .await
+            .unwrap();
+
+        // Verify initial state: 2 segments, both fragments live
+        let committed = dataset
+            .load_indices_by_name("text_fmindex_compact")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), 2);
+
+        // Delete rows from fragment 0 to trigger compaction retirement
+        dataset.delete("text = 'alpha beta gamma'").await.unwrap();
+        dataset.delete("text = 'beta gamma delta'").await.unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 4,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let live_frags: RoaringBitmap = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        assert!(
+            !live_frags.contains(0),
+            "compaction should retire fragment 0"
+        );
+
+        // Merge: the retired fragment should be dropped from coverage
+        let segments = dataset
+            .load_indices_by_name("text_fmindex_compact")
+            .await
+            .unwrap();
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+
+        let coverage = merged.fragment_bitmap.as_ref().unwrap();
+        assert!(
+            !coverage.contains(0),
+            "merged coverage must drop retired fragment 0"
+        );
+        assert!(
+            coverage.contains(1),
+            "merged coverage must keep live fragment 1"
+        );
+
+        // Commit the merged segment and verify search works
+        dataset
+            .commit_existing_index_segments("text_fmindex_compact", "text", vec![merged])
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .load_indices_by_name("text_fmindex_compact")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), 1);
+
+        let logical = open_named_scalar_index(
+            &dataset,
+            "text",
+            "text_fmindex_compact",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        // "alpha" only existed in the deleted/retired rows
+        let query = lance_index::scalar::TextQuery::StringContains("alpha".to_string());
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!(
+                "expected exact result from merged fmindex, got {:?}",
+                other
+            ),
+        };
+        assert_eq!(
+            row_addrs.true_rows().row_addrs().unwrap().count(),
+            0,
+            "deleted rows from retired fragment should not appear in merged index"
+        );
+
+        // "theta" exists in fragment 1 rows only
+        let query = lance_index::scalar::TextQuery::StringContains("theta".to_string());
+        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!(
+                "expected exact result from merged fmindex, got {:?}",
+                other
+            ),
+        };
+        assert!(
+            row_addrs.true_rows().row_addrs().unwrap().count() > 0,
+            "rows from live fragment should still be searchable"
+        );
     }
 }
