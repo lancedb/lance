@@ -188,6 +188,7 @@ async fn merge_scalar_indices<'a>(
     let reference_index = dataset
         .open_scalar_index(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
+    let update_criteria = reference_index.update_criteria();
 
     // Effective = bitmap ∩ live fragments; deleted = bitmap \ live fragments.
     let mut effective_old_frags = RoaringBitmap::new();
@@ -209,15 +210,19 @@ async fn merge_scalar_indices<'a>(
     // rescanning the dataset
     let has_segment_merge_primitive = matches!(index_type, IndexType::BTree);
 
-    // Merge new data into the existing segment(s) instead of rebuilding from
-    // scratch, when both hold:
+    // Merge new data into the existing segment(s) without rebuilding from
+    // scratch, when all hold:
     //   - `effective_old_frags`: the selected segments' coverage intersected
     //     with live fragments is non-empty, i.e. there is old data worth keeping.
+    //   - `update_criteria` only requires the newly appended data. Indexes that
+    //     need old data must rebuild over `frag_bitmap` so the scanned rows
+    //     exactly match the segment coverage being committed.
     //   - `has_segment_merge_primitive` (Indices supports N:1 segments merge) OR
     //     `selected_old_indices.len() == 1` (any scalar type can `update` one).
     // Otherwise (e.g. ≥2 selected segments of a type without an N:1 merge
     // primitive) the index is rebuilt from scratch over `frag_bitmap`.
     let can_merge_segments = !effective_old_frags.is_empty()
+        && !update_criteria.requires_old_data
         && (has_segment_merge_primitive || selected_old_indices.len() == 1);
 
     let created_index = if !can_merge_segments {
@@ -231,7 +236,6 @@ async fn merge_scalar_indices<'a>(
         )
         .await?
     } else {
-        let update_criteria = reference_index.update_criteria();
         let new_data_stream =
             load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
                 .await?;
@@ -748,7 +752,7 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
         IndexType,
-        scalar::ScalarIndexParams,
+        scalar::{BuiltinIndexType, ScalarIndexParams, SearchResult, TextQuery},
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
@@ -1449,6 +1453,113 @@ mod tests {
             covered, expected,
             "post-optimize segments should cover every dataset fragment"
         );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_fmindex_default_rebuilds_old_and_new_rows() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let make_batch = |values: &[&str]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from_iter_values(
+                    values.iter().copied(),
+                ))],
+            )
+            .unwrap()
+        };
+
+        let reader = RecordBatchIterator::new(
+            vec![Ok(make_batch(&["old alpha needle", "old beta"]))],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::FMIndex,
+                Some("text_fmindex".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let appended = RecordBatchIterator::new(
+            vec![Ok(make_batch(&["new gamma needle", "new delta"]))],
+            schema.clone(),
+        );
+        dataset.append(appended, None).await.unwrap();
+
+        assert!(
+            !dataset
+                .unindexed_fragments("text_fmindex")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert!(
+            dataset
+                .unindexed_fragments("text_fmindex")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let committed = dataset.load_indices_by_name("text_fmindex").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(
+            committed[0]
+                .fragment_bitmap
+                .as_ref()
+                .expect("FMIndex segment should carry fragment coverage")
+                .len(),
+            2
+        );
+
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "text",
+            "text_fmindex",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        for (pattern, expected) in [("old alpha", 1), ("new gamma", 1), ("needle", 2)] {
+            let query = TextQuery::StringContains(pattern.to_string());
+            let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+            let row_addrs = match result {
+                SearchResult::Exact(row_addrs) => row_addrs,
+                other => panic!("expected exact result for {pattern}, got {other:?}"),
+            };
+            let count = row_addrs.true_rows().row_addrs().unwrap().count();
+            assert_eq!(
+                count, expected,
+                "expected {expected} matches for {pattern}, got {count}"
+            );
+        }
     }
 
     #[tokio::test]

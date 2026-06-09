@@ -24,8 +24,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, OnceLock};
 
-use lance_select::RowSetOps;
-
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
@@ -764,6 +762,7 @@ impl FMIndex {
         (lo, hi)
     }
 
+    #[cfg(test)]
     fn search(&self, pattern: &[u8]) -> RoaringBitmap {
         let (lo, hi) = self.backward_search(pattern);
         if lo >= hi {
@@ -1009,6 +1008,7 @@ impl LazyFMIndex {
         }
     }
 
+    #[cfg(test)]
     fn search(&self, pattern: &[u8]) -> RoaringBitmap {
         let (lo, hi) = self.backward_search(pattern);
         if lo >= hi {
@@ -1368,17 +1368,9 @@ impl ScalarIndex for FMIndexScalarIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        _old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let mut texts = collect_texts(new_data).await?;
-        if let Some(filter) = old_data_filter {
-            texts.retain(|(row_addr, _)| match &filter {
-                OldIndexDataFilter::Fragments { to_remove, .. } => {
-                    !to_remove.contains((*row_addr >> 32) as u32)
-                }
-                OldIndexDataFilter::RowIds(valid) => valid.contains(*row_addr),
-            });
-        }
+        let texts = collect_texts(new_data).await?;
         let files = write_partitioned_fmindex(&texts, dest).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
@@ -1409,9 +1401,7 @@ async fn collect_texts(mut stream: SendableRecordBatchStream) -> Result<Vec<(u64
             .or_else(|| batch.column_by_name("_rowid"))
             .and_then(|c| c.as_any().downcast_ref())
             .ok_or_else(|| {
-                Error::invalid_input(
-                    "FMIndex training data must include _rowaddr or _rowid column",
-                )
+                Error::invalid_input("FMIndex training data must include _rowaddr or _rowid column")
             })?;
         // Use the named value column; fall back to column(0) for legacy streams
         let value_col = batch

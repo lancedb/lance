@@ -1313,20 +1313,22 @@ mod tests {
             enable_stable_row_ids: true,
             ..Default::default()
         };
-        let batches = vec![arrow_array::RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow_array::StringArray::from(vec![
-                "alpha beta gamma",
-                "beta gamma delta",
-                "gamma delta epsilon",
-                "delta epsilon zeta",
-                "epsilon zeta eta",
-                "zeta eta theta",
-                "eta theta iota",
-                "theta iota kappa",
-            ]))],
-        )
-        .unwrap()];
+        let batches = vec![
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(vec![
+                    "alpha beta gamma",
+                    "beta gamma delta",
+                    "gamma delta epsilon",
+                    "delta epsilon zeta",
+                    "epsilon zeta eta",
+                    "zeta eta theta",
+                    "eta theta iota",
+                    "theta iota kappa",
+                ]))],
+            )
+            .unwrap(),
+        ];
         let reader =
             arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
         let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
@@ -1431,10 +1433,7 @@ mod tests {
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
         let row_addrs = match result {
             SearchResult::Exact(row_addrs) => row_addrs,
-            other => panic!(
-                "expected exact result from merged fmindex, got {:?}",
-                other
-            ),
+            other => panic!("expected exact result from merged fmindex, got {:?}", other),
         };
         assert_eq!(
             row_addrs.true_rows().row_addrs().unwrap().count(),
@@ -1447,10 +1446,7 @@ mod tests {
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
         let row_addrs = match result {
             SearchResult::Exact(row_addrs) => row_addrs,
-            other => panic!(
-                "expected exact result from merged fmindex, got {:?}",
-                other
-            ),
+            other => panic!("expected exact result from merged fmindex, got {:?}", other),
         };
         assert!(
             row_addrs.true_rows().row_addrs().unwrap().count() > 0,
