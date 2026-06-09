@@ -20,10 +20,12 @@ use crate::{
     metrics::MetricsCollector,
     prefilter::PreFilter,
     vector::{
-        DIST_COL, Query,
+        ApproxMode, DIST_COL, Query,
         graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
-        storage::{DistCalculator, QueryResidual, QueryScratch, VectorStore},
+        storage::{
+            DistCalculator, DistanceCalculatorOptions, QueryResidual, QueryScratch, VectorStore,
+        },
         v3::subindex::IvfSubIndex,
     },
 };
@@ -68,6 +70,7 @@ pub struct FlatQueryParams {
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
     dist_q_c: f32,
+    approx_mode: ApproxMode,
 }
 
 impl From<&Query> for FlatQueryParams {
@@ -76,6 +79,7 @@ impl From<&Query> for FlatQueryParams {
             lower_bound: q.lower_bound,
             upper_bound: q.upper_bound,
             dist_q_c: q.dist_q_c,
+            approx_mode: q.approx_mode,
         }
     }
 }
@@ -136,6 +140,9 @@ impl IvfSubIndex for FlatIndex {
             params.dist_q_c,
             residual,
             &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
         );
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
@@ -147,6 +154,7 @@ impl IvfSubIndex for FlatIndex {
                     &mut scratch.distances,
                     &mut scratch.u16,
                     &mut scratch.u8,
+                    &mut scratch.u32,
                 );
                 let dists = scratch.distances.iter().copied();
 
@@ -254,6 +262,9 @@ impl IvfSubIndex for FlatIndex {
             params.dist_q_c,
             residual,
             &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
         );
         metrics.record_comparisons(storage.len());
 
@@ -268,6 +279,7 @@ impl IvfSubIndex for FlatIndex {
                     &mut scratch.distances,
                     &mut scratch.u16,
                     &mut scratch.u8,
+                    &mut scratch.u32,
                 );
             }
             false => {
@@ -282,6 +294,7 @@ impl IvfSubIndex for FlatIndex {
                     &mut scratch.distances,
                     &mut scratch.u16,
                     &mut scratch.u8,
+                    &mut scratch.u32,
                 );
             }
         };

@@ -1934,6 +1934,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         }
     }
 
@@ -2693,6 +2694,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         };
 
         async fn multivector_scoring(

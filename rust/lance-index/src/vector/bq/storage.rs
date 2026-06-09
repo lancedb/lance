@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
+use crate::vector::ApproxMode;
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
@@ -52,7 +53,9 @@ use crate::vector::bq::{
 use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
-use crate::vector::storage::{DistCalculator, QueryResidual, RabitRawQueryContext, VectorStore};
+use crate::vector::storage::{
+    DistCalculator, DistanceCalculatorOptions, QueryResidual, RabitRawQueryContext, VectorStore,
+};
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
@@ -558,6 +561,7 @@ impl RabitQuantizationStorage {
         sum_q: f32,
         query_factor: f32,
         query_error: f32,
+        approx_mode: ApproxMode,
     ) -> RabitDistCalculator<'a> {
         let ex_codes = self
             .ex_codes
@@ -590,6 +594,7 @@ impl RabitQuantizationStorage {
             packed_ex_codes,
             query_factor,
             query_error,
+            approx_mode,
         )
     }
 
@@ -776,6 +781,7 @@ pub struct RabitDistCalculator<'a> {
     packed_ex_codes: Option<&'a [u8]>,
     query_factor: f32,
     query_error: f32,
+    approx_mode: ApproxMode,
 
     sum_q: f32,
     sqrt_d: f32,
@@ -800,6 +806,7 @@ impl<'a> RabitDistCalculator<'a> {
         packed_ex_codes: Option<&'a [u8]>,
         query_factor: f32,
         query_error: f32,
+        approx_mode: ApproxMode,
     ) -> Self {
         Self {
             dim,
@@ -817,6 +824,7 @@ impl<'a> RabitDistCalculator<'a> {
             packed_ex_codes,
             query_factor,
             query_error,
+            approx_mode,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
         }
@@ -830,7 +838,18 @@ impl<'a> RabitDistCalculator<'a> {
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
     ) -> usize {
+        if self.approx_mode == ApproxMode::Accurate {
+            return self.binary_distances_hacc_with_scratch(
+                n,
+                code_len,
+                dists,
+                quantized_dists,
+                hacc_quantized_dists,
+            );
+        }
+
         let (qmin, qmax) = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
@@ -881,6 +900,65 @@ impl<'a> RabitDistCalculator<'a> {
         simd_len
     }
 
+    #[allow(clippy::uninit_vec)]
+    fn binary_distances_hacc_with_scratch(
+        &self,
+        n: usize,
+        code_len: usize,
+        dists: &mut Vec<f32>,
+        quantized_dist_table: &mut Vec<u16>,
+        quantized_dists: &mut Vec<u32>,
+    ) -> usize {
+        let (qmin, qmax) = quantize_dist_table_u16_into(&self.dist_table, quantized_dist_table);
+        let remainder = n % BATCH_SIZE;
+        let simd_len = n - remainder;
+        quantized_dists.clear();
+        quantized_dists.reserve(simd_len);
+        // SAFETY: sum_4bit_dist_table_u16 overwrites each element in the batch range.
+        unsafe {
+            quantized_dists.set_len(simd_len);
+        }
+        simd::dist_table::sum_4bit_dist_table_u16(
+            simd_len,
+            code_len,
+            self.codes,
+            quantized_dist_table,
+            quantized_dists,
+        );
+
+        let range = (qmax - qmin) / u16::MAX as f32;
+        let num_tables = quantized_dist_table.len() / SEGMENT_NUM_CODES;
+        let sum_min = num_tables as f32 * qmin;
+        dists.clear();
+        dists.reserve(n);
+        // SAFETY: the batch section writes [0, simd_len), and the
+        // remainder section writes [simd_len, n).
+        unsafe {
+            dists.set_len(n);
+        }
+        let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
+        simd_dists
+            .iter_mut()
+            .zip(quantized_dists.iter())
+            .for_each(|(dist, q_dist)| {
+                *dist = (*q_dist as f32) * range + sum_min;
+            });
+
+        remainder_dists
+            .iter_mut()
+            .enumerate()
+            .for_each(|(id, dist)| {
+                *dist = compute_single_rq_distance(
+                    self.codes,
+                    simd_len + id,
+                    n,
+                    code_len,
+                    &self.dist_table,
+                );
+            });
+        simd_len
+    }
+
     #[inline]
     fn binary_distance_factor_params(&self) -> (f32, f32) {
         match self.query_estimator {
@@ -897,61 +975,25 @@ impl<'a> RabitDistCalculator<'a> {
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
     ) {
-        let (qmin, qmax) = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
-        let remainder = n % BATCH_SIZE;
-        let simd_len = n - remainder;
-        quantized_dists.clear();
-        quantized_dists.reserve(simd_len);
-        // SAFETY: sum_4bit_dist_table overwrites each element in the SIMD batch range.
-        unsafe {
-            quantized_dists.set_len(simd_len);
-        }
-        simd::dist_table::sum_4bit_dist_table(
-            simd_len,
+        self.binary_distances_with_scratch(
+            n,
             code_len,
-            self.codes,
-            quantized_dists_table,
+            dists,
             quantized_dists,
+            quantized_dists_table,
+            hacc_quantized_dists,
         );
-
-        let range = (qmax - qmin) / 255.0;
-        let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
-        let sum_min = num_tables as f32 * qmin;
         let (binary_distance_multiplier, binary_distance_offset) =
             self.binary_distance_factor_params();
-        dists.clear();
-        dists.reserve(n);
-        // SAFETY: the SIMD section below writes [0, simd_len), and the
-        // remainder section writes [simd_len, n).
-        unsafe {
-            dists.set_len(n);
-        }
-        let (simd_dists, remainder_dists) = dists.split_at_mut(simd_len);
-        simd_dists
-            .iter_mut()
-            .zip(quantized_dists.iter())
-            .enumerate()
-            .for_each(|(id, (dist, q_dist))| {
-                let binary_dist = (*q_dist as f32) * range + sum_min;
-                *dist = (binary_dist * binary_distance_multiplier + binary_distance_offset)
-                    * self.scale_factors[id]
-                    + self.add_factors[id]
-                    + self.query_factor;
-            });
-
-        remainder_dists
-            .iter_mut()
-            .enumerate()
-            .for_each(|(offset, dist)| {
-                let id = simd_len + offset;
-                let binary_dist =
-                    compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table);
-                *dist = (binary_dist * binary_distance_multiplier + binary_distance_offset)
-                    * self.scale_factors[id]
-                    + self.add_factors[id]
-                    + self.query_factor;
-            });
+        dists.iter_mut().enumerate().for_each(|(id, dist)| {
+            let binary_dist = *dist;
+            *dist = (binary_dist * binary_distance_multiplier + binary_distance_offset)
+                * self.scale_factors[id]
+                + self.add_factors[id]
+                + self.query_factor;
+        });
     }
 
     #[allow(clippy::uninit_vec)]
@@ -1092,12 +1134,14 @@ impl<'a> RabitDistCalculator<'a> {
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
     ) {
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
         if n == 0 {
             dists.clear();
             quantized_dists.clear();
+            hacc_quantized_dists.clear();
             return;
         }
 
@@ -1107,6 +1151,7 @@ impl<'a> RabitDistCalculator<'a> {
             dists,
             quantized_dists,
             quantized_dists_table,
+            hacc_quantized_dists,
         );
 
         let ex_bits = self.num_bits - 1;
@@ -1183,7 +1228,9 @@ impl<'a> RabitDistCalculator<'a> {
     }
 
     fn raw_query_lower_bound_gating_disabled_reason(&self) -> Option<&'static str> {
-        if self.query_estimator != RabitQueryEstimator::RawQuery {
+        if self.approx_mode == ApproxMode::Fast {
+            Some("approx_mode_fast")
+        } else if self.query_estimator != RabitQueryEstimator::RawQuery {
             Some("residual_query_estimator")
         } else if self.num_bits <= 1 {
             Some("num_bits_le_one")
@@ -1297,6 +1344,38 @@ fn quantize_dist_table_into(dist_table: &[f32], quantized_dist_table: &mut Vec<u
     let spare = quantized_dist_table.spare_capacity_mut();
     for (quantized, &d) in spare[..dist_table.len()].iter_mut().zip(dist_table.iter()) {
         quantized.write(((d - qmin) * factor).round() as u8);
+    }
+    // SAFETY: every element in the reserved range was initialized in the loop above.
+    unsafe {
+        quantized_dist_table.set_len(dist_table.len());
+    }
+
+    (qmin, qmax)
+}
+
+#[inline]
+fn quantize_dist_table_u16_into(
+    dist_table: &[f32],
+    quantized_dist_table: &mut Vec<u16>,
+) -> (f32, f32) {
+    let (qmin, qmax) = dist_table
+        .iter()
+        .cloned()
+        .minmax_by(|a, b| a.total_cmp(b))
+        .into_option()
+        .unwrap();
+    if qmin == qmax {
+        quantized_dist_table.clear();
+        quantized_dist_table.resize(dist_table.len(), 0);
+        return (qmin, qmax);
+    }
+
+    let factor = u16::MAX as f32 / (qmax - qmin);
+    quantized_dist_table.clear();
+    quantized_dist_table.reserve(dist_table.len());
+    let spare = quantized_dist_table.spare_capacity_mut();
+    for (quantized, &d) in spare[..dist_table.len()].iter_mut().zip(dist_table.iter()) {
+        quantized.write(((d - qmin) * factor).round() as u16);
     }
     // SAFETY: every element in the reserved range was initialized in the loop above.
     unsafe {
@@ -1472,11 +1551,8 @@ impl DistCalculator for RabitDistCalculator<'_> {
             }
             RabitQueryEstimator::RawQuery => {
                 let ex_bits = self.num_bits - 1;
-                if ex_bits == 0 {
-                    let binary_dot = dist - 0.5 * self.sum_q;
-                    return binary_dot * self.scale_factors[id]
-                        + self.add_factors[id]
-                        + self.query_factor;
+                if ex_bits == 0 || self.approx_mode == ApproxMode::Fast {
+                    return self.raw_query_binary_distance(id, dist);
                 }
 
                 let ex_codes = self
@@ -1508,11 +1584,13 @@ impl DistCalculator for RabitDistCalculator<'_> {
         let mut dists = Vec::new();
         let mut quantized_dists = Vec::new();
         let mut quantized_dists_table = Vec::new();
+        let mut hacc_quantized_dists = Vec::new();
         self.distance_all_with_scratch(
             0,
             &mut dists,
             &mut quantized_dists,
             &mut quantized_dists_table,
+            &mut hacc_quantized_dists,
         );
         dists
     }
@@ -1525,6 +1603,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
     ) {
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
@@ -1534,13 +1613,17 @@ impl DistCalculator for RabitDistCalculator<'_> {
             return;
         }
 
-        if self.query_estimator == RabitQueryEstimator::ResidualQuery || self.num_bits == 1 {
+        if self.query_estimator == RabitQueryEstimator::ResidualQuery
+            || self.num_bits == 1
+            || self.approx_mode == ApproxMode::Fast
+        {
             self.one_bit_distances_with_scratch(
                 n,
                 code_len,
                 dists,
                 quantized_dists,
                 quantized_dists_table,
+                hacc_quantized_dists,
             );
             return;
         }
@@ -1551,6 +1634,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
             dists,
             quantized_dists,
             quantized_dists_table,
+            hacc_quantized_dists,
         );
 
         self.apply_raw_query_multi_bit_distances(
@@ -1572,13 +1656,20 @@ impl DistCalculator for RabitDistCalculator<'_> {
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
     ) {
         if k == 0 {
             return;
         }
         if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
             record_rabit_prune_bypass(reason);
-            self.distance_all_with_scratch(k, dists, quantized_dists, quantized_dists_table);
+            self.distance_all_with_scratch(
+                k,
+                dists,
+                quantized_dists,
+                quantized_dists_table,
+                hacc_quantized_dists,
+            );
             accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
             return;
         }
@@ -1594,6 +1685,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
             dists,
             quantized_dists,
             quantized_dists_table,
+            hacc_quantized_dists,
         );
     }
 
@@ -1609,13 +1701,20 @@ impl DistCalculator for RabitDistCalculator<'_> {
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
     ) {
         if k == 0 {
             return;
         }
         if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
             record_rabit_prune_bypass(reason);
-            self.distance_all_with_scratch(k, dists, quantized_dists, quantized_dists_table);
+            self.distance_all_with_scratch(
+                k,
+                dists,
+                quantized_dists,
+                quantized_dists_table,
+                hacc_quantized_dists,
+            );
             accumulate_filtered_distances_into_heap(
                 k,
                 lower_bound,
@@ -1639,6 +1738,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
             dists,
             quantized_dists,
             quantized_dists_table,
+            hacc_quantized_dists,
         );
     }
 }
@@ -1770,6 +1870,7 @@ impl VectorStore for RabitQuantizationStorage {
             sum_q,
             query_factor,
             query_error,
+            ApproxMode::Normal,
         )
     }
 
@@ -1781,6 +1882,7 @@ impl VectorStore for RabitQuantizationStorage {
         dist_q_c: f32,
         residual: Option<QueryResidual<'a>>,
         f32_scratch: &'a mut Vec<f32>,
+        options: DistanceCalculatorOptions,
     ) -> Self::DistanceCalculator<'a> {
         let code_dim = self.code_dim();
         if let (
@@ -1807,6 +1909,7 @@ impl VectorStore for RabitQuantizationStorage {
                 raw_query.sum_q,
                 query_factor,
                 query_error,
+                options.approx_mode,
             );
         }
 
@@ -1876,6 +1979,7 @@ impl VectorStore for RabitQuantizationStorage {
             sum_q,
             query_factor,
             query_error,
+            options.approx_mode,
         )
     }
 
@@ -2420,8 +2524,13 @@ mod tests {
         let mut scratch = Vec::with_capacity(expected_scratch_len);
         let initial_ptr = scratch.as_ptr();
         {
-            let calc =
-                storage.dist_calculator_with_scratch(query.clone(), 0.25, None, &mut scratch);
+            let calc = storage.dist_calculator_with_scratch(
+                query.clone(),
+                0.25,
+                None,
+                &mut scratch,
+                DistanceCalculatorOptions::default(),
+            );
             assert_eq!(calc.distance_all(0), expected);
         }
         assert_eq!(scratch.len(), expected_scratch_len);
@@ -2429,7 +2538,13 @@ mod tests {
 
         scratch.fill(f32::NAN);
         {
-            let calc = storage.dist_calculator_with_scratch(query, 0.25, None, &mut scratch);
+            let calc = storage.dist_calculator_with_scratch(
+                query,
+                0.25,
+                None,
+                &mut scratch,
+                DistanceCalculatorOptions::default(),
+            );
             assert_eq!(calc.distance_all(0), expected);
         }
         assert_eq!(scratch.as_ptr(), initial_ptr);
@@ -2470,6 +2585,7 @@ mod tests {
             0.25,
             Some(QueryResidual::Centroid(centroid.as_ref())),
             &mut scratch,
+            DistanceCalculatorOptions::default(),
         );
 
         assert_eq!(calc.distance_all(0), expected);
@@ -2508,6 +2624,7 @@ mod tests {
             0.25,
             Some(QueryResidual::Centroid(centroid.as_ref())),
             &mut scratch,
+            DistanceCalculatorOptions::default(),
         );
 
         assert_eq!(calc.distance_all(0), expected);
@@ -2754,8 +2871,172 @@ mod tests {
         let mut distances = Vec::new();
         let mut u16_scratch = Vec::new();
         let mut u8_scratch = Vec::new();
-        calc.distance_all_with_scratch(0, &mut distances, &mut u16_scratch, &mut u8_scratch);
+        let mut u32_scratch = Vec::new();
+        calc.distance_all_with_scratch(
+            0,
+            &mut distances,
+            &mut u16_scratch,
+            &mut u8_scratch,
+            &mut u32_scratch,
+        );
         assert_eq!(distances, vec![104.0, 22.0]);
+    }
+
+    #[test]
+    fn test_fast_approx_mode_uses_one_bit_scores_for_multi_bit_raw_query() {
+        let code_dim = 8usize;
+        let identity = Float32Array::from_iter_values(
+            (0..code_dim)
+                .flat_map(|row| (0..code_dim).map(move |col| if row == col { 1.0 } else { 0.0 })),
+        );
+        let rotate_mat =
+            FixedSizeListArray::try_new_from_values(identity, code_dim as i32).unwrap();
+        let metadata = RabitQuantizationMetadata {
+            rotate_mat: Some(rotate_mat),
+            rotate_mat_position: None,
+            fast_rotation_signs: None,
+            rotation_type: RQRotationType::Matrix,
+            code_dim: code_dim as u32,
+            num_bits: 2,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0xff]), 1).unwrap();
+        let ex_codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0x00, 0xff]), 1).unwrap();
+        let batch = make_test_batch_with_ex(codes, ex_codes)
+            .replace_column_by_name(
+                SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0, 0.0])),
+            )
+            .unwrap();
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+        let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
+        let normal = storage.dist_calculator(query.clone(), 0.0).distance_all(0);
+
+        let mut f32_scratch = Vec::new();
+        let calc = storage.dist_calculator_with_scratch(
+            query,
+            0.0,
+            None,
+            &mut f32_scratch,
+            DistanceCalculatorOptions {
+                approx_mode: ApproxMode::Fast,
+            },
+        );
+        let mut distances = Vec::new();
+        let mut u16_scratch = Vec::new();
+        let mut u8_scratch = Vec::new();
+        let mut u32_scratch = Vec::new();
+        calc.distance_all_with_scratch(
+            0,
+            &mut distances,
+            &mut u16_scratch,
+            &mut u8_scratch,
+            &mut u32_scratch,
+        );
+
+        let expected_fast = (0..2)
+            .map(|id| calc.distance(id as u32))
+            .collect::<Vec<_>>();
+        assert_ne!(normal, distances);
+        assert_eq!(distances, expected_fast);
+        assert_eq!(
+            calc.raw_query_lower_bound_gating_disabled_reason(),
+            Some("approx_mode_fast")
+        );
+    }
+
+    #[test]
+    fn test_accurate_approx_mode_reduces_binary_lut_quantization_error() {
+        let code_dim = 64usize;
+        let num_rows = BATCH_SIZE;
+        let original_codes = make_test_codes(num_rows, code_dim as i32);
+        let metadata = make_test_metadata(code_dim);
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(original_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        let query = Arc::new(Float32Array::from_iter_values(
+            (0..code_dim).map(|idx| (idx as f32 * 0.137).sin() + idx as f32 * 0.003),
+        )) as ArrayRef;
+        let exact_calc = storage.dist_calculator(query.clone(), 0.0);
+        let exact = (0..num_rows)
+            .map(|id| exact_calc.distance(id as u32))
+            .collect::<Vec<_>>();
+
+        let normal = {
+            let mut f32_scratch = Vec::new();
+            let calc = storage.dist_calculator_with_scratch(
+                query.clone(),
+                0.0,
+                None,
+                &mut f32_scratch,
+                DistanceCalculatorOptions::default(),
+            );
+            let mut distances = Vec::new();
+            let mut u16_scratch = Vec::new();
+            let mut u8_scratch = Vec::new();
+            let mut u32_scratch = Vec::new();
+            calc.distance_all_with_scratch(
+                0,
+                &mut distances,
+                &mut u16_scratch,
+                &mut u8_scratch,
+                &mut u32_scratch,
+            );
+            distances
+        };
+
+        let (accurate, hacc_table_len, hacc_accum_len) = {
+            let mut f32_scratch = Vec::new();
+            let calc = storage.dist_calculator_with_scratch(
+                query,
+                0.0,
+                None,
+                &mut f32_scratch,
+                DistanceCalculatorOptions {
+                    approx_mode: ApproxMode::Accurate,
+                },
+            );
+            let mut distances = Vec::new();
+            let mut u16_scratch = Vec::new();
+            let mut u8_scratch = Vec::new();
+            let mut u32_scratch = Vec::new();
+            calc.distance_all_with_scratch(
+                0,
+                &mut distances,
+                &mut u16_scratch,
+                &mut u8_scratch,
+                &mut u32_scratch,
+            );
+            (distances, u16_scratch.len(), u32_scratch.len())
+        };
+
+        let normal_error = normal
+            .iter()
+            .zip(exact.iter())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .sum::<f32>();
+        let accurate_error = accurate
+            .iter()
+            .zip(exact.iter())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .sum::<f32>();
+
+        assert!(normal_error > 0.0);
+        assert!(
+            accurate_error < normal_error,
+            "accurate_error={accurate_error}, normal_error={normal_error}"
+        );
+        assert_eq!(hacc_table_len, code_dim * 4);
+        assert_eq!(hacc_accum_len, num_rows);
     }
 
     fn assert_raw_query_multi_bit_distance_all_uses_fastscan(num_bits: u8) {
@@ -2826,7 +3107,14 @@ mod tests {
         let mut distances = Vec::new();
         let mut u16_scratch = Vec::new();
         let mut u8_scratch = Vec::new();
-        calc.distance_all_with_scratch(0, &mut distances, &mut u16_scratch, &mut u8_scratch);
+        let mut u32_scratch = Vec::new();
+        calc.distance_all_with_scratch(
+            0,
+            &mut distances,
+            &mut u16_scratch,
+            &mut u8_scratch,
+            &mut u32_scratch,
+        );
 
         assert_eq!(distances.len(), num_rows);
         assert_eq!(u16_scratch.len(), BATCH_SIZE);
@@ -2906,12 +3194,14 @@ mod tests {
         let mut binary_ips = Vec::new();
         let mut binary_u16_scratch = Vec::new();
         let mut binary_u8_scratch = Vec::new();
+        let mut binary_u32_scratch = Vec::new();
         calc.binary_distances_with_scratch(
             num_rows,
             rabit_binary_code_bytes(code_dim),
             &mut binary_ips,
             &mut binary_u16_scratch,
             &mut binary_u8_scratch,
+            &mut binary_u32_scratch,
         );
         let ex_codes = calc.ex_codes.unwrap();
         let ex_add_factors = calc.ex_add_factors.unwrap();
@@ -2947,6 +3237,7 @@ mod tests {
         let mut distances = Vec::new();
         let mut u16_scratch = Vec::new();
         let mut u8_scratch = Vec::new();
+        let mut u32_scratch = Vec::new();
         calc.accumulate_topk_with_scratch(
             k,
             None,
@@ -2956,6 +3247,7 @@ mod tests {
             &mut distances,
             &mut u16_scratch,
             &mut u8_scratch,
+            &mut u32_scratch,
         );
         let mut actual = heap
             .into_iter()
@@ -3053,6 +3345,7 @@ mod tests {
                     query: None,
                 }),
                 &mut fallback_scratch,
+                DistanceCalculatorOptions::default(),
             )
             .distance_all(0);
 
@@ -3066,6 +3359,7 @@ mod tests {
                     query: Some(&raw_query),
                 }),
                 &mut prepared_scratch,
+                DistanceCalculatorOptions::default(),
             )
             .distance_all(0);
 

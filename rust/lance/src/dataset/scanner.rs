@@ -72,7 +72,7 @@ use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -1592,6 +1592,7 @@ impl Scanner {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
@@ -1756,6 +1757,19 @@ impl Scanner {
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.use_index = use_index
+        }
+        self
+    }
+
+    /// Configure the speed / accuracy tradeoff for approximate vector search.
+    ///
+    /// This setting is only used by index implementations that support multiple
+    /// approximation modes.
+    pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.approx_mode = approx_mode;
+        } else {
+            log::warn!("approx_mode is not set because nearest has not been called yet");
         }
         self
     }
@@ -10848,6 +10862,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         scanner.query_parallelism(-1);
         assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, -1);
+    }
+
+    #[tokio::test]
+    async fn test_knn_approx_mode_defaults_and_setter() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(
+            scanner.nearest_mut().unwrap().approx_mode,
+            ApproxMode::Normal
+        );
+
+        scanner.approx_mode(ApproxMode::Accurate);
+        assert_eq!(
+            scanner.nearest_mut().unwrap().approx_mode,
+            ApproxMode::Accurate
+        );
     }
 
     #[tokio::test]

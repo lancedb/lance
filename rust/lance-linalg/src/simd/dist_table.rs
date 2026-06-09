@@ -113,6 +113,60 @@ pub fn sum_4bit_dist_table_scalar(
     }
 }
 
+#[inline]
+#[allow(unused)]
+pub fn sum_4bit_dist_table_u16(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u16],
+    dists: &mut [u32],
+) {
+    debug_assert!(n.is_multiple_of(BATCH_SIZE));
+    debug_assert!(dists.len() >= n);
+    debug_assert!(codes.len() >= n * code_len);
+    sum_4bit_dist_table_u16_scalar(
+        code_len,
+        &codes[..n * code_len],
+        dist_table,
+        &mut dists[..n],
+    );
+}
+
+#[inline]
+#[allow(unused)]
+pub fn sum_4bit_dist_table_u16_scalar(
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u16],
+    dists: &mut [u32],
+) {
+    let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
+    dists[..num_full_vectors].fill(0);
+
+    for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
+        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+            let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
+            let next_dist_table =
+                &dist_table[(sub_vec_idx * 2 + 1) * 16..(sub_vec_idx * 2 + 2) * 16];
+
+            for j in 0..16 {
+                let low_current_code = (block[j] & 0x0F) as usize;
+                let high_current_code = (block[j] >> 4) as usize;
+                let low_next_code = (block[j + 16] & 0x0F) as usize;
+                let high_next_code = (block[j + 16] >> 4) as usize;
+
+                let lower_id = vec_block_idx * BATCH_SIZE + PERM0[j];
+                let higher_id = lower_id + 16;
+                dists[lower_id] += current_dist_table[low_current_code] as u32
+                    + next_dist_table[low_next_code] as u32;
+                dists[higher_id] += current_dist_table[high_current_code] as u32
+                    + next_dist_table[high_next_code] as u32;
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -336,6 +390,52 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(actual.iter().all(|dist| *dist != u16::MAX));
+    }
+
+    #[test]
+    fn test_sum_4bit_dist_table_u16_basic() {
+        let n = BATCH_SIZE;
+        let code_len = 2;
+        let codes = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc, 0xde, 0xf0,
+        ];
+        let codes = codes.repeat(n * code_len / codes.len());
+        let dist_table: Vec<u16> = (0..16 * 4).map(|idx| (idx % 16 + 1) as u16).collect();
+
+        let mut dists = vec![0u32; n];
+        sum_4bit_dist_table_u16(n, code_len, &codes, &dist_table, &mut dists);
+
+        assert_eq!(dists[1], 38);
+    }
+
+    #[test]
+    fn test_sum_4bit_dist_table_u16_matches_reference_multi_batch() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+
+        for code_len in [1, 3, 16, 191, 192, 1024] {
+            let n = BATCH_SIZE * 4;
+            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+            let dist_table: Vec<u16> = (0..BATCH_SIZE * code_len)
+                .map(|_| rng.random::<u16>())
+                .collect();
+
+            let mut expected = vec![0u32; n];
+            sum_4bit_dist_table_u16_scalar(code_len, &codes, &dist_table, &mut expected);
+
+            let mut actual = vec![u32::MAX; n];
+            sum_4bit_dist_table_u16(n, code_len, &codes, &dist_table, &mut actual);
+
+            assert_eq!(
+                actual,
+                expected,
+                "u16 dist-table mismatch for code_len={} (DIM={})",
+                code_len,
+                code_len * 8,
+            );
+        }
     }
 
     /// Test that the SIMD path (NEON on ARM, AVX2 on x86) produces identical

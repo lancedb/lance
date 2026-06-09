@@ -6253,6 +6253,7 @@ class ScannerBuilder:
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
+        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
@@ -6276,6 +6277,9 @@ class ScannerBuilder:
             the CPU pool size. Value 1 uses the single-worker sequential path.
             Values >= 2 use the partition-parallel path and are clamped to the
             CPU pool size.
+        approx_mode: {"fast", "normal", "accurate"}, default "normal"
+            Controls the speed / accuracy tradeoff for approximate vector search
+            when supported by the selected index.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -6290,6 +6294,7 @@ class ScannerBuilder:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            approx_mode=approx_mode,
             distance_range=distance_range,
         )
         return self
@@ -7412,6 +7417,7 @@ def _build_vector_search_query(
     use_index: bool = True,
     ef: Optional[int] = None,
     query_parallelism: Optional[int] = None,
+    approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -7453,6 +7459,9 @@ def _build_vector_search_query(
         maps to the single-worker sequential path. Value -1 uses the CPU pool
         size. Value 1 uses the single-worker sequential path. Values >= 2 use
         the partition-parallel path and are clamped to the CPU pool size.
+    approx_mode: {"fast", "normal", "accurate"}, default "normal"
+        Controls the speed / accuracy tradeoff for approximate vector search
+        when supported by the selected index.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -7526,6 +7535,12 @@ def _build_vector_search_query(
     if query_parallelism is not None and query_parallelism < -1:
         raise ValueError("query_parallelism must be >= -1")
 
+    if approx_mode not in {"fast", "normal", "accurate"}:
+        raise ValueError(
+            "approx_mode must be one of 'fast', 'normal', or 'accurate', "
+            f"got {approx_mode!r}"
+        )
+
     if distance_range is not None:
         if len(distance_range) != 2:
             raise ValueError(
@@ -7543,6 +7558,7 @@ def _build_vector_search_query(
         "use_index": use_index,
         "ef": ef,
         "query_parallelism": query_parallelism,
+        "approx_mode": approx_mode,
         "distance_range": distance_range,
     }
 
@@ -7699,6 +7715,7 @@ class VectorSearchQuery:
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
+        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -7712,6 +7729,7 @@ class VectorSearchQuery:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            approx_mode=approx_mode,
         )
 
     def inner(self):

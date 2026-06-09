@@ -1101,6 +1101,17 @@ def test_create_ivf_rq_multi_bit_searches_l2_and_cosine():
     stats = ds.stats.index_stats("vector_idx")
     assert stats["indices"][0]["sub_index"]["num_bits"] == 9
     assert stats["indices"][0]["sub_index"]["query_estimator"] == "raw_query"
+    for approx_mode in ["fast", "normal", "accurate"]:
+        result = ds.to_table(
+            nearest={
+                "column": "vector",
+                "q": mat[0],
+                "k": 10,
+                "approx_mode": approx_mode,
+            },
+            columns=["id"],
+        )
+        assert result.num_rows == 10
 
     cosine_ds = lance.write_dataset(tbl, "memory://")
     cosine_ds = _assert_recall_at_least(cosine_ds, mat[1], metric="cosine")
@@ -2093,6 +2104,33 @@ def test_vector_index_invalid_query_parallelism(indexed_dataset):
                 "q": np.random.randn(128),
                 "k": 10,
                 "query_parallelism": -2,
+            }
+        )
+
+
+def test_vector_index_with_approx_mode(indexed_dataset):
+    q = np.random.randn(128)
+
+    for approx_mode in ["fast", "normal", "accurate"]:
+        result = indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": 10,
+                "approx_mode": approx_mode,
+            }
+        )
+        assert len(result) == 10
+
+
+def test_vector_index_invalid_approx_mode(indexed_dataset):
+    with pytest.raises(ValueError, match="approx_mode"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "approx_mode": "hacc",
             }
         )
 

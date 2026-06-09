@@ -269,6 +269,7 @@ mod test {
                 use_index: true,
                 query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                 dist_q_c: 0.0,
+                approx_mode: Default::default(),
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
             let (partition_ids, _) = idx.find_partitions(&q).unwrap();

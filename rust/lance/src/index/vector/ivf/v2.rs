@@ -947,11 +947,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         };
         let max_partition_len = ivf.lengths.iter().copied().max().unwrap_or_default() as usize;
 
-        QueryScratchCapacity::new(
+        QueryScratchCapacity::new_with_u32(
             max_partition_len,
             dim + dist_table_len + ex_dist_table_len,
-            max_partition_len,
+            max_partition_len.max(dist_table_len),
             u8_scratch_len,
+            max_partition_len,
         )
     }
 
