@@ -3414,10 +3414,13 @@ def test_segment_fts(tmp_path, index_type):
         idx.name == index_name and idx.index_type == "Inverted"
         for idx in committed_ds.describe_indices()
     )
-    assert "FlatMatchQuery" not in committed_ds.scanner(
-        full_text_query=query,
-        use_scalar_index=True,
-    ).explain_plan()
+    assert (
+        "FlatMatchQuery"
+        not in committed_ds.scanner(
+            full_text_query=query,
+            use_scalar_index=True,
+        ).explain_plan()
+    )
 
 
 def test_compare_fts_results_identical(tmp_path):
