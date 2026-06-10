@@ -311,6 +311,21 @@ is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
 (default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
 `/path` is the filesystem path within GooseFS.
 
+!!! note "About the dataset path"
+
+    `/path` is just an arbitrary directory inside GooseFS — Lance does **not**
+    require the path to end with a `.lance` suffix. Any valid GooseFS directory
+    works, for example:
+
+    - `goosefs://10.0.0.1:9200/data/my-dataset`
+    - `goosefs://10.0.0.1:9200/data/my-dataset.lance`
+    - `goosefs://10.0.0.1:9200/lance-test/lance-io`
+
+    The `.lance` suffix used in the examples below is only a naming convention
+    that makes it easy to recognize a Lance dataset directory at a glance; it
+    has no special meaning to Lance itself. The only requirement is that the
+    same path is used consistently for reads and writes of a given dataset.
+
 === "Python"
 
     ```python
