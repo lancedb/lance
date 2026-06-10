@@ -220,29 +220,47 @@ And the whole `java` dir is a standard maven project can be imported into any ID
 Standard Build (Java + JNI)
 
 ```shell
-mvn clean package
+./mvnw clean package
 ```
 This command executes the base Maven build process to compile all Java code in the `java` directory and generate the JNI native library.
+
+HDFS-enabled Build:
+
+HDFS support is not enabled by default because it introduces additional native dependencies and requires a Java and Hadoop environment. To build the Java SDK and JNI native library with HDFS support, pass the `hdfs` Cargo feature through the Rust Maven plugin:
+
+```shell
+./mvnw clean package -Dfeatures=hdfs
+```
+
+For a release build with HDFS support:
+
+```shell
+./mvnw clean package -Drust.release.build=true -Dfeatures=hdfs
+```
+
+The resulting native library requires the Hadoop native client libraries at runtime. Configure `JAVA_HOME`, Hadoop configuration, and the platform library path, such as `LD_LIBRARY_PATH`, before loading the Java SDK.
 
 Java-Only Build: 
 
 ```shell
-mvn clean package -Dskip.build.jni=true
+./mvnw clean package -Dskip.build.jni=true
  ```
 This will skip the JNI code compilation step and only process the Java module. Useful when focusing on Java feature development without needing native libraries, reducing build time.
 
 Product Release Build:
 
 ```shell
-mvn clean package -Drust.release.build=true
+./mvnw clean package -Drust.release.build=true
 ```
 This will enable product environment optimization configurations (e.g., code shrinking, debug symbol removal, performance tuning) to generate deployment packages suitable for production environments. The optimized package is smaller in size and runs more efficiently.
 
 If you only want to build rust code(`lance-jni`), you can run the following command:
 
 ```shell
-cd lance-jni && cargo build
+cd lance-jni && cargo build --features hdfs
 ```
+
+Omit `--features hdfs` to build the JNI native library without HDFS support.
 
 The java module uses `spotless` maven plugin to format the code and check the license header. 
 And it is applied in the `validate` phase automatically.
@@ -266,7 +284,7 @@ And you also need to install the rust plugin for your IDE.
 Then, you can build the whole java module:
 
 ```shell
-mvn clean package
+./mvnw clean package
 ```
 
 Running these commands, it builds the rust jni binding codes automatically.
