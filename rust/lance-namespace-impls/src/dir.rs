@@ -3438,6 +3438,7 @@ impl LanceNamespace for DirectoryNamespace {
                     index_uuid: description.metadata()[0].uuid.to_string(),
                     columns,
                     status: "SUCCEEDED".to_string(),
+                    ..Default::default()
                 })
             })
             .collect::<Result<Vec<_>>>()?;
