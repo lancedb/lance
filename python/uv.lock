@@ -1083,19 +1083,19 @@ wheels = [
 
 [[package]]
 name = "lance-namespace"
-version = "0.8.0"
+version = "0.8.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lance-namespace-urllib3-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/21/80/2b6eaa08c5e25915acaa6368a70211a25b5ba9d2d6006450e68a73936164/lance_namespace-0.8.0.tar.gz", hash = "sha256:c4a79ee221a3b2315c29863ad12d85fcf219a13158e26149d63e21dc4b4673a7", size = 10756, upload-time = "2026-06-01T08:47:10.183Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/48/8f/8a03395587a78cfaf92f7307ad931f61eb515af67705c704bd6c7af2f745/lance_namespace-0.8.4.tar.gz", hash = "sha256:1a54ad49e7ace25a629c5f2c99d393629742eceeeb16ba2f51a771ccb350e284", size = 11282, upload-time = "2026-06-10T19:07:21.919Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4b/bd/7b40a08fb132fab39a6caebf832fdf6b9befc71be9413beb9be0a9d927d4/lance_namespace-0.8.0-py3-none-any.whl", hash = "sha256:782cf9e332f46bf06836722dd98b53ca8495ad98bb541501ff6876c89b67ec90", size = 12579, upload-time = "2026-06-01T08:47:10.91Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/4b/218c67cafb707024069925ce86534588861a464aaa327f7a457b94eed3c2/lance_namespace-0.8.4-py3-none-any.whl", hash = "sha256:8b347eef4b7c7187a1b52f388b5dcc345fed0bf4ea87728188dcb11a52619d0b", size = 13111, upload-time = "2026-06-10T19:07:22.6Z" },
 ]
 
 [[package]]
 name = "lance-namespace-urllib3-client"
-version = "0.8.0"
+version = "0.8.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
@@ -1104,9 +1104,9 @@ dependencies = [
     { name = "urllib3", version = "1.26.20", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "urllib3", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8c/37/06fcd5a8969381e0ba953d51990af8d331bdccbc62458bf2eed30d064573/lance_namespace_urllib3_client-0.8.0.tar.gz", hash = "sha256:4f060f05ebf3c04aeaeb0d2022cbe77648a3df290f02cd2c305e5797d0fc1fdd", size = 203710, upload-time = "2026-06-01T08:47:13.404Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0a/55/4a7cc7e5d19bda170c896a6adff2ec925c533df812b91bce2bc8f7aea30b/lance_namespace_urllib3_client-0.8.4.tar.gz", hash = "sha256:1a292a83509ab79475da967b78839e9ead4ab973064d37d1ba1575b23ffdacef", size = 228485, upload-time = "2026-06-10T19:07:19.863Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/43/e280727feee958f303bc58d5fa912b07734a0831f756d841654d500c2c34/lance_namespace_urllib3_client-0.8.0-py3-none-any.whl", hash = "sha256:6734e341b726e5cc96a0cd257cef27eb9d03013f2d151526ee426cef8e63e228", size = 336669, upload-time = "2026-06-01T08:47:11.88Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/f7/70dd2fc1f9ef462d3802b4cffcd64f2b9233a9907d6071e8694338492608/lance_namespace_urllib3_client-0.8.4-py3-none-any.whl", hash = "sha256:37ee1d74614fae6358f50e3589ac26c29379ffb1346f09c4f5ec8953f823cefd", size = 369807, upload-time = "2026-06-10T19:07:21.001Z" },
 ]
 
 [[package]]
