@@ -363,6 +363,148 @@ mod f32 {
         let xy = xv * yv;
         1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
     }
+
+    /// Batch-level SIMD dispatch: the tier is chosen once by the caller, and the
+    /// whole `chunks_exact` loop runs inside one `#[target_feature]` context so
+    /// the per-vector `cosine_once_*` / `cosine_fast` kernels inline (no
+    /// per-vector `*SIMD_SUPPORT` branch, no per-vector call boundary). Used for
+    /// the AVX-512 path on the default wheel and for all tiers on sub-AVX2 builds.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx,fma")]
+    pub(super) unsafe fn cosine_batch_avx_fma(
+        x: &[f32],
+        x_norm: f32,
+        batch: &[f32],
+        dimension: usize,
+    ) -> Vec<f32> {
+        match dimension {
+            8 => batch
+                .chunks_exact(8)
+                .map(|y| unsafe { cosine_once_x86::cosine_once_8_avx_fma(x, x_norm, y) })
+                .collect(),
+            16 => batch
+                .chunks_exact(16)
+                .map(|y| unsafe { cosine_once_x86::cosine_once_16_avx_fma(x, x_norm, y) })
+                .collect(),
+            _ => batch
+                .chunks_exact(dimension)
+                .map(|y| unsafe { super::f32_x86::cosine_fast_avx_fma(x, x_norm, y) })
+                .collect(),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn cosine_batch_avx512(
+        x: &[f32],
+        x_norm: f32,
+        batch: &[f32],
+        dimension: usize,
+    ) -> Vec<f32> {
+        match dimension {
+            8 => batch
+                .chunks_exact(8)
+                .map(|y| unsafe { cosine_once_x86::cosine_once_8_avx512(x, x_norm, y) })
+                .collect(),
+            16 => batch
+                .chunks_exact(16)
+                .map(|y| unsafe { cosine_once_x86::cosine_once_16_avx512(x, x_norm, y) })
+                .collect(),
+            _ => batch
+                .chunks_exact(dimension)
+                .map(|y| unsafe { super::f32_x86::cosine_fast_avx512(x, x_norm, y) })
+                .collect(),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn cosine_batch_avx(
+        x: &[f32],
+        x_norm: f32,
+        batch: &[f32],
+        dimension: usize,
+    ) -> Vec<f32> {
+        match dimension {
+            8 => batch
+                .chunks_exact(8)
+                .map(|y| unsafe { cosine_once_x86::cosine_once_8_avx(x, x_norm, y) })
+                .collect(),
+            16 => batch
+                .chunks_exact(16)
+                .map(|y| unsafe { cosine_once_x86::cosine_once_16_avx(x, x_norm, y) })
+                .collect(),
+            _ => batch
+                .chunks_exact(dimension)
+                .map(|y| unsafe { super::f32_x86::cosine_fast_avx(x, x_norm, y) })
+                .collect(),
+        }
+    }
+}
+
+/// Inlined f32 cosine kernels for builds whose baseline already guarantees AVX2
+/// (the default `haswell` wheel). No `#[target_feature]`, no runtime dispatch:
+/// under `target-feature=+avx2,+fma` these compile to AVX2 and inline into the
+/// batch loop exactly like the pre-PR code, so the modern path is not taxed by
+/// the runtime-dispatch machinery (only needed below the AVX2 baseline).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod f32_baseline {
+    use super::{dot, f32x8, f32x16, norm_l2};
+    use crate::simd::{FloatSimd, SIMD};
+
+    #[inline]
+    pub fn cosine_once_8(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+        unsafe {
+            let xv = f32x8::load_unaligned(x.as_ptr());
+            let yv = f32x8::load_unaligned(y.as_ptr());
+            let y2 = yv * yv;
+            let xy = xv * yv;
+            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
+        }
+    }
+
+    #[inline]
+    pub fn cosine_once_16(x: &[f32], x_norm: f32, y: &[f32]) -> f32 {
+        unsafe {
+            let xv = f32x16::load_unaligned(x.as_ptr());
+            let yv = f32x16::load_unaligned(y.as_ptr());
+            let y2 = yv * yv;
+            let xy = xv * yv;
+            1.0 - xy.reduce_sum() / x_norm / y2.reduce_sum().sqrt()
+        }
+    }
+
+    #[inline]
+    pub fn cosine_fast(x: &[f32], x_norm: f32, other: &[f32]) -> f32 {
+        unsafe {
+            let dim = x.len();
+            let unrolled_len = dim / 16 * 16;
+            let mut y_norm16 = f32x16::zeros();
+            let mut xy16 = f32x16::zeros();
+            for i in (0..unrolled_len).step_by(16) {
+                let xv = f32x16::load_unaligned(x.as_ptr().add(i));
+                let yv = f32x16::load_unaligned(other.as_ptr().add(i));
+                xy16.multiply_add(xv, yv);
+                y_norm16.multiply_add(yv, yv);
+            }
+            let aligned_len = dim / 8 * 8;
+            let mut y_norm8 = f32x8::zeros();
+            let mut xy8 = f32x8::zeros();
+            for i in (unrolled_len..aligned_len).step_by(8) {
+                let xv = f32x8::load_unaligned(x.as_ptr().add(i));
+                let yv = f32x8::load_unaligned(other.as_ptr().add(i));
+                xy8.multiply_add(xv, yv);
+                y_norm8.multiply_add(yv, yv);
+            }
+            let y_norm = y_norm16.reduce_sum()
+                + y_norm8.reduce_sum()
+                + norm_l2(&other[aligned_len..]).powi(2);
+            let xy = xy16.reduce_sum()
+                + xy8.reduce_sum()
+                + dot(&x[aligned_len..], &other[aligned_len..]);
+            1.0 - xy / x_norm / y_norm.sqrt()
+        }
+    }
 }
 
 impl Cosine for f32 {
@@ -382,6 +524,7 @@ impl Cosine for f32 {
         cosine_with_norms_f32_dispatched(x, x_norm, y_norm, y)
     }
 
+    #[allow(unreachable_code)]
     fn cosine_batch<'a>(
         x: &'a [Self],
         batch: &'a [Self],
@@ -389,6 +532,73 @@ impl Cosine for f32 {
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
         let x_norm = norm_l2(x);
 
+        // On a build whose baseline already guarantees AVX2 (the default
+        // `haswell` wheel), avoid the per-vector runtime dispatch + `#[target_feature]`
+        // wrapping that taxes the modern path. Dispatch ONCE per batch: AVX-512
+        // hosts get the wide kernel; everyone else uses the inlined AVX2 baseline
+        // path (base-equivalent). The runtime-dispatch path below is only
+        // compiled/reached when the baseline is below AVX2 (pre-Haswell builds).
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            // dim 8/16 always use the inlined AVX2 baseline: AVX-512 gives no
+            // benefit for such tiny vectors (a masked 512-bit load is slower than
+            // a plain AVX2 load) and only adds dispatch + eager-collect overhead.
+            // Only the larger-dim path routes to AVX-512 on capable hosts — that's
+            // where the wider lanes actually pay off.
+            return match dimension {
+                8 => Box::new(
+                    batch
+                        .chunks_exact(8)
+                        .map(move |y| f32_baseline::cosine_once_8(x, x_norm, y)),
+                ),
+                16 => Box::new(
+                    batch
+                        .chunks_exact(16)
+                        .map(move |y| f32_baseline::cosine_once_16(x, x_norm, y)),
+                ),
+                _ => {
+                    if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
+                        Box::new(
+                            unsafe { f32::cosine_batch_avx512(x, x_norm, batch, dimension) }
+                                .into_iter(),
+                        )
+                    } else {
+                        Box::new(
+                            batch
+                                .chunks_exact(dimension)
+                                .map(move |y| f32_baseline::cosine_fast(x, x_norm, y)),
+                        )
+                    }
+                }
+            };
+        }
+
+        // Sub-AVX2 / non-x86 build: hoisted per-batch runtime dispatch.
+        #[cfg(target_arch = "x86_64")]
+        {
+            match *SIMD_SUPPORT {
+                SimdSupport::Avx512 | SimdSupport::Avx512FP16 => {
+                    return Box::new(
+                        unsafe { f32::cosine_batch_avx512(x, x_norm, batch, dimension) }
+                            .into_iter(),
+                    );
+                }
+                SimdSupport::Avx2 | SimdSupport::AvxFma => {
+                    return Box::new(
+                        unsafe { f32::cosine_batch_avx_fma(x, x_norm, batch, dimension) }
+                            .into_iter(),
+                    );
+                }
+                SimdSupport::Avx => {
+                    return Box::new(
+                        unsafe { f32::cosine_batch_avx(x, x_norm, batch, dimension) }.into_iter(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Scalar / non-x86 fallback.
         match dimension {
             8 => Box::new(
                 batch
