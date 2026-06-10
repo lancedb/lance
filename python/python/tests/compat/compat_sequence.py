@@ -266,7 +266,6 @@ def search(
                     )
                     err = str(e).strip()
                     failures.append({"run": i, "sequence": label, "error": err})
-                    print(f"FAIL (setup): {label}\n    {err}")
                     snapshots[key] = None
                     shutil.rmtree(snap, ignore_errors=True)
                     if stop_on_first:
@@ -286,11 +285,8 @@ def search(
             except Exception as e:
                 error = str(e).strip()
                 failures.append({"run": i, "sequence": label, "error": error})
-                print(f"FAIL: {label}\n    {error}")
                 if stop_on_first:
                     break
-            else:
-                print(f"ok  : {label}")
             finally:
                 shutil.rmtree(ex_path, ignore_errors=True)
     finally:

@@ -9,6 +9,7 @@ with specific Lance versions installed.
 """
 
 import contextlib
+import glob
 import os
 import pickle
 import re
@@ -62,6 +63,27 @@ def _is_release_version(ref: str) -> bool:
         return True
     except InvalidVersion:
         return False
+
+
+def _prebuilt_wheel_for(ref: str) -> Optional[str]:
+    """A prebuilt wheel to install for `ref` instead of building it from source.
+
+    When CI has already built a ref (e.g. the PR head, built once by the Python build
+    job), COMPAT_PREBUILT_REF names that ref and COMPAT_PREBUILT_WHEEL points at the
+    wheel (a path or glob). Lets the PR workflow reuse that wheel rather than rebuilding
+    the reader. Returns None when no prebuilt wheel applies to `ref`.
+    """
+    if os.environ.get("COMPAT_PREBUILT_REF") != ref:
+        return None
+    pattern = os.environ.get("COMPAT_PREBUILT_WHEEL")
+    if not pattern:
+        return None
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(
+            f"COMPAT_PREBUILT_WHEEL={pattern!r} matched no wheel for ref {ref!r}"
+        )
+    return matches[0]
 
 
 def _repo_root() -> Path:
@@ -137,15 +159,26 @@ class VenvExecutor:
                     check=True,
                     capture_output=True,
                 )
-                # Release wheel when the ref is a published version; otherwise build the
-                # ref (commit/branch/tag) from source -- so two arbitrary refs can be
-                # compared and only the ones without a wheel pay a build.
-                if _is_release_version(self.version):
+                # Prefer a wheel CI already built for this ref; else a published
+                # release installs its wheel; else build the ref (commit/branch/tag)
+                # from source -- so two arbitrary refs can be compared and only the
+                # ones without a wheel pay a build.
+                prebuilt = _prebuilt_wheel_for(self.version)
+                if prebuilt is not None:
+                    self._install_wheel(prebuilt)
+                elif _is_release_version(self.version):
                     self._install_release_wheel()
                 else:
                     self._build_from_source()
                 self._marker_path.write_text(self.version)
         self._created = True
+
+    def _install_wheel(self, wheel: str):
+        subprocess.run(
+            [str(self.python_path), "-m", "pip", "install", "--quiet", wheel, "pytest"],
+            check=True,
+            capture_output=True,
+        )
 
     def _install_release_wheel(self):
         subprocess.run(
