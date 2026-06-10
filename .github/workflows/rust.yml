@@ -104,9 +104,6 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-          JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
-          echo "JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${JAVA_HOME}/lib/server:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
@@ -138,9 +135,6 @@ jobs:
         run: |
           sudo apt -y -qq update
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
-          JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
-          echo "JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${JAVA_HOME}/lib/server:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
       - name: Build tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests -e hdfs | sort | uniq | paste -s -d "," -`

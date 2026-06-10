@@ -19,6 +19,12 @@ use lance_core::error::{Error, Result};
 pub struct HdfsStoreProvider;
 
 impl HdfsStoreProvider {
+    fn operator_error(error: impl std::fmt::Display, name_node: &str, has_user: bool) -> Error {
+        Error::io(format!(
+            "Failed to create HDFS operator: {error}. name_node={name_node}, has_user={has_user}"
+        ))
+    }
+
     fn build_config<I, K, V>(
         base_path: &Url,
         storage_options: &StorageOptions,
@@ -90,8 +96,13 @@ impl ObjectStoreProvider for HdfsStoreProvider {
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let config = Self::build_config(&base_path, &storage_options, std::env::vars())?;
 
+        let name_node = config
+            .get("name_node")
+            .cloned()
+            .unwrap_or_else(|| "<missing>".to_string());
+        let has_user = config.contains_key("user");
         let operator = Operator::from_iter::<Hdfs>(config)
-            .map_err(|e| Error::invalid_input(format!("Failed to create HDFS operator: {e:?}")))?
+            .map_err(|error| Self::operator_error(error, &name_node, has_user))?
             .finish();
         let opendal_store = Arc::new(OpendalStore::new(operator));
 
@@ -215,5 +226,20 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("namenode host"));
+    }
+
+    #[test]
+    fn test_hdfs_operator_error_includes_connection_context() {
+        let error = HdfsStoreProvider::operator_error(
+            std::io::Error::other("native client unavailable"),
+            "hdfs://namenode:9000",
+            true,
+        );
+        let message = error.to_string();
+
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(message.contains("native client unavailable"));
+        assert!(message.contains("name_node=hdfs://namenode:9000"));
+        assert!(message.contains("has_user=true"));
     }
 }
