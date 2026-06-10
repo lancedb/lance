@@ -687,9 +687,8 @@ where
 ///
 /// The batch holds one row per page with columns `min | max | null_count | page_idx`,
 /// sorted ascending by `min` with NULLs first (the order the index is trained in).
-/// The batch is the single source of truth, avoiding a parallel `BTreeMap` of owned
-/// `ScalarValue`s alongside the Arrow buffers. Both query paths binary-search the
-/// sorted `min` column for a starting row and scan forward filtering by `max`:
+/// Both query paths binary-search the sorted `min` column for a starting row and
+/// scan forward filtering by `max`:
 ///
 /// - Equality / `IN` (`candidate_pages_for_values`) dispatch on the query's
 ///   *physical storage type* to a monomorphized, inlined comparator: numerics go
@@ -698,7 +697,7 @@ where
 ///   without a native fast path (struct-backed intervals, booleans) fall back to the
 ///   boxed [`make_comparator`] via `scan_fallback`.
 /// - Range searches (`pages_between`) currently use [`make_comparator`] directly.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, DeepSizeOf)]
 pub struct BTreeLookup {
     /// One row per page (`min | max | null_count | page_idx`), sorted by `min`.
     batch: RecordBatch,
@@ -709,23 +708,6 @@ pub struct BTreeLookup {
     /// Index of the first row whose `max` is non-null. Entirely-null pages sort to
     /// the front (NULLs first) and are skipped when searching value ranges.
     search_start: usize,
-}
-
-impl PartialEq for BTreeLookup {
-    fn eq(&self, other: &Self) -> bool {
-        self.batch == other.batch
-            && self.null_pages == other.null_pages
-            && self.all_null_pages == other.all_null_pages
-            && self.search_start == other.search_start
-    }
-}
-
-impl DeepSizeOf for BTreeLookup {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
-            + self.null_pages.deep_size_of_children(context)
-            + self.all_null_pages.deep_size_of_children(context)
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1393,10 +1375,10 @@ struct BTreeIndexState {
 }
 
 impl DeepSizeOf for BTreeIndexState {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`;
         // the lookup batch dominates, matching how `BTreeIndex` accounts for itself.
-        self.lookup_batch.get_array_memory_size()
+        self.lookup_batch.deep_size_of_children(context)
     }
 }
 
