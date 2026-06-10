@@ -3391,6 +3391,11 @@ impl LanceNamespace for DirectoryNamespace {
         let dataset = self
             .load_dataset(&table_uri, request.version, "list_table_indices")
             .await?;
+        let total_rows = dataset.count_rows(None).await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to count rows for table '{}': {:?}", table_uri, e),
+            })
+        })? as u64;
         let mut indices = dataset
             .describe_indices(None)
             .await
@@ -3433,13 +3438,35 @@ impl LanceNamespace for DirectoryNamespace {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                Ok(IndexContent {
+                let segments = description.segments();
+                let created_at = segments
+                    .iter()
+                    .filter_map(|segment| segment.created_at)
+                    .min()
+                    .map(|ts| ts.to_rfc3339());
+
+                // `..Default::default()` keeps this tolerant of additive reqwest
+                // client model changes (see #7212).
+                #[allow(clippy::needless_update)]
+                let content = IndexContent {
                     index_name: description.name().to_string(),
                     index_uuid: description.metadata()[0].uuid.to_string(),
                     columns,
                     status: "SUCCEEDED".to_string(),
+                    index_type: Some(description.index_type().to_string()),
+                    type_url: Some(description.type_url().to_string()),
+                    num_indexed_rows: Some(description.rows_indexed() as i64),
+                    num_unindexed_rows: Some(
+                        total_rows.saturating_sub(description.rows_indexed()) as i64,
+                    ),
+                    size_bytes: description.total_size_bytes().map(|size| size as i64),
+                    num_segments: Some(segments.len() as i32),
+                    created_at,
+                    index_version: segments.first().map(|segment| segment.index_version),
+                    index_details: description.details().ok(),
                     ..Default::default()
-                })
+                };
+                Ok(content)
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -4345,13 +4372,16 @@ impl LanceNamespace for DirectoryNamespace {
             .load_dataset(&table_uri, None, "get_table_tag_version")
             .await?;
 
-        let version = dataset
+        let contents = dataset
             .tags()
-            .get_version(&request.tag)
+            .get(&request.tag)
             .await
             .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
 
-        Ok(GetTableTagVersionResponse::new(version as i64))
+        Ok(GetTableTagVersionResponse {
+            version: contents.version as i64,
+            branch: contents.branch,
+        })
     }
 
     async fn create_table_tag(
@@ -6748,7 +6778,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_table_indices() {
-        use lance_namespace::models::ListTableIndicesRequest;
+        use lance_namespace::models::{CreateTableIndexRequest, ListTableIndicesRequest};
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
@@ -6776,6 +6806,22 @@ mod tests {
             .unwrap();
         assert_eq!(users_id_idx.columns, vec!["id"]);
         assert_eq!(users_id_idx.status, "SUCCEEDED");
+
+        // Enriched fields populated from the index metadata for a scalar index.
+        assert_eq!(users_id_idx.index_type.as_deref(), Some("BTree"));
+        assert!(
+            users_id_idx
+                .type_url
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert_eq!(users_id_idx.num_indexed_rows, Some(3));
+        assert_eq!(users_id_idx.num_unindexed_rows, Some(0));
+        assert_eq!(users_id_idx.num_segments, Some(1));
+        assert!(users_id_idx.size_bytes.is_some_and(|size| size > 0));
+        assert!(users_id_idx.created_at.is_some());
+        assert!(users_id_idx.index_version.is_some());
+        assert!(users_id_idx.index_details.is_some());
 
         let dataset = open_dataset(&namespace, "users").await;
         let expected_transaction_id = dataset
@@ -6820,6 +6866,44 @@ mod tests {
         assert_eq!(second_page.indexes.len(), 1);
         assert_eq!(second_page.indexes[0].index_name, "users_id_idx");
         assert!(second_page.page_token.is_none());
+
+        // A vector index exercises a different type_url, index_type, and details payload.
+        create_vector_table(&namespace, "vectors").await;
+        let mut create_index_request =
+            CreateTableIndexRequest::new("vector".to_string(), "IVF_FLAT".to_string());
+        create_index_request.id = Some(vec!["vectors".to_string()]);
+        create_index_request.name = Some("vector_idx".to_string());
+        create_index_request.distance_type = Some("l2".to_string());
+        namespace
+            .create_table_index(create_index_request)
+            .await
+            .unwrap();
+
+        let vector_response = namespace
+            .list_table_indices(ListTableIndicesRequest {
+                id: Some(vec!["vectors".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(vector_response.indexes.len(), 1);
+        let vector_idx = &vector_response.indexes[0];
+        assert_eq!(vector_idx.index_name, "vector_idx");
+        assert_eq!(vector_idx.columns, vec!["vector"]);
+        assert_eq!(vector_idx.index_type.as_deref(), Some("IVF_FLAT"));
+        assert!(
+            vector_idx
+                .type_url
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(vector_idx.num_indexed_rows.is_some());
+        assert!(vector_idx.num_unindexed_rows.is_some());
+        assert_eq!(vector_idx.num_segments, Some(1));
+        assert!(vector_idx.created_at.is_some());
+        assert!(vector_idx.index_version.is_some());
+        assert!(vector_idx.index_details.is_some());
     }
 
     #[tokio::test]
@@ -12276,6 +12360,7 @@ mod tests {
         get_req.id = Some(table_id);
         let resp = namespace.get_table_tag_version(get_req).await.unwrap();
         assert_eq!(resp.version, 2);
+        assert_eq!(resp.branch, None);
     }
 
     #[tokio::test]
