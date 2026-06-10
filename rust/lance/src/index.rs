@@ -1636,7 +1636,6 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
-        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
         let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
         if index_uri.is_none() {
             index_uri = Some(index_details.type_url.clone());
@@ -1645,12 +1644,16 @@ async fn collect_regular_indices_statistics(
         let index_details_wrapper = scalar::IndexDetails(index_details.clone());
         if let Ok(plugin) =
             index_details_wrapper.get_plugin(ds.session.scalar_index_plugins().as_ref())
-            && let Some(stats) = plugin
-                .load_statistics(index_store.clone(), index_details.as_ref())
-                .await?
+            && plugin.supports_load_statistics()
         {
-            indices_stats.push(stats);
-            continue;
+            let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
+            if let Some(stats) = plugin
+                .load_statistics(index_store, index_details.as_ref())
+                .await?
+            {
+                indices_stats.push(stats);
+                continue;
+            }
         }
 
         let index = ds

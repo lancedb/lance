@@ -302,6 +302,10 @@ impl ScalarIndexPlugin for XabiScalarIndexPlugin {
             .transpose()
     }
 
+    fn supports_load_statistics(&self) -> bool {
+        true
+    }
+
     fn details_as_json(&self, details: &ProstAny) -> Result<serde_json::Value> {
         let json = self
             .handle

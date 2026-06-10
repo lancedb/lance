@@ -205,6 +205,12 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// Returns true if [`load_statistics`](Self::load_statistics) may return
+    /// statistics without opening the index.
+    fn supports_load_statistics(&self) -> bool {
+        false
+    }
+
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<IndexPluginRegistry>) {}
 
