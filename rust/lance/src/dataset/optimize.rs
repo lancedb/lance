@@ -4616,6 +4616,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_ivf_rq_index_v3_with_defer_index_remap() {
+        use arrow_array::cast::AsArray;
+        use lance_index::vector::bq::RQBuildParams;
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        let stored: Vec<Vec<f32>> = {
+            let mut scanner = dataset.scan();
+            scanner.project(&["vec"]).unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            for batch in &batches {
+                let vecs = batch["vec"].as_fixed_size_list();
+                for i in 0..batch.num_rows() {
+                    let values = vecs.value(i);
+                    let values = values.as_primitive::<Float32Type>();
+                    out.push(values.values().to_vec());
+                }
+            }
+            out
+        };
+
+        let index_name = Some("vec_idx".into());
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                index_name.clone(),
+                &VectorIndexParams {
+                    metric_type: DistanceType::L2,
+                    stages: vec![
+                        StageParams::Ivf(IvfBuildParams {
+                            max_iters: 2,
+                            num_partitions: Some(2),
+                            sample_rate: 2,
+                            ..Default::default()
+                        }),
+                        StageParams::RQ(RQBuildParams::new(1)),
+                    ],
+                    version: crate::index::vector::IndexFileVersion::V3,
+                    skip_transpose: false,
+                    runtime_hints: Default::default(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        let Some(current_index) = dataset.load_index_by_name("vec_idx").await.unwrap() else {
+            panic!("vec index must be available");
+        };
+        assert_eq!(current_index.uuid, original_index.uuid);
+
+        let frag_reuse_present = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+        assert!(
+            frag_reuse_present,
+            "defer_index_remap must record a {} index",
+            FRAG_REUSE_INDEX_NAME
+        );
+
+        let sample_step = (stored.len() / 8).max(1);
+        let mut checked = 0;
+        for query in stored.iter().step_by(sample_step) {
+            let query_vec = PrimitiveArray::<Float32Type>::from_iter_values(query.iter().copied());
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &query_vec, 5).unwrap();
+            scanner.project(&["vec"]).unwrap().with_row_id();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(!batches.is_empty(), "query returned no batches");
+            let top = &batches[0];
+            assert!(top.num_rows() > 0, "query returned empty top batch");
+            let top_vec = top["vec"].as_fixed_size_list().value(0);
+            let top_vec = top_vec.as_primitive::<Float32Type>();
+            assert_eq!(
+                top_vec.values(),
+                query.as_slice(),
+                "top-1 self-recall returned a different vector than the query"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "expected to check at least one stored vector");
+    }
+
+    #[tokio::test]
     async fn test_default_compaction_planner() {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;

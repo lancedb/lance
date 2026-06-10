@@ -249,6 +249,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
         object_store: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>>;
 }
 
@@ -431,6 +432,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         object_store: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>> {
         Box::pin(async move {
             match self.sub_index_type {
@@ -440,6 +442,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         object_store,
                         file_metadata_cache,
                         index_cache,
+                        frag_reuse_index,
                     )
                     .await
                 }
@@ -449,6 +452,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         object_store,
                         file_metadata_cache,
                         index_cache,
+                        frag_reuse_index,
                     )
                     .await
                 }
@@ -1812,6 +1816,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     object_store: Arc<ObjectStore>,
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let io_parallelism = object_store.io_parallelism();
 
@@ -1867,7 +1872,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         state.aux_ivf.clone(),
         state.metadata.clone(),
         state.distance_type,
-        None,
+        frag_reuse_index,
     );
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
