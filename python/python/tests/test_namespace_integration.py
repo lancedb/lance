@@ -31,6 +31,8 @@ from lance.namespace import (
 from lance_namespace import (
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableBranchRequest,
+    CreateTableBranchResponse,
     CreateTableRequest,
     CreateTableResponse,
     CreateTableVersionRequest,
@@ -136,6 +138,11 @@ class CustomNamespace(LanceNamespace):
     ) -> CreateTableVersionResponse:
         return self._inner.create_table_version(request)
 
+    def create_table_branch(
+        self, request: CreateTableBranchRequest
+    ) -> CreateTableBranchResponse:
+        return self._inner.create_table_branch(request)
+
     def retrieve_ops_metrics(self) -> Optional[Dict[str, int]]:
         return self._inner.retrieve_ops_metrics()
 
@@ -199,6 +206,7 @@ def create_tracking_namespace(
     storage_options: dict,
     credential_expires_in_seconds: int = 60,
     use_custom: bool = False,
+    managed_versioning: bool = False,
 ):
     """Create a DirectoryNamespace with ops metrics and credential vending enabled.
 
@@ -212,6 +220,9 @@ def create_tracking_namespace(
         storage_options: Storage options to pass through (credentials, endpoint, etc.)
         credential_expires_in_seconds: Interval in seconds for credential expiration
         use_custom: If True, wrap in CustomNamespace for testing custom implementations
+        managed_versioning: If True, enable the manifest catalog so table versions
+            are tracked by the namespace and commits route through
+            create_table_version
 
     Returns:
         Tuple of (namespace_client, inner_namespace_client) where inner is always
@@ -238,6 +249,10 @@ def create_tracking_namespace(
     dir_props["vend_input_storage_options_refresh_interval_millis"] = str(
         credential_expires_in_seconds * 1000
     )
+    if managed_versioning:
+        dir_props["manifest_enabled"] = "true"
+        dir_props["table_version_tracking_enabled"] = "true"
+        dir_props["table_version_storage_enabled"] = "true"
 
     inner_ns_client = DirectoryNamespace(**dir_props)
     ns_client = _wrap_if_custom(inner_ns_client, use_custom)
@@ -556,6 +571,87 @@ def test_namespace_write_overwrite_mode(s3_bucket: str, use_custom: bool):
     for _ in range(3):
         assert ds.count_rows() == 2
     assert get_describe_call_count(inner_ns_client) == call_count_before_reads
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("use_custom", [False, True], ids=["DirectoryNS", "CustomNS"])
+def test_namespace_managed_branches(s3_bucket: str, use_custom: bool):
+    """Branches on a managed-versioning table over S3.
+
+    Branch commits must route through the catalog (create_table_version) and
+    leave main's chain untouched. A cross-branch checkout at an overlapping
+    version number must resolve the requested chain: branch version numbers
+    continue from the fork point, so the same number exists on both chains
+    with different data.
+    """
+    storage_options = copy.deepcopy(CONFIG)
+
+    ns_client, inner_ns_client = create_tracking_namespace(
+        bucket_name=s3_bucket,
+        storage_options=storage_options,
+        credential_expires_in_seconds=3600,
+        use_custom=use_custom,
+        managed_versioning=True,
+    )
+
+    table_name = uuid.uuid4().hex
+    table_id = ["test_ns", table_name]
+
+    def commit_count() -> int:
+        return inner_ns_client.retrieve_ops_metrics().get("create_table_version", 0)
+
+    lance.write_dataset(
+        pa.Table.from_pylist([{"a": 1}]),
+        namespace_client=ns_client,
+        table_id=table_id,
+        mode="create",
+        storage_options=storage_options,
+    )
+    ds = lance.write_dataset(
+        pa.Table.from_pylist([{"a": 2}]),
+        namespace_client=ns_client,
+        table_id=table_id,
+        mode="append",
+        storage_options=storage_options,
+    )
+    assert commit_count() >= 2
+
+    ns_client.create_table_branch(
+        CreateTableBranchRequest(id=table_id, name="dev", from_version=2)
+    )
+
+    dev = ds.checkout_version(("dev", None))
+    commits_before_branch_append = commit_count()
+    dev = lance.write_dataset(
+        pa.Table.from_pylist([{"a": 3}]),
+        dev,
+        mode="append",
+        storage_options=storage_options,
+    )
+    assert commit_count() == commits_before_branch_append + 1
+    assert sorted(dev.to_table()["a"].to_pylist()) == [1, 2, 3]
+
+    # Diverge main to the same version number as dev's tip.
+    ds = lance.write_dataset(
+        pa.Table.from_pylist([{"a": 100}]),
+        namespace_client=ns_client,
+        table_id=table_id,
+        mode="append",
+        storage_options=storage_options,
+    )
+    assert sorted(ds.to_table()["a"].to_pylist()) == [1, 2, 100]
+
+    on_dev = ds.checkout_version(("dev", 3))
+    assert sorted(on_dev.to_table()["a"].to_pylist()) == [1, 2, 3]
+    back_on_main = dev.checkout_version(("main", None))
+    assert sorted(back_on_main.to_table()["a"].to_pylist()) == [1, 2, 100]
+
+    fresh = lance.dataset(
+        namespace_client=ns_client,
+        table_id=table_id,
+        storage_options=storage_options,
+    )
+    assert sorted(fresh.to_table()["a"].to_pylist()) == [1, 2, 100]
 
 
 @pytest.mark.integration

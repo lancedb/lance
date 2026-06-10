@@ -514,7 +514,10 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
-            .with_store_params(store_params.unwrap_or_default())
+            // Fall back to the dataset's own store params
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
