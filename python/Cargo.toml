@@ -80,6 +80,7 @@ bytes = "1.4"
 default = []
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+hdfs = ["lance/hdfs"]
 
 [profile.ci]
 debug = "line-tables-only"

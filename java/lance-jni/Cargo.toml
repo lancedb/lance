@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
-hdfs = ["lance-io/hdfs"]
+hdfs = ["lance/hdfs"]
 
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait"] }

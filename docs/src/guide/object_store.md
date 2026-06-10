@@ -252,9 +252,16 @@ ds = lance.dataset(
 ## HDFS Configuration
 
 HDFS support is optional and must be enabled when building Lance. For Rust builds,
-enable the `hdfs` feature on `lance-io`. For Java builds, see the
+enable the `hdfs` feature on `lance`. For Java builds, see the
 [Java HDFS build instructions](https://github.com/lance-format/lance/tree/main/java#hdfs-enabled-build).
 Prebuilt Lance packages may not include HDFS support.
+
+To build the Python package with HDFS support from source:
+
+```bash
+cd python
+uv run maturin build --release --features hdfs
+```
 
 Use an `hdfs://` URI containing a NameNode address or an HDFS high-availability
 nameservice:
