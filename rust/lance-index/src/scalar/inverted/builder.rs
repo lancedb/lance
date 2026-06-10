@@ -3162,6 +3162,80 @@ mod tests {
         assert!((zeta_id as usize) < first.posting_lists.len());
     }
 
+    // FST token file with a stale next_id (above the token count), as a pre-#7115 writer left.
+    async fn write_stale_next_id_token_file(store: &dyn IndexStore, partition_id: u64) {
+        let mut tokens = TokenSet::default();
+        tokens.add("alpha".to_owned());
+        tokens.add("gamma".to_owned());
+        assert_eq!(tokens.len(), 2);
+        tokens.next_id = 9;
+        let batch = tokens.to_batch(TokenSetFormat::Fst).unwrap();
+        let mut writer = store
+            .new_index_file(&token_file_path(partition_id), batch.schema())
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    // load_fst recomputes next_id from the token count rather than trusting the persisted value.
+    #[tokio::test]
+    async fn test_load_fst_recomputes_stale_next_id() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_stale_next_id_token_file(store.as_ref(), 0).await;
+        let reader = store.open_index_file(&token_file_path(0)).await.unwrap();
+        let tokens = TokenSet::load(reader, TokenSetFormat::Fst).await.unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens.next_id(), 2);
+    }
+
+    // A stale next_id loaded from disk must not leak an out-of-range token id into a merge.
+    #[tokio::test]
+    async fn test_merge_with_stale_next_id_token_file_does_not_panic() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_stale_next_id_token_file(store.as_ref(), 0).await;
+        let reader = store.open_index_file(&token_file_path(0)).await.unwrap();
+        let tokens = TokenSet::load(reader, TokenSetFormat::Fst)
+            .await
+            .unwrap()
+            .into_mutable();
+
+        let mut first = InnerBuilder::new(0, false, TokenSetFormat::Fst);
+        first.set_tokens(tokens);
+        first
+            .posting_lists
+            .resize_with(first.tokens.len(), || PostingListBuilder::new(false));
+        let doc = first.docs.append(10, 1);
+        first.posting_lists[0].add(doc, PositionRecorder::Count(1));
+        first.posting_lists[1].add(doc, PositionRecorder::Count(1));
+
+        let mut second = InnerBuilder::new(1, false, TokenSetFormat::Fst);
+        let zeta = second.tokens.add("zeta".to_owned());
+        second
+            .posting_lists
+            .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
+        let second_doc = second.docs.append(20, 1);
+        second.posting_lists[zeta as usize].add(second_doc, PositionRecorder::Count(1));
+
+        first.merge_from(second).unwrap();
+        assert_eq!(first.tokens.len(), 3);
+        assert_eq!(first.posting_lists.len(), 3);
+        let zeta_id = first.tokens.get("zeta").expect("zeta should be merged in");
+        assert!((zeta_id as usize) < first.posting_lists.len());
+    }
+
     #[tokio::test]
     async fn test_update_index_returns_worker_error_when_workers_exit_during_dispatch() {
         let num_batches = (*LANCE_FTS_NUM_SHARDS * 2 + 1) as u64;

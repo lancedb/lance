@@ -1620,15 +1620,13 @@ impl TokenSet {
         let map = fst::Map::new(bytes.to_vec())
             .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
 
-        let next_id_col = batch[TOKEN_NEXT_ID_COL].as_primitive::<datatypes::UInt32Type>();
         let total_length_col =
             batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
 
-        let next_id = next_id_col
-            .values()
-            .first()
-            .copied()
-            .ok_or(Error::index("token next id column is empty".to_owned()))?;
+        // Token ids are dense `[0, len)`, so `next_id` must equal the token count. Recompute
+        // it instead of trusting the persisted value, which writers before #7115 could leave
+        // stale. Mirrors `load_arrow`.
+        let next_id = map.len() as u32;
 
         let total_length = total_length_col
             .values()
