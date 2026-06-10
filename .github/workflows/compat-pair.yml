@@ -1,0 +1,158 @@
+# Cross-version index compatibility suite between two refs.
+#
+# Each ref (version, commit sha, branch, or tag) is provisioned by the compat framework:
+# a published release installs a wheel, anything else is built from a worktree via maturin.
+# The suite ages an index under the writer ref and exercises it under the reader, searching
+# maintenance-op sequences and asserting the reader neither panics nor disagrees with a
+# full scan.
+#
+# Triggers:
+#   - workflow_dispatch: run one explicit writer -> reader pair on demand.
+#   - pull_request: age indexes under the latest release of each of the two previous
+#     majors and exercise them under the PR head, so a change that breaks reading older
+#     indexes fails the PR.
+name: Compat (index ref pair)
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_ref:
+        description: "Writer ref (version / sha / branch). Blank = 2nd most recent release."
+        required: false
+        default: ""
+      to_ref:
+        description: "Reader ref (version / sha / branch). Blank = most recent release."
+        required: false
+        default: ""
+      kinds:
+        description: "Comma-separated index kinds (INVERTED,BTREE,...) or 'all'."
+        required: false
+        default: "all"
+      max_length:
+        description: "Max maintenance-op sequence length to search (deeper = slower)."
+        required: false
+        default: "5"
+  pull_request:
+    # Only changes that can alter index format or its readers need the cross-version check.
+    paths:
+      - "rust/lance-index/**"
+      - "rust/lance/**"
+      - "python/**"
+      - ".github/workflows/compat-pair.yml"
+
+# Each run builds refs from source, so supersede an in-flight run for the same PR/ref
+# rather than letting expensive builds pile up on rapid pushes.
+concurrency:
+  group: compat-pair-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Resolve the writer -> reader pairs to run. For a PR this is the latest minor/patch
+  # release of each of the two previous majors (e.g. 6.0.1, not 6.0.0) aged into the PR
+  # head; for a manual run it is the single pair from the inputs (blank inputs fall
+  # through to the suite's own defaults).
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest packaging
+      - id: gen
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_FROM: ${{ inputs.from_ref }}
+          IN_TO: ${{ inputs.to_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "python/tests")
+          from compat.compat_decorator import pylance_stable_versions
+
+          if os.environ["EVENT"] == "pull_request":
+              # Latest minor/patch release within each of the two most recent majors --
+              # e.g. 6.0.1, not 6.0.0 -- aged into the PR head. Iterating ascending means
+              # the last version stored per major is that major's newest release.
+              latest_by_major = {}
+              for v in pylance_stable_versions():
+                  latest_by_major[v.major] = v
+              refs = [str(latest_by_major[m]) for m in sorted(latest_by_major)[-2:]]
+              head = os.environ["HEAD_SHA"]
+              include = [{"from_ref": ref, "to_ref": head} for ref in refs]
+          else:
+              # Single explicit pair; blanks fall through to the suite defaults.
+              include = [
+                  {"from_ref": os.environ.get("IN_FROM", ""),
+                   "to_ref": os.environ.get("IN_TO", "")}
+              ]
+
+          matrix = {"include": include}
+          print(json.dumps(matrix, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={json.dumps(matrix)}\n")
+          PY
+
+  compat-pair:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: python
+    env:
+      # PRs cover all kinds; a manual run honors its input (expanded below). Length 5 is
+      # the shallowest depth that reaches the ENT-1662 sequence.
+      COMPAT_MAX_LENGTH: ${{ inputs.max_length || '5' }}
+    steps:
+      # Full history so arbitrary refs (and the PR head) can be checked out for builds.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      # Toolchain for the build-from-source provisioning path (refs without a wheel).
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install build deps
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install host deps
+        run: pip install pytest pytest-xdist pyarrow packaging maturin
+      - name: Resolve kinds
+        id: kinds
+        env:
+          KINDS_IN: ${{ inputs.kinds }}
+        run: |
+          if [ -z "$KINDS_IN" ] || [ "$KINDS_IN" = "all" ]; then
+            echo "value=INVERTED,BTREE,BITMAP,LABEL_LIST,NGRAM,ZONEMAP,BLOOMFILTER" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$KINDS_IN" >> "$GITHUB_OUTPUT"
+          fi
+      # Run the kind x shard cases in parallel. Each scenario writes a small dataset to
+      # disk and the reader spends most of its time in short subprocess round-trips, so the
+      # work is largely I/O-bound -- oversubscribe (4x cores) so a worker waiting on disk or
+      # the sub-venv pipe overlaps another's compute. Venvs live in a shared cache and are
+      # created under a lock, so workers build each ref once.
+      - name: Run compat suite (${{ matrix.from_ref }} -> ${{ matrix.to_ref }})
+        env:
+          COMPAT_FROM_REF: ${{ matrix.from_ref }}
+          COMPAT_TO_REF: ${{ matrix.to_ref }}
+          COMPAT_KINDS: ${{ steps.kinds.outputs.value }}
+        run: |
+          python -m pytest python/tests/compat/test_index_sequence.py \
+            --run-compat -n "$(( $(nproc) * 4 ))" -v --no-header
