@@ -687,10 +687,17 @@ where
 ///
 /// The batch holds one row per page with columns `min | max | null_count | page_idx`,
 /// sorted ascending by `min` with NULLs first (the order the index is trained in).
-/// The batch is the single source of truth: range searches binary-search the `min`
-/// column for a starting row and scan forward filtering by `max`, type-dispatched
-/// per column type via [`make_comparator`]. This avoids materializing a parallel
-/// `BTreeMap` of owned `ScalarValue`s alongside the Arrow buffers.
+/// The batch is the single source of truth, avoiding a parallel `BTreeMap` of owned
+/// `ScalarValue`s alongside the Arrow buffers. Both query paths binary-search the
+/// sorted `min` column for a starting row and scan forward filtering by `max`:
+///
+/// - Equality / `IN` (`candidate_pages_for_values`) dispatch on the query's
+///   *physical storage type* to a monomorphized, inlined comparator: numerics go
+///   through `scan_native` (logical types sharing a native — e.g. `Date32` and
+///   `Int32` — fold to one path), byte-likes through `scan_accessor`. Only types
+///   without a native fast path (struct-backed intervals, booleans) fall back to the
+///   boxed [`make_comparator`] via `scan_fallback`.
+/// - Range searches (`pages_between`) currently use [`make_comparator`] directly.
 #[derive(Debug)]
 pub struct BTreeLookup {
     /// One row per page (`min | max | null_count | page_idx`), sorted by `min`.
@@ -992,6 +999,7 @@ impl BTreeLookup {
     /// Monomorphized over the comparator closures so a typed-native comparator
     /// inlines (no per-call vtable dispatch). The closures encode NULLs-first,
     /// ascending order:
+    ///   * `max_is_null(i)` — whether page `i`'s `max` is null (an all-null page)
     ///   * `cmp_min(i, j)` — page `i`'s `min` vs query value `j`
     ///   * `cmp_max(i, j)` — page `i`'s `max` vs query value `j`
     ///   * `cmp_min_min(i, anchor)` — two page `min`s, to expand left onto a straddle
@@ -1378,7 +1386,7 @@ impl CacheKey for BTreePageKey {
 /// `BTreeIndex::try_from_serialized` reconstructs the in-memory lookup with
 /// no IO) plus the page batch size and range-partition map.
 #[derive(Debug, Clone)]
-pub struct BTreeIndexState {
+struct BTreeIndexState {
     lookup_batch: RecordBatch,
     batch_size: u64,
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
@@ -5370,7 +5378,10 @@ mod tests {
     /// columns, including the null-min straddle page and duplicate `min`s.
     #[test]
     fn test_btree_lookup_pages_eq_bytes() {
-        use arrow_array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, UInt32Array};
+        use arrow_array::{
+            ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
+            UInt32Array,
+        };
         use arrow_schema::{DataType, Field, Schema};
 
         // 2-byte big-endian keys, so lexicographic byte order matches numeric
@@ -5449,6 +5460,26 @@ mod tests {
         };
         assert_byte_lookup(bin(&mins), bin(&maxs), &|v| {
             ScalarValue::Binary(Some(be(v).to_vec()))
+        });
+
+        let lbin = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(LargeBinaryArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| be(v).to_vec())),
+            ))
+        };
+        assert_byte_lookup(lbin(&mins), lbin(&maxs), &|v| {
+            ScalarValue::LargeBinary(Some(be(v).to_vec()))
+        });
+
+        // `LargeUtf8` over zero-padded decimal strings, whose lexicographic order
+        // matches the numeric order of the keys.
+        let lstr = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(LargeStringArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| format!("{v:02}"))),
+            ))
+        };
+        assert_byte_lookup(lstr(&mins), lstr(&maxs), &|v| {
+            ScalarValue::LargeUtf8(Some(format!("{v:02}")))
         });
     }
 
@@ -5533,6 +5564,344 @@ mod tests {
                 Some(50),
             ])),
             &|v| ScalarValue::Date32(Some(v as i32)),
+        );
+    }
+
+    /// Exercises the remaining physical-type dispatch arms that the temporal and
+    /// byte tests don't reach: every integer width and signedness, `Float16`, and
+    /// the 128-/256-bit decimal paths. All share the temporal test's numeric layout
+    /// (mins `[_, 10, 20, 20, 40]`, maxs `[5, 20, 20, 30, 50]`) so the assertions are
+    /// identical; only the array/scalar type varies.
+    #[test]
+    fn test_btree_lookup_pages_eq_numeric_widths() {
+        use arrow::datatypes::i256;
+        use arrow_array::{
+            ArrayRef, Decimal128Array, Decimal256Array, Float16Array, Int8Array, Int16Array,
+            UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+        use half::f16;
+
+        let null_count = UInt32Array::from(vec![2u32, 0, 0, 0, 0]);
+        let page_idx = UInt32Array::from(vec![0u32, 1, 2, 3, 4]);
+        let assert_lookup =
+            |min_arr: ArrayRef, max_arr: ArrayRef, sv: &dyn Fn(i64) -> ScalarValue| {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("min", min_arr.data_type().clone(), true),
+                        Field::new("max", max_arr.data_type().clone(), true),
+                        Field::new("null_count", DataType::UInt32, false),
+                        Field::new("page_idx", DataType::UInt32, false),
+                    ])),
+                    vec![
+                        min_arr,
+                        max_arr,
+                        Arc::new(null_count.clone()),
+                        Arc::new(page_idx.clone()),
+                    ],
+                )
+                .unwrap();
+                let lookup = BTreeLookup::try_new(batch).unwrap();
+                let eq = |v: i64| {
+                    let mut p: Vec<u32> = lookup
+                        .pages_eq(&OrderableScalarValue(sv(v)))
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.page_id())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                };
+                assert_eq!(eq(15), vec![1]); // only page 1 ([10, 20])
+                assert_eq!(eq(20), vec![1, 2, 3]); // shared min of 2 & 3, max of 1
+                assert!(eq(35).is_empty()); // gap between pages 3 and 4
+                assert_eq!(eq(5), vec![0]); // reaches the null-min straddle via its max
+            };
+
+        assert_lookup(
+            Arc::new(Int8Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(Int8Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::Int8(Some(v as i8)),
+        );
+        assert_lookup(
+            Arc::new(Int16Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(Int16Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::Int16(Some(v as i16)),
+        );
+        assert_lookup(
+            Arc::new(UInt8Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt8Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt8(Some(v as u8)),
+        );
+        assert_lookup(
+            Arc::new(UInt16Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt16Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt16(Some(v as u16)),
+        );
+        assert_lookup(
+            Arc::new(UInt32Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt32Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt32(Some(v as u32)),
+        );
+        assert_lookup(
+            Arc::new(UInt64Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt64Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt64(Some(v as u64)),
+        );
+
+        let f = |v: f64| f16::from_f64(v);
+        assert_lookup(
+            Arc::new(Float16Array::from(vec![
+                None,
+                Some(f(10.0)),
+                Some(f(20.0)),
+                Some(f(20.0)),
+                Some(f(40.0)),
+            ])),
+            Arc::new(Float16Array::from(vec![
+                Some(f(5.0)),
+                Some(f(20.0)),
+                Some(f(20.0)),
+                Some(f(30.0)),
+                Some(f(50.0)),
+            ])),
+            &|v| ScalarValue::Float16(Some(f(v as f64))),
+        );
+
+        // Decimal128 (i128 native path). Comparison is on the raw integer, so a
+        // scale of 0 lets the values double as plain integers.
+        let dec128 = |vals: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(vals)
+                    .with_precision_and_scale(18, 0)
+                    .unwrap(),
+            )
+        };
+        assert_lookup(
+            dec128(vec![None, Some(10), Some(20), Some(20), Some(40)]),
+            dec128(vec![Some(5), Some(20), Some(20), Some(30), Some(50)]),
+            &|v| ScalarValue::Decimal128(Some(v as i128), 18, 0),
+        );
+
+        // Decimal256 (i256 native path).
+        let dec256 = |vals: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal256Array::from(
+                    vals.into_iter()
+                        .map(|o| o.map(i256::from_i128))
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(40, 0)
+                .unwrap(),
+            )
+        };
+        assert_lookup(
+            dec256(vec![None, Some(10), Some(20), Some(20), Some(40)]),
+            dec256(vec![Some(5), Some(20), Some(20), Some(30), Some(50)]),
+            &|v| ScalarValue::Decimal256(Some(i256::from_i128(v as i128)), 40, 0),
+        );
+    }
+
+    /// Exercises the NULL paths of the lookup directly: `pages_eq(NULL)` and
+    /// `pages_in` with a NULL in the value list (and a NULL-only list), including
+    /// the partial-null (`Some`) vs entirely-null (`All`) page classification.
+    #[test]
+    fn test_btree_lookup_pages_null() {
+        // Page 0 is entirely null (null max -> All); page 1 is a partial-null
+        // straddle (max 5, null_count > 0 -> Some); page 2 also carries a null.
+        let batch = record_batch!(
+            ("min", Int32, [None, None, Some(10), Some(20), Some(40)]),
+            ("max", Int32, [None, Some(5), Some(20), Some(30), Some(50)]),
+            ("null_count", UInt32, [3, 2, 1, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        assert_eq!(lookup.all_null_pages, vec![0]);
+        assert_eq!(lookup.null_pages, vec![1, 2]);
+
+        // pages_eq(NULL) short-circuits to the null pages: partial-null pages are
+        // `Some`, the entirely-null page is `All`.
+        assert_eq!(
+            lookup
+                .pages_eq(&OrderableScalarValue(ScalarValue::Int32(None)))
+                .unwrap(),
+            vec![Matches::Some(1), Matches::Some(2), Matches::All(0)]
+        );
+
+        let in_ids = |vals: Vec<Option<i32>>| {
+            let mut p: Vec<u32> = lookup
+                .pages_in(
+                    vals.into_iter()
+                        .map(|v| OrderableScalarValue(ScalarValue::Int32(v))),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|m| m.page_id())
+                .collect();
+            p.sort_unstable();
+            p
+        };
+        // Baseline: a non-null value only -> just its value page.
+        assert_eq!(in_ids(vec![Some(45)]), vec![4]);
+        // A NULL in the list unions in every null page (0, 1, 2).
+        assert_eq!(in_ids(vec![Some(45), None]), vec![0, 1, 2, 4]);
+        // A NULL-only list (empty non-null set) returns exactly the null pages.
+        assert_eq!(in_ids(vec![None]), vec![0, 1, 2]);
+    }
+
+    /// A 0-row page_lookup batch (an index over an empty dataset) must yield no
+    /// candidates for any query rather than panicking on the binary-search bounds.
+    #[test]
+    fn test_btree_lookup_empty_batch() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("page_idx", DataType::UInt32, false),
+        ]));
+        let lookup = BTreeLookup::try_new(RecordBatch::new_empty(schema)).unwrap();
+        assert_eq!(lookup.search_start, 0);
+        assert!(lookup.null_pages.is_empty());
+        assert!(lookup.all_null_pages.is_empty());
+
+        assert!(lookup.pages_eq(&osv(5)).unwrap().is_empty());
+        assert!(lookup.pages_in([osv(5)]).unwrap().is_empty());
+        assert!(
+            lookup
+                .pages_between((
+                    std::ops::Bound::Included(&osv(0)),
+                    std::ops::Bound::Included(&osv(100)),
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(lookup.pages_null().is_empty());
+    }
+
+    /// A straddle page (null `min`, non-null `max`) can sort ahead of an entirely-
+    /// null page within the leading NULL-`min` group. When it does, `search_start`
+    /// points at the straddle and the all-null page falls inside the forward-scan
+    /// window, so both the equality and range scans must skip it (it matches only
+    /// IS NULL).
+    #[test]
+    fn test_btree_lookup_skips_all_null_page_in_scan_window() {
+        // Page 0: straddle (null min, max 5). Page 1: entirely null (null min/max).
+        let batch = record_batch!(
+            ("min", Int32, [None, None, Some(10), Some(20), Some(40)]),
+            ("max", Int32, [Some(5), None, Some(20), Some(30), Some(50)]),
+            ("null_count", UInt32, [2, 3, 0, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        assert_eq!(lookup.search_start, 0); // straddle page 0 has a non-null max
+        assert_eq!(lookup.all_null_pages, vec![1]);
+        assert_eq!(lookup.null_pages, vec![0]);
+
+        // Equality for 5 peeks left across the all-null page 1 (index 1, inside the
+        // scan window) and must skip it, reaching only the straddle page 0.
+        assert_eq!(
+            lookup
+                .pages_eq(&osv(5))
+                .unwrap()
+                .into_iter()
+                .map(|m| m.page_id())
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        // The same all-null page sits inside the range scan window and is skipped:
+        // page 0 (straddle) is a partial match, pages 2-4 are fully covered.
+        let mut between = lookup
+            .pages_between((
+                std::ops::Bound::Included(&osv(0)),
+                std::ops::Bound::Included(&osv(100)),
+            ))
+            .unwrap();
+        between.sort_by_key(|m| m.page_id());
+        assert_eq!(
+            between,
+            vec![
+                Matches::Some(0),
+                Matches::All(2),
+                Matches::All(3),
+                Matches::All(4),
+            ]
         );
     }
 
