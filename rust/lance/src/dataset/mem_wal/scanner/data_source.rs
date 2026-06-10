@@ -11,6 +11,34 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
+/// A snapshot-consistent cut of one shard's fresh tier, used to evaluate
+/// membership "as of" the exact tier a prior scan observed (see
+/// [`super::builder::LsmScanner::contains_pks_as_of`]).
+///
+/// The only fresh-tier source that grows between two reads is the active
+/// memtable (appended batches) and, when it rolls, a new generation. Everything
+/// at a lower generation — frozen memtables and flushed generations — is
+/// immutable and was fully observed. So the cut is `(active_generation,
+/// active_batch_count)`: include all sources strictly below `active_generation`
+/// whole, include the active generation only up to `active_batch_count` batches,
+/// and exclude anything at a higher generation (it appeared after the snapshot).
+/// This uses only the batch count and generation — both always available —
+/// rather than per-batch WAL positions, which the memtable does not track on the
+/// write path. The bound only ever *excludes* rows the scan did not observe, so
+/// a stale cut under-counts (a tolerable stale read) rather than over-counts
+/// (which would drop a row with no replacement).
+#[derive(Debug, Clone, Copy)]
+pub struct AsOfCut {
+    /// Generation of the active memtable the scan observed. In-memory sources at
+    /// a higher generation appeared after the snapshot and are excluded; sources
+    /// at a lower generation are immutable and included whole.
+    pub active_generation: u64,
+    /// Number of batches in the active memtable at snapshot time. Within the
+    /// active generation, only batches with index `< active_batch_count` were
+    /// observed; later appends are excluded.
+    pub active_batch_count: u64,
+}
+
 /// Generation number in LSM tree.
 ///
 /// The base table has generation 0. MemTables have positive integers

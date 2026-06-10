@@ -20,7 +20,7 @@ use lance_core::{Error, Result, is_system_column};
 use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
-use super::data_source::ShardSnapshot;
+use super::data_source::{AsOfCut, ShardSnapshot};
 use super::flushed_cache::FlushedMemTableCache;
 use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
@@ -456,12 +456,26 @@ impl LsmScanner {
     /// hashes PKs itself. Flushed membership comes from the injected
     /// [`FlushedMemTableCache`] when one is set.
     pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
+        self.contains_pks_as_of(pks, None).await
+    }
+
+    /// As-of variant of [`Self::contains_pks`]. Membership is evaluated against
+    /// a snapshot-consistent cut of the fresh tier, supplied per shard via
+    /// `as_of` (see [`AsOfCut`]), so a caller can match the exact tier a prior
+    /// scan observed and avoid the two-snapshot skew that would drop a base row
+    /// with no delivered replacement. `None` evaluates against the live tier.
+    pub async fn contains_pks_as_of(
+        &self,
+        pks: &RecordBatch,
+        as_of: Option<&HashMap<Uuid, AsOfCut>>,
+    ) -> Result<Vec<bool>> {
         let sources = self.build_collector().collect()?;
         let sets = super::block_list::fresh_tier_block_list(
             &sources,
             &self.pk_columns,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
+            as_of,
         )
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
