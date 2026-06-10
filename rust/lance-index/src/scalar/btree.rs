@@ -30,10 +30,15 @@ use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
 use arrow_array::{
     Array, ArrayAccessor, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
-    cast::AsArray, downcast_primitive, new_empty_array, types::ArrowPrimitiveType,
+    cast::AsArray,
+    new_empty_array,
+    types::{
+        ArrowPrimitiveType, Decimal128Type, Decimal256Type, Float16Type, Float32Type, Float64Type,
+        Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    },
 };
 use arrow_ord::ord::make_comparator;
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
@@ -636,6 +641,30 @@ where
     }
 }
 
+/// Views `arr` as `PrimitiveArray<K>` for comparison. Zero-copy (shared buffers)
+/// when `arr` already has type `K`; otherwise — a logical type whose physical
+/// storage is `K::Native`, e.g. `Date32`/`Time32` over `i32` or `Timestamp`/
+/// `Duration` over `i64` — the array data is relabeled to `K` without copying the
+/// values, so all such logical types share one comparison path.
+fn reinterpret_primitive<K: ArrowPrimitiveType>(arr: &dyn Array) -> Result<PrimitiveArray<K>> {
+    if let Some(arr) = arr.as_primitive_opt::<K>() {
+        return Ok(arr.clone());
+    }
+    let data = arr
+        .to_data()
+        .into_builder()
+        .data_type(K::DATA_TYPE)
+        .build()
+        .map_err(|e| {
+            Error::internal(format!(
+                "failed to reinterpret {} as {}: {e}",
+                arr.data_type(),
+                K::DATA_TYPE
+            ))
+        })?;
+    Ok(PrimitiveArray::<K>::from(data))
+}
+
 /// Like [`accessor_cmp`] but for primitive columns, comparing native values with
 /// [`ArrowNativeTypeOp::compare`] (total order, so floats match arrow's NaN-last
 /// `make_comparator` ordering).
@@ -826,79 +855,136 @@ impl BTreeLookup {
         let maxs = self.batch.column(1).as_ref();
         let page_ids = self.page_numbers()?.values();
 
-        // For primitive and byte-like columns we downcast once and compare with
-        // native closures that inline into the scan, instead of going through the
-        // boxed `DynComparator` (one vtable call per comparison). The query array
-        // always matches the column type, so its type selects both columns' branch.
-        macro_rules! scan_primitive {
-            ($t:ty) => {{
-                let mins = mins.as_primitive::<$t>();
-                let maxs = maxs.as_primitive::<$t>();
-                let query = query.as_primitive::<$t>();
-                self.scan_equality_pages(
-                    query.len(),
-                    page_ids,
-                    |idx| maxs.is_null(idx),
-                    primitive_cmp(mins, query),
-                    primitive_cmp(maxs, query),
-                    primitive_cmp(mins, mins),
-                )
-            }};
+        // Compare against the page columns with a native, monomorphized comparator
+        // that inlines, rather than the boxed `DynComparator` from `make_comparator`
+        // (one vtable call per comparison). Logical types that share a physical
+        // storage type route to one path via a zero-copy reinterpret, so e.g. every
+        // date/time/timestamp/duration type reuses the `i32`/`i64` path instead of
+        // generating its own. Types with no native path (intervals with struct
+        // natives, booleans, ...) take the `make_comparator` fallback. The query
+        // array always matches the column type, so its type selects the branch.
+        use DataType::*;
+        match query.data_type() {
+            Int8 => self.scan_native::<Int8Type>(mins, maxs, query, page_ids),
+            Int16 => self.scan_native::<Int16Type>(mins, maxs, query, page_ids),
+            // i32-backed: Int32, Date32, Time32, Decimal32, year-month intervals.
+            Int32 | Date32 | Time32(_) | Decimal32(_, _) | Interval(IntervalUnit::YearMonth) => {
+                self.scan_native::<Int32Type>(mins, maxs, query, page_ids)
+            }
+            // i64-backed: Int64, Date64, Time64, Timestamp, Duration, Decimal64.
+            Int64 | Date64 | Time64(_) | Timestamp(_, _) | Duration(_) | Decimal64(_, _) => {
+                self.scan_native::<Int64Type>(mins, maxs, query, page_ids)
+            }
+            UInt8 => self.scan_native::<UInt8Type>(mins, maxs, query, page_ids),
+            UInt16 => self.scan_native::<UInt16Type>(mins, maxs, query, page_ids),
+            UInt32 => self.scan_native::<UInt32Type>(mins, maxs, query, page_ids),
+            UInt64 => self.scan_native::<UInt64Type>(mins, maxs, query, page_ids),
+            Float16 => self.scan_native::<Float16Type>(mins, maxs, query, page_ids),
+            Float32 => self.scan_native::<Float32Type>(mins, maxs, query, page_ids),
+            Float64 => self.scan_native::<Float64Type>(mins, maxs, query, page_ids),
+            Decimal128(_, _) => self.scan_native::<Decimal128Type>(mins, maxs, query, page_ids),
+            Decimal256(_, _) => self.scan_native::<Decimal256Type>(mins, maxs, query, page_ids),
+            Utf8 => Ok(self.scan_accessor(
+                mins.as_string::<i32>(),
+                maxs.as_string::<i32>(),
+                query.as_string::<i32>(),
+                page_ids,
+            )),
+            LargeUtf8 => Ok(self.scan_accessor(
+                mins.as_string::<i64>(),
+                maxs.as_string::<i64>(),
+                query.as_string::<i64>(),
+                page_ids,
+            )),
+            Binary => Ok(self.scan_accessor(
+                mins.as_binary::<i32>(),
+                maxs.as_binary::<i32>(),
+                query.as_binary::<i32>(),
+                page_ids,
+            )),
+            LargeBinary => Ok(self.scan_accessor(
+                mins.as_binary::<i64>(),
+                maxs.as_binary::<i64>(),
+                query.as_binary::<i64>(),
+                page_ids,
+            )),
+            FixedSizeBinary(_) => Ok(self.scan_accessor(
+                mins.as_fixed_size_binary(),
+                maxs.as_fixed_size_binary(),
+                query.as_fixed_size_binary(),
+                page_ids,
+            )),
+            _ => self.scan_fallback(mins, maxs, query, page_ids),
         }
-        macro_rules! scan_bytes {
-            ($mins:expr, $maxs:expr, $query:expr) => {{
-                let mins = $mins;
-                let maxs = $maxs;
-                let query = $query;
-                self.scan_equality_pages(
-                    query.len(),
-                    page_ids,
-                    |idx| maxs.is_null(idx),
-                    accessor_cmp(mins, query),
-                    accessor_cmp(maxs, query),
-                    accessor_cmp(mins, mins),
-                )
-            }};
-        }
+    }
 
-        let pages = downcast_primitive! {
-            query.data_type() => (scan_primitive),
-            DataType::Utf8 => {
-                scan_bytes!(mins.as_string::<i32>(), maxs.as_string::<i32>(), query.as_string::<i32>())
-            }
-            DataType::LargeUtf8 => {
-                scan_bytes!(mins.as_string::<i64>(), maxs.as_string::<i64>(), query.as_string::<i64>())
-            }
-            DataType::Binary => {
-                scan_bytes!(mins.as_binary::<i32>(), maxs.as_binary::<i32>(), query.as_binary::<i32>())
-            }
-            DataType::LargeBinary => {
-                scan_bytes!(mins.as_binary::<i64>(), maxs.as_binary::<i64>(), query.as_binary::<i64>())
-            }
-            DataType::FixedSizeBinary(_) => {
-                scan_bytes!(mins.as_fixed_size_binary(), maxs.as_fixed_size_binary(), query.as_fixed_size_binary())
-            }
-            _ => {
-                // The batch is sorted ascending by `min` with NULLs first; compare the
-                // query values the same way so the binary searches stay consistent.
-                let opts = SortOptions {
-                    descending: false,
-                    nulls_first: true,
-                };
-                let cmp_min = make_comparator(mins, query, opts)?;
-                let cmp_max = make_comparator(maxs, query, opts)?;
-                let cmp_min_min = make_comparator(mins, mins, opts)?;
-                self.scan_equality_pages(
-                    query.len(),
-                    page_ids,
-                    |idx| maxs.is_null(idx),
-                    cmp_min,
-                    cmp_max,
-                    cmp_min_min,
-                )
-            }
+    /// Native-comparator equality scan for a primitive physical type `K`. The page
+    /// columns and `query` are reinterpreted to `PrimitiveArray<K>` (zero-copy when
+    /// already that type) and compared with [`primitive_cmp`].
+    fn scan_native<K: ArrowPrimitiveType>(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        let mins = reinterpret_primitive::<K>(mins)?;
+        let maxs = reinterpret_primitive::<K>(maxs)?;
+        let query = reinterpret_primitive::<K>(query)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            primitive_cmp(&mins, &query),
+            primitive_cmp(&maxs, &query),
+            primitive_cmp(&mins, &mins),
+        ))
+    }
+
+    /// Native-comparator equality scan for byte-like columns (`Utf8`/`Binary`/
+    /// `FixedSizeBinary` and their large variants), compared lexicographically via
+    /// [`accessor_cmp`].
+    fn scan_accessor<T, A>(&self, mins: A, maxs: A, query: A, page_ids: &[u32]) -> Vec<u32>
+    where
+        T: Ord,
+        A: ArrayAccessor<Item = T> + Copy,
+    {
+        self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            accessor_cmp(mins, query),
+            accessor_cmp(maxs, query),
+            accessor_cmp(mins, mins),
+        )
+    }
+
+    /// Fallback equality scan for types without a native path (intervals with struct
+    /// natives, booleans, ...), using arrow's boxed `make_comparator`.
+    fn scan_fallback(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        // The batch is sorted ascending by `min` with NULLs first; compare the query
+        // values the same way so the binary searches stay consistent.
+        let opts = SortOptions {
+            descending: false,
+            nulls_first: true,
         };
-        Ok(pages)
+        let cmp_min = make_comparator(mins, query, opts)?;
+        let cmp_max = make_comparator(maxs, query, opts)?;
+        let cmp_min_min = make_comparator(mins, mins, opts)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            cmp_min,
+            cmp_max,
+            cmp_min_min,
+        ))
     }
 
     /// Binary-search + forward-scan the page batch for equality candidates.
@@ -5364,6 +5450,90 @@ mod tests {
         assert_byte_lookup(bin(&mins), bin(&maxs), &|v| {
             ScalarValue::Binary(Some(be(v).to_vec()))
         });
+    }
+
+    /// Exercises the physical-type reinterpret path: temporal columns (`Date32`
+    /// over `i32`, `Timestamp` over `i64`) are compared through the integer native
+    /// path without a dedicated per-type branch.
+    #[test]
+    fn test_btree_lookup_pages_eq_temporal() {
+        use arrow_array::{ArrayRef, Date32Array, TimestampMicrosecondArray, UInt32Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let null_count = UInt32Array::from(vec![2u32, 0, 0, 0, 0]);
+        let page_idx = UInt32Array::from(vec![0u32, 1, 2, 3, 4]);
+
+        let assert_lookup =
+            |min_arr: ArrayRef, max_arr: ArrayRef, sv: &dyn Fn(i64) -> ScalarValue| {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("min", min_arr.data_type().clone(), true),
+                        Field::new("max", max_arr.data_type().clone(), true),
+                        Field::new("null_count", DataType::UInt32, false),
+                        Field::new("page_idx", DataType::UInt32, false),
+                    ])),
+                    vec![
+                        min_arr,
+                        max_arr,
+                        Arc::new(null_count.clone()),
+                        Arc::new(page_idx.clone()),
+                    ],
+                )
+                .unwrap();
+                let lookup = BTreeLookup::try_new(batch).unwrap();
+                let eq = |v: i64| {
+                    let mut p: Vec<u32> = lookup
+                        .pages_eq(&OrderableScalarValue(sv(v)))
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.page_id())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                };
+                assert_eq!(eq(15), vec![1]); // only page 1 ([10, 20])
+                assert_eq!(eq(20), vec![1, 2, 3]); // shared min of 2 & 3, max of 1
+                assert!(eq(35).is_empty()); // gap between pages 3 and 4
+                assert_eq!(eq(5), vec![0]); // reaches the null-min straddle via its max
+            };
+
+        // Timestamp (i64-backed) → Int64 native path.
+        assert_lookup(
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::TimestampMicrosecond(Some(v), None),
+        );
+
+        // Date32 (i32-backed) → Int32 native path.
+        assert_lookup(
+            Arc::new(Date32Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(Date32Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::Date32(Some(v as i32)),
+        );
     }
 
     fn assert_state_roundtrips(state: &BTreeIndexState) {
