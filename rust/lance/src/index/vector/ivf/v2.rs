@@ -38,6 +38,7 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::ex_dot::ex_query_len;
 use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::bq::{rabit_ex_bits, rabit_ex_code_bytes};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -152,16 +153,17 @@ fn rotated_partition_centroid_slice(
     cache.rotated_centroids.get(start..end)
 }
 
-fn rabit_ex_dist_table_len(dim: usize, num_bits: u8) -> usize {
+/// `f32` scratch needed for the ex-bit query state: the quantized-table input
+/// for FastScan-supported widths plus the kernel-order query for the exact
+/// rerank path.
+fn rabit_ex_scratch_len(dim: usize, num_bits: u8) -> usize {
     rabit_ex_bits(num_bits)
-        .map(|ex_bits| {
-            if ex_bits == 0 {
-                0
-            } else {
-                dim * (1usize << usize::from(ex_bits))
-            }
+        .map(|ex_bits| match ex_bits {
+            0 => 0,
+            2 | 4 | 8 => dim * (1usize << usize::from(ex_bits)) + ex_query_len(dim),
+            _ => ex_query_len(dim),
         })
-        .unwrap_or(dim * 256)
+        .unwrap_or(dim * 256 + ex_query_len(dim))
 }
 
 fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
@@ -183,12 +185,12 @@ fn rabit_query_scratch_capacity(
     num_bits: u8,
 ) -> QueryScratchCapacity {
     let dist_table_len = dim * 4;
-    let ex_dist_table_len = rabit_ex_dist_table_len(dim, num_bits);
+    let ex_scratch_len = rabit_ex_scratch_len(dim, num_bits);
     let u8_scratch_len = rabit_u8_scratch_len(dim, num_bits);
 
     QueryScratchCapacity::new(
         max_partition_len,
-        dim + dist_table_len + ex_dist_table_len,
+        dim + dist_table_len + ex_scratch_len,
         max_partition_len.max(dist_table_len),
         u8_scratch_len,
     )
@@ -1908,6 +1910,8 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
         RQBuildParams, RQRotationType,
+        ex_dot::ex_query_len,
+        rabit_ex_code_bytes,
         storage::{RABIT_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
@@ -1983,14 +1987,15 @@ mod tests {
     }
 
     #[test]
-    fn test_rabit_ex_dist_table_len_uses_num_bits() {
+    fn test_rabit_ex_scratch_len_uses_num_bits() {
         let dim = 960;
+        let ex_query = ex_query_len(dim);
 
-        assert_eq!(super::rabit_ex_dist_table_len(dim, 1), 0);
-        assert_eq!(super::rabit_ex_dist_table_len(dim, 3), dim * 4);
-        assert_eq!(super::rabit_ex_dist_table_len(dim, 5), dim * 16);
-        assert_eq!(super::rabit_ex_dist_table_len(dim, 7), dim * 64);
-        assert_eq!(super::rabit_ex_dist_table_len(dim, 9), dim * 256);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 1), 0);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 3), dim * 4 + ex_query);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 5), dim * 16 + ex_query);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 7), ex_query);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 9), dim * 256 + ex_query);
     }
 
     #[test]
@@ -2012,7 +2017,10 @@ mod tests {
         let capacity = super::rabit_query_scratch_capacity(dim, max_partition_len, 5);
 
         assert_eq!(capacity.distances, max_partition_len);
-        assert_eq!(capacity.query_f32, dim + dim * 4 + dim * 16);
+        assert_eq!(
+            capacity.query_f32,
+            dim + dim * 4 + dim * 16 + ex_query_len(dim)
+        );
         assert_eq!(capacity.u16, max_partition_len);
         assert_eq!(capacity.u8, dim * 16);
         assert_eq!(capacity.u32, 0);
@@ -4403,18 +4411,24 @@ mod tests {
     }
 
     #[rstest]
-    #[case::l2(DistanceType::L2)]
-    #[case::cosine(DistanceType::Cosine)]
+    #[case::l2(DistanceType::L2, 9)]
+    #[case::cosine(DistanceType::Cosine, 9)]
+    // ex_bits=3 and ex_bits=5 have no FastScan support and use the bit-plane
+    // repack, so these searches go through the exact ex-dot rerank kernels
+    // end to end.
+    #[case::l2_plane_repack_3bit(DistanceType::L2, 4)]
+    #[case::l2_plane_repack_5bit(DistanceType::L2, 6)]
     #[tokio::test]
     async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_searches(
         #[case] distance_type: DistanceType,
+        #[case] num_bits: u8,
     ) {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(4);
-        let rq_params = RQBuildParams::with_rotation_type(9, RQRotationType::Fast);
+        let rq_params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)
@@ -4427,7 +4441,7 @@ mod tests {
         let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
         let index_uuid = indices[0].uuid.to_string();
         let rq_meta = get_rq_metadata(&dataset, scheduler.clone(), &index_uuid).await;
-        assert_eq!(rq_meta.num_bits, 9);
+        assert_eq!(rq_meta.num_bits, num_bits);
         assert_eq!(rq_meta.query_estimator, RabitQueryEstimator::RawQuery);
 
         let reader = open_rq_aux_reader(&dataset, scheduler, &index_uuid).await;
@@ -4436,7 +4450,9 @@ mod tests {
         let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
             panic!("RQ ex-code field should be FixedSizeList");
         };
-        assert_eq!(ex_code_bytes, 32);
+        let expected_ex_code_bytes =
+            rabit_ex_code_bytes(rq_meta.rotated_dim(), num_bits - 1).unwrap() as i32;
+        assert_eq!(ex_code_bytes, expected_ex_code_bytes);
         assert!(schema.field(EX_ADD_FACTORS_COLUMN).is_some());
         assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());
 

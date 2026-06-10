@@ -41,6 +41,10 @@ use serde::{Deserialize, Serialize};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::vector::ApproxMode;
+use crate::vector::bq::ex_dot::{
+    ExDotFn, build_ex_query, build_ex_query_into, ex_dot_code_bytes, ex_dot_kernel, ex_query_len,
+    needs_plane_repack, plane_pack_row,
+};
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
@@ -349,10 +353,13 @@ impl RabitQuantizationMetadata {
         let code_dim = self.code_dim();
         let ex_bits = rabit_ex_bits(self.num_bits)?;
         let dist_table_len = code_dim * 4;
-        let ex_dist_table_len = if ex_bits == 0 {
-            0
-        } else {
+        // The quantized ex dist table is only consumed by the FastScan bulk
+        // path; the exact rerank path multiplies the query against the packed
+        // codes directly (see `ex_dot`).
+        let ex_dist_table_len = if supports_ex_fastscan(ex_bits) {
             code_dim * (1usize << ex_bits)
+        } else {
+            0
         };
 
         let mut rotated_query = vec![0.0; code_dim];
@@ -364,6 +371,12 @@ impl RabitQuantizationMetadata {
         let mut ex_dist_table = vec![0.0; ex_dist_table_len];
         build_ex_dist_table_direct_into(&rotated_query, ex_bits, &mut ex_dist_table);
 
+        let mut ex_query = Vec::new();
+        if ex_bits > 0 {
+            ex_query.resize(ex_query_len(code_dim), 0.0);
+            build_ex_query_into(&rotated_query, ex_bits, &mut ex_query);
+        }
+
         let sum_q = rotated_query.iter().copied().sum();
         Ok(RabitRawQueryContext {
             code_dim,
@@ -371,6 +384,7 @@ impl RabitQuantizationMetadata {
             rotated_query,
             dist_table,
             ex_dist_table,
+            ex_query,
             sum_q,
         })
     }
@@ -464,6 +478,12 @@ pub struct RabitQuantizationStorage {
     error_factors: Option<Float32Array>,
     ex_codes: Option<FixedSizeListArray>,
     packed_ex_codes: Option<FixedSizeListArray>,
+    // ex codes repacked into the bit-plane layout consumed by the ex-dot
+    // kernels; only present for the widths whose sequential layout is not
+    // byte-aligned (see `ex_dot::needs_plane_repack`). This keeps a second
+    // resident copy of the ex codes, mirroring `packed_ex_codes` for the
+    // FastScan widths.
+    plane_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
 }
@@ -474,6 +494,11 @@ impl DeepSizeOf for RabitQuantizationStorage {
             + self.batch.deep_size_of_children(context)
             + self
                 .packed_ex_codes
+                .as_ref()
+                .map(|codes| (codes as &dyn Array).deep_size_of_children(context))
+                .unwrap_or_default()
+            + self
+                .plane_ex_codes
                 .as_ref()
                 .map(|codes| (codes as &dyn Array).deep_size_of_children(context))
                 .unwrap_or_default()
@@ -561,14 +586,18 @@ impl RabitQuantizationStorage {
             dim,
             dist_table,
             ex_dist_table,
+            ex_query,
             sum_q,
             query_factor,
             query_error,
             approx_mode,
         } = parts;
+        // The ex-dot kernels consume the bit-plane repack where one exists and
+        // the sequential (byte-aligned) layout otherwise.
         let ex_codes = self
-            .ex_codes
+            .plane_ex_codes
             .as_ref()
+            .or(self.ex_codes.as_ref())
             .map(|codes| codes.values().as_primitive::<UInt8Type>().values().as_ref());
         let packed_ex_codes = self
             .packed_ex_codes
@@ -580,6 +609,7 @@ impl RabitQuantizationStorage {
             self.metadata.query_estimator,
             dist_table,
             ex_dist_table,
+            ex_query,
             sum_q,
             self.codes.values().as_primitive::<UInt8Type>().values(),
             ex_codes,
@@ -768,6 +798,7 @@ struct RabitDistCalculatorParts<'a> {
     dim: usize,
     dist_table: Cow<'a, [f32]>,
     ex_dist_table: Cow<'a, [f32]>,
+    ex_query: Cow<'a, [f32]>,
     sum_q: f32,
     query_factor: f32,
     query_error: f32,
@@ -780,12 +811,19 @@ pub struct RabitDistCalculator<'a> {
     query_estimator: RabitQueryEstimator,
     // n * d / 8 binary-code bytes
     codes: &'a [u8],
+    // per-row ex codes in the layout consumed by the ex-dot kernels
+    // (`ex_dot::ex_dot_code_bytes` bytes per row)
     ex_codes: Option<&'a [u8]>,
     // this is a flattened 2D array of size d/4 * 16,
     // we split the query codes into d/4 chunks, each chunk is with 4 elements,
     // then dist_table[i][j] is the distance between the i-th query code and the code j
     dist_table: Cow<'a, [f32]>,
+    // only built for the ex widths supported by FastScan; the exact rerank
+    // path uses `ex_query` + `ex_dot` instead
     ex_dist_table: Cow<'a, [f32]>,
+    // rotated query permuted into kernel order (see `ex_dot::build_ex_query_into`)
+    ex_query: Cow<'a, [f32]>,
+    ex_dot: Option<ExDotFn>,
     add_factors: &'a [f32],
     scale_factors: &'a [f32],
     error_factors: Option<&'a [f32]>,
@@ -808,6 +846,7 @@ impl<'a> RabitDistCalculator<'a> {
         query_estimator: RabitQueryEstimator,
         dist_table: Cow<'a, [f32]>,
         ex_dist_table: Cow<'a, [f32]>,
+        ex_query: Cow<'a, [f32]>,
         sum_q: f32,
         codes: &'a [u8],
         ex_codes: Option<&'a [u8]>,
@@ -821,6 +860,7 @@ impl<'a> RabitDistCalculator<'a> {
         query_error: f32,
         approx_mode: ApproxMode,
     ) -> Self {
+        let ex_dot = (num_bits > 1).then(|| ex_dot_kernel(num_bits - 1));
         Self {
             dim,
             num_bits,
@@ -829,6 +869,8 @@ impl<'a> RabitDistCalculator<'a> {
             ex_codes,
             dist_table,
             ex_dist_table,
+            ex_query,
+            ex_dot,
             add_factors,
             scale_factors,
             error_factors,
@@ -841,6 +883,18 @@ impl<'a> RabitDistCalculator<'a> {
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
         }
+    }
+
+    /// `sum_d query[d] * ex_code[d]` for the candidate's packed ex codes.
+    #[inline]
+    fn ex_code_dot(&self, ex_codes: &[u8], id: usize, ex_code_len: usize) -> f32 {
+        let ex_dot = self
+            .ex_dot
+            .expect("raw-query multi-bit RQ requires an ex-dot kernel");
+        ex_dot(
+            self.ex_query.as_ref(),
+            &ex_codes[id * ex_code_len..(id + 1) * ex_code_len],
+        )
     }
 
     #[allow(clippy::uninit_vec)]
@@ -1030,8 +1084,7 @@ impl<'a> RabitDistCalculator<'a> {
         let ex_scale_factors = self
             .ex_scale_factors
             .expect("raw-query multi-bit RQ requires ex scale factors");
-        let ex_code_len =
-            rabit_ex_code_bytes(self.dim, ex_bits).expect("RabitQ num_bits should be validated");
+        let ex_code_len = ex_dot_code_bytes(self.dim, ex_bits);
         let code_scale = (1u32 << ex_bits) as f32;
         let code_bias = -(code_scale - 0.5);
 
@@ -1088,14 +1141,7 @@ impl<'a> RabitDistCalculator<'a> {
             .enumerate()
             .skip(fastscan_len)
             .for_each(|(id, dist)| {
-                let ex_dist = compute_single_rq_ex_distance(
-                    ex_codes,
-                    id,
-                    ex_code_len,
-                    ex_bits,
-                    self.dim,
-                    &self.ex_dist_table,
-                );
+                let ex_dist = self.ex_code_dot(ex_codes, id, ex_code_len);
                 let full_dot = code_scale * *dist + ex_dist + code_bias * self.sum_q;
                 *dist = full_dot * ex_scale_factors[id] + ex_add_factors[id] + self.query_factor;
             });
@@ -1126,14 +1172,7 @@ impl<'a> RabitDistCalculator<'a> {
         ex_add_factors: &[f32],
         ex_scale_factors: &[f32],
     ) -> f32 {
-        let ex_dist = compute_single_rq_ex_distance(
-            ex_codes,
-            id,
-            ex_code_len,
-            ex_bits,
-            self.dim,
-            &self.ex_dist_table,
-        );
+        let ex_dist = self.ex_code_dot(ex_codes, id, ex_code_len);
         let code_bias = -((1u32 << ex_bits) as f32 - 0.5);
         let full_dot = (1u32 << ex_bits) as f32 * binary_ip + ex_dist + code_bias * self.sum_q;
         full_dot * ex_scale_factors[id] + ex_add_factors[id] + self.query_factor
@@ -1180,8 +1219,7 @@ impl<'a> RabitDistCalculator<'a> {
         let ex_scale_factors = self
             .ex_scale_factors
             .expect("raw-query multi-bit RQ requires ex scale factors");
-        let ex_code_len =
-            rabit_ex_code_bytes(self.dim, ex_bits).expect("RabitQ num_bits should be validated");
+        let ex_code_len = ex_dot_code_bytes(self.dim, ex_bits);
         let query_lower_bound = lower_bound.unwrap_or(f32::MIN);
         let query_upper_bound = upper_bound.unwrap_or(f32::MAX);
         let mut max_dist = res.peek().map(|node| node.dist);
@@ -1287,7 +1325,9 @@ fn build_ex_dist_table_direct(rotated_query: &[f32], ex_bits: u8) -> Vec<f32> {
 }
 
 fn build_ex_dist_table_direct_into(rotated_query: &[f32], ex_bits: u8, dist_table: &mut [f32]) {
-    if ex_bits == 0 {
+    // The table may legitimately be empty for multi-bit widths without
+    // FastScan support; the exact path uses the ex-dot kernels instead.
+    if ex_bits == 0 || dist_table.is_empty() {
         debug_assert!(dist_table.is_empty());
         return;
     }
@@ -1401,21 +1441,6 @@ fn quantize_dist_table_u16_into(
     (qmin, qmax)
 }
 
-#[inline]
-fn packed_ex_code_value(row_codes: &[u8], dim_idx: usize, ex_bits: u8) -> u8 {
-    debug_assert!(ex_bits > 0);
-    let bit_offset = dim_idx * ex_bits as usize;
-    let byte_idx = bit_offset / u8::BITS as usize;
-    let bit_shift = bit_offset % u8::BITS as usize;
-    let bits = row_codes[byte_idx] as u16
-        | row_codes
-            .get(byte_idx + 1)
-            .map(|byte| (*byte as u16) << u8::BITS)
-            .unwrap_or_default();
-    let mask = (1u16 << ex_bits) - 1;
-    ((bits >> bit_shift) & mask) as u8
-}
-
 fn quantize_ex_fastscan_dist_table_into(
     dim: usize,
     ex_bits: u8,
@@ -1517,28 +1542,6 @@ fn ex_dist_table_value(
     ex_dist_table[dim_idx * entries_per_dim + code]
 }
 
-#[inline]
-fn compute_single_rq_ex_distance(
-    ex_codes: &[u8],
-    id: usize,
-    ex_code_len: usize,
-    ex_bits: u8,
-    dim: usize,
-    ex_dist_table: &[f32],
-) -> f32 {
-    if ex_bits == 0 {
-        return 0.0;
-    }
-    let entries_per_dim = 1usize << ex_bits;
-    let row_codes = &ex_codes[id * ex_code_len..(id + 1) * ex_code_len];
-    (0..dim)
-        .map(|dim_idx| {
-            let code = packed_ex_code_value(row_codes, dim_idx, ex_bits) as usize;
-            ex_dist_table[dim_idx * entries_per_dim + code]
-        })
-        .sum()
-}
-
 fn maybe_pack_ex_codes(
     ex_codes: Option<&FixedSizeListArray>,
     ex_bits: u8,
@@ -1548,6 +1551,33 @@ fn maybe_pack_ex_codes(
         2 | 4 | 8 => Some(pack_codes(ex_codes)),
         _ => None,
     }
+}
+
+/// Repack sequential ex codes into the bit-plane layout the ex-dot kernels
+/// consume, for the widths whose sequential layout is not byte-aligned.
+fn maybe_plane_pack_ex_codes(
+    ex_codes: Option<&FixedSizeListArray>,
+    dim: usize,
+    ex_bits: u8,
+) -> Result<Option<FixedSizeListArray>> {
+    let ex_codes = match ex_codes {
+        Some(ex_codes) if needs_plane_repack(ex_bits) => ex_codes,
+        _ => return Ok(None),
+    };
+    let seq_code_len = ex_codes.value_length() as usize;
+    let seq_values = ex_codes.values().as_primitive::<UInt8Type>().values();
+    let plane_code_len = ex_dot_code_bytes(dim, ex_bits);
+    let mut plane_values = vec![0u8; ex_codes.len() * plane_code_len];
+    for (seq_row, plane_row) in seq_values
+        .chunks_exact(seq_code_len)
+        .zip(plane_values.chunks_exact_mut(plane_code_len))
+    {
+        plane_pack_row(seq_row, dim, ex_bits, plane_row);
+    }
+    Ok(Some(FixedSizeListArray::try_new_from_values(
+        UInt8Array::from(plane_values),
+        plane_code_len as i32,
+    )?))
 }
 
 impl DistCalculator for RabitDistCalculator<'_> {
@@ -1580,8 +1610,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
                 let ex_scale_factors = self
                     .ex_scale_factors
                     .expect("raw-query multi-bit RQ requires ex scale factors");
-                let ex_code_len = rabit_ex_code_bytes(self.dim, ex_bits)
-                    .expect("RabitQ num_bits should be validated");
+                let ex_code_len = ex_dot_code_bytes(self.dim, ex_bits);
                 self.raw_query_multi_bit_exact_distance(
                     id,
                     dist,
@@ -1866,7 +1895,16 @@ impl VectorStore for RabitQuantizationStorage {
         let rotated_qr = self.rotate_query_vector(code_dim, &qr);
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
         let ex_bits = self.metadata.num_bits - 1;
-        let ex_dist_table = build_ex_dist_table_direct(&rotated_qr, ex_bits);
+        let ex_dist_table = if supports_ex_fastscan(ex_bits) {
+            build_ex_dist_table_direct(&rotated_qr, ex_bits)
+        } else {
+            Vec::new()
+        };
+        let ex_query = if ex_bits > 0 {
+            build_ex_query(&rotated_qr, ex_bits)
+        } else {
+            Vec::new()
+        };
         let query_factor = match self.metadata.query_estimator {
             RabitQueryEstimator::ResidualQuery => self.residual_query_factor(dist_q_c),
             RabitQueryEstimator::RawQuery => self.raw_query_factor(dist_q_c, &rotated_qr, None),
@@ -1883,6 +1921,7 @@ impl VectorStore for RabitQuantizationStorage {
             dim: code_dim,
             dist_table: Cow::Owned(dist_table),
             ex_dist_table: Cow::Owned(ex_dist_table),
+            ex_query: Cow::Owned(ex_query),
             sum_q,
             query_factor,
             query_error,
@@ -1922,6 +1961,7 @@ impl VectorStore for RabitQuantizationStorage {
                 dim: code_dim,
                 dist_table: Cow::Borrowed(&raw_query.dist_table),
                 ex_dist_table: Cow::Borrowed(&raw_query.ex_dist_table),
+                ex_query: Cow::Borrowed(&raw_query.ex_query),
                 sum_q: raw_query.sum_q,
                 query_factor,
                 query_error,
@@ -1931,18 +1971,29 @@ impl VectorStore for RabitQuantizationStorage {
 
         let dist_table_len = code_dim * 4;
         let ex_bits = self.metadata.num_bits - 1;
-        let ex_dist_table_len = if ex_bits == 0 {
+        // Only the FastScan bulk path consumes the quantized ex dist table;
+        // the exact rerank path uses the kernel-order query instead.
+        let ex_dist_table_len = if supports_ex_fastscan(ex_bits) {
+            code_dim * (1usize << ex_bits)
+        } else {
+            0
+        };
+        let ex_query_table_len = if ex_bits == 0 {
             0
         } else {
-            code_dim * (1usize << ex_bits)
+            ex_query_len(code_dim)
         };
-        f32_scratch.resize(code_dim + dist_table_len + ex_dist_table_len, 0.0);
+        f32_scratch.resize(
+            code_dim + dist_table_len + ex_dist_table_len + ex_query_table_len,
+            0.0,
+        );
 
         let query_factor;
         let query_error;
         let sum_q = {
             let (rotated_qr, remaining) = f32_scratch.split_at_mut(code_dim);
-            let (dist_table, ex_dist_table) = remaining.split_at_mut(dist_table_len);
+            let (dist_table, remaining) = remaining.split_at_mut(dist_table_len);
+            let (ex_dist_table, ex_query) = remaining.split_at_mut(ex_dist_table_len);
             match residual {
                 Some(QueryResidual::Centroid(residual_centroid)) => {
                     self.rotate_query_vector_into(
@@ -1982,15 +2033,20 @@ impl VectorStore for RabitQuantizationStorage {
             };
             build_dist_table_direct_into::<Float32Type>(rotated_qr, dist_table);
             build_ex_dist_table_direct_into(rotated_qr, ex_bits, ex_dist_table);
+            if ex_bits > 0 {
+                build_ex_query_into(rotated_qr, ex_bits, ex_query);
+            }
             rotated_qr.iter().copied().sum()
         };
 
+        let ex_dist_table_start = code_dim + dist_table_len;
+        let ex_query_start = ex_dist_table_start + ex_dist_table_len;
         self.distance_calculator_from_parts(RabitDistCalculatorParts {
             dim: code_dim,
-            dist_table: Cow::Borrowed(&f32_scratch[code_dim..code_dim + dist_table_len]),
-            ex_dist_table: Cow::Borrowed(
-                &f32_scratch
-                    [code_dim + dist_table_len..code_dim + dist_table_len + ex_dist_table_len],
+            dist_table: Cow::Borrowed(&f32_scratch[code_dim..ex_dist_table_start]),
+            ex_dist_table: Cow::Borrowed(&f32_scratch[ex_dist_table_start..ex_query_start]),
+            ex_query: Cow::Borrowed(
+                &f32_scratch[ex_query_start..ex_query_start + ex_query_table_len],
             ),
             sum_q,
             query_factor,
@@ -2271,6 +2327,8 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let mut metadata = metadata.clone();
         metadata.packed = true;
         let packed_ex_codes = maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits);
+        let plane_ex_codes =
+            maybe_plane_pack_ex_codes(ex_codes.as_ref(), metadata.rotated_dim(), ex_bits)?;
 
         Ok(Self {
             metadata,
@@ -2283,6 +2341,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             error_factors,
             ex_codes,
             packed_ex_codes,
+            plane_ex_codes,
             ex_add_factors,
             ex_scale_factors,
         })
@@ -2356,8 +2415,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let ex_codes = batch
             .column_by_name(RABIT_EX_CODE_COLUMN)
             .map(|codes| codes.as_fixed_size_list().clone());
-        let packed_ex_codes =
-            maybe_pack_ex_codes(ex_codes.as_ref(), rabit_ex_bits(self.metadata.num_bits)?);
+        let ex_bits = rabit_ex_bits(self.metadata.num_bits)?;
+        let packed_ex_codes = maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits);
+        let plane_ex_codes =
+            maybe_plane_pack_ex_codes(ex_codes.as_ref(), self.metadata.rotated_dim(), ex_bits)?;
         let ex_add_factors = batch
             .column_by_name(EX_ADD_FACTORS_COLUMN)
             .map(|factors| factors.as_primitive::<Float32Type>().clone());
@@ -2375,6 +2436,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             error_factors,
             ex_codes,
             packed_ex_codes,
+            plane_ex_codes,
             ex_add_factors,
             ex_scale_factors,
             row_ids: new_row_ids,
@@ -2896,6 +2958,206 @@ mod tests {
             &mut u32_scratch,
         );
         assert_eq!(distances, vec![104.0, 22.0]);
+    }
+
+    /// Exercise the ex-dot kernel through the storage API for every ex width,
+    /// including the widths without FastScan support ({1, 3, 5, 6, 7}), and a
+    /// dim that is not a multiple of the 64-dim kernel group.
+    ///
+    /// The dim must be a multiple of 8: the binary distance stage consumes
+    /// two 4-dim segments per code byte and ignores trailing dims otherwise.
+    #[test]
+    fn test_raw_query_multi_bit_distance_matches_reference_for_all_ex_widths() {
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+
+        // 72 exercises the kernels' padded-tail path; 1536 is a production
+        // embedding dim exercising the full-group path.
+        for (code_dim, num_rows) in [(72usize, 33usize), (1536, 33)] {
+            for num_bits in 2..=9u8 {
+                let ex_bits = num_bits - 1;
+                let mut rng = SmallRng::seed_from_u64(num_bits as u64);
+
+                let sign_bits = (0..num_rows * code_dim)
+                    .map(|_| rng.random_bool(0.5))
+                    .collect::<Vec<_>>();
+                let max_code = ((1u16 << ex_bits) - 1) as u8;
+                let ex_values = (0..num_rows * code_dim)
+                    .map(|_| rng.random_range(0..=max_code))
+                    .collect::<Vec<_>>();
+
+                let code_len = rabit_binary_code_bytes(code_dim);
+                let mut code_bytes = vec![0u8; num_rows * code_len];
+                for (row, bits) in sign_bits.chunks_exact(code_dim).enumerate() {
+                    for (dim, &bit) in bits.iter().enumerate() {
+                        code_bytes[row * code_len + dim / 8] |= (bit as u8) << (dim % 8);
+                    }
+                }
+                let ex_code_len = rabit_ex_code_bytes(code_dim, ex_bits).unwrap();
+                let mut ex_code_bytes = vec![0u8; num_rows * ex_code_len];
+                for (row, values) in ex_values.chunks_exact(code_dim).enumerate() {
+                    for (dim, &value) in values.iter().enumerate() {
+                        let bit_offset = dim * ex_bits as usize;
+                        let bits = (value as u16) << (bit_offset % 8);
+                        ex_code_bytes[row * ex_code_len + bit_offset / 8] |= bits as u8;
+                        if bits >> 8 != 0 {
+                            ex_code_bytes[row * ex_code_len + bit_offset / 8 + 1] |=
+                                (bits >> 8) as u8;
+                        }
+                    }
+                }
+
+                let identity = Float32Array::from_iter_values((0..code_dim).flat_map(|row| {
+                    (0..code_dim).map(move |col| if row == col { 1.0 } else { 0.0 })
+                }));
+                let rotate_mat =
+                    FixedSizeListArray::try_new_from_values(identity, code_dim as i32).unwrap();
+                let metadata = RabitQuantizationMetadata {
+                    rotate_mat: Some(rotate_mat),
+                    rotate_mat_position: None,
+                    fast_rotation_signs: None,
+                    rotation_type: RQRotationType::Matrix,
+                    code_dim: code_dim as u32,
+                    num_bits,
+                    packed: false,
+                    query_estimator: RabitQueryEstimator::RawQuery,
+                };
+                let codes = FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(code_bytes),
+                    code_len as i32,
+                )
+                .unwrap();
+                let ex_codes = FixedSizeListArray::try_new_from_values(
+                    UInt8Array::from(ex_code_bytes),
+                    ex_code_len as i32,
+                )
+                .unwrap();
+                let ex_add_factors = (0..num_rows)
+                    .map(|_| rng.random_range(-1.0f32..1.0))
+                    .collect::<Vec<_>>();
+                let ex_scale_factors = (0..num_rows)
+                    .map(|_| rng.random_range(0.1f32..1.0))
+                    .collect::<Vec<_>>();
+                let batch = RecordBatch::try_from_iter(vec![
+                    (
+                        ROW_ID,
+                        Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+                    ),
+                    (RABIT_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+                    (
+                        ADD_FACTORS_COLUMN,
+                        Arc::new(Float32Array::from(vec![0.0; num_rows])) as ArrayRef,
+                    ),
+                    (
+                        SCALE_FACTORS_COLUMN,
+                        Arc::new(Float32Array::from(vec![0.0; num_rows])) as ArrayRef,
+                    ),
+                    (RABIT_EX_CODE_COLUMN, Arc::new(ex_codes) as ArrayRef),
+                    (
+                        EX_ADD_FACTORS_COLUMN,
+                        Arc::new(Float32Array::from(ex_add_factors.clone())) as ArrayRef,
+                    ),
+                    (
+                        EX_SCALE_FACTORS_COLUMN,
+                        Arc::new(Float32Array::from(ex_scale_factors.clone())) as ArrayRef,
+                    ),
+                ])
+                .unwrap();
+                let storage = RabitQuantizationStorage::try_from_batch(
+                    batch,
+                    &metadata,
+                    DistanceType::L2,
+                    None,
+                )
+                .unwrap();
+
+                let query = (0..code_dim)
+                    .map(|_| rng.random_range(-1.0f32..1.0))
+                    .collect::<Vec<_>>();
+                let sum_q = query.iter().sum::<f32>();
+                let calc = storage
+                    .dist_calculator(Arc::new(Float32Array::from(query.clone())) as ArrayRef, 0.0);
+
+                let code_scale = (1u32 << ex_bits) as f32;
+                let code_bias = -(code_scale - 0.5);
+                let expected = (0..num_rows)
+                    .map(|row| {
+                        let binary_ip = (0..code_dim)
+                            .map(|dim| query[dim] * sign_bits[row * code_dim + dim] as u8 as f32)
+                            .sum::<f32>();
+                        let ex_dist = (0..code_dim)
+                            .map(|dim| query[dim] * ex_values[row * code_dim + dim] as f32)
+                            .sum::<f32>();
+                        let full_dot = code_scale * binary_ip + ex_dist + code_bias * sum_q;
+                        full_dot * ex_scale_factors[row] + ex_add_factors[row]
+                    })
+                    .collect::<Vec<_>>();
+
+                for (row, &want) in expected.iter().enumerate() {
+                    let got = calc.distance(row as u32);
+                    assert!(
+                        (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                        "num_bits={num_bits} row={row}: {got} != {want}"
+                    );
+                }
+
+                let mut distances = Vec::new();
+                let mut u16_scratch = Vec::new();
+                let mut u8_scratch = Vec::new();
+                let mut u32_scratch = Vec::new();
+                calc.distance_all_with_scratch(
+                    0,
+                    &mut distances,
+                    &mut u16_scratch,
+                    &mut u8_scratch,
+                    &mut u32_scratch,
+                );
+                assert_eq!(distances.len(), num_rows);
+                // The bulk path quantizes the binary LUT to u8, and that error is
+                // amplified by 2^ex_bits in the multi-bit estimate, so the value
+                // assertions need a quantization-aware bound. The FastScan ex
+                // widths additionally quantize the ex LUT and are covered by
+                // `test_raw_query_multi_bit_distance_all_uses_fastscan_for_split_ex_codes`.
+                if !matches!(ex_bits, 2 | 4 | 8) {
+                    // Worst-case |error| of one u8-quantized binary LUT lookup is
+                    // (table range) / 255 / 2, accumulated over one lookup per
+                    // 8-dim pair of segments.
+                    let num_tables = code_dim.div_ceil(4);
+                    let mut table_min = f32::INFINITY;
+                    let mut table_max = f32::NEG_INFINITY;
+                    for segment in query.chunks(4) {
+                        for subset in 0..16usize {
+                            let value = segment
+                                .iter()
+                                .enumerate()
+                                .filter(|(idx, _)| subset & (1 << idx) != 0)
+                                .map(|(_, q)| *q)
+                                .sum::<f32>();
+                            table_min = table_min.min(value);
+                            table_max = table_max.max(value);
+                        }
+                    }
+                    let binary_bound =
+                        code_scale * num_tables as f32 * (table_max - table_min) / 255.0 / 2.0
+                            * ex_scale_factors.iter().fold(0.0f32, |max, &s| max.max(s));
+                    for (row, (&got, &want)) in distances.iter().zip(expected.iter()).enumerate() {
+                        assert!(
+                            (got - want).abs() <= binary_bound + 1e-3,
+                            "num_bits={num_bits} row={row} (distance_all): {got} != {want} (bound {binary_bound})"
+                        );
+                    }
+                    // Rows past the SIMD batch use the exact binary path, so the
+                    // final remainder row must match the per-candidate distance.
+                    let remainder_row = num_rows - 1;
+                    let got = distances[remainder_row];
+                    let want = calc.distance(remainder_row as u32);
+                    assert!(
+                        (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                        "num_bits={num_bits} remainder row (distance_all): {got} != {want}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -3571,11 +3833,19 @@ mod tests {
 
     #[test]
     fn test_remap_preserves_multi_bit_rq_split_columns() {
+        // num_bits=9 keeps sequential ex codes; num_bits 4/6/8 (ex_bits
+        // 3/5/7) also exercise the bit-plane repack rebuild in `remap`.
+        for num_bits in [4, 6, 8, 9u8] {
+            test_remap_preserves_multi_bit_rq_split_columns_impl(num_bits);
+        }
+    }
+
+    fn test_remap_preserves_multi_bit_rq_split_columns_impl(num_bits: u8) {
         let original_codes = make_test_codes(50, 64);
         let code_dim = original_codes.value_length() as usize * 8;
-        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, 9);
+        let ex_codes = make_test_ex_codes(original_codes.len(), code_dim, num_bits);
         let mut metadata = make_test_metadata(code_dim);
-        metadata.num_bits = 9;
+        metadata.num_bits = num_bits;
         let storage = RabitQuantizationStorage::try_from_batch(
             make_test_batch_with_ex(original_codes.clone(), ex_codes),
             &metadata,
@@ -3599,11 +3869,12 @@ mod tests {
         );
         assert_eq!(remapped_row_ids, expected_row_ids.values());
 
+        let ex_code_len = rabit_ex_code_bytes(code_dim, rabit_ex_bits(num_bits).unwrap()).unwrap();
         assert_eq!(
             remapped_batch[RABIT_EX_CODE_COLUMN]
                 .as_fixed_size_list()
                 .value_length(),
-            64
+            ex_code_len as i32
         );
         assert_eq!(
             &remapped_batch[EX_ADD_FACTORS_COLUMN]
@@ -3622,6 +3893,21 @@ mod tests {
                 .as_primitive::<Float32Type>()
                 .values()[..5],
             &[0.25, 1.25, 2.25, 4.25, 5.25]
+        );
+
+        // The remapped storage must hold the same kernel-layout ex codes as a
+        // storage freshly loaded from the remapped batch.
+        let reloaded = RabitQuantizationStorage::try_from_batch(
+            remapped_batch,
+            &remapped.metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(remapped.plane_ex_codes, reloaded.plane_ex_codes);
+        assert_eq!(
+            remapped.plane_ex_codes.is_some(),
+            needs_plane_repack(rabit_ex_bits(num_bits).unwrap())
         );
     }
 }
