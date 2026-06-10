@@ -1,6 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! HDFS object store provider backed by OpenDAL.
+//!
+//! HDFS support is optional and requires the `hdfs` Cargo feature. Dataset URIs
+//! use the form `hdfs://<name-node-or-nameservice>/<path>`, for example
+//! `hdfs://namenode:9000/user/lance/dataset` or
+//! `hdfs://mycluster/user/lance/dataset` for an HA nameservice.
+//!
+//! Configuration priority is `storage_options`, environment variables, then
+//! the URI authority:
+//!
+//! | `storage_options` key | Environment variable | OpenDAL option |
+//! | --- | --- | --- |
+//! | `hdfs_name_node` | `HDFS_NAME_NODE` | `name_node` |
+//! | `hdfs_user` | `HADOOP_USER_NAME`, then `HDFS_USER` | `user` |
+//! | `hdfs_kerberos_ticket_cache_path` | None | `kerberos_ticket_cache_path` |
+//! | `hdfs_atomic_write_dir` | None | `atomic_write_dir` |
+//!
+//! OpenDAL's HDFS service depends on `hdrs` and `hdfs-sys`. Building and
+//! running it requires a local Java and Hadoop native environment. In
+//! particular, configure `JAVA_HOME`, `HADOOP_HOME`, `CLASSPATH`, and the
+//! platform library path so that `libjvm` and, when dynamically linked,
+//! `libhdfs` can be discovered.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
