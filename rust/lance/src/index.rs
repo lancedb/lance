@@ -688,6 +688,7 @@ struct IndexDescriptionImpl {
     /// persisted in the manifest. Such indices are still described on a
     /// best-effort basis rather than rejected.
     details: Option<IndexDetails>,
+    scalar_index_plugins: Arc<lance_index::registry::IndexPluginRegistry>,
     rows_indexed: u64,
 }
 
@@ -748,7 +749,7 @@ impl IndexDescriptionImpl {
                     // is registered, so a known type URL is never reported as the
                     // opaque "Unknown".
                     details
-                        .get_plugin()
+                        .get_plugin(dataset.session.scalar_index_plugins().as_ref())
                         .map(|p| p.name().to_string())
                         .unwrap_or_else(|_| {
                             display_type_from_url(details.0.type_url.as_str()).to_string()
@@ -805,6 +806,7 @@ impl IndexDescriptionImpl {
             index_type,
             segments,
             details,
+            scalar_index_plugins: dataset.session.scalar_index_plugins(),
             rows_indexed,
         })
     }
@@ -854,7 +856,7 @@ impl IndexDescription for IndexDescriptionImpl {
         if details.is_vector() {
             vector_details_as_json(&details.0)
         } else {
-            let plugin = details.get_plugin()?;
+            let plugin = details.get_plugin(self.scalar_index_plugins.as_ref())?;
             plugin.details_as_json(&details.0).map(|v| v.to_string())
         }
     }
@@ -1028,7 +1030,14 @@ impl DatasetIndexExt for Dataset {
                     .iter()
                     .filter_map(|id| self.schema().field_by_id(*id))
                     .collect::<Vec<_>>();
-                match index_matches_criteria(idx, &criteria, &fields, false, self.schema()) {
+                match index_matches_criteria(
+                    idx,
+                    &criteria,
+                    &fields,
+                    false,
+                    self.schema(),
+                    self.session.scalar_index_plugins().as_ref(),
+                ) {
                     Ok(matched) => matched,
                     Err(err) => {
                         log::warn!("Could not describe index {}: {}", idx.name, err);
@@ -1069,7 +1078,10 @@ impl DatasetIndexExt for Dataset {
                     &self.manifest,
                 )
                 .await?;
-                retain_supported_indices(&mut loaded_indices);
+                retain_supported_indices(
+                    &mut loaded_indices,
+                    self.session.scalar_index_plugins().as_ref(),
+                );
                 let loaded_indices = Arc::new(loaded_indices);
                 self.index_cache
                     .insert_with_key(&metadata_key, loaded_indices.clone())
@@ -1327,6 +1339,7 @@ impl DatasetIndexExt for Dataset {
                         &[field],
                         has_multiple,
                         self.schema(),
+                        self.session.scalar_index_plugins().as_ref(),
                     )?
                 {
                     let non_empty = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
@@ -1623,20 +1636,24 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
-        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
         let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
         if index_uri.is_none() {
             index_uri = Some(index_details.type_url.clone());
         }
 
         let index_details_wrapper = scalar::IndexDetails(index_details.clone());
-        if let Ok(plugin) = index_details_wrapper.get_plugin()
-            && let Some(stats) = plugin
-                .load_statistics(index_store.clone(), index_details.as_ref())
-                .await?
+        if let Ok(plugin) =
+            index_details_wrapper.get_plugin(ds.session.scalar_index_plugins().as_ref())
+            && plugin.supports_load_statistics()
         {
-            indices_stats.push(stats);
-            continue;
+            let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
+            if let Some(stats) = plugin
+                .load_statistics(index_store, index_details.as_ref())
+                .await?
+            {
+                indices_stats.push(stats);
+                continue;
+            }
         }
 
         let index = ds
@@ -1699,14 +1716,17 @@ async fn gather_fragment_statistics(
     )))
 }
 
-pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
+pub(crate) fn retain_supported_indices(
+    indices: &mut Vec<IndexMetadata>,
+    registry: &lance_index::registry::IndexPluginRegistry,
+) {
     indices.retain(|idx| {
         let max_supported_version = idx
             .index_details
             .as_ref()
             .map(|details| {
                 IndexDetails(details.clone())
-                    .index_version()
+                    .index_version(registry)
                     // If we don't know how to read the index, it isn't supported
                     .unwrap_or(i32::MAX as u32)
             })
@@ -2337,19 +2357,20 @@ impl DatasetIndexInternalExt for Dataset {
                 continue;
             }
 
-            let plugin = match index_details.get_plugin() {
-                Ok(plugin) => plugin,
-                Err(e) => {
-                    log::warn!(
-                        "Skipping index '{}' on column '{}': {}. \
+            let plugin =
+                match index_details.get_plugin(self.session.scalar_index_plugins().as_ref()) {
+                    Ok(plugin) => plugin,
+                    Err(e) => {
+                        log::warn!(
+                            "Skipping index '{}' on column '{}': {}. \
                          Queries on this column will fall back to a full scan.",
-                        index.name,
-                        field_path,
-                        e
-                    );
-                    continue;
-                }
-            };
+                            index.name,
+                            field_path,
+                            e
+                        );
+                        continue;
+                    }
+                };
             let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
 
             if let Some(query_parser) = query_parser {

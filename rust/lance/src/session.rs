@@ -8,6 +8,7 @@ use lance_core::cache::{CacheBackend, LanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
+use lance_index::registry::IndexPluginRegistry;
 use lance_io::object_store::ObjectStoreRegistry;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
@@ -19,6 +20,7 @@ use self::index_extension::IndexExtension;
 pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
+pub mod xabi_index_plugin;
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
@@ -52,6 +54,8 @@ pub struct Session {
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
+    pub(crate) scalar_index_plugins: Arc<IndexPluginRegistry>,
+
     store_registry: Arc<ObjectStoreRegistry>,
 }
 
@@ -83,6 +87,7 @@ impl std::fmt::Debug for Session {
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
+            .field("scalar_index_plugins", &"IndexPluginRegistry")
             .finish()
     }
 }
@@ -106,6 +111,7 @@ impl Session {
             index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
+            scalar_index_plugins: IndexPluginRegistry::with_default_plugins(),
             store_registry,
         }
     }
@@ -123,6 +129,7 @@ impl Session {
             index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
+            scalar_index_plugins: IndexPluginRegistry::with_default_plugins(),
             store_registry,
         }
     }
@@ -171,6 +178,25 @@ impl Session {
         Ok(())
     }
 
+    /// Register scalar index plugins from a trusted xabi dynamic library.
+    ///
+    /// # Safety
+    ///
+    /// Loading a plugin library runs native code in the current process. The
+    /// caller must trust `path` and ensure it was built against a compatible
+    /// Lance index plugin ABI.
+    pub unsafe fn register_xabi_index_plugin_library(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Vec<String>> {
+        unsafe {
+            xabi_index_plugin::register_xabi_scalar_index_plugin_library(
+                self.scalar_index_plugins.clone(),
+                path,
+            )
+        }
+    }
+
     /// Return the current size of the session in bytes
     ///
     /// Keep in mind that this is not trivial to compute, as we will need to walk the caches
@@ -193,6 +219,11 @@ impl Session {
     /// Get the object store registry.
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
         self.store_registry.clone()
+    }
+
+    /// Get the scalar index plugin registry.
+    pub fn scalar_index_plugins(&self) -> Arc<IndexPluginRegistry> {
+        self.scalar_index_plugins.clone()
     }
 
     /// Get a reference to the raw metadata cache (for use in index reconstruction).

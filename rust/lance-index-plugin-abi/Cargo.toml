@@ -1,0 +1,26 @@
+[package]
+name = "lance-index-plugin-abi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stable ABI contracts for Lance index plugins"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+xabi.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+xabi-assert = "0.1.0"

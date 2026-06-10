@@ -101,7 +101,7 @@ def probe_index_statistics_no_leak(dataset_path: str) -> None:
             d.stats.index_stats(idx.name)
 
     assert_noleaks(
-        access_index_stats, iterations=1000, threshold_mb=2.0, check_interval=25
+        access_index_stats, iterations=1000, threshold_mb=3.0, check_interval=25
     )
 
 

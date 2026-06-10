@@ -12,7 +12,7 @@ pub(crate) mod zonemap;
 
 pub use inverted::{load_segment_details, load_segments};
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -37,7 +37,6 @@ use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
 };
 use lance_index::progress::IndexBuildProgress;
-use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::label_list::{
@@ -232,10 +231,6 @@ pub(crate) async fn load_training_data(
     }
 }
 
-// TODO: Allow users to register their own plugins
-static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
-
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 
 impl IndexDetails {
@@ -251,12 +246,18 @@ impl IndexDetails {
     }
 
     /// Returns the plugin for the index
-    pub fn get_plugin(&self) -> Result<&dyn ScalarIndexPlugin> {
-        SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(self.0.as_ref())
+    pub fn get_plugin(
+        &self,
+        registry: &lance_index::registry::IndexPluginRegistry,
+    ) -> Result<Arc<dyn ScalarIndexPlugin>> {
+        registry.get_plugin_by_details(self.0.as_ref())
     }
 
     /// Returns the index version
-    pub fn index_version(&self) -> Result<u32> {
+    pub fn index_version(
+        &self,
+        registry: &lance_index::registry::IndexPluginRegistry,
+    ) -> Result<u32> {
         if self.is_vector() {
             // VectorIndexDetails currently does not include the concrete vector
             // subtype (IVF_PQ / IVF_RQ / ...), so compatibility filtering cannot
@@ -265,7 +266,7 @@ impl IndexDetails {
             // ignore newer indices based on their own lower bound.
             Ok(IndexType::max_vector_version())
         } else {
-            self.get_plugin().map(|p| p.version())
+            self.get_plugin(registry).map(|p| p.version())
         }
     }
 }
@@ -293,7 +294,10 @@ pub(super) async fn build_scalar_index(
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
 
-    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let plugin = dataset
+        .session
+        .scalar_index_plugins()
+        .get_plugin_by_name(&params.index_type)?;
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
@@ -350,7 +354,10 @@ pub(super) async fn build_bitmap_index_segment(
     let field: arrow_schema::Field = field.into();
 
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
-    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let plugin = dataset
+        .session
+        .scalar_index_plugins()
+        .get_plugin_by_name(&params.index_type)?;
     let training_request =
         plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
     let criteria = training_request.criteria();
@@ -438,7 +445,10 @@ pub async fn open_scalar_index(
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
-    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
+    let plugin = dataset
+        .session
+        .scalar_index_plugins()
+        .get_plugin_by_details(index_details.as_ref())?;
 
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 
@@ -537,6 +547,7 @@ pub fn index_matches_criteria(
     fields: &[&Field],
     has_multiple_indices: bool,
     schema: &lance_core::datatypes::Schema,
+    registry: &lance_index::registry::IndexPluginRegistry,
 ) -> Result<bool> {
     if let Some(name) = &criteria.has_name
         && &index.name != name
@@ -589,7 +600,7 @@ pub fn index_matches_criteria(
         // We should not use FTS / NGram indices for exact equality queries
         // (i.e. merge insert with a join on the indexed column)
         if criteria.must_support_exact_equality {
-            let plugin = index_details.get_plugin()?;
+            let plugin = index_details.get_plugin(registry)?;
             if !plugin.provides_exact_answer() {
                 return Ok(false);
             }
@@ -734,10 +745,26 @@ mod tests {
             metadata: Default::default(),
         };
         // Vector indices should now match basic criteria
-        let result = index_matches_criteria(&index1, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &index1,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
-        let result = index_matches_criteria(&index1, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &index1,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
     }
 
@@ -759,12 +786,26 @@ mod tests {
             fields: vec![field.clone()],
             metadata: Default::default(),
         };
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
         // test for_column
@@ -774,13 +815,27 @@ mod tests {
             for_column: Some("mycol"),
             has_name: None,
         };
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
         criteria.for_column = Some("mycol2");
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(!result);
 
         // test has_name
@@ -790,19 +845,47 @@ mod tests {
             for_column: None,
             has_name: Some("btree_index"),
         };
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
         criteria.has_name = Some("btree_index2");
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(!result);
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(!result);
 
         // test supports_exact_equality
@@ -812,18 +895,39 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result =
-            index_matches_criteria(&inverted_index, &criteria, &[&field], false, &schema).unwrap();
+        let result = index_matches_criteria(
+            &inverted_index,
+            &criteria,
+            &[&field],
+            false,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(!result);
 
         criteria.must_support_fts = false;
-        let result =
-            index_matches_criteria(&ngram_index, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &ngram_index,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(!result);
 
         // test multiple indices
@@ -833,18 +937,39 @@ mod tests {
             for_column: None,
             has_name: None,
         };
-        let result =
-            index_matches_criteria(&btree_index, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &btree_index,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
         criteria.must_support_fts = true;
-        let result =
-            index_matches_criteria(&inverted_index, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &inverted_index,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
 
         criteria.must_support_fts = false;
-        let result =
-            index_matches_criteria(&ngram_index, &criteria, &[&field], true, &schema).unwrap();
+        let result = index_matches_criteria(
+            &ngram_index,
+            &criteria,
+            &[&field],
+            true,
+            &schema,
+            lance_index::registry::IndexPluginRegistry::with_default_plugins().as_ref(),
+        )
+        .unwrap();
         assert!(result);
     }
 

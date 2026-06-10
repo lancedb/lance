@@ -664,7 +664,7 @@ impl Dataset {
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            retain_supported_indices(&mut indices);
+            retain_supported_indices(&mut indices, session.scalar_index_plugins().as_ref());
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,

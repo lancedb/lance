@@ -4512,6 +4512,7 @@ dependencies = [
  "lance-encoding",
  "lance-file",
  "lance-index",
+ "lance-index-plugin-abi",
  "lance-io",
  "lance-linalg",
  "lance-namespace",
@@ -4557,6 +4558,7 @@ dependencies = [
  "tracking-allocator",
  "url",
  "uuid",
+ "xabi",
 ]
 
 [[package]]
@@ -4919,6 +4921,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-index-plugin-abi"
+version = "8.0.0-beta.9"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "futures",
+ "xabi",
+ "xabi-assert",
+]
+
+[[package]]
 name = "lance-io"
 version = "8.0.0-beta.9"
 dependencies = [
@@ -5260,6 +5275,16 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if 1.0.4",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -10257,6 +10282,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "xabi"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "502d74af326b336ce3d0bb4f90a181bedc1a79de6eeccf51983339b5395e8aca"
+dependencies = [
+ "libloading",
+ "xabi-macros",
+]
+
+[[package]]
+name = "xabi-assert"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bd399017ed5d647c7ed3612b0bc0b47eb5a5b7be315c89c2c4af462cdfd606e"
+dependencies = [
+ "xabi",
+]
+
+[[package]]
+name = "xabi-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ded715a3002053fea77d239272e8bc8bbafd89dbdc8e0f1c8c21c2b3fc239"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

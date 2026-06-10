@@ -1787,6 +1787,10 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             Ok(None)
         }
     }
+
+    fn supports_load_statistics(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

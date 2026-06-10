@@ -1,0 +1,20 @@
+[package]
+name = "lance-index-plugin-mock-btree"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Mock xabi BTree scalar index plugin for Lance tests"
+license = "Apache-2.0"
+rust-version = "1.91.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+arrow-array = "58.0.0"
+arrow-schema = "58.0.0"
+lance-index-plugin-abi = { path = "../../../../lance-index-plugin-abi" }
+serde_json = "1"
+xabi = "0.1.0"
+
+[workspace]

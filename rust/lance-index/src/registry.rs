@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use lance_core::{Error, Result};
 
@@ -33,7 +36,7 @@ pub fn display_type_from_url(type_url: &str) -> &str {
 
 /// A registry of index plugins
 pub struct IndexPluginRegistry {
-    plugins: HashMap<String, Box<dyn ScalarIndexPlugin>>,
+    plugins: RwLock<HashMap<String, Arc<dyn ScalarIndexPlugin>>>,
 }
 
 impl IndexPluginRegistry {
@@ -67,18 +70,76 @@ impl IndexPluginRegistry {
         DetailsType: prost::Message + prost::Name,
         PluginType: ScalarIndexPlugin + std::default::Default + 'static,
     >(
-        &mut self,
+        &self,
     ) {
         let plugin_name = self.get_plugin_name_from_details_name(DetailsType::NAME);
         self.plugins
-            .insert(plugin_name, Box::new(PluginType::default()));
+            .write()
+            .expect("index plugin registry lock is poisoned")
+            .insert(plugin_name, Arc::new(PluginType::default()));
+    }
+
+    /// Adds an already-created scalar index plugin under a runtime name.
+    pub fn add_runtime_plugin(
+        &self,
+        name: String,
+        plugin: Arc<dyn ScalarIndexPlugin>,
+    ) -> Result<()> {
+        let plugin_name = Self::normalize_plugin_name(&name);
+        let mut plugins = self
+            .plugins
+            .write()
+            .expect("index plugin registry lock is poisoned");
+        if plugins.contains_key(&plugin_name) {
+            return Err(Error::invalid_input(format!(
+                "scalar index plugin '{name}' is already registered"
+            )));
+        }
+        plugins.insert(plugin_name, plugin);
+        Ok(())
+    }
+
+    /// Adds an alias for a runtime scalar index plugin based on its details type URL.
+    ///
+    /// This lets dynamically registered plugins use their own persisted
+    /// `prost_types::Any::type_url` while still being resolved by manifest
+    /// metadata during dataset open and index description.
+    pub fn add_runtime_plugin_for_details(
+        &self,
+        details_type_url: &str,
+        plugin: Arc<dyn ScalarIndexPlugin>,
+    ) -> Result<()> {
+        let details_name = details_type_url
+            .split('.')
+            .next_back()
+            .unwrap_or(details_type_url);
+        let plugin_name = self.get_plugin_name_from_details_name(details_name);
+        let mut plugins = self
+            .plugins
+            .write()
+            .expect("index plugin registry lock is poisoned");
+        match plugins.get(&plugin_name) {
+            Some(existing) if Arc::ptr_eq(existing, &plugin) => Ok(()),
+            Some(_) => Err(Error::invalid_input(format!(
+                "scalar index plugin alias '{plugin_name}' is already registered"
+            ))),
+            None => {
+                plugins.insert(plugin_name, plugin);
+                Ok(())
+            }
+        }
+    }
+
+    /// Create an empty registry.
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            plugins: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Create a registry with the default plugins
     pub fn with_default_plugins() -> Arc<Self> {
-        let mut registry = Self {
-            plugins: HashMap::new(),
-        };
+        let registry = Self::empty();
         registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
         registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
         registry.add_plugin::<pbold::LabelListIndexDetails, LabelListIndexPlugin>();
@@ -91,8 +152,12 @@ impl IndexPluginRegistry {
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 
-        let registry = Arc::new(registry);
-        for plugin in registry.plugins.values() {
+        for plugin in registry
+            .plugins
+            .read()
+            .expect("index plugin registry lock is poisoned")
+            .values()
+        {
             plugin.attach_registry(registry.clone());
         }
 
@@ -100,11 +165,13 @@ impl IndexPluginRegistry {
     }
 
     /// Get an index plugin suitable for training an index with the given parameters
-    pub fn get_plugin_by_name(&self, name: &str) -> Result<&dyn ScalarIndexPlugin> {
+    pub fn get_plugin_by_name(&self, name: &str) -> Result<Arc<dyn ScalarIndexPlugin>> {
         let plugin_name = Self::normalize_plugin_name(name);
         self.plugins
+            .read()
+            .expect("index plugin registry lock is poisoned")
             .get(&plugin_name)
-            .map(|plugin| plugin.as_ref())
+            .cloned()
             .ok_or_else(|| {
                 let hint = if plugin_name == "rtree" {
                     ". The 'rtree' index requires the `geo` feature. \
@@ -121,7 +188,7 @@ impl IndexPluginRegistry {
     pub fn get_plugin_by_details(
         &self,
         details: &prost_types::Any,
-    ) -> Result<&dyn ScalarIndexPlugin> {
+    ) -> Result<Arc<dyn ScalarIndexPlugin>> {
         let details_name = details.type_url.split('.').next_back().unwrap();
         let plugin_name = self.get_plugin_name_from_details_name(details_name);
         self.get_plugin_by_name(&plugin_name)
