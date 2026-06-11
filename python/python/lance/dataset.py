@@ -950,6 +950,9 @@ class LanceDataset(pa.dataset.Dataset):
         ds._base_store_params = self._base_store_params
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
+        ds._namespace_client_managed_versioning = (
+            self._namespace_client_managed_versioning
+        )
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
         return ds
@@ -4579,6 +4582,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._base_store_params = base_store_params
         ds._namespace_client = None
         ds._table_id = None
+        ds._namespace_client_managed_versioning = False
         ds._default_scan_options = None
         ds._read_params = None
         return BulkCommitResult(

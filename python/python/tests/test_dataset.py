@@ -1742,6 +1742,7 @@ def test_commit_batch_append():
     result = lance.LanceDataset.commit_batch(dataset, [txn2, txn3])
     dataset = result["dataset"]
     assert dataset.version == 2
+    assert dataset.checkout_version(1).version == 1
     assert len(dataset.get_fragments()) == 3
     assert dataset.to_table() == pa.concat_tables([data1, data2, data3])
     merged_txn = result["merged"]
@@ -5538,6 +5539,8 @@ def test_branches(tmp_path: Path):
     branch1 = ds_main.create_branch("branch1")
     ds_main.branches.replace_metadata("branch1", {"description": "branch one"})
     assert branch1.version == 1
+    # The dataset returned by create_branch must be fully constructed
+    assert branch1.checkout_version(("main", None)).version == 1
     branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
     branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
     assert branch1.version == 2
