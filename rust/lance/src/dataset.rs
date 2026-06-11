@@ -2235,6 +2235,39 @@ impl Dataset {
             .version)
     }
 
+    /// Return whether the dataset has a newer committed version.
+    pub async fn is_stale(&self) -> Result<bool> {
+        let latest_version = self.latest_version_id().await?;
+        Ok(latest_version != self.manifest.version)
+    }
+
+    /// Return whether the immediate attached successor manifest exists.
+    ///
+    /// This is a fast contiguous-history probe. It does not resolve the latest
+    /// version and may return `false` if intermediate manifests have been
+    /// removed. Callers that need a general freshness check should use
+    /// [`Self::is_stale`].
+    #[doc(hidden)]
+    pub async fn has_successor_version(&self) -> Result<bool> {
+        let Some(next_version) = self.manifest.version.checked_add(1) else {
+            return Ok(false);
+        };
+        if lance_table::format::is_detached_version(next_version) {
+            return Ok(false);
+        }
+
+        let exists = self
+            .commit_handler
+            .version_exists(
+                &self.base,
+                next_version,
+                self.object_store.inner.as_ref(),
+                self.manifest_location.naming_scheme,
+            )
+            .await?;
+        Ok(exists)
+    }
+
     pub fn count_fragments(&self) -> usize {
         self.manifest.fragments.len()
     }

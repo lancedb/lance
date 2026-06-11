@@ -670,13 +670,23 @@ pub struct NamespaceInfo {
 /// A wrapper around a Dataset that provides concurrent access.
 ///
 /// This can be cloned cheaply. It supports concurrent reads or exclusive writes.
-/// The manifest dataset is always kept strongly consistent by reloading on each read.
+/// The manifest dataset uses contiguous attached versions and this module never
+/// runs old-version cleanup on it, allowing reads to check only the immediate
+/// successor manifest before deciding whether a reload is needed.
 #[derive(Debug, Clone)]
 pub struct DatasetConsistencyWrapper(Arc<RwLock<Dataset>>);
 
 impl DatasetConsistencyWrapper {
     /// Create a new wrapper with the given dataset.
     pub fn new(dataset: Dataset) -> Self {
+        debug_assert!(
+            !dataset
+                .manifest()
+                .config
+                .keys()
+                .any(|key| key.starts_with("lance.auto_cleanup.")),
+            "the directory manifest dataset must not enable old-version cleanup"
+        );
         Self(Arc::new(RwLock::new(dataset)))
     }
 
@@ -728,21 +738,25 @@ impl DatasetConsistencyWrapper {
             dataset_uri,
             current_version
         );
-        let latest_version = read_guard.latest_version_id().await.map_err(|e| {
+        // The directory manifest table uses contiguous attached versions and
+        // does not run old-version cleanup, so the immediate successor probe is
+        // enough to detect changes without resolving or loading the latest
+        // manifest on every namespace read.
+        let has_successor_version = read_guard.has_successor_version().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to get latest version: {:?}", e),
+                message: format!("Failed to check dataset staleness: {:?}", e),
             })
         })?;
         log::debug!(
-            "Reload got latest_version={} for uri={}, current_version={}",
-            latest_version,
+            "Reload checked successor_version_exists={} for uri={}, current_version={}",
+            has_successor_version,
             dataset_uri,
             current_version
         );
         drop(read_guard);
 
         // If already up-to-date, return early
-        if latest_version == current_version {
+        if !has_successor_version {
             log::debug!("Already up-to-date for uri={}", dataset_uri);
             return Ok(());
         }
@@ -751,13 +765,13 @@ impl DatasetConsistencyWrapper {
         let mut write_guard = self.0.write().await;
 
         // Double-check after acquiring write lock (someone else might have reloaded)
-        let latest_version = write_guard.latest_version_id().await.map_err(|e| {
+        let has_successor_version = write_guard.has_successor_version().await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to get latest version: {:?}", e),
+                message: format!("Failed to check dataset staleness: {:?}", e),
             })
         })?;
 
-        if latest_version != write_guard.version().version {
+        if has_successor_version {
             write_guard.checkout_latest().await.map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to checkout latest: {:?}", e),

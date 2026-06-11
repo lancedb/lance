@@ -11780,6 +11780,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_manifest_reload_observes_new_version_from_other_namespace() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace_a = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        create_scalar_table(&namespace_a, "alpha").await;
+
+        let namespace_b = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        create_scalar_table(&namespace_b, "beta").await;
+
+        let response = namespace_a
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut tables = response.tables;
+        tables.sort();
+        assert_eq!(tables, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
     async fn test_migration_not_found_errors_include_table_id() {
         let temp_dir = TempStdDir::default();
         let temp_path = temp_dir.to_str().unwrap();
