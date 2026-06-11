@@ -77,6 +77,8 @@ from lance_namespace.errors import (
     InvalidInputError,
     NamespaceNotEmptyError,
     NamespaceNotFoundError,
+    TableBranchAlreadyExistsError,
+    TableBranchNotFoundError,
     TableNotFoundError,
 )
 
@@ -605,6 +607,16 @@ class TestTableBranchOperations:
         assert "dev" in listed.branches
         assert listed.branches["dev"].parent_version == 1
 
+        # Duplicate creation and deleting a missing branch surface the typed
+        # branch errors (codes 23 and 22), not InternalError.
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="dev2")
+        )
+        with pytest.raises(TableBranchAlreadyExistsError):
+            temp_ns_client.create_table_branch(
+                CreateTableBranchRequest(id=table_id, name="dev2")
+            )
+
         temp_ns_client.delete_table_branch(
             DeleteTableBranchRequest(id=table_id, name="dev")
         )
@@ -612,6 +624,10 @@ class TestTableBranchOperations:
             ListTableBranchesRequest(id=table_id)
         )
         assert "dev" not in listed.branches
+        with pytest.raises(TableBranchNotFoundError):
+            temp_ns_client.delete_table_branch(
+                DeleteTableBranchRequest(id=table_id, name="dev")
+            )
 
     def test_create_branch_from_other_branch(self, temp_ns_client):
         """Forking from a non-main source branch records the right parent."""
@@ -660,6 +676,11 @@ class TestPythonNamespaceErrorMapping:
     def test_namespace_error_identity_preserved(self):
         ns = _RaisingNamespace(TableNotFoundError("no such table"))
         with pytest.raises(TableNotFoundError, match="no such table"):
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+        # Branch error codes (22/23) survive the round trip too.
+        ns = _RaisingNamespace(TableBranchNotFoundError("no such branch"))
+        with pytest.raises(TableBranchNotFoundError, match="no such branch"):
             lance.dataset(namespace_client=ns, table_id=["t"])
 
     def test_foreign_code_attribute_not_trusted(self):
