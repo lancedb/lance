@@ -360,23 +360,12 @@ impl RabitQuantizationMetadata {
         let code_dim = self.code_dim();
         let ex_bits = rabit_ex_bits(self.num_bits)?;
         let dist_table_len = code_dim * 4;
-        // The quantized ex dist table is only consumed by the FastScan bulk
-        // path; the exact rerank path multiplies the query against the packed
-        // codes directly (see `ex_dot`).
-        let ex_dist_table_len = if supports_ex_fastscan(ex_bits) {
-            code_dim * (1usize << ex_bits)
-        } else {
-            0
-        };
 
         let mut rotated_query = vec![0.0; code_dim];
         self.rotate_vector_with_residual_into(query, None, &mut rotated_query);
 
         let mut dist_table = vec![0.0; dist_table_len];
         build_dist_table_direct_into::<Float32Type>(&rotated_query, &mut dist_table);
-
-        let mut ex_dist_table = vec![0.0; ex_dist_table_len];
-        build_ex_dist_table_direct_into(&rotated_query, ex_bits, &mut ex_dist_table);
 
         // The kernels consume the rotated query directly; a zero-padded copy
         // is only needed when the rotated dim is not block-aligned.
@@ -392,7 +381,6 @@ impl RabitQuantizationMetadata {
             ex_bits,
             rotated_query,
             dist_table,
-            ex_dist_table,
             ex_query,
             sum_q,
         })
@@ -587,7 +575,6 @@ impl RabitQuantizationStorage {
         let RabitDistCalculatorParts {
             dim,
             dist_table,
-            ex_dist_table,
             ex_query,
             sum_q,
             query_factor,
@@ -612,7 +599,6 @@ impl RabitQuantizationStorage {
             self.metadata.num_bits,
             self.metadata.query_estimator,
             dist_table,
-            ex_dist_table,
             ex_query,
             sum_q,
             self.codes.values().as_primitive::<UInt8Type>().values(),
@@ -802,7 +788,6 @@ fn copy_subtract_f32(lhs: &[f32], rhs: &[f32], output: &mut [f32]) {
 struct RabitDistCalculatorParts<'a> {
     dim: usize,
     dist_table: Cow<'a, [f32]>,
-    ex_dist_table: Cow<'a, [f32]>,
     ex_query: Cow<'a, [f32]>,
     sum_q: f32,
     query_factor: f32,
@@ -835,10 +820,8 @@ pub struct RabitDistCalculator<'a> {
     // we split the query codes into d/4 chunks, each chunk is with 4 elements,
     // then dist_table[i][j] is the distance between the i-th query code and the code j
     dist_table: Cow<'a, [f32]>,
-    // only built for the ex widths supported by FastScan; the exact rerank
-    // path uses `ex_query` + `ex_dot` instead
-    ex_dist_table: Cow<'a, [f32]>,
-    // the rotated query, zero-padded to a 64-dim multiple when needed
+    // the rotated query, zero-padded to a 64-dim multiple when needed; also
+    // the source for the FastScan ex LUT on the legacy bypass path
     ex_query: Cow<'a, [f32]>,
     ex_dot: Option<ExDotFn>,
     add_factors: &'a [f32],
@@ -862,7 +845,6 @@ impl<'a> RabitDistCalculator<'a> {
         num_bits: u8,
         query_estimator: RabitQueryEstimator,
         dist_table: Cow<'a, [f32]>,
-        ex_dist_table: Cow<'a, [f32]>,
         ex_query: Cow<'a, [f32]>,
         sum_q: f32,
         codes: &'a [u8],
@@ -887,7 +869,6 @@ impl<'a> RabitDistCalculator<'a> {
             ex_codes,
             ex_code_len,
             dist_table,
-            ex_dist_table,
             ex_query,
             ex_dot,
             add_factors,
@@ -1112,10 +1093,9 @@ impl<'a> RabitDistCalculator<'a> {
                     let fastscan_len = simd_len;
                     let fastscan_code_len = self.ex_code_len;
                     let (qmin, qmax, quantization_max) = quantize_ex_fastscan_dist_table_into(
-                        self.dim,
                         ex_bits,
                         self.ex_code_len,
-                        &self.ex_dist_table,
+                        self.ex_query.as_ref(),
                         quantized_dists_table,
                     );
                     quantized_dists.clear();
@@ -1329,35 +1309,6 @@ where
     dist_table
 }
 
-fn build_ex_dist_table_direct(rotated_query: &[f32], ex_bits: u8) -> Vec<f32> {
-    if ex_bits == 0 {
-        return Vec::new();
-    }
-    let entries_per_dim = 1usize << ex_bits;
-    let mut dist_table = vec![0.0; rotated_query.len() * entries_per_dim];
-    build_ex_dist_table_direct_into(rotated_query, ex_bits, &mut dist_table);
-    dist_table
-}
-
-fn build_ex_dist_table_direct_into(rotated_query: &[f32], ex_bits: u8, dist_table: &mut [f32]) {
-    // The table may legitimately be empty for multi-bit widths without
-    // FastScan support; the exact path uses the ex-dot kernels instead.
-    if ex_bits == 0 || dist_table.is_empty() {
-        debug_assert!(dist_table.is_empty());
-        return;
-    }
-    let entries_per_dim = 1usize << ex_bits;
-    debug_assert_eq!(dist_table.len(), rotated_query.len() * entries_per_dim);
-    for (query_value, table) in rotated_query
-        .iter()
-        .zip(dist_table.chunks_exact_mut(entries_per_dim))
-    {
-        for (code, value) in table.iter_mut().enumerate() {
-            *value = *query_value * code as f32;
-        }
-    }
-}
-
 fn build_dist_table_direct_into<T: ArrowFloatType>(qc: &[T::Native], dist_table: &mut [f32])
 where
     T::Native: AsPrimitive<f32>,
@@ -1456,17 +1407,18 @@ fn quantize_dist_table_u16_into(
     (qmin, qmax)
 }
 
+/// Build the u8 FastScan LUT for the ex codes directly from the rotated
+/// query (`ex_query`, natural dim order, padding dims zero): the underlying
+/// per-dim table is the pure multiplication `q[d] * code`, so no intermediate
+/// `dim * 2^ex_bits` table is materialized.
 fn quantize_ex_fastscan_dist_table_into(
-    dim: usize,
     ex_bits: u8,
     ex_code_len: usize,
-    ex_dist_table: &[f32],
+    ex_query: &[f32],
     quantized_dist_table: &mut Vec<u8>,
 ) -> (f32, f32, f32) {
     debug_assert!(supports_ex_fastscan(ex_bits));
 
-    let entries_per_dim = 1usize << ex_bits;
-    debug_assert_eq!(ex_dist_table.len(), dim * entries_per_dim);
     // One split table per code nibble of the row.
     let num_split_tables = ex_code_len * 2;
     let quantization_max = (u16::MAX as usize / num_split_tables)
@@ -1477,7 +1429,7 @@ fn quantize_ex_fastscan_dist_table_into(
     let mut qmax = f32::NEG_INFINITY;
     for table_idx in 0..num_split_tables {
         for code in 0..SEGMENT_NUM_CODES {
-            let value = ex_fastscan_dist_table_value(dim, ex_bits, ex_dist_table, table_idx, code);
+            let value = ex_fastscan_dist_table_value(ex_query, ex_bits, table_idx, code);
             qmin = qmin.min(value);
             qmax = qmax.max(value);
         }
@@ -1493,7 +1445,7 @@ fn quantize_ex_fastscan_dist_table_into(
     let factor = quantization_max / (qmax - qmin);
     for table_idx in 0..num_split_tables {
         for code in 0..SEGMENT_NUM_CODES {
-            let value = ex_fastscan_dist_table_value(dim, ex_bits, ex_dist_table, table_idx, code);
+            let value = ex_fastscan_dist_table_value(ex_query, ex_bits, table_idx, code);
             quantized_dist_table.push(((value - qmin) * factor).round() as u8);
         }
     }
@@ -1509,15 +1461,16 @@ fn supports_ex_fastscan(ex_bits: u8) -> bool {
 /// The FastScan LUT value for one nibble of a blocked-layout code byte:
 /// `table_idx / 2` is the byte position within a row and `table_idx % 2`
 /// selects its low/high nibble (see the `ex_dot` module docs for the
-/// byte-to-dim mapping per width). Padding dims contribute zero.
+/// byte-to-dim mapping per width). Dims beyond the query length (block
+/// padding) contribute zero.
 #[inline]
 fn ex_fastscan_dist_table_value(
-    dim: usize,
+    ex_query: &[f32],
     ex_bits: u8,
-    ex_dist_table: &[f32],
     table_idx: usize,
     code: usize,
 ) -> f32 {
+    let query = |dim_idx: usize| ex_query.get(dim_idx).copied().unwrap_or(0.0);
     let byte_idx = table_idx / 2;
     let high_nibble = table_idx % 2 == 1;
     match ex_bits {
@@ -1525,10 +1478,9 @@ fn ex_fastscan_dist_table_value(
             // byte 16g+b = dims {64g+b, +16, +32, +48} at bit pairs; the low
             // nibble covers the first two dims, the high nibble the last two.
             let dim_idx = 64 * (byte_idx / 16) + byte_idx % 16 + 32 * usize::from(high_nibble);
-            let low = code & 0b11;
-            let high = (code >> 2) & 0b11;
-            ex_dist_table_value(ex_dist_table, dim, ex_bits, dim_idx, low)
-                + ex_dist_table_value(ex_dist_table, dim, ex_bits, dim_idx + 16, high)
+            let low = (code & 0b11) as f32;
+            let high = ((code >> 2) & 0b11) as f32;
+            query(dim_idx) * low + query(dim_idx + 16) * high
         }
         4 => {
             // byte 32g+8j+b = dim 64g+16j+b (low nibble) | dim +8 (high).
@@ -1537,46 +1489,34 @@ fn ex_fastscan_dist_table_value(
                 + 16 * (in_block / 8)
                 + in_block % 8
                 + 8 * usize::from(high_nibble);
-            ex_dist_table_value(ex_dist_table, dim, ex_bits, dim_idx, code)
+            query(dim_idx) * code as f32
         }
         8 => {
             // byte = dim identity; the high nibble carries code bits 4..8.
-            if high_nibble {
-                ex_dist_table_value(
-                    ex_dist_table,
-                    dim,
-                    ex_bits,
-                    byte_idx,
-                    code << SEGMENT_LENGTH,
-                )
+            let code = if high_nibble {
+                code << SEGMENT_LENGTH
             } else {
-                ex_dist_table_value(ex_dist_table, dim, ex_bits, byte_idx, code)
-            }
+                code
+            };
+            query(byte_idx) * code as f32
         }
         _ => unreachable!("unsupported RabitQ ex_bits={ex_bits} for FastScan"),
     }
 }
 
-#[inline]
-fn ex_dist_table_value(
-    ex_dist_table: &[f32],
-    dim: usize,
-    ex_bits: u8,
-    dim_idx: usize,
-    code: usize,
-) -> f32 {
-    if dim_idx >= dim {
-        return 0.0;
-    }
-    let entries_per_dim = 1usize << ex_bits;
-    ex_dist_table[dim_idx * entries_per_dim + code]
-}
-
+/// Transpose ex codes for the FastScan bulk path. That path is only reachable
+/// when lower-bound gating is disabled, i.e. for legacy indexes without error
+/// factors; gated indexes rerank per candidate with the ex-dot kernels and
+/// never touch this copy, so skip the transpose (and its resident memory).
 fn maybe_pack_ex_codes(
     ex_codes: Option<&FixedSizeListArray>,
     ex_bits: u8,
+    error_factors: Option<&Float32Array>,
 ) -> Option<FixedSizeListArray> {
     let ex_codes = ex_codes?;
+    if error_factors.is_some() {
+        return None;
+    }
     match ex_bits {
         2 | 4 | 8 => Some(pack_codes(ex_codes)),
         _ => None,
@@ -1977,12 +1917,6 @@ impl VectorStore for RabitQuantizationStorage {
         let code_dim = self.code_dim();
         let rotated_qr = self.rotate_query_vector(code_dim, &qr);
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
-        let ex_bits = self.metadata.num_bits - 1;
-        let ex_dist_table = if supports_ex_fastscan(ex_bits) {
-            build_ex_dist_table_direct(&rotated_qr, ex_bits)
-        } else {
-            Vec::new()
-        };
         let query_factor = match self.metadata.query_estimator {
             RabitQueryEstimator::ResidualQuery => self.residual_query_factor(dist_q_c),
             RabitQueryEstimator::RawQuery => self.raw_query_factor(dist_q_c, &rotated_qr, None),
@@ -2007,7 +1941,6 @@ impl VectorStore for RabitQuantizationStorage {
         self.distance_calculator_from_parts(RabitDistCalculatorParts {
             dim: code_dim,
             dist_table: Cow::Owned(dist_table),
-            ex_dist_table: Cow::Owned(ex_dist_table),
             ex_query: Cow::Owned(ex_query),
             sum_q,
             query_factor,
@@ -2047,7 +1980,6 @@ impl VectorStore for RabitQuantizationStorage {
             return self.distance_calculator_from_parts(RabitDistCalculatorParts {
                 dim: code_dim,
                 dist_table: Cow::Borrowed(&raw_query.dist_table),
-                ex_dist_table: Cow::Borrowed(&raw_query.ex_dist_table),
                 ex_query: Cow::Borrowed(kernel_query(
                     &raw_query.rotated_query,
                     &raw_query.ex_query,
@@ -2061,13 +1993,6 @@ impl VectorStore for RabitQuantizationStorage {
 
         let dist_table_len = code_dim * 4;
         let ex_bits = self.metadata.num_bits - 1;
-        // Only the FastScan bulk path consumes the quantized ex dist table;
-        // the exact rerank path uses the kernel-order query instead.
-        let ex_dist_table_len = if supports_ex_fastscan(ex_bits) {
-            code_dim * (1usize << ex_bits)
-        } else {
-            0
-        };
         // The kernels read the rotated query in place; a zero-padded copy is
         // only needed when the rotated dim is not block-aligned.
         let ex_query_table_len = if ex_bits == 0 || code_dim.is_multiple_of(EX_DOT_BLOCK_DIMS) {
@@ -2075,17 +2000,13 @@ impl VectorStore for RabitQuantizationStorage {
         } else {
             padded_query_len(code_dim)
         };
-        f32_scratch.resize(
-            code_dim + dist_table_len + ex_dist_table_len + ex_query_table_len,
-            0.0,
-        );
+        f32_scratch.resize(code_dim + dist_table_len + ex_query_table_len, 0.0);
 
         let query_factor;
         let query_error;
         let sum_q = {
             let (rotated_qr, remaining) = f32_scratch.split_at_mut(code_dim);
-            let (dist_table, remaining) = remaining.split_at_mut(dist_table_len);
-            let (ex_dist_table, ex_query) = remaining.split_at_mut(ex_dist_table_len);
+            let (dist_table, ex_query) = remaining.split_at_mut(dist_table_len);
             match residual {
                 Some(QueryResidual::Centroid(residual_centroid)) => {
                     self.rotate_query_vector_into(
@@ -2124,19 +2045,16 @@ impl VectorStore for RabitQuantizationStorage {
                 }
             };
             build_dist_table_direct_into::<Float32Type>(rotated_qr, dist_table);
-            build_ex_dist_table_direct_into(rotated_qr, ex_bits, ex_dist_table);
             if ex_query_table_len > 0 {
                 pad_query_into(rotated_qr, ex_query);
             }
             rotated_qr.iter().copied().sum()
         };
 
-        let ex_dist_table_start = code_dim + dist_table_len;
-        let ex_query_start = ex_dist_table_start + ex_dist_table_len;
+        let ex_query_start = code_dim + dist_table_len;
         self.distance_calculator_from_parts(RabitDistCalculatorParts {
             dim: code_dim,
-            dist_table: Cow::Borrowed(&f32_scratch[code_dim..ex_dist_table_start]),
-            ex_dist_table: Cow::Borrowed(&f32_scratch[ex_dist_table_start..ex_query_start]),
+            dist_table: Cow::Borrowed(&f32_scratch[code_dim..ex_query_start]),
             ex_query: Cow::Borrowed(kernel_query(
                 &f32_scratch[..code_dim],
                 &f32_scratch[ex_query_start..ex_query_start + ex_query_table_len],
@@ -2405,7 +2323,8 @@ impl QuantizerStorage for RabitQuantizationStorage {
 
         let mut metadata = metadata.clone();
         metadata.packed = true;
-        let packed_ex_codes = maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits);
+        let packed_ex_codes =
+            maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref());
 
         Ok(Self {
             metadata,
@@ -2498,7 +2417,8 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 load_blocked_ex_codes(batch, self.metadata.rotated_dim(), self.metadata.num_bits)?;
             (batch, Some(codes))
         };
-        let packed_ex_codes = maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits);
+        let packed_ex_codes =
+            maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref());
         let ex_add_factors = batch
             .column_by_name(EX_ADD_FACTORS_COLUMN)
             .map(|factors| factors.as_primitive::<Float32Type>().clone());
@@ -3425,7 +3345,11 @@ mod tests {
         assert_eq!(hacc_accum_len, num_rows);
     }
 
-    fn assert_raw_query_multi_bit_distance_all_uses_fastscan(num_bits: u8, legacy_format: bool) {
+    fn assert_raw_query_multi_bit_distance_all_uses_fastscan(
+        num_bits: u8,
+        legacy_format: bool,
+        with_error_factors: bool,
+    ) {
         // Not a multiple of 64, so the padded-tail LUT entries are exercised;
         // a multiple of 8 as the binary stage requires.
         let code_dim = 72usize;
@@ -3512,10 +3436,23 @@ mod tests {
             ),
         ])
         .unwrap();
+        let batch = if with_error_factors {
+            batch
+                .try_with_column(
+                    crate::vector::bq::transform::ERROR_FACTORS_FIELD.clone(),
+                    Arc::new(Float32Array::from(vec![1000.0; num_rows])) as ArrayRef,
+                )
+                .unwrap()
+        } else {
+            batch
+        };
         let storage =
             RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
                 .unwrap();
-        assert!(storage.packed_ex_codes.is_some());
+        // The FastScan transpose only exists for indexes that can reach the
+        // bulk bypass path (no error factors); gated indexes fall through to
+        // the exact per-row kernels in `distance_all`.
+        assert_eq!(storage.packed_ex_codes.is_some(), !with_error_factors);
 
         // A per-dim varying query so that any dim-mapping error in the
         // FastScan LUT shows up as a value mismatch.
@@ -3539,7 +3476,13 @@ mod tests {
         assert_eq!(distances.len(), num_rows);
         assert_eq!(u16_scratch.len(), BATCH_SIZE);
         let loaded_ex_code_len = storage.ex_codes.as_ref().unwrap().value_length() as usize;
-        assert_eq!(u8_scratch.len(), loaded_ex_code_len * 2 * SEGMENT_NUM_CODES);
+        if with_error_factors {
+            // The gated path never builds the ex LUT; the scratch holds the
+            // binary LUT only.
+            assert_eq!(u8_scratch.len(), code_dim * 4);
+        } else {
+            assert_eq!(u8_scratch.len(), loaded_ex_code_len * 2 * SEGMENT_NUM_CODES);
+        }
 
         // The fastscan estimate differs from the exact path only by the u8
         // quantization of the binary LUT (amplified by 2^ex_bits) and of the
@@ -3561,16 +3504,22 @@ mod tests {
         let code_scale = (1u32 << ex_bits) as f32;
         let binary_bound =
             code_scale * code_dim.div_ceil(4) as f32 * (table_max - table_min) / 510.0;
-        let ex_dist_table = build_ex_dist_table_direct(&query_values, ex_bits);
+        let mut padded_query = vec![0.0f32; crate::vector::bq::ex_dot::padded_query_len(code_dim)];
+        crate::vector::bq::ex_dot::pad_query_into(&query_values, &mut padded_query);
         let mut quantized_table = Vec::new();
         let (ex_qmin, ex_qmax, ex_qcap) = quantize_ex_fastscan_dist_table_into(
-            code_dim,
             ex_bits,
             loaded_ex_code_len,
-            &ex_dist_table,
+            &padded_query,
             &mut quantized_table,
         );
-        let ex_bound = (loaded_ex_code_len * 2) as f32 * (ex_qmax - ex_qmin) / ex_qcap / 2.0;
+        // Without the FastScan transpose the ex stage is exact, so only the
+        // binary LUT quantization remains.
+        let ex_bound = if with_error_factors {
+            0.0
+        } else {
+            (loaded_ex_code_len * 2) as f32 * (ex_qmax - ex_qmin) / ex_qcap / 2.0
+        };
         let bound = (binary_bound + ex_bound) * 1.5 + 1e-3;
         for (id, distance) in distances.iter().take(BATCH_SIZE).enumerate() {
             let exact = calc.distance(id as u32);
@@ -3586,8 +3535,15 @@ mod tests {
     fn test_raw_query_multi_bit_distance_all_uses_fastscan_for_split_ex_codes() {
         for num_bits in [3, 5, 9] {
             for legacy_format in [false, true] {
-                assert_raw_query_multi_bit_distance_all_uses_fastscan(num_bits, legacy_format);
+                assert_raw_query_multi_bit_distance_all_uses_fastscan(
+                    num_bits,
+                    legacy_format,
+                    false,
+                );
             }
+            // Gated indexes (with error factors) skip the FastScan artifacts
+            // and score the bulk path with the exact kernels.
+            assert_raw_query_multi_bit_distance_all_uses_fastscan(num_bits, false, true);
         }
     }
 

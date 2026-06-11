@@ -153,22 +153,18 @@ fn rotated_partition_centroid_slice(
     cache.rotated_centroids.get(start..end)
 }
 
-/// `f32` scratch needed for the ex-bit query state: the quantized-table input
-/// for FastScan-supported widths, plus a zero-padded query copy when the
-/// rotated dim is not a multiple of the 64-dim kernel block.
+/// `f32` scratch needed for the ex-bit query state: a zero-padded query copy
+/// when the rotated dim is not a multiple of the 64-dim kernel block (the
+/// FastScan ex LUT is built directly from the query, with no f32 table).
 fn rabit_ex_scratch_len(dim: usize, num_bits: u8) -> usize {
-    let padded_query = if dim.is_multiple_of(64) {
+    let multi_bit = rabit_ex_bits(num_bits)
+        .map(|ex_bits| ex_bits > 0)
+        .unwrap_or(true);
+    if !multi_bit || dim.is_multiple_of(64) {
         0
     } else {
         padded_query_len(dim)
-    };
-    rabit_ex_bits(num_bits)
-        .map(|ex_bits| match ex_bits {
-            0 => 0,
-            2 | 4 | 8 => dim * (1usize << usize::from(ex_bits)) + padded_query,
-            _ => padded_query,
-        })
-        .unwrap_or(dim * 256 + padded_query)
+    }
 }
 
 fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
@@ -1992,16 +1988,15 @@ mod tests {
 
     #[test]
     fn test_rabit_ex_scratch_len_uses_num_bits() {
-        // 960 is block-aligned, so no padded query copy is needed.
+        // Block-aligned dims read the rotated query in place.
         let dim = 960;
-        assert_eq!(super::rabit_ex_scratch_len(dim, 1), 0);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 3), dim * 4);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 5), dim * 16);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 7), 0);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 9), dim * 256);
+        for num_bits in [1, 3, 5, 7, 9] {
+            assert_eq!(super::rabit_ex_scratch_len(dim, num_bits), 0);
+        }
 
-        // Unaligned dims add one padded query copy.
+        // Unaligned multi-bit queries add one padded query copy.
         let dim = 968;
+        assert_eq!(super::rabit_ex_scratch_len(dim, 1), 0);
         assert_eq!(super::rabit_ex_scratch_len(dim, 7), padded_query_len(dim));
     }
 
@@ -2024,7 +2019,7 @@ mod tests {
         let capacity = super::rabit_query_scratch_capacity(dim, max_partition_len, 5);
 
         assert_eq!(capacity.distances, max_partition_len);
-        assert_eq!(capacity.query_f32, dim + dim * 4 + dim * 16);
+        assert_eq!(capacity.query_f32, dim + dim * 4);
         assert_eq!(capacity.u16, max_partition_len);
         assert_eq!(capacity.u8, dim * 16);
         assert_eq!(capacity.u32, 0);
