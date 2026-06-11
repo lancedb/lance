@@ -68,6 +68,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+pub(crate) mod archive;
+use archive::{VersionArchive, VersionArchiveConfig};
 pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
@@ -224,6 +226,16 @@ impl From<&Manifest> for Version {
             version: m.version,
             timestamp: m.timestamp(),
             metadata: m.summary().into(),
+        }
+    }
+}
+
+impl From<&archive::ArchivedVersion> for Version {
+    fn from(s: &archive::ArchivedVersion) -> Self {
+        Self {
+            version: s.version,
+            timestamp: DateTime::from_timestamp_millis(s.timestamp_millis).unwrap_or_else(Utc::now),
+            metadata: s.manifest_summary.clone().into(),
         }
     }
 }
@@ -2181,19 +2193,53 @@ impl Dataset {
     }
 
     /// Get all versions.
+    ///
+    /// This method returns only versions that are still available for checkout.
+    /// If the archive is unavailable or disabled, falls back to reading all manifests.
     pub async fn versions(&self) -> Result<Vec<Version>> {
-        let mut versions: Vec<Version> = self
+        let manifest_locations: Vec<_> = self
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
-            .try_filter_map(|location| async move {
-                match read_manifest(&self.object_store, &location.path, location.size).await {
-                    Ok(manifest) => Ok(Some(Version::from(&manifest))),
-                    Err(e) => Err(e),
-                }
-            })
             .try_collect()
             .await?;
+        let live_versions: HashSet<u64> = manifest_locations
+            .iter()
+            .map(|location| location.version)
+            .collect();
 
+        let config = VersionArchiveConfig::from_config(&self.manifest.config);
+        let (archived_versions, mut versions): (HashSet<u64>, Vec<Version>) = if config.enabled {
+            VersionArchive::load_latest(self.base.clone(), self.object_store.clone(), config)
+                .await?
+                .map(|version_archive| {
+                    let archived_versions = version_archive
+                        .versions
+                        .iter()
+                        .map(|version| version.version)
+                        .collect();
+                    let versions = version_archive
+                        .versions
+                        .iter()
+                        .filter(|version| live_versions.contains(&version.version))
+                        .map(|s| s.into())
+                        .collect();
+                    (archived_versions, versions)
+                })
+                .unwrap_or_default()
+        } else {
+            (HashSet::new(), Vec::new())
+        };
+
+        let mut inc_versions = Vec::new();
+        for location in manifest_locations {
+            if archived_versions.contains(&location.version) {
+                continue;
+            }
+            let manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
+            inc_versions.push(Version::from(&manifest));
+        }
+
+        versions.extend(inc_versions);
         // TODO: this API should support pagination
         versions.sort_by_key(|v| v.version);
 

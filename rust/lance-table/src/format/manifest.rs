@@ -123,7 +123,7 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub struct ManifestSummary {
     pub total_fragments: u64,
     pub total_data_files: u64,

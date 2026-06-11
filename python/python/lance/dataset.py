@@ -2755,7 +2755,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def versions(self):
         """
-        Return all versions in this dataset.
+        Return all versions in this dataset that are still available for checkout.
         """
         versions = self._ds.versions()
         for v in versions:

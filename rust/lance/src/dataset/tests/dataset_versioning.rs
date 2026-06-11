@@ -971,3 +971,139 @@ async fn test_branch() {
         .unwrap();
     assert!(branches.is_empty());
 }
+
+#[tokio::test]
+async fn test_versions_with_archive() {
+    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig};
+
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+    write_versions(test_uri, 5).await;
+
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let config = VersionArchiveConfig {
+        max_entries: 2,
+        ..Default::default()
+    };
+    let mut archive =
+        VersionArchive::load_or_new(dataset.base.clone(), dataset.object_store.clone(), config)
+            .await
+            .unwrap();
+
+    let entries: Vec<_> = (1..=5).map(archived_version).collect();
+    archive.add(&entries);
+    archive.flush().await.unwrap();
+
+    assert_versions(test_uri, &[1, 2, 3, 4, 5]).await;
+}
+
+#[tokio::test]
+async fn test_versions_without_archive() {
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+
+    write_versions(test_uri, 3).await;
+    assert_versions(test_uri, &[1, 2, 3]).await;
+}
+
+#[tokio::test]
+async fn test_versions_skip_cleaned_archive() {
+    use crate::dataset::archive::{VersionArchive, VersionArchiveConfig};
+
+    let test_dir = TempStdDir::default();
+    let test_uri = test_dir.to_str().unwrap();
+    write_versions(test_uri, 2).await;
+
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    let object_store = dataset.object_store.clone();
+    let base_path = dataset.base.clone();
+
+    let config = VersionArchiveConfig::default();
+    let mut archive = VersionArchive::load_or_new(base_path.clone(), object_store.clone(), config)
+        .await
+        .unwrap();
+
+    let entries = vec![archived_version(1), archived_version(2)];
+
+    archive.add(&entries);
+    archive.flush().await.unwrap();
+
+    let version_1_manifest_path = dataset
+        .checkout_version(1)
+        .await
+        .unwrap()
+        .manifest_location
+        .path;
+    object_store.delete(&version_1_manifest_path).await.unwrap();
+
+    assert_versions(test_uri, &[2]).await;
+
+    let archive_entries =
+        VersionArchive::load_latest(base_path.clone(), object_store.clone(), config)
+            .await
+            .unwrap()
+            .unwrap()
+            .versions;
+    assert_eq!(archived_version_numbers(&archive_entries), vec![1, 2]);
+}
+
+async fn write_versions(test_uri: &str, count: u64) {
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    let schema = data.schema();
+
+    Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+
+    for _ in 1..count {
+        Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+async fn assert_versions(test_uri: &str, expected: &[u64]) {
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    assert_eq!(
+        dataset_version_numbers(&dataset.versions().await.unwrap()),
+        expected
+    );
+}
+
+fn dataset_version_numbers(versions: &[crate::dataset::Version]) -> Vec<u64> {
+    versions.iter().map(|version| version.version).collect()
+}
+
+fn archived_version_numbers(versions: &[crate::dataset::archive::ArchivedVersion]) -> Vec<u64> {
+    versions.iter().map(|version| version.version).collect()
+}
+
+fn archived_version(version: u64) -> crate::dataset::archive::ArchivedVersion {
+    use lance_table::format::ManifestSummary;
+    use std::collections::HashMap;
+
+    crate::dataset::archive::ArchivedVersion {
+        version,
+        timestamp_millis: version as i64 * 1000,
+        manifest_summary: ManifestSummary::default(),
+        is_tagged: false,
+        transaction_uuid: None,
+        read_version: None,
+        operation_type: None,
+        transaction_properties: HashMap::new(),
+    }
+}
