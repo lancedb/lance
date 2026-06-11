@@ -1042,8 +1042,6 @@ mod tests {
         }
     }
 
-    /// Matrix rotation writes an extra `rotate_mat` IPC section between the
-    /// sub-index and storage sections; exercise that the codec preserves it.
     #[test]
     fn test_roundtrip_rabitq_raw_query_estimator() {
         // The query estimator is a non-default value here; it must survive the
@@ -1072,6 +1070,8 @@ mod tests {
         );
     }
 
+    /// Matrix rotation writes an extra `rotate_mat` IPC section between the
+    /// sub-index and storage sections; exercise that the codec preserves it.
     #[test]
     fn test_roundtrip_flat_rabitq_matrix() {
         let storage = make_rabit_storage(

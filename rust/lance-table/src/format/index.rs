@@ -356,7 +356,6 @@ mod tests {
         let bytes = store.get(&key).unwrap();
         let recovered = codec
             .deserialize(&bytes::Bytes::copy_from_slice(bytes))
-            .unwrap()
             .hit()
             .expect("entry should decode as a hit");
         let recovered = recovered

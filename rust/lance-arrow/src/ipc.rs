@@ -396,6 +396,20 @@ impl Write for CountingWriter<'_> {
     }
 }
 
+/// Write zero padding so the next byte lands on an [`IPC_SECTION_ALIGNMENT`]
+/// boundary, advancing `pos` past it.
+fn write_section_padding(writer: &mut dyn Write, pos: &mut usize) -> Result<(), ArrowError> {
+    let pad = section_padding(*pos);
+    if pad > 0 {
+        const ZEROS: [u8; IPC_SECTION_ALIGNMENT] = [0u8; IPC_SECTION_ALIGNMENT];
+        writer
+            .write_all(&ZEROS[..pad])
+            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+        *pos += pad;
+    }
+    Ok(())
+}
+
 /// Write `batch` as a 64-byte-aligned single-batch Arrow IPC section.
 ///
 /// `pos` is the absolute byte offset of `writer` within the enclosing blob.
@@ -412,14 +426,7 @@ pub fn write_ipc_section(
     pos: &mut usize,
     batch: &RecordBatch,
 ) -> Result<(), ArrowError> {
-    let pad = section_padding(*pos);
-    if pad > 0 {
-        const ZEROS: [u8; IPC_SECTION_ALIGNMENT] = [0u8; IPC_SECTION_ALIGNMENT];
-        writer
-            .write_all(&ZEROS[..pad])
-            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
-        *pos += pad;
-    }
+    write_section_padding(writer, pos)?;
 
     let mut counting = CountingWriter {
         inner: writer,
@@ -455,14 +462,7 @@ pub fn write_ipc_section_batches<I>(
 where
     I: IntoIterator<Item = RecordBatch>,
 {
-    let pad = section_padding(*pos);
-    if pad > 0 {
-        const ZEROS: [u8; IPC_SECTION_ALIGNMENT] = [0u8; IPC_SECTION_ALIGNMENT];
-        writer
-            .write_all(&ZEROS[..pad])
-            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
-        *pos += pad;
-    }
+    write_section_padding(writer, pos)?;
 
     let mut counting = CountingWriter {
         inner: writer,

@@ -893,5 +893,24 @@ mod tests {
             blob.extend_from_slice(&[0u8; 30]);
             assert!(codec().deserialize(&Bytes::from(blob)).hit().is_none());
         }
+
+        /// A structurally-valid envelope whose body leads with an out-of-range
+        /// variant tag self-heals to a `BodyError` miss rather than panicking or
+        /// misreading the remaining bytes.
+        #[test]
+        fn unknown_posting_variant_is_miss() {
+            use lance_core::cache::{CacheDecode, CacheMissReason};
+
+            let mut buf = serialize_entry(compressed_with_shared_positions());
+            // The variant tag is the first body byte, right after the envelope
+            // (magic[4] + ver[1] + type_id_len[2] + type_id[N] + type_version[4]).
+            let type_id_len = u16::from_le_bytes([buf[5], buf[6]]) as usize;
+            let variant_off = 4 + 1 + 2 + type_id_len + 4;
+            buf[variant_off] = 2; // neither PLAIN (0) nor COMPRESSED (1)
+            match codec().deserialize(&Bytes::from(buf)) {
+                CacheDecode::Miss(reason) => assert_eq!(reason, CacheMissReason::BodyError),
+                CacheDecode::Hit(_) => panic!("expected a BodyError miss, got a hit"),
+            }
+        }
     }
 }
