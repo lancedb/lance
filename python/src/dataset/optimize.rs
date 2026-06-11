@@ -58,6 +58,9 @@ fn parse_compaction_options(
             "batch_size" => {
                 opts.batch_size = value.extract()?;
             }
+            "io_buffer_size" => {
+                opts.io_buffer_size = value.extract()?;
+            }
             "compaction_mode" => {
                 let mode_str: Option<String> = value.extract()?;
                 if let Some(mode_str) = mode_str {
