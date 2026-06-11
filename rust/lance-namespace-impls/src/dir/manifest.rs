@@ -1823,6 +1823,7 @@ impl ManifestNamespace {
     /// file) — otherwise it would orphan files a committed manifest still references.
     async fn cleanup_staged_manifest_files(
         &self,
+        object_store: &ObjectStore,
         data_files: &HashSet<String>,
         index_uuids: &[Uuid],
     ) {
@@ -1833,7 +1834,7 @@ impl ManifestNamespace {
             .join(LANCE_DATA_DIR);
         for path in data_files {
             let data_path = data_dir.clone().join(path.as_str());
-            if let Err(err) = self.object_store.delete(&data_path).await {
+            if let Err(err) = object_store.delete(&data_path).await {
                 log::warn!(
                     "Failed to clean up uncommitted manifest rewrite data file '{}': {}",
                     data_path,
@@ -1841,12 +1842,13 @@ impl ManifestNamespace {
                 );
             }
         }
-        self.cleanup_uncommitted_manifest_index_dirs(index_uuids.iter().copied())
+        self.cleanup_uncommitted_manifest_index_dirs(object_store, index_uuids.iter().copied())
             .await;
     }
 
     async fn cleanup_uncommitted_manifest_index_dirs(
         &self,
+        object_store: &ObjectStore,
         index_uuids: impl IntoIterator<Item = Uuid>,
     ) {
         for index_uuid in index_uuids {
@@ -1856,7 +1858,7 @@ impl ManifestNamespace {
                 .join(MANIFEST_TABLE_NAME)
                 .join(LANCE_INDICES_DIR)
                 .join(index_uuid.to_string());
-            if let Err(err) = self.object_store.remove_dir_all(index_dir.clone()).await
+            if let Err(err) = object_store.remove_dir_all(index_dir.clone()).await
                 && !matches!(err, LanceError::NotFound { .. })
             {
                 log::warn!(
@@ -1898,6 +1900,13 @@ impl ManifestNamespace {
         manifest.set_timestamp(timestamp_nanos);
         manifest.update_max_fragment_id();
 
+        // Commit through the dataset's own object store, not `self.object_store`: for
+        // stores like `memory://` the namespace and the dataset can hold different
+        // instances, and a commit written to the wrong one is invisible to reads.
+        let object_store = dataset
+            .object_store(None)
+            .await
+            .map_err(CommitError::from)?;
         let base_path = self.base_path.clone().join(MANIFEST_TABLE_NAME);
         let naming_scheme = dataset.manifest_location().naming_scheme;
         commit_handler
@@ -1905,7 +1914,7 @@ impl ManifestNamespace {
                 manifest,
                 indices,
                 &base_path,
-                &self.object_store,
+                &object_store,
                 write_manifest_file_to_path,
                 naming_scheme,
                 Some((&transaction).into()),
@@ -1987,6 +1996,9 @@ impl ManifestNamespace {
             let dataset_guard = self.manifest_dataset.get_refreshed().await?;
             let dataset = Arc::new(dataset_guard.clone());
             drop(dataset_guard);
+            // Staged files, indices, the commit, and cleanup must all use the dataset's
+            // own object store (see `commit_manifest_overwrite`).
+            let object_store = dataset.object_store(None).await?;
 
             let source = Self::manifest_projected_stream(&dataset).await?;
             let resolution = make_mutation().conflict_resolution();
@@ -2040,7 +2052,7 @@ impl ManifestNamespace {
                 .collect::<HashSet<_>>();
 
             if !mutation.has_changes {
-                self.cleanup_staged_manifest_files(&staged_data_files, &[])
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
                     .await;
                 return Ok(mutation.result);
             }
@@ -2059,8 +2071,12 @@ impl ManifestNamespace {
                 {
                     Ok(indices) => Some(indices),
                     Err(err) => {
-                        self.cleanup_staged_manifest_files(&staged_data_files, &index_uuids)
-                            .await;
+                        self.cleanup_staged_manifest_files(
+                            &object_store,
+                            &staged_data_files,
+                            &index_uuids,
+                        )
+                        .await;
                         return Err(err);
                     }
                 }
@@ -2095,8 +2111,12 @@ impl ManifestNamespace {
                         let _ = self.manifest_dataset.get_refreshed().await;
                         return Ok(mutation.result);
                     }
-                    self.cleanup_staged_manifest_files(&staged_data_files, staged_index_uuids)
-                        .await;
+                    self.cleanup_staged_manifest_files(
+                        &object_store,
+                        &staged_data_files,
+                        staged_index_uuids,
+                    )
+                    .await;
                     match err {
                         CommitError::CommitConflict => {
                             if let Some(output) =
@@ -4581,6 +4601,47 @@ mod tests {
         assert!(
             !manifest_ns
                 .manifest_contains_object("attempted_table")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_commit_visible_on_memory_store() {
+        // Regression: the commit must use the same object store the manifest dataset reads
+        // from. On `memory://` the namespace store and the dataset store can be different
+        // in-memory instances, so a commit written to the wrong one is invisible to reads
+        // (manifests as stale version -> endless conflict / "not found").
+        let manifest_ns = create_manifest_namespace("memory://test_commit_visible", false).await;
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("table.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(manifest_ns.manifest_contains_object("table").await.unwrap());
+        // A second sequential commit must not falsely conflict.
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table2".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("table2.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            manifest_ns
+                .manifest_contains_object("table2")
                 .await
                 .unwrap()
         );
