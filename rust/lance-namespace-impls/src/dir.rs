@@ -66,10 +66,9 @@ use lance_namespace::models::{
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
     QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RenameTableRequest,
-    RenameTableResponse, RestoreTableRequest,
-    RestoreTableResponse, TableExistsRequest, TableVersion, TagContents as ModelTagContents,
-    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
-    UpdateTableTagResponse,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    TableVersion, TagContents as ModelTagContents, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 use lance_core::{Error, Result};
