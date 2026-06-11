@@ -3,7 +3,9 @@
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
 use geo_types::coord;
@@ -17,9 +19,9 @@ use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::scalar::rtree::{BoundingBox, RTreeIndex, RTreeIndexPlugin, RTreeTrainingRequest};
 use lance_index::scalar::{GeoQuery, RelationQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

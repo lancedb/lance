@@ -11,8 +11,8 @@ use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array,
 use arrow_schema::Field;
 use async_trait::async_trait;
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
@@ -296,7 +296,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.reader.deep_size_of_children(context)
             + self.quantizer.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)

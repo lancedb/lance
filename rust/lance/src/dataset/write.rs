@@ -53,7 +53,7 @@ mod retry;
 pub mod update;
 
 pub use super::progress::{WriteProgressFn, WriteStats};
-pub use commit::CommitBuilder;
+pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
 pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
 
@@ -657,6 +657,26 @@ pub(crate) async fn cleanup_data_fragments(
                 if let Err(e) = object_store.delete(&path).await {
                     log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
                 }
+
+                // Clean up any blob v2 sidecars that might exist for this data file.
+                // Blob v2 sidecars are written to `data/{data_file_key}/{blob_id}.blob`.
+                // The `data_file_key` is the file stem of the .lance file.
+                if let Some(stem) = std::path::Path::new(file.path.as_str())
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                {
+                    let blob_dir = data_dir.clone().join(stem);
+                    match object_store.remove_dir_all(blob_dir.clone()).await {
+                        Err(e) if !matches!(e, Error::NotFound { .. }) => {
+                            log::warn!(
+                                "Failed to clean up orphaned blob dir '{}': {}",
+                                blob_dir,
+                                e
+                            );
+                        }
+                        _ => {}
+                    }
+                }
             } else {
                 skipped_external += 1;
             }
@@ -1031,9 +1051,10 @@ where
         Ok(self.writer.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        let num_rows = self.writer.finish().await? as u32;
         let size_bytes = self.writer.tell().await?;
         Ok((
-            self.writer.finish().await? as u32,
+            num_rows,
             DataFile::new_legacy(
                 self.path.clone(),
                 self.writer.schema(),
@@ -1086,17 +1107,17 @@ impl GenericWriter for V2WriterAdapter {
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
-        let num_rows = self.writer.finish().await? as u32;
+        let write_summary = self.writer.finish().await?;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
             major,
             minor,
-            NonZero::new(self.writer.tell().await?),
+            NonZero::new(write_summary.size_bytes),
             self.base_id,
         );
-        Ok((num_rows, data_file))
+        Ok((write_summary.num_rows as u32, data_file))
     }
 }
 

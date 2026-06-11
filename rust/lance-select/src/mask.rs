@@ -9,8 +9,8 @@ use std::{collections::BTreeMap, io::Read};
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
 use lance_core::cache::CacheCodecImpl;
@@ -76,6 +76,13 @@ impl RowAddrMask {
             Self::AllowList(allow_list) => allow_list.contains(row_id),
             Self::BlockList(block_list) => !block_list.contains(row_id),
         }
+    }
+
+    /// True if every row_id is selected. Lets callers (e.g. the FTS wand
+    /// loop) skip per-row mask checks entirely, which in turn lets the
+    /// deferred-row_id scoring path skip loading the row_id column.
+    pub fn is_select_all(&self) -> bool {
+        matches!(self, Self::BlockList(b) if b.is_empty())
     }
 
     /// Return the indices of the input row ids that were valid
@@ -301,7 +308,7 @@ pub enum RowAddrSelection {
 }
 
 impl DeepSizeOf for RowAddrSelection {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Full => 0,
             Self::Partial(bitmap) => bitmap.serialized_size(),
@@ -1859,7 +1866,7 @@ mod tests {
 
     #[test]
     fn test_row_addr_selection_deep_size_of() {
-        use deepsize::DeepSizeOf;
+        use lance_core::deepsize::DeepSizeOf;
 
         // Test Full variant - should have minimal size (just the enum discriminant)
         let full = RowAddrSelection::Full;

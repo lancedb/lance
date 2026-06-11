@@ -26,7 +26,6 @@ datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion.workspace = true
-deepsize.workspace = true
 dirs.workspace = true
 fst.workspace = true
 futures.workspace = true
@@ -45,11 +44,11 @@ lance-encoding.workspace = true
 lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
+libsais-rs = "0.2"
 lance-linalg.workspace = true
 lance-select.workspace = true
 lance-tokenizer.workspace = true
 lance-table.workspace = true
-libm.workspace = true
 log.workspace = true
 ndarray.workspace = true
 num-traits.workspace = true
@@ -69,7 +68,6 @@ crossbeam-queue.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-twox-hash = "2.0"
 async-channel = "2.3.1"
 bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 rand_distr.workspace = true
@@ -92,17 +90,12 @@ geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-sch
 protoc = ["dep:protobuf-src"]
 jieba-rs = ["tokenizer-jieba"]
 lindera = ["tokenizer-lindera"]
-icu = ["tokenizer-icu"]
 tokenizer-lindera = ["lance-tokenizer/tokenizer-lindera"]
 tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
-tokenizer-icu = ["lance-tokenizer/tokenizer-icu"]
 
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof.workspace = true
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version

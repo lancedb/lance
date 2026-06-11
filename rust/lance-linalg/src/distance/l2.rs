@@ -18,6 +18,7 @@ use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
@@ -37,6 +38,51 @@ pub trait L2: Num {
 #[inline]
 pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
     T::l2(from, to)
+}
+
+/// L2 distance between two f32 slices, dispatched to the widest SIMD backend
+/// available at runtime.
+///
+/// On x86_64 with AVX-512 this uses 16-wide f32 lanes; otherwise it falls back
+/// to [`l2`], which auto-vectorizes to the compiled target (AVX2 on the default
+/// `haswell` build). Lance ships an AVX2-baseline binary, so the generic
+/// [`l2`] never emits AVX-512 even on capable CPUs — this dispatcher recovers
+/// that throughput for callers in the hot path (e.g. the in-memory HNSW index).
+#[inline]
+pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use lance_core::utils::cpu::SimdSupport;
+        if matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
+            // SAFETY: guarded by the runtime AVX-512 detection above.
+            return unsafe { l2_f32_avx512(x, y) };
+        }
+    }
+    l2(x, y)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn l2_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let a = _mm512_loadu_ps(x.as_ptr().add(i));
+        let b = _mm512_loadu_ps(y.as_ptr().add(i));
+        let diff = _mm512_sub_ps(a, b);
+        acc = _mm512_fmadd_ps(diff, diff, acc);
+        i += 16;
+    }
+    let mut sum = _mm512_reduce_add_ps(acc);
+    while i < n {
+        let diff = x[i] - y[i];
+        sum += diff * diff;
+        i += 1;
+    }
+    sum
 }
 
 /// Calculate L2 distance between two uint8 slices.
@@ -106,7 +152,7 @@ mod bf16_kernel {
     unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn l2_bf16_neon(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512_bf16", target_arch = "x86_64"))]
         pub fn l2_bf16_avx512(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn l2_bf16_avx2(ptr1: *const bf16, ptr2: *const bf16, len: u32) -> f32;
@@ -127,7 +173,7 @@ impl L2 for bf16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_support = "avx512",
+                kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512FP16 => unsafe {
@@ -159,7 +205,7 @@ mod kernel {
     unsafe extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn l2_f16_neon(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512_f16", target_arch = "x86_64"))]
         pub fn l2_f16_avx512(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn l2_f16_avx2(ptr1: *const f16, ptr2: *const f16, len: u32) -> f32;
@@ -180,7 +226,7 @@ impl L2 for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_support = "avx512",
+                kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512FP16 => unsafe {
@@ -286,7 +332,7 @@ fn accumulate_l2_dimension(q: f32, row: &[f32], result: &mut [f32]) {
 /// sub-vector codebooks (e.g. 256 centroids × 16 dims = 16 KB).
 /// For large target sets the SoA layout causes L1 thrashing and
 /// [`l2_distance_batch`] with its AoS per-target locality is faster.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct L2Prepared {
     transposed: Vec<f32>,
     dimension: usize,
@@ -465,6 +511,16 @@ mod tests {
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
     };
+
+    #[test]
+    fn test_l2_f32_dispatch_matches_scalar() {
+        // Covers tail handling for lengths around the 16-lane AVX-512 stride.
+        for dim in [1usize, 7, 15, 16, 17, 31, 33, 64, 100, 1024] {
+            let x: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.25 + 1.5).collect();
+            assert_relative_eq!(l2_f32(&x, &y), l2(&x, &y), max_relative = 1e-5);
+        }
+    }
 
     #[test]
     fn test_euclidean_distance() {

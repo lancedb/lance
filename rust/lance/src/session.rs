@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use deepsize::DeepSizeOf;
 use lance_core::cache::{CacheBackend, LanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -56,7 +56,7 @@ pub struct Session {
 }
 
 impl DeepSizeOf for Session {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut size = 0;
         // Measure the actual cache contents through the wrapper types
         size += self.index_cache.deep_size_of_children(context);

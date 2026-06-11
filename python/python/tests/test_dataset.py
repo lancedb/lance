@@ -1655,6 +1655,51 @@ def test_strict_overwrite(tmp_path: Path):
         )
 
 
+def test_commit_timeout(tmp_path: Path):
+    from datetime import timedelta
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "timeout"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    append = lance.LanceOperation.Append([fragment])
+
+    # A zero duration reaches Rust and is rejected as invalid input.
+    with pytest.raises(OSError, match="non-zero"):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, commit_timeout=timedelta(0)
+        )
+
+    # A negative duration is rejected by PyO3's timedelta -> Duration conversion.
+    with pytest.raises(ValueError):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, commit_timeout=timedelta(seconds=-1)
+        )
+
+    # None disables the timeout.
+    dataset_no_timeout = lance.LanceDataset.commit(
+        dataset, append, read_version=1, commit_timeout=None
+    )
+    assert dataset_no_timeout.version == dataset.version + 1
+
+    # Explicit positive timeout works.
+    fragment2 = lance.fragment.LanceFragment.create(base_dir, table)
+    append2 = lance.LanceOperation.Append([fragment2])
+    dataset_with_timeout = lance.LanceDataset.commit(
+        dataset_no_timeout,
+        append2,
+        read_version=dataset_no_timeout.version,
+        commit_timeout=timedelta(minutes=1),
+    )
+    assert dataset_with_timeout.version == dataset_no_timeout.version + 1
+
+    # Timeout *firing* behavior is covered by the Rust test
+    # `test_commit_timeout_triggers`, which uses a throttled store for a
+    # reliable trigger; reproducing it from Python without exposing
+    # throttling would be flaky on fast runners.
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -5612,4 +5657,33 @@ def test_default_scan_options_nearest(tmp_path: Path) -> None:
     distances = result["_distance"].to_pylist()
     assert distances == sorted(distances)
 
-    assert "id" in result.column_names
+
+def test_tracked_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+    ds.delete("x = 2")  # adds a deletion file
+
+    reader = ds.tracked_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("version").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+
+    types = set(result.column("type").to_pylist())
+    assert "manifest" in types
+    assert "data file" in types
+    assert "deletion file" in types
+
+
+def test_all_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+
+    reader = ds.all_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("size_bytes").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+    assert all(s > 0 for s in result.column("size_bytes").to_pylist())

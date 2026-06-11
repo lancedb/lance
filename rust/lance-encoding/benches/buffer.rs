@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use lance_encoding::buffer::LanceBuffer;
 
 const NUM_VALUES: &[usize] = &[1024 * 1024, 32 * 1024, 8 * 1024];
@@ -63,7 +65,7 @@ fn bench_zip(c: &mut Criterion) {
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+        .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_zip);
 
 // Non-linux version does not support pprof.

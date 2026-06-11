@@ -9,7 +9,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::utils::SimpleIndex;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_index::vector::kmeans::{
     KMeans, KMeansAlgo, KMeansAlgoFloat, KMeansParams, compute_partitions_arrow_array,

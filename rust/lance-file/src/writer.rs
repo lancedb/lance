@@ -49,6 +49,15 @@ const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
 
+/// Summary of a completed Lance file write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileWriteSummary {
+    /// The number of rows written to the file.
+    pub num_rows: u64,
+    /// The final size of the file in bytes.
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
     /// How many bytes to use for buffering column data
@@ -303,7 +312,7 @@ impl FileWriter {
         for batch in batches {
             writer.write_batch(&batch).await?;
         }
-        Ok(writer.finish().await? as usize)
+        Ok(writer.finish().await?.num_rows as usize)
     }
 
     async fn do_write_buffer(writer: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> Result<()> {
@@ -755,8 +764,8 @@ impl FileWriter {
     /// will write the file metadata and the footer.  It will not return until all
     /// data has been flushed and the file has been closed.
     ///
-    /// Returns the total number of rows written
-    pub async fn finish(&mut self) -> Result<u64> {
+    /// Returns a summary of the completed file write.
+    pub async fn finish(&mut self) -> Result<FileWriteSummary> {
         // 1. flush any remaining data and write out those pages
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
@@ -812,9 +821,12 @@ impl FileWriter {
         self.writer.write_all(MAGIC).await?;
 
         // 7. close the writer
-        Writer::shutdown(self.writer.as_mut()).await?;
+        let write_result = Writer::shutdown(self.writer.as_mut()).await?;
 
-        Ok(self.rows_written)
+        Ok(FileWriteSummary {
+            num_rows: self.rows_written,
+            size_bytes: write_result.size as u64,
+        })
     }
 
     pub async fn abort(&mut self) {
@@ -1581,8 +1593,12 @@ mod tests {
         .unwrap();
 
         writer.write_batch(&batch).await.unwrap();
-        let num_rows = writer.finish().await.unwrap();
-        assert_eq!(num_rows, 2);
+        let write_summary = writer.finish().await.unwrap();
+        assert_eq!(write_summary.num_rows, 2);
+        assert_eq!(
+            write_summary.size_bytes,
+            fs.object_store.size(&path).await.unwrap()
+        );
 
         // Read back with split configuration
         let file_scheduler = fs

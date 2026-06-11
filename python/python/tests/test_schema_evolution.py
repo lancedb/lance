@@ -6,6 +6,8 @@ import uuid
 from pathlib import Path
 
 import lance
+import lance.dependencies as dependencies
+import lance.udf as udf_module
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -285,6 +287,37 @@ def test_add_columns_callable(tmp_path: Path, use_fragments):
 
     expected = pa.table({"a": range(100), "b": range(1, 101)})
     check_add_columns(dataset, expected, use_fragments, mapper)
+
+
+@pytest.mark.parametrize("use_batch_udf", [False, True])
+def test_add_columns_arrow_udf_without_pandas_dependency(
+    tmp_path: Path, monkeypatch, use_batch_udf
+):
+    table = pa.table({"caption": ["a Shutterstock photo", "clean"]})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    def mapper(batch: pa.RecordBatch) -> pa.RecordBatch:
+        flags = pc.match_substring_regex(
+            pc.utf8_lower(batch["caption"]), "shutterstock"
+        )
+        return pa.record_batch([flags], names=["wm"])
+
+    if use_batch_udf:
+        mapper = lance.batch_udf()(mapper)
+
+    # CI has pandas installed, so simulate Lance's no-pandas lazy proxy state.
+    # Without the guard, accessing pd.DataFrame raises ModuleNotFoundError.
+    monkeypatch.setattr(dependencies, "_PANDAS_AVAILABLE", False)
+    monkeypatch.setattr(
+        udf_module,
+        "pd",
+        dependencies._LazyModule("pandas", module_available=False),
+    )
+
+    dataset.add_columns(mapper, read_columns=["caption"], batch_size=64)
+
+    expected = table.append_column("wm", pa.array([True, False]))
+    assert dataset.to_table() == expected
 
 
 def test_query_after_merge(tmp_path):

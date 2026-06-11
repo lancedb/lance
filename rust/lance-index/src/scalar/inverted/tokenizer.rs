@@ -22,11 +22,9 @@ use crate::pbold;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
-#[cfg(feature = "tokenizer-icu")]
-use lance_tokenizer::IcuTokenizer;
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
-    AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
+    AsciiFoldingFilter, IcuTokenizer, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
     SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
     WhitespaceTokenizer,
 };
@@ -154,7 +152,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                 .base_tokenizer
                 .as_ref()
                 .cloned()
-                .unwrap_or(defaults.base_tokenizer),
+                .unwrap_or_else(|| "simple".to_string()),
             language: serde_json::from_str(details.language.as_str())?,
             with_position: details.with_position,
             max_token_length: details.max_token_length.map(|l| l as usize),
@@ -389,7 +387,6 @@ impl InvertedIndexParams {
             "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
             "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
             "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
-            #[cfg(feature = "tokenizer-icu")]
             "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
@@ -443,7 +440,6 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::InvertedIndexParams;
-    #[cfg(feature = "tokenizer-icu")]
     use lance_tokenizer::TokenStream;
 
     #[test]
@@ -494,7 +490,6 @@ mod tests {
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
     }
 
-    #[cfg(feature = "tokenizer-icu")]
     #[test]
     fn test_build_icu_tokenizer() {
         let mut tokenizer = InvertedIndexParams::default()

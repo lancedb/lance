@@ -58,7 +58,9 @@ use crate::{
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        AddRowAddrExec, Planner, TakeExec, project, scalar_index::MapIndexExec, utils::ReplayExec,
+        AddRowAddrExec, Planner, TakeExec, project,
+        scalar_index::{IndexLookup, MapIndexExec},
+        utils::ReplayExec,
     },
 };
 use arrow_array::{
@@ -121,6 +123,7 @@ use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
+use std::collections::HashMap;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::{
@@ -624,30 +627,67 @@ impl MergeInsertJob {
             .map(|_| SchemaComparison::Subschema)
     }
 
-    async fn join_key_as_scalar_index(&self) -> Result<Option<IndexMetadata>> {
-        if self.params.on.len() != 1 {
-            // joining on more than one column
-            Ok(None)
-        } else {
-            let col = &self.params.on[0];
-            self.dataset
+    /// Collect every join column that has a scalar index supporting exact
+    /// equality.
+    ///
+    /// For a single-column join this matches the previous behavior. For a
+    /// multi-column (composite key) join, every indexed column contributes
+    /// an additional `IsIn` probe inside one [`MapIndexExec`]: their AND
+    /// yields the row addresses where every indexed column matches some
+    /// source value. The downstream hash join still filters by the full
+    /// composite key, so unindexed columns simply do not prune the
+    /// candidate set — they are checked by the post-filter.
+    ///
+    /// Returns an empty vec when no join column has a usable scalar index;
+    /// callers should then fall through to the full-scan path.
+    async fn indexed_join_keys(&self) -> Result<Vec<(String, IndexMetadata)>> {
+        let mut indexed = Vec::with_capacity(self.params.on.len());
+        for col in &self.params.on {
+            if let Some(idx) = self
+                .dataset
                 .load_scalar_index(
                     IndexCriteria::default()
                         .for_column(col)
                         // Unclear if this would work if the index does not support exact equality
                         .supports_exact_equality(),
                 )
-                .await
+                .await?
+            {
+                indexed.push((col.clone(), idx));
+            }
         }
+        Ok(indexed)
+    }
+
+    /// Fragments that cannot be reached by every index in `indexed_keys`
+    /// and therefore must be scanned separately and unioned in alongside
+    /// the indexed take.  A fragment is "reachable" by the composite probe
+    /// only if it is in the intersection of all the indices' fragment
+    /// bitmaps; everything else falls into the unindexed set.
+    async fn unindexed_fragments_for_keys(
+        &self,
+        indexed_keys: &[(String, IndexMetadata)],
+    ) -> Result<Vec<Fragment>> {
+        let mut unindexed: HashMap<u64, Fragment> = HashMap::new();
+        for (_, index) in indexed_keys {
+            for frag in self.dataset.unindexed_fragments(&index.name).await? {
+                unindexed.entry(frag.id).or_insert(frag);
+            }
+        }
+        Ok(unindexed.into_values().collect())
     }
 
     async fn create_indexed_scan_joined_stream(
         &self,
         source: SendableRecordBatchStream,
-        index: IndexMetadata,
+        indexed_keys: Vec<(String, IndexMetadata)>,
     ) -> Result<SendableRecordBatchStream> {
         // This relies on a few non-standard physical operators and so we cannot use the
         // datafusion dataframe API and need to construct the plan manually :'(
+        debug_assert!(
+            !indexed_keys.is_empty(),
+            "create_indexed_scan_joined_stream requires at least one indexed key"
+        );
         let schema = source.schema();
         let add_row_addr = match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => false,
@@ -662,22 +702,25 @@ impl MergeInsertJob {
         // the new data into memory.  In the future, we can do better
         let shared_input = Arc::new(ReplayExec::new(Capacity::Unbounded, input));
 
-        // 3 - Use the index to map input to row addresses
-        // First, we need to project to the key column
-        let field = schema.field_with_name(&self.params.on[0])?;
-        let index_mapper_input = Arc::new(project(
-            shared_input.clone(),
-            // schema for only the key join column
-            &Schema::new(vec![field.clone()]),
-        )?);
+        // 3 - Probe every indexed join column.  For composite keys this is
+        //     the AND of one `IsIn` query per indexed column, which yields
+        //     a tighter candidate set than probing a single column.  The
+        //     downstream hash join still filters by the full composite key,
+        //     so unindexed `on` columns simply do not prune the candidates.
+        let lookup_fields = indexed_keys
+            .iter()
+            .map(|(col, _)| Ok(schema.field_with_name(col)?.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let index_mapper_input =
+            Arc::new(project(shared_input.clone(), &Schema::new(lookup_fields))?);
 
-        // Then we pass the key column into the index mapper
-        let index_column = self.params.on[0].clone();
-        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new(
-            // create index from original data and key column
+        let lookups = indexed_keys
+            .iter()
+            .map(|(col, idx)| IndexLookup::new(col.clone(), idx.name.clone()))
+            .collect::<Vec<_>>();
+        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
             self.dataset.clone(),
-            index_column.clone(),
-            index.name.clone(),
+            lookups,
             index_mapper_input,
         ));
 
@@ -722,8 +765,12 @@ impl MergeInsertJob {
             .filter(|name| name.as_str() != ROW_ID && name.as_str() != ROW_ADDR)
             .collect::<Vec<_>>();
 
-        // 5a - We also need to scan any new unindexed data and union it in
-        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        // 5a - We also need to scan any new unindexed data and union it in.
+        //      A row can be reached by the composite index probe only if it
+        //      lives in a fragment covered by *every* chosen index, so the
+        //      "unindexed" set is the union of fragments missing from any
+        //      one of them.
+        let unindexed_fragments = self.unindexed_fragments_for_keys(&indexed_keys).await?;
         if !unindexed_fragments.is_empty() {
             let mut builder = self.dataset.scan();
             if add_row_addr {
@@ -748,22 +795,47 @@ impl MergeInsertJob {
         // field names (DF doesn't support this as of version 44)
         target = Self::prefix_columns_phys(target, "target_");
 
-        // 6 - Finally, join the input (source table) with the taken data (target table)
-        let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
-        let target_key = Column::new_with_schema(
-            &format!("target_{}", index_column),
-            target.schema().as_ref(),
-        )?;
+        // 6 - Join the source against the taken target rows on the full
+        //     composite key.  Probing the index produces a super-set of the
+        //     actual matches (when not every key column has an index, or
+        //     even when they do — the per-column `IsIn` lists do not
+        //     correlate values across the tuple), so this join is what
+        //     trims candidates down to the exact composite-key matches.
+        let on_keys = self
+            .params
+            .on
+            .iter()
+            .map(|col| {
+                let source_key = Column::new_with_schema(col, shared_input.schema().as_ref())?;
+                let target_key =
+                    Column::new_with_schema(&format!("target_{}", col), target.schema().as_ref())?;
+                Ok::<_, Error>((
+                    Arc::new(source_key) as Arc<dyn PhysicalExpr>,
+                    Arc::new(target_key) as Arc<dyn PhysicalExpr>,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Use standard SQL NULL semantics for composite keys so this path
+        // produces the same result as the full-scan path.  The
+        // single-column case keeps its historical `NullEqualsNull` behavior
+        // to avoid changing semantics for existing callers.
+        let null_equality = if self.params.on.len() == 1 {
+            NullEquality::NullEqualsNull
+        } else {
+            NullEquality::NullEqualsNothing
+        };
+
         let joined = Arc::new(
             HashJoinExec::try_new(
                 shared_input,
                 target,
-                vec![(Arc::new(source_key), Arc::new(target_key))],
+                on_keys,
                 None,
                 &JoinType::Full,
                 None,
                 PartitionMode::CollectLeft,
-                NullEquality::NullEqualsNull,
+                null_equality,
                 false,
             )
             .unwrap(),
@@ -882,8 +954,11 @@ impl MergeInsertJob {
             )
         {
             // keeping unmatched rows, no deletion
-            if let Some(index) = self.join_key_as_scalar_index().await? {
-                return self.create_indexed_scan_joined_stream(source, index).await;
+            let indexed_keys = self.indexed_join_keys().await?;
+            if !indexed_keys.is_empty() {
+                return self
+                    .create_indexed_scan_joined_stream(source, indexed_keys)
+                    .await;
             }
         }
 
@@ -1618,7 +1693,7 @@ impl MergeInsertJob {
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
             ) {
-            self.join_key_as_scalar_index().await?.is_some()
+            !self.indexed_join_keys().await?.is_empty()
         } else {
             false
         };
@@ -3562,6 +3637,368 @@ mod tests {
             .unwrap();
 
         assert_eq!(ds.count_rows(None).await.unwrap(), 2048);
+    }
+
+    /// Multi-column (composite key) merge_insert when one or more join
+    /// columns have a scalar index.  Before this change the indexed path
+    /// was hard-gated to single-column joins; composite-key merges fell
+    /// through to a full target scan even when every key column was
+    /// indexed.  Now each indexed column contributes an AND-ed `IsIn`
+    /// probe inside one `MapIndexExec`, and the downstream hash join trims
+    /// the candidates to the exact composite-key matches — rows that
+    /// happen to match one key column but not the other must NOT be
+    /// touched.
+    #[rstest::rstest]
+    #[case::index_on_first(true, false)]
+    #[case::index_on_second(false, true)]
+    #[case::index_on_both(true, true)]
+    #[tokio::test]
+    async fn test_indexed_merge_insert_composite_key(
+        #[case] index_on_a: bool,
+        #[case] index_on_b: bool,
+    ) {
+        // Target rows: every (a, b) combination from {1,2} x {10,20}.
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2, 2]),
+            ("b", Int32, [10, 20, 10, 20]),
+            ("value", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::default();
+        if index_on_a {
+            ds.create_index(&["a"], IndexType::Scalar, None, &params, false)
+                .await
+                .unwrap();
+        }
+        if index_on_b {
+            ds.create_index(&["b"], IndexType::Scalar, None, &params, false)
+                .await
+                .unwrap();
+        }
+
+        // Update (1, 10) and insert (3, 30).  A naive single-column probe
+        // on `a` would also pull (1, 20) into the candidate set; the
+        // composite hash join must keep (1, 20) untouched.
+        let source = record_batch!(
+            ("a", Int32, [1, 3]),
+            ("b", Int32, [10, 30]),
+            ("value", Int32, [999, 333])
+        )
+        .unwrap();
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 5);
+
+        let untouched = updated_ds
+            .count_rows(Some("a = 1 AND b = 20 AND value = 200".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            untouched, 1,
+            "(1, 20) must not be clobbered by an `a`-only probe"
+        );
+
+        let updated = updated_ds
+            .count_rows(Some("a = 1 AND b = 10 AND value = 999".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let inserted = updated_ds
+            .count_rows(Some("a = 3 AND b = 30 AND value = 333".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+    }
+
+    /// Composite key merge_insert with no scalar index on any join column
+    /// must keep working via the full-scan fallback.  Guards against the
+    /// indexed path becoming a hard requirement after this optimization.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_composite_key_no_index() {
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2]),
+            ("b", Int32, [10, 20, 10]),
+            ("value", Int32, [100, 200, 300])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(
+            ("a", Int32, [1]),
+            ("b", Int32, [20]),
+            ("value", Int32, [999])
+        )
+        .unwrap();
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 0);
+        let count = updated_ds
+            .count_rows(Some("a = 1 AND b = 20 AND value = 999".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Composite-key merge_insert must use standard SQL NULL semantics
+    /// (NULL != NULL) on the post-filter hash join so its behavior is
+    /// identical to the full-scan path; otherwise enabling the indexed
+    /// path for multi-column joins would silently change semantics.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_composite_key_null_semantics() {
+        let initial = record_batch!(
+            ("a", Int32, [Some(1)]),
+            ("b", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(10)])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        ds.create_index(
+            &["a"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(
+            ("a", Int32, [Some(1)]),
+            ("b", Utf8, [Option::<&str>::None]),
+            ("value", Int32, [Some(99)])
+        )
+        .unwrap();
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, 1);
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
+    }
+
+    /// Composite-key merge_insert where new (unindexed) fragments are
+    /// appended after the indices were built.  The indexed take only sees
+    /// fragments covered by every chosen index, so the unindexed remainder
+    /// must be unioned in via a full scan — otherwise updates to rows
+    /// that live in those fragments are silently dropped.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_composite_key_unindexed_fragments() {
+        let first = record_batch!(
+            ("a", Int32, [1, 2]),
+            ("b", Int32, [10, 20]),
+            ("value", Int32, [100, 200])
+        )
+        .unwrap();
+        let schema = first.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first.clone())], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::default();
+        ds.create_index(&["a"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        ds.create_index(&["b"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Append a fragment AFTER both indices are built.  The new (3, 30)
+        // row lives in a fragment neither index covers, so the indexed
+        // take alone would miss it.
+        let appended = record_batch!(
+            ("a", Int32, [3]),
+            ("b", Int32, [30]),
+            ("value", Int32, [300])
+        )
+        .unwrap();
+        ds.append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Source updates one row in the indexed fragment AND one row in
+        // the appended (unindexed) fragment.
+        let source = record_batch!(
+            ("a", Int32, [1, 3]),
+            ("b", Int32, [10, 30]),
+            ("value", Int32, [999, 333])
+        )
+        .unwrap();
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            stats.num_updated_rows, 2,
+            "row in the unindexed fragment must also be updated"
+        );
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
+    }
+
+    /// Composite-key `MapIndexExec` formats its Display so plans expose
+    /// every probed column, and `with_new_children` round-trips the full
+    /// lookup list rather than collapsing back to a single-column form.
+    /// Lives here (not in scalar_index.rs's tests) so the new lines don't
+    /// pile up in a file with pending upstream conflicts.
+    #[test]
+    fn map_index_exec_multi_lookup_plan_shape() {
+        use crate::io::exec::scalar_index::{IndexLookup, MapIndexExec, ScalarIndexExec};
+        use crate::utils::test::NoContextTestFixture;
+        use datafusion::physical_plan::{ExecutionPlan, displayable};
+        use datafusion::scalar::ScalarValue;
+        use lance_index::scalar::{
+            SargableQuery,
+            expression::{ScalarIndexExpr, ScalarIndexSearch},
+        };
+        use lance_select::result::IndexExprResultWireFormat;
+
+        let fixture = NoContextTestFixture::new();
+        let dataset = Arc::new(fixture.dataset);
+
+        let dummy_input: Arc<dyn ExecutionPlan> = Arc::new(ScalarIndexExec::new(
+            dataset.clone(),
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "ordered".to_string(),
+                index_name: "ordered_idx".to_string(),
+                index_type: "BTree".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::UInt64(Some(1)))),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            }),
+            IndexExprResultWireFormat::default(),
+        ));
+
+        let lookups = vec![
+            IndexLookup::new("a", "a_idx"),
+            IndexLookup::new("b", "b_idx"),
+        ];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
+            dataset.clone(),
+            lookups,
+            dummy_input.clone(),
+        ));
+
+        let rendered = format!("{}", displayable(plan.as_ref()).indent(false));
+        assert!(
+            rendered.contains("IndexedLookup [a, b]"),
+            "multi-lookup Display must list every probed column, got: {rendered}",
+        );
+
+        let rebuilt = plan
+            .with_new_children(vec![dummy_input.clone()])
+            .expect("with_new_children must accept exactly one child");
+        let rebuilt_rendered = format!("{}", displayable(rebuilt.as_ref()).indent(false));
+        assert!(
+            rebuilt_rendered.contains("IndexedLookup [a, b]"),
+            "with_new_children must preserve every lookup, got: {rebuilt_rendered}",
+        );
+
+        // The single-lookup convenience constructor still renders without
+        // the column list, so existing EXPLAIN output is unchanged for
+        // single-column joins.
+        let single: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new(
+            dataset,
+            "ordered".to_string(),
+            "ordered_idx".to_string(),
+            dummy_input,
+        ));
+        let single_rendered = format!("{}", displayable(single.as_ref()).indent(false));
+        assert!(
+            single_rendered.contains("IndexedLookup")
+                && !single_rendered.contains("IndexedLookup ["),
+            "single-lookup Display must not include the column list, got: {single_rendered}",
+        );
     }
 
     mod subcols {

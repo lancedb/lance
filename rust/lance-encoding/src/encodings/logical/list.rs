@@ -264,6 +264,118 @@ mod tests {
         DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
     }
 
+    async fn try_encode_v22_pages(
+        array: ArrayRef,
+    ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
+        try_encode_v22_pages_with_metadata(array, HashMap::new()).await
+    }
+
+    async fn try_encode_v22_pages_with_metadata(
+        array: ArrayRef,
+        field_metadata: HashMap<String, String>,
+    ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
+        let arrow_field =
+            Field::new("", array.data_type().clone(), true).with_metadata(field_metadata);
+        let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
+        let encoding_strategy = crate::encoder::default_encoding_strategy(LanceFileVersion::V2_2);
+        let mut column_index_seq = crate::encoder::ColumnIndexSequence::default();
+        let encoding_options = crate::encoder::EncodingOptions {
+            version: LanceFileVersion::V2_2,
+            ..Default::default()
+        };
+        let mut encoder = encoding_strategy
+            .create_field_encoder(
+                encoding_strategy.as_ref(),
+                &lance_field,
+                &mut column_index_seq,
+                &encoding_options,
+            )
+            .unwrap();
+        let mut external_buffers =
+            crate::encoder::OutOfLineBuffers::new(0, crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT);
+        let num_rows = array.len() as u64;
+        let mut pages = Vec::new();
+        for task in encoder
+            .maybe_encode(
+                array,
+                &mut external_buffers,
+                crate::repdef::RepDefBuilder::default(),
+                0,
+                num_rows,
+            )
+            .unwrap()
+        {
+            pages.push(task.await?);
+        }
+        for task in encoder.flush(&mut external_buffers).unwrap() {
+            pages.push(task.await?);
+        }
+        Ok(pages)
+    }
+
+    async fn encode_v22_pages(array: ArrayRef) -> Vec<crate::encoder::EncodedPage> {
+        try_encode_v22_pages(array).await.unwrap()
+    }
+
+    fn assert_split_miniblock_layout(
+        pages: &[crate::encoder::EncodedPage],
+        expect_structural_only_page: bool,
+    ) {
+        let mut miniblock_pages = 0;
+        let mut fullzip_pages = 0;
+        let mut structural_only_pages = 0;
+
+        for page in pages {
+            let crate::decoder::PageEncoding::Structural(layout) = &page.description else {
+                continue;
+            };
+            match layout.layout.as_ref().unwrap() {
+                crate::format::pb21::page_layout::Layout::MiniBlockLayout(_) => {
+                    miniblock_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::FullZipLayout(_) => {
+                    fullzip_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::ConstantLayout(layout) => {
+                    if layout.inline_value.is_none()
+                        && (layout.num_rep_values > 0 || layout.num_def_values > 0)
+                    {
+                        structural_only_pages += 1;
+                    }
+                }
+                crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
+            }
+        }
+
+        assert!(
+            miniblock_pages > 0,
+            "expected leaf values to remain on mini-block pages"
+        );
+        assert_eq!(
+            fullzip_pages, 0,
+            "split list pages should not fall back to full-zip"
+        );
+        if expect_structural_only_page {
+            assert!(
+                structural_only_pages > 0,
+                "expected at least one structural-only page"
+            );
+        }
+    }
+
+    fn assert_has_fullzip_layout(pages: &[crate::encoder::EncodedPage]) {
+        let has_fullzip = pages.iter().any(|page| {
+            let crate::decoder::PageEncoding::Structural(layout) = &page.description else {
+                return false;
+            };
+            matches!(
+                layout.layout.as_ref().unwrap(),
+                crate::format::pb21::page_layout::Layout::FullZipLayout(_)
+            )
+        });
+        assert!(has_fullzip, "expected at least one full-zip page");
+    }
+
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_list(
@@ -949,10 +1061,226 @@ mod tests {
             .await;
     }
 
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_uses_miniblock() {
+        // Redacted reproduction from a production schema shape containing ARRAY(BOOLEAN).
+        // The field names are not relevant; the failure requires sparse list structure
+        // with a 1-bit Boolean leaf value.
+        let num_rows = 200_000usize;
+        let num_non_empty = 10usize;
+        let booleans_per_list = 8usize;
+        let step = num_rows / num_non_empty;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let mut values = Vec::with_capacity(num_non_empty * booleans_per_list);
+        offsets.push(0i32);
+
+        let mut next_non_empty = step / 2;
+        for row in 0..num_rows {
+            if row == next_non_empty {
+                values.extend((0..booleans_per_list).map(|idx| idx % 2 == 0));
+                next_non_empty += step;
+            }
+            offsets.push(values.len() as i32);
+        }
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            None,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..1000)
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_split_miniblock_layout(&pages, false);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_with_long_empty_prefix() {
+        let empty_prefix_rows = 70_000usize;
+        let trailing_empty_rows = 9usize;
+        let booleans_per_list = 8usize;
+        let num_rows = empty_prefix_rows + 1 + trailing_empty_rows;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.extend(std::iter::repeat_n(0i32, empty_prefix_rows + 1));
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        offsets.push(values.len() as i32);
+        offsets.extend(std::iter::repeat_n(
+            values.len() as i32,
+            trailing_empty_rows,
+        ));
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            None,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, empty_prefix_rows as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_with_long_null_prefix() {
+        let null_prefix_rows = 70_000usize;
+        let trailing_empty_rows = 9usize;
+        let booleans_per_list = 8usize;
+        let num_rows = null_prefix_rows + 1 + trailing_empty_rows;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.extend(std::iter::repeat_n(0i32, null_prefix_rows + 1));
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        offsets.push(values.len() as i32);
+        offsets.extend(std::iter::repeat_n(
+            values.len() as i32,
+            trailing_empty_rows,
+        ));
+        let validity = BooleanBuffer::from_iter((0..num_rows).map(|row| row >= null_prefix_rows));
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            Some(NullBuffer::new(validity)),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, null_prefix_rows as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_with_amortized_long_empty_prefix() {
+        let empty_prefix_rows = 62_000usize;
+        let booleans_per_list = 8_192usize;
+        let num_rows = empty_prefix_rows + 1;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.extend(std::iter::repeat_n(0i32, empty_prefix_rows + 1));
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        offsets.push(values.len() as i32);
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            None,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, empty_prefix_rows as u64])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_sparse_boolean_list_fails_without_panic() {
+        let empty_inner_lists = 70_000usize;
+        let booleans_per_list = 8usize;
+
+        let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        inner_offsets.push(values.len() as i32);
+
+        let inner_items = BooleanArray::from(values);
+        let inner_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
+            Arc::new(inner_items),
+            None,
+        );
+        let outer_list = ListArray::new(
+            Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 1])),
+            Arc::new(inner_list),
+            None,
+        );
+
+        let err = try_encode_v22_pages(Arc::new(outer_list))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Mini-block cannot encode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_sparse_string_single_row_falls_back_to_fullzip() {
+        let empty_inner_lists = 70_000usize;
+
+        let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
+        inner_offsets.push(1);
+        inner_offsets.push(2);
+
+        let mut strings = StringBuilder::new();
+        strings.append_value("value");
+        strings.append_value("other");
+        let inner_items = strings.finish();
+        let inner_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
+            Arc::new(inner_items),
+            None,
+        );
+        let outer_list = ListArray::new(
+            Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 2])),
+            Arc::new(inner_list),
+            None,
+        );
+
+        let outer_list = Arc::new(outer_list) as ArrayRef;
+        let pages = encode_v22_pages(outer_list.clone()).await;
+        assert_has_fullzip_layout(&pages);
+
+        let test_cases = TestCases::default()
+            .with_range(0..1)
+            .with_indices(vec![0])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::new()).await;
+    }
+
     /// Builds the HNSW-flush repro shape: a dense prefix where every row has
     /// `NEIGHBORS_PER_ROW` distinct values, followed by a long tail of empty
     /// lists. Mirrors `HNSW::schema()` `__neighbors` / `__dists` columns:
-    /// dense level-0 lists, then ~6× as many mostly-empty higher-level rows.
+    /// dense level-0 lists, then ~6x as many mostly-empty higher-level rows.
     fn make_hnsw_shaped_list_u32() -> ListArray {
         const DENSE_ROWS: u32 = 40_000;
         const NEIGHBORS_PER_ROW: u32 = 32;
@@ -973,21 +1301,20 @@ mod tests {
         list_builder.finish()
     }
 
-    /// Reproduces the HNSW-shaped variable-length `List` miniblock bug at v2.2
-    /// **on the auto-routing path** (no `STRUCTURAL_ENCODING` metadata): a
-    /// dense prefix followed by a long tail of empty lists. Globally the data
-    /// looks dense, so the unfixed `repdef_too_sparse_for_miniblock` heuristic
-    /// picks miniblock; the final chunk's level count then overflows the u16
-    /// stored in the chunk header and the read drops rows. After the heuristic
-    /// fix, this shape correctly routes to fullzip and the round-trip is
-    /// lossless.
+    /// Reproduces the HNSW-flush shape at v2.2 on the auto path (no
+    /// `STRUCTURAL_ENCODING` metadata): a dense level-0 prefix followed by a
+    /// long tail of empty lists. The global levels/values ratio looks dense,
+    /// so this used to encode as a single mini-block page whose final chunk
+    /// absorbed every trailing empty list and overflowed the per-chunk `u16`
+    /// `num_levels`, corrupting the read. The structural page planner now
+    /// splits on top-level row boundaries: the dense prefix stays on
+    /// mini-block pages and the empty tail becomes structural-only pages, so
+    /// the round-trip is lossless without falling back to full-zip.
     #[test_log::test(tokio::test)]
-    async fn test_list_hnsw_shape_auto_routes_around_miniblock_overflow_v2_2() {
+    async fn test_list_hnsw_shape_splits_to_miniblock_v2_2() {
         let list_array = make_hnsw_shaped_list_u32();
         let dense_rows: u64 = 40_000;
         let total_rows = list_array.len() as u64;
-
-        let field_metadata = HashMap::new();
 
         let test_cases = TestCases::default()
             .with_range(0..1000)
@@ -996,23 +1323,19 @@ mod tests {
             .with_indices(vec![0, dense_rows - 1, dense_rows, total_rows - 1])
             .with_min_file_version(LanceFileVersion::V2_2)
             .with_max_file_version(LanceFileVersion::V2_2);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
-            .await;
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
-    /// Companion to the auto-routing test: even when the user *explicitly*
-    /// sets `STRUCTURAL_ENCODING_MINIBLOCK` on the HNSW shape, the heuristic
-    /// must still detect the per-chunk `num_levels: u16` overflow and override
-    /// the request with fullzip — silently overriding a corrupt-encoding
-    /// preference is the safe behaviour given v2.2 is a stable on-disk format
-    /// whose chunk header width cannot widen.
-    ///
-    /// (The codec-side `u16::try_from` safety net at the chunk-build site is
-    /// dormant on this shape precisely because the heuristic intercepts it;
-    /// the safety net is there in case a future shape sneaks past the
-    /// heuristic.)
+    /// Companion to the auto-path test: even when the user explicitly requests
+    /// `STRUCTURAL_ENCODING_MINIBLOCK`, the structural page planner splits the
+    /// HNSW shape so every emitted page fits the mini-block per-chunk budget.
+    /// The request is honored (the dense prefix stays on mini-block pages
+    /// rather than being forced to full-zip) and the round-trip is lossless.
     #[test_log::test(tokio::test)]
-    async fn test_forced_miniblock_hnsw_shape_routed_to_fullzip_v2_2() {
+    async fn test_forced_miniblock_hnsw_shape_splits_to_miniblock_v2_2() {
         let list_array = make_hnsw_shaped_list_u32();
         let total_rows = list_array.len() as u64;
 
@@ -1026,7 +1349,11 @@ mod tests {
             .with_range(0..total_rows)
             .with_min_file_version(LanceFileVersion::V2_2)
             .with_max_file_version(LanceFileVersion::V2_2);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
-            .await;
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = try_encode_v22_pages_with_metadata(list_array.clone(), field_metadata.clone())
+            .await
+            .unwrap();
+        assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
     }
 }

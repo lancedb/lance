@@ -347,8 +347,10 @@ impl LanceFileWriter {
     }
 
     pub fn finish(&self) -> PyResult<u64> {
-        rt().block_on(None, async { self.inner.lock().await.finish().await })?
-            .infer_error()
+        rt().block_on(None, async {
+            self.inner.lock().await.finish().await.map(|s| s.num_rows)
+        })?
+        .infer_error()
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {

@@ -86,6 +86,22 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
         None
     }
+
+    /// Returns a version of this I/O service that additionally records the I/O it
+    /// performs into `stats`, on top of any global accounting.  This is the seam
+    /// used to measure exact per-scope (e.g. per-query) I/O without re-opening
+    /// files: wrap a reader's I/O service, perform the reads, then inspect the
+    /// recorder.
+    ///
+    /// Returns `None` if this implementation does not support per-scope I/O
+    /// statistics (e.g. in-memory or test schedulers), in which case the caller
+    /// should fall back to using self (and no statistics are recorded).
+    fn with_io_stats(
+        &self,
+        _stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
+    ) -> Option<Arc<dyn EncodingsIo>> {
+        None
+    }
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer

@@ -14,7 +14,7 @@ use std::{any::Any, sync::Arc};
 use crate::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::mem_wal::MEM_WAL_INDEX_NAME;
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -125,6 +125,8 @@ pub enum IndexType {
 
     RTree = 10, // RTree
 
+    Fm = 11, // FM-Index
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -150,6 +152,7 @@ impl std::fmt::Display for IndexType {
             Self::ZoneMap => write!(f, "ZoneMap"),
             Self::BloomFilter => write!(f, "BloomFilter"),
             Self::RTree => write!(f, "RTree"),
+            Self::Fm => write!(f, "Fm"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -177,6 +180,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::ZoneMap as i32 => Ok(Self::ZoneMap),
             v if v == Self::BloomFilter as i32 => Ok(Self::BloomFilter),
             v if v == Self::RTree as i32 => Ok(Self::RTree),
+            v if v == Self::Fm as i32 => Ok(Self::Fm),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -205,6 +209,7 @@ impl TryFrom<&str> for IndexType {
             "ZoneMap" | "ZONEMAP" => Ok(Self::ZoneMap),
             "BloomFilter" | "BLOOMFILTER" | "BLOOM_FILTER" => Ok(Self::BloomFilter),
             "RTree" | "RTREE" | "R_TREE" => Ok(Self::RTree),
+            "Fm" | "FM" => Ok(Self::Fm),
             "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
@@ -235,7 +240,8 @@ impl IndexType {
                 | Self::NGram
                 | Self::ZoneMap
                 | Self::BloomFilter
-                | Self::RTree,
+                | Self::RTree
+                | Self::Fm,
         )
     }
 
@@ -275,6 +281,7 @@ impl IndexType {
             Self::ZoneMap => 0,
             Self::BloomFilter => 0,
             Self::RTree => 0,
+            Self::Fm => 0,
 
             // IMPORTANT: if any vector index subtype needs a format bump that is
             // not backward compatible, its new version must be set to
@@ -389,6 +396,7 @@ mod tests {
             IndexType::ZoneMap,
             IndexType::BloomFilter,
             IndexType::RTree,
+            IndexType::Fm,
             IndexType::Vector,
             IndexType::IvfFlat,
             IndexType::IvfSq,
@@ -430,6 +438,8 @@ mod tests {
             ("RTree", IndexType::RTree),
             ("RTREE", IndexType::RTree),
             ("R_TREE", IndexType::RTree),
+            ("Fm", IndexType::Fm),
+            ("FM", IndexType::Fm),
             ("Vector", IndexType::Vector),
             ("VECTOR", IndexType::Vector),
             ("IVF_FLAT", IndexType::IvfFlat),

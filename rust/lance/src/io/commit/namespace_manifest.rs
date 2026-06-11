@@ -14,27 +14,61 @@ use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use object_store::ObjectStore as OSObjectStore;
 use object_store::path::Path;
 
+use crate::dataset::branch_location::BranchLocation;
+
 #[derive(Debug)]
 pub struct LanceNamespaceExternalManifestStore {
     namespace_client: Arc<dyn LanceNamespace>,
     table_id: Vec<String>,
+    /// Object-store path of the table root (the main branch). The base path the
+    /// trait methods receive is resolved against this to derive which branch a
+    /// request targets, so a single store serves every branch of the table.
+    table_root: Path,
 }
 
 impl LanceNamespaceExternalManifestStore {
-    pub fn new(namespace_client: Arc<dyn LanceNamespace>, table_id: Vec<String>) -> Self {
+    pub fn new(
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        table_root: Path,
+    ) -> Self {
         Self {
             namespace_client,
             table_id,
+            table_root,
         }
+    }
+
+    /// Build a store for the table rooted at `table_uri`, resolving the root
+    /// path from the uri without initializing an object store.
+    pub fn for_table_uri(
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        table_uri: &str,
+    ) -> Result<Self> {
+        let table_root = lance_io::object_store::ObjectStore::extract_path_from_uri(
+            Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+            table_uri,
+        )?;
+        Ok(Self::new(namespace_client, table_id, table_root))
+    }
+
+    /// Derive the branch targeted by `base` (the table root for main, or a
+    /// branch chain produced by `BranchLocation::find_branch`). The branch
+    /// path layout is owned by [`BranchLocation`]; this store never parses or
+    /// constructs it directly.
+    fn branch_for_base(&self, base: &str) -> Result<Option<String>> {
+        BranchLocation::branch_of(self.table_root.as_ref(), base)
     }
 }
 
 #[async_trait]
 impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
-    async fn get(&self, _base_uri: &str, version: u64) -> Result<String> {
+    async fn get(&self, base_uri: &str, version: u64) -> Result<String> {
         let request = DescribeTableVersionRequest {
             id: Some(self.table_id.clone()),
             version: Some(version as i64),
+            branch: self.branch_for_base(base_uri)?,
             ..Default::default()
         };
 
@@ -47,11 +81,12 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         Ok(response.version.manifest_path)
     }
 
-    async fn get_latest_version(&self, _base_uri: &str) -> Result<Option<(u64, String)>> {
+    async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
         let request = ListTableVersionsRequest {
             id: Some(self.table_id.clone()),
             descending: Some(true),
             limit: Some(1),
+            branch: self.branch_for_base(base_uri)?,
             ..Default::default()
         };
 
@@ -73,7 +108,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
     /// Put the manifest to the namespace store.
     async fn put(
         &self,
-        _base_path: &Path,
+        base_path: &Path,
         version: u64,
         staging_path: &Path,
         size: u64,
@@ -94,6 +129,7 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             manifest_size: Some(size as i64),
             e_tag: e_tag.clone(),
             naming_scheme: Some(naming_scheme_str.to_string()),
+            branch: self.branch_for_base(base_path.as_ref())?,
             ..Default::default()
         };
 

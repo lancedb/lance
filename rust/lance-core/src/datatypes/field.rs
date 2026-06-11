@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::{
     ArrayRef,
     cast::AsArray,
@@ -18,7 +19,6 @@ use arrow_array::{
     },
 };
 use arrow_schema::{DataType, Field as ArrowField};
-use deepsize::DeepSizeOf;
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME, DataTypeExt,
     json::{is_arrow_json_field, is_json_field},
@@ -1300,6 +1300,23 @@ mod tests {
             assert_eq!(field.data_type(), data_type);
             assert_eq!(ArrowField::from(&field), arrow_field);
         }
+    }
+
+    #[test]
+    fn test_view_types_stored_as_lance_base_types() {
+        let field = Field::try_from(&ArrowField::new("s", DataType::Utf8View, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Utf8);
+        assert_eq!(
+            LogicalType::try_from(&DataType::Utf8View).unwrap().0,
+            "string"
+        );
+
+        let field = Field::try_from(&ArrowField::new("b", DataType::BinaryView, true)).unwrap();
+        assert_eq!(field.data_type(), DataType::Binary);
+        assert_eq!(
+            LogicalType::try_from(&DataType::BinaryView).unwrap().0,
+            "binary"
+        );
     }
 
     #[test]

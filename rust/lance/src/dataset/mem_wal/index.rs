@@ -14,6 +14,7 @@
 #![allow(clippy::print_stderr)]
 #![allow(clippy::type_complexity)]
 
+mod arena_skiplist;
 mod btree;
 mod fts;
 mod hnsw;
@@ -288,7 +289,8 @@ impl IndexStore {
         Ok(registry)
     }
 
-    /// Add a BTree/scalar index (implemented using skip-list for better concurrency).
+    /// Add a BTree/scalar index (skip-list backed). Low-level / test helper;
+    /// the production memtable path goes through [`Self::from_configs`].
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.btree_indexes
             .insert(name, BTreeMemIndex::new(field_id, column));

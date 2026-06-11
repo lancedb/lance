@@ -4,14 +4,14 @@
 use std::{
     any::Any,
     cmp::Ordering,
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Bound,
     sync::Arc,
 };
 
 use super::{
-    AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
+    AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
@@ -28,8 +28,17 @@ use crate::{
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
-use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_array::{
+    Array, ArrayAccessor, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
+    cast::AsArray,
+    new_empty_array,
+    types::{
+        ArrowPrimitiveType, Decimal128Type, Decimal256Type, Float16Type, Float32Type, Float64Type,
+        Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    },
+};
+use arrow_ord::ord::make_comparator;
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
@@ -38,13 +47,13 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
 };
 use lance_arrow::ipc::{read_ipc_stream_single_at, write_ipc_stream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
@@ -58,10 +67,9 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_io::object_store::ObjectStore;
 use lance_select::NullableRowAddrSet;
 use log::{debug, warn};
-use object_store::{Error as ObjectStoreError, path::Path};
+use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -69,7 +77,7 @@ use tracing::{info, instrument};
 
 mod flat;
 
-const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
+pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
@@ -85,7 +93,7 @@ pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
 pub struct OrderableScalarValue(pub ScalarValue);
 
 impl DeepSizeOf for OrderableScalarValue {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // deepsize and size both factor in the size of the ScalarValue
         self.0.size() - std::mem::size_of::<ScalarValue>()
     }
@@ -595,44 +603,114 @@ impl Ord for OrderableScalarValue {
     }
 }
 
-#[derive(Debug, DeepSizeOf, PartialEq, Eq)]
-struct PageRecord {
-    max: OrderableScalarValue,
-    page_number: u32,
-}
-
-trait BTreeMapExt<K, V> {
-    fn largest_node_less(&self, key: &K) -> Option<(&K, &V)>;
-}
-
-impl<K: Ord, V> BTreeMapExt<K, V> for BTreeMap<K, V> {
-    fn largest_node_less(&self, key: &K) -> Option<(&K, &V)> {
-        self.range((Bound::Unbounded, Bound::Excluded(key)))
-            .next_back()
-    }
-}
-
-/// An in-memory structure that can quickly satisfy scalar queries using a btree of ScalarValue
-#[derive(Debug, DeepSizeOf, PartialEq, Eq)]
-pub struct BTreeLookup {
-    tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-    /// Pages where the value may be null (does not include all_null_pages)
-    null_pages: Vec<u32>,
-    /// Pages that are entirely null
-    all_null_pages: Vec<u32>,
-}
-
-impl BTreeLookup {
-    fn empty() -> Self {
-        Self {
-            tree: BTreeMap::new(),
-            null_pages: Vec::new(),
-            all_null_pages: Vec::new(),
+/// Returns the first index `i` in `[lo, hi)` for which `pred(i)` is `false`.
+///
+/// `pred` must be `true` for a (possibly empty) prefix of the range and `false`
+/// for the rest, i.e. the range is partitioned by `pred`.
+fn partition_point(lo: usize, hi: usize, mut pred: impl FnMut(usize) -> bool) -> usize {
+    let mut lo = lo;
+    let mut hi = hi;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
+    lo
 }
 
-#[derive(Debug, Copy, Clone)]
+/// Builds a comparator over two array accessors of the same `Ord` item type,
+/// matching arrow's NULLs-first ascending order (`null < non-null`, `null == null`).
+///
+/// Unlike [`make_comparator`], the returned closure is generic (not boxed), so the
+/// element comparison inlines into the scan instead of dispatching through a vtable
+/// on every call.
+fn accessor_cmp<'a, T, L, R>(left: L, right: R) -> impl Fn(usize, usize) -> Ordering + 'a
+where
+    T: Ord,
+    L: ArrayAccessor<Item = T> + 'a,
+    R: ArrayAccessor<Item = T> + 'a,
+{
+    move |i, j| match (left.is_null(i), right.is_null(j)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => left.value(i).cmp(&right.value(j)),
+    }
+}
+
+/// Views `arr` as `PrimitiveArray<K>` for comparison. Zero-copy (shared buffers)
+/// when `arr` already has type `K`; otherwise — a logical type whose physical
+/// storage is `K::Native`, e.g. `Date32`/`Time32` over `i32` or `Timestamp`/
+/// `Duration` over `i64` — the array data is relabeled to `K` without copying the
+/// values, so all such logical types share one comparison path.
+fn reinterpret_primitive<K: ArrowPrimitiveType>(arr: &dyn Array) -> Result<PrimitiveArray<K>> {
+    if let Some(arr) = arr.as_primitive_opt::<K>() {
+        return Ok(arr.clone());
+    }
+    let data = arr
+        .to_data()
+        .into_builder()
+        .data_type(K::DATA_TYPE)
+        .build()
+        .map_err(|e| {
+            Error::internal(format!(
+                "failed to reinterpret {} as {}: {e}",
+                arr.data_type(),
+                K::DATA_TYPE
+            ))
+        })?;
+    Ok(PrimitiveArray::<K>::from(data))
+}
+
+/// Like [`accessor_cmp`] but for primitive columns, comparing native values with
+/// [`ArrowNativeTypeOp::compare`] (total order, so floats match arrow's NaN-last
+/// `make_comparator` ordering).
+fn primitive_cmp<'a, T>(
+    left: &'a PrimitiveArray<T>,
+    right: &'a PrimitiveArray<T>,
+) -> impl Fn(usize, usize) -> Ordering + 'a
+where
+    T: ArrowPrimitiveType,
+{
+    move |i, j| match (left.is_null(i), right.is_null(j)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => left.value(i).compare(right.value(j)),
+    }
+}
+
+/// Satisfies scalar queries by searching the `page_lookup.lance` batch directly.
+///
+/// The batch holds one row per page with columns `min | max | null_count | page_idx`,
+/// sorted ascending by `min` with NULLs first (the order the index is trained in).
+/// Both query paths binary-search the sorted `min` column for a starting row and
+/// scan forward filtering by `max`:
+///
+/// - Equality / `IN` (`candidate_pages_for_values`) dispatch on the query's
+///   *physical storage type* to a monomorphized, inlined comparator: numerics go
+///   through `scan_native` (logical types sharing a native — e.g. `Date32` and
+///   `Int32` — fold to one path), byte-likes through `scan_accessor`. Only types
+///   without a native fast path (struct-backed intervals, booleans) fall back to the
+///   boxed [`make_comparator`] via `scan_fallback`.
+/// - Range searches (`pages_between`) currently use [`make_comparator`] directly.
+#[derive(Debug, PartialEq, DeepSizeOf)]
+pub struct BTreeLookup {
+    /// One row per page (`min | max | null_count | page_idx`), sorted by `min`.
+    batch: RecordBatch,
+    /// Pages with at least one null value (does not include `all_null_pages`).
+    null_pages: Vec<u32>,
+    /// Pages that are entirely null.
+    all_null_pages: Vec<u32>,
+    /// Index of the first row whose `max` is non-null. Entirely-null pages sort to
+    /// the front (NULLs first) and are skipped when searching value ranges.
+    search_start: usize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Matches {
     Some(u32),
     All(u32),
@@ -648,184 +726,460 @@ impl Matches {
 }
 
 impl BTreeLookup {
-    fn new(
-        tree: BTreeMap<OrderableScalarValue, Vec<PageRecord>>,
-        null_pages: Vec<u32>,
-        all_null_pages: Vec<u32>,
-    ) -> Self {
-        Self {
-            tree,
+    /// Build a lookup over the `page_lookup.lance` batch. The batch is retained as
+    /// the source of truth; only the small null-page index lists are precomputed.
+    fn try_new(batch: RecordBatch) -> Result<Self> {
+        let mut null_pages = Vec::new();
+        let mut all_null_pages = Vec::new();
+        let mut search_start = batch.num_rows();
+
+        if batch.num_rows() > 0 {
+            let maxs = batch.column(1);
+            let null_counts = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::internal("BTree lookup null_count column must be UInt32"))?;
+            let page_numbers = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::internal("BTree lookup page_idx column must be UInt32"))?;
+
+            for idx in 0..batch.num_rows() {
+                let page_number = page_numbers.values()[idx];
+                // An entirely-null page has a null `max`; it is never searched by value.
+                if maxs.is_null(idx) {
+                    all_null_pages.push(page_number);
+                    continue;
+                }
+                if search_start == batch.num_rows() {
+                    search_start = idx;
+                }
+                if null_counts.values()[idx] > 0 {
+                    null_pages.push(page_number);
+                }
+            }
+        } else {
+            search_start = 0;
+        }
+
+        Ok(Self {
+            batch,
             null_pages,
             all_null_pages,
-        }
+            search_start,
+        })
+    }
+
+    fn page_numbers(&self) -> Result<&UInt32Array> {
+        self.batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::internal("BTree lookup page_idx column must be UInt32"))
     }
 
     // All pages that could have a value equal to val
-    fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<Matches> {
+    fn pages_eq(&self, query: &OrderableScalarValue) -> Result<Vec<Matches>> {
         if query.0.is_null() {
-            self.pages_null()
+            Ok(self.pages_null())
         } else {
-            self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+            let query_arr = query.0.to_array_of_size(1)?;
+            let pages = self.candidate_pages_for_values(query_arr.as_ref())?;
+            Ok(pages.into_iter().map(Matches::Some).collect())
         }
     }
 
     // All pages that could have a value equal to one of the values
-    fn pages_in(&self, values: impl IntoIterator<Item = OrderableScalarValue>) -> Vec<Matches> {
-        // TODO: Right now we convert all Matches::All into Matches::Some.  We could refine this.
-        // It would improve performance on low cardinality data.
-        let page_lists = values
-            .into_iter()
-            .map(|val| {
-                self.pages_eq(&val)
-                    .into_iter()
-                    .map(|matches| matches.page_id())
-            })
-            .collect::<Vec<_>>();
-        let total_size = page_lists.iter().map(|set| set.len()).sum();
-        let mut heap = BinaryHeap::with_capacity(total_size);
-        for page_list in page_lists {
-            heap.extend(page_list);
+    fn pages_in(
+        &self,
+        values: impl IntoIterator<Item = OrderableScalarValue>,
+    ) -> Result<Vec<Matches>> {
+        // Equality lookups never produce a full-page (`Matches::All`) match because a
+        // single value cannot cover an entire page's range, so every candidate is
+        // `Matches::Some`. Refining this for low-cardinality data is the TODO in
+        // `pages_between`.
+        let values = values.into_iter();
+        let mut has_null = false;
+        let mut non_null = Vec::with_capacity(values.size_hint().0);
+        for val in values {
+            if val.0.is_null() {
+                has_null = true;
+            } else {
+                non_null.push(val.0);
+            }
         }
-        let mut all_pages = heap.into_sorted_vec();
+
+        // Build a single array holding every queried value so the comparators are
+        // constructed once and reused across all of them, rather than per value.
+        let mut all_pages = if non_null.is_empty() {
+            Vec::new()
+        } else {
+            let query_arr = ScalarValue::iter_to_array(non_null)?;
+            self.candidate_pages_for_values(query_arr.as_ref())?
+        };
+        if has_null {
+            all_pages.extend(self.pages_null().into_iter().map(|m| m.page_id()));
+        }
+        all_pages.sort_unstable();
         all_pages.dedup();
-        all_pages.into_iter().map(Matches::Some).collect()
+        Ok(all_pages.into_iter().map(Matches::Some).collect())
+    }
+
+    /// Candidate page numbers (deduped, ascending) for an equality search against
+    /// every value in `query`. A page is a candidate when its `[min, max]` range
+    /// could contain the value, i.e. `min <= value <= max`.
+    ///
+    /// The comparators are built once over the whole `query` array and reused for
+    /// each value, so an N-value `IN` costs three comparator constructions instead
+    /// of three per value.
+    fn candidate_pages_for_values(&self, query: &dyn Array) -> Result<Vec<u32>> {
+        let num_rows = self.batch.num_rows();
+        if self.search_start >= num_rows || query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mins = self.batch.column(0).as_ref();
+        let maxs = self.batch.column(1).as_ref();
+        let page_ids = self.page_numbers()?.values();
+
+        // Compare against the page columns with a native, monomorphized comparator
+        // that inlines, rather than the boxed `DynComparator` from `make_comparator`
+        // (one vtable call per comparison). Logical types that share a physical
+        // storage type route to one path via a zero-copy reinterpret, so e.g. every
+        // date/time/timestamp/duration type reuses the `i32`/`i64` path instead of
+        // generating its own. Types with no native path (intervals with struct
+        // natives, booleans, ...) take the `make_comparator` fallback. The query
+        // array always matches the column type, so its type selects the branch.
+        use DataType::*;
+        match query.data_type() {
+            Int8 => self.scan_native::<Int8Type>(mins, maxs, query, page_ids),
+            Int16 => self.scan_native::<Int16Type>(mins, maxs, query, page_ids),
+            // i32-backed: Int32, Date32, Time32, Decimal32, year-month intervals.
+            Int32 | Date32 | Time32(_) | Decimal32(_, _) | Interval(IntervalUnit::YearMonth) => {
+                self.scan_native::<Int32Type>(mins, maxs, query, page_ids)
+            }
+            // i64-backed: Int64, Date64, Time64, Timestamp, Duration, Decimal64.
+            Int64 | Date64 | Time64(_) | Timestamp(_, _) | Duration(_) | Decimal64(_, _) => {
+                self.scan_native::<Int64Type>(mins, maxs, query, page_ids)
+            }
+            UInt8 => self.scan_native::<UInt8Type>(mins, maxs, query, page_ids),
+            UInt16 => self.scan_native::<UInt16Type>(mins, maxs, query, page_ids),
+            UInt32 => self.scan_native::<UInt32Type>(mins, maxs, query, page_ids),
+            UInt64 => self.scan_native::<UInt64Type>(mins, maxs, query, page_ids),
+            Float16 => self.scan_native::<Float16Type>(mins, maxs, query, page_ids),
+            Float32 => self.scan_native::<Float32Type>(mins, maxs, query, page_ids),
+            Float64 => self.scan_native::<Float64Type>(mins, maxs, query, page_ids),
+            Decimal128(_, _) => self.scan_native::<Decimal128Type>(mins, maxs, query, page_ids),
+            Decimal256(_, _) => self.scan_native::<Decimal256Type>(mins, maxs, query, page_ids),
+            Utf8 => Ok(self.scan_accessor(
+                mins.as_string::<i32>(),
+                maxs.as_string::<i32>(),
+                query.as_string::<i32>(),
+                page_ids,
+            )),
+            LargeUtf8 => Ok(self.scan_accessor(
+                mins.as_string::<i64>(),
+                maxs.as_string::<i64>(),
+                query.as_string::<i64>(),
+                page_ids,
+            )),
+            Binary => Ok(self.scan_accessor(
+                mins.as_binary::<i32>(),
+                maxs.as_binary::<i32>(),
+                query.as_binary::<i32>(),
+                page_ids,
+            )),
+            LargeBinary => Ok(self.scan_accessor(
+                mins.as_binary::<i64>(),
+                maxs.as_binary::<i64>(),
+                query.as_binary::<i64>(),
+                page_ids,
+            )),
+            FixedSizeBinary(_) => Ok(self.scan_accessor(
+                mins.as_fixed_size_binary(),
+                maxs.as_fixed_size_binary(),
+                query.as_fixed_size_binary(),
+                page_ids,
+            )),
+            _ => self.scan_fallback(mins, maxs, query, page_ids),
+        }
+    }
+
+    /// Native-comparator equality scan for a primitive physical type `K`. The page
+    /// columns and `query` are reinterpreted to `PrimitiveArray<K>` (zero-copy when
+    /// already that type) and compared with [`primitive_cmp`].
+    fn scan_native<K: ArrowPrimitiveType>(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        let mins = reinterpret_primitive::<K>(mins)?;
+        let maxs = reinterpret_primitive::<K>(maxs)?;
+        let query = reinterpret_primitive::<K>(query)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            primitive_cmp(&mins, &query),
+            primitive_cmp(&maxs, &query),
+            primitive_cmp(&mins, &mins),
+        ))
+    }
+
+    /// Native-comparator equality scan for byte-like columns (`Utf8`/`Binary`/
+    /// `FixedSizeBinary` and their large variants), compared lexicographically via
+    /// [`accessor_cmp`].
+    fn scan_accessor<T, A>(&self, mins: A, maxs: A, query: A, page_ids: &[u32]) -> Vec<u32>
+    where
+        T: Ord,
+        A: ArrayAccessor<Item = T> + Copy,
+    {
+        self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            accessor_cmp(mins, query),
+            accessor_cmp(maxs, query),
+            accessor_cmp(mins, mins),
+        )
+    }
+
+    /// Fallback equality scan for types without a native path (intervals with struct
+    /// natives, booleans, ...), using arrow's boxed `make_comparator`.
+    fn scan_fallback(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        // The batch is sorted ascending by `min` with NULLs first; compare the query
+        // values the same way so the binary searches stay consistent.
+        let opts = SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        let cmp_min = make_comparator(mins, query, opts)?;
+        let cmp_max = make_comparator(maxs, query, opts)?;
+        let cmp_min_min = make_comparator(mins, mins, opts)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            cmp_min,
+            cmp_max,
+            cmp_min_min,
+        ))
+    }
+
+    /// Binary-search + forward-scan the page batch for equality candidates.
+    ///
+    /// Monomorphized over the comparator closures so a typed-native comparator
+    /// inlines (no per-call vtable dispatch). The closures encode NULLs-first,
+    /// ascending order:
+    ///   * `max_is_null(i)` — whether page `i`'s `max` is null (an all-null page)
+    ///   * `cmp_min(i, j)` — page `i`'s `min` vs query value `j`
+    ///   * `cmp_max(i, j)` — page `i`'s `max` vs query value `j`
+    ///   * `cmp_min_min(i, anchor)` — two page `min`s, to expand left onto a straddle
+    fn scan_equality_pages(
+        &self,
+        num_query: usize,
+        page_ids: &[u32],
+        max_is_null: impl Fn(usize) -> bool,
+        cmp_min: impl Fn(usize, usize) -> Ordering,
+        cmp_max: impl Fn(usize, usize) -> Ordering,
+        cmp_min_min: impl Fn(usize, usize) -> Ordering,
+    ) -> Vec<u32> {
+        let num_rows = self.batch.num_rows();
+        // High-cardinality lookups hit ~one page per value; presize to avoid the
+        // element-by-element `RawVec` growth that profiling flagged.
+        let mut pages = Vec::with_capacity(num_query);
+        for j in 0..num_query {
+            // Start row: peek a little to the left of the value. A query for 7 must
+            // still reach a page like [5, 10], so we include every page whose `min`
+            // equals the largest `min` strictly less than the value.
+            let p = partition_point(0, num_rows, |i| cmp_min(i, j) == Ordering::Less);
+            let start = if p == 0 {
+                self.search_start
+            } else {
+                let anchor = p - 1;
+                partition_point(0, p, |i| cmp_min_min(i, anchor) == Ordering::Less)
+            }
+            .max(self.search_start);
+
+            // End row: pages whose `min` exceeds the value cannot match.
+            let end = partition_point(start, num_rows, |i| cmp_min(i, j) != Ordering::Greater);
+
+            // The window splits at `p` (first row with `min >= value`):
+            //   * `[start, p)` — the peek-left/straddle region (`min < value`). A page
+            //     here matches only if its `max` reaches the value, so it needs the
+            //     filter, and it may include a null-`min`/null-`max` straddle page.
+            //   * `[p, end)` — rows with `min == value`. These always match (`max >=
+            //     min == value`) and can't have a null `max` (all-null pages sort to
+            //     the front, before `search_start <= start`), so we copy them in one
+            //     slice instead of pushing per row.
+            let bulk_start = p.max(start);
+            for (offset, &page_id) in page_ids[start..bulk_start].iter().enumerate() {
+                let idx = start + offset;
+                // All-null pages are only matched by IS NULL queries.
+                if max_is_null(idx) {
+                    continue;
+                }
+                // Candidate when the page's `max` reaches the value (`max >= value`).
+                if cmp_max(idx, j) != Ordering::Less {
+                    pages.push(page_id);
+                }
+            }
+            pages.extend_from_slice(&page_ids[bulk_start..end]);
+        }
+
+        pages.sort_unstable();
+        pages.dedup();
+        pages
     }
 
     // All pages that could have a value in the range
     fn pages_between(
         &self,
         range: (Bound<&OrderableScalarValue>, Bound<&OrderableScalarValue>),
-    ) -> Vec<Matches> {
-        // We need to grab a little bit left of the given range because the query might be 7
-        // and the first page might be something like 5-10.
-        let lower_bound = match range.0 {
-            Bound::Unbounded => Bound::Unbounded,
-            // It doesn't matter if the bound is exclusive or inclusive.  We are going to grab
-            // the first node whose min is strictly less than the given bound.  Then we grab
-            // all nodes greater than or equal to that
-            //
-            // We have to peek a bit to the left because we might have something like a lower
-            // bound of 7 and there is a page [5-10] we want to search for.
-            Bound::Included(lower) => self
-                .tree
-                .largest_node_less(lower)
-                .map(|val| Bound::Included(val.0))
-                .unwrap_or(Bound::Unbounded),
-            Bound::Excluded(lower) => self
-                .tree
-                .largest_node_less(lower)
-                .map(|val| Bound::Included(val.0))
-                .unwrap_or(Bound::Unbounded),
+    ) -> Result<Vec<Matches>> {
+        let num_rows = self.batch.num_rows();
+        // No searchable (non-all-null) pages.
+        if self.search_start >= num_rows {
+            return Ok(vec![]);
+        }
+
+        let mins = self.batch.column(0).as_ref();
+        let maxs = self.batch.column(1).as_ref();
+        let page_numbers = self.page_numbers()?;
+
+        // The batch is sorted ascending by `min` with NULLs first; compare bounds
+        // the same way so the binary searches and the null `min` of a straddling
+        // page are handled consistently.
+        let opts = SortOptions {
+            descending: false,
+            nulls_first: true,
         };
-        let upper_bound = match range.1 {
-            Bound::Unbounded => Bound::Unbounded,
-            Bound::Included(upper) => Bound::Included(upper),
-            // Even if the upper bound is excluded we need to include it on an [x, x) query.  This is because the
-            // query might be [x, x).  Our lower bound might find some [a-x] bucket and we still
-            // want to include any [x, z] bucket.
-            //
-            // We could be slightly more accurate here and only include the upper bound if the lower bound
-            // is defined, inclusive, and equal to the upper bound.  However, let's keep it simple for now.  This
-            // should only affect the probably rare case that our query is a true range query and the value
-            // matches an upper bound.  This will all be moot if/when we merge pages.
-            Bound::Excluded(upper) => Bound::Included(upper),
+        // Bounds become 1-row arrays of the column type so arrow's type-dispatched
+        // comparator can compare them against the `min`/`max` columns.
+        let lower_arr = match range.0 {
+            Bound::Unbounded => None,
+            Bound::Included(v) | Bound::Excluded(v) => Some(v.0.to_array_of_size(1)?),
+        };
+        let upper_arr = match range.1 {
+            Bound::Unbounded => None,
+            Bound::Included(v) | Bound::Excluded(v) => Some(v.0.to_array_of_size(1)?),
         };
 
-        match (lower_bound, upper_bound) {
-            (Bound::Excluded(lower), Bound::Excluded(upper))
-            | (Bound::Excluded(lower), Bound::Included(upper))
-            | (Bound::Included(lower), Bound::Excluded(upper)) => {
-                // It's not really clear what (Included(5), Excluded(5)) would mean so we
-                // interpret it as an empty range which matches rust's BTreeMap behavior
-                if lower >= upper {
-                    return vec![];
+        // Start row: peek a little to the left of the lower bound. A query for 7
+        // must still reach a page like [5, 10], so we include every page whose
+        // `min` equals the largest `min` strictly less than the lower bound.
+        let start = match &lower_arr {
+            None => self.search_start,
+            Some(lower) => {
+                let cmp = make_comparator(mins, lower.as_ref(), opts)?;
+                // first row with min >= lower
+                let p = partition_point(0, num_rows, |i| cmp(i, 0) == Ordering::Less);
+                if p == 0 {
+                    self.search_start
+                } else {
+                    // first row sharing the straddling page's `min`
+                    let straddle = mins.slice(p - 1, 1);
+                    let cmp = make_comparator(mins, straddle.as_ref(), opts)?;
+                    partition_point(0, p, |i| cmp(i, 0) == Ordering::Less)
                 }
             }
-            (Bound::Included(lower), Bound::Included(upper)) => {
-                if lower > upper {
-                    return vec![];
-                }
-            }
-            _ => {}
         }
+        .max(self.search_start);
+
+        // End row: pages whose `min` exceeds the upper bound cannot match. The
+        // upper bound is treated as inclusive even when the query bound is
+        // exclusive, so an [x, x) query still reaches a page whose `min` == x.
+        let end = match &upper_arr {
+            None => num_rows,
+            Some(upper) => {
+                let cmp = make_comparator(mins, upper.as_ref(), opts)?;
+                partition_point(start, num_rows, |i| cmp(i, 0) != Ordering::Greater)
+            }
+        };
+
+        if start >= end {
+            return Ok(vec![]);
+        }
+
+        // Comparators reused across the candidate rows.
+        let cmp_max_lower = lower_arr
+            .as_ref()
+            .map(|l| make_comparator(maxs, l.as_ref(), opts))
+            .transpose()?;
+        let cmp_min_lower = lower_arr
+            .as_ref()
+            .map(|l| make_comparator(mins, l.as_ref(), opts))
+            .transpose()?;
+        let cmp_max_upper = upper_arr
+            .as_ref()
+            .map(|u| make_comparator(maxs, u.as_ref(), opts))
+            .transpose()?;
 
         let mut matches = Vec::new();
+        for idx in start..end {
+            // All-null pages are only matched by IS NULL queries.
+            if maxs.is_null(idx) {
+                continue;
+            }
 
-        for (min, page_records) in self.tree.range((lower_bound, upper_bound)) {
-            for page_record in page_records {
-                match lower_bound {
-                    Bound::Unbounded => {}
-                    Bound::Included(lower) => {
-                        if page_record.max.cmp(lower) == Ordering::Less {
-                            continue;
-                        }
-                    }
-                    Bound::Excluded(lower) => {
-                        if page_record.max.cmp(lower) != Ordering::Greater {
-                            continue;
-                        }
-                    }
-                }
-                // At this point we know the page record matches at least some values.
-                // We should test to see if ALL values are a match.
+            // Candidate filter: the page's `max` reaches the lower bound.
+            let lower_ok = match (range.0, &cmp_max_lower) {
+                (Bound::Unbounded, _) => true,
+                (Bound::Included(_), Some(cmp)) => cmp(idx, 0) != Ordering::Less, // max >= lower
+                (Bound::Excluded(_), Some(cmp)) => cmp(idx, 0) == Ordering::Greater, // max > lower
+                _ => unreachable!("lower bound and its comparator are constructed together"),
+            };
+            if !lower_ok {
+                continue;
+            }
 
-                if min.0.is_null() || page_record.max.0.is_null() {
-                    // If there are nulls then we just use Matches::Some
-                    matches.push(Matches::Some(page_record.page_number));
-                    continue;
-                }
+            let page_number = page_numbers.values()[idx];
 
-                match range.0 {
-                    // range.0 < X therefore if the smallest value is not strictly greater than
-                    // the lower bound we only have partial match
-                    Bound::Excluded(lower) => {
-                        if min.cmp(lower) != Ordering::Greater {
-                            matches.push(Matches::Some(page_record.page_number));
-                            continue;
-                        }
-                    }
-                    // range.0 <= X therefore if the smallest value is not greater than or equal
-                    // to the lower bound we only have partial match
-                    Bound::Included(lower) => {
-                        if min.cmp(lower) == Ordering::Less {
-                            matches.push(Matches::Some(page_record.page_number));
-                            continue;
-                        }
-                    }
-                    Bound::Unbounded => {}
-                }
-                match range.1 {
-                    // X < range.1 therefore if the largest value is not strictly less than
-                    // the upper bound we only have partial match
-                    Bound::Excluded(upper) => {
-                        if page_record.max.cmp(upper) != Ordering::Less {
-                            matches.push(Matches::Some(page_record.page_number));
-                            continue;
-                        }
-                    }
-                    // X <= range.1 therefore if the largest value is not less than or equal to
-                    // the upper bound we only have partial match
-                    Bound::Included(upper) => {
-                        if page_record.max.cmp(upper) == Ordering::Greater {
-                            matches.push(Matches::Some(page_record.page_number));
-                            continue;
-                        }
-                    }
-                    Bound::Unbounded => {}
-                }
-                // The min is greater than the lower bound and the max is less than the upper bound
-                // so we have a full match
-                matches.push(Matches::All(page_record.page_number));
+            // A page with a null `min` straddles the NULL/non-NULL boundary, so it
+            // is only ever a partial match.
+            if mins.is_null(idx) {
+                matches.push(Matches::Some(page_number));
+                continue;
+            }
+
+            // Full match requires the page to sit entirely within the query range.
+            let lower_full = match (range.0, &cmp_min_lower) {
+                (Bound::Unbounded, _) => true,
+                (Bound::Included(_), Some(cmp)) => cmp(idx, 0) != Ordering::Less, // min >= lower
+                (Bound::Excluded(_), Some(cmp)) => cmp(idx, 0) == Ordering::Greater, // min > lower
+                _ => unreachable!("lower bound and its comparator are constructed together"),
+            };
+            let upper_full = match (range.1, &cmp_max_upper) {
+                (Bound::Unbounded, _) => true,
+                (Bound::Included(_), Some(cmp)) => cmp(idx, 0) != Ordering::Greater, // max <= upper
+                (Bound::Excluded(_), Some(cmp)) => cmp(idx, 0) == Ordering::Less,    // max < upper
+                _ => unreachable!("upper bound and its comparator are constructed together"),
+            };
+            if lower_full && upper_full {
+                matches.push(Matches::All(page_number));
+            } else {
+                matches.push(Matches::Some(page_number));
             }
         }
 
-        matches
+        Ok(matches)
     }
 
     fn pages_null(&self) -> Vec<Matches> {
         self.null_pages
             .iter()
-            .map(|page_id| Matches::Some(*page_id))
+            .copied()
+            .map(Matches::Some)
             .chain(self.all_null_pages.iter().copied().map(Matches::All))
             .collect()
     }
@@ -1014,17 +1368,17 @@ impl CacheKey for BTreePageKey {
 /// `BTreeIndex::try_from_serialized` reconstructs the in-memory lookup with
 /// no IO) plus the page batch size and range-partition map.
 #[derive(Debug, Clone)]
-pub struct BTreeIndexState {
+struct BTreeIndexState {
     lookup_batch: RecordBatch,
     batch_size: u64,
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
 }
 
 impl DeepSizeOf for BTreeIndexState {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`;
         // the lookup batch dominates, matching how `BTreeIndex` accounts for itself.
-        self.lookup_batch.get_array_memory_size()
+        self.lookup_batch.deep_size_of_children(context)
     }
 }
 
@@ -1208,26 +1562,14 @@ pub struct BTreeIndex {
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
-
-    /// The raw lookup batch this index was built from (the contents of
-    /// `page_lookup.lance`). Retained so the index can be serialized into a
-    /// cache as a [`BTreeIndexState`] without re-reading it from storage.
-    ///
-    /// TODO: this duplicates the min/max values already held in `page_lookup`.
-    /// A follow-up could rewrite `BTreeLookup` to query this batch directly
-    /// (binary search on the sorted `min` column + linear scan, type-dispatched
-    /// per column type), eliminating the duplication and making this batch the
-    /// single source of truth.
-    lookup_batch: RecordBatch,
 }
 
 impl DeepSizeOf for BTreeIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We don't include the index cache, or anything stored in it. For example:
-        // sub_index and fri.
-        self.page_lookup.deep_size_of_children(context)
-            + self.store.deep_size_of_children(context)
-            + self.lookup_batch.get_array_memory_size()
+        // sub_index and fri. `page_lookup` owns the lookup batch (the single source
+        // of truth), so accounting for it covers the lookup data.
+        self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
 
@@ -1241,7 +1583,6 @@ impl BTreeIndex {
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        lookup_batch: RecordBatch,
     ) -> Self {
         Self {
             page_lookup,
@@ -1251,7 +1592,6 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-            lookup_batch,
         }
     }
 
@@ -1324,68 +1664,8 @@ impl BTreeIndex {
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
-        // Pages that have at least one null value
-        let mut null_pages = Vec::<u32>::new();
-        // Pages that are entirely null
-        let mut all_null_pages = Vec::<u32>::new();
-
-        if data.num_rows() == 0 {
-            let data_type = data.column(0).data_type().clone();
-            let page_lookup = Arc::new(BTreeLookup::empty());
-            return Ok(Self::new(
-                page_lookup,
-                store,
-                data_type,
-                WeakLanceCache::from(index_cache),
-                batch_size,
-                ranges_to_files,
-                frag_reuse_index,
-                data,
-            ));
-        }
-
-        let mins = data.column(0);
-        let maxs = data.column(1);
-        let null_counts = data
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let page_numbers = data
-            .column(3)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-
-        for idx in 0..data.num_rows() {
-            let min = OrderableScalarValue(ScalarValue::try_from_array(&mins, idx)?);
-            let max = OrderableScalarValue(ScalarValue::try_from_array(&maxs, idx)?);
-            let null_count = null_counts.values()[idx];
-            let page_number = page_numbers.values()[idx];
-
-            // If the page is entirely null don't even bother putting it in the tree
-            if max.0.is_null() {
-                all_null_pages.push(page_number);
-                // continue so we don't add it to the null_pages
-                continue;
-            } else {
-                map.entry(min)
-                    .or_default()
-                    .push(PageRecord { max, page_number });
-            }
-
-            if null_count > 0 {
-                null_pages.push(page_number);
-            }
-        }
-
-        let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
-        map.entry(OrderableScalarValue(last_max)).or_default();
-
-        let data_type = mins.data_type().clone();
-
-        let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
+        let data_type = data.column(0).data_type().clone();
+        let page_lookup = Arc::new(BTreeLookup::try_new(data)?);
 
         Ok(Self::new(
             page_lookup,
@@ -1395,7 +1675,6 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-            data,
         ))
     }
 
@@ -1490,7 +1769,7 @@ impl BTreeIndex {
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
-    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+    async fn data_stream(&self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = lazy_reader.get().await?;
         let new_schema = Arc::new(self.train_schema());
@@ -1513,25 +1792,51 @@ impl BTreeIndex {
         )))
     }
 
-    async fn combine_old_new(
-        self,
+    /// Merge N source BTree segments plus an additional `new_data` stream into
+    /// a single BTree under `dest_store`, without re-reading the dataset.
+    pub async fn merge_segments(
+        segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
-        chunk_size: u64,
+        dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
-    ) -> Result<SendableRecordBatchStream> {
-        let value_column_index = new_data.schema().index_of(VALUE_COLUMN_NAME)?;
-
-        let new_input = Arc::new(OneShotExec::new(new_data));
-        let old_stream = self.into_data_stream().await?;
-        let old_stream = match old_data_filter {
-            Some(filter) => filter_row_ids(old_stream, filter),
-            None => old_stream,
+    ) -> Result<CreatedIndex> {
+        let Some(first) = segments.first() else {
+            return Err(Error::invalid_input(
+                "cannot merge BTree index without at least one source segment".to_string(),
+            ));
         };
-        let old_input = Arc::new(OneShotExec::new(old_stream));
-        debug_assert_eq!(
-            old_input.schema().flattened_fields().len(),
-            new_input.schema().flattened_fields().len()
-        );
+
+        for segment in segments.iter().skip(1) {
+            if segment.data_type != first.data_type {
+                return Err(Error::index(format!(
+                    "cannot merge BTree segments with different value types ({:?} vs {:?})",
+                    first.data_type, segment.data_type
+                )));
+            }
+        }
+
+        let new_schema = new_data.schema();
+        let value_column_index = new_schema.index_of(VALUE_COLUMN_NAME)?;
+        let new_value_type = new_schema.field(value_column_index).data_type();
+        if new_value_type != &first.data_type {
+            return Err(Error::invalid_input(format!(
+                "BTree merge: new_data value column type {:?} does not match \
+                 segment value type {:?}",
+                new_value_type, first.data_type
+            )));
+        }
+
+        let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
+        for segment in segments {
+            let stream = segment.data_stream().await?;
+            let stream = match old_data_filter.clone() {
+                Some(filter) => filter_row_ids(stream, filter),
+                None => stream,
+            };
+            let exec = Arc::new(OneShotExec::new(stream));
+            inputs.push(exec);
+        }
+        inputs.push(Arc::new(OneShotExec::new(new_data)));
 
         let sort_expr = PhysicalSortExpr {
             expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_index)),
@@ -1540,11 +1845,10 @@ impl BTreeIndex {
                 nulls_first: true,
             },
         };
-        // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
-        // them back into a single partition.
-        let all_data = UnionExec::try_new(vec![old_input, new_input])?;
-        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), all_data));
-
+        // UnionExec yields multiple partitions; SortPreservingMergeExec merges
+        // them back into a single partition while preserving value-ordering.
+        let unioned = UnionExec::try_new(inputs)?;
+        let ordered = Arc::new(SortPreservingMergeExec::new([sort_expr].into(), unioned));
         let unchunked = execute_plan(
             ordered,
             LanceExecutionOptions {
@@ -1552,7 +1856,17 @@ impl BTreeIndex {
                 ..Default::default()
             },
         )?;
-        Ok(chunk_concat_stream(unchunked, chunk_size as usize))
+        let merged_stream = chunk_concat_stream(unchunked, first.batch_size as usize);
+
+        let files =
+            train_btree_index(merged_stream, dest_store, first.batch_size, None, None).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
+                .unwrap(),
+            index_version: BTREE_INDEX_VERSION,
+            files,
+        })
     }
 }
 
@@ -1661,18 +1975,25 @@ impl Index for BTreeIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        let min = self
-            .page_lookup
-            .tree
-            .first_key_value()
-            .map(|(k, _)| k.clone());
-        let max = self
-            .page_lookup
-            .tree
-            .last_key_value()
-            .map(|(k, _)| k.clone());
+        let lookup = &self.page_lookup;
+        let batch = &lookup.batch;
+        let num_rows = batch.num_rows();
+        // The batch is sorted by `min`, so the smallest searchable value is the
+        // `min` of the first non-all-null page and the largest is the `max` of the
+        // last page.
+        let (min, max) = if lookup.search_start >= num_rows {
+            (None, None)
+        } else {
+            let min = OrderableScalarValue(ScalarValue::try_from_array(
+                batch.column(0),
+                lookup.search_start,
+            )?);
+            let max =
+                OrderableScalarValue(ScalarValue::try_from_array(batch.column(1), num_rows - 1)?);
+            (Some(min), Some(max))
+        };
         serde_json::to_value(&BTreeStatistics {
-            num_pages: self.page_lookup.tree.len() as u32,
+            num_pages: num_rows as u32,
             min,
             max,
         })
@@ -1719,7 +2040,7 @@ impl ScalarIndex for BTreeIndex {
                     "full text search is not supported for BTree index, build a inverted index for it",
                 ));
             }
-            SargableQuery::IsNull() => self.page_lookup.pages_null(),
+            SargableQuery::IsNull() => Ok(self.page_lookup.pages_null()),
             SargableQuery::LikePrefix(prefix) => {
                 // Convert LikePrefix to a range query: [prefix, next_prefix)
                 match prefix {
@@ -1753,7 +2074,7 @@ impl ScalarIndex for BTreeIndex {
                     }
                 }
             }
-        };
+        }?;
 
         // For non-IsNull queries, also include null pages so that null row IDs
         // are tracked in the result. Any comparison with NULL yields NULL, and
@@ -1764,6 +2085,11 @@ impl ScalarIndex for BTreeIndex {
         // We add them as Matches::Some (not Matches::All) so that
         // FlatIndex::search() evaluates the predicate and correctly marks
         // the rows as NULL rather than TRUE.
+        //
+        // TODO: the lookup batch retains a per-page `null_count`. A fully-covered
+        // page with zero nulls is a true Matches::All, while one with nulls needs
+        // Matches::Some only to track the null rows; surfacing `null_count` here
+        // could refine that classification (see #6802).
         if !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
             for &page_id in self
@@ -1831,6 +2157,7 @@ impl ScalarIndex for BTreeIndex {
 
         let mapping = Arc::new(mapping.clone());
         let train_schema = Arc::new(self.train_schema());
+        let mut remapped_files = Vec::new();
 
         // TODO: Could potentially parallelize this across parts, unclear it would be worth it
         for (part_id, page_file) in part_page_files {
@@ -1861,7 +2188,10 @@ impl ScalarIndex for BTreeIndex {
                 remapped_stream,
             ));
 
-            train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id).await?;
+            let mut files =
+                train_btree_index(remapped_stream, dest_store, self.batch_size, None, part_id)
+                    .await?;
+            remapped_files.append(&mut files);
         }
 
         if let Some(ranges_to_files) = &self.ranges_to_files {
@@ -1873,7 +2203,7 @@ impl ScalarIndex for BTreeIndex {
             let lookup_files = (0..num_parts)
                 .map(|part_id| part_lookup_file_path((part_id as u64) << 32))
                 .collect::<Vec<_>>();
-            merge_metadata_files(
+            let merged_files = merge_metadata_files(
                 dest_store,
                 &page_files,
                 &lookup_files,
@@ -1881,13 +2211,15 @@ impl ScalarIndex for BTreeIndex {
                 noop_progress(),
             )
             .await?;
+            remapped_files.retain(|file| file.path.ends_with("_page_data.lance"));
+            remapped_files.extend(merged_files);
         }
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: remapped_files,
         })
     }
 
@@ -1897,19 +2229,15 @@ impl ScalarIndex for BTreeIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        // Merge the existing index data with the new data and then retrain the index on the merged stream
-        let merged_data_source = self
-            .clone()
-            .combine_old_new(new_data, self.batch_size, old_data_filter)
-            .await?;
-        train_btree_index(merged_data_source, dest_store, self.batch_size, None, None).await?;
-
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
-                .unwrap(),
-            index_version: BTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
-        })
+        // Updating is the single-segment case of a segment merge: union this
+        // index's data with `new_data`, re-sort on value, and retrain.
+        Self::merge_segments(
+            &[Arc::new(self.clone())],
+            new_data,
+            dest_store,
+            old_data_filter,
+        )
+        .await
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
@@ -2046,7 +2374,7 @@ pub async fn train_btree_index(
     batch_size: u64,
     fragment_ids: Option<Vec<u32>>,
     range_id: Option<u32>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create `partition_id` for distributed index building.
     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
     // that index partitions generated by different workers do not conflict.
@@ -2111,7 +2439,7 @@ pub async fn train_btree_index(
         );
         batch_idx += 1;
     }
-    sub_index_file.finish().await?;
+    let pages_file = sub_index_file.finish().await?;
     let record_batch = btree_stats_as_batch(encoded_batches, &value_type)?;
     let mut file_schema = record_batch.schema().as_ref().clone();
     file_schema
@@ -2137,68 +2465,8 @@ pub async fn train_btree_index(
         }
     };
     btree_index_file.write_record_batch(record_batch).await?;
-    btree_index_file.finish().await?;
-    Ok(())
-}
-
-pub async fn merge_index_files(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-    store: Arc<dyn IndexStore>,
-    batch_readhead: Option<usize>,
-    progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
-    // List all partition page / lookup files in the index directory
-    let (part_page_files, part_lookup_files) =
-        list_page_lookup_files(object_store, index_dir).await?;
-    merge_metadata_files(
-        store.as_ref(),
-        &part_page_files,
-        &part_lookup_files,
-        batch_readhead,
-        progress,
-    )
-    .await
-}
-
-/// List and filter files from the index directory
-/// Returns (page_files, lookup_files)
-async fn list_page_lookup_files(
-    object_store: &ObjectStore,
-    index_dir: &Path,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let mut part_page_files = Vec::new();
-    let mut part_lookup_files = Vec::new();
-
-    let mut list_stream = object_store.list(Some(index_dir.clone()));
-
-    while let Some(item) = list_stream.next().await {
-        match item {
-            Ok(meta) => {
-                let file_name = meta.location.filename().unwrap_or_default();
-                // Filter files matching the pattern part_*_page_data.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_page_data.lance") {
-                    part_page_files.push(file_name.to_string());
-                }
-                // Filter files matching the pattern part_*_page_lookup.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_page_lookup.lance") {
-                    part_lookup_files.push(file_name.to_string());
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-
-    if part_page_files.is_empty() || part_lookup_files.is_empty() {
-        return Err(Error::internal(format!(
-            "No partition metadata files found in index directory: {} (page_files: {}, lookup_files: {})",
-            index_dir,
-            part_page_files.len(),
-            part_lookup_files.len()
-        )));
-    }
-
-    Ok((part_page_files, part_lookup_files))
+    let lookup_file = btree_index_file.finish().await?;
+    Ok(vec![pages_file, lookup_file])
 }
 
 fn find_single_partition_files(
@@ -2256,7 +2524,7 @@ async fn merge_metadata_files(
     part_lookup_files: &[String],
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     if part_lookup_files.is_empty() || part_page_files.is_empty() {
         return Err(Error::internal(
             "No partition files provided for merging".to_string(),
@@ -2332,6 +2600,7 @@ async fn merge_metadata_files(
             progress,
         )
         .await
+        .map(|file| vec![file])
     } else {
         merge_pages_and_lookups(
             store,
@@ -2385,7 +2654,7 @@ async fn merge_range_partitioned_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<IndexFile> {
     let sorted_part_lookup_files = sort_files_by_partition_id(part_lookup_files)?;
     let mut lookup_file = store
         .new_index_file(BTREE_LOOKUP_NAME, lookup_schema)
@@ -2425,12 +2694,12 @@ async fn merge_range_partitioned_lookups(
         serde_json::to_string(&pages_per_file)?,
     );
 
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_complete("merge_lookups").await?;
 
     // In this mode, we only clean up lookup files, and page files are untouched.
     cleanup_partition_files(store, part_lookup_files, &[]).await;
-    Ok(())
+    Ok(lookup_file)
 }
 
 /// Merges partition files using a K-way sort-merge algorithm.
@@ -2449,7 +2718,7 @@ async fn merge_pages_and_lookups(
     batch_size: u64,
     batch_readhead: Option<usize>,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<Vec<IndexFile>> {
     // Create a new global page file
     let partition_id = extract_partition_id(part_lookup_files[0].as_str())?;
     let page_file = page_files_map.get(&partition_id).unwrap();
@@ -2472,7 +2741,7 @@ async fn merge_pages_and_lookups(
         progress.clone(),
     )
     .await?;
-    page_file.finish().await?;
+    let page_file = page_file.finish().await?;
     progress.stage_complete("merge_pages").await?;
 
     let lookup_batch = RecordBatch::try_new(
@@ -2497,7 +2766,7 @@ async fn merge_pages_and_lookups(
         .stage_start("write_lookup_file", Some(1), "files")
         .await?;
     lookup_file.write_record_batch(lookup_batch).await?;
-    lookup_file.finish_with_metadata(metadata).await?;
+    let lookup_file = lookup_file.finish_with_metadata(metadata).await?;
     progress.stage_progress("write_lookup_file", 1).await?;
     progress.stage_complete("write_lookup_file").await?;
 
@@ -2505,7 +2774,7 @@ async fn merge_pages_and_lookups(
     // Only perform deletion after files are successfully written, ensuring debug information is not lost in case of failure
     cleanup_partition_files(store, part_lookup_files, part_page_files).await;
 
-    Ok(())
+    Ok(vec![page_file, lookup_file])
 }
 
 // Adjust local_page_idx_ in each look-up file to create a contiguous global_page_idx
@@ -2803,29 +3072,19 @@ pub struct BTreeParameters {
     /// The number of rows to include in each zone
     pub zone_size: Option<u64>,
 
-    /// The ordinal ID of a data partition for building a large, distributed BTree index.
+    /// DEPRECATED: range-based distributed BTree building has been retired.
+    /// Setting this to `Some(..)` now emits a warning and is ignored at build time
+    /// (see `BTreeIndexPlugin::train_index`). Build one segment per worker and
+    /// commit them with `commit_existing_index_segments(...)`, optionally
+    /// consolidating with `merge_existing_index_segments(...)`. The field is
+    /// retained (rather than removed) so the plugin can detect stale `range_id`
+    /// inputs and warn loudly instead of serde silently dropping an unknown field.
     ///
-    /// When building an index from multiple, pre-partitioned data chunks (for example,
-    /// in a distributed environment), this ID specifies which partition this particular
-    /// build operation corresponds to.
-    ///
-    /// # Data Distribution Requirements
-    ///
-    /// If this parameter is `Some(id)`, the caller **must** guarantee that the input data
-    /// is strictly global sorted. The input data, when considered as a whole across all
-    /// partitions ordered by `range_id`, must be sorted.
-    ///
-    /// Concretely, this means:
-    ///
-    /// All values in the data provided for `range_id: N` must be **less than or equal to**
-    /// all values in the data for `range_id: N+1`.
-    ///
-    /// Lance relies on this precondition to ensure the final, merged index is valid and
-    /// correctly ordered.
-    ///
-    /// # `None` Case
-    ///
-    /// If `range_id` is `None`, a single, monolithic index is built over the provided dataset.
+    /// Historically, this was the ordinal ID of a globally sorted range
+    /// partition. Lance used it to write `part_*` BTree files that were later
+    /// merged by `merge_index_metadata`. That flow has been retired. A
+    /// pre-sorted training stream is still accepted, but this field no longer
+    /// affects file names, commit behavior, or query semantics.
     pub range_id: Option<u32>,
 }
 
@@ -2903,29 +3162,43 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
             .downcast_ref::<BTreeTrainingRequest>()
             .unwrap();
-        train_btree_index(
+        if request.parameters.range_id.is_some() {
+            // `range_id` is deprecated and now ignored. A pre-sorted data stream is
+            // still supported (pass it as the training data), but `range_id` no longer
+            // needs to be set: each build now produces one canonical segment, and
+            // distribution is handled by the segmented-index APIs. The field will be
+            // removed in a future release.
+            warn!(
+                "BTree `range_id` is deprecated and now ignored; a pre-sorted data \
+                 stream is still supported, but `range_id` no longer needs to be passed. \
+                 Use the segmented-index APIs instead (build per-fragment segments, then \
+                 commit_existing_index_segments(...) / merge_existing_index_segments(...)). \
+                 The `range_id` field will be removed in a future release."
+            );
+        }
+        let files = train_btree_index(
             data,
             index_store,
             request
                 .parameters
                 .zone_size
                 .unwrap_or(DEFAULT_BTREE_BATCH_SIZE),
-            fragment_ids,
-            request.parameters.range_id,
+            None,
+            None,
         )
         .await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -2960,7 +3233,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             Error::internal("BTreeIndexPlugin::put_in_cache called with a non-BTree index")
         })?;
         let state = BTreeIndexState {
-            lookup_batch: btree.lookup_batch.clone(),
+            lookup_batch: btree.page_lookup.batch.clone(),
             batch_size: btree.batch_size,
             ranges_to_files: btree.ranges_to_files.clone(),
         };
@@ -2984,10 +3257,10 @@ mod tests {
     };
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
-    use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use futures::stream;
     use lance_core::cache::LanceCache;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
@@ -3007,8 +3280,9 @@ mod tests {
     };
 
     use super::{
-        BTreeIndexPlugin, BTreeIndexState, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        OrderableScalarValue, part_lookup_file_path, part_page_data_file_path, train_btree_index,
+        BTreeIndexPlugin, BTreeIndexState, BTreeLookup, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
+        Matches, OrderableScalarValue, part_lookup_file_path, part_page_data_file_path,
+        train_btree_index,
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use arrow_array::RecordBatch;
@@ -5000,6 +5274,619 @@ mod tests {
         .unwrap()
     }
 
+    fn osv(v: i32) -> OrderableScalarValue {
+        OrderableScalarValue(ScalarValue::Int32(Some(v)))
+    }
+
+    /// The rewritten [`BTreeLookup`] searches the lookup batch directly, so this
+    /// exercises the binary-search bounds, duplicate `min` values, a partial-null
+    /// (null `min`) straddling page, and the `Matches::Some`/`All` classification.
+    #[test]
+    fn test_btree_lookup_pages_between() {
+        // Pages sorted by `min`, NULLs first. Page 0 straddles the NULL/non-NULL
+        // boundary; pages 2 and 3 share a `min` of 20.
+        let batch = record_batch!(
+            ("min", Int32, [None, Some(10), Some(20), Some(20), Some(40)]),
+            (
+                "max",
+                Int32,
+                [Some(5), Some(20), Some(20), Some(30), Some(50)]
+            ),
+            ("null_count", UInt32, [2, 0, 0, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        assert_eq!(lookup.null_pages, vec![0]);
+        assert!(lookup.all_null_pages.is_empty());
+        assert_eq!(lookup.search_start, 0);
+
+        let between = |lo: i32, hi: i32| {
+            let mut m = lookup
+                .pages_between((
+                    std::ops::Bound::Included(&osv(lo)),
+                    std::ops::Bound::Included(&osv(hi)),
+                ))
+                .unwrap();
+            m.sort_by_key(|m| m.page_id());
+            m
+        };
+
+        // Equality only ever yields partial (Some) matches.
+        assert_eq!(lookup.pages_eq(&osv(15)).unwrap(), vec![Matches::Some(1)]);
+        assert_eq!(
+            lookup.pages_eq(&osv(20)).unwrap(),
+            vec![Matches::Some(1), Matches::Some(2), Matches::Some(3)]
+        );
+        assert!(lookup.pages_eq(&osv(35)).unwrap().is_empty());
+
+        // [20, 25]: page 2 ([20, 20]) sits entirely inside -> All; pages 1 and 3
+        // only partially overlap -> Some. The null-min page 0 (max 5) is excluded.
+        assert_eq!(
+            between(20, 25),
+            vec![Matches::Some(1), Matches::All(2), Matches::Some(3)]
+        );
+
+        // A query below all non-null data still reaches the straddling page 0,
+        // which is only ever a partial match because its `min` is NULL.
+        assert_eq!(between(0, 5), vec![Matches::Some(0)]);
+
+        // Unbounded above: page 4 ([40, 50]) is fully covered from 40 onward.
+        assert_eq!(
+            lookup
+                .pages_between((
+                    std::ops::Bound::Included(&osv(40)),
+                    std::ops::Bound::Unbounded
+                ))
+                .unwrap(),
+            vec![Matches::All(4)]
+        );
+
+        // Empty / inverted ranges select nothing.
+        assert!(between(31, 39).is_empty());
+        assert!(
+            lookup
+                .pages_between((
+                    std::ops::Bound::Included(&osv(25)),
+                    std::ops::Bound::Included(&osv(15))
+                ))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Exercises the native byte comparator path (`accessor_cmp`) for
+    /// variable-length `Binary` and fixed-width `FixedSizeBinary` (e.g. UUID)
+    /// columns, including the null-min straddle page and duplicate `min`s.
+    #[test]
+    fn test_btree_lookup_pages_eq_bytes() {
+        use arrow_array::{
+            ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
+            UInt32Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+
+        // 2-byte big-endian keys, so lexicographic byte order matches numeric
+        // order. Same layout as the int test: page 0 is a null-min straddle,
+        // pages 2 and 3 share `min` 20, and 35 falls in a gap.
+        fn be(v: u16) -> [u8; 2] {
+            v.to_be_bytes()
+        }
+        let mins = [None, Some(10u16), Some(20), Some(20), Some(40)];
+        let maxs = [Some(5u16), Some(20), Some(20), Some(30), Some(50)];
+        let null_count = UInt32Array::from(vec![2u32, 0, 0, 0, 0]);
+        let page_idx = UInt32Array::from(vec![0u32, 1, 2, 3, 4]);
+
+        let assert_byte_lookup =
+            |min_arr: ArrayRef, max_arr: ArrayRef, sv: &dyn Fn(u16) -> ScalarValue| {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("min", min_arr.data_type().clone(), true),
+                        Field::new("max", max_arr.data_type().clone(), true),
+                        Field::new("null_count", DataType::UInt32, false),
+                        Field::new("page_idx", DataType::UInt32, false),
+                    ])),
+                    vec![
+                        min_arr,
+                        max_arr,
+                        Arc::new(null_count.clone()),
+                        Arc::new(page_idx.clone()),
+                    ],
+                )
+                .unwrap();
+                let lookup = BTreeLookup::try_new(batch).unwrap();
+
+                let eq = |v: u16| {
+                    let mut p: Vec<u32> = lookup
+                        .pages_eq(&OrderableScalarValue(sv(v)))
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.page_id())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                };
+                assert_eq!(eq(15), vec![1]); // only page 1 ([10, 20])
+                assert_eq!(eq(20), vec![1, 2, 3]); // shared min of 2 & 3, max of 1
+                assert!(eq(35).is_empty()); // gap between pages 3 and 4
+                assert_eq!(eq(5), vec![0]); // reaches the null-min straddle via its max
+
+                // IN merges and dedups across values.
+                let mut in_pages: Vec<u32> = lookup
+                    .pages_in([5u16, 15].into_iter().map(|v| OrderableScalarValue(sv(v))))
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| m.page_id())
+                    .collect();
+                in_pages.sort_unstable();
+                assert_eq!(in_pages, vec![0, 1]);
+            };
+
+        let fsb = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    arr.iter().copied().map(|o| o.map(be)),
+                    2,
+                )
+                .unwrap(),
+            )
+        };
+        assert_byte_lookup(fsb(&mins), fsb(&maxs), &|v| {
+            ScalarValue::FixedSizeBinary(2, Some(be(v).to_vec()))
+        });
+
+        let bin = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(BinaryArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| be(v).to_vec())),
+            ))
+        };
+        assert_byte_lookup(bin(&mins), bin(&maxs), &|v| {
+            ScalarValue::Binary(Some(be(v).to_vec()))
+        });
+
+        let lbin = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(LargeBinaryArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| be(v).to_vec())),
+            ))
+        };
+        assert_byte_lookup(lbin(&mins), lbin(&maxs), &|v| {
+            ScalarValue::LargeBinary(Some(be(v).to_vec()))
+        });
+
+        // `LargeUtf8` over zero-padded decimal strings, whose lexicographic order
+        // matches the numeric order of the keys.
+        let lstr = |arr: &[Option<u16>]| -> ArrayRef {
+            Arc::new(LargeStringArray::from_iter(
+                arr.iter().copied().map(|o| o.map(|v| format!("{v:02}"))),
+            ))
+        };
+        assert_byte_lookup(lstr(&mins), lstr(&maxs), &|v| {
+            ScalarValue::LargeUtf8(Some(format!("{v:02}")))
+        });
+    }
+
+    /// Exercises the physical-type reinterpret path: temporal columns (`Date32`
+    /// over `i32`, `Timestamp` over `i64`) are compared through the integer native
+    /// path without a dedicated per-type branch.
+    #[test]
+    fn test_btree_lookup_pages_eq_temporal() {
+        use arrow_array::{ArrayRef, Date32Array, TimestampMicrosecondArray, UInt32Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let null_count = UInt32Array::from(vec![2u32, 0, 0, 0, 0]);
+        let page_idx = UInt32Array::from(vec![0u32, 1, 2, 3, 4]);
+
+        let assert_lookup =
+            |min_arr: ArrayRef, max_arr: ArrayRef, sv: &dyn Fn(i64) -> ScalarValue| {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("min", min_arr.data_type().clone(), true),
+                        Field::new("max", max_arr.data_type().clone(), true),
+                        Field::new("null_count", DataType::UInt32, false),
+                        Field::new("page_idx", DataType::UInt32, false),
+                    ])),
+                    vec![
+                        min_arr,
+                        max_arr,
+                        Arc::new(null_count.clone()),
+                        Arc::new(page_idx.clone()),
+                    ],
+                )
+                .unwrap();
+                let lookup = BTreeLookup::try_new(batch).unwrap();
+                let eq = |v: i64| {
+                    let mut p: Vec<u32> = lookup
+                        .pages_eq(&OrderableScalarValue(sv(v)))
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.page_id())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                };
+                assert_eq!(eq(15), vec![1]); // only page 1 ([10, 20])
+                assert_eq!(eq(20), vec![1, 2, 3]); // shared min of 2 & 3, max of 1
+                assert!(eq(35).is_empty()); // gap between pages 3 and 4
+                assert_eq!(eq(5), vec![0]); // reaches the null-min straddle via its max
+            };
+
+        // Timestamp (i64-backed) → Int64 native path.
+        assert_lookup(
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::TimestampMicrosecond(Some(v), None),
+        );
+
+        // Date32 (i32-backed) → Int32 native path.
+        assert_lookup(
+            Arc::new(Date32Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(Date32Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::Date32(Some(v as i32)),
+        );
+    }
+
+    /// Exercises the remaining physical-type dispatch arms that the temporal and
+    /// byte tests don't reach: every integer width and signedness, `Float16`, and
+    /// the 128-/256-bit decimal paths. All share the temporal test's numeric layout
+    /// (mins `[_, 10, 20, 20, 40]`, maxs `[5, 20, 20, 30, 50]`) so the assertions are
+    /// identical; only the array/scalar type varies.
+    #[test]
+    fn test_btree_lookup_pages_eq_numeric_widths() {
+        use arrow::datatypes::i256;
+        use arrow_array::{
+            ArrayRef, Decimal128Array, Decimal256Array, Float16Array, Int8Array, Int16Array,
+            UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+        use half::f16;
+
+        let null_count = UInt32Array::from(vec![2u32, 0, 0, 0, 0]);
+        let page_idx = UInt32Array::from(vec![0u32, 1, 2, 3, 4]);
+        let assert_lookup =
+            |min_arr: ArrayRef, max_arr: ArrayRef, sv: &dyn Fn(i64) -> ScalarValue| {
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("min", min_arr.data_type().clone(), true),
+                        Field::new("max", max_arr.data_type().clone(), true),
+                        Field::new("null_count", DataType::UInt32, false),
+                        Field::new("page_idx", DataType::UInt32, false),
+                    ])),
+                    vec![
+                        min_arr,
+                        max_arr,
+                        Arc::new(null_count.clone()),
+                        Arc::new(page_idx.clone()),
+                    ],
+                )
+                .unwrap();
+                let lookup = BTreeLookup::try_new(batch).unwrap();
+                let eq = |v: i64| {
+                    let mut p: Vec<u32> = lookup
+                        .pages_eq(&OrderableScalarValue(sv(v)))
+                        .unwrap()
+                        .into_iter()
+                        .map(|m| m.page_id())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                };
+                assert_eq!(eq(15), vec![1]); // only page 1 ([10, 20])
+                assert_eq!(eq(20), vec![1, 2, 3]); // shared min of 2 & 3, max of 1
+                assert!(eq(35).is_empty()); // gap between pages 3 and 4
+                assert_eq!(eq(5), vec![0]); // reaches the null-min straddle via its max
+            };
+
+        assert_lookup(
+            Arc::new(Int8Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(Int8Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::Int8(Some(v as i8)),
+        );
+        assert_lookup(
+            Arc::new(Int16Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(Int16Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::Int16(Some(v as i16)),
+        );
+        assert_lookup(
+            Arc::new(UInt8Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt8Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt8(Some(v as u8)),
+        );
+        assert_lookup(
+            Arc::new(UInt16Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt16Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt16(Some(v as u16)),
+        );
+        assert_lookup(
+            Arc::new(UInt32Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt32Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt32(Some(v as u32)),
+        );
+        assert_lookup(
+            Arc::new(UInt64Array::from(vec![
+                None,
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(40),
+            ])),
+            Arc::new(UInt64Array::from(vec![
+                Some(5),
+                Some(20),
+                Some(20),
+                Some(30),
+                Some(50),
+            ])),
+            &|v| ScalarValue::UInt64(Some(v as u64)),
+        );
+
+        let f = |v: f64| f16::from_f64(v);
+        assert_lookup(
+            Arc::new(Float16Array::from(vec![
+                None,
+                Some(f(10.0)),
+                Some(f(20.0)),
+                Some(f(20.0)),
+                Some(f(40.0)),
+            ])),
+            Arc::new(Float16Array::from(vec![
+                Some(f(5.0)),
+                Some(f(20.0)),
+                Some(f(20.0)),
+                Some(f(30.0)),
+                Some(f(50.0)),
+            ])),
+            &|v| ScalarValue::Float16(Some(f(v as f64))),
+        );
+
+        // Decimal128 (i128 native path). Comparison is on the raw integer, so a
+        // scale of 0 lets the values double as plain integers.
+        let dec128 = |vals: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(vals)
+                    .with_precision_and_scale(18, 0)
+                    .unwrap(),
+            )
+        };
+        assert_lookup(
+            dec128(vec![None, Some(10), Some(20), Some(20), Some(40)]),
+            dec128(vec![Some(5), Some(20), Some(20), Some(30), Some(50)]),
+            &|v| ScalarValue::Decimal128(Some(v as i128), 18, 0),
+        );
+
+        // Decimal256 (i256 native path).
+        let dec256 = |vals: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal256Array::from(
+                    vals.into_iter()
+                        .map(|o| o.map(i256::from_i128))
+                        .collect::<Vec<_>>(),
+                )
+                .with_precision_and_scale(40, 0)
+                .unwrap(),
+            )
+        };
+        assert_lookup(
+            dec256(vec![None, Some(10), Some(20), Some(20), Some(40)]),
+            dec256(vec![Some(5), Some(20), Some(20), Some(30), Some(50)]),
+            &|v| ScalarValue::Decimal256(Some(i256::from_i128(v as i128)), 40, 0),
+        );
+    }
+
+    /// Exercises the NULL paths of the lookup directly: `pages_eq(NULL)` and
+    /// `pages_in` with a NULL in the value list (and a NULL-only list), including
+    /// the partial-null (`Some`) vs entirely-null (`All`) page classification.
+    #[test]
+    fn test_btree_lookup_pages_null() {
+        // Page 0 is entirely null (null max -> All); page 1 is a partial-null
+        // straddle (max 5, null_count > 0 -> Some); page 2 also carries a null.
+        let batch = record_batch!(
+            ("min", Int32, [None, None, Some(10), Some(20), Some(40)]),
+            ("max", Int32, [None, Some(5), Some(20), Some(30), Some(50)]),
+            ("null_count", UInt32, [3, 2, 1, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        assert_eq!(lookup.all_null_pages, vec![0]);
+        assert_eq!(lookup.null_pages, vec![1, 2]);
+
+        // pages_eq(NULL) short-circuits to the null pages: partial-null pages are
+        // `Some`, the entirely-null page is `All`.
+        assert_eq!(
+            lookup
+                .pages_eq(&OrderableScalarValue(ScalarValue::Int32(None)))
+                .unwrap(),
+            vec![Matches::Some(1), Matches::Some(2), Matches::All(0)]
+        );
+
+        let in_ids = |vals: Vec<Option<i32>>| {
+            let mut p: Vec<u32> = lookup
+                .pages_in(
+                    vals.into_iter()
+                        .map(|v| OrderableScalarValue(ScalarValue::Int32(v))),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|m| m.page_id())
+                .collect();
+            p.sort_unstable();
+            p
+        };
+        // Baseline: a non-null value only -> just its value page.
+        assert_eq!(in_ids(vec![Some(45)]), vec![4]);
+        // A NULL in the list unions in every null page (0, 1, 2).
+        assert_eq!(in_ids(vec![Some(45), None]), vec![0, 1, 2, 4]);
+        // A NULL-only list (empty non-null set) returns exactly the null pages.
+        assert_eq!(in_ids(vec![None]), vec![0, 1, 2]);
+    }
+
+    /// A 0-row page_lookup batch (an index over an empty dataset) must yield no
+    /// candidates for any query rather than panicking on the binary-search bounds.
+    #[test]
+    fn test_btree_lookup_empty_batch() {
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("page_idx", DataType::UInt32, false),
+        ]));
+        let lookup = BTreeLookup::try_new(RecordBatch::new_empty(schema)).unwrap();
+        assert_eq!(lookup.search_start, 0);
+        assert!(lookup.null_pages.is_empty());
+        assert!(lookup.all_null_pages.is_empty());
+
+        assert!(lookup.pages_eq(&osv(5)).unwrap().is_empty());
+        assert!(lookup.pages_in([osv(5)]).unwrap().is_empty());
+        assert!(
+            lookup
+                .pages_between((
+                    std::ops::Bound::Included(&osv(0)),
+                    std::ops::Bound::Included(&osv(100)),
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(lookup.pages_null().is_empty());
+    }
+
+    /// A straddle page (null `min`, non-null `max`) can sort ahead of an entirely-
+    /// null page within the leading NULL-`min` group. When it does, `search_start`
+    /// points at the straddle and the all-null page falls inside the forward-scan
+    /// window, so both the equality and range scans must skip it (it matches only
+    /// IS NULL).
+    #[test]
+    fn test_btree_lookup_skips_all_null_page_in_scan_window() {
+        // Page 0: straddle (null min, max 5). Page 1: entirely null (null min/max).
+        let batch = record_batch!(
+            ("min", Int32, [None, None, Some(10), Some(20), Some(40)]),
+            ("max", Int32, [Some(5), None, Some(20), Some(30), Some(50)]),
+            ("null_count", UInt32, [2, 3, 0, 0, 0]),
+            ("page_idx", UInt32, [0, 1, 2, 3, 4])
+        )
+        .unwrap();
+        let lookup = BTreeLookup::try_new(batch).unwrap();
+        assert_eq!(lookup.search_start, 0); // straddle page 0 has a non-null max
+        assert_eq!(lookup.all_null_pages, vec![1]);
+        assert_eq!(lookup.null_pages, vec![0]);
+
+        // Equality for 5 peeks left across the all-null page 1 (index 1, inside the
+        // scan window) and must skip it, reaching only the straddle page 0.
+        assert_eq!(
+            lookup
+                .pages_eq(&osv(5))
+                .unwrap()
+                .into_iter()
+                .map(|m| m.page_id())
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        // The same all-null page sits inside the range scan window and is skipped:
+        // page 0 (straddle) is a partial match, pages 2-4 are fully covered.
+        let mut between = lookup
+            .pages_between((
+                std::ops::Bound::Included(&osv(0)),
+                std::ops::Bound::Included(&osv(100)),
+            ))
+            .unwrap();
+        between.sort_by_key(|m| m.page_id());
+        assert_eq!(
+            between,
+            vec![
+                Matches::Some(0),
+                Matches::All(2),
+                Matches::All(3),
+                Matches::All(4),
+            ]
+        );
+    }
+
     fn assert_state_roundtrips(state: &BTreeIndexState) {
         let mut buf = Vec::new();
         state.serialize(&mut buf).unwrap();
@@ -5068,7 +5955,7 @@ mod tests {
 
         // Round-trip the state through the codec and reconstruct an index from it.
         let state = BTreeIndexState {
-            lookup_batch: index.lookup_batch.clone(),
+            lookup_batch: index.page_lookup.batch.clone(),
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
         };
@@ -5150,7 +6037,7 @@ mod tests {
             .await
             .unwrap();
         let state = BTreeIndexState {
-            lookup_batch: index.lookup_batch.clone(),
+            lookup_batch: index.page_lookup.batch.clone(),
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
         };

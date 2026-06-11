@@ -17,9 +17,12 @@ import org.lance.fragment.FragmentMergeResult;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.operation.Merge;
+import org.lance.operation.Project;
 import org.lance.operation.Update;
+import org.lance.schema.LanceField;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -29,6 +32,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,6 +41,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -76,6 +81,70 @@ public class FragmentTest {
         try (LanceScanner scanner = fragment.newScan()) {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
+        }
+      }
+    }
+  }
+
+  @Test
+  void testWriteFragmentWithSchemaOverride(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fragment_schema_override").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        List<org.apache.arrow.vector.types.pojo.Field> fieldList =
+            new ArrayList<>(testDataset.getSchema().getFields());
+        Collections.reverse(fieldList);
+
+        try (Transaction projectTxn =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(Project.builder().schema(new Schema(fieldList)).build())
+                    .build();
+            Dataset evolvedDataset = new CommitBuilder(dataset).execute(projectTxn);
+            VectorSchemaRoot root =
+                VectorSchemaRoot.create(evolvedDataset.getSchema(), allocator)) {
+          root.allocateNew();
+          VarCharVector nameVector = (VarCharVector) root.getVector("name");
+          IntVector idVector = (IntVector) root.getVector("id");
+          nameVector.setSafe(0, "Person 1".getBytes(StandardCharsets.UTF_8));
+          idVector.setSafe(0, 1);
+          root.setRowCount(1);
+
+          List<FragmentMetadata> fragments =
+              Fragment.write()
+                  .datasetUri(datasetPath)
+                  .allocator(allocator)
+                  .data(root)
+                  .schema(evolvedDataset.getLanceSchema())
+                  .mode(WriteParams.WriteMode.APPEND)
+                  .execute();
+
+          assertEquals(1, fragments.size());
+          assertEquals(1, fragments.get(0).getPhysicalRows());
+          assertArrayEquals(
+              evolvedDataset.getLanceSchema().fields().stream()
+                  .mapToInt(LanceField::getId)
+                  .toArray(),
+              fragments.get(0).getFiles().get(0).getFields());
+
+          FragmentOperation.Append appendOp = new FragmentOperation.Append(fragments);
+          try (Dataset appendedDataset =
+                  Dataset.commit(
+                      allocator, datasetPath, appendOp, Optional.of(evolvedDataset.version()));
+              ArrowReader reader = appendedDataset.newScan().scanBatches()) {
+            assertEquals(3, appendedDataset.version());
+            assertEquals(1, appendedDataset.countRows());
+            assertTrue(reader.loadNextBatch());
+            VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+            assertEquals(1, batch.getRowCount());
+            assertEquals(
+                "Person 1",
+                new String(
+                    ((VarCharVector) batch.getVector("name")).get(0), StandardCharsets.UTF_8));
+            assertEquals(1, ((IntVector) batch.getVector("id")).get(0));
+          }
         }
       }
     }
