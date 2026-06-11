@@ -2271,6 +2271,112 @@ mod tests {
         );
     }
 
+    // Distributed LabelList build: one segment per fragment via
+    // `execute_uncommitted`, then `merge_existing_index_segments` consolidates them
+    // into a single canonical segment that answers `array_has_any` across all rows.
+    #[tokio::test]
+    async fn test_label_list_merge_existing_index_segments() {
+        use lance_index::scalar::{LabelListQuery, SearchResult};
+
+        // Open `segment` and count rows whose `labels` list contains `label`.
+        async fn count_has_any(dataset: &Dataset, segment: &IndexMetadata, label: i64) -> usize {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::Int64(Some(label))]);
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_addrs) => {
+                    row_addrs.true_rows().row_addrs().unwrap().count()
+                }
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // 4000 rows across two 2000-row fragments; each `labels` list cycles over 1..=5.
+        let mut dataset = gen_batch()
+            .col(
+                "labels",
+                lance_datagen::array::rand_list_any(
+                    lance_datagen::array::cycle::<arrow::datatypes::Int64Type>(vec![1, 2, 3, 4, 5]),
+                    false,
+                ),
+            )
+            .into_dataset(
+                &dataset_uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(2000),
+            )
+            .await
+            .unwrap();
+
+        // Ground truth via a full scan before any index exists.
+        let expected = dataset
+            .scan()
+            .project(&["labels"])
+            .unwrap()
+            .filter("array_has_any(labels, [3])")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert!(
+            expected > 0,
+            "test dataset must contain at least one row whose labels include 3"
+        );
+
+        // One LabelList segment per fragment, committed as a multi-segment index.
+        let params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList);
+        let mut staged = Vec::new();
+        for fragment in dataset.get_fragments() {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["labels"], IndexType::LabelList, &params)
+                    .name("labels_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("labels_idx", "labels", staged)
+            .await
+            .unwrap();
+
+        // Merge the two per-fragment segments into a single segment covering both.
+        let merged = dataset
+            .merge_existing_index_segments(
+                dataset.load_indices_by_name("labels_idx").await.unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.fragment_bitmap.as_ref().unwrap(),
+            &roaring::RoaringBitmap::from_iter([0u32, 1])
+        );
+        assert!(
+            merged
+                .index_details
+                .as_ref()
+                .unwrap()
+                .type_url
+                .ends_with("LabelListIndexDetails")
+        );
+        // The merged segment returns every row whose labels include 3 across both
+        // fragments — i.e. the per-fragment bitmaps and null sets were unioned.
+        assert_eq!(count_has_any(&dataset, &merged, 3).await, expected);
+    }
+
     #[tokio::test]
     async fn test_commit_existing_index_supports_local_hnsw_segments() {
         let tmpdir = TempStrDir::default();
