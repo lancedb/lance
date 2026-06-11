@@ -29,7 +29,8 @@ use crate::{Error, Result};
 /// directly to the underlying writer.
 ///
 /// The envelope is written by the [`CacheCodec`](super::CacheCodec) wrapper
-/// before this writer is handed to [`CacheCodecImpl::serialize`].
+/// before this writer is handed to
+/// [`CacheCodecImpl::serialize`](super::CacheCodecImpl::serialize).
 pub struct CacheEntryWriter<'a> {
     writer: &'a mut dyn Write,
     /// Absolute byte offset within the entry, used to align IPC sections.
