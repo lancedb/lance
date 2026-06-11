@@ -1440,6 +1440,25 @@ pub async fn merge_partial_vector_auxiliary_files(
                     )));
                 }
 
+                // Shards written by older lance versions carry sequential ex
+                // codes; normalize every batch to the blocked layout before
+                // concatenation so mixed-version shards merge correctly
+                // (concat_batches combines columns by position and would
+                // otherwise mix the two layouts silently).
+                let batches = match rq_meta.as_ref() {
+                    Some(meta) if meta.num_bits > 1 => batches
+                        .into_iter()
+                        .map(|batch| {
+                            crate::vector::bq::storage::load_blocked_ex_codes(
+                                batch,
+                                meta.rotated_dim(),
+                                meta.num_bits,
+                            )
+                            .map(|(batch, _)| batch)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    _ => batches,
+                };
                 let schema = batches[0].schema();
                 let partition_batch = concat_batches(&schema, batches.iter())?;
                 if let Some(w) = v2w_opt.as_mut() {
@@ -1527,7 +1546,7 @@ mod tests {
     use prost::Message;
 
     use crate::vector::bq::RQRotationType;
-    use crate::vector::bq::storage::{RABIT_EX_CODE_COLUMN, RabitQueryEstimator};
+    use crate::vector::bq::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQueryEstimator};
     use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
@@ -2529,11 +2548,14 @@ mod tests {
             let batch = batch.unwrap();
             if !checked_split_columns {
                 let schema = batch.schema();
-                let ex_code_field = schema.field_with_name(RABIT_EX_CODE_COLUMN).unwrap();
+                let ex_code_field = schema
+                    .field_with_name(RABIT_BLOCKED_EX_CODE_COLUMN)
+                    .unwrap();
                 let DataType::FixedSizeList(_, ex_code_bytes) = ex_code_field.data_type() else {
                     panic!("RQ ex-code field should be FixedSizeList");
                 };
-                assert_eq!(*ex_code_bytes, 6);
+                // code_dim=16 padded to one 64-dim block at ex_bits=3.
+                assert_eq!(*ex_code_bytes, 24);
                 assert!(schema.field_with_name(ERROR_FACTORS_FIELD.name()).is_ok());
                 assert!(schema.field_with_name(EX_ADD_FACTORS_COLUMN).is_ok());
                 assert!(schema.field_with_name(EX_SCALE_FACTORS_COLUMN).is_ok());

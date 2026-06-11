@@ -252,8 +252,9 @@ pub struct RabitRawQueryContext {
     /// Quantized-table input for the FastScan ex path; empty for ex widths
     /// without FastScan support.
     pub ex_dist_table: Vec<f32>,
-    /// Rotated query permuted into ex-dot kernel order (see
-    /// `lance_index::vector::bq::ex_dot::build_ex_query_into`).
+    /// The rotated query zero-padded to a 64-dim multiple for the ex-dot
+    /// kernels; empty when `code_dim` is already aligned (the kernels then
+    /// read `rotated_query` directly).
     pub ex_query: Vec<f32>,
     pub sum_q: f32,
 }

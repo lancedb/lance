@@ -11,60 +11,62 @@
 //! query directly, following the kernel design of the RaBitQ reference library
 //! (<https://github.com/VectorDB-NTU/RaBitQ-Library>, Apache-2.0).
 //!
-//! Two code layouts are consumed:
+//! Codes are stored in the *blocked* layout: dims are grouped into 64-dim
+//! blocks (the last block zero-padded) and bit-interleaved within each block
+//! so that the SIMD unpack emits codes in natural dim order:
 //!
-//! - `ex_bits` ∈ {1, 2, 4, 8}: the sequential LSB-first layout written by the
-//!   index builder is already byte-aligned, so rows are used as stored.
-//! - `ex_bits` ∈ {3, 5, 6, 7}: codes straddle byte boundaries in the sequential
-//!   layout, so rows are repacked once at load time ([`plane_pack_row`]) into
-//!   bit-planes that unpack with byte-wise shifts:
+//! ```text
+//! per 64-dim block (T = ex_bits - 1, the top bit; "run k" = dims 16k..16k+16):
+//! 1 bit:  [8B]  bit i of the LE word = dim i
+//! 2 bits: [16B] byte b = dims {b, b+16, b+32, b+48} at bit pairs 0/2/4/6
+//! 3 bits: [16B 2-bit plane as above][8B top-bit plane]
+//! 4 bits: [32B] byte 8j+b = dim 16j+b (low nibble) | dim 16j+8+b (high nibble)
+//! 5 bits: [32B 4-bit plane: byte b = dims b|b+16; byte 16+b = dims b+32|b+48]
+//!         [8B top-bit plane]
+//! 6 bits: [48B] byte 16k+b = dim 16k+b (6 low bits) | bits 2k..2k+2 of
+//!         dim 48+b (2 high bits)
+//! 7 bits: [48B as 6 bits][8B top-bit plane]
+//! 8 bits: [64B] identity
+//! top-bit plane: top bit of dim 16k+b at bit 8*(b%8) + 2k + b/8 of a LE u64
+//! ```
 //!
-//!   ```text
-//!   per 64-dim group (T = ex_bits - 1, the top bit):
-//!   3 bits: [16B 2-bit plane][8B top-bit plane]
-//!   5 bits: [32B 4-bit plane][8B top-bit plane]
-//!   6 bits: [48B: 3 blocks of "6 low bits | 2 stolen bits"]
-//!   7 bits: [48B: same as 6 bits][8B top-bit plane]
-//!   ```
-//!
-//! Kernels unpack each group into runs of 16 code bytes whose dimension order
-//! differs from the natural order, so the query is permuted once per search
-//! with [`build_ex_query_into`] and the kernels then read both sides
-//! sequentially. The permuted query is zero-padded to a multiple of 64 so that
-//! padded lanes contribute nothing.
+//! Because unpack order is natural, the kernels read the rotated query
+//! directly; it only needs zero-padding ([`pad_query_into`]) when the rotated
+//! dim is not a multiple of 64. Legacy indexes store ex codes sequentially
+//! (LSB-first bit stream) and are repacked once at load time
+//! ([`repack_sequential_row`]); for `ex_bits` ∈ {1, 8} the two layouts agree
+//! (modulo trailing padding, which the kernels tolerate) and rows are used as
+//! stored.
 
 use std::sync::LazyLock;
 
-/// Dimensions are processed in groups; the permuted query is padded to this
-/// multiple so every kernel sees whole groups.
-pub const EX_DOT_GROUP_DIMS: usize = 64;
+/// Dims are packed in blocks of this size; the query is zero-padded to a
+/// whole number of blocks when the rotated dim is not already a multiple.
+pub const EX_DOT_BLOCK_DIMS: usize = 64;
 
-/// `f32` length of the kernel-order query built by [`build_ex_query_into`].
-pub fn ex_query_len(dim: usize) -> usize {
-    dim.next_multiple_of(EX_DOT_GROUP_DIMS)
+/// `f32` length of the query consumed by the kernels.
+pub fn padded_query_len(dim: usize) -> usize {
+    dim.next_multiple_of(EX_DOT_BLOCK_DIMS)
 }
 
-/// Whether the sequential ex-code layout must be repacked into bit-planes for
-/// the dot kernels. For the remaining widths codes are byte-aligned already.
-pub fn needs_plane_repack(ex_bits: u8) -> bool {
-    matches!(ex_bits, 3 | 5 | 6 | 7)
+/// Whether the legacy sequential layout of a row already matches the blocked
+/// layout (modulo trailing zero padding, which the kernels tolerate), so
+/// legacy rows can be consumed without repacking.
+pub fn sequential_matches_blocked(ex_bits: u8) -> bool {
+    matches!(ex_bits, 1 | 8)
 }
 
-/// Bytes per row of the code layout consumed by the dot kernels.
-pub fn ex_dot_code_bytes(dim: usize, ex_bits: u8) -> usize {
+/// Bytes per row of the blocked ex-code layout.
+pub fn blocked_ex_code_bytes(dim: usize, ex_bits: u8) -> usize {
     debug_assert!((1..=8).contains(&ex_bits));
-    if needs_plane_repack(ex_bits) {
-        ex_query_len(dim) * ex_bits as usize / 8
-    } else {
-        (dim * ex_bits as usize).div_ceil(u8::BITS as usize)
-    }
+    padded_query_len(dim) * ex_bits as usize / 8
 }
 
 /// Dimensions per unpacking group for the given code width.
 fn group_dims(ex_bits: u8) -> usize {
     match ex_bits {
         1 | 4 | 8 => 16,
-        _ => EX_DOT_GROUP_DIMS,
+        _ => EX_DOT_BLOCK_DIMS,
     }
 }
 
@@ -89,52 +91,24 @@ pub fn packed_ex_code_value(row_codes: &[u8], dim_idx: usize, ex_bits: u8) -> u8
     ((bits >> bit_shift) & mask) as u8
 }
 
-/// Kernel-order position of `dim` within its group (see [`build_ex_query_into`]).
-fn kernel_position(dim: usize, ex_bits: u8) -> usize {
-    match ex_bits {
-        1 | 8 => dim,
-        // 16-dim groups unpack the low nibbles (even dims) before the high
-        // nibbles (odd dims).
-        4 => {
-            let group = dim / 16;
-            let r = dim % 16;
-            group * 16 + r / 2 + (r % 2) * 8
-        }
-        // 64-dim groups unpack four 16-byte runs holding dims k, k+4, k+8, ...
-        2 | 3 | 5 | 6 | 7 => {
-            let group = dim / 64;
-            let r = dim % 64;
-            group * 64 + (r % 4) * 16 + r / 4
-        }
-        _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
-    }
-}
-
-/// Permute the rotated query into the order the dot kernels unpack codes in,
-/// zero-padding to a multiple of [`EX_DOT_GROUP_DIMS`].
-pub fn build_ex_query_into(rotated_query: &[f32], ex_bits: u8, out: &mut [f32]) {
-    debug_assert_eq!(out.len(), ex_query_len(rotated_query.len()));
-    out.fill(0.0);
-    for (dim, &value) in rotated_query.iter().enumerate() {
-        out[kernel_position(dim, ex_bits)] = value;
-    }
-}
-
-pub fn build_ex_query(rotated_query: &[f32], ex_bits: u8) -> Vec<f32> {
-    let mut out = vec![0.0; ex_query_len(rotated_query.len())];
-    build_ex_query_into(rotated_query, ex_bits, &mut out);
-    out
+/// Zero-pad the rotated query to a whole number of 64-dim blocks. Only needed
+/// when `dim` is not a multiple of [`EX_DOT_BLOCK_DIMS`]; aligned queries are
+/// passed to the kernels as-is.
+pub fn pad_query_into(rotated_query: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(out.len(), padded_query_len(rotated_query.len()));
+    out[..rotated_query.len()].copy_from_slice(rotated_query);
+    out[rotated_query.len()..].fill(0.0);
 }
 
 /// Pack the top bit of each of 64 codes into a `u64` so kernels can position
-/// it with two shifts per 16-code run: the top bit of dim `4j + k` is stored
-/// at bit `8 * (j % 8) + 2k + j / 8`.
-fn pack_top_plane(group_values: &[u8; 64], top_bit: u8) -> u64 {
+/// it with two shifts per 16-code run: the top bit of dim `16k + b` is stored
+/// at bit `8 * (b % 8) + 2k + b / 8`.
+fn pack_top_plane(block_values: &[u8; 64], top_bit: u8) -> u64 {
     let mut plane = 0u64;
-    for j in 0..16 {
-        for k in 0..4 {
-            let bit = (group_values[4 * j + k] >> top_bit) & 1;
-            plane |= (bit as u64) << (8 * (j % 8) + 2 * k + j / 8);
+    for k in 0..4 {
+        for b in 0..16 {
+            let bit = (block_values[16 * k + b] >> top_bit) & 1;
+            plane |= (bit as u64) << (8 * (b % 8) + 2 * k + b / 8);
         }
     }
     plane
@@ -150,66 +124,94 @@ fn shift_plane(plane: u64, from_bit: usize, to_bit: usize) -> u64 {
     }
 }
 
-/// Pack one group of 64 code values (natural dim order) into the bit-plane
+/// Pack one block of 64 code values (natural dim order) into the blocked
 /// layout described in the module docs.
-fn plane_pack_group(ex_bits: u8, group_values: &[u8; 64], out: &mut [u8]) {
-    let v = group_values;
+fn pack_block(ex_bits: u8, block_values: &[u8; 64], out: &mut [u8]) {
+    let v = block_values;
     match ex_bits {
-        3 => {
-            for b in 0..16 {
-                out[b] = (v[4 * b] & 0b11)
-                    | ((v[4 * b + 1] & 0b11) << 2)
-                    | ((v[4 * b + 2] & 0b11) << 4)
-                    | ((v[4 * b + 3] & 0b11) << 6);
+        1 => {
+            for (b, byte) in out[..8].iter_mut().enumerate() {
+                *byte = (0..8).fold(0, |acc, t| acc | ((v[8 * b + t] & 1) << t));
             }
-            out[16..24].copy_from_slice(&pack_top_plane(v, 2).to_le_bytes());
+        }
+        2 | 3 => {
+            for b in 0..16 {
+                out[b] = (v[b] & 0b11)
+                    | ((v[16 + b] & 0b11) << 2)
+                    | ((v[32 + b] & 0b11) << 4)
+                    | ((v[48 + b] & 0b11) << 6);
+            }
+            if ex_bits == 3 {
+                out[16..24].copy_from_slice(&pack_top_plane(v, 2).to_le_bytes());
+            }
+        }
+        4 => {
+            for unit in 0..4 {
+                for b in 0..8 {
+                    out[8 * unit + b] =
+                        (v[16 * unit + b] & 0x0f) | ((v[16 * unit + 8 + b] & 0x0f) << 4);
+                }
+            }
         }
         5 => {
             for b in 0..16 {
-                out[b] = (v[4 * b] & 0x0f) | ((v[4 * b + 1] & 0x0f) << 4);
-                out[16 + b] = (v[4 * b + 2] & 0x0f) | ((v[4 * b + 3] & 0x0f) << 4);
+                out[b] = (v[b] & 0x0f) | ((v[16 + b] & 0x0f) << 4);
+                out[16 + b] = (v[32 + b] & 0x0f) | ((v[48 + b] & 0x0f) << 4);
             }
             out[32..40].copy_from_slice(&pack_top_plane(v, 4).to_le_bytes());
         }
         6 | 7 => {
-            // Dims k, k+4, ... (k < 3) keep their 6 low bits in block k; the
-            // fourth dim of each quad is split into three 2-bit pieces stored
-            // in the blocks' top bits.
+            // Runs 0..3 keep their 6 low bits in place; the fourth run's dims
+            // are split into three 2-bit pieces stored in the runs' top bits.
             for k in 0..3 {
                 for b in 0..16 {
                     out[16 * k + b] =
-                        (v[4 * b + k] & 0x3f) | (((v[4 * b + 3] >> (2 * k)) & 0b11) << 6);
+                        (v[16 * k + b] & 0x3f) | (((v[48 + b] >> (2 * k)) & 0b11) << 6);
                 }
             }
             if ex_bits == 7 {
                 out[48..56].copy_from_slice(&pack_top_plane(v, 6).to_le_bytes());
             }
         }
-        _ => unreachable!("plane packing is only used for ex_bits 3, 5, 6, 7"),
+        8 => out[..64].copy_from_slice(v),
+        _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
     }
 }
 
-/// Repack one sequentially bit-packed row into the kernel bit-plane layout.
-/// `out` must have [`ex_dot_code_bytes`] bytes.
-pub fn plane_pack_row(seq_row: &[u8], dim: usize, ex_bits: u8, out: &mut [u8]) {
-    debug_assert!(needs_plane_repack(ex_bits));
-    debug_assert_eq!(out.len(), ex_dot_code_bytes(dim, ex_bits));
-    let bytes_per_group = group_bytes(ex_bits);
-    let mut group_values = [0u8; 64];
-    for (group, out) in out.chunks_exact_mut(bytes_per_group).enumerate() {
-        group_values.fill(0);
-        let base = group * 64;
-        let count = 64.min(dim.saturating_sub(base));
-        for (i, value) in group_values[..count].iter_mut().enumerate() {
+/// Pack one row of unpacked code values (one `u8` per dim) into the blocked
+/// layout; the writer path. `out` must have [`blocked_ex_code_bytes`] bytes.
+pub fn pack_blocked_row(values: &[u8], ex_bits: u8, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), blocked_ex_code_bytes(values.len(), ex_bits));
+    let block_bytes = EX_DOT_BLOCK_DIMS * ex_bits as usize / 8;
+    let mut block_values = [0u8; 64];
+    for (block, out) in out.chunks_exact_mut(block_bytes).enumerate() {
+        let base = block * EX_DOT_BLOCK_DIMS;
+        let count = EX_DOT_BLOCK_DIMS.min(values.len() - base);
+        block_values[..count].copy_from_slice(&values[base..base + count]);
+        block_values[count..].fill(0);
+        pack_block(ex_bits, &block_values, out);
+    }
+}
+
+/// Repack one legacy sequentially bit-packed row into the blocked layout.
+/// `out` must have [`blocked_ex_code_bytes`] bytes.
+pub fn repack_sequential_row(seq_row: &[u8], dim: usize, ex_bits: u8, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), blocked_ex_code_bytes(dim, ex_bits));
+    let block_bytes = EX_DOT_BLOCK_DIMS * ex_bits as usize / 8;
+    let mut block_values = [0u8; 64];
+    for (block, out) in out.chunks_exact_mut(block_bytes).enumerate() {
+        block_values.fill(0);
+        let base = block * EX_DOT_BLOCK_DIMS;
+        let count = EX_DOT_BLOCK_DIMS.min(dim.saturating_sub(base));
+        for (i, value) in block_values[..count].iter_mut().enumerate() {
             *value = packed_ex_code_value(seq_row, base + i, ex_bits);
         }
-        plane_pack_group(ex_bits, &group_values, out);
+        pack_block(ex_bits, &block_values, out);
     }
 }
 
-/// Unpack one code group into per-dim values in kernel order (the order
-/// [`build_ex_query_into`] permutes the query into). Reference implementation
-/// for the SIMD unpackers; also the scalar fallback.
+/// Unpack one code group into per-dim values (natural dim order). Reference
+/// implementation for the SIMD unpackers; also the scalar fallback.
 fn unpack_group(ex_bits: u8, group_codes: &[u8], out: &mut [u8; 64]) {
     debug_assert_eq!(group_codes.len(), group_bytes(ex_bits));
     match ex_bits {
@@ -276,12 +278,12 @@ fn unpack_group(ex_bits: u8, group_codes: &[u8], out: &mut [u8; 64]) {
     }
 }
 
-/// `sum_d ex_query[d] * code[d]` for one row of kernel-layout codes.
+/// `sum_d query[d] * code[d]` for one row of blocked-layout codes.
 ///
-/// `ex_query` must be the kernel-order query from [`build_ex_query_into`];
-/// `codes` is the row slice (sequential layout for `ex_bits` ∈ {1, 2, 4, 8},
-/// bit-plane layout otherwise). Rows shorter than the padded query length are
-/// treated as zero-padded.
+/// The query must cover a whole number of 64-dim blocks (the rotated query
+/// as-is for aligned dims, otherwise zero-padded via [`pad_query_into`]);
+/// `codes` is the blocked row slice. Rows shorter than the padded query
+/// length are treated as zero-padded.
 pub type ExDotFn = fn(&[f32], &[u8]) -> f32;
 
 /// Resolve the dot kernel for `ex_bits` once; the result can be cached by the
@@ -330,7 +332,7 @@ fn scalar_kernel(ex_bits: u8) -> ExDotFn {
 fn ex_dot_scalar<const EX_BITS: u8>(ex_query: &[f32], codes: &[u8]) -> f32 {
     let group_dims = group_dims(EX_BITS);
     let bytes_per_group = group_bytes(EX_BITS);
-    debug_assert_eq!(ex_query.len() % EX_DOT_GROUP_DIMS, 0);
+    debug_assert_eq!(ex_query.len() % EX_DOT_BLOCK_DIMS, 0);
     debug_assert!(codes.len() * u8::BITS as usize <= ex_query.len() * EX_BITS as usize);
 
     let mut sum = 0.0f32;
@@ -559,7 +561,7 @@ mod x86 {
             unsafe fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
                 const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
                 const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
-                debug_assert_eq!(ex_query.len() % super::EX_DOT_GROUP_DIMS, 0);
+                debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
                 debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
 
                 let groups = ex_query.len() / GROUP_DIMS;
@@ -613,7 +615,7 @@ mod x86 {
             unsafe fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
                 const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
                 const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
-                debug_assert_eq!(ex_query.len() % super::EX_DOT_GROUP_DIMS, 0);
+                debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
                 debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
 
                 let groups = ex_query.len() / GROUP_DIMS;
@@ -835,7 +837,7 @@ mod neon {
             unsafe fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
                 const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
                 const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
-                debug_assert_eq!(ex_query.len() % super::EX_DOT_GROUP_DIMS, 0);
+                debug_assert_eq!(ex_query.len() % super::EX_DOT_BLOCK_DIMS, 0);
                 debug_assert!(codes.len() * 8 <= ex_query.len() * $ex_bits);
 
                 let groups = ex_query.len() / GROUP_DIMS;
@@ -916,14 +918,10 @@ mod tests {
     }
 
     fn kernel_codes(values: &[u8], dim: usize, ex_bits: u8) -> Vec<u8> {
-        let seq = pack_sequential(values, ex_bits);
-        if needs_plane_repack(ex_bits) {
-            let mut out = vec![0u8; ex_dot_code_bytes(dim, ex_bits)];
-            plane_pack_row(&seq, dim, ex_bits, &mut out);
-            out
-        } else {
-            seq
-        }
+        debug_assert_eq!(values.len(), dim);
+        let mut out = vec![0u8; blocked_ex_code_bytes(dim, ex_bits)];
+        pack_blocked_row(values, ex_bits, &mut out);
+        out
     }
 
     fn available_kernels(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
@@ -968,8 +966,8 @@ mod tests {
             .sum::<f64>();
 
         let codes = kernel_codes(&values, dim, ex_bits);
-        let ex_query = build_ex_query(&query, ex_bits);
-        assert_eq!(ex_query.len() % EX_DOT_GROUP_DIMS, 0);
+        let mut ex_query = vec![0.0; padded_query_len(dim)];
+        pad_query_into(&query, &mut ex_query);
 
         let tolerance = 1e-3 * expected.abs().max(1.0);
         for (name, kernel) in available_kernels(ex_bits) {
@@ -984,21 +982,54 @@ mod tests {
     #[rstest]
     fn test_unpack_group_roundtrip(#[values(1, 2, 3, 4, 5, 6, 7, 8)] ex_bits: u8) {
         let mut rng = SmallRng::seed_from_u64(7 + ex_bits as u64);
-        let dims = group_dims(ex_bits);
         let max_code = ((1u16 << ex_bits) - 1) as u8;
-        let values = (0..dims)
+        let values = (0..EX_DOT_BLOCK_DIMS)
             .map(|_| rng.random_range(0..=max_code))
             .collect::<Vec<_>>();
-        let codes = kernel_codes(&values, dims, ex_bits);
+        let codes = kernel_codes(&values, EX_DOT_BLOCK_DIMS, ex_bits);
 
+        // Unpacking each kernel group must reproduce the values in natural
+        // dim order.
+        let dims = group_dims(ex_bits);
+        let bytes = group_bytes(ex_bits);
         let mut unpacked = [0u8; 64];
-        unpack_group(ex_bits, &codes, &mut unpacked);
-        for dim in 0..dims {
-            assert_eq!(
-                unpacked[kernel_position(dim, ex_bits)],
-                values[dim],
-                "ex_bits={ex_bits} dim={dim}"
+        for group in 0..EX_DOT_BLOCK_DIMS / dims {
+            unpack_group(
+                ex_bits,
+                &codes[group * bytes..(group + 1) * bytes],
+                &mut unpacked,
             );
+            assert_eq!(
+                &unpacked[..dims],
+                &values[group * dims..(group + 1) * dims],
+                "ex_bits={ex_bits} group={group}"
+            );
+        }
+    }
+
+    /// The legacy sequential rows must repack into exactly what the writer
+    /// produces from the unpacked values.
+    #[rstest]
+    fn test_repack_sequential_matches_blocked(
+        #[values(1, 2, 3, 4, 5, 6, 7, 8)] ex_bits: u8,
+        #[values(7, 64, 100, 1536)] dim: usize,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(11 + ex_bits as u64 * 100 + dim as u64);
+        let max_code = ((1u16 << ex_bits) - 1) as u8;
+        let values = (0..dim)
+            .map(|_| rng.random_range(0..=max_code))
+            .collect::<Vec<_>>();
+        let seq = pack_sequential(&values, ex_bits);
+
+        let mut repacked = vec![0u8; blocked_ex_code_bytes(dim, ex_bits)];
+        repack_sequential_row(&seq, dim, ex_bits, &mut repacked);
+        assert_eq!(repacked, kernel_codes(&values, dim, ex_bits));
+
+        // For the widths where the sequential layout is already blocked
+        // (modulo trailing padding), the raw row must be a prefix.
+        if sequential_matches_blocked(ex_bits) {
+            assert_eq!(&repacked[..seq.len()], &seq);
+            assert!(repacked[seq.len()..].iter().all(|&byte| byte == 0));
         }
     }
 
@@ -1022,7 +1053,8 @@ mod tests {
                 .sum::<f64>();
 
             let codes = kernel_codes(&values, dim, ex_bits);
-            let ex_query = build_ex_query(&query, ex_bits);
+            let mut ex_query = vec![0.0; padded_query_len(dim)];
+            pad_query_into(&query, &mut ex_query);
             let tolerance = 1e-3 * expected.abs().max(1.0);
             for (name, kernel) in available_kernels(ex_bits) {
                 let actual = kernel(&ex_query, &codes) as f64;
@@ -1035,13 +1067,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ex_query_pads_with_zeros() {
+    fn test_pad_query_pads_with_zeros() {
         let query = vec![1.0f32; 100];
-        for ex_bits in 1..=8u8 {
-            let ex_query = build_ex_query(&query, ex_bits);
-            assert_eq!(ex_query.len(), 128);
-            let sum = ex_query.iter().sum::<f32>();
-            assert_eq!(sum, 100.0, "ex_bits={ex_bits}");
-        }
+        let mut padded = vec![f32::NAN; padded_query_len(query.len())];
+        pad_query_into(&query, &mut padded);
+        assert_eq!(padded.len(), 128);
+        assert_eq!(&padded[..100], &query[..]);
+        assert!(padded[100..].iter().all(|&value| value == 0.0));
     }
 }

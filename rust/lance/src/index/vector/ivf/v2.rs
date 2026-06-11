@@ -38,9 +38,9 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
-use lance_index::vector::bq::ex_dot::ex_query_len;
+use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
+use lance_index::vector::bq::rabit_ex_bits;
 use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
-use lance_index::vector::bq::{rabit_ex_bits, rabit_ex_code_bytes};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
@@ -154,16 +154,21 @@ fn rotated_partition_centroid_slice(
 }
 
 /// `f32` scratch needed for the ex-bit query state: the quantized-table input
-/// for FastScan-supported widths plus the kernel-order query for the exact
-/// rerank path.
+/// for FastScan-supported widths, plus a zero-padded query copy when the
+/// rotated dim is not a multiple of the 64-dim kernel block.
 fn rabit_ex_scratch_len(dim: usize, num_bits: u8) -> usize {
+    let padded_query = if dim.is_multiple_of(64) {
+        0
+    } else {
+        padded_query_len(dim)
+    };
     rabit_ex_bits(num_bits)
         .map(|ex_bits| match ex_bits {
             0 => 0,
-            2 | 4 | 8 => dim * (1usize << usize::from(ex_bits)) + ex_query_len(dim),
-            _ => ex_query_len(dim),
+            2 | 4 | 8 => dim * (1usize << usize::from(ex_bits)) + padded_query,
+            _ => padded_query,
         })
-        .unwrap_or(dim * 256 + ex_query_len(dim))
+        .unwrap_or(dim * 256 + padded_query)
 }
 
 fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
@@ -171,7 +176,7 @@ fn rabit_u8_scratch_len(dim: usize, num_bits: u8) -> usize {
     let ex_dist_table_len = rabit_ex_bits(num_bits)
         .ok()
         .and_then(|ex_bits| match ex_bits {
-            2 | 4 | 8 => rabit_ex_code_bytes(dim, ex_bits).ok(),
+            2 | 4 | 8 => Some(blocked_ex_code_bytes(dim, ex_bits)),
             _ => None,
         })
         .map(|ex_code_len| ex_code_len * 2 * SEGMENT_NUM_CODES)
@@ -1910,9 +1915,8 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
         RQBuildParams, RQRotationType,
-        ex_dot::ex_query_len,
-        rabit_ex_code_bytes,
-        storage::{RABIT_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
+        ex_dot::{blocked_ex_code_bytes, padded_query_len},
+        storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
     use lance_index::vector::storage::VectorStore;
@@ -1988,14 +1992,17 @@ mod tests {
 
     #[test]
     fn test_rabit_ex_scratch_len_uses_num_bits() {
+        // 960 is block-aligned, so no padded query copy is needed.
         let dim = 960;
-        let ex_query = ex_query_len(dim);
-
         assert_eq!(super::rabit_ex_scratch_len(dim, 1), 0);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 3), dim * 4 + ex_query);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 5), dim * 16 + ex_query);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 7), ex_query);
-        assert_eq!(super::rabit_ex_scratch_len(dim, 9), dim * 256 + ex_query);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 3), dim * 4);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 5), dim * 16);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 7), 0);
+        assert_eq!(super::rabit_ex_scratch_len(dim, 9), dim * 256);
+
+        // Unaligned dims add one padded query copy.
+        let dim = 968;
+        assert_eq!(super::rabit_ex_scratch_len(dim, 7), padded_query_len(dim));
     }
 
     #[test]
@@ -2017,10 +2024,7 @@ mod tests {
         let capacity = super::rabit_query_scratch_capacity(dim, max_partition_len, 5);
 
         assert_eq!(capacity.distances, max_partition_len);
-        assert_eq!(
-            capacity.query_f32,
-            dim + dim * 4 + dim * 16 + ex_query_len(dim)
-        );
+        assert_eq!(capacity.query_f32, dim + dim * 4 + dim * 16);
         assert_eq!(capacity.u16, max_partition_len);
         assert_eq!(capacity.u8, dim * 16);
         assert_eq!(capacity.u32, 0);
@@ -4446,12 +4450,12 @@ mod tests {
 
         let reader = open_rq_aux_reader(&dataset, scheduler, &index_uuid).await;
         let schema = reader.schema();
-        let ex_field = schema.field(RABIT_EX_CODE_COLUMN).unwrap();
+        let ex_field = schema.field(RABIT_BLOCKED_EX_CODE_COLUMN).unwrap();
         let DataType::FixedSizeList(_, ex_code_bytes) = ex_field.data_type() else {
             panic!("RQ ex-code field should be FixedSizeList");
         };
         let expected_ex_code_bytes =
-            rabit_ex_code_bytes(rq_meta.rotated_dim(), num_bits - 1).unwrap() as i32;
+            blocked_ex_code_bytes(rq_meta.rotated_dim(), num_bits - 1) as i32;
         assert_eq!(ex_code_bytes, expected_ex_code_bytes);
         assert!(schema.field(EX_ADD_FACTORS_COLUMN).is_some());
         assert!(schema.field(EX_SCALE_FACTORS_COLUMN).is_some());

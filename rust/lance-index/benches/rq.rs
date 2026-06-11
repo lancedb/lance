@@ -18,8 +18,7 @@ use lance_datagen::{BatchGeneratorBuilder, RowCount};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{
-    build_ex_query, ex_dot_code_bytes, ex_dot_kernel, needs_plane_repack, packed_ex_code_value,
-    plane_pack_row,
+    blocked_ex_code_bytes, ex_dot_kernel, pack_blocked_row, packed_ex_code_value,
 };
 use lance_index::vector::bq::storage::*;
 use lance_index::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
@@ -154,11 +153,19 @@ fn ex_dot_kernels_for_dim(c: &mut Criterion, ex_dim: usize) {
 
     for ex_bits in 1..=8u8 {
         let max_code = ((1u16 << ex_bits) - 1) as u8;
+        let values = (0..NUM_ROWS * ex_dim)
+            .map(|_| rng.random_range(0..=max_code))
+            .collect::<Vec<_>>();
+
+        // The gather baseline reads the legacy sequential layout it shipped
+        // with; the kernel reads the blocked layout.
         let seq_code_len = (ex_dim * ex_bits as usize).div_ceil(8);
         let mut seq_codes = vec![0u8; NUM_ROWS * seq_code_len];
-        for row in seq_codes.chunks_exact_mut(seq_code_len) {
-            for dim in 0..ex_dim {
-                let value = rng.random_range(0..=max_code);
+        for (row, row_values) in seq_codes
+            .chunks_exact_mut(seq_code_len)
+            .zip(values.chunks_exact(ex_dim))
+        {
+            for (dim, &value) in row_values.iter().enumerate() {
                 let bit_offset = dim * ex_bits as usize;
                 let bits = (value as u16) << (bit_offset % 8);
                 row[bit_offset / 8] |= bits as u8;
@@ -168,21 +175,17 @@ fn ex_dot_kernels_for_dim(c: &mut Criterion, ex_dim: usize) {
             }
         }
 
-        let kernel_code_len = ex_dot_code_bytes(ex_dim, ex_bits);
-        let kernel_codes = if needs_plane_repack(ex_bits) {
-            let mut out = vec![0u8; NUM_ROWS * kernel_code_len];
-            for (seq_row, plane_row) in seq_codes
-                .chunks_exact(seq_code_len)
-                .zip(out.chunks_exact_mut(kernel_code_len))
-            {
-                plane_pack_row(seq_row, ex_dim, ex_bits, plane_row);
-            }
-            out
-        } else {
-            seq_codes.clone()
-        };
+        let kernel_code_len = blocked_ex_code_bytes(ex_dim, ex_bits);
+        let mut kernel_codes = vec![0u8; NUM_ROWS * kernel_code_len];
+        for (row, row_values) in kernel_codes
+            .chunks_exact_mut(kernel_code_len)
+            .zip(values.chunks_exact(ex_dim))
+        {
+            pack_blocked_row(row_values, ex_bits, row);
+        }
 
-        let ex_query = build_ex_query(&query, ex_bits);
+        // ex_dim is block-aligned here, so the kernels read the query as-is.
+        let ex_query = &query;
         let kernel = ex_dot_kernel(ex_bits);
         c.bench_function(
             format!("RQ ex_dot kernel: ex_bits={ex_bits}, DIM={ex_dim}, rows={NUM_ROWS}").as_str(),
@@ -190,7 +193,7 @@ fn ex_dot_kernels_for_dim(c: &mut Criterion, ex_dim: usize) {
                 b.iter(|| {
                     let mut sum = 0.0f32;
                     for row in kernel_codes.chunks_exact(kernel_code_len) {
-                        sum += kernel(&ex_query, row);
+                        sum += kernel(ex_query, row);
                     }
                     black_box(sum)
                 })
@@ -220,9 +223,141 @@ fn ex_dot_kernels_for_dim(c: &mut Criterion, ex_dim: usize) {
     }
 }
 
+/// Storage load cost per format: blocked-format ex codes are aliased as-is,
+/// legacy sequential ex codes are repacked row by row.
+fn ex_code_storage_load(c: &mut Criterion) {
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, UInt8Array, UInt64Array};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_index::vector::bq::ex_dot::repack_sequential_row;
+    use lance_index::vector::bq::rabit_ex_code_bytes;
+    use lance_index::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
+    use std::sync::Arc;
+
+    const LOAD_DIM: usize = 1536;
+    const LOAD_ROWS: usize = 8192;
+    const NUM_BITS: u8 = 4; // ex_bits=3, a bit-plane width
+
+    let ex_bits = NUM_BITS - 1;
+    let mut rng = SmallRng::seed_from_u64(7);
+    let metadata = RabitQuantizationMetadata {
+        rotate_mat: None,
+        rotate_mat_position: None,
+        fast_rotation_signs: None,
+        rotation_type: RQRotationType::Fast,
+        code_dim: LOAD_DIM as u32,
+        num_bits: NUM_BITS,
+        packed: true,
+        query_estimator: RabitQueryEstimator::RawQuery,
+    };
+    let code_len = LOAD_DIM / 8;
+    let binary_codes = (0..LOAD_ROWS * code_len)
+        .map(|_| rng.random_range(0..=u8::MAX))
+        .collect::<Vec<_>>();
+    let seq_code_len = rabit_ex_code_bytes(LOAD_DIM, ex_bits).unwrap();
+    let seq_codes = (0..LOAD_ROWS * seq_code_len)
+        .map(|_| rng.random_range(0..=u8::MAX))
+        .collect::<Vec<_>>();
+    let blocked_code_len = blocked_ex_code_bytes(LOAD_DIM, ex_bits);
+    let mut blocked_codes = vec![0u8; LOAD_ROWS * blocked_code_len];
+    for (seq_row, blocked_row) in seq_codes
+        .chunks_exact(seq_code_len)
+        .zip(blocked_codes.chunks_exact_mut(blocked_code_len))
+    {
+        repack_sequential_row(seq_row, LOAD_DIM, ex_bits, blocked_row);
+    }
+
+    let make_batch = |ex_column: &str, ex_values: Vec<u8>, ex_code_len: usize| {
+        arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from_iter_values(0..LOAD_ROWS as u64)) as ArrayRef,
+            ),
+            (
+                RABIT_CODE_COLUMN,
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        UInt8Array::from(binary_codes.clone()),
+                        code_len as i32,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+            (
+                ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0f32; LOAD_ROWS])) as ArrayRef,
+            ),
+            (
+                SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0f32; LOAD_ROWS])) as ArrayRef,
+            ),
+            (
+                ex_column,
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        UInt8Array::from(ex_values),
+                        ex_code_len as i32,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+            (
+                EX_ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0f32; LOAD_ROWS])) as ArrayRef,
+            ),
+            (
+                EX_SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0f32; LOAD_ROWS])) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+
+    let blocked_batch = make_batch(
+        RABIT_BLOCKED_EX_CODE_COLUMN,
+        blocked_codes,
+        blocked_code_len,
+    );
+    c.bench_function(
+        format!("RQ storage load (blocked ex codes): num_bits={NUM_BITS}, DIM={LOAD_DIM}, rows={LOAD_ROWS}")
+            .as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    RabitQuantizationStorage::try_from_batch(
+                        blocked_batch.clone(),
+                        &metadata,
+                        DistanceType::L2,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            })
+        },
+    );
+
+    let legacy_batch = make_batch(RABIT_EX_CODE_COLUMN, seq_codes, seq_code_len);
+    c.bench_function(
+        format!("RQ storage load (legacy ex codes): num_bits={NUM_BITS}, DIM={LOAD_DIM}, rows={LOAD_ROWS}")
+            .as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(
+                    RabitQuantizationStorage::try_from_batch(
+                        legacy_batch.clone(),
+                        &metadata,
+                        DistanceType::L2,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            })
+        },
+    );
+}
+
 criterion_group!(
     name=benches;
     config = Criterion::default().measurement_time(Duration::from_secs(10));
-    targets = construct_dist_table, compute_distances, ex_dot_kernels);
+    targets = construct_dist_table, compute_distances, ex_dot_kernels, ex_code_storage_load);
 
 criterion_main!(benches);
