@@ -100,6 +100,11 @@ rstest.workspace = true
 lance-table.workspace = true
 lance-arrow = { workspace = true }
 lance = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[[example]]
+name = "manifest_bench"
+path = "examples/manifest_bench.rs"
 
 [lints]
 workspace = true
