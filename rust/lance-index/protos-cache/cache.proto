@@ -122,6 +122,12 @@ enum RotationType {
   ROTATION_TYPE_FAST = 1;
 }
 
+// Estimator a RabitQ quantizer uses at query time.
+enum RabitQueryEstimator {
+  RABIT_QUERY_ESTIMATOR_RESIDUAL_QUERY = 0;
+  RABIT_QUERY_ESTIMATOR_RAW_QUERY = 1;
+}
+
 // Product quantizer. Sections: sub-index IPC, codebook IPC, storage IPC.
 message PqPartitionHeader {
   DistanceType distance_type = 1;
@@ -175,4 +181,6 @@ message RabitPartitionHeader {
   // Fast-rotation sign vector; present only when rotation_type ==
   // ROTATION_TYPE_FAST (the Matrix case stores its rotation as an IPC section).
   optional bytes fast_rotation_signs = 5;
+  // Estimator the RabitQ storage uses at query time (residual vs raw query).
+  RabitQueryEstimator query_estimator = 6;
 }

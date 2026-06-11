@@ -29,7 +29,8 @@ use lance_linalg::distance::DistanceType;
 
 use lance_index::cache_pb::{
     DistanceType as PbDistanceType, FlatPartitionHeader, PqPartitionHeader, RabitPartitionHeader,
-    RotationType as PbRotationType, SqPartitionHeader,
+    RabitQueryEstimator as PbRabitQueryEstimator, RotationType as PbRotationType,
+    SqPartitionHeader,
 };
 
 use super::v2::PartitionEntry;
@@ -142,6 +143,20 @@ fn proto_to_rotation_type(rt: PbRotationType) -> RQRotationType {
     match rt {
         PbRotationType::Matrix => RQRotationType::Matrix,
         PbRotationType::Fast => RQRotationType::Fast,
+    }
+}
+
+fn query_estimator_to_proto(qe: RabitQueryEstimator) -> PbRabitQueryEstimator {
+    match qe {
+        RabitQueryEstimator::ResidualQuery => PbRabitQueryEstimator::ResidualQuery,
+        RabitQueryEstimator::RawQuery => PbRabitQueryEstimator::RawQuery,
+    }
+}
+
+fn proto_to_query_estimator(qe: PbRabitQueryEstimator) -> RabitQueryEstimator {
+    match qe {
+        PbRabitQueryEstimator::ResidualQuery => RabitQueryEstimator::ResidualQuery,
+        PbRabitQueryEstimator::RawQuery => RabitQueryEstimator::RawQuery,
     }
 }
 
@@ -403,6 +418,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             num_bits: metadata.num_bits as u32,
             code_dim: metadata.code_dim,
             rotation_type: rotation_type_to_proto(metadata.rotation_type) as i32,
+            query_estimator: query_estimator_to_proto(metadata.query_estimator) as i32,
             fast_rotation_signs: metadata.fast_rotation_signs.clone(),
         };
 
@@ -442,6 +458,8 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
         let storage_batch = read_single_storage_batch(r)?;
 
         let index = S::load(sub_index_batch)?;
+        // Read the proto enum accessor before moving fields out of `header`.
+        let query_estimator = proto_to_query_estimator(header.query_estimator());
         let metadata = RabitQuantizationMetadata {
             rotate_mat,
             rotate_mat_position: None,
@@ -451,7 +469,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             num_bits: header.num_bits as u8,
             // The storage batch already has packed codes; skip re-packing.
             packed: true,
-            query_estimator: header.query_estimator,
+            query_estimator,
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(
             storage_batch,
@@ -896,7 +914,13 @@ mod tests {
         code_dim: usize,
         distance_type: DistanceType,
     ) -> <RabitQuantizer as Quantization>::Storage {
-        make_rabit_storage(num_rows, code_dim, distance_type, RQRotationType::Fast)
+        make_rabit_storage(
+            num_rows,
+            code_dim,
+            distance_type,
+            RQRotationType::Fast,
+            RabitQueryEstimator::ResidualQuery,
+        )
     }
 
     fn make_rabit_storage(
@@ -904,6 +928,7 @@ mod tests {
         code_dim: usize,
         distance_type: DistanceType,
         rotation_type: RQRotationType,
+        query_estimator: RabitQueryEstimator,
     ) -> <RabitQuantizer as Quantization>::Storage {
         use lance_arrow::FixedSizeListArrayExt;
 
@@ -920,7 +945,8 @@ mod tests {
             .as_fixed_size_list()
             .clone();
 
-        let metadata = quantizer.metadata(None);
+        let mut metadata = quantizer.metadata(None);
+        metadata.query_estimator = query_estimator;
         let batch = RecordBatch::try_from_iter(vec![
             (
                 lance_core::ROW_ID,
@@ -1002,26 +1028,59 @@ mod tests {
     fn test_rabitq_distance_types() {
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             let storage = make_rabit_storage_fast(10, 32, dt);
-            let expected_distance_type = if dt == DistanceType::Cosine {
-                DistanceType::L2
-            } else {
-                dt
-            };
             let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
                 index: FlatIndex::default(),
                 storage,
             };
             let bytes = ser_body(&entry);
             let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
-            assert_eq!(restored.storage.distance_type(), expected_distance_type);
+            // The codec round-trips the distance type faithfully.
+            assert_eq!(
+                restored.storage.distance_type(),
+                entry.storage.distance_type()
+            );
         }
     }
 
     /// Matrix rotation writes an extra `rotate_mat` IPC section between the
     /// sub-index and storage sections; exercise that the codec preserves it.
     #[test]
+    fn test_roundtrip_rabitq_raw_query_estimator() {
+        // The query estimator is a non-default value here; it must survive the
+        // round trip so raw-query search keeps working after a cache reload.
+        let storage = make_rabit_storage(
+            40,
+            32,
+            DistanceType::L2,
+            RQRotationType::Fast,
+            RabitQueryEstimator::RawQuery,
+        );
+        assert_eq!(
+            storage.metadata().query_estimator,
+            RabitQueryEstimator::RawQuery
+        );
+        let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
+            index: FlatIndex::default(),
+            storage,
+        };
+
+        let bytes = ser_body(&entry);
+        let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
+        assert_eq!(
+            restored.storage.metadata().query_estimator,
+            RabitQueryEstimator::RawQuery
+        );
+    }
+
+    #[test]
     fn test_roundtrip_flat_rabitq_matrix() {
-        let storage = make_rabit_storage(40, 32, DistanceType::L2, RQRotationType::Matrix);
+        let storage = make_rabit_storage(
+            40,
+            32,
+            DistanceType::L2,
+            RQRotationType::Matrix,
+            RabitQueryEstimator::ResidualQuery,
+        );
         let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
             index: FlatIndex::default(),
             storage,
