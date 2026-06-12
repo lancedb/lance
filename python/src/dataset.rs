@@ -1963,6 +1963,7 @@ impl Dataset {
     }
 
     /// Explain cleanup old versions from the dataset without deleting files
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, include_files = false, max_files = 1000))]
     fn explain_cleanup_old_versions(
         &self,
