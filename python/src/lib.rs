@@ -22,6 +22,9 @@
 // Remove after upgrading pyo3 to 0.23
 #![allow(clippy::useless_conversion)]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;
