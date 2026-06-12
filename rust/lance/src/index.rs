@@ -1891,9 +1891,18 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            // Re-open the FRI (cheap; cached) and thread it in: the cached state
+            // can't carry it, so without this the reconstruct path skips
+            // auto-remap and serves stale addresses after deferred compaction.
+            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
-                .reconstruct(object_store, self.metadata_cache.as_ref(), partition_cache)
+                .reconstruct(
+                    object_store,
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
                 .await;
         }
 
@@ -7652,6 +7661,134 @@ mod tests {
 
             // Validate files are populated after remap
             assert_all_indices_have_files(&dataset, "after remap").await;
+        }
+    }
+
+    /// Regression test: vector search must return remapped row addresses
+    /// during the FRI window (after a deferred-remap compaction, before any
+    /// physical remap). Covers two historical bugs:
+    /// 1. `IvfIndexState::reconstruct` (index state-cache hit) dropped the
+    ///    frag reuse index, so partitions loaded through reconstruction
+    ///    served stale pre-compaction addresses.
+    /// 2. `ProductQuantizationStorage::new` refreshed the remapped batch and
+    ///    codes but kept the pre-remap `row_ids` binding, so PQ searches
+    ///    returned stale addresses even on a cold open.
+    /// Searching twice on the same handle exercises both the cold-open and
+    /// the state-cache reconstruct paths.
+    #[tokio::test]
+    async fn test_vector_search_during_fri_window() {
+        use arrow_array::types::UInt64Type;
+        use futures::TryStreamExt;
+
+        async fn knn_ids(dataset: &Dataset) -> Vec<u64> {
+            let q = Float32Array::from(vec![0.5f32; 32]);
+            let batches: Vec<RecordBatch> = dataset
+                .scan()
+                .nearest("vec_col", &q, 10)
+                .unwrap()
+                .with_row_id()
+                .project(&["vec_col"])
+                .unwrap()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let mut ids: Vec<u64> = batches
+                .iter()
+                .flat_map(|b| {
+                    b["_rowid"]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+
+        for use_pq in [false, true] {
+            let test_dir = TempStrDir::default();
+            let data = gen_batch()
+                .col(
+                    "vec_col",
+                    array::rand_vec::<Float32Type>(Dimension::from(32)),
+                )
+                .into_reader_rows(RowCount::from(1000), BatchCount::from(1));
+            let mut dataset = Dataset::write(
+                data,
+                test_dir.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let params = if use_pq {
+                VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, 50)
+            } else {
+                VectorIndexParams::ivf_flat(4, MetricType::L2)
+            };
+            dataset
+                .create_index(
+                    &["vec_col"],
+                    IndexType::Vector,
+                    Some("vec_idx".to_string()),
+                    &params,
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+            let before = knn_ids(&dataset).await;
+            assert_eq!(before.len(), 10);
+
+            let mut dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 1000,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+            // Old fragments are gone post-compaction, so any stale address fails the take.
+            let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+            let expected: Vec<u64> = {
+                let fri = dataset
+                    .open_frag_reuse_index(&NoOpMetricsCollector)
+                    .await
+                    .unwrap()
+                    .expect("deferred compaction must write a frag reuse index");
+                let mut ids: Vec<u64> = before
+                    .iter()
+                    .filter_map(|id| fri.remap_row_id(*id))
+                    .collect();
+                ids.sort_unstable();
+                ids
+            };
+            // Cold open path (PQ row_ids bug).
+            let first = knn_ids(&dataset).await;
+            assert_eq!(
+                first, expected,
+                "use_pq={use_pq}: first search during FRI window must return remapped addresses"
+            );
+            // State-cache reconstruct path (dropped-FRI bug).
+            let second = knn_ids(&dataset).await;
+            assert_eq!(
+                second, expected,
+                "use_pq={use_pq}: search through the reconstructed index must return remapped addresses"
+            );
         }
     }
 
