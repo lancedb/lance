@@ -1353,7 +1353,10 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def has_stable_row_ids(self) -> bool:
         """
-        Whether this dataset has stable row IDs enabled
+        Whether this dataset has stable row IDs enabled.
+
+        This is based on the dataset manifest feature flag and does not depend on
+        whether the current version has any fragments.
         """
         return self._ds.has_stable_row_ids
 

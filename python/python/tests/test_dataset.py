@@ -424,16 +424,27 @@ def test_enable_stable_row_ids(tmp_path: Path):
     assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
-def test_has_stable_row_ids_property(tmp_path: Path):
-    table = pa.Table.from_pylist([{"a": 1}, {"a": 2}])
+@pytest.mark.parametrize("enable_stable_row_ids", [True, False])
+@pytest.mark.parametrize(
+    "rows",
+    [[{"a": 1}, {"a": 2}], []],
+    ids=["non_empty", "empty"],
+)
+def test_has_stable_row_ids_property(tmp_path: Path, enable_stable_row_ids: bool, rows):
+    schema = pa.schema([pa.field("a", pa.int64())])
+    table = pa.Table.from_pylist(rows, schema=schema)
 
-    stable_path = tmp_path / "stable"
-    lance.write_dataset(table, stable_path, enable_stable_row_ids=True)
-    assert lance.dataset(stable_path).has_stable_row_ids is True
+    path = tmp_path / f"stable_row_ids_{enable_stable_row_ids}_{len(rows)}"
+    lance.write_dataset(
+        table,
+        path,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    ds = lance.dataset(path)
 
-    non_stable_path = tmp_path / "non_stable"
-    lance.write_dataset(table, non_stable_path, enable_stable_row_ids=False)
-    assert lance.dataset(non_stable_path).has_stable_row_ids is False
+    assert ds.count_rows() == len(rows)
+    assert len(ds.get_fragments()) == (0 if len(rows) == 0 else 1)
+    assert ds.has_stable_row_ids is enable_stable_row_ids
 
 
 def _list_manifests(versions_dir):
