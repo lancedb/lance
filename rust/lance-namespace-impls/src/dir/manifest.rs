@@ -1857,8 +1857,9 @@ impl ManifestNamespace {
 
     /// Validate that this build can write the current `__manifest` before a
     /// mutating operation performs any side effect (e.g. writing table data), so
-    /// a refused write leaves nothing orphaned behind. The eventual commit
-    /// re-checks, so a concurrent upgrade in between is still caught.
+    /// a refused write leaves nothing orphaned behind. The eventual
+    /// `rewrite_manifest` commit re-checks `ensure_writable` on each retry, so a
+    /// concurrent upgrade in between is still caught.
     async fn ensure_manifest_writable(&self) -> Result<()> {
         let dataset_guard = self.manifest_dataset.get().await?;
         ensure_writable(dataset_guard.metadata())
@@ -3928,6 +3929,32 @@ mod tests {
             entries_before,
             dir_entry_names(temp_path),
             "a refused create_table must not create an orphaned table directory"
+        );
+
+        // Mutations that go straight through rewrite_manifest (no early
+        // create_table check) must also be refused: an insert (create_namespace)
+        // and a delete (drop_table). This proves the writer check is enforced at
+        // the single copy-on-write chokepoint, not just on the create_table path.
+        let mut create_ns = CreateNamespaceRequest::new();
+        create_ns.id = Some(vec!["ns1".to_string()]);
+        let err = ns
+            .create_namespace(create_ns)
+            .await
+            .expect_err("create_namespace through an unknown writer flag should fail");
+        assert!(
+            err.to_string().to_lowercase().contains("upgrade"),
+            "expected an upgrade error, got: {err}"
+        );
+
+        let mut drop_request = DropTableRequest::new();
+        drop_request.id = Some(vec!["t1".to_string()]);
+        let err = ns
+            .drop_table(drop_request)
+            .await
+            .expect_err("drop_table through an unknown writer flag should fail");
+        assert!(
+            err.to_string().to_lowercase().contains("upgrade"),
+            "expected an upgrade error, got: {err}"
         );
     }
 
