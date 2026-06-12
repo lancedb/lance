@@ -68,7 +68,8 @@ public class CleanupTest {
 
       try (Dataset dataset = testDataset.write(3, 10)) {
         CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
-        CleanupExplanation explanation = dataset.explainCleanupWithPolicy(policy);
+        CleanupOperation cleanup = dataset.cleanup(policy);
+        CleanupExplanation explanation = cleanup.explain();
 
         assertEquals(2L, explanation.getStats().getOldVersions());
         assertEquals(2L, explanation.getStats().getTransactionFilesRemoved());
@@ -80,7 +81,7 @@ public class CleanupTest {
         List<Version> versions = dataset.listVersions();
         assertEquals(4, versions.size());
 
-        RemovalStats stats = dataset.cleanupWithPolicy(policy);
+        RemovalStats stats = cleanup.execute();
         assertEquals(explanation.getStats().getOldVersions(), stats.getOldVersions());
       }
     }
