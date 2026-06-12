@@ -34,6 +34,10 @@ pub struct LsmScanPlanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Over-fetch multiple for the per-source limit pushdown: block-listed
+    /// sources scan `(offset + limit) * factor` rows so cross-gen dedup drops
+    /// still leave enough live rows. Clamped to `>= 1.0`.
+    overfetch_factor: f64,
 }
 
 impl LsmScanPlanner {
@@ -49,6 +53,7 @@ impl LsmScanPlanner {
             base_schema,
             session: None,
             flushed_cache: None,
+            overfetch_factor: 1.0,
         }
     }
 
@@ -63,6 +68,13 @@ impl LsmScanPlanner {
     /// queries against the same generation a pure `Arc::clone`.
     pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Set the over-fetch multiple for the per-source limit pushdown
+    /// (see the field docs). Clamped to `>= 1.0` at use.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = factor;
         self
     }
 
@@ -130,21 +142,57 @@ impl LsmScanPlanner {
         // cross-gen block-list, not from output ordering.
         let sources: Vec<_> = sources.into_iter().rev().collect();
 
+        // Per-source limit pushdown: an unordered LIMIT needs only
+        // `offset + limit` live rows from EACH source to fill the global
+        // limit after dedup (any-N semantics), so cap every on-disk source
+        // instead of scanning whole generations and trimming above the
+        // union. Block-listed sources over-fetch by `overfetch_factor` so
+        // cross-gen dedup drops still leave `n_needed` live rows; the
+        // PkHashFilter warns when that was not enough. The active memtable
+        // is in-memory and within-gen append duplicates are resolved by its
+        // own dedup, so it is never capped here.
+        let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
+        let overfetch = self.overfetch_factor.max(1.0);
+
         let mut source_plans = Vec::new();
         for source in sources {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            let scan = self.build_source_scan(&source, projection, filter).await?;
+            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+            let blocked = block_lists
+                .get(&(source.shard_id(), source.generation()))
+                .cloned();
+            let fetch = match (n_needed, is_active) {
+                (Some(n), false) => Some(if blocked.is_some() {
+                    ((n as f64) * overfetch).ceil() as usize
+                } else {
+                    n
+                }),
+                _ => None,
+            };
+            let scan = self
+                .build_source_scan(&source, projection, filter, fetch)
+                .await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
-            // `k = 0`: there is no top-k, so the under-fetch warning never fires.
-            let scan = match block_lists.get(&(source.shard_id(), source.generation())) {
+            // With a limit, `k = n_needed` arms the under-fetch warning; with
+            // no limit `k = 0` keeps it silent.
+            let scan = match blocked {
                 Some(set) => Arc::new(PkHashFilterExec::new(
                     scan,
                     self.pk_columns.clone(),
-                    set.clone(),
-                    0,
+                    set,
+                    n_needed.unwrap_or(0),
                 )) as Arc<dyn ExecutionPlan>,
                 None => scan,
+            };
+
+            // Post-block-list cap: each source contributes at most `n_needed`
+            // live rows toward the global limit.
+            let scan: Arc<dyn ExecutionPlan> = match n_needed {
+                Some(n) if !is_active => Arc::new(
+                    datafusion::physical_plan::limit::LocalLimitExec::new(scan, n),
+                ),
+                _ => scan,
             };
 
             // When `_rowaddr` is surfaced, NULL it for non-base arms: only base
@@ -229,6 +277,7 @@ impl LsmScanPlanner {
         source: &LsmDataSource,
         projection: Option<&[String]>,
         filter: Option<&Expr>,
+        fetch: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -247,6 +296,11 @@ impl LsmScanPlanner {
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
+                // Per-source limit pushdown (post-filter rows): bounds the
+                // physical scan instead of trimming above the union.
+                if let Some(fetch) = fetch {
+                    scanner.limit(Some(fetch as i64), None)?;
+                }
 
                 scanner.create_plan().await
             }
@@ -263,6 +317,12 @@ impl LsmScanPlanner {
 
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
+                }
+                // Per-source limit pushdown: flushed generations are
+                // within-gen live (dedup-on-flush deletion vectors), so any
+                // `fetch` post-filter rows are valid contributions.
+                if let Some(fetch) = fetch {
+                    scanner.limit(Some(fetch as i64), None)?;
                 }
 
                 scanner.create_plan().await
