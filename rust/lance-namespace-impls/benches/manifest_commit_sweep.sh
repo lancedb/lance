@@ -18,7 +18,7 @@
 #
 # Env knobs (defaults match the requested panel):
 #   SIZES, CONCURRENCY, INLINE_VARIANTS, CONT_OPS, CONC_DURATION_SECS,
-#   AWS_REGION, OUT_DIR, BIN
+#   MANIFEST_SHARD_COUNT, AWS_REGION, OUT_DIR, BIN
 #
 # Resilient by design: a single failed run is logged and skipped rather than aborting
 # the sweep, and re-running fills the gaps (completed runs are detected and skipped).
@@ -41,7 +41,14 @@ CONCURRENCY=(${CONCURRENCY:-10 20 50 100 120 150 200})
 INLINE_VARIANTS=(${INLINE_VARIANTS:-true false})
 CONT_OPS="${CONT_OPS:-100}"
 CONC_DURATION_SECS="${CONC_DURATION_SECS:-30}"
+MANIFEST_SHARD_COUNT="${MANIFEST_SHARD_COUNT:-0}"
 STORAGE_OPT=(--storage-option "aws_region=${AWS_REGION}")
+SHARD_ARGS=()
+SHARD_TAG=""
+if [[ "$MANIFEST_SHARD_COUNT" -gt 0 ]]; then
+  SHARD_ARGS=(--manifest-shard-count "$MANIFEST_SHARD_COUNT")
+  SHARD_TAG="_shards_${MANIFEST_SHARD_COUNT}"
+fi
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$PROGRESS"; }
 
@@ -66,17 +73,21 @@ clear_stragglers() { pkill -f 'examples/manifest_bench worker' 2>/dev/null || tr
 
 for inline in "${INLINE_VARIANTS[@]}"; do
   for rows in "${SIZES[@]}"; do
-    golden="${S3_BASE}/golden/inline_${inline}_rows_${rows}"
-    boot_tag="boot_inline_${inline}_rows_${rows}"
+    golden="${S3_BASE}/golden/inline_${inline}_rows_${rows}${SHARD_TAG}"
+    boot_tag="boot_inline_${inline}_rows_${rows}${SHARD_TAG}"
+    VARIANT_ARGS=()
+    if [[ "$MANIFEST_SHARD_COUNT" -gt 0 ]]; then
+      VARIANT_ARGS=(--variant "sharded_${MANIFEST_SHARD_COUNT}_inline_${inline}")
+    fi
 
     if ! done_already "$boot_tag"; then
-      log "BOOTSTRAP inline=$inline rows=$rows -> $golden"
+      log "BOOTSTRAP inline=$inline rows=$rows shards=$MANIFEST_SHARD_COUNT -> $golden"
       s3_rm "$golden"
       if "$BIN" seed-large --root "$golden" --count "$rows" \
-          --inline-optimization "$inline" "${STORAGE_OPT[@]}"; then
+          --inline-optimization "$inline" "${SHARD_ARGS[@]}" "${STORAGE_OPT[@]}"; then
         echo "{\"bench_tag\":\"$boot_tag\"}" >> "$RESULTS"
       else
-        log "BOOTSTRAP FAILED inline=$inline rows=$rows (skipping this size)"
+        log "BOOTSTRAP FAILED inline=$inline rows=$rows shards=$MANIFEST_SHARD_COUNT (skipping this size)"
         continue
       fi
     else
@@ -84,15 +95,15 @@ for inline in "${INLINE_VARIANTS[@]}"; do
     fi
 
     # ---- Continuous: single process, CONT_OPS commits ----
-    cont_tag="cont_inline_${inline}_rows_${rows}"
+    cont_tag="cont_inline_${inline}_rows_${rows}${SHARD_TAG}"
     if ! done_already "$cont_tag"; then
       run_prefix="${S3_BASE}/run/${cont_tag}"
-      log "CONTINUOUS inline=$inline rows=$rows ops=$CONT_OPS"
+      log "CONTINUOUS inline=$inline rows=$rows shards=$MANIFEST_SHARD_COUNT ops=$CONT_OPS"
       clear_stragglers
       s3_copy "$golden" "$run_prefix"
       timeout "$RUN_TIMEOUT" "$BIN" run --root "$run_prefix" --operation write-create-namespace \
         --concurrency 1 --operations "$CONT_OPS" --initial-entries "$rows" \
-        --inline-optimization "$inline" "${STORAGE_OPT[@]}" \
+        --inline-optimization "$inline" "${SHARD_ARGS[@]}" "${VARIANT_ARGS[@]}" "${STORAGE_OPT[@]}" \
         2>>"$PROGRESS" | while read -r line; do record "$cont_tag" <<<"$line"; done
       s3_rm "$run_prefix"
     else
@@ -101,15 +112,15 @@ for inline in "${INLINE_VARIANTS[@]}"; do
 
     # ---- Concurrent: C processes, steady TPS over CONC_DURATION_SECS ----
     for c in "${CONCURRENCY[@]}"; do
-      conc_tag="conc_inline_${inline}_rows_${rows}_c_${c}"
+      conc_tag="conc_inline_${inline}_rows_${rows}_c_${c}${SHARD_TAG}"
       if done_already "$conc_tag"; then log "skip concurrent $conc_tag (done)"; continue; fi
       run_prefix="${S3_BASE}/run/${conc_tag}"
-      log "CONCURRENT inline=$inline rows=$rows c=$c dur=${CONC_DURATION_SECS}s"
+      log "CONCURRENT inline=$inline rows=$rows shards=$MANIFEST_SHARD_COUNT c=$c dur=${CONC_DURATION_SECS}s"
       clear_stragglers
       s3_copy "$golden" "$run_prefix"
       timeout "$RUN_TIMEOUT" "$BIN" run --root "$run_prefix" --operation write-create-namespace \
         --concurrency "$c" --duration-secs "$CONC_DURATION_SECS" --initial-entries "$rows" \
-        --inline-optimization "$inline" "${STORAGE_OPT[@]}" \
+        --inline-optimization "$inline" "${SHARD_ARGS[@]}" "${VARIANT_ARGS[@]}" "${STORAGE_OPT[@]}" \
         2>>"$PROGRESS" | while read -r line; do record "$conc_tag" <<<"$line"; done
       s3_rm "$run_prefix"
     done
@@ -129,6 +140,7 @@ with open(sys.argv[1]) as f:
         mode = "continuous" if d["duration_secs"] == 0 else "concurrent"
         rows.append({
             "mode": mode, "variant": d["variant"], "initial_entries": d["initial_entries"],
+            "manifest_shard_count": d.get("manifest_shard_count", 0),
             "concurrency": d["concurrency"], "duration_secs": d["duration_secs"],
             "ops": d["total_operations"], "errors": d["errors"],
             "tps": round(d["throughput_ops_per_sec"], 3),

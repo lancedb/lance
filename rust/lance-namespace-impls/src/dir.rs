@@ -194,6 +194,9 @@ pub struct DirectoryNamespaceBuilder {
     manifest_enabled: bool,
     dir_listing_enabled: bool,
     inline_optimization_enabled: bool,
+    /// Number of manifest fragments used as shards. Zero keeps the default
+    /// single-fragment `__manifest` layout.
+    manifest_shard_count: usize,
     table_version_tracking_enabled: bool,
     /// When true, table versions are stored in the `__manifest` table instead of
     /// relying on Lance's native version management.
@@ -229,6 +232,7 @@ impl std::fmt::Debug for DirectoryNamespaceBuilder {
                 "inline_optimization_enabled",
                 &self.inline_optimization_enabled,
             )
+            .field("manifest_shard_count", &self.manifest_shard_count)
             .field(
                 "table_version_tracking_enabled",
                 &self.table_version_tracking_enabled,
@@ -272,6 +276,7 @@ impl DirectoryNamespaceBuilder {
             manifest_enabled: true,
             dir_listing_enabled: true, // Default to enabled for backwards compatibility
             inline_optimization_enabled: true,
+            manifest_shard_count: 0,
             table_version_tracking_enabled: false, // Default to disabled
             table_version_storage_enabled: false,  // Default to disabled
             dir_listing_to_manifest_migration_enabled: false, // Default to disabled
@@ -322,6 +327,16 @@ impl DirectoryNamespaceBuilder {
         self
     }
 
+    /// Configure the number of fragments in the `__manifest` table.
+    ///
+    /// A value of 0 keeps the default single-fragment layout. Values greater
+    /// than 0 create or open a sharded `__manifest` with exactly that many
+    /// fragments.
+    pub fn manifest_shard_count(mut self, shard_count: usize) -> Self {
+        self.manifest_shard_count = shard_count;
+        self
+    }
+
     /// Enable or disable table version tracking through the namespace.
     ///
     /// When enabled, `describe_table` returns `managed_versioning: true` to indicate
@@ -355,6 +370,7 @@ impl DirectoryNamespaceBuilder {
     /// - `manifest_enabled`: Enable manifest-based table tracking (optional, default: true)
     /// - `dir_listing_enabled`: Enable directory listing for table discovery (optional, default: true)
     /// - `inline_optimization_enabled`: Enable replacement indices on __manifest rewrites (optional, default: true)
+    /// - `manifest_shard_count`: Number of __manifest fragments to use as shards (optional, default: 0)
     /// - `storage.*`: Storage options (optional, prefix will be stripped)
     ///
     /// Credential vendor properties (prefixed with `credential_vendor.`, prefix is stripped):
@@ -458,6 +474,21 @@ impl DirectoryNamespaceBuilder {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
+        let manifest_shard_count = properties
+            .get("manifest_shard_count")
+            .map(|value| {
+                value.parse::<usize>().map_err(|e| {
+                    lance_core::Error::from(NamespaceError::InvalidInput {
+                        message: format!(
+                            "manifest_shard_count must be a non-negative integer, got '{}': {}",
+                            value, e
+                        ),
+                    })
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+
         // Extract table_version_tracking_enabled (default: false)
         let table_version_tracking_enabled = properties
             .get("table_version_tracking_enabled")
@@ -515,6 +546,7 @@ impl DirectoryNamespaceBuilder {
             manifest_enabled,
             dir_listing_enabled,
             inline_optimization_enabled,
+            manifest_shard_count,
             table_version_tracking_enabled,
             table_version_storage_enabled,
             dir_listing_to_manifest_migration_enabled,
@@ -700,6 +732,12 @@ impl DirectoryNamespaceBuilder {
             }
             .into());
         }
+        if self.manifest_shard_count > 0 && !self.manifest_enabled {
+            return Err(NamespaceError::InvalidInput {
+                message: "manifest_shard_count requires manifest_enabled=true".to_string(),
+            }
+            .into());
+        }
 
         let (object_store, base_path) =
             Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
@@ -715,10 +753,12 @@ impl DirectoryNamespaceBuilder {
                 self.inline_optimization_enabled,
                 self.commit_retries,
                 self.table_version_storage_enabled,
+                (self.manifest_shard_count > 0).then_some(self.manifest_shard_count),
             )
             .await
             {
                 Ok(ns) => Some(Arc::new(ns)),
+                Err(e) if self.manifest_shard_count > 0 => return Err(e),
                 Err(e) => {
                     // Failed to initialize manifest namespace, fall back to directory listing only
                     log::warn!(
@@ -4652,6 +4692,7 @@ mod tests {
         QueryTableRequestColumns,
     };
     use lance_namespace::schema::convert_json_arrow_schema;
+    use std::collections::BTreeMap;
     use std::io::Cursor;
     use std::sync::{
         Arc,
@@ -4680,6 +4721,29 @@ mod tests {
             .await
             .unwrap();
         (namespace, temp_dir)
+    }
+
+    async fn open_manifest_dataset(root: &str) -> Dataset {
+        Dataset::open(&format!("{}/__manifest", root))
+            .await
+            .unwrap()
+    }
+
+    fn manifest_fragment_files(dataset: &Dataset) -> BTreeMap<u64, Vec<String>> {
+        dataset
+            .manifest()
+            .fragments
+            .iter()
+            .map(|fragment| {
+                let mut files = fragment
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>();
+                files.sort();
+                (fragment.id, files)
+            })
+            .collect()
     }
 
     #[derive(Debug)]
@@ -7429,6 +7493,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_from_properties_manifest_shard_count() {
+        let temp_dir = TempStdDir::default();
+
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+        properties.insert("manifest_shard_count".to_string(), "4".to_string());
+
+        let builder = DirectoryNamespaceBuilder::from_properties(properties, None).unwrap();
+        assert_eq!(builder.manifest_shard_count, 4);
+
+        let mut invalid_properties = HashMap::new();
+        invalid_properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+        invalid_properties.insert(
+            "manifest_shard_count".to_string(),
+            "not-a-number".to_string(),
+        );
+        let err = DirectoryNamespaceBuilder::from_properties(invalid_properties, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("manifest_shard_count must be a non-negative integer")
+        );
+
+        let err = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .manifest_shard_count(4)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("manifest_shard_count requires manifest_enabled=true")
+        );
+    }
+
+    #[tokio::test]
     async fn test_from_properties_with_storage_options() {
         let temp_dir = TempStdDir::default();
 
@@ -9084,6 +9183,127 @@ mod tests {
                 .unwrap()
                 .tables
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sharded_manifest_namespace_and_table_operations() {
+        use lance_namespace::models::{
+            DeclareTableRequest, DescribeTableRequest, ListNamespacesRequest, ListTablesRequest,
+            TableExistsRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let shard_count = 4;
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .manifest_shard_count(shard_count)
+            .build()
+            .await
+            .unwrap();
+
+        let manifest_before = open_manifest_dataset(temp_path).await;
+        assert_eq!(manifest_before.count_fragments(), shard_count);
+        assert_eq!(manifest_before.count_rows(None).await.unwrap(), shard_count);
+        let files_before = manifest_fragment_files(&manifest_before);
+
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["team_a".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+
+        let manifest_after = open_manifest_dataset(temp_path).await;
+        assert_eq!(manifest_after.count_fragments(), shard_count);
+        assert_eq!(
+            manifest_after.count_rows(None).await.unwrap(),
+            shard_count + 1
+        );
+        let files_after = manifest_fragment_files(&manifest_after);
+        assert_eq!(
+            files_before.keys().collect::<Vec<_>>(),
+            files_after.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            files_before
+                .iter()
+                .filter(|(fragment_id, files)| files_after.get(fragment_id) != Some(files))
+                .count(),
+            1
+        );
+
+        let mut list_ns_req = ListNamespacesRequest::new();
+        list_ns_req.id = Some(vec![]);
+        assert_eq!(
+            namespace
+                .list_namespaces(list_ns_req)
+                .await
+                .unwrap()
+                .namespaces,
+            vec!["team_a".to_string()]
+        );
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["team_a".to_string(), "events".to_string()]);
+        declare_req.properties = Some(HashMap::from([(
+            "owner".to_string(),
+            "analytics".to_string(),
+        )]));
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["team_a".to_string(), "events".to_string()]);
+        namespace.table_exists(exists_req).await.unwrap();
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["team_a".to_string(), "events".to_string()]);
+        describe_req.check_declared = Some(true);
+        let describe_response = namespace.describe_table(describe_req).await.unwrap();
+        assert_eq!(describe_response.is_only_declared, Some(true));
+        assert_eq!(
+            describe_response
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner")),
+            Some(&"analytics".to_string())
+        );
+
+        let mut list_tables_req = ListTablesRequest::new();
+        list_tables_req.id = Some(vec!["team_a".to_string()]);
+        assert_eq!(
+            namespace.list_tables(list_tables_req).await.unwrap().tables,
+            vec!["events".to_string()]
+        );
+
+        assert!(
+            !std::path::Path::new(temp_path)
+                .join("__manifest_shard_000000")
+                .exists()
+        );
+
+        let reopened = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["team_b".to_string()]);
+        reopened.create_namespace(create_ns_req).await.unwrap();
+        let manifest_after_reopen = open_manifest_dataset(temp_path).await;
+        assert_eq!(manifest_after_reopen.count_fragments(), shard_count);
+
+        let err = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(false)
+            .manifest_shard_count(shard_count + 1)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("manifest_shard_count=4 but requested 5")
         );
     }
 
@@ -11297,6 +11517,22 @@ mod tests {
             )
         }
 
+        async fn create_sharded_managed_namespace(
+            temp_path: &str,
+            shard_count: usize,
+        ) -> Arc<DirectoryNamespace> {
+            Arc::new(
+                DirectoryNamespaceBuilder::new(temp_path)
+                    .table_version_tracking_enabled(true)
+                    .table_version_storage_enabled(true)
+                    .manifest_enabled(true)
+                    .manifest_shard_count(shard_count)
+                    .build()
+                    .await
+                    .unwrap(),
+            )
+        }
+
         /// Helper to create a table and get its staging manifest path
         async fn create_table_and_get_staging(
             namespace: Arc<dyn LanceNamespace>,
@@ -11423,6 +11659,36 @@ mod tests {
             );
             let (ver, _path) = &versions[0];
             assert_eq!(*ver, 2, "Recorded version should be 2");
+        }
+
+        #[tokio::test]
+        async fn test_sharded_create_table_version_records_in_manifest() {
+            let temp_dir = TempStrDir::default();
+            let temp_path: &str = &temp_dir;
+
+            let namespace = create_sharded_managed_namespace(temp_path, 4).await;
+            let ns: Arc<dyn LanceNamespace> = namespace.clone();
+
+            let (table_id, staging_path) =
+                create_table_and_get_staging(ns.clone(), "table_managed_sharded").await;
+
+            let mut create_req = CreateTableVersionRequest::new(2, staging_path.to_string());
+            create_req.id = Some(table_id.clone());
+            create_req.naming_scheme = Some("V2".to_string());
+            namespace.create_table_version(create_req).await.unwrap();
+
+            let manifest = open_manifest_dataset(temp_path).await;
+            assert_eq!(manifest.count_fragments(), 4);
+
+            let manifest_ns = namespace.manifest_ns.as_ref().unwrap();
+            let table_id_str = manifest::ManifestNamespace::str_object_id(&table_id);
+            let versions = manifest_ns
+                .query_table_versions(&table_id_str, false, None)
+                .await
+                .unwrap();
+
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].0, 2);
         }
     }
 

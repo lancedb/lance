@@ -18,6 +18,10 @@
 //!   manifest_bench seed-large --root s3://bucket/bench/p --count 100000 \
 //!     --inline-optimization true --storage-option aws_region=us-east-1
 //!
+//!   # Bootstrap 100k rows into a 1000-fragment sharded __manifest
+//!   manifest_bench seed-large --root s3://bucket/bench/p --count 100000 \
+//!     --manifest-shard-count 1000 --storage-option aws_region=us-east-1
+//!
 //!   # Continuous: 100 commits, single process
 //!   manifest_bench run --root s3://bucket/bench/p --operation write-create-namespace \
 //!     --concurrency 1 --operations 100 --initial-entries 100000 --inline-optimization true
@@ -63,6 +67,7 @@ struct BenchResult {
     operation: String,
     concurrency: usize,
     initial_entries: usize,
+    manifest_shard_count: usize,
     duration_secs: u64,
     total_operations: usize,
     total_duration_ms: f64,
@@ -90,6 +95,7 @@ fn compute_result(
     operation: &str,
     concurrency: usize,
     initial_entries: usize,
+    manifest_shard_count: usize,
     duration_secs: u64,
     wall_duration: Duration,
     mut latencies: Vec<f64>,
@@ -108,6 +114,7 @@ fn compute_result(
         operation: operation.to_string(),
         concurrency,
         initial_entries,
+        manifest_shard_count,
         duration_secs,
         total_operations: total,
         total_duration_ms: total_ms,
@@ -174,61 +181,84 @@ fn manifest_schema() -> Arc<ArrowSchema> {
     ]))
 }
 
-async fn build_namespace(
-    root: &str,
-    inline_optimization: bool,
-    storage_options: &HashMap<String, String>,
-) -> Box<dyn LanceNamespace> {
-    let mut properties = HashMap::new();
-    properties.insert("root".to_string(), root.to_string());
-    properties.insert("dir_listing_enabled".to_string(), "false".to_string());
-    properties.insert(
-        "inline_optimization_enabled".to_string(),
-        inline_optimization.to_string(),
-    );
-    for (k, v) in storage_options {
-        properties.insert(format!("storage.{}", k), v.clone());
-    }
-    let builder = DirectoryNamespaceBuilder::from_properties(properties, None)
-        .expect("Failed to create namespace builder from properties");
-    Box::new(builder.build().await.expect("Failed to build namespace"))
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+#[derive(Clone)]
+struct ManifestSeedRow {
+    object_id: String,
+    object_type: String,
+    location: Option<String>,
+    metadata: Option<String>,
 }
 
-// ──────────────────── seed-large mode ────────────────────
-// Bootstrap a `__manifest` with N rows by writing the Lance dataset directly (fast,
-// O(N) once), then trigger a single CoW rewrite via the namespace so the on-disk state
-// matches what the catalog produces (single fragment + inline indices when enabled).
+fn stable_hash(value: &str) -> u64 {
+    value
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
+}
 
-const SEED_LARGE_BATCH_SIZE: usize = 50_000;
+fn shard_index_for_key(shard_count: usize, key: &str) -> usize {
+    (stable_hash(key) % shard_count as u64) as usize
+}
 
-fn generate_manifest_batch(start_idx: usize, batch_size: usize, total_count: usize) -> RecordBatch {
+fn shard_marker_object_id(shard_index: usize, marker_index: usize) -> String {
+    format!(
+        "__manifest_shard_marker_{:06}_{:06}",
+        shard_index, marker_index
+    )
+}
+
+fn shard_marker_row(shard_index: usize, marker_index: usize) -> ManifestSeedRow {
+    ManifestSeedRow {
+        object_id: shard_marker_object_id(shard_index, marker_index),
+        object_type: "shard_marker".to_string(),
+        location: None,
+        metadata: None,
+    }
+}
+
+fn generate_manifest_seed_row(row_index: usize, total_count: usize) -> ManifestSeedRow {
     let ns_count = total_count / 3;
-    let actual_size = batch_size.min(total_count - start_idx);
-
-    let mut object_ids = Vec::with_capacity(actual_size);
-    let mut object_types = Vec::with_capacity(actual_size);
-    let mut locations: Vec<Option<String>> = Vec::with_capacity(actual_size);
-    let mut metadatas: Vec<Option<String>> = Vec::with_capacity(actual_size);
-
-    for i in start_idx..start_idx + actual_size {
-        if i < ns_count {
-            object_ids.push(format!("ns_{}", i));
-            object_types.push("namespace".to_string());
-            locations.push(None);
-            metadatas.push(None);
-        } else {
-            let table_idx = i - ns_count;
-            object_ids.push(format!("table_{}", table_idx));
-            object_types.push("table".to_string());
-            locations.push(Some(format!("table_{}", table_idx)));
-            metadatas.push(Some(r#"{"bench":"true"}"#.to_string()));
+    if row_index < ns_count {
+        ManifestSeedRow {
+            object_id: format!("ns_{}", row_index),
+            object_type: "namespace".to_string(),
+            location: None,
+            metadata: None,
         }
+    } else {
+        let table_idx = row_index - ns_count;
+        ManifestSeedRow {
+            object_id: format!("table_{}", table_idx),
+            object_type: "table".to_string(),
+            location: Some(format!("table_{}", table_idx)),
+            metadata: Some(r#"{"bench":"true"}"#.to_string()),
+        }
+    }
+}
+
+fn manifest_batch_from_rows(rows: Vec<ManifestSeedRow>) -> RecordBatch {
+    let row_count = rows.len();
+    let mut object_ids = Vec::with_capacity(row_count);
+    let mut object_types = Vec::with_capacity(row_count);
+    let mut locations: Vec<Option<String>> = Vec::with_capacity(row_count);
+    let mut metadatas: Vec<Option<String>> = Vec::with_capacity(row_count);
+
+    for row in rows {
+        object_ids.push(row.object_id);
+        object_types.push(row.object_type);
+        locations.push(row.location);
+        metadatas.push(row.metadata);
     }
 
     // base_objects is null for every bootstrapped row.
     let mut base_objects_builder = ListBuilder::new(StringBuilder::new())
         .with_field(Arc::new(Field::new("object_id", DataType::Utf8, true)));
-    for _ in 0..actual_size {
+    for _ in 0..row_count {
         base_objects_builder.append_null();
     }
 
@@ -249,27 +279,117 @@ fn generate_manifest_batch(start_idx: usize, batch_size: usize, total_count: usi
     .expect("Failed to create manifest batch")
 }
 
+async fn build_namespace(
+    root: &str,
+    inline_optimization: bool,
+    manifest_shard_count: usize,
+    storage_options: &HashMap<String, String>,
+) -> Box<dyn LanceNamespace> {
+    let mut properties = HashMap::new();
+    properties.insert("root".to_string(), root.to_string());
+    properties.insert("dir_listing_enabled".to_string(), "false".to_string());
+    properties.insert(
+        "inline_optimization_enabled".to_string(),
+        inline_optimization.to_string(),
+    );
+    if manifest_shard_count > 0 {
+        properties.insert(
+            "manifest_shard_count".to_string(),
+            manifest_shard_count.to_string(),
+        );
+    }
+    for (k, v) in storage_options {
+        properties.insert(format!("storage.{}", k), v.clone());
+    }
+    let builder = DirectoryNamespaceBuilder::from_properties(properties, None)
+        .expect("Failed to create namespace builder from properties");
+    Box::new(builder.build().await.expect("Failed to build namespace"))
+}
+
+// ──────────────────── seed-large mode ────────────────────
+// Bootstrap a `__manifest` with N rows by writing the Lance dataset directly (fast,
+// O(N) once), then trigger a single CoW rewrite via the namespace so the on-disk state
+// matches what the catalog produces (single fragment + inline indices when enabled).
+
+const SEED_LARGE_BATCH_SIZE: usize = 50_000;
+
+fn generate_manifest_batch(start_idx: usize, batch_size: usize, total_count: usize) -> RecordBatch {
+    let actual_size = batch_size.min(total_count - start_idx);
+    let rows = (start_idx..start_idx + actual_size)
+        .map(|row_index| generate_manifest_seed_row(row_index, total_count))
+        .collect();
+    manifest_batch_from_rows(rows)
+}
+
+fn generate_sharded_manifest_batches(
+    count: usize,
+    shard_count: usize,
+) -> (Vec<RecordBatch>, usize) {
+    let mut grouped = vec![Vec::<ManifestSeedRow>::new(); shard_count];
+    for row_index in 0..count {
+        let row = generate_manifest_seed_row(row_index, count);
+        let shard_index = shard_index_for_key(shard_count, &row.object_id);
+        grouped[shard_index].push(row);
+    }
+
+    let rows_per_fragment = grouped.iter().map(|rows| rows.len() + 1).max().unwrap_or(1);
+
+    let batches = grouped
+        .into_iter()
+        .enumerate()
+        .map(|(shard_index, rows)| {
+            let mut shard_rows = Vec::with_capacity(rows_per_fragment);
+            shard_rows.push(shard_marker_row(shard_index, 0));
+            shard_rows.extend(rows);
+            while shard_rows.len() < rows_per_fragment {
+                shard_rows.push(shard_marker_row(shard_index, shard_rows.len()));
+            }
+            manifest_batch_from_rows(shard_rows)
+        })
+        .collect();
+
+    (batches, rows_per_fragment)
+}
+
 async fn seed_large(
     root: &str,
     count: usize,
     inline_optimization: bool,
+    manifest_shard_count: usize,
     storage_options: &HashMap<String, String>,
 ) {
     let manifest_uri = format!("{}/{}", root, "__manifest");
-    eprintln!("Seed-large: writing {} rows to {}", count, manifest_uri);
+    eprintln!(
+        "Seed-large: writing {} rows to {} (manifest_shard_count={})",
+        count, manifest_uri, manifest_shard_count
+    );
 
     let schema = manifest_schema();
-    let mut batches = Vec::new();
-    let mut offset = 0;
-    while offset < count {
-        let batch_size = SEED_LARGE_BATCH_SIZE.min(count - offset);
-        batches.push(generate_manifest_batch(offset, batch_size, count));
-        offset += batch_size;
-    }
-    eprintln!("  generated {} batches", batches.len());
+    let (batches, max_rows_per_file) = if manifest_shard_count > 0 {
+        let (batches, rows_per_fragment) =
+            generate_sharded_manifest_batches(count, manifest_shard_count);
+        eprintln!(
+            "  generated {} shard batches with {} rows per fragment",
+            batches.len(),
+            rows_per_fragment
+        );
+        (batches, rows_per_fragment)
+    } else {
+        let mut batches = Vec::new();
+        let mut offset = 0;
+        while offset < count {
+            let batch_size = SEED_LARGE_BATCH_SIZE.min(count - offset);
+            batches.push(generate_manifest_batch(offset, batch_size, count));
+            offset += batch_size;
+        }
+        eprintln!("  generated {} batches", batches.len());
+        (batches, WriteParams::default().max_rows_per_file)
+    };
 
     let mut write_params = WriteParams {
         mode: WriteMode::Create,
+        max_rows_per_file,
+        max_bytes_per_file: usize::MAX,
         ..WriteParams::default()
     };
     if !storage_options.is_empty() {
@@ -292,13 +412,13 @@ async fn seed_large(
         .expect("Failed to write manifest dataset");
     eprintln!("  wrote Lance dataset");
 
-    // Trigger one CoW rewrite so the manifest is in steady catalog form (single
-    // fragment; inline indices when enabled). For the no-index variant the first real
-    // commit performs this rewrite instead.
+    // Trigger one catalog rewrite so the manifest is in steady catalog form with
+    // inline indices when enabled. Sharded manifests route this through a single
+    // shard rewrite so the fragment layout is preserved.
     if inline_optimization {
         eprintln!("  triggering initial CoW rewrite to build indices...");
         let start = Instant::now();
-        let ns = build_namespace(root, true, storage_options).await;
+        let ns = build_namespace(root, true, manifest_shard_count, storage_options).await;
         let mut req = CreateNamespaceRequest::new();
         req.id = Some(vec!["__seed_trigger__".to_string()]);
         ns.create_namespace(req)
@@ -308,6 +428,15 @@ async fn seed_large(
             "  CoW rewrite with index build took {:.1}s",
             start.elapsed().as_secs_f64()
         );
+    } else if manifest_shard_count > 0 {
+        let ns = build_namespace(
+            root,
+            inline_optimization,
+            manifest_shard_count,
+            storage_options,
+        )
+        .await;
+        drop(ns);
     }
 
     let ns_count = count / 3;
@@ -331,9 +460,16 @@ async fn worker(
     worker_id: usize,
     table_count: usize,
     inline_optimization: bool,
+    manifest_shard_count: usize,
     storage_options: &HashMap<String, String>,
 ) {
-    let ns = build_namespace(root, inline_optimization, storage_options).await;
+    let ns = build_namespace(
+        root,
+        inline_optimization,
+        manifest_shard_count,
+        storage_options,
+    )
+    .await;
     let ipc_data = Bytes::from(create_test_ipc_data());
 
     if operation.starts_with("warm-read") {
@@ -454,6 +590,7 @@ fn run_workers(
     warmup: usize,
     table_count: usize,
     initial_entries: usize,
+    manifest_shard_count: usize,
     inline_optimization: bool,
     variant: &str,
     storage_options: &HashMap<String, String>,
@@ -471,6 +608,7 @@ fn run_workers(
             operation,
             concurrency,
             initial_entries,
+            manifest_shard_count,
             duration_secs,
             Duration::ZERO,
             vec![],
@@ -498,7 +636,9 @@ fn run_workers(
                 .arg("--table-count")
                 .arg(table_count.to_string())
                 .arg("--inline-optimization")
-                .arg(inline_optimization.to_string());
+                .arg(inline_optimization.to_string())
+                .arg("--manifest-shard-count")
+                .arg(manifest_shard_count.to_string());
             for (k, v) in storage_options {
                 cmd.arg("--storage-option").arg(format!("{}={}", k, v));
             }
@@ -534,6 +674,7 @@ fn run_workers(
         operation,
         concurrency,
         initial_entries,
+        manifest_shard_count,
         duration_secs,
         wall_start.elapsed(),
         all_latencies,
@@ -568,6 +709,7 @@ async fn main() {
     let mut table_count: usize = 667;
     let mut initial_entries: usize = 0;
     let mut inline_optimization = true;
+    let mut manifest_shard_count: usize = 0;
     let mut variant = String::new();
     let mut storage_options: HashMap<String, String> = HashMap::new();
 
@@ -618,6 +760,10 @@ async fn main() {
                 inline_optimization = args[i + 1].parse().unwrap();
                 i += 2;
             }
+            "--manifest-shard-count" => {
+                manifest_shard_count = args[i + 1].parse().unwrap();
+                i += 2;
+            }
             "--variant" => {
                 variant = args[i + 1].clone();
                 i += 2;
@@ -636,7 +782,9 @@ async fn main() {
     }
 
     if variant.is_empty() {
-        variant = if inline_optimization {
+        variant = if manifest_shard_count > 0 {
+            format!("sharded_{}", manifest_shard_count)
+        } else if inline_optimization {
             "inline_index".to_string()
         } else {
             "no_index".to_string()
@@ -645,7 +793,14 @@ async fn main() {
 
     match mode {
         "seed-large" => {
-            seed_large(&root, count, inline_optimization, &storage_options).await;
+            seed_large(
+                &root,
+                count,
+                inline_optimization,
+                manifest_shard_count,
+                &storage_options,
+            )
+            .await;
         }
         "worker" => {
             worker(
@@ -657,6 +812,7 @@ async fn main() {
                 worker_id,
                 table_count,
                 inline_optimization,
+                manifest_shard_count,
                 &storage_options,
             )
             .await;
@@ -674,8 +830,15 @@ async fn main() {
 
             eprintln!("=== Manifest commit benchmark ===");
             eprintln!(
-                "variant={} op={} root={} initial_entries={} concurrency={:?} operations={} duration_secs={}",
-                variant, op, root, initial_entries, concurrency_list, operations, duration_secs
+                "variant={} op={} root={} initial_entries={} manifest_shard_count={} concurrency={:?} operations={} duration_secs={}",
+                variant,
+                op,
+                root,
+                initial_entries,
+                manifest_shard_count,
+                concurrency_list,
+                operations,
+                duration_secs
             );
 
             for &concurrency in &concurrency_list {
@@ -689,6 +852,7 @@ async fn main() {
                     warmup,
                     table_count,
                     initial_entries,
+                    manifest_shard_count,
                     inline_optimization,
                     &variant,
                     &storage_options,

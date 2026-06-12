@@ -9,7 +9,10 @@ use crate::{
     dataset::rowids::load_row_id_sequences,
     index::{
         prefilter::DatasetPreFilter,
-        scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
+        scalar_logical::{
+            open_named_scalar_index, open_named_scalar_index_for_fragments,
+            scalar_index_fragment_bitmap, scalar_index_fragment_bitmap_for_fragments,
+        },
     },
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -60,6 +63,30 @@ impl ScalarIndexLoader for Dataset {
     }
 }
 
+struct FragmentPrunedScalarIndexLoader {
+    dataset: Arc<Dataset>,
+    fragment_bitmap: Option<Arc<RoaringBitmap>>,
+}
+
+#[async_trait]
+impl ScalarIndexLoader for FragmentPrunedScalarIndexLoader {
+    async fn load_index(
+        &self,
+        column: &str,
+        index_name: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        open_named_scalar_index_for_fragments(
+            &self.dataset,
+            column,
+            index_name,
+            metrics,
+            self.fragment_bitmap.as_deref(),
+        )
+        .await
+    }
+}
+
 /// An execution node that performs a scalar index search
 ///
 /// This does not actually scan any data.  We only look through the index to determine
@@ -74,6 +101,7 @@ pub struct ScalarIndexExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
+    fragment_bitmap: Option<Arc<RoaringBitmap>>,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -107,7 +135,13 @@ impl ScalarIndexExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
+            fragment_bitmap: None,
         }
+    }
+
+    pub fn with_fragment_bitmap(mut self, fragment_bitmap: Arc<RoaringBitmap>) -> Self {
+        self.fragment_bitmap = Some(fragment_bitmap);
+        self
     }
 
     pub fn dataset(&self) -> &Arc<Dataset> {
@@ -129,29 +163,48 @@ impl ScalarIndexExec {
     pub async fn fragments_covered_by_index_query(
         index_expr: &ScalarIndexExpr,
         dataset: &Dataset,
+        target_fragment_bitmap: Option<&RoaringBitmap>,
     ) -> Result<RoaringBitmap> {
         match index_expr {
-            ScalarIndexExpr::And(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
-            ScalarIndexExpr::Or(lhs, rhs) => {
-                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
-                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
-            }
+            ScalarIndexExpr::And(lhs, rhs) => Ok(Self::fragments_covered_by_index_query(
+                lhs,
+                dataset,
+                target_fragment_bitmap,
+            )
+            .await?
+                & Self::fragments_covered_by_index_query(rhs, dataset, target_fragment_bitmap)
+                    .await?),
+            ScalarIndexExpr::Or(lhs, rhs) => Ok(Self::fragments_covered_by_index_query(
+                lhs,
+                dataset,
+                target_fragment_bitmap,
+            )
+            .await?
+                & Self::fragments_covered_by_index_query(rhs, dataset, target_fragment_bitmap)
+                    .await?),
             ScalarIndexExpr::Not(expr) => {
-                Self::fragments_covered_by_index_query(expr, dataset).await
+                Self::fragments_covered_by_index_query(expr, dataset, target_fragment_bitmap).await
             }
-            ScalarIndexExpr::Query(search_key) => {
+            ScalarIndexExpr::Query(search_key) => if let Some(target_fragment_bitmap) =
+                target_fragment_bitmap
+            {
+                scalar_index_fragment_bitmap_for_fragments(
+                    dataset,
+                    &search_key.column,
+                    &search_key.index_name,
+                    target_fragment_bitmap,
+                )
+                .await?
+            } else {
                 scalar_index_fragment_bitmap(dataset, &search_key.column, &search_key.index_name)
                     .await?
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "Index not found even though it must have been found earlier: {}",
-                            search_key.index_name
-                        ))
-                    })
             }
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Index not found even though it must have been found earlier: {}",
+                    search_key.index_name
+                ))
+            }),
         }
     }
 
@@ -160,15 +213,25 @@ impl ScalarIndexExec {
         dataset: Arc<Dataset>,
         plan_metrics: ExecutionPlanMetricsSet,
         result_format: IndexExprResultWireFormat,
+        fragment_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<RecordBatch> {
         let metrics = IndexMetrics::new(&plan_metrics, 0);
-        let query_result = {
+        let mut query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
-            expr.evaluate(dataset.as_ref(), &metrics).await?
+            let index_loader = FragmentPrunedScalarIndexLoader {
+                dataset: dataset.clone(),
+                fragment_bitmap: fragment_bitmap.clone(),
+            };
+            expr.evaluate(&index_loader, &metrics).await?
         };
-        let fragments_covered_by_result =
-            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
+        let fragments_covered_by_result = Self::fragments_covered_by_index_query(
+            &expr,
+            dataset.as_ref(),
+            fragment_bitmap.as_deref(),
+        )
+        .await?;
+        retain_index_result_fragments(&mut query_result, &fragments_covered_by_result);
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
@@ -217,6 +280,7 @@ impl ExecutionPlan for ScalarIndexExec {
             self.dataset.clone(),
             self.metrics.clone(),
             self.result_format,
+            self.fragment_bitmap.clone(),
         );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
@@ -250,6 +314,19 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+}
+
+fn retain_index_result_fragments(result: &mut IndexExprResult, fragment_bitmap: &RoaringBitmap) {
+    retain_mask_fragments(&mut result.lower, fragment_bitmap);
+    retain_mask_fragments(&mut result.upper, fragment_bitmap);
+}
+
+fn retain_mask_fragments(mask: &mut RowAddrMask, fragment_bitmap: &RoaringBitmap) {
+    match mask {
+        RowAddrMask::AllowList(rows) | RowAddrMask::BlockList(rows) => {
+            rows.retain_fragments(fragment_bitmap.iter());
+        }
     }
 }
 
@@ -855,6 +932,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::{
@@ -864,7 +942,8 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{IndexExprResult, RowAddrMask, result::IndexExprResultWireFormat};
+    use roaring::RoaringBitmap;
 
     use crate::{
         Dataset,
@@ -1004,6 +1083,47 @@ mod tests {
         let schema = IndexExprResultWireFormat::TwoMask.schema().clone();
 
         verify(plan, schema).await;
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_exec_restricts_fragment_bitmap() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "ordered".to_string(),
+            index_name: "ordered_idx".to_string(),
+            index_type: "BTree".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::UInt64(Some(47))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let target_fragment = 2_u32;
+        let target_fragment_bitmap = Arc::new(RoaringBitmap::from_iter([target_fragment]));
+        let plan = ScalarIndexExec::new(dataset, query, IndexExprResultWireFormat::default())
+            .with_fragment_bitmap(target_fragment_bitmap.clone());
+
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        let (result, fragments_covered) = IndexExprResult::deserialize(&batches[0]).unwrap();
+        assert_eq!(fragments_covered, target_fragment_bitmap.as_ref().clone());
+        assert!(result.is_exact());
+
+        let RowAddrMask::AllowList(rows) = result.upper else {
+            panic!("BTree range search should return an allow-list");
+        };
+        let row_addrs = unsafe { rows.into_addr_iter().collect::<Vec<_>>() };
+        let expected = (0..10)
+            .map(|row_offset| u64::from(RowAddress::new_from_parts(target_fragment, row_offset)))
+            .collect::<Vec<_>>();
+        assert_eq!(row_addrs, expected);
     }
 
     #[test]

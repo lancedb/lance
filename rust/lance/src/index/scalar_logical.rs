@@ -203,23 +203,32 @@ fn combine_search_results(results: Vec<SearchResult>) -> Result<SearchResult> {
     })
 }
 
-fn index_intersects_dataset(index: &IndexMetadata, dataset: &Dataset) -> bool {
+fn index_intersects_fragments(index: &IndexMetadata, fragment_bitmap: &RoaringBitmap) -> bool {
     index
         .fragment_bitmap
         .as_ref()
-        .is_some_and(|index_bitmap| index_bitmap.intersection_len(&dataset.fragment_bitmap) > 0)
+        .is_some_and(|index_bitmap| index_bitmap.intersection_len(fragment_bitmap) > 0)
 }
 
 async fn load_named_scalar_segments(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
+    target_fragment_bitmap: Option<&RoaringBitmap>,
 ) -> Result<Vec<IndexMetadata>> {
+    let live_fragment_bitmap;
+    let fragment_bitmap = if let Some(target_fragment_bitmap) = target_fragment_bitmap {
+        live_fragment_bitmap = target_fragment_bitmap & dataset.fragment_bitmap.as_ref();
+        &live_fragment_bitmap
+    } else {
+        dataset.fragment_bitmap.as_ref()
+    };
+
     let usable_indices = dataset
         .load_indices_by_name(index_name)
         .await?
         .into_iter()
-        .filter(|index| index_intersects_dataset(index, dataset))
+        .filter(|index| index_intersects_fragments(index, fragment_bitmap))
         .collect::<Vec<_>>();
 
     let mut index_type_url = None::<String>;
@@ -268,7 +277,7 @@ pub async fn scalar_index_fragment_bitmap(
     column: &str,
     index_name: &str,
 ) -> Result<Option<RoaringBitmap>> {
-    let indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    let indices = load_named_scalar_segments(dataset, column, index_name, None).await?;
     match indices.len() {
         0 => Ok(None),
         1 => Ok(indices
@@ -279,13 +288,48 @@ pub async fn scalar_index_fragment_bitmap(
     }
 }
 
+pub async fn scalar_index_fragment_bitmap_for_fragments(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    target_fragment_bitmap: &RoaringBitmap,
+) -> Result<Option<RoaringBitmap>> {
+    let indices =
+        load_named_scalar_segments(dataset, column, index_name, Some(target_fragment_bitmap))
+            .await?;
+    let Some(mut fragment_bitmap) = (match indices.len() {
+        0 => Ok(None),
+        1 => Ok(indices
+            .into_iter()
+            .next()
+            .and_then(|index| index.fragment_bitmap)),
+        _ => union_fragment_bitmaps(&indices, index_name).map(Some),
+    })?
+    else {
+        return Ok(None);
+    };
+    fragment_bitmap &= target_fragment_bitmap;
+    Ok(Some(fragment_bitmap))
+}
+
 pub async fn open_named_scalar_index(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    open_named_scalar_index_for_fragments(dataset, column, index_name, metrics, None).await
+}
+
+pub async fn open_named_scalar_index_for_fragments(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    metrics: &dyn MetricsCollector,
+    target_fragment_bitmap: Option<&RoaringBitmap>,
+) -> Result<Arc<dyn ScalarIndex>> {
+    let indices =
+        load_named_scalar_segments(dataset, column, index_name, target_fragment_bitmap).await?;
     match indices.len() {
         0 => Err(Error::internal(format!(
             "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
@@ -435,6 +479,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+
+        let target_fragment_bitmap = RoaringBitmap::from_iter([fragments[2].id() as u32]);
+        let pruned = open_named_scalar_index_for_fragments(
+            &dataset,
+            "value",
+            "value_btree",
+            &NoOpMetricsCollector,
+            Some(&target_fragment_bitmap),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pruned.index_type(), IndexType::BTree);
+        assert_eq!(
+            pruned.calculate_included_frags().await.unwrap(),
+            target_fragment_bitmap
+        );
+
+        let pruned_bitmap = scalar_index_fragment_bitmap_for_fragments(
+            &dataset,
+            "value",
+            "value_btree",
+            &target_fragment_bitmap,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pruned_bitmap, target_fragment_bitmap);
     }
 
     #[tokio::test]
