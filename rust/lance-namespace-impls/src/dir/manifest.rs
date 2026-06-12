@@ -26,10 +26,12 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
     InsertBuilder, ReadParams, WhenMatched, WriteMode, WriteParams, builder::DatasetBuilder,
 };
+use lance::index::DatasetIndexExt;
 use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ID, Result};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
@@ -88,6 +90,8 @@ const BASE_OBJECTS_INDEX_NAME: &str = "base_objects_label_list";
 // commit retry budget so multi-process namespace writes can make progress.
 const DEFAULT_MANIFEST_REWRITE_COMMIT_RETRIES: u32 = 20;
 const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
+const MANIFEST_FRAGMENT_SHARD_MARKER_ROWS_PER_FILE: usize = 1;
+const MANIFEST_SHARD_COUNT_PROPERTY: &str = "manifest_shard_count";
 
 /// Object types that can be stored in the manifest
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +99,7 @@ pub enum ObjectType {
     Namespace,
     Table,
     TableVersion,
+    ShardMarker,
 }
 
 impl ObjectType {
@@ -103,6 +108,7 @@ impl ObjectType {
             Self::Namespace => "namespace",
             Self::Table => "table",
             Self::TableVersion => "table_version",
+            Self::ShardMarker => "shard_marker",
         }
     }
 
@@ -111,6 +117,7 @@ impl ObjectType {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
             "table_version" => Ok(Self::TableVersion),
+            "shard_marker" => Ok(Self::ShardMarker),
             _ => Err(NamespaceError::Internal {
                 message: format!("Invalid object type: {}", s),
             }
@@ -173,7 +180,7 @@ pub struct TableInfo {
 pub struct ManifestEntry {
     /// The unique object identifier (e.g., table name or version object_id)
     pub object_id: String,
-    /// The type of the object (Namespace, Table, or TableVersion)
+    /// The type of the object (Namespace, Table, TableVersion, or ShardMarker)
     pub object_type: ObjectType,
     /// The storage location (e.g., directory name for tables)
     pub location: Option<String>,
@@ -233,35 +240,52 @@ struct ManifestOutputRow<'a> {
     base_objects: Option<&'a [String]>,
 }
 
-#[derive(Default)]
 struct ManifestIndexAccumulator {
     object_ids: BTreeMap<Arc<str>, u64>,
-    object_types: BTreeMap<&'static str, RoaringBitmap>,
+    object_types: BTreeMap<&'static str, Vec<u64>>,
     base_objects_values: Vec<Option<Vec<String>>>,
     base_objects_row_ids: Vec<u64>,
+    fragment_id: u32,
     row_count: u64,
 }
 
 impl ManifestIndexAccumulator {
+    fn new(fragment_id: u32) -> Self {
+        Self {
+            object_ids: BTreeMap::new(),
+            object_types: BTreeMap::new(),
+            base_objects_values: Vec::new(),
+            base_objects_row_ids: Vec::new(),
+            fragment_id,
+            row_count: 0,
+        }
+    }
+
     fn next_row_id(&self) -> Result<u64> {
         if self.row_count >= u64::from(u32::MAX) {
             return Err(NamespaceError::Internal {
                 message: format!(
-                    "Manifest rewrite exceeded maximum single-fragment row count: {}",
-                    self.row_count
+                    "Manifest rewrite exceeded maximum row count for fragment {}: {}",
+                    self.fragment_id, self.row_count
                 ),
             }
             .into());
         }
-        Ok(self.row_count)
+        Ok(RowAddress::new_from_parts(self.fragment_id, self.row_count as u32).into())
     }
 
     fn push(&mut self, row: &ManifestOutputRow<'_>) -> Result<u64> {
         let row_id = self.next_row_id()?;
-        if self
-            .object_ids
-            .insert(Arc::<str>::from(row.object_id), row_id)
-            .is_some()
+        self.push_row_id(row, row_id)?;
+        Ok(row_id)
+    }
+
+    fn push_row_id(&mut self, row: &ManifestOutputRow<'_>, row_id: u64) -> Result<()> {
+        if row.object_type != ObjectType::ShardMarker
+            && self
+                .object_ids
+                .insert(Arc::<str>::from(row.object_id), row_id)
+                .is_some()
         {
             return Err(NamespaceError::Internal {
                 message: format!("Manifest contains duplicate object_id '{}'", row.object_id),
@@ -271,12 +295,18 @@ impl ManifestIndexAccumulator {
         self.object_types
             .entry(row.object_type.as_str())
             .or_default()
-            .insert(row_id as u32);
+            .push(row_id);
         self.base_objects_values
             .push(row.base_objects.map(|objects| objects.to_vec()));
         self.base_objects_row_ids.push(row_id);
         self.row_count += 1;
-        Ok(row_id)
+        Ok(())
+    }
+}
+
+impl Default for ManifestIndexAccumulator {
+    fn default() -> Self {
+        Self::new(0)
     }
 }
 
@@ -386,10 +416,10 @@ struct ManifestRewriteShared<M: ManifestStreamMutation> {
 }
 
 impl<M: ManifestStreamMutation> ManifestRewriteShared<M> {
-    fn new(mutation: M) -> Self {
+    fn new(mutation: M, fragment_id: u32) -> Self {
         Self {
             mutation,
-            index_data: Some(ManifestIndexAccumulator::default()),
+            index_data: Some(ManifestIndexAccumulator::new(fragment_id)),
             result: None,
             error: None,
         }
@@ -450,7 +480,9 @@ impl ManifestStreamMutation for UpsertManifestMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
-        if let Some(index) = self.entry_positions.get(&row.object_id).copied() {
+        if row.object_type != ObjectType::ShardMarker
+            && let Some(index) = self.entry_positions.get(&row.object_id).copied()
+        {
             match self.when_matched {
                 WhenMatched::Fail => {
                     return Err(NamespaceError::ConcurrentModification {
@@ -526,7 +558,7 @@ struct DeleteObjectMutation {
 }
 
 impl ManifestStreamMutation for DeleteObjectMutation {
-    type Output = ();
+    type Output = bool;
 
     fn process_existing_row(
         &mut self,
@@ -534,7 +566,7 @@ impl ManifestStreamMutation for DeleteObjectMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
-        if row.object_id == self.object_id {
+        if row.object_type != ObjectType::ShardMarker && row.object_id == self.object_id {
             self.deleted = true;
             return Ok(());
         }
@@ -561,9 +593,9 @@ impl ManifestStreamMutation for DeleteObjectMutation {
 
     fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
         if self.deleted {
-            CopyOnWriteMutation::updated(())
+            CopyOnWriteMutation::updated(true)
         } else {
-            CopyOnWriteMutation::unchanged(())
+            CopyOnWriteMutation::unchanged(false)
         }
     }
 
@@ -571,7 +603,7 @@ impl ManifestStreamMutation for DeleteObjectMutation {
         // If a concurrent writer already removed the object, the delete is satisfied.
         ConflictResolution::SucceedIfAbsent {
             object_id: self.object_id.clone(),
-            output: (),
+            output: true,
         }
     }
 }
@@ -580,6 +612,9 @@ enum DeleteTableVersionsTarget {
     ObjectIds(HashSet<String>),
     Ranges(Vec<DeleteTableVersionRangeTarget>),
 }
+
+type TableVersionRangeGroup = Vec<(String, Vec<(i64, i64)>)>;
+type TableVersionRangeGroupsByShard = HashMap<usize, TableVersionRangeGroup>;
 
 #[derive(Clone)]
 struct DeleteTableVersionRangeTarget {
@@ -819,6 +854,10 @@ pub struct ManifestNamespace {
     /// Number of retries for commit operations on the manifest table.
     /// If None, defaults to [`lance_table::io::commit::CommitConfig`] default (20).
     commit_retries: Option<u32>,
+    /// When set, the single `__manifest` table is partitioned into this many
+    /// Lance fragments and each manifest mutation rewrites only the routed
+    /// fragment.
+    manifest_fragment_shard_count: Option<usize>,
     /// Serialize manifest mutations within a single namespace instance so concurrent
     /// create/drop calls do not compete with each other on the same in-memory snapshot.
     manifest_mutation_lock: Arc<Mutex<()>>,
@@ -833,6 +872,10 @@ impl std::fmt::Debug for ManifestNamespace {
             .field(
                 "inline_optimization_enabled",
                 &self.inline_optimization_enabled,
+            )
+            .field(
+                "manifest_fragment_shard_count",
+                &self.manifest_fragment_shard_count,
             )
             .finish()
     }
@@ -909,14 +952,17 @@ impl ManifestNamespace {
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
         table_version_storage_enabled: bool,
+        manifest_fragment_shard_count: Option<usize>,
     ) -> Result<Self> {
-        let manifest_dataset = Self::ensure_manifest_table_up_to_date(
-            &root,
-            &storage_options,
-            session.clone(),
-            table_version_storage_enabled,
-        )
-        .await?;
+        let (manifest_dataset, manifest_fragment_shard_count) =
+            Self::ensure_manifest_table_up_to_date(
+                &root,
+                &storage_options,
+                session.clone(),
+                table_version_storage_enabled,
+                manifest_fragment_shard_count,
+            )
+            .await?;
 
         Ok(Self {
             root,
@@ -928,6 +974,7 @@ impl ManifestNamespace {
             dir_listing_enabled,
             inline_optimization_enabled,
             commit_retries,
+            manifest_fragment_shard_count,
             manifest_mutation_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -1002,6 +1049,146 @@ impl ManifestNamespace {
 
     fn build_version_object_id_prefix(table_object_id: &str) -> String {
         format!("{}{}", table_object_id, DELIMITER)
+    }
+
+    fn stable_hash(value: &str) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn table_version_table_id(version_object_id: &str) -> &str {
+        version_object_id
+            .rsplit_once(DELIMITER)
+            .map(|(table_id, _version)| table_id)
+            .unwrap_or(version_object_id)
+    }
+
+    fn table_version_table_id_if_version_object_id(object_id: &str) -> Option<&str> {
+        let (table_id, version) = object_id.rsplit_once(DELIMITER)?;
+        if version.len() == 20 && version.bytes().all(|byte| byte.is_ascii_digit()) {
+            Some(table_id)
+        } else {
+            None
+        }
+    }
+
+    fn shard_key_for_entry(entry: &ManifestEntry) -> &str {
+        match entry.object_type {
+            ObjectType::TableVersion => Self::table_version_table_id(&entry.object_id),
+            _ => &entry.object_id,
+        }
+    }
+
+    fn shard_index_for_key(shard_count: usize, key: &str) -> usize {
+        (Self::stable_hash(key) % shard_count as u64) as usize
+    }
+
+    fn shard_count(&self) -> Option<usize> {
+        self.manifest_fragment_shard_count
+    }
+
+    fn persisted_manifest_shard_count(dataset: &Dataset) -> Result<Option<usize>> {
+        let Some(value) = dataset.metadata().get(MANIFEST_SHARD_COUNT_PROPERTY) else {
+            return Ok(None);
+        };
+        let shard_count = value.parse::<usize>().map_err(|e| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid persisted {} value '{}': {}",
+                    MANIFEST_SHARD_COUNT_PROPERTY, value, e
+                ),
+            })
+        })?;
+        if shard_count == 0 {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid persisted {} value '0': shard count must be greater than 0",
+                    MANIFEST_SHARD_COUNT_PROPERTY
+                ),
+            }
+            .into());
+        }
+        Ok(Some(shard_count))
+    }
+
+    async fn persist_manifest_shard_count(dataset: &mut Dataset, shard_count: usize) -> Result<()> {
+        if dataset
+            .metadata()
+            .get(MANIFEST_SHARD_COUNT_PROPERTY)
+            .is_some_and(|value| value == &shard_count.to_string())
+        {
+            return Ok(());
+        }
+        dataset
+            .update_metadata([(
+                MANIFEST_SHARD_COUNT_PROPERTY.to_string(),
+                shard_count.to_string(),
+            )])
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to persist {}={} in __manifest metadata: {}",
+                        MANIFEST_SHARD_COUNT_PROPERTY, shard_count, e
+                    ),
+                })
+            })?;
+        Ok(())
+    }
+
+    async fn resolve_manifest_shard_count(
+        dataset: &mut Dataset,
+        requested_shard_count: Option<usize>,
+    ) -> Result<Option<usize>> {
+        let persisted_shard_count = Self::persisted_manifest_shard_count(dataset)?;
+        let effective_shard_count = match (requested_shard_count, persisted_shard_count) {
+            (Some(requested), Some(persisted)) if requested != persisted => {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Existing __manifest table has {}={} but requested {}",
+                        MANIFEST_SHARD_COUNT_PROPERTY, persisted, requested
+                    ),
+                }
+                .into());
+            }
+            (Some(requested), _) => Some(requested),
+            (None, Some(persisted)) => Some(persisted),
+            (None, None) => None,
+        };
+
+        if let Some(shard_count) = effective_shard_count {
+            let fragment_count = dataset.manifest().fragments.len();
+            if fragment_count != shard_count {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Existing __manifest table has {} fragments but {} is {}",
+                        fragment_count, MANIFEST_SHARD_COUNT_PROPERTY, shard_count
+                    ),
+                }
+                .into());
+            }
+            if persisted_shard_count != Some(shard_count) {
+                Self::persist_manifest_shard_count(dataset, shard_count).await?;
+            }
+        }
+
+        Ok(effective_shard_count)
+    }
+
+    fn delete_shard_indices_for_object_id(&self, object_id: &str) -> Option<Vec<usize>> {
+        let shard_count = self.shard_count()?;
+        let mut shard_indices = vec![Self::shard_index_for_key(shard_count, object_id)];
+        if let Some(table_id) = Self::table_version_table_id_if_version_object_id(object_id) {
+            let table_shard_index = Self::shard_index_for_key(shard_count, table_id);
+            if !shard_indices.contains(&table_shard_index) {
+                shard_indices.push(table_shard_index);
+            }
+        }
+        Some(shard_indices)
     }
 
     fn normalize_table_version_ranges(ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
@@ -1189,7 +1376,7 @@ impl ManifestNamespace {
     }
 
     fn object_type_index_stream(
-        object_types: BTreeMap<&'static str, RoaringBitmap>,
+        object_types: BTreeMap<&'static str, Vec<u64>>,
     ) -> SendableRecordBatchStream {
         let schema =
             Self::value_row_id_schema(Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false));
@@ -1199,7 +1386,7 @@ impl ManifestNamespace {
             .map(|(value, bitmap)| {
                 (
                     value,
-                    Box::new(bitmap.into_iter()) as Box<dyn Iterator<Item = u32> + Send>,
+                    Box::new(bitmap.into_iter()) as Box<dyn Iterator<Item = u64> + Send>,
                 )
             })
             .collect::<Vec<_>>()
@@ -1218,7 +1405,7 @@ impl ManifestNamespace {
                     };
                     if let Some(row_id) = iter.next() {
                         values.push((*value).to_string());
-                        row_ids.push(u64::from(row_id));
+                        row_ids.push(row_id);
                     } else {
                         current = None;
                     }
@@ -1342,14 +1529,18 @@ impl ManifestNamespace {
     fn manifest_fragment_bitmap(manifest: &Manifest) -> Result<RoaringBitmap> {
         let mut bitmap = RoaringBitmap::new();
         for fragment in manifest.fragments.iter() {
-            let fragment_id = u32::try_from(fragment.id).map_err(|_| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Manifest fragment id {} exceeds u32", fragment.id),
-                })
-            })?;
+            let fragment_id = Self::fragment_id_for_row_address(fragment.id)?;
             bitmap.insert(fragment_id);
         }
         Ok(bitmap)
+    }
+
+    fn fragment_id_for_row_address(fragment_id: u64) -> Result<u32> {
+        u32::try_from(fragment_id).map_err(|_| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Manifest fragment id {} exceeds u32", fragment_id),
+            })
+        })
     }
 
     fn manifest_from_overwrite_transaction(
@@ -1380,6 +1571,40 @@ impl ManifestNamespace {
         index_uuids: [Uuid; 3],
     ) -> Result<Vec<IndexMetadata>> {
         let fragment_bitmap = Self::manifest_fragment_bitmap(manifest)?;
+        Self::build_manifest_indices_for_bitmap(
+            dataset,
+            manifest,
+            index_data,
+            index_uuids,
+            fragment_bitmap,
+        )
+        .await
+    }
+
+    async fn build_manifest_indices_for_fragment(
+        dataset: &Dataset,
+        manifest: &Manifest,
+        index_data: ManifestIndexAccumulator,
+        index_uuids: [Uuid; 3],
+        fragment_id: u32,
+    ) -> Result<Vec<IndexMetadata>> {
+        Self::build_manifest_indices_for_bitmap(
+            dataset,
+            manifest,
+            index_data,
+            index_uuids,
+            RoaringBitmap::from_iter([fragment_id]),
+        )
+        .await
+    }
+
+    async fn build_manifest_indices_for_bitmap(
+        dataset: &Dataset,
+        manifest: &Manifest,
+        index_data: ManifestIndexAccumulator,
+        index_uuids: [Uuid; 3],
+        fragment_bitmap: RoaringBitmap,
+    ) -> Result<Vec<IndexMetadata>> {
         let schema = &manifest.schema;
         let ManifestIndexAccumulator {
             object_ids,
@@ -1455,6 +1680,111 @@ impl ManifestNamespace {
         ])
     }
 
+    fn is_manifest_index_name(name: &str) -> bool {
+        matches!(
+            name,
+            OBJECT_ID_INDEX_NAME | OBJECT_TYPE_INDEX_NAME | BASE_OBJECTS_INDEX_NAME
+        )
+    }
+
+    fn manifest_index_is_shard_local(index: &IndexMetadata) -> bool {
+        index
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|fragment_bitmap| fragment_bitmap.len() == 1)
+    }
+
+    fn manifest_indices_are_shard_local(
+        manifest: &Manifest,
+        indices: &[IndexMetadata],
+    ) -> Result<bool> {
+        let expected_fragments = Self::manifest_fragment_bitmap(manifest)?;
+        for index_name in [
+            OBJECT_ID_INDEX_NAME,
+            OBJECT_TYPE_INDEX_NAME,
+            BASE_OBJECTS_INDEX_NAME,
+        ] {
+            let mut covered_fragments = RoaringBitmap::new();
+            let mut found = false;
+            for index in indices.iter().filter(|index| index.name == index_name) {
+                found = true;
+                let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() else {
+                    return Ok(false);
+                };
+                if !Self::manifest_index_is_shard_local(index)
+                    || covered_fragments.intersection_len(fragment_bitmap) != 0
+                {
+                    return Ok(false);
+                }
+                covered_fragments |= fragment_bitmap.clone();
+            }
+            if !found || covered_fragments != expected_fragments {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn replace_manifest_index_segments(
+        existing_indices: Vec<IndexMetadata>,
+        fragment_id: u32,
+        replacement_indices: Vec<IndexMetadata>,
+    ) -> Vec<IndexMetadata> {
+        existing_indices
+            .into_iter()
+            .filter(|index| {
+                !Self::is_manifest_index_name(&index.name)
+                    || !index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|fragment_bitmap| fragment_bitmap.contains(fragment_id))
+            })
+            .chain(replacement_indices)
+            .collect()
+    }
+
+    async fn build_all_manifest_shard_indices(
+        dataset: &Dataset,
+        manifest: &Manifest,
+        replaced_fragment_id: u32,
+        replaced_fragment_index_data: ManifestIndexAccumulator,
+        staged_index_uuids: &mut Vec<Uuid>,
+    ) -> Result<Vec<IndexMetadata>> {
+        let mut indices = Vec::new();
+        let mut replaced_fragment_index_data = Some(replaced_fragment_index_data);
+
+        for fragment in manifest.fragments.iter() {
+            let fragment_id = Self::fragment_id_for_row_address(fragment.id)?;
+            let index_data = if fragment_id == replaced_fragment_id {
+                replaced_fragment_index_data.take().ok_or_else(|| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Missing replacement index data for manifest fragment {}",
+                            fragment_id
+                        ),
+                    })
+                })?
+            } else {
+                Self::collect_manifest_index_data_from_fragments(dataset, vec![fragment.clone()])
+                    .await?
+            };
+            let fragment_index_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+            staged_index_uuids.extend(fragment_index_uuids.iter().copied());
+            indices.extend(
+                Self::build_manifest_indices_for_fragment(
+                    dataset,
+                    manifest,
+                    index_data,
+                    fragment_index_uuids,
+                    fragment_id,
+                )
+                .await?,
+            );
+        }
+
+        Ok(indices)
+    }
+
     async fn build_manifest_index(
         dataset: &Dataset,
         registry: Arc<IndexPluginRegistry>,
@@ -1497,10 +1827,54 @@ impl ManifestNamespace {
         ]))
     }
 
+    fn shard_marker_object_id(shard_index: usize) -> String {
+        format!("__manifest_shard_marker_{:06}", shard_index)
+    }
+
+    fn manifest_shard_marker_batch(
+        schema: Arc<ArrowSchema>,
+        shard_index: usize,
+    ) -> Result<RecordBatch> {
+        let base_objects = Self::base_objects_array(&[None]);
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Self::shard_marker_object_id(
+                    shard_index,
+                )])),
+                Arc::new(StringArray::from(vec![ObjectType::ShardMarker.as_str()])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(base_objects),
+            ],
+        )
+        .map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to create manifest shard marker batch: {:?}", e),
+            })
+        })
+    }
+
     /// Get a scanner for the manifest dataset
     async fn manifest_scanner(&self) -> Result<Scanner> {
         let dataset_guard = self.manifest_dataset.get().await?;
         Ok(dataset_guard.scan())
+    }
+
+    async fn manifest_scanner_for_shard(&self, shard_index: usize) -> Result<Scanner> {
+        let dataset_guard = self.manifest_dataset.get().await?;
+        let fragment = Self::manifest_shard_fragment(&dataset_guard, shard_index)?;
+        let mut scanner = dataset_guard.scan();
+        scanner.with_fragments(vec![fragment]);
+        Ok(scanner)
+    }
+
+    async fn manifest_scanner_for_shard_key(&self, shard_key: &str) -> Result<Scanner> {
+        let Some(shard_count) = self.shard_count() else {
+            return self.manifest_scanner().await;
+        };
+        let shard_index = Self::shard_index_for_key(shard_count, shard_key);
+        self.manifest_scanner_for_shard(shard_index).await
     }
 
     /// Helper to execute a scanner and collect results into a Vec
@@ -1536,6 +1910,22 @@ impl ManifestNamespace {
             .ok_or_else(|| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Column '{}' is not a string array", column_name),
+                })
+            })
+    }
+
+    fn get_u64_column<'a>(batch: &'a RecordBatch, column_name: &str) -> Result<&'a UInt64Array> {
+        let column = batch.column_by_name(column_name).ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Column '{}' not found", column_name),
+            })
+        })?;
+        column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Column '{}' is not a uint64 array", column_name),
                 })
             })
     }
@@ -1604,8 +1994,60 @@ impl ManifestNamespace {
         Ok(values)
     }
 
+    fn append_manifest_index_batch(
+        index_data: &mut ManifestIndexAccumulator,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let object_ids = Self::get_string_column(batch, "object_id")?;
+        let object_types = Self::get_string_column(batch, "object_type")?;
+        let base_objects = Self::base_objects_column_values(batch)?;
+        let row_ids = Self::get_u64_column(batch, ROW_ID)?;
+
+        for (row, base_objects) in base_objects.into_iter().enumerate().take(batch.num_rows()) {
+            if row_ids.is_null(row) {
+                return Err(NamespaceError::Internal {
+                    message: format!("Manifest row id column has null at row {}", row),
+                }
+                .into());
+            }
+            let row_value = ManifestOutputRow {
+                object_id: Self::required_string_value(object_ids, row, "object_id")?,
+                object_type: ObjectType::parse(Self::required_string_value(
+                    object_types,
+                    row,
+                    "object_type",
+                )?)?,
+                location: None,
+                metadata: None,
+                base_objects: base_objects.as_deref(),
+            };
+            index_data.push_row_id(&row_value, row_ids.value(row))?;
+        }
+
+        Ok(())
+    }
+
     async fn manifest_projected_stream(dataset: &Dataset) -> Result<SendableRecordBatchStream> {
+        Self::manifest_projected_stream_for_fragments(dataset, None).await
+    }
+
+    async fn manifest_projected_stream_for_fragments(
+        dataset: &Dataset,
+        fragments: Option<Vec<Fragment>>,
+    ) -> Result<SendableRecordBatchStream> {
+        if fragments
+            .as_ref()
+            .is_some_and(|fragments| fragments.iter().all(|fragment| fragment.files.is_empty()))
+        {
+            return Ok(Box::pin(DatafusionRecordBatchStreamAdapter::new(
+                Self::manifest_schema(),
+                stream::empty(),
+            )));
+        }
         let mut scanner = dataset.scan();
+        if let Some(fragments) = fragments {
+            scanner.with_fragments(fragments);
+        }
         scanner
             .project(&[
                 "object_id",
@@ -1630,6 +2072,53 @@ impl ManifestNamespace {
             schema,
             stream.fuse(),
         )))
+    }
+
+    async fn collect_manifest_index_data_from_fragments(
+        dataset: &Dataset,
+        fragments: Vec<Fragment>,
+    ) -> Result<ManifestIndexAccumulator> {
+        let fragments = fragments
+            .into_iter()
+            .filter(|fragment| !fragment.files.is_empty())
+            .collect::<Vec<_>>();
+        let mut index_data = ManifestIndexAccumulator::default();
+        if fragments.is_empty() {
+            return Ok(index_data);
+        }
+
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(fragments);
+        scanner
+            .project(&[
+                "object_id",
+                "object_type",
+                "location",
+                "metadata",
+                "base_objects",
+            ])
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to project manifest columns: {:?}", e),
+                })
+            })?;
+        scanner.with_row_id();
+        let mut stream = scanner.try_into_stream().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to create manifest stream: {:?}", e),
+            })
+        })?;
+
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to read manifest index batch: {:?}", e),
+                })
+            })?;
+            Self::append_manifest_index_batch(&mut index_data, &batch)?;
+        }
+
+        Ok(index_data)
     }
 
     fn manifest_rewrite_commit_retries(&self) -> u32 {
@@ -1882,9 +2371,9 @@ impl ManifestNamespace {
     }
 
     /// Directly write the rewritten `__manifest` as a new version using the storage
-    /// backend's atomic put-if-not-exists. The overwrite transaction is embedded inline
+    /// backend's atomic put-if-not-exists. The transaction is embedded inline
     /// (no separate transaction file) and the commit handler writes the version hint.
-    async fn commit_manifest_overwrite(
+    async fn commit_manifest_transaction(
         &self,
         dataset: &Dataset,
         commit_handler: &dyn CommitHandler,
@@ -1997,12 +2486,15 @@ impl ManifestNamespace {
             let dataset = Arc::new(dataset_guard.clone());
             drop(dataset_guard);
             // Staged files, indices, the commit, and cleanup must all use the dataset's
-            // own object store (see `commit_manifest_overwrite`).
+            // own object store (see `commit_manifest_transaction`).
             let object_store = dataset.object_store(None).await?;
 
             let source = Self::manifest_projected_stream(&dataset).await?;
             let resolution = make_mutation().conflict_resolution();
-            let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(make_mutation())));
+            let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(
+                make_mutation(),
+                0,
+            )));
             let output_stream = Self::manifest_rewrite_output_stream(source, shared.clone());
             // Pin both limits so the overwrite never splits into multiple fragments: the
             // replacement indices map each row to address `(0 << 32) | offset`, valid only
@@ -2086,7 +2578,7 @@ impl ManifestNamespace {
             let staged_index_uuids: &[Uuid] = if build_indices { &index_uuids } else { &[] };
 
             let commit_result = self
-                .commit_manifest_overwrite(
+                .commit_manifest_transaction(
                     &dataset,
                     commit_handler.as_ref(),
                     &mut manifest,
@@ -2148,13 +2640,365 @@ impl ManifestNamespace {
         }
     }
 
-    /// Check if the manifest contains an object with the given ID
-    async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
-        let escaped_id = object_id.replace('\'', "''");
-        let filter = format!("object_id = '{}'", escaped_id);
+    fn manifest_shard_fragment(dataset: &Dataset, shard_index: usize) -> Result<Fragment> {
+        let mut fragments = dataset.manifest().fragments.iter().collect::<Vec<_>>();
+        fragments.sort_by_key(|fragment| fragment.id);
+        fragments
+            .get(shard_index)
+            .map(|fragment| (*fragment).clone())
+            .ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Manifest shard fragment {} is missing from __manifest",
+                        shard_index
+                    ),
+                })
+            })
+    }
 
-        let dataset_guard = self.manifest_dataset.get().await?;
-        let mut scanner = dataset_guard.scan();
+    fn staged_data_files(fragments: &[Fragment]) -> HashSet<String> {
+        fragments
+            .iter()
+            .flat_map(|fragment| fragment.files.iter())
+            .filter(|file| file.base_id.is_none())
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
+    fn all_manifest_field_ids(dataset: &Dataset) -> Vec<u32> {
+        dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.id as u32)
+            .collect()
+    }
+
+    fn manifest_with_replaced_fragment(
+        previous: &Manifest,
+        replacement_fragment: Fragment,
+    ) -> Result<Manifest> {
+        Self::manifest_with_replaced_fragments(previous, vec![replacement_fragment])
+    }
+
+    fn manifest_with_replaced_fragments(
+        previous: &Manifest,
+        replacement_fragments: Vec<Fragment>,
+    ) -> Result<Manifest> {
+        let mut replacements = HashMap::with_capacity(replacement_fragments.len());
+        for replacement_fragment in replacement_fragments {
+            if replacements
+                .insert(replacement_fragment.id, replacement_fragment)
+                .is_some()
+            {
+                return Err(NamespaceError::Internal {
+                    message: "Manifest shard replacement contained duplicate fragment ids"
+                        .to_string(),
+                }
+                .into());
+            }
+        }
+        let mut fragments = previous
+            .fragments
+            .iter()
+            .map(|fragment| {
+                if let Some(replacement_fragment) = replacements.remove(&fragment.id) {
+                    replacement_fragment
+                } else {
+                    fragment.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        if !replacements.is_empty() {
+            return Err(NamespaceError::Internal {
+                message: format!(
+                    "Manifest shard replacement fragments {:?} do not match existing fragments",
+                    replacements.keys().collect::<Vec<_>>()
+                ),
+            }
+            .into());
+        }
+        fragments.sort_by_key(|fragment| fragment.id);
+        Ok(Manifest::new_from_previous(
+            previous,
+            previous.schema.clone(),
+            Arc::new(fragments),
+        ))
+    }
+
+    async fn rewrite_manifest_shard<M, F>(
+        &self,
+        shard_index: usize,
+        operation: &str,
+        mut make_mutation: F,
+    ) -> Result<M::Output>
+    where
+        M: ManifestStreamMutation + 'static,
+        F: FnMut() -> M,
+    {
+        let _mutation_guard = self.manifest_mutation_lock.lock().await;
+        let max_retries = self.manifest_rewrite_commit_retries();
+        let mut retries = 0;
+        let build_indices = self.inline_optimization_enabled;
+        let commit_handler = self.manifest_commit_handler().await?;
+
+        loop {
+            let dataset_guard = self.manifest_dataset.get_refreshed().await?;
+            let dataset = Arc::new(dataset_guard.clone());
+            drop(dataset_guard);
+            let object_store = dataset.object_store(None).await?;
+
+            let old_fragment = Self::manifest_shard_fragment(&dataset, shard_index)?;
+            let shard_fragment_id = Self::fragment_id_for_row_address(old_fragment.id)?;
+            let source = Self::manifest_projected_stream_for_fragments(
+                &dataset,
+                Some(vec![old_fragment.clone()]),
+            )
+            .await?;
+            let resolution = make_mutation().conflict_resolution();
+            let shared = Arc::new(StdMutex::new(ManifestRewriteShared::new(
+                make_mutation(),
+                shard_fragment_id,
+            )));
+            let output_stream = Self::manifest_rewrite_output_stream(source, shared.clone());
+            let write_params = WriteParams {
+                mode: WriteMode::Append,
+                session: self.session.clone(),
+                max_rows_per_file: u32::MAX as usize,
+                max_bytes_per_file: usize::MAX,
+                skip_auto_cleanup: true,
+                ..WriteParams::default()
+            };
+
+            let append_transaction = match InsertBuilder::new(dataset.clone())
+                .with_params(&write_params)
+                .execute_uncommitted_stream(output_stream)
+                .await
+            {
+                Ok(transaction) => transaction,
+                Err(err) => {
+                    if let Some(stream_err) = Self::take_manifest_rewrite_error(&shared)? {
+                        return Err(stream_err);
+                    }
+                    return Err(convert_lance_commit_error(&err, operation, None));
+                }
+            };
+
+            let (mutation, shard_index_data) = Self::take_manifest_rewrite_result(&shared)?;
+            let Operation::Append { mut fragments } = append_transaction.operation else {
+                return Err(NamespaceError::Internal {
+                    message: "Manifest shard rewrite transaction is not an append".to_string(),
+                }
+                .into());
+            };
+            let staged_data_files = Self::staged_data_files(&fragments);
+
+            if !mutation.has_changes {
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                    .await;
+                return Ok(mutation.result);
+            }
+
+            if fragments.len() != 1 {
+                self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                    .await;
+                return Err(NamespaceError::Internal {
+                    message: format!(
+                        "Manifest shard rewrite expected one replacement fragment, got {}",
+                        fragments.len()
+                    ),
+                }
+                .into());
+            }
+
+            let mut replacement_fragment = fragments.remove(0);
+            replacement_fragment.id = old_fragment.id;
+            let update = Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![replacement_fragment.clone()],
+                new_fragments: vec![],
+                fields_modified: Self::all_manifest_field_ids(&dataset),
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            };
+            let update_transaction =
+                Transaction::new_from_version(dataset.manifest().version, update);
+            let mut manifest = match Self::manifest_with_replaced_fragment(
+                dataset.manifest(),
+                replacement_fragment,
+            ) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                        .await;
+                    return Err(err);
+                }
+            };
+            let target_version = manifest.version;
+
+            let mut staged_index_uuids = Vec::new();
+            let indices = if build_indices {
+                let existing_indices = match dataset.load_indices().await {
+                    Ok(indices) => indices.as_ref().clone(),
+                    Err(err) => {
+                        self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                            .await;
+                        return Err(err);
+                    }
+                };
+                let shard_local_indices = match Self::manifest_indices_are_shard_local(
+                    dataset.manifest(),
+                    &existing_indices,
+                ) {
+                    Ok(shard_local_indices) => shard_local_indices,
+                    Err(err) => {
+                        self.cleanup_staged_manifest_files(&object_store, &staged_data_files, &[])
+                            .await;
+                        return Err(err);
+                    }
+                };
+                if shard_local_indices {
+                    let index_uuids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+                    staged_index_uuids.extend(index_uuids.iter().copied());
+                    let replacement_indices = match Self::build_manifest_indices_for_fragment(
+                        &dataset,
+                        &manifest,
+                        shard_index_data,
+                        index_uuids,
+                        shard_fragment_id,
+                    )
+                    .await
+                    {
+                        Ok(indices) => indices,
+                        Err(err) => {
+                            self.cleanup_staged_manifest_files(
+                                &object_store,
+                                &staged_data_files,
+                                &staged_index_uuids,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    };
+                    Some(Self::replace_manifest_index_segments(
+                        existing_indices,
+                        shard_fragment_id,
+                        replacement_indices,
+                    ))
+                } else {
+                    let new_manifest_indices = match Self::build_all_manifest_shard_indices(
+                        &dataset,
+                        &manifest,
+                        shard_fragment_id,
+                        shard_index_data,
+                        &mut staged_index_uuids,
+                    )
+                    .await
+                    {
+                        Ok(indices) => indices,
+                        Err(err) => {
+                            self.cleanup_staged_manifest_files(
+                                &object_store,
+                                &staged_data_files,
+                                &staged_index_uuids,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    };
+                    Some(
+                        existing_indices
+                            .into_iter()
+                            .filter(|index| !Self::is_manifest_index_name(&index.name))
+                            .chain(new_manifest_indices)
+                            .collect(),
+                    )
+                }
+            } else {
+                None
+            };
+            let staged_index_uuids: &[Uuid] = if build_indices {
+                &staged_index_uuids
+            } else {
+                &[]
+            };
+
+            let commit_result = self
+                .commit_manifest_transaction(
+                    &dataset,
+                    commit_handler.as_ref(),
+                    &mut manifest,
+                    indices,
+                    update_transaction,
+                )
+                .await;
+
+            match commit_result {
+                Ok(()) => {
+                    let _ = self.manifest_dataset.get_refreshed().await;
+                    return Ok(mutation.result);
+                }
+                Err(err) => {
+                    if self
+                        .manifest_commit_landed(&dataset, target_version, &staged_data_files)
+                        .await
+                    {
+                        let _ = self.manifest_dataset.get_refreshed().await;
+                        return Ok(mutation.result);
+                    }
+                    self.cleanup_staged_manifest_files(
+                        &object_store,
+                        &staged_data_files,
+                        staged_index_uuids,
+                    )
+                    .await;
+                    match err {
+                        CommitError::CommitConflict => {
+                            if let Some(output) =
+                                self.resolve_manifest_conflict(&resolution).await?
+                            {
+                                return Ok(output);
+                            }
+                            if retries >= max_retries {
+                                return Err(NamespaceError::ConcurrentModification {
+                                    message: format!(
+                                        "{}: still conflicting after {} retries",
+                                        operation, max_retries
+                                    ),
+                                }
+                                .into());
+                            }
+                            retries += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                10 * u64::from(retries),
+                            ))
+                            .await;
+                        }
+                        CommitError::OtherError(err) => {
+                            return Err(convert_lance_commit_error(&err, operation, None));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn manifest_contains_object_in_shard(
+        &self,
+        object_id: &str,
+        shard_key: &str,
+    ) -> Result<bool> {
+        let escaped_id = object_id.replace('\'', "''");
+        let filter = format!(
+            "object_id = '{}' AND object_type != '{}'",
+            escaped_id,
+            ObjectType::ShardMarker.as_str()
+        );
+
+        let mut scanner = self.manifest_scanner_for_shard_key(shard_key).await?;
 
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
@@ -2180,11 +3024,36 @@ impl ManifestNamespace {
         Ok(count > 0)
     }
 
+    /// Check if the manifest contains an object with the given ID
+    async fn manifest_contains_object(&self, object_id: &str) -> Result<bool> {
+        let Some(shard_count) = self.shard_count() else {
+            return self
+                .manifest_contains_object_in_shard(object_id, object_id)
+                .await;
+        };
+
+        if self
+            .manifest_contains_object_in_shard(object_id, object_id)
+            .await?
+        {
+            return Ok(true);
+        }
+        if let Some(table_id) = Self::table_version_table_id_if_version_object_id(object_id)
+            && Self::shard_index_for_key(shard_count, table_id)
+                != Self::shard_index_for_key(shard_count, object_id)
+        {
+            return self
+                .manifest_contains_object_in_shard(object_id, table_id)
+                .await;
+        }
+        Ok(false)
+    }
+
     /// Query the manifest for a table with the given object ID
     async fn query_manifest_for_table(&self, object_id: &str) -> Result<Option<TableInfo>> {
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}' AND object_type = 'table'", escaped_id);
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self.manifest_scanner_for_shard_key(object_id).await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
@@ -2393,6 +3262,51 @@ impl ManifestNamespace {
             return Ok(());
         }
 
+        if let Some(shard_count) = self.shard_count() {
+            let mut grouped: HashMap<usize, Vec<(usize, ManifestEntry)>> = HashMap::new();
+            for (entry_index, entry) in entries.into_iter().enumerate() {
+                let shard_index =
+                    Self::shard_index_for_key(shard_count, Self::shard_key_for_entry(&entry));
+                grouped
+                    .entry(shard_index)
+                    .or_default()
+                    .push((entry_index, entry));
+            }
+
+            if grouped.len() > 1 {
+                return Err(NamespaceError::Unsupported {
+                    message: "Sharded manifest mode does not support multi-shard batch upserts"
+                        .to_string(),
+                }
+                .into());
+            }
+
+            for (shard_index, grouped_entries) in grouped {
+                let group_base_objects = grouped_entries
+                    .iter()
+                    .any(|(entry_index, _entry)| *entry_index == 0)
+                    .then(|| base_objects.clone())
+                    .flatten();
+                let entries = grouped_entries
+                    .into_iter()
+                    .map(|(_entry_index, entry)| entry)
+                    .collect::<Vec<_>>();
+                self.rewrite_manifest_shard(
+                    shard_index,
+                    "Failed to overwrite manifest shard",
+                    || {
+                        UpsertManifestMutation::new(
+                            entries.clone(),
+                            group_base_objects.clone(),
+                            when_matched.clone(),
+                        )
+                    },
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
         self.rewrite_manifest("Failed to overwrite manifest", || {
             UpsertManifestMutation::new(entries.clone(), base_objects.clone(), when_matched.clone())
         })
@@ -2402,11 +3316,30 @@ impl ManifestNamespace {
     /// Delete an entry from the manifest table
     pub async fn delete_from_manifest(&self, object_id: &str) -> Result<()> {
         let object_id = object_id.to_string();
+        if let Some(shard_indices) = self.delete_shard_indices_for_object_id(&object_id) {
+            for shard_index in shard_indices {
+                let deleted = self
+                    .rewrite_manifest_shard(
+                        shard_index,
+                        "Failed to delete from manifest shard",
+                        || DeleteObjectMutation {
+                            object_id: object_id.clone(),
+                            deleted: false,
+                        },
+                    )
+                    .await?;
+                if deleted {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
         self.rewrite_manifest("Failed to delete from manifest", || DeleteObjectMutation {
             object_id: object_id.clone(),
             deleted: false,
         })
         .await
+        .map(|_| ())
     }
 
     /// Query the manifest for all versions of a table, sorted by version.
@@ -2430,7 +3363,7 @@ impl ManifestNamespace {
             "object_type = 'table_version' AND starts_with(object_id, '{}{}')",
             escaped_id, DELIMITER
         );
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self.manifest_scanner_for_shard_key(object_id).await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
@@ -2498,7 +3431,9 @@ impl ManifestNamespace {
             "object_id = '{}' AND object_type = 'table_version'",
             escaped_id
         );
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self
+            .manifest_scanner_for_shard_key(Self::table_version_table_id(version_object_id))
+            .await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
@@ -2545,6 +3480,61 @@ impl ManifestNamespace {
         &self,
         table_ranges: &[(String, Vec<(i64, i64)>)],
     ) -> Result<i64> {
+        if let Some(shard_count) = self.shard_count() {
+            let mut grouped: TableVersionRangeGroupsByShard = HashMap::new();
+            for (object_id, ranges) in table_ranges {
+                let shard_index = Self::shard_index_for_key(shard_count, object_id);
+                grouped
+                    .entry(shard_index)
+                    .or_default()
+                    .push((object_id.clone(), ranges.clone()));
+            }
+
+            let mut shard_inputs = grouped
+                .into_iter()
+                .filter_map(|(shard_index, table_ranges)| {
+                    let targets = table_ranges
+                        .iter()
+                        .filter_map(|(object_id, ranges)| {
+                            let ranges = Self::normalize_table_version_ranges(ranges);
+                            if ranges.is_empty() {
+                                None
+                            } else {
+                                Some(DeleteTableVersionRangeTarget {
+                                    object_id_prefix: Self::build_version_object_id_prefix(
+                                        object_id,
+                                    ),
+                                    ranges,
+                                })
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    (!targets.is_empty()).then_some((shard_index, targets))
+                })
+                .collect::<Vec<_>>();
+            if shard_inputs.len() > 1 {
+                return Err(NamespaceError::Unsupported {
+                    message:
+                        "Sharded manifest mode does not support multi-shard table version deletes"
+                            .to_string(),
+                }
+                .into());
+            }
+            if let Some((shard_index, targets)) = shard_inputs.pop() {
+                return self
+                    .rewrite_manifest_shard(
+                        shard_index,
+                        "Failed to delete table versions from manifest shard",
+                        || DeleteTableVersionsMutation {
+                            target: DeleteTableVersionsTarget::Ranges(targets.clone()),
+                            deleted_count: 0,
+                        },
+                    )
+                    .await;
+            }
+            return Ok(0);
+        }
+
         let targets = table_ranges
             .iter()
             .filter_map(|(object_id, ranges)| {
@@ -2585,6 +3575,45 @@ impl ManifestNamespace {
     ) -> Result<i64> {
         if object_ids.is_empty() {
             return Ok(0);
+        }
+
+        if let Some(shard_count) = self.shard_count() {
+            let mut grouped: HashMap<usize, Vec<String>> = HashMap::new();
+            for object_id in object_ids {
+                let shard_index =
+                    Self::shard_index_for_key(shard_count, Self::table_version_table_id(object_id));
+                grouped
+                    .entry(shard_index)
+                    .or_default()
+                    .push(object_id.clone());
+            }
+
+            let mut shard_inputs = grouped
+                .into_iter()
+                .map(|(shard_index, object_ids)| {
+                    (shard_index, object_ids.into_iter().collect::<HashSet<_>>())
+                })
+                .collect::<Vec<_>>();
+            if shard_inputs.len() > 1 {
+                return Err(NamespaceError::Unsupported {
+                    message:
+                        "Sharded manifest mode does not support multi-shard table version deletes"
+                            .to_string(),
+                }
+                .into());
+            }
+            if let Some((shard_index, object_ids)) = shard_inputs.pop() {
+                return self
+                    .rewrite_manifest_shard(
+                        shard_index,
+                        "Failed to delete table versions from manifest shard",
+                        || DeleteTableVersionsMutation {
+                            target: DeleteTableVersionsTarget::ObjectIds(object_ids.clone()),
+                            deleted_count: 0,
+                        },
+                    )
+                    .await;
+            }
         }
 
         let object_ids = object_ids.iter().cloned().collect::<HashSet<_>>();
@@ -2754,7 +3783,7 @@ impl ManifestNamespace {
     async fn query_manifest_for_namespace(&self, object_id: &str) -> Result<Option<NamespaceInfo>> {
         let escaped_id = object_id.replace('\'', "''");
         let filter = format!("object_id = '{}' AND object_type = 'namespace'", escaped_id);
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self.manifest_scanner_for_shard_key(object_id).await?;
         scanner.filter(&filter).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!("Failed to filter: {:?}", e),
@@ -2831,7 +3860,15 @@ impl ManifestNamespace {
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
         table_version_storage_enabled: bool,
-    ) -> Result<DatasetConsistencyWrapper> {
+        manifest_fragment_shard_count: Option<usize>,
+    ) -> Result<(DatasetConsistencyWrapper, Option<usize>)> {
+        if matches!(manifest_fragment_shard_count, Some(0)) {
+            return Err(NamespaceError::InvalidInput {
+                message: "manifest_shard_count must be greater than 0".to_string(),
+            }
+            .into());
+        }
+
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
         let store_options = ObjectStoreParams {
@@ -2906,12 +3943,29 @@ impl ManifestNamespace {
                 }
             }
 
-            Ok(DatasetConsistencyWrapper::new(dataset))
+            let effective_shard_count =
+                Self::resolve_manifest_shard_count(&mut dataset, manifest_fragment_shard_count)
+                    .await?;
+            Ok((
+                DatasetConsistencyWrapper::new(dataset),
+                effective_shard_count,
+            ))
         } else {
             log::info!("Creating new manifest table at {}", manifest_path);
             let schema = Self::manifest_schema();
-            let empty_batch = RecordBatch::new_empty(schema.clone());
-            let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+            let batches = if let Some(shard_count) = manifest_fragment_shard_count {
+                let mut batches = Vec::with_capacity(shard_count);
+                for shard_index in 0..shard_count {
+                    batches.push(Self::manifest_shard_marker_batch(
+                        schema.clone(),
+                        shard_index,
+                    )?);
+                }
+                batches
+            } else {
+                vec![RecordBatch::new_empty(schema.clone())]
+            };
+            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
             let store_params = ObjectStoreParams {
                 storage_options_accessor: storage_options.as_ref().map(|opts| {
@@ -2926,6 +3980,9 @@ impl ManifestNamespace {
             let write_params = WriteParams {
                 session: session.clone(),
                 store_params: Some(store_params),
+                max_rows_per_file: manifest_fragment_shard_count
+                    .map(|_| MANIFEST_FRAGMENT_SHARD_MARKER_ROWS_PER_FILE)
+                    .unwrap_or(WriteParams::default().max_rows_per_file),
                 ..Default::default()
             };
 
@@ -2934,14 +3991,22 @@ impl ManifestNamespace {
 
             // Handle race condition where another process created the manifest concurrently
             match dataset {
-                Ok(dataset) => {
+                Ok(mut dataset) => {
                     log::info!(
                         "Successfully created manifest table at {}, version={}, uri={}",
                         manifest_path,
                         dataset.version().version,
                         dataset.uri()
                     );
-                    Ok(DatasetConsistencyWrapper::new(dataset))
+                    let effective_shard_count = Self::resolve_manifest_shard_count(
+                        &mut dataset,
+                        manifest_fragment_shard_count,
+                    )
+                    .await?;
+                    Ok((
+                        DatasetConsistencyWrapper::new(dataset),
+                        effective_shard_count,
+                    ))
                 }
                 Err(ref e)
                     if matches!(
@@ -2972,7 +4037,7 @@ impl ManifestNamespace {
                         store_options: Some(recovery_store_options),
                         ..Default::default()
                     };
-                    let dataset = DatasetBuilder::from_uri(&manifest_path)
+                    let mut dataset = DatasetBuilder::from_uri(&manifest_path)
                         .with_read_params(recovery_read_params)
                         .load()
                         .await
@@ -2984,7 +4049,15 @@ impl ManifestNamespace {
                                 ),
                             })
                         })?;
-                    Ok(DatasetConsistencyWrapper::new(dataset))
+                    let effective_shard_count = Self::resolve_manifest_shard_count(
+                        &mut dataset,
+                        manifest_fragment_shard_count,
+                    )
+                    .await?;
+                    Ok((
+                        DatasetConsistencyWrapper::new(dataset),
+                        effective_shard_count,
+                    ))
                 }
                 Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
                     message: format!("Failed to create manifest dataset: {:?}", e),
@@ -4013,7 +5086,7 @@ mod tests {
     use bytes::Bytes;
     use futures::StreamExt;
     use lance::index::DatasetIndexExt;
-    use lance_core::utils::tempfile::TempStdDir;
+    use lance_core::utils::{address::RowAddress, tempfile::TempStdDir};
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
@@ -4021,6 +5094,7 @@ mod tests {
         ListTablesRequest, TableExistsRequest,
     };
     use lance_table::format::Fragment;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -4036,6 +5110,21 @@ mod tests {
         root: &str,
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
+    ) -> ManifestNamespace {
+        create_manifest_namespace_with_shards(
+            root,
+            inline_optimization_enabled,
+            commit_retries,
+            None,
+        )
+        .await
+    }
+
+    async fn create_manifest_namespace_with_shards(
+        root: &str,
+        inline_optimization_enabled: bool,
+        commit_retries: Option<u32>,
+        manifest_fragment_shard_count: Option<usize>,
     ) -> ManifestNamespace {
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
@@ -4054,6 +5143,7 @@ mod tests {
             inline_optimization_enabled,
             commit_retries,
             false,
+            manifest_fragment_shard_count,
         )
         .await
         .unwrap()
@@ -4139,7 +5229,7 @@ mod tests {
     }
 
     impl ManifestStreamMutation for ConcurrentDeleteBeforeCommitMutation {
-        type Output = ();
+        type Output = bool;
 
         fn process_existing_row(
             &mut self,
@@ -4176,7 +5266,7 @@ mod tests {
         fn conflict_resolution(&self) -> ConflictResolution<Self::Output> {
             ConflictResolution::SucceedIfAbsent {
                 object_id: self.target.clone(),
-                output: (),
+                output: true,
             }
         }
     }
@@ -4410,6 +5500,121 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_manifest_index_accumulator_uses_fragment_row_addresses() {
+        let mut index_data = ManifestIndexAccumulator::new(7);
+        let row_id = index_data
+            .push(&ManifestOutputRow {
+                object_id: "table",
+                object_type: ObjectType::Table,
+                location: Some("table.lance"),
+                metadata: None,
+                base_objects: Some(&["base".to_string()]),
+            })
+            .unwrap();
+
+        assert_eq!(row_id, u64::from(RowAddress::new_from_parts(7, 0)));
+        assert_eq!(
+            index_data.object_ids.get("table").copied(),
+            Some(u64::from(RowAddress::new_from_parts(7, 0)))
+        );
+        assert_eq!(
+            index_data
+                .object_types
+                .get(ObjectType::Table.as_str())
+                .unwrap(),
+            &vec![u64::from(RowAddress::new_from_parts(7, 0))]
+        );
+        assert_eq!(
+            index_data.base_objects_row_ids,
+            vec![u64::from(RowAddress::new_from_parts(7, 0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sharded_manifest_rewrite_builds_shard_local_index_segments() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let shard_count = 4;
+        let manifest_ns =
+            create_manifest_namespace_with_shards(temp_path, true, None, Some(shard_count)).await;
+
+        let first_id = "table_a".to_string();
+        let first_shard = ManifestNamespace::shard_index_for_key(shard_count, &first_id);
+        let second_id = (0..)
+            .map(|index| format!("table_b_{}", index))
+            .find(|object_id| {
+                ManifestNamespace::shard_index_for_key(shard_count, object_id) != first_shard
+            })
+            .unwrap();
+
+        for object_id in [&first_id, &second_id] {
+            manifest_ns
+                .insert_into_manifest_with_metadata(
+                    vec![ManifestEntry {
+                        object_id: object_id.clone(),
+                        object_type: ObjectType::Table,
+                        location: Some(format!("{}.lance", object_id)),
+                        metadata: None,
+                    }],
+                    Some(vec!["base".to_string()]),
+                )
+                .await
+                .unwrap();
+        }
+
+        let dataset_guard = manifest_ns.manifest_dataset.get().await.unwrap();
+        let dataset_version = dataset_guard.version().version;
+        let expected_fragments = dataset_guard
+            .manifest()
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(expected_fragments.len(), shard_count);
+
+        let indices = dataset_guard.load_indices().await.unwrap();
+        let names = indices
+            .iter()
+            .map(|index| index.name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            names,
+            HashSet::from([
+                OBJECT_ID_INDEX_NAME,
+                OBJECT_TYPE_INDEX_NAME,
+                BASE_OBJECTS_INDEX_NAME
+            ])
+        );
+        assert_eq!(indices.len(), shard_count * 3);
+        assert!(
+            indices
+                .iter()
+                .any(|index| index.dataset_version == dataset_version)
+        );
+
+        for index_name in [
+            OBJECT_ID_INDEX_NAME,
+            OBJECT_TYPE_INDEX_NAME,
+            BASE_OBJECTS_INDEX_NAME,
+        ] {
+            let mut covered_fragments = RoaringBitmap::new();
+            let mut segment_count = 0;
+            for index in indices.iter().filter(|index| index.name == index_name) {
+                let fragment_bitmap = index.fragment_bitmap.as_ref().unwrap();
+                assert_eq!(fragment_bitmap.len(), 1);
+                assert_eq!(covered_fragments.intersection_len(fragment_bitmap), 0);
+                covered_fragments |= fragment_bitmap.clone();
+                segment_count += 1;
+            }
+            assert_eq!(segment_count, shard_count);
+            assert_eq!(
+                covered_fragments.into_iter().collect::<Vec<_>>(),
+                expected_fragments
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_manifest_delete_table_versions_by_ranges() {
         let temp_dir = TempStdDir::default();
@@ -4492,6 +5697,141 @@ mod tests {
             .map(|(version, _)| version)
             .collect::<Vec<_>>();
         assert_eq!(remaining, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn test_sharded_manifest_rejects_multi_shard_insert_without_partial_write() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let shard_count = 4;
+        let manifest_ns =
+            create_manifest_namespace_with_shards(temp_path, false, None, Some(shard_count)).await;
+
+        let existing_id = "existing_table".to_string();
+        let existing_shard = ManifestNamespace::shard_index_for_key(shard_count, &existing_id);
+        let different_shard_id = (0..)
+            .map(|index| format!("new_table_{}", index))
+            .find(|object_id| {
+                ManifestNamespace::shard_index_for_key(shard_count, object_id) != existing_shard
+            })
+            .unwrap();
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: existing_id.clone(),
+                    object_type: ObjectType::Table,
+                    location: Some("existing_table.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let version_before = manifest_ns
+            .manifest_dataset
+            .get()
+            .await
+            .unwrap()
+            .version()
+            .version;
+
+        let result = manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![
+                    ManifestEntry {
+                        object_id: different_shard_id.clone(),
+                        object_type: ObjectType::Table,
+                        location: Some("new_table.lance".to_string()),
+                        metadata: None,
+                    },
+                    ManifestEntry {
+                        object_id: existing_id.clone(),
+                        object_type: ObjectType::Table,
+                        location: Some("duplicate.lance".to_string()),
+                        metadata: None,
+                    },
+                ],
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("multi-shard"));
+        assert!(
+            !manifest_ns
+                .manifest_contains_object(&different_shard_id)
+                .await
+                .unwrap()
+        );
+        let dataset_after = manifest_ns.manifest_dataset.get_refreshed().await.unwrap();
+        assert_eq!(dataset_after.version().version, version_before);
+        assert_eq!(dataset_after.count_fragments(), shard_count);
+    }
+
+    #[tokio::test]
+    async fn test_sharded_manifest_marker_ids_do_not_conflict_with_user_objects() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let shard_count = 3;
+        let manifest_ns =
+            create_manifest_namespace_with_shards(temp_path, false, None, Some(shard_count)).await;
+        let marker_object_id = ManifestNamespace::shard_marker_object_id(2);
+        assert_eq!(
+            ManifestNamespace::shard_index_for_key(shard_count, &marker_object_id),
+            2
+        );
+
+        assert!(
+            !manifest_ns
+                .manifest_contains_object(&marker_object_id)
+                .await
+                .unwrap()
+        );
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: marker_object_id.clone(),
+                    object_type: ObjectType::Table,
+                    location: Some("marker_table.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            manifest_ns
+                .manifest_contains_object(&marker_object_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            manifest_ns
+                .query_manifest_for_table(&marker_object_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        manifest_ns
+            .delete_from_manifest(&marker_object_id)
+            .await
+            .unwrap();
+        assert!(
+            !manifest_ns
+                .manifest_contains_object(&marker_object_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            manifest_ns
+                .query_manifest_for_table(&marker_object_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

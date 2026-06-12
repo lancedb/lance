@@ -1,10 +1,12 @@
 # `__manifest` commit benchmark
 
-Measures how fast the copy-on-write directory catalog commits `__manifest` mutations as
-the manifest scales, with the inline scalar indices on or off.
+Measures how fast the directory catalog commits `__manifest` mutations as the
+manifest scales, with copy-on-write and optional fragment sharding.
 
-The catalog commits every mutation by rewriting the whole `__manifest` (copy-on-write)
-and atomically writing a new manifest version. This benchmark characterises:
+Without sharding, the catalog commits every mutation by rewriting the whole
+`__manifest` (copy-on-write) and atomically writing a new manifest version. With
+`--manifest-shard-count`, the catalog keeps one physical `__manifest` fragment per
+shard and rewrites only the target fragment. This benchmark characterises:
 
 - **Continuous commit** — a single process commits `N` times into a manifest already
   holding `rows` entries (per-commit latency + throughput).
@@ -15,23 +17,33 @@ and atomically writing a new manifest version. This benchmark characterises:
 
 ```
 manifest_bench seed-large --root <uri> --count <rows> --inline-optimization <true|false> \
-    [--storage-option aws_region=us-east-1]
+    [--manifest-shard-count <shards>] [--storage-option aws_region=us-east-1]
 manifest_bench run --root <uri> --operation write-create-namespace \
-    --concurrency 1 --operations 100 --initial-entries <rows> --inline-optimization <bool>   # continuous
+    --concurrency 1 --operations 100 --initial-entries <rows> --inline-optimization <bool> \
+    [--manifest-shard-count <shards>]   # continuous
 manifest_bench run --root <uri> --operation write-create-namespace \
-    --concurrency 50 --duration-secs 30 --initial-entries <rows> --inline-optimization <bool> # concurrent
+    --concurrency 50 --duration-secs 30 --initial-entries <rows> --inline-optimization <bool> \
+    [--manifest-shard-count <shards>]   # concurrent
 ```
 
 - `seed-large` bootstraps a manifest to `count` rows by writing the Lance dataset
   directly (O(rows) once) and then triggering one CoW rewrite so the on-disk state
   matches the steady catalog form (single fragment; inline indices when enabled).
+  With `--manifest-shard-count`, it writes exactly one fragment per shard; when inline
+  indices are enabled, the setup rewrite is routed through a single shard so the shard
+  layout is preserved while the full inline index section is built.
 - `run` spawns `--concurrency` worker subprocesses. With `--operations` it runs a fixed
   commit budget (continuous); with `--duration-secs` each worker commits until the
   deadline (steady TPS). It prints one JSON `BenchResult` per concurrency level with
-  throughput and p50/p90/p99 latency.
+  throughput, p50/p90/p99 latency, and `manifest_shard_count`.
 - The committed operation (`--operation`) defaults to `write-create-namespace`, the
   cheapest pure-`__manifest` mutation (no table data). `write-create-table` /
   `write-declare-table` are also available.
+- Sharding reduces the amount of data rewritten per commit. It does not remove the
+  single-version commit serialization point, so high-concurrency runs still contend on
+  the `__manifest` dataset version. When inline optimization is enabled, sharded
+  rewrites rebuild the inline scalar index section with row addresses across all
+  manifest fragments.
 
 S3 requires the default `dir-aws` feature (on by default) and AWS credentials in the
 environment; pass `--storage-option aws_region=<region>`.
@@ -48,9 +60,12 @@ S3_BASE=s3://<bucket>/manifest-cow-bench/$(date -u +%Y%m%dT%H%M%SZ) \
   rust/lance-namespace-impls/benches/manifest_commit_sweep.sh
 ```
 
+Set `MANIFEST_SHARD_COUNT=1000` to run the same panel against a sharded
+`__manifest`. Leave it unset or set it to `0` for the copy-on-write baseline.
+
 Default panel (override via env): `SIZES="1000 2000 5000 10000 20000 50000 100000 200000
 500000 1000000"`, `CONCURRENCY="10 20 50 100 120 150 200"`, `INLINE_VARIANTS="true false"`,
-`CONT_OPS=100`, `CONC_DURATION_SECS=30`. Results land in `$OUT_DIR` (default
+`CONT_OPS=100`, `CONC_DURATION_SECS=30`, `MANIFEST_SHARD_COUNT=0`. Results land in `$OUT_DIR` (default
 `~/manifest_cow_bench_<RUN_ID>`).
 
 ## Representative results
