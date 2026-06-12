@@ -5548,20 +5548,42 @@ mod tests {
             })
             .unwrap();
 
-        for object_id in [&first_id, &second_id] {
-            manifest_ns
-                .insert_into_manifest_with_metadata(
-                    vec![ManifestEntry {
-                        object_id: object_id.clone(),
-                        object_type: ObjectType::Table,
-                        location: Some(format!("{}.lance", object_id)),
-                        metadata: None,
-                    }],
-                    Some(vec!["base".to_string()]),
-                )
-                .await
-                .unwrap();
-        }
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: first_id.clone(),
+                    object_type: ObjectType::Table,
+                    location: Some(format!("{}.lance", first_id)),
+                    metadata: None,
+                }],
+                Some(vec!["base".to_string()]),
+            )
+            .await
+            .unwrap();
+        let indices_after_first_insert = manifest_ns
+            .manifest_dataset
+            .get()
+            .await
+            .unwrap()
+            .load_indices()
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        assert_eq!(indices_after_first_insert.len(), shard_count * 3);
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: second_id.clone(),
+                    object_type: ObjectType::Table,
+                    location: Some(format!("{}.lance", second_id)),
+                    metadata: None,
+                }],
+                Some(vec!["base".to_string()]),
+            )
+            .await
+            .unwrap();
 
         let dataset_guard = manifest_ns.manifest_dataset.get().await.unwrap();
         let dataset_version = dataset_guard.version().version;
@@ -5574,6 +5596,41 @@ mod tests {
         assert_eq!(expected_fragments.len(), shard_count);
 
         let indices = dataset_guard.load_indices().await.unwrap();
+        let first_insert_uuids = indices_after_first_insert
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<HashSet<_>>();
+        let retained_segment_count = indices
+            .iter()
+            .filter(|index| first_insert_uuids.contains(&index.uuid))
+            .count();
+        assert_eq!(retained_segment_count, (shard_count - 1) * 3);
+        let second_shard = ManifestNamespace::shard_index_for_key(shard_count, &second_id) as u32;
+        assert_eq!(
+            indices_after_first_insert
+                .iter()
+                .filter(|index| index
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(second_shard))
+                .count(),
+            3
+        );
+        assert_eq!(
+            indices
+                .iter()
+                .filter(|index| {
+                    index
+                        .fragment_bitmap
+                        .as_ref()
+                        .unwrap()
+                        .contains(second_shard)
+                        && !first_insert_uuids.contains(&index.uuid)
+                })
+                .count(),
+            3
+        );
         let names = indices
             .iter()
             .map(|index| index.name.as_str())

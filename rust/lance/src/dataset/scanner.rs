@@ -2864,6 +2864,11 @@ impl Scanner {
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
             .with_projection(projection);
+        let target_fragment_bitmap = fragments.as_ref().map(|fragments| {
+            Arc::new(RoaringBitmap::from_iter(
+                fragments.iter().map(|fragment| fragment.id as u32),
+            ))
+        });
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
@@ -2899,11 +2904,12 @@ impl Scanner {
 
         let result_format = self.index_expr_result_format();
         let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(
-                self.dataset.clone(),
-                index_query,
-                result_format,
-            )) as Arc<dyn ExecutionPlan>
+            let mut index_exec =
+                ScalarIndexExec::new(self.dataset.clone(), index_query, result_format);
+            if let Some(target_fragment_bitmap) = target_fragment_bitmap.clone() {
+                index_exec = index_exec.with_fragment_bitmap(target_fragment_bitmap);
+            }
+            Arc::new(index_exec) as Arc<dyn ExecutionPlan>
         });
 
         Ok(Arc::new(FilteredReadExec::try_new(
