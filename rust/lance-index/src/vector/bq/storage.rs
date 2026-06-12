@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::vector::ApproxMode;
+use crate::vector::bq::dist_table_quant::{quantize_dist_table_into, quantize_dist_table_u16_into};
 use crate::vector::bq::ex_dot::{
     EX_DOT_BLOCK_DIMS, ExDotFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
@@ -1343,68 +1344,6 @@ where
         // where lowbit(0b1010) = 0b10, LOWBIT_IDX[0b1010] = LOWBIT_IDX[0b10] = 1.
         dist_table[j] = dist_table[j - lowbit(j)] + sub_vec[LOWBIT_IDX[j]].as_();
     })
-}
-
-// Quantize the distance table into a caller-owned buffer.
-#[inline]
-fn quantize_dist_table_into(dist_table: &[f32], quantized_dist_table: &mut Vec<u8>) -> (f32, f32) {
-    let (qmin, qmax) = dist_table
-        .iter()
-        .cloned()
-        .minmax_by(|a, b| a.total_cmp(b))
-        .into_option()
-        .unwrap();
-    // this happens if the query is all zeros
-    if qmin == qmax {
-        quantized_dist_table.clear();
-        quantized_dist_table.resize(dist_table.len(), 0);
-        return (qmin, qmax);
-    }
-    let factor = 255.0 / (qmax - qmin);
-    quantized_dist_table.clear();
-    quantized_dist_table.reserve(dist_table.len());
-    let spare = quantized_dist_table.spare_capacity_mut();
-    for (quantized, &d) in spare[..dist_table.len()].iter_mut().zip(dist_table.iter()) {
-        quantized.write(((d - qmin) * factor).round() as u8);
-    }
-    // SAFETY: every element in the reserved range was initialized in the loop above.
-    unsafe {
-        quantized_dist_table.set_len(dist_table.len());
-    }
-
-    (qmin, qmax)
-}
-
-#[inline]
-fn quantize_dist_table_u16_into(
-    dist_table: &[f32],
-    quantized_dist_table: &mut Vec<u16>,
-) -> (f32, f32) {
-    let (qmin, qmax) = dist_table
-        .iter()
-        .cloned()
-        .minmax_by(|a, b| a.total_cmp(b))
-        .into_option()
-        .unwrap();
-    if qmin == qmax {
-        quantized_dist_table.clear();
-        quantized_dist_table.resize(dist_table.len(), 0);
-        return (qmin, qmax);
-    }
-
-    let factor = u16::MAX as f32 / (qmax - qmin);
-    quantized_dist_table.clear();
-    quantized_dist_table.reserve(dist_table.len());
-    let spare = quantized_dist_table.spare_capacity_mut();
-    for (quantized, &d) in spare[..dist_table.len()].iter_mut().zip(dist_table.iter()) {
-        quantized.write(((d - qmin) * factor).round() as u16);
-    }
-    // SAFETY: every element in the reserved range was initialized in the loop above.
-    unsafe {
-        quantized_dist_table.set_len(dist_table.len());
-    }
-
-    (qmin, qmax)
 }
 
 /// Build the u8 FastScan LUT for the ex codes directly from the rotated
