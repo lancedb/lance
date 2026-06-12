@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
@@ -2156,4 +2157,19 @@ public class Dataset implements Closeable {
   }
 
   private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
+
+  /**
+   * Explain cleanup based on a specified policy without deleting files.
+   *
+   * @param policy cleanup policy
+   * @return cleanup explanation
+   */
+  public CleanupExplanation explainCleanupWithPolicy(CleanupPolicy policy) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExplainCleanupWithPolicy(policy);
+    }
+  }
+
+  private native CleanupExplanation nativeExplainCleanupWithPolicy(CleanupPolicy policy);
 }

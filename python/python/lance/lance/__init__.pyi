@@ -95,6 +95,26 @@ class CleanupStats:
     index_files_removed: int
     deletion_files_removed: int
 
+class CleanupCandidateFile:
+    path: str
+    kind: str
+    unverified: bool
+    size_bytes: int
+
+class CleanupReferencedBranch:
+    name: str
+    referenced_version: int
+    cleanup_candidate: bool
+
+class CleanupExplanation:
+    read_version: int
+    stats: CleanupStats
+    candidate_files: List[CleanupCandidateFile]
+    candidate_files_truncated: bool
+    candidate_file_limit: int
+    referenced_branches: List[CleanupReferencedBranch]
+    warnings: List[str]
+
 class LanceFileWriter:
     def __init__(
         self,
@@ -342,11 +362,22 @@ class _Dataset:
     def restore(self): ...
     def cleanup_old_versions(
         self,
-        older_than_micros: int,
+        older_than_micros: Optional[int] = None,
+        retain_versions: Optional[int] = None,
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
         delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats: ...
+    def explain_cleanup_old_versions(
+        self,
+        older_than_micros: Optional[int] = None,
+        retain_versions: Optional[int] = None,
+        delete_unverified: Optional[bool] = None,
+        error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
+        include_files: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupExplanation: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
     def tags(self) -> Dict[str, Tag]: ...

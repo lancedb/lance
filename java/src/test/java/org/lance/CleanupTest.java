@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 
@@ -49,6 +50,38 @@ public class CleanupTest {
         assertEquals(2L, stats.getTransactionFilesRemoved());
         assertEquals(0L, stats.getIndexFilesRemoved());
         assertEquals(0L, stats.getDeletionFilesRemoved());
+      }
+    }
+  }
+
+  @Test
+  public void testExplainCleanupBeforeVersion(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      testDataset.createEmptyDataset().close();
+
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+
+      try (Dataset dataset = testDataset.write(3, 10)) {
+        CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
+        CleanupExplanation explanation = dataset.explainCleanupWithPolicy(policy);
+
+        assertEquals(2L, explanation.getStats().getOldVersions());
+        assertEquals(2L, explanation.getStats().getTransactionFilesRemoved());
+        assertTrue(explanation.getStats().getBytesRemoved() > 0);
+        assertTrue(explanation.getReadVersion() > 0);
+        assertTrue(explanation.getCandidateFiles().size() > 0);
+        assertTrue(explanation.getReferencedBranches().isEmpty());
+
+        List<Version> versions = dataset.listVersions();
+        assertEquals(4, versions.size());
+
+        RemovalStats stats = dataset.cleanupWithPolicy(policy);
+        assertEquals(explanation.getStats().getOldVersions(), stats.getOldVersions());
       }
     }
   }

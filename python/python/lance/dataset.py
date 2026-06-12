@@ -51,6 +51,7 @@ from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
+    CleanupExplanation,
     CleanupStats,
     Compaction,
     CompactionMetrics,
@@ -2974,6 +2975,64 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+        )
+
+    def explain_cleanup_old_versions(
+        self,
+        older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
+        *,
+        delete_unverified: bool = False,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+        include_files: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupExplanation:
+        """
+        Explain what :meth:`cleanup_old_versions` would remove without deleting files.
+
+        Parameters
+        ----------
+
+        older_than: timedelta, optional
+            Only versions older than this would be removed. If ``older_than`` and
+            ``retain_versions`` are not specified, this will default to two weeks.
+
+        retain_versions: int, optional
+            Retain the last N versions of the dataset.
+
+        delete_unverified: bool, default False
+            Include unverified files that cleanup would remove when this is set.
+
+        error_if_tagged_old_versions: bool, default True
+            If set to `True`, an exception will be raised if any tagged versions
+            match the parameters. Otherwise, tagged versions will be ignored.
+
+        delete_rate_limit: int, optional
+            Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
+            issued by explain.
+
+        include_files: bool, default False
+            If `True`, include candidate files in the explanation up to
+            ``max_files`` entries. Aggregate stats always include all candidates.
+
+        max_files: int, default 1000
+            Maximum number of candidate files to include when ``include_files``
+            is `True`.
+        """
+        if older_than is None and retain_versions is None:
+            older_than = timedelta(days=14)
+        if max_files <= 0:
+            raise ValueError("max_files must be positive")
+
+        return self._ds.explain_cleanup_old_versions(
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+            include_files,
+            max_files,
         )
 
     def _prepare_scalar_index_request(
