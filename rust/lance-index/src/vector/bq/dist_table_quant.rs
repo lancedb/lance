@@ -42,13 +42,18 @@ pub fn quantize_dist_table_into(
 ) -> (f32, f32) {
     debug_assert!(!dist_table.is_empty(), "dist table must be non-empty");
     let (qmin, qmax) = min_max(dist_table);
-    // this happens if the query is all zeros
-    if qmin == qmax {
+    let range = qmax - qmin;
+    let factor = u8::MAX as f32 / range;
+    // A zero range happens if the query is all zeros. A non-finite `range`
+    // or `factor` (table spread overflowing f32 or below ~255/f32::MAX)
+    // would produce NaN/inf products on which the kernels' saturating
+    // narrows disagree. Either way the table carries no information at u8
+    // resolution: emit a zeroed LUT that callers reconstruct from `min`.
+    if !range.is_finite() || !factor.is_finite() {
         quantized_dist_table.clear();
         quantized_dist_table.resize(dist_table.len(), 0);
         return (qmin, qmax);
     }
-    let factor = u8::MAX as f32 / (qmax - qmin);
     quantized_dist_table.clear();
     quantized_dist_table.reserve(dist_table.len());
     quantize_u8(
@@ -72,12 +77,15 @@ pub fn quantize_dist_table_u16_into(
 ) -> (f32, f32) {
     debug_assert!(!dist_table.is_empty(), "dist table must be non-empty");
     let (qmin, qmax) = min_max(dist_table);
-    if qmin == qmax {
+    let range = qmax - qmin;
+    let factor = u16::MAX as f32 / range;
+    // See quantize_dist_table_into: degenerate ranges collapse to a zeroed
+    // LUT to keep all kernels bit-exact.
+    if !range.is_finite() || !factor.is_finite() {
         quantized_dist_table.clear();
         quantized_dist_table.resize(dist_table.len(), 0);
         return (qmin, qmax);
     }
-    let factor = u16::MAX as f32 / (qmax - qmin);
     quantized_dist_table.clear();
     quantized_dist_table.reserve(dist_table.len());
     quantize_u16(
@@ -485,10 +493,11 @@ mod tests {
 
     fn reference_u8(values: &[f32]) -> (Vec<u8>, f32, f32) {
         let (qmin, qmax) = reference_min_max(values);
-        if qmin == qmax {
+        let range = qmax - qmin;
+        let factor = u8::MAX as f32 / range;
+        if !range.is_finite() || !factor.is_finite() {
             return (vec![0; values.len()], qmin, qmax);
         }
-        let factor = u8::MAX as f32 / (qmax - qmin);
         let quantized = values
             .iter()
             .map(|&d| ((d - qmin) * factor).round_ties_even() as u8)
@@ -498,10 +507,11 @@ mod tests {
 
     fn reference_u16(values: &[f32]) -> (Vec<u16>, f32, f32) {
         let (qmin, qmax) = reference_min_max(values);
-        if qmin == qmax {
+        let range = qmax - qmin;
+        let factor = u16::MAX as f32 / range;
+        if !range.is_finite() || !factor.is_finite() {
             return (vec![0; values.len()], qmin, qmax);
         }
-        let factor = u16::MAX as f32 / (qmax - qmin);
         let quantized = values
             .iter()
             .map(|&d| ((d - qmin) * factor).round_ties_even() as u16)
@@ -554,31 +564,36 @@ mod tests {
                 "kernel={name} len={}",
                 values.len()
             );
-            if qmin == qmax {
-                continue;
+
+            // The public entry points never hand a degenerate factor to the
+            // quantize kernels; mirror that here.
+            let factor_u8 = u8::MAX as f32 / (qmax - qmin);
+            if (qmax - qmin).is_finite() && factor_u8.is_finite() {
+                let mut out_u8 = Vec::with_capacity(values.len());
+                quantize_u8_fn(
+                    values,
+                    qmin,
+                    factor_u8,
+                    &mut out_u8.spare_capacity_mut()[..values.len()],
+                );
+                // SAFETY: the kernel initialized every element.
+                unsafe { out_u8.set_len(values.len()) };
+                assert_eq!(out_u8, expected_u8, "kernel={name} len={}", values.len());
             }
 
-            let mut out_u8 = Vec::with_capacity(values.len());
-            quantize_u8_fn(
-                values,
-                qmin,
-                u8::MAX as f32 / (qmax - qmin),
-                &mut out_u8.spare_capacity_mut()[..values.len()],
-            );
-            // SAFETY: the kernel initialized every element.
-            unsafe { out_u8.set_len(values.len()) };
-            assert_eq!(out_u8, expected_u8, "kernel={name} len={}", values.len());
-
-            let mut out_u16 = Vec::with_capacity(values.len());
-            quantize_u16_fn(
-                values,
-                qmin,
-                u16::MAX as f32 / (qmax - qmin),
-                &mut out_u16.spare_capacity_mut()[..values.len()],
-            );
-            // SAFETY: the kernel initialized every element.
-            unsafe { out_u16.set_len(values.len()) };
-            assert_eq!(out_u16, expected_u16, "kernel={name} len={}", values.len());
+            let factor_u16 = u16::MAX as f32 / (qmax - qmin);
+            if (qmax - qmin).is_finite() && factor_u16.is_finite() {
+                let mut out_u16 = Vec::with_capacity(values.len());
+                quantize_u16_fn(
+                    values,
+                    qmin,
+                    factor_u16,
+                    &mut out_u16.spare_capacity_mut()[..values.len()],
+                );
+                // SAFETY: the kernel initialized every element.
+                unsafe { out_u16.set_len(values.len()) };
+                assert_eq!(out_u16, expected_u16, "kernel={name} len={}", values.len());
+            }
         }
 
         // The public entry points exercise the dispatched kernels plus the
@@ -662,6 +677,40 @@ mod tests {
         let (qmin, qmax) = quantize_dist_table_u16_into(&values, &mut quantized);
         assert_eq!((qmin, qmax), (value, value));
         assert_eq!(quantized, vec![0; 100]);
+    }
+
+    /// Degenerate finite ranges make `factor` (or `range` itself) non-finite
+    /// and must collapse to a zeroed LUT on every kernel: NaN/inf products
+    /// would otherwise hit the saturating narrows, which disagree across
+    /// scalar, AVX2, and AVX-512.
+    #[test]
+    fn test_degenerate_range_zeroes_table() {
+        // factor = 255 / 1e-38 overflows to +inf.
+        let mut tiny_range = vec![0.0f32; 32];
+        tiny_range[1] = 1e-38;
+        // qmax - qmin overflows to +inf, so factor is 0 and products are NaN.
+        let mut huge_range = vec![0.0f32; 32];
+        huge_range[0] = -2e38;
+        huge_range[1] = 2e38;
+        // factor = 65535 / 1e-35 overflows only in the u16 variant; the u8
+        // variant still quantizes normally.
+        let mut u16_only = vec![0.0f32; 32];
+        u16_only[1] = 1e-35;
+
+        for values in [&tiny_range, &huge_range, &u16_only] {
+            check_against_reference(values);
+        }
+        let mut quantized_u8 = Vec::new();
+        let (qmin, qmax) = quantize_dist_table_into(&tiny_range, &mut quantized_u8);
+        assert_eq!((qmin, qmax), (0.0, 1e-38));
+        assert_eq!(quantized_u8, vec![0; 32]);
+        quantize_dist_table_into(&huge_range, &mut quantized_u8);
+        assert_eq!(quantized_u8, vec![0; 32]);
+        let mut quantized_u16 = Vec::new();
+        quantize_dist_table_u16_into(&u16_only, &mut quantized_u16);
+        assert_eq!(quantized_u16, vec![0; 32]);
+        quantize_dist_table_into(&u16_only, &mut quantized_u8);
+        assert_eq!(quantized_u8[1], u8::MAX);
     }
 
     /// `-0.0 == 0.0` must keep taking the all-equal early-out even though
