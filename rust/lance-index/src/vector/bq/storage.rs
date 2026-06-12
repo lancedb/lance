@@ -17,7 +17,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use itertools::Itertools;
+use itertools::{Itertools, izip};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
@@ -48,6 +48,7 @@ use crate::vector::bq::ex_dot::{
     EX_DOT_BLOCK_DIMS, ExDotFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
 };
+use crate::vector::bq::prune::{LowerBoundTerms, PRUNE_LANES, prune_mask_kernel};
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
@@ -136,16 +137,28 @@ fn emit_rabit_prune_stats(message: &str) {
     );
 }
 
-fn record_rabit_prune_stats(
+/// Per-scan tallies of the raw-query lower-bound gating, reported through
+/// `record_rabit_prune_stats`.
+#[derive(Default)]
+struct RabitPruneCounters {
     candidates: usize,
     pruned_upper_bound: usize,
     pruned_heap: usize,
     exact: usize,
     exact_rejected: usize,
-) {
+}
+
+fn record_rabit_prune_stats(counters: &RabitPruneCounters) {
     if !rabit_prune_stats_enabled() {
         return;
     }
+    let RabitPruneCounters {
+        candidates,
+        pruned_upper_bound,
+        pruned_heap,
+        exact,
+        exact_rejected,
+    } = *counters;
 
     let stats = RABIT_PRUNE_STATS.get_or_init(RabitPruneStats::default);
     let calls = stats.calls.fetch_add(1, Ordering::Relaxed) + 1;
@@ -798,6 +811,20 @@ struct RabitDistCalculatorParts<'a> {
     approx_mode: ApproxMode,
 }
 
+/// Loop-invariant inputs of the raw-query multi-bit top-k scans: the row
+/// count, the resolved ex-code state for exact reranking, and the query
+/// bounds.
+struct RawQueryTopkContext<'a> {
+    n: usize,
+    k: usize,
+    ex_bits: u8,
+    ex_codes: &'a [u8],
+    ex_add_factors: &'a [f32],
+    ex_scale_factors: &'a [f32],
+    query_lower_bound: f32,
+    query_upper_bound: f32,
+}
+
 /// Pick the query slice the ex-dot kernels consume: the rotated query itself
 /// when the dim is block-aligned, otherwise a zero-padded copy.
 fn kernel_query<'a>(rotated_query: &'a [f32], padded: &'a [f32]) -> &'a [f32] {
@@ -1212,6 +1239,107 @@ impl<'a> RabitDistCalculator<'a> {
         full_dot * ex_scale_factors[id] + ex_add_factors[id] + self.query_factor
     }
 
+    /// Compute the binary inner products into `dists` and resolve the inputs
+    /// shared by the raw-query multi-bit top-k scans. Returns `None` when the
+    /// partition has no rows.
+    #[allow(clippy::too_many_arguments)]
+    fn raw_query_multi_bit_topk_context(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
+    ) -> Option<RawQueryTopkContext<'_>> {
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let n = self.codes.len() / code_len;
+        if n == 0 {
+            dists.clear();
+            quantized_dists.clear();
+            hacc_quantized_dists.clear();
+            return None;
+        }
+
+        self.binary_distances_with_scratch(
+            n,
+            code_len,
+            dists,
+            quantized_dists,
+            quantized_dists_table,
+            hacc_quantized_dists,
+        );
+
+        Some(RawQueryTopkContext {
+            n,
+            k,
+            ex_bits: self.num_bits - 1,
+            ex_codes: self
+                .ex_codes
+                .expect("raw-query multi-bit RQ requires ex codes"),
+            ex_add_factors: self
+                .ex_add_factors
+                .expect("raw-query multi-bit RQ requires ex add factors"),
+            ex_scale_factors: self
+                .ex_scale_factors
+                .expect("raw-query multi-bit RQ requires ex scale factors"),
+            query_lower_bound: lower_bound.unwrap_or(f32::MIN),
+            query_upper_bound: upper_bound.unwrap_or(f32::MAX),
+        })
+    }
+
+    /// Process one candidate row given its lower bound: the bound checks,
+    /// the exact rerank, and the heap update shared by the sparse scan and
+    /// the dense scan's surviving lanes and tail.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_raw_query_multi_bit_row(
+        &self,
+        ctx: &RawQueryTopkContext<'_>,
+        id: usize,
+        row_id: u64,
+        binary_ip: f32,
+        raw_lower_bound: f32,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        max_dist: &mut Option<OrderedFloat>,
+        counters: &mut RabitPruneCounters,
+    ) {
+        if raw_lower_bound >= ctx.query_upper_bound {
+            counters.pruned_upper_bound += 1;
+            return;
+        }
+        if res.len() >= ctx.k && max_dist.is_some_and(|max_dist| raw_lower_bound >= max_dist.0) {
+            counters.pruned_heap += 1;
+            return;
+        }
+
+        counters.exact += 1;
+        let dist = self.raw_query_multi_bit_exact_distance(
+            id,
+            binary_ip,
+            ctx.ex_bits,
+            ctx.ex_codes,
+            ctx.ex_add_factors,
+            ctx.ex_scale_factors,
+        );
+        if dist < ctx.query_lower_bound || dist >= ctx.query_upper_bound {
+            counters.exact_rejected += 1;
+            return;
+        }
+        let dist = OrderedFloat(dist);
+        if res.len() < ctx.k {
+            res.push(OrderedNode::new(row_id, dist));
+            if res.len() == ctx.k {
+                *max_dist = res.peek().map(|node| node.dist);
+            }
+        } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+            res.pop();
+            res.push(OrderedNode::new(row_id, dist));
+            *max_dist = res.peek().map(|node| node.dist);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accumulate_raw_query_multi_bit_topk_with_scratch(
         &self,
@@ -1225,92 +1353,151 @@ impl<'a> RabitDistCalculator<'a> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) {
-        let code_len = rabit_binary_code_bytes(self.dim);
-        let n = self.codes.len() / code_len;
-        if n == 0 {
-            dists.clear();
-            quantized_dists.clear();
-            hacc_quantized_dists.clear();
-            return;
-        }
-
-        self.binary_distances_with_scratch(
-            n,
-            code_len,
+        let Some(ctx) = self.raw_query_multi_bit_topk_context(
+            k,
+            lower_bound,
+            upper_bound,
             dists,
             quantized_dists,
             quantized_dists_table,
             hacc_quantized_dists,
-        );
-
-        let ex_bits = self.num_bits - 1;
-        let ex_codes = self
-            .ex_codes
-            .expect("raw-query multi-bit RQ requires ex codes");
-        let ex_add_factors = self
-            .ex_add_factors
-            .expect("raw-query multi-bit RQ requires ex add factors");
-        let ex_scale_factors = self
-            .ex_scale_factors
-            .expect("raw-query multi-bit RQ requires ex scale factors");
-        let query_lower_bound = lower_bound.unwrap_or(f32::MIN);
-        let query_upper_bound = upper_bound.unwrap_or(f32::MAX);
+        ) else {
+            return;
+        };
         let mut max_dist = res.peek().map(|node| node.dist);
-        let mut candidates = 0;
-        let mut pruned_upper_bound = 0;
-        let mut pruned_heap = 0;
-        let mut exact = 0;
-        let mut exact_rejected = 0;
+        let mut counters = RabitPruneCounters::default();
 
         for (id, row_id) in row_ids {
             let Some(binary_ip) = dists.get(id).copied() else {
                 continue;
             };
-            candidates += 1;
+            counters.candidates += 1;
             let Some(raw_lower_bound) = self.raw_query_lower_bound(id, binary_ip) else {
                 continue;
             };
-            if raw_lower_bound >= query_upper_bound {
-                pruned_upper_bound += 1;
-                continue;
-            }
-            if res.len() >= k && max_dist.is_some_and(|max_dist| raw_lower_bound >= max_dist.0) {
-                pruned_heap += 1;
-                continue;
-            }
-
-            exact += 1;
-            let dist = self.raw_query_multi_bit_exact_distance(
+            self.accumulate_raw_query_multi_bit_row(
+                &ctx,
                 id,
+                row_id,
                 binary_ip,
-                ex_bits,
-                ex_codes,
-                ex_add_factors,
-                ex_scale_factors,
+                raw_lower_bound,
+                res,
+                &mut max_dist,
+                &mut counters,
             );
-            if dist < query_lower_bound || dist >= query_upper_bound {
-                exact_rejected += 1;
-                continue;
-            }
-            let dist = OrderedFloat(dist);
-            if res.len() < k {
-                res.push(OrderedNode::new(row_id, dist));
-                if res.len() == k {
-                    max_dist = res.peek().map(|node| node.dist);
-                }
-            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-                res.pop();
-                res.push(OrderedNode::new(row_id, dist));
-                max_dist = res.peek().map(|node| node.dist);
+        }
+        record_rabit_prune_stats(&counters);
+    }
+
+    /// Top-k scan over all rows `0..n` in order: classify [`PRUNE_LANES`]
+    /// rows at a time with the SIMD lower-bound kernel and run the scalar
+    /// rerank only for the surviving lanes.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_raw_query_multi_bit_topk_dense_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
+    ) {
+        let Some(ctx) = self.raw_query_multi_bit_topk_context(
+            k,
+            lower_bound,
+            upper_bound,
+            dists,
+            quantized_dists,
+            quantized_dists_table,
+            hacc_quantized_dists,
+        ) else {
+            return;
+        };
+        let dists = dists.as_slice();
+        debug_assert_eq!(dists.len(), ctx.n);
+        let scale_factors = &self.scale_factors[..ctx.n];
+        let add_factors = &self.add_factors[..ctx.n];
+        let error_factors = &self
+            .error_factors
+            .expect("raw-query lower-bound gating requires error factors")[..ctx.n];
+        // Same expression as `raw_query_lower_bound` with `error_factors`
+        // already resolved; the masks below match it bit for bit.
+        let lower_bound_of = |id: usize, binary_ip: f32| {
+            self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error
+        };
+        let terms = LowerBoundTerms {
+            half_sum_q: 0.5 * self.sum_q,
+            query_factor: self.query_factor,
+            query_error: self.query_error,
+        };
+        let prune_masks = prune_mask_kernel();
+        let mut max_dist = res.peek().map(|node| node.dist);
+        let mut counters = RabitPruneCounters::default();
+
+        let (dist_groups, dist_tail) = dists.as_chunks::<PRUNE_LANES>();
+        let (scale_groups, _) = scale_factors.as_chunks::<PRUNE_LANES>();
+        let (add_groups, _) = add_factors.as_chunks::<PRUNE_LANES>();
+        let (error_groups, _) = error_factors.as_chunks::<PRUNE_LANES>();
+        for (group, (dist16, scale16, add16, error16)) in
+            izip!(dist_groups, scale_groups, add_groups, error_groups).enumerate()
+        {
+            counters.candidates += PRUNE_LANES;
+            // The heap threshold only ever tightens, so this group-start
+            // snapshot can only over-select survivors (which the per-row
+            // processing below re-checks against live values), never prune a
+            // row the scalar scan would have kept.
+            let heap_threshold = (res.len() >= ctx.k)
+                .then(|| max_dist.map(|max_dist| max_dist.0))
+                .flatten();
+            let (pruned_upper_bound, pruned_heap) = prune_masks(
+                dist16,
+                scale16,
+                add16,
+                error16,
+                terms,
+                ctx.query_upper_bound,
+                heap_threshold,
+            );
+            counters.pruned_upper_bound += pruned_upper_bound.count_ones() as usize;
+            counters.pruned_heap += pruned_heap.count_ones() as usize;
+            let mut survivors = !(pruned_upper_bound | pruned_heap);
+            while survivors != 0 {
+                let lane = survivors.trailing_zeros() as usize;
+                survivors &= survivors - 1;
+                let id = group * PRUNE_LANES + lane;
+                let binary_ip = dists[id];
+                self.accumulate_raw_query_multi_bit_row(
+                    &ctx,
+                    id,
+                    row_id(id as u32),
+                    binary_ip,
+                    lower_bound_of(id, binary_ip),
+                    res,
+                    &mut max_dist,
+                    &mut counters,
+                );
             }
         }
-        record_rabit_prune_stats(
-            candidates,
-            pruned_upper_bound,
-            pruned_heap,
-            exact,
-            exact_rejected,
-        );
+
+        let tail_start = ctx.n - dist_tail.len();
+        for (offset, binary_ip) in dist_tail.iter().copied().enumerate() {
+            let id = tail_start + offset;
+            counters.candidates += 1;
+            self.accumulate_raw_query_multi_bit_row(
+                &ctx,
+                id,
+                row_id(id as u32),
+                binary_ip,
+                lower_bound_of(id, binary_ip),
+                res,
+                &mut max_dist,
+                &mut counters,
+            );
+        }
+        record_rabit_prune_stats(&counters);
     }
 
     fn raw_query_lower_bound_gating_disabled_reason(&self) -> Option<&'static str> {
@@ -1717,13 +1904,11 @@ impl DistCalculator for RabitDistCalculator<'_> {
             return;
         }
 
-        let code_len = rabit_binary_code_bytes(self.dim);
-        let n = self.codes.len() / code_len;
-        self.accumulate_raw_query_multi_bit_topk_with_scratch(
+        self.accumulate_raw_query_multi_bit_topk_dense_with_scratch(
             k,
             lower_bound,
             upper_bound,
-            (0..n).map(|id| (id, row_id(id as u32))),
+            row_id,
             res,
             dists,
             quantized_dists,
@@ -2526,6 +2711,8 @@ mod tests {
     use arrow_array::{ArrayRef, Float32Array, Float64Array, UInt64Array};
     use lance_core::ROW_ID;
     use lance_linalg::distance::DistanceType;
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
     use rstest::rstest;
 
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
@@ -3738,6 +3925,200 @@ mod tests {
                 (actual_dist - expected_dist).abs() < 1e-5,
                 "actual={actual_dist}, expected={expected_dist}"
             );
+        }
+    }
+
+    /// Inputs crafted so the top-k scan outcomes are fully determined by the
+    /// factor columns: with zero scale factors, a zero query factor, and a
+    /// query error of one, the lower bound is
+    /// `add_factors[id] - error_factors[id]`, and with zero ex scale factors
+    /// the exact distance is `ex_add_factors[id]`, regardless of the random
+    /// codes and query.
+    struct CraftedTopkData {
+        codes: Vec<u8>,
+        ex_codes: Vec<u8>,
+        dist_table: Vec<f32>,
+        ex_query: Vec<f32>,
+        scale_factors: Vec<f32>,
+        add_factors: Vec<f32>,
+        error_factors: Vec<f32>,
+        ex_scale_factors: Vec<f32>,
+        ex_add_factors: Vec<f32>,
+    }
+
+    const CRAFTED_TOPK_DIM: usize = 64;
+    const CRAFTED_TOPK_NUM_BITS: u8 = 5;
+
+    impl CraftedTopkData {
+        fn new(
+            exact_dists: &[f32],
+            lower_bound_margins: &[f32],
+            error_factors: Vec<f32>,
+            rng: &mut SmallRng,
+        ) -> Self {
+            let n = exact_dists.len();
+            let code_len = rabit_binary_code_bytes(CRAFTED_TOPK_DIM);
+            let ex_code_len = blocked_ex_code_bytes(CRAFTED_TOPK_DIM, CRAFTED_TOPK_NUM_BITS - 1);
+            let add_factors = izip!(exact_dists, lower_bound_margins, &error_factors)
+                .map(|(dist, margin, error)| dist - margin + error)
+                .collect();
+            Self {
+                codes: (0..n * code_len).map(|_| rng.random()).collect(),
+                ex_codes: (0..n * ex_code_len).map(|_| rng.random()).collect(),
+                dist_table: (0..CRAFTED_TOPK_DIM * 4)
+                    .map(|_| rng.random_range(-1.0f32..1.0))
+                    .collect(),
+                ex_query: (0..CRAFTED_TOPK_DIM)
+                    .map(|_| rng.random_range(-1.0f32..1.0))
+                    .collect(),
+                scale_factors: vec![0.0; n],
+                add_factors,
+                error_factors,
+                ex_scale_factors: vec![0.0; n],
+                ex_add_factors: exact_dists.to_vec(),
+            }
+        }
+
+        fn calculator(&self, approx_mode: ApproxMode) -> RabitDistCalculator<'_> {
+            RabitDistCalculator::new(
+                CRAFTED_TOPK_DIM,
+                CRAFTED_TOPK_NUM_BITS,
+                RabitQueryEstimator::RawQuery,
+                Cow::Borrowed(self.dist_table.as_slice()),
+                Cow::Borrowed(self.ex_query.as_slice()),
+                0.7,
+                &self.codes,
+                Some(&self.ex_codes),
+                blocked_ex_code_bytes(CRAFTED_TOPK_DIM, CRAFTED_TOPK_NUM_BITS - 1),
+                &self.add_factors,
+                &self.scale_factors,
+                Some(&self.error_factors),
+                Some(&self.ex_add_factors),
+                Some(&self.ex_scale_factors),
+                None,
+                0.0,
+                1.0,
+                approx_mode,
+            )
+        }
+    }
+
+    fn canonical_heap_rows(heap: BinaryHeap<OrderedNode<u64>>) -> Vec<(u32, u64)> {
+        let mut rows = heap
+            .into_iter()
+            .map(|node| (node.dist.0.to_bits(), node.id))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// The dense (SIMD-pruned) scan must reproduce the sparse scalar scan
+    /// exactly: identical heap contents including row ids, and the k smallest
+    /// in-bounds exact distances overall.
+    #[rstest]
+    fn test_raw_query_multi_bit_topk_dense_matches_sparse(
+        #[values(ApproxMode::Normal, ApproxMode::Accurate)] approx_mode: ApproxMode,
+        #[values("descending", "ascending", "random", "duplicates", "duplicate_ties")]
+        ordering: &str,
+    ) {
+        for n in [1usize, 15, 16, 17, 100, 4109] {
+            let mut rng = SmallRng::seed_from_u64(n as u64 * 31 + ordering.len() as u64);
+            let exact_dists: Vec<f32> = match ordering {
+                // Improving rows force constant heap updates.
+                "descending" => (0..n).map(|id| (n - id) as f32).collect(),
+                // Worsening rows force mass pruning, the common regime.
+                "ascending" => (0..n).map(|id| id as f32).collect(),
+                "random" => (0..n).map(|_| rng.random_range(0.0..n as f32)).collect(),
+                "duplicates" => (0..n).map(|id| (id % 7) as f32).collect(),
+                // Lower bound equals the distance, so heap-threshold and
+                // upper-bound comparisons hit exact `>=` ties.
+                "duplicate_ties" => (0..n).map(|id| (id % 5) as f32).collect(),
+                _ => unreachable!(),
+            };
+            let (margins, error_factors) = if ordering == "duplicate_ties" {
+                (vec![0.0; n], vec![0.0; n])
+            } else if ordering == "random" {
+                (
+                    (0..n).map(|_| rng.random_range(0.0f32..2.0)).collect(),
+                    (0..n).map(|_| rng.random_range(0.0f32..1.0)).collect(),
+                )
+            } else {
+                (
+                    vec![1.0; n],
+                    (0..n).map(|_| rng.random_range(0.0f32..1.0)).collect(),
+                )
+            };
+            let data = CraftedTopkData::new(&exact_dists, &margins, error_factors, &mut rng);
+            let calc = data.calculator(approx_mode);
+            assert!(
+                calc.raw_query_lower_bound_gating_disabled_reason()
+                    .is_none()
+            );
+
+            let max_dist = exact_dists.iter().fold(0.0f32, |acc, dist| acc.max(*dist));
+            for k in [1usize, 10, n + 7] {
+                for bounds in [(None, None), (Some(max_dist * 0.25), Some(max_dist * 0.7))] {
+                    let (lower_bound, upper_bound) = bounds;
+                    let mut dense_heap = BinaryHeap::new();
+                    let mut sparse_heap = BinaryHeap::new();
+                    let mut dists = Vec::new();
+                    let mut u16_scratch = Vec::new();
+                    let mut u8_scratch = Vec::new();
+                    let mut u32_scratch = Vec::new();
+                    // Two passes sharing the heap, as IVF partition probing
+                    // does: the second pass starts with a full, tight heap.
+                    for pass in 0..2u64 {
+                        let offset = pass * n as u64;
+                        calc.accumulate_topk_with_scratch(
+                            k,
+                            lower_bound,
+                            upper_bound,
+                            |id| id as u64 + offset,
+                            &mut dense_heap,
+                            &mut dists,
+                            &mut u16_scratch,
+                            &mut u8_scratch,
+                            &mut u32_scratch,
+                        );
+                        calc.accumulate_filtered_topk_with_scratch(
+                            k,
+                            lower_bound,
+                            upper_bound,
+                            (0..n as u32).map(|id| (id, id as u64 + offset)),
+                            |_| true,
+                            &mut sparse_heap,
+                            &mut dists,
+                            &mut u16_scratch,
+                            &mut u8_scratch,
+                            &mut u32_scratch,
+                        );
+                    }
+                    let dense = canonical_heap_rows(dense_heap);
+                    let sparse = canonical_heap_rows(sparse_heap);
+                    assert_eq!(
+                        dense, sparse,
+                        "ordering={ordering} n={n} k={k} bounds={bounds:?} mode={approx_mode:?}"
+                    );
+
+                    // The distance multiset must be the k smallest in-bounds
+                    // distances over both passes. Row ids are not compared:
+                    // evictions among tied maxima depend on heap layout.
+                    let query_lower_bound = lower_bound.unwrap_or(f32::MIN);
+                    let query_upper_bound = upper_bound.unwrap_or(f32::MAX);
+                    let mut expected = (0..2 * n)
+                        .map(|row| exact_dists[row % n])
+                        .filter(|dist| *dist >= query_lower_bound && *dist < query_upper_bound)
+                        .map(|dist| dist.to_bits())
+                        .collect::<Vec<_>>();
+                    expected.sort_unstable();
+                    expected.truncate(k);
+                    let actual = dense.iter().map(|(dist, _)| *dist).collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "ordering={ordering} n={n} k={k} bounds={bounds:?} mode={approx_mode:?}"
+                    );
+                }
+            }
         }
     }
 
