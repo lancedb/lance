@@ -28,3 +28,22 @@ pub use pk::{
 };
 pub use pk_hash_filter::PkHashFilterExec;
 pub use within_source_dedup::{DedupDirection, WithinSourceDedupExec};
+
+/// Give each union arm its own driver task. `UnionExec` exposes one
+/// partition per arm, but a downstream `SortPreservingMergeExec` polls them
+/// all from a single task, serializing per-arm CPU (index decode, scoring)
+/// even though the IO awaits interleave. Round-robin repartitioning spawns
+/// one pull task per input partition; rows stay disjoint across partitions,
+/// so per-partition TopK + merge semantics are unchanged.
+pub fn spawn_union_arms(
+    union: std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+) -> lance_core::Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    let n = union.properties().partitioning.partition_count();
+    let repart = RepartitionExec::try_new(
+        union,
+        datafusion::physical_plan::Partitioning::RoundRobinBatch(n),
+    )
+    .map_err(|e| lance_core::Error::internal(format!("repartition union arms: {e}")))?;
+    Ok(std::sync::Arc::new(repart))
+}

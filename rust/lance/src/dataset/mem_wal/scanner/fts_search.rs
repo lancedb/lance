@@ -52,7 +52,7 @@ use tracing::instrument;
 use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{DedupDirection, PkHashFilterExec, WithinSourceDedupExec};
+use super::exec::{DedupDirection, PkHashFilterExec, WithinSourceDedupExec, spawn_union_arms};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
@@ -167,23 +167,39 @@ impl LsmFtsSearchPlanner {
         .await?;
         let overfetch = self.overfetch_factor.max(1.0);
 
+        // Stage the per-source over-fetch decisions, then build every source
+        // plan concurrently — the builds are independent and a sequential loop
+        // was the dominant serial planning cost at multiple generations.
+        let arm_inputs: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+                let blocked = block_lists.get(&(source.shard_id(), source.generation()));
+                // Over-fetch a blocked source so the post-filter still yields k live
+                // rows. The active arm returns all matches (no builder limit), so its
+                // within-source dedup needs no over-fetch hint.
+                let fetch_k = if blocked.is_some() {
+                    ((k as f64) * overfetch).ceil() as usize
+                } else {
+                    k
+                };
+                (source, is_active, blocked, fetch_k)
+            })
+            .collect();
+        let built =
+            futures::future::try_join_all(arm_inputs.iter().map(
+                |(source, is_active, _, fetch_k)| {
+                    Box::pin(self.build_source_plan(
+                        source, column, &query, *fetch_k, projection, *is_active,
+                    ))
+                },
+            ))
+            .await?;
+
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
-        for source in &sources {
-            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
-            let blocked = block_lists.get(&(source.shard_id(), source.generation()));
-            // Over-fetch a blocked source so the post-filter still yields k live
-            // rows. The active arm returns all matches (no builder limit), so its
-            // within-source dedup needs no over-fetch hint.
-            let fetch_k = if blocked.is_some() {
-                ((k as f64) * overfetch).ceil() as usize
-            } else {
-                k
-            };
-
-            let plan = self
-                .build_source_plan(source, column, &query, fetch_k, projection, is_active)
-                .await?;
-
+        for ((_, is_active, blocked, _), plan) in arm_inputs.iter().zip(built) {
+            let is_active = *is_active;
+            let blocked = *blocked;
             // Dedup, mirroring LsmVectorSearchPlanner:
             //  * active: collapse duplicate-PK appends to the newest insert
             //    (larger _rowid = inserted later). The FTS index is append-only,
@@ -220,7 +236,10 @@ impl LsmFtsSearchPlanner {
         } else {
             #[allow(deprecated)]
             let union: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(per_source_plans));
-            union
+            // Per-arm driver tasks: without this the downstream merge polls
+            // every arm from one task and per-arm CPU (posting decode, BM25)
+            // serializes.
+            spawn_union_arms(union)?
         };
 
         let score_idx = merged.schema().index_of(SCORE_COLUMN).map_err(|_| {
