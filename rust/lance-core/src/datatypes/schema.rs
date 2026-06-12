@@ -11,7 +11,7 @@ use std::{
 
 use crate::deepsize::DeepSizeOf;
 use arrow_array::RecordBatch;
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
@@ -108,6 +108,29 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
             None
         }
     }
+}
+
+/// Reject `FixedSizeList` types whose dimension is not a positive integer.
+///
+/// The row count of a fixed-size list is derived by dividing the number of
+/// child items by the dimension, so a zero dimension panics with a
+/// divide-by-zero further down the write path (see issue #5102). A
+/// `FixedSizeList` of a `FixedSizeList` over a primitive collapses into a
+/// single leaf field, so the pre-order field walk never visits the inner list;
+/// recurse through the nested list types here to catch an inner zero dimension.
+///
+/// Shared by [`Schema::validate`] on the write path and the decoder's
+/// field-scheduler builders on the read path.
+pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataType) -> Result<()> {
+    if let DataType::FixedSizeList(inner, dimension) = data_type {
+        if *dimension <= 0 {
+            return Err(Error::schema(format!(
+                "Field \"{field_name}\" contains a FixedSizeList with dimension {dimension}; dimension must be a positive integer"
+            )));
+        }
+        validate_fixed_size_list_dimensions(field_name, inner.data_type())?;
+    }
+    Ok(())
 }
 
 impl Schema {
@@ -346,6 +369,10 @@ impl Schema {
                     field.id, self
                 )));
             }
+            // The row count of a fixed-size list is derived by dividing the
+            // number of items by the dimension, so a zero dimension would
+            // panic with a divide-by-zero further down the write path.
+            validate_fixed_size_list_dimensions(&field.name, &field.data_type())?;
         }
 
         Ok(())
@@ -2823,6 +2850,67 @@ mod tests {
         assert!(paths.contains(&"id".to_string()));
         assert!(paths.contains(&"vector".to_string()));
         assert!(paths.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_dimension_fixed_size_list() {
+        // A zero dimension divides-by-zero further down the write path (#5102)
+        let fsl = |dimension: i32| {
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", ArrowDataType::Float32, true)),
+                dimension,
+            )
+        };
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", fsl(0), true)]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // Nested inside a struct is rejected too
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "outer",
+            ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "vec",
+                fsl(0),
+                true,
+            )])),
+            true,
+        )]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A zero-dimension FixedSizeList nested inside a positive-dimension
+        // FixedSizeList collapses into a single leaf field, so the inner
+        // dimension is not visited by the pre-order field walk and must still
+        // be rejected: FixedSizeList(FixedSizeList(Float32, 0), 4).
+        let nested =
+            ArrowDataType::FixedSizeList(Arc::new(ArrowField::new("inner", fsl(0), true)), 4);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", nested, true)]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A positive dimension still validates, including nested lists
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", fsl(2), true)]);
+        assert!(Schema::try_from(&arrow_schema).is_ok());
+        let nested_ok =
+            ArrowDataType::FixedSizeList(Arc::new(ArrowField::new("inner", fsl(2), true)), 4);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", nested_ok, true)]);
+        assert!(Schema::try_from(&arrow_schema).is_ok());
     }
 
     #[test]
