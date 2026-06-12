@@ -22,6 +22,8 @@ import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.ScanStats;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -153,6 +155,51 @@ public class ScannerTest {
           Schema expectedSchema =
               new Schema(Arrays.asList(Field.nullable("id", new ArrowType.Int(32, true))));
           assertEquals(expectedSchema, scanner.schema());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetScannerExportArrowStream(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_export_stream").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 40;
+      int batchRows = 20;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(batchRows)
+                    .columns(Arrays.asList("id"))
+                    .build())) {
+          // Caller allocates the C stream from their own allocator; the scanner only fills the
+          // C struct. This is the path callers loaded by a different classloader use to avoid
+          // sharing Java Arrow vector classes with Lance.
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream);
+            try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              int index = 0;
+              while (reader.loadNextBatch()) {
+                List<FieldVector> fieldVectors = root.getFieldVectors();
+                assertEquals(1, fieldVectors.size());
+                FieldVector fieldVector = fieldVectors.get(0);
+                assertEquals(
+                    ArrowType.ArrowTypeID.Int, fieldVector.getField().getType().getTypeID());
+                assertEquals(batchRows, fieldVector.getValueCount());
+                IntVector vector = (IntVector) fieldVector;
+                for (int i = 0; i < batchRows; i++) {
+                  assertEquals(index, vector.get(i));
+                  index++;
+                }
+              }
+              assertEquals(totalRows, index);
+            }
+          }
         }
       }
     }
