@@ -812,6 +812,19 @@ fn decompress_bulk<T: OffsetSizeTrait>(
 ) -> io::Result<()> {
     let symbols = decoder.symbols;
     let lens = decoder.lens;
+
+    // A code byte can decode to an 8-byte symbol and the loop below writes 8 bytes
+    // at a time via raw pointers, so size the buffer for the worst case (it is
+    // shrunk to the real size at the end).
+    let max_decoded = compressed_strs
+        .len()
+        .saturating_mul(MAX_SYMBOL_LENGTH)
+        .saturating_add(MAX_SYMBOL_LENGTH);
+    let needed = out_pos.saturating_add(max_decoded);
+    if out.len() < needed {
+        out.resize(needed, 0);
+    }
+
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         // Do SIMD operation here by 4 bytes
         while in_curr + 4 <= in_end {
