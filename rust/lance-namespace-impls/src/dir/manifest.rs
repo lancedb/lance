@@ -44,11 +44,10 @@ use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest, CreateTableResponse,
     DeclareTableRequest, DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
-    DescribeTableResponse, DescribeTableVersionResponse, DropNamespaceRequest,
-    DropNamespaceResponse, DropTableRequest, DropTableResponse, ListNamespacesRequest,
-    ListNamespacesResponse, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
-    NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse, TableExistsRequest,
-    TableVersion,
+    DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
+    DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
+    ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
+    TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_table::feature_flags::apply_feature_flags;
@@ -94,7 +93,6 @@ const MANIFEST_INDEX_BATCH_SIZE: usize = 8192;
 pub enum ObjectType {
     Namespace,
     Table,
-    TableVersion,
 }
 
 impl ObjectType {
@@ -102,7 +100,6 @@ impl ObjectType {
         match self {
             Self::Namespace => "namespace",
             Self::Table => "table",
-            Self::TableVersion => "table_version",
         }
     }
 
@@ -110,7 +107,6 @@ impl ObjectType {
         match s {
             "namespace" => Ok(Self::Namespace),
             "table" => Ok(Self::Table),
-            "table_version" => Ok(Self::TableVersion),
             _ => Err(NamespaceError::Internal {
                 message: format!("Invalid object type: {}", s),
             }
@@ -173,7 +169,7 @@ pub struct TableInfo {
 pub struct ManifestEntry {
     /// The unique object identifier (e.g., table name or version object_id)
     pub object_id: String,
-    /// The type of the object (Namespace, Table, or TableVersion)
+    /// The type of the object (Namespace or Table)
     pub object_type: ObjectType,
     /// The storage location (e.g., directory name for tables)
     pub location: Option<String>,
@@ -576,89 +572,6 @@ impl ManifestStreamMutation for DeleteObjectMutation {
     }
 }
 
-enum DeleteTableVersionsTarget {
-    ObjectIds(HashSet<String>),
-    Ranges(Vec<DeleteTableVersionRangeTarget>),
-}
-
-#[derive(Clone)]
-struct DeleteTableVersionRangeTarget {
-    object_id_prefix: String,
-    ranges: Vec<(i64, i64)>,
-}
-
-impl DeleteTableVersionRangeTarget {
-    fn matches(&self, object_id: &str) -> bool {
-        let Some(version) = object_id
-            .strip_prefix(&self.object_id_prefix)
-            .and_then(|suffix| suffix.parse::<i64>().ok())
-        else {
-            return false;
-        };
-
-        self.ranges
-            .iter()
-            .any(|(start, end)| *start <= version && version <= *end)
-    }
-}
-
-impl DeleteTableVersionsTarget {
-    fn matches(&self, object_id: &str) -> bool {
-        match self {
-            Self::ObjectIds(object_ids) => object_ids.contains(object_id),
-            Self::Ranges(targets) => targets.iter().any(|target| target.matches(object_id)),
-        }
-    }
-}
-
-struct DeleteTableVersionsMutation {
-    target: DeleteTableVersionsTarget,
-    deleted_count: i64,
-}
-
-impl ManifestStreamMutation for DeleteTableVersionsMutation {
-    type Output = i64;
-
-    fn process_existing_row(
-        &mut self,
-        row: ManifestRowValue,
-        output: &mut ManifestBatchBuilder,
-        index_data: &mut ManifestIndexAccumulator,
-    ) -> Result<()> {
-        if row.object_type == ObjectType::TableVersion && self.target.matches(&row.object_id) {
-            self.deleted_count += 1;
-            return Ok(());
-        }
-
-        output.append(
-            index_data,
-            ManifestOutputRow {
-                object_id: &row.object_id,
-                object_type: row.object_type,
-                location: row.location.as_deref(),
-                metadata: row.metadata.as_deref(),
-                base_objects: row.base_objects.as_deref(),
-            },
-        )
-    }
-
-    fn append_rows(
-        &mut self,
-        _output: &mut ManifestBatchBuilder,
-        _index_data: &mut ManifestIndexAccumulator,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
-        if self.deleted_count > 0 {
-            CopyOnWriteMutation::updated(self.deleted_count)
-        } else {
-            CopyOnWriteMutation::unchanged(0)
-        }
-    }
-}
-
 /// Information about a namespace stored in the manifest
 #[derive(Debug, Clone)]
 pub struct NamespaceInfo {
@@ -922,15 +835,10 @@ impl ManifestNamespace {
         dir_listing_enabled: bool,
         inline_optimization_enabled: bool,
         commit_retries: Option<u32>,
-        table_version_storage_enabled: bool,
     ) -> Result<Self> {
-        let manifest_dataset = Self::ensure_manifest_table_up_to_date(
-            &root,
-            &storage_options,
-            session.clone(),
-            table_version_storage_enabled,
-        )
-        .await?;
+        let manifest_dataset =
+            Self::ensure_manifest_table_up_to_date(&root, &storage_options, session.clone())
+                .await?;
 
         Ok(Self {
             root,
@@ -992,60 +900,6 @@ impl ManifestNamespace {
 
     fn format_table_id(table_id: &[String]) -> String {
         format!("table id '{}'", Self::str_object_id(table_id))
-    }
-
-    /// Format a version number as a zero-padded lexicographically sortable string.
-    ///
-    /// Versions are stored as 20-digit zero-padded integers (e.g., `00000000000000000001`
-    /// for version 1) so that string-based range queries and sorting work correctly.
-    pub fn format_table_version(version: i64) -> String {
-        format!("{:020}", version)
-    }
-
-    /// Build the object_id for a table version entry.
-    ///
-    /// Format: `{table_object_id}${zero_padded_version}`
-    pub fn build_version_object_id(table_object_id: &str, version: i64) -> String {
-        format!(
-            "{}{}{}",
-            table_object_id,
-            DELIMITER,
-            Self::format_table_version(version)
-        )
-    }
-
-    fn build_version_object_id_prefix(table_object_id: &str) -> String {
-        format!("{}{}", table_object_id, DELIMITER)
-    }
-
-    fn normalize_table_version_ranges(ranges: &[(i64, i64)]) -> Vec<(i64, i64)> {
-        let mut normalized = ranges
-            .iter()
-            .filter_map(|(start, end)| (*start <= *end).then_some((*start, *end)))
-            .collect::<Vec<_>>();
-        normalized.sort_unstable();
-
-        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(normalized.len());
-        for (start, end) in normalized {
-            let Some((_last_start, last_end)) = merged.last_mut() else {
-                merged.push((start, end));
-                continue;
-            };
-            if start <= *last_end + 1 {
-                *last_end = (*last_end).max(end);
-                continue;
-            }
-            merged.push((start, end));
-        }
-        merged
-    }
-
-    /// Parse a version number from the version suffix of a table version object_id.
-    ///
-    /// The object_id is formatted as `{table_id}${zero_padded_version}`.
-    pub fn parse_version_from_object_id(object_id: &str) -> Option<i64> {
-        let (_namespace, name) = Self::parse_object_id(object_id);
-        name.parse::<i64>().ok()
     }
 
     /// Generate a new directory name in format: `<hash>_<object_id>`
@@ -2423,318 +2277,6 @@ impl ManifestNamespace {
         .await
     }
 
-    /// Query the manifest for all versions of a table, sorted by version.
-    ///
-    /// Returns a list of (version, metadata_json_string) tuples where metadata_json_string
-    /// contains the full metadata JSON stored in the manifest (manifest_path, manifest_size,
-    /// e_tag, naming_scheme).
-    ///
-    /// **Known limitation**: All matching rows are loaded into memory, sorted in Rust,
-    /// and then truncated. For tables with a very large number of versions this may be
-    /// expensive. Pushing sort/limit into the scan is not yet supported by Lance.
-    pub async fn query_table_versions(
-        &self,
-        object_id: &str,
-        descending: bool,
-        limit: Option<i32>,
-    ) -> Result<Vec<(i64, String)>> {
-        let escaped_id = object_id.replace('\'', "''");
-        // table_version object_ids are formatted as "{object_id}${zero_padded_version}"
-        let filter = format!(
-            "object_type = 'table_version' AND starts_with(object_id, '{}{}')",
-            escaped_id, DELIMITER
-        );
-        let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {:?}", e),
-            })
-        })?;
-        scanner.project(&["object_id", "metadata"]).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {:?}", e),
-            })
-        })?;
-        let batches = Self::execute_scanner(scanner).await?;
-
-        let mut versions: Vec<(i64, String)> = Vec::new();
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let object_id_array = Self::get_string_column(&batch, "object_id")?;
-            let metadata_array = Self::get_string_column(&batch, "metadata")?;
-            for i in 0..batch.num_rows() {
-                let oid = object_id_array.value(i);
-                // Parse version from object_id
-                if let Some(version) = Self::parse_version_from_object_id(oid) {
-                    let metadata_str = metadata_array.value(i).to_string();
-                    versions.push((version, metadata_str));
-                }
-            }
-        }
-
-        if descending {
-            versions.sort_by(|a, b| b.0.cmp(&a.0));
-        } else {
-            versions.sort_by(|a, b| a.0.cmp(&b.0));
-        }
-
-        if let Some(limit) = limit {
-            versions.truncate(limit as usize);
-        }
-
-        Ok(versions)
-    }
-
-    /// Query the manifest for a specific version of a table.
-    ///
-    /// Returns the full metadata JSON string if found, which contains
-    /// manifest_path, manifest_size, e_tag, and naming_scheme.
-    ///
-    pub async fn query_table_version(
-        &self,
-        object_id: &str,
-        version: i64,
-    ) -> Result<Option<String>> {
-        let version_object_id = Self::build_version_object_id(object_id, version);
-        self.query_table_version_by_object_id(&version_object_id)
-            .await
-    }
-
-    /// Query a specific table version by its exact object_id.
-    async fn query_table_version_by_object_id(
-        &self,
-        version_object_id: &str,
-    ) -> Result<Option<String>> {
-        let escaped_id = version_object_id.replace('\'', "''");
-        let filter = format!(
-            "object_id = '{}' AND object_type = 'table_version'",
-            escaped_id
-        );
-        let mut scanner = self.manifest_scanner().await?;
-        scanner.filter(&filter).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to filter: {:?}", e),
-            })
-        })?;
-        scanner.project(&["metadata"]).map_err(|e| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to project: {:?}", e),
-            })
-        })?;
-        let batches = Self::execute_scanner(scanner).await?;
-
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let metadata_array = Self::get_string_column(&batch, "metadata")?;
-            return Ok(Some(metadata_array.value(0).to_string()));
-        }
-
-        Ok(None)
-    }
-
-    /// Delete table version entries from the manifest for a given table and version ranges.
-    ///
-    /// Each range is (start_version, end_version) inclusive. Deletes all matching
-    /// `object_type = 'table_version'` entries whose object_id matches
-    /// `{object_id}${zero_padded_version}`.
-    ///
-    /// Applies the ranges while streaming the manifest rewrite, without expanding
-    /// sparse ranges into every possible version object id.
-    pub async fn delete_table_versions(
-        &self,
-        object_id: &str,
-        ranges: &[(i64, i64)],
-    ) -> Result<i64> {
-        self.batch_delete_table_versions_by_ranges(&[(object_id.to_string(), ranges.to_vec())])
-            .await
-    }
-
-    /// Atomically delete table version entries from the manifest for multiple
-    /// tables and version ranges.
-    pub async fn batch_delete_table_versions_by_ranges(
-        &self,
-        table_ranges: &[(String, Vec<(i64, i64)>)],
-    ) -> Result<i64> {
-        let targets = table_ranges
-            .iter()
-            .filter_map(|(object_id, ranges)| {
-                let ranges = Self::normalize_table_version_ranges(ranges);
-                if ranges.is_empty() {
-                    None
-                } else {
-                    Some(DeleteTableVersionRangeTarget {
-                        object_id_prefix: Self::build_version_object_id_prefix(object_id),
-                        ranges,
-                    })
-                }
-            })
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return Ok(0);
-        }
-
-        self.rewrite_manifest("Failed to delete table versions from manifest", || {
-            DeleteTableVersionsMutation {
-                target: DeleteTableVersionsTarget::Ranges(targets.clone()),
-                deleted_count: 0,
-            }
-        })
-        .await
-    }
-
-    /// Atomically delete table version entries from the manifest by their object_ids.
-    ///
-    /// This method supports multi-table transactional deletion: all specified
-    /// object_ids (which may span multiple tables) are deleted in a single atomic
-    /// copy-on-write manifest rewrite. Either all entries are removed or none are.
-    ///
-    /// Object IDs are formatted as `{table_id}${version}`.
-    pub async fn batch_delete_table_versions_by_object_ids(
-        &self,
-        object_ids: &[String],
-    ) -> Result<i64> {
-        if object_ids.is_empty() {
-            return Ok(0);
-        }
-
-        let object_ids = object_ids.iter().cloned().collect::<HashSet<_>>();
-        self.rewrite_manifest("Failed to delete table versions from manifest", || {
-            DeleteTableVersionsMutation {
-                target: DeleteTableVersionsTarget::ObjectIds(object_ids.clone()),
-                deleted_count: 0,
-            }
-        })
-        .await
-    }
-
-    /// Set a property flag in the __manifest table's metadata key-value map.
-    ///
-    /// This uses `dataset.update_metadata()` to persist the flag in the
-    /// __manifest dataset's table metadata, rather than inserting a row.
-    /// If the property already exists with the same value, this is a no-op.
-    pub async fn set_property(&self, name: &str, value: &str) -> Result<()> {
-        let _mutation_guard = self.manifest_mutation_lock.lock().await;
-        let dataset_guard = self.manifest_dataset.get().await?;
-        if dataset_guard.metadata().get(name) == Some(&value.to_string()) {
-            return Ok(());
-        }
-        drop(dataset_guard);
-
-        let mut dataset_guard = self.manifest_dataset.get_mut().await?;
-        dataset_guard
-            .update_metadata([(name, value)])
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to set property '{}' in __manifest metadata: {}",
-                        name, e
-                    ),
-                })
-            })?;
-        Ok(())
-    }
-
-    /// Check if a property flag exists in the __manifest table's metadata key-value map.
-    pub async fn has_property(&self, name: &str) -> Result<bool> {
-        let dataset_guard = self.manifest_dataset.get().await?;
-        Ok(dataset_guard.metadata().contains_key(name))
-    }
-
-    /// Parse metadata JSON into a `TableVersion`.
-    ///
-    /// Returns `None` if metadata is invalid or missing required fields.
-    fn parse_table_version(version: i64, metadata_str: &str) -> Option<TableVersion> {
-        let meta: serde_json::Value = match serde_json::from_str(metadata_str) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!(
-                    "Skipping version {} due to invalid metadata JSON: {}",
-                    version,
-                    e
-                );
-                return None;
-            }
-        };
-        let manifest_path = match meta.get("manifest_path").and_then(|v| v.as_str()) {
-            Some(p) => p.to_string(),
-            None => {
-                log::warn!(
-                    "Skipping version {} due to missing 'manifest_path' in metadata — \
-                     this may indicate data corruption",
-                    version
-                );
-                return None;
-            }
-        };
-        let manifest_size = meta.get("manifest_size").and_then(|v| v.as_i64());
-        let e_tag = meta
-            .get("e_tag")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        Some(TableVersion {
-            version,
-            manifest_path,
-            manifest_size,
-            e_tag,
-            timestamp_millis: None,
-            metadata: None,
-        })
-    }
-
-    /// List table versions from the __manifest table.
-    ///
-    /// Queries the manifest for all versions of the given table and returns
-    /// them as a `ListTableVersionsResponse`.
-    pub async fn list_table_versions(
-        &self,
-        table_id: &[String],
-        descending: bool,
-        limit: Option<i32>,
-    ) -> Result<ListTableVersionsResponse> {
-        let object_id = Self::str_object_id(table_id);
-        let manifest_versions = self
-            .query_table_versions(&object_id, descending, limit)
-            .await?;
-
-        let table_versions: Vec<TableVersion> = manifest_versions
-            .into_iter()
-            .filter_map(|(version, metadata_str)| Self::parse_table_version(version, &metadata_str))
-            .collect();
-
-        Ok(ListTableVersionsResponse {
-            versions: table_versions,
-            page_token: None,
-        })
-    }
-
-    /// Describe a specific table version from the __manifest table.
-    ///
-    /// Queries the manifest for a specific version and returns it as a
-    /// `DescribeTableVersionResponse`. Returns an error if the version is not found.
-    pub async fn describe_table_version(
-        &self,
-        table_id: &[String],
-        version: i64,
-    ) -> Result<DescribeTableVersionResponse> {
-        let object_id = Self::str_object_id(table_id);
-        if let Some(metadata_str) = self.query_table_version(&object_id, version).await?
-            && let Some(tv) = Self::parse_table_version(version, &metadata_str)
-        {
-            return Ok(DescribeTableVersionResponse {
-                version: Box::new(tv),
-            });
-        }
-        Err(NamespaceError::TableVersionNotFound {
-            message: format!("version {} for table {:?}", version, table_id),
-        }
-        .into())
-    }
-
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);
@@ -2839,12 +2381,10 @@ impl ManifestNamespace {
     /// 1. Try to load an existing manifest table
     /// 2. If it exists, check and migrate the schema if needed (e.g., add primary key metadata)
     /// 3. If it doesn't exist, create a new manifest table with the current schema
-    /// 4. Persist feature flags (e.g., table_version_storage_enabled) if requested
     async fn ensure_manifest_table_up_to_date(
         root: &str,
         storage_options: &Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
-        table_version_storage_enabled: bool,
     ) -> Result<DatasetConsistencyWrapper> {
         let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
         log::debug!("Attempting to load manifest from {}", manifest_path);
@@ -2897,27 +2437,6 @@ impl ManifestNamespace {
                             message: format!("Failed to migrate primary key metadata: {:?}", e),
                         })
                     })?;
-            }
-
-            // Persist table_version_storage_enabled flag in __manifest so that once
-            // enabled, it becomes a permanent property of this namespace.
-            if table_version_storage_enabled {
-                let needs_flag = dataset
-                    .metadata()
-                    .get("table_version_storage_enabled")
-                    .map(|v| v != "true")
-                    .unwrap_or(true);
-
-                if needs_flag
-                    && let Err(e) = dataset
-                        .update_metadata([("table_version_storage_enabled", "true")])
-                        .await
-                {
-                    log::warn!(
-                        "Failed to persist table_version_storage_enabled flag in __manifest: {:?}",
-                        e
-                    );
-                }
             }
 
             Ok(DatasetConsistencyWrapper::new(dataset))
@@ -4067,7 +3586,6 @@ mod tests {
             true,
             inline_optimization_enabled,
             commit_retries,
-            false,
         )
         .await
         .unwrap()
@@ -4422,90 +3940,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 7]
         );
-    }
-
-    #[tokio::test]
-    async fn test_manifest_delete_table_versions_by_ranges() {
-        let temp_dir = TempStdDir::default();
-        let temp_path = temp_dir.to_str().unwrap();
-        let manifest_ns = create_manifest_namespace(temp_path, false).await;
-        let table_id = "table";
-        let entries = (1..=5)
-            .map(|version| ManifestEntry {
-                object_id: ManifestNamespace::build_version_object_id(table_id, version),
-                object_type: ObjectType::TableVersion,
-                location: None,
-                metadata: Some(
-                    serde_json::json!({
-                        "manifest_path": format!("_versions/{}.manifest", version),
-                    })
-                    .to_string(),
-                ),
-            })
-            .collect::<Vec<_>>();
-        manifest_ns
-            .insert_into_manifest_with_metadata(entries, None)
-            .await
-            .unwrap();
-
-        let deleted = manifest_ns
-            .delete_table_versions(table_id, &[(2, 3), (5, 5)])
-            .await
-            .unwrap();
-        assert_eq!(deleted, 3);
-
-        let remaining = manifest_ns
-            .query_table_versions(table_id, false, None)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(version, _)| version)
-            .collect::<Vec<_>>();
-        assert_eq!(remaining, vec![1, 4]);
-    }
-
-    #[tokio::test]
-    async fn test_manifest_delete_table_versions_by_object_ids() {
-        let temp_dir = TempStdDir::default();
-        let temp_path = temp_dir.to_str().unwrap();
-        let manifest_ns = create_manifest_namespace(temp_path, false).await;
-        let table_id = "table";
-        let entries = (1..=3)
-            .map(|version| ManifestEntry {
-                object_id: ManifestNamespace::build_version_object_id(table_id, version),
-                object_type: ObjectType::TableVersion,
-                location: None,
-                metadata: Some(
-                    serde_json::json!({
-                        "manifest_path": format!("_versions/{}.manifest", version),
-                    })
-                    .to_string(),
-                ),
-            })
-            .collect::<Vec<_>>();
-        manifest_ns
-            .insert_into_manifest_with_metadata(entries, None)
-            .await
-            .unwrap();
-
-        let object_ids = vec![
-            ManifestNamespace::build_version_object_id(table_id, 1),
-            ManifestNamespace::build_version_object_id(table_id, 3),
-        ];
-        let deleted = manifest_ns
-            .batch_delete_table_versions_by_object_ids(&object_ids)
-            .await
-            .unwrap();
-        assert_eq!(deleted, 2);
-
-        let remaining = manifest_ns
-            .query_table_versions(table_id, false, None)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(version, _)| version)
-            .collect::<Vec<_>>();
-        assert_eq!(remaining, vec![2]);
     }
 
     #[tokio::test]
