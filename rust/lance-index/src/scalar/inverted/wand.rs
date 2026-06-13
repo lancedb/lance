@@ -2273,14 +2273,15 @@ mod tests {
             )
             .unwrap();
 
-        let matched = result
-            .into_iter()
-            .map(|doc| match doc.addr {
-                CandidateAddr::RowId(r) => r,
-                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(matched, vec![100]);
+        // flat_search resolves the prefilter against the DocSet, so the single
+        // match comes back as a concrete RowId(100) rather than a deferred
+        // Pending addr. Asserting on the whole result avoids a never-taken
+        // match arm that would otherwise read as uncovered.
+        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
+        assert!(
+            matches!(addrs.as_slice(), [CandidateAddr::RowId(100)]),
+            "expected exactly row 100, got {addrs:?}"
+        );
     }
 
     #[test]
