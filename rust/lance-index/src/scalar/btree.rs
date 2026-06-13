@@ -589,7 +589,7 @@ impl Ord for OrderableScalarValue {
                 }
             }
             (Struct(_arr), _) => panic!("Attempt to compare Struct with non-Struct"),
-            (Dictionary(_k1, _v1), Dictionary(_k2, _v2)) => todo!(),
+            (Dictionary(_k1, v1), Dictionary(_k2, v2)) => Self(*v1.clone()).cmp(&Self(*v2.clone())),
             (Dictionary(_, v1), Null) => Self(*v1.clone()).cmp(&Self(ScalarValue::Null)),
             (Dictionary(_, _), _) => panic!("Attempt to compare Dictionary with non-Dictionary"),
             // What would a btree of unions even look like?  May not be possible.
@@ -3308,6 +3308,37 @@ mod tests {
         // deep_size_of should account for the rust type overhead
         assert!(size_of_i32 > 4);
         assert!(size_of_many_i32 > 128 * 4);
+    }
+
+    #[test]
+    fn test_orderable_dictionary_cmp() {
+        use arrow_schema::DataType;
+        use std::cmp::Ordering;
+
+        let dict = |s: &str, key: DataType| {
+            OrderableScalarValue(ScalarValue::Dictionary(
+                Box::new(key),
+                Box::new(ScalarValue::Utf8(Some(s.to_string()))),
+            ))
+        };
+
+        // Dictionary scalars are ordered by their underlying value, regardless
+        // of the key type. This is exercised when loading a scalar index built
+        // on a dictionary-encoded column into a BTreeMap.
+        assert_eq!(
+            dict("a", DataType::Int16).cmp(&dict("b", DataType::Int16)),
+            Ordering::Less
+        );
+        assert_eq!(
+            dict("b", DataType::Int32).cmp(&dict("b", DataType::Int16)),
+            Ordering::Equal
+        );
+
+        // A non-null dictionary value sorts after null.
+        assert_eq!(
+            dict("a", DataType::Int16).cmp(&OrderableScalarValue(ScalarValue::Null)),
+            Ordering::Greater
+        );
     }
 
     #[tokio::test]

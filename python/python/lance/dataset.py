@@ -950,6 +950,9 @@ class LanceDataset(pa.dataset.Dataset):
         ds._base_store_params = self._base_store_params
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
+        ds._namespace_client_managed_versioning = (
+            self._namespace_client_managed_versioning
+        )
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
         return ds
@@ -1350,7 +1353,10 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def has_stable_row_ids(self) -> bool:
         """
-        Whether this dataset has stable row IDs enabled
+        Whether this dataset has stable row IDs enabled.
+
+        This is based on the dataset manifest feature flag and does not depend on
+        whether the current version has any fragments.
         """
         return self._ds.has_stable_row_ids
 
@@ -4579,6 +4585,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._base_store_params = base_store_params
         ds._namespace_client = None
         ds._table_id = None
+        ds._namespace_client_managed_versioning = False
         ds._default_scan_options = None
         ds._read_params = None
         return BulkCommitResult(

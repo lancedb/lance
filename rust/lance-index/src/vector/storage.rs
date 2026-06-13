@@ -251,7 +251,10 @@ pub struct RabitRawQueryContext {
     pub ex_bits: u8,
     pub rotated_query: Vec<f32>,
     pub dist_table: Vec<f32>,
-    pub ex_dist_table: Vec<f32>,
+    /// The rotated query zero-padded to a 64-dim multiple for the ex-dot
+    /// kernels; empty when `code_dim` is already aligned (the kernels then
+    /// read `rotated_query` directly).
+    pub ex_query: Vec<f32>,
     pub sum_q: f32,
 }
 

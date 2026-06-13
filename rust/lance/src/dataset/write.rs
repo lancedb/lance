@@ -1021,6 +1021,8 @@ pub async fn write_fragments_internal(
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+    /// Get the file path and base ID for the data file being written.
+    fn data_file_path(&self) -> (&str, Option<u32>);
     /// Get the current position in the file
     ///
     /// We use this to know when the file is too large and we need to start
@@ -1046,6 +1048,9 @@ where
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
+    }
+    fn data_file_path(&self) -> (&str, Option<u32>) {
+        (&self.path, self.base_id)
     }
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await? as u64)
@@ -1086,6 +1091,9 @@ impl GenericWriter for V2WriterAdapter {
             }
         }
         Ok(())
+    }
+    fn data_file_path(&self) -> (&str, Option<u32>) {
+        (&self.path, self.base_id)
     }
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await?)
@@ -1134,6 +1142,39 @@ pub async fn open_writer(
         storage_version,
         WriterOptions {
             add_data_dir: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub(super) async fn open_update_writer(
+    dataset: &Dataset,
+    schema: &Schema,
+    storage_version: LanceFileVersion,
+) -> Result<Box<dyn GenericWriter>> {
+    // add_columns / alter_columns reuse the normal writer stack, but they do not
+    // flow through WriteParams. Rebuild the external base resolver here so blob
+    // v2 reference columns can resolve dataset-registered external URIs.
+    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
+        && schema.fields.iter().any(|f| f.is_blob_v2())
+    {
+        Some(Arc::new(
+            build_external_base_resolver(Some(dataset), &WriteParams::default()).await?,
+        ))
+    } else {
+        None
+    };
+
+    open_writer_with_options(
+        &dataset.object_store,
+        schema,
+        &dataset.base,
+        storage_version,
+        WriterOptions {
+            add_data_dir: true,
+            external_base_resolver,
+            source_store_registry: dataset.session.store_registry(),
             ..Default::default()
         },
     )
