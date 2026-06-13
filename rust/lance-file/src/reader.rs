@@ -470,6 +470,23 @@ impl FileReader {
         }
     }
 
+    /// Returns a clone of this reader whose I/O is additionally recorded into
+    /// `stats`, on top of the scheduler's global accounting.
+    ///
+    /// All cached metadata is shared with `self`, so no file is re-opened and
+    /// only a few `Arc` clones are performed.  If the underlying I/O service
+    /// does not support per-scope statistics (e.g. an in-memory scheduler), the
+    /// returned reader is an ordinary, uninstrumented clone.
+    pub fn with_io_stats(
+        &self,
+        stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
+    ) -> Self {
+        match self.scheduler.with_io_stats(stats) {
+            Some(scheduler) => self.with_scheduler(scheduler),
+            None => self.clone(),
+        }
+    }
+
     pub fn num_rows(&self) -> u64 {
         self.num_rows
     }

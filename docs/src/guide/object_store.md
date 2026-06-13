@@ -248,3 +248,208 @@ ds = lance.dataset(
 | `tos_access_key_id` | Access key ID used for TOS authentication. Optional if credentials are provided by environment. |
 | `tos_secret_access_key` | Secret access key used for TOS authentication. Optional if credentials are provided by environment. |
 | `tos_security_token` | Security token for temporary credentials. Optional. |
+
+## Tencent Cloud COS Configuration
+
+[COS (Cloud Object Storage)](https://cloud.tencent.com/product/cos) credentials can be set in environment variables prefixed
+with `COS_` or `TENCENTCLOUD_` (for example, `COS_ENDPOINT`, `COS_SECRET_ID`,
+`COS_SECRET_KEY`, `TENCENTCLOUD_REGION`, `TENCENTCLOUD_SECURITY_TOKEN`).
+Alternatively, credentials can be passed as parameters to the `storage_options`
+parameter; explicit `storage_options` override environment variables:
+
+=== "Python"
+
+    ```python
+    import lance
+    ds = lance.dataset(
+        "cos://bucket/path",
+        storage_options={
+            "cos_endpoint": "https://cos.ap-guangzhou.myqcloud.com",
+            "cos_secret_id": "my-secret-id",
+            "cos_secret_key": "my-secret-key",
+        }
+    )
+    ```
+
+=== "Rust"
+
+    In this Lance distribution, `tencent` is already part of the **default
+    features** of the `lance` crate, so simply depending on `lance` is enough:
+
+    ```toml
+    [dependencies]
+    lance = "*"
+    ```
+
+    You only need to enable the `tencent` feature explicitly in the following
+    cases:
+
+    - You opted out of default features, e.g.
+      `lance = { version = "*", default-features = false, features = ["tencent", ...] }`.
+    - You depend on `lance-io` directly (without `lance`); `tencent` is **not**
+      a default feature of `lance-io`:
+      `lance-io = { version = "*", features = ["tencent"] }`.
+
+| Key | Description |
+|-----|-------------|
+| `cos_endpoint` | COS endpoint. Required (for example, `https://cos.ap-guangzhou.myqcloud.com`). Can also be set via the `COS_ENDPOINT` environment variable. |
+| `cos_secret_id` | Secret ID used for COS authentication. Optional if credentials are provided by environment. |
+| `cos_secret_key` | Secret key used for COS authentication. Optional if credentials are provided by environment. |
+| `cos_enable_versioning` | Whether to enable object versioning on the bucket. Optional. |
+
+!!! note
+
+    The OpenDAL `CosConfig` currently exposes a limited set of options. Additional
+    settings such as the security token (`TENCENTCLOUD_SECURITY_TOKEN`) and region
+    (`TENCENTCLOUD_REGION`) must be configured via environment variables.
+
+## GooseFS Configuration
+
+[GooseFS](https://cloud.tencent.com/product/goosefs) is a distributed caching
+filesystem. Lance accesses GooseFS through its Master gRPC service. The URL format
+is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
+(default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
+`/path` is the filesystem path within GooseFS.
+
+!!! note "About the dataset path"
+
+    `/path` is just an arbitrary directory inside GooseFS — Lance does **not**
+    require the path to end with a `.lance` suffix. Any valid GooseFS directory
+    works, for example:
+
+    - `goosefs://10.0.0.1:9200/data/my-dataset`
+    - `goosefs://10.0.0.1:9200/data/my-dataset.lance`
+    - `goosefs://10.0.0.1:9200/lance-test/lance-io`
+
+    The `.lance` suffix used in the examples below is only a naming convention
+    that makes it easy to recognize a Lance dataset directory at a glance; it
+    has no special meaning to Lance itself. The only requirement is that the
+    same path is used consistently for reads and writes of a given dataset.
+
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset(
+        "goosefs://10.0.0.1:9200/data/my-dataset.lance",
+        storage_options={
+            "goosefs_auth_type": "simple",
+            "goosefs_auth_username": "lance",
+        },
+    )
+    ```
+
+=== "Rust"
+
+    In this Lance distribution, `goosefs` is already part of the **default
+    features** of the `lance` crate, so simply depending on `lance` is enough:
+
+    ```toml
+    [dependencies]
+    lance = "*"
+    ```
+
+    You only need to enable the `goosefs` feature explicitly in the following
+    cases:
+
+    - You opted out of default features, e.g.
+      `lance = { version = "*", default-features = false, features = ["goosefs", ...] }`.
+    - You depend on `lance-io` directly (without `lance`); `goosefs` is **not**
+      a default feature of `lance-io`:
+      `lance-io = { version = "*", features = ["goosefs"] }`.
+
+    Open the underlying `lance_io::object_store::ObjectStore` directly (mirrors
+    the integration test in `rust/lance-io/tests/goosefs_integration.rs`):
+
+    ```rust
+    use lance_io::object_store::ObjectStore;
+
+    let uri = "goosefs://10.0.0.1:9200/lance-test/lance-io";
+    let (store, path) = ObjectStore::from_uri(uri).await?;
+
+    // Read / write through the underlying `object_store::ObjectStore` API
+    store.inner.put(&path, (&b"hello"[..]).into()).await?;
+    let result = store.inner.get(&path).await?;
+    let bytes = result.bytes().await?;
+    ```
+
+    Open a Lance dataset with custom storage options:
+
+    ```rust
+    use std::collections::HashMap;
+    use lance::dataset::DatasetBuilder;
+
+    let mut storage_options = HashMap::new();
+    storage_options.insert("goosefs_master_addr".to_string(), "10.0.0.1:9200".to_string());
+    storage_options.insert("goosefs_auth_type".to_string(), "simple".to_string());
+    storage_options.insert("goosefs_auth_username".to_string(), "lance".to_string());
+
+    let dataset = DatasetBuilder::from_uri("goosefs://10.0.0.1:9200/data/my-dataset.lance")
+        .with_storage_options(storage_options)
+        .load()
+        .await?;
+    ```
+
+=== "Java"
+
+    Pass the GooseFS configuration through `ReadOptions.setStorageOptions`
+    when opening the dataset:
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.ReadOptions;
+
+    import java.util.HashMap;
+    import java.util.Map;
+
+    Map<String, String> storageOptions = new HashMap<>();
+    storageOptions.put("goosefs_master_addr", "10.0.0.1:9200");
+    storageOptions.put("goosefs_auth_type", "simple");
+    storageOptions.put("goosefs_auth_username", "lance");
+
+    ReadOptions options = new ReadOptions.Builder()
+        .setStorageOptions(storageOptions)
+        .build();
+
+    try (Dataset dataset = Dataset.open()
+            .uri("goosefs://10.0.0.1:9200/data/my-dataset.lance")
+            .readOptions(options)
+            .build()) {
+        // ... use the dataset
+    }
+    ```
+
+    For writes, the same `storageOptions(...)` setter is available on
+    `WriteDatasetBuilder` and `WriteFragmentBuilder`.
+
+The Master address can be resolved from (in priority order):
+
+1. The `goosefs_master_addr` storage option (supports HA: `"addr1:port,addr2:port"`).
+2. The `GOOSEFS_MASTER_ADDR` environment variable.
+3. The host and port from the URL authority.
+
+The following keys can be used as both environment variables or keys in the
+`storage_options` parameter:
+
+| Key | Description |
+|-----|-------------|
+| `goosefs_master_addr` / `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
+| `goosefs_write_type` / `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
+| `goosefs_block_size` / `GOOSEFS_BLOCK_SIZE` | GooseFS block size in bytes (this is the GooseFS-side block size, not Lance's I/O block size). Optional. |
+| `goosefs_chunk_size` / `GOOSEFS_CHUNK_SIZE` | Chunk size in bytes used when reading or writing files. Optional. |
+| `goosefs_auth_type` / `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
+| `goosefs_auth_username` / `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
+
+!!! note "Running the GooseFS integration tests"
+
+    The Rust integration tests for GooseFS live at
+    `rust/lance-io/tests/goosefs_integration.rs` and are gated behind feature
+    flags. They require a reachable GooseFS cluster (configured via the
+    `GOOSEFS_MASTER_ADDR` and `GOOSEFS_AUTH_TYPE` environment variables) and
+    can be run with:
+
+    ```bash
+    cargo test -p lance-io --features "goosefs goosefs-test" \
+        --test goosefs_integration -- --ignored --nocapture --test-threads=1
+    ```

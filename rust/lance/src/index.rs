@@ -2158,6 +2158,15 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let (index, ivf_entry) = result?;
         metrics.record_index_load();
+        // Attribute the one-time index-open I/O (file footers, IVF centroids,
+        // quantization metadata) to this query's metrics.  This runs only on a
+        // real open; cache hits return earlier, so a warm query reports zero
+        // index-open I/O.
+        if let Some(io_stats) = metrics.io_stats()
+            && let Some(open_stats) = index.open_io_stats()
+        {
+            io_stats.add_scan_stats(&open_stats);
+        }
         if let Some(ivf_entry) = ivf_entry {
             let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
             self.index_cache

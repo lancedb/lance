@@ -23,11 +23,13 @@ use lance_namespace::models::{
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
     CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest,
-    CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
-    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
-    DeleteTableTagRequest, DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
+    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
+    DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
     DescribeTableIndexStatsResponse, DescribeTableRequest, DescribeTableResponse,
     DescribeTableVersionRequest, DescribeTableVersionResponse, DescribeTransactionRequest,
@@ -36,7 +38,8 @@ use lance_namespace::models::{
     ErrorResponse, ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableStatsResponse,
     GetTableTagVersionRequest, GetTableTagVersionResponse, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTableIndicesRequest, ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
+    ListTableBranchesRequest, ListTableBranchesResponse, ListTableIndicesRequest,
+    ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
     QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
@@ -1294,6 +1297,13 @@ impl LanceNamespace for RestNamespace {
             descending_str = descending.to_string();
             query.push(("descending", descending_str.as_str()));
         }
+        // Forward branch as a query param (this op sends no body).
+        // describe_table_version differs: branch rides its body, already serialized.
+        let branch_str;
+        if let Some(ref branch) = request.branch {
+            branch_str = branch.clone();
+            query.push(("branch", branch_str.as_str()));
+        }
         self.post_json(&path, &query, &(), "list_table_versions", &id)
             .await
     }
@@ -1550,6 +1560,55 @@ impl LanceNamespace for RestNamespace {
         let path = format!("/v1/table/{}/tags/update", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
         self.post_json(&path, &query, &request, "update_table_tag", &id)
+            .await
+    }
+
+    async fn create_table_branch(
+        &self,
+        request: CreateTableBranchRequest,
+    ) -> Result<CreateTableBranchResponse> {
+        self.record_op("create_table_branch");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/create", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "create_table_branch", &id)
+            .await
+    }
+
+    async fn list_table_branches(
+        &self,
+        request: ListTableBranchesRequest,
+    ) -> Result<ListTableBranchesResponse> {
+        self.record_op("list_table_branches");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/list", encoded_id);
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let page_token_str;
+        if let Some(ref pt) = request.page_token {
+            page_token_str = pt.clone();
+            query.push(("page_token", page_token_str.as_str()));
+        }
+        let limit_str;
+        if let Some(limit) = request.limit {
+            limit_str = limit.to_string();
+            query.push(("limit", limit_str.as_str()));
+        }
+        self.post_json(&path, &query, &request, "list_table_branches", &id)
+            .await
+    }
+
+    async fn delete_table_branch(
+        &self,
+        request: DeleteTableBranchRequest,
+    ) -> Result<DeleteTableBranchResponse> {
+        self.record_op("delete_table_branch");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/branches/delete", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        self.post_json(&path, &query, &request, "delete_table_branch", &id)
             .await
     }
 

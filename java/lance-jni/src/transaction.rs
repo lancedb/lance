@@ -774,12 +774,18 @@ fn inner_commit_to_dataset<'local>(
     // Set namespace commit handler only if namespace_client_managed_versioning is true
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
     let commit_handler = if namespace_client_managed_versioning {
-        namespace_info.map(|(ns, tid)| {
-            let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
-            Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            }) as Arc<dyn CommitHandler>
-        })
+        match namespace_info {
+            Some((ns, tid)) => {
+                // The store derives the branch a request targets from the base
+                // path it is handed, resolved against the table root.
+                let table_root = java_blocking_ds.inner.branch_location().find_main()?.path;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns, tid, table_root);
+                Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }) as Arc<dyn CommitHandler>)
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -1560,7 +1566,8 @@ fn inner_commit_to_uri<'local>(
 
     // Set namespace commit handler only if namespace_client_managed_versioning is true
     if namespace_client_managed_versioning && let Some((namespace_client, tid)) = namespace_info {
-        let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
+        let external_store =
+            LanceNamespaceExternalManifestStore::for_table_uri(namespace_client, tid, &uri_str)?;
         let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(external_store),
         });

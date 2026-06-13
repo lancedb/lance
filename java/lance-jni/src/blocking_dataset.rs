@@ -201,7 +201,8 @@ impl BlockingDataset {
         if namespace_client_managed_versioning
             && let (Some(namespace_client), Some(tid)) = (namespace, table_id)
         {
-            let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
+            let external_store =
+                LanceNamespaceExternalManifestStore::for_table_uri(namespace_client, tid, uri)?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -689,8 +690,11 @@ fn create_dataset<'local>(
     if let Some((namespace, table_id)) = namespace_info {
         // Set up commit handler only if namespace manages versioning
         if namespace_client_managed_versioning {
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                namespace.clone(),
+                table_id.clone(),
+                &path_str,
+            )?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });

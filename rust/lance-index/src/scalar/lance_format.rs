@@ -370,6 +370,12 @@ impl IndexReader for current_reader::FileReader {
     fn schema(&self) -> &lance_core::datatypes::Schema {
         Self::schema(self)
     }
+
+    fn file_size_bytes(&self) -> Option<u64> {
+        // The manifest records each index file's size and passes it to the reader
+        // at open, so it's already in metadata here (no extra I/O).
+        Some(self.metadata().file_size())
+    }
 }
 
 #[async_trait]
