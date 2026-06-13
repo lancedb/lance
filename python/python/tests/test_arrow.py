@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 import lance
+import lance.arrow
 import numpy as np
 import pandas as pd
 import pyarrow as pa
