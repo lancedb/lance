@@ -419,6 +419,14 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+
+    /// The cumulative I/O performed while opening this index (file footers, IVF
+    /// centroids, quantization metadata).  This is a one-time cost; it is
+    /// reported once, on the query that actually opens the index, and is `None`
+    /// for index implementations that do not track it.
+    fn open_io_stats(&self) -> Option<lance_io::scheduler::ScanStats> {
+        None
+    }
 }
 
 // it can be an IVF index or a partition of IVF index

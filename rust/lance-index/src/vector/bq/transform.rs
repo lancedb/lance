@@ -17,7 +17,9 @@ use tracing::instrument;
 
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::vector::bq::rabit_ex_bits;
-use crate::vector::bq::storage::{RABIT_CODE_COLUMN, RABIT_EX_CODE_COLUMN, RabitQueryEstimator};
+use crate::vector::bq::storage::{
+    RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQueryEstimator,
+};
 use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
 use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
@@ -281,7 +283,7 @@ impl Transformer for RQTransformer {
     #[instrument(name = "RQTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let has_split_codes = self.rq.num_bits() == 1
-            || (batch.column_by_name(RABIT_EX_CODE_COLUMN).is_some()
+            || (batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some()
                 && batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
                 && batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some());
         if batch.column_by_name(RABIT_CODE_COLUMN).is_some() && has_split_codes {
@@ -494,7 +496,8 @@ mod tests {
 
     use crate::vector::bq::RQRotationType;
     use crate::vector::bq::builder::RabitQuantizer;
-    use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
+    use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
+    use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
     use crate::vector::transform::Transformer;
     use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
@@ -535,15 +538,19 @@ mod tests {
         .unwrap();
 
         let transformed = transformer.transform(&batch).unwrap();
-        assert!(transformed.column_by_name(RABIT_EX_CODE_COLUMN).is_some());
+        assert!(
+            transformed
+                .column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN)
+                .is_some()
+        );
         assert_eq!(
-            transformed[RABIT_EX_CODE_COLUMN]
+            transformed[RABIT_BLOCKED_EX_CODE_COLUMN]
                 .as_fixed_size_list()
                 .value_length(),
-            3
+            blocked_ex_code_bytes(8, 3) as i32
         );
         assert!(
-            transformed[RABIT_EX_CODE_COLUMN]
+            transformed[RABIT_BLOCKED_EX_CODE_COLUMN]
                 .as_fixed_size_list()
                 .values()
                 .as_primitive::<UInt8Type>()

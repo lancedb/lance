@@ -8843,6 +8843,93 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         );
     }
 
+    /// Build an in-memory dataset with a single `Dictionary(Int16, Utf8)` column.
+    /// The dictionary cycles through "a", "b", "c" so each value appears in a
+    /// predictable, repeated pattern.
+    async fn dictionary_string_dataset() -> Dataset {
+        use arrow_array::{Int16Array, Int16DictionaryArray};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "etld",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            false,
+        )]));
+
+        let dictionary = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let indices = Int16Array::from((0..30).map(|i| i % 3).collect::<Vec<_>>());
+        let dict_array = Int16DictionaryArray::try_new(indices, dictionary).unwrap();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dict_array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(reader, "memory://test_dict_filter", None)
+            .await
+            .unwrap()
+    }
+
+    /// Regression test for filtering a dictionary-encoded string column via the
+    /// SQL string path (`Scanner::filter`). This used to fail to plan with
+    /// "could not convert to literal of type 'Dictionary(Int16, Utf8)'".
+    #[tokio::test]
+    async fn test_filter_on_dictionary_string_column() {
+        let dataset = dictionary_string_dataset().await;
+
+        // Equality predicate.
+        let count = dataset
+            .scan()
+            .filter("etld = 'a'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count, 10);
+
+        // IN-list predicate.
+        let count = dataset
+            .scan()
+            .filter("etld IN ('a', 'b')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count, 20);
+    }
+
+    /// An `IN`/`=` predicate on a dictionary column with a scalar index should be
+    /// pushed down to the index rather than falling back to a full scan.
+    #[tokio::test]
+    async fn test_dictionary_string_column_uses_scalar_index() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let mut dataset = dictionary_string_dataset().await;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(&["etld"], IndexType::Scalar, None, &params, true)
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.filter("etld IN ('a', 'b')").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") || plan_str.contains("MaterializeIndex"),
+            "IN on a dictionary column should use the scalar index, but got: {}",
+            plan_str
+        );
+
+        let count = dataset
+            .scan()
+            .filter("etld IN ('a', 'b')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count, 20);
+    }
+
     #[tokio::test]
     async fn test_like_prefix_with_segmented_zone_map() {
         use lance_index::scalar::BuiltinIndexType;

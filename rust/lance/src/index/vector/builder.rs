@@ -1045,7 +1045,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 continue;
             }
 
-            let part_storage = existing_index.load_partition_storage(part_id).await?;
+            let part_storage = existing_index.load_partition_storage(part_id, None).await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
             match Q::quantization_type() {
