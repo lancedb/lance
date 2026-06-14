@@ -7517,9 +7517,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
                 let batch = RecordBatch::try_new(
                     s.clone(),
                     vec![
-                        Arc::new(UInt32Array::from(
-                            (0..rows_per_worker).collect::<Vec<_>>(),
-                        )),
+                        Arc::new(UInt32Array::from((0..rows_per_worker).collect::<Vec<_>>())),
                         Arc::new(StringArray::from(
                             (0..rows_per_worker)
                                 .map(|i| format!("w{worker}_r{i}"))

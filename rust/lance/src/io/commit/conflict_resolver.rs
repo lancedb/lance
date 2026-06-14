@@ -376,11 +376,7 @@ impl<'a> TransactionRebase<'a> {
                         // (Some, None): self has filter, other doesn't.
                         // (None, Some): self doesn't have filter, other does.
                         // Both are conservatively treated as conflicts.
-                        return Err(self.retryable_conflict_err(
-                            other_transaction,
-                            other_version,
-                            location!(),
-                        ));
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                     // (None, None): Neither transaction tracks inserts.
                     // This is the backward-compatible case for older transactions
