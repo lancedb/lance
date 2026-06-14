@@ -583,6 +583,160 @@ def test_blob_extension_write_inline(tmp_path):
         assert f.read() == b"foo"
 
 
+def test_blob_field_threshold_metadata():
+    field = lance.blob_field(
+        "blob",
+        inline_size_threshold=16 * 1024,
+        dedicated_size_threshold=2 * 1024 * 1024,
+    )
+
+    assert field.metadata[b"lance-encoding:blob-inline-size-threshold"] == b"16384"
+    assert field.metadata[b"lance-encoding:blob-dedicated-size-threshold"] == b"2097152"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        pytest.param(
+            {"inline_size_threshold": -1},
+            ValueError,
+            "inline_size_threshold must be non-negative",
+            id="negative_inline",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": 0},
+            ValueError,
+            "dedicated_size_threshold must be positive",
+            id="zero_dedicated",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": -1},
+            ValueError,
+            "dedicated_size_threshold must be positive",
+            id="negative_dedicated",
+        ),
+        pytest.param(
+            {"inline_size_threshold": True},
+            TypeError,
+            "inline_size_threshold must be an int",
+            id="bool_inline",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": True},
+            TypeError,
+            "dedicated_size_threshold must be an int",
+            id="bool_dedicated",
+        ),
+        pytest.param(
+            {"inline_size_threshold": 1.5},
+            TypeError,
+            "inline_size_threshold must be an int",
+            id="float_inline",
+        ),
+        pytest.param(
+            {"inline_size_threshold": 2**100},
+            OverflowError,
+            "inline_size_threshold must fit in a Rust usize",
+            id="overflow_inline",
+        ),
+        pytest.param(
+            {"dedicated_size_threshold": 2**100},
+            OverflowError,
+            "dedicated_size_threshold must fit in a Rust usize",
+            id="overflow_dedicated",
+        ),
+    ],
+)
+def test_blob_field_rejects_invalid_thresholds(kwargs, error, message):
+    with pytest.raises(error, match=message):
+        lance.blob_field("blob", **kwargs)
+
+
+def test_blob_extension_inline_threshold_per_column(tmp_path):
+    payload = b"x" * 2048
+    schema = pa.schema(
+        [
+            lance.blob_field("inline_blob", inline_size_threshold=4096),
+            lance.blob_field("packed_blob", inline_size_threshold=1024),
+        ]
+    )
+    table = pa.table(
+        {
+            "inline_blob": lance.blob_array([payload]),
+            "packed_blob": lance.blob_array([payload]),
+        },
+        schema=schema,
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_inline_threshold_per_column",
+        data_storage_version="2.2",
+    )
+
+    desc = ds.to_table(columns=["inline_blob", "packed_blob"])
+    assert desc.column("inline_blob").chunk(0).field("kind").to_pylist() == [0]
+    assert desc.column("packed_blob").chunk(0).field("kind").to_pylist() == [1]
+
+
+def test_blob_extension_threshold_metadata_persists_after_reopen(tmp_path):
+    dataset_path = tmp_path / "test_ds_v2_threshold_metadata_persists"
+    schema = pa.schema([lance.blob_field("blob", inline_size_threshold=1024)])
+    table = pa.table({"blob": lance.blob_array([b"x"])}, schema=schema)
+
+    lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+    reopened = lance.dataset(dataset_path)
+
+    assert (
+        reopened.schema.field("blob").metadata[
+            b"lance-encoding:blob-inline-size-threshold"
+        ]
+        == b"1024"
+    )
+
+
+def test_blob_extension_append_rejects_explicit_threshold_mismatch(tmp_path):
+    dataset_path = tmp_path / "test_ds_v2_append_threshold_mismatch"
+    initial_schema = pa.schema([lance.blob_field("blob", inline_size_threshold=4096)])
+    initial = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=initial_schema,
+    )
+    lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
+
+    append_schema = pa.schema([lance.blob_field("blob", inline_size_threshold=1024)])
+    append = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=append_schema,
+    )
+
+    with pytest.raises(
+        OSError, match="Cannot append data with blob threshold metadata"
+    ):
+        lance.write_dataset(append, dataset_path, mode="append")
+
+
+def test_blob_extension_dedicated_threshold_precedes_inline_threshold(tmp_path):
+    payload = b"x" * 2048
+    schema = pa.schema(
+        [
+            lance.blob_field(
+                "blob",
+                inline_size_threshold=4096,
+                dedicated_size_threshold=1024,
+            )
+        ]
+    )
+    table = pa.table({"blob": lance.blob_array([payload])}, schema=schema)
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_dedicated_precedes_inline",
+        data_storage_version="2.2",
+    )
+
+    desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
+    assert desc.field("kind").to_pylist() == [2]
+
+
 def test_blob_extension_write_external(tmp_path):
     blob_path = tmp_path / "external_blob.bin"
     blob_path.write_bytes(b"hello")

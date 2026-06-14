@@ -6,7 +6,9 @@ use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt, TryStreamExt};
-use lance_arrow::BLOB_META_KEY;
+use lance_arrow::{
+    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY,
+};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
@@ -165,6 +167,42 @@ fn validate_external_blob_write_params(params: &WriteParams) -> Result<()> {
         return Err(Error::invalid_input(
             "allow_external_blob_outside_bases only applies when external_blob_mode=\"reference\"",
         ));
+    }
+
+    Ok(())
+}
+
+fn validate_blob_threshold_metadata_for_append(
+    input_schema: &Schema,
+    dataset_schema: &Schema,
+) -> Result<()> {
+    for input_field in &input_schema.fields {
+        let Some(dataset_field) = dataset_schema.field(&input_field.name) else {
+            continue;
+        };
+
+        for key in [
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+        ] {
+            let Some(input_value) = input_field.metadata.get(key) else {
+                continue;
+            };
+
+            if dataset_field.metadata.get(key) != Some(input_value) {
+                let dataset_value = dataset_field
+                    .metadata
+                    .get(key)
+                    .map(String::as_str)
+                    .unwrap_or("<unset>");
+                return Err(Error::invalid_input(format!(
+                    "Cannot append data with blob threshold metadata {key}={input_value:?} \
+                     for field '{}'; the dataset schema has {key}={dataset_value:?}. \
+                     Blob thresholds for existing columns are stored in the dataset schema.",
+                    input_field.name
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -953,6 +991,7 @@ pub async fn write_fragments_internal(
                         ..Default::default()
                     },
                 )?;
+                validate_blob_threshold_metadata_for_append(&converted_schema, dataset.schema())?;
                 let write_schema = dataset.schema().project_by_schema(
                     &converted_schema,
                     OnMissing::Error,
