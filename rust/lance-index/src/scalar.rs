@@ -288,6 +288,22 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// This is often useful when remapping or updating
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<IndexFile>;
 
+    /// Copy an index file from this store to a new name in another store, leaving the source intact
+    async fn copy_index_file_to(
+        &self,
+        name: &str,
+        new_name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<IndexFile> {
+        if name == new_name {
+            self.copy_index_file(name, dest_store).await
+        } else {
+            Err(Error::not_supported(format!(
+                "copying index file {name} to {new_name} is not supported by this index store"
+            )))
+        }
+    }
+
     /// Rename an index file
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile>;
 

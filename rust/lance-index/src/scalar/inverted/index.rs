@@ -6446,6 +6446,16 @@ mod tests {
         ) -> Result<crate::scalar::IndexFile> {
             self.inner.copy_index_file(name, dest_store).await
         }
+        async fn copy_index_file_to(
+            &self,
+            name: &str,
+            new_name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner
+                .copy_index_file_to(name, new_name, dest_store)
+                .await
+        }
         async fn rename_index_file(
             &self,
             name: &str,
