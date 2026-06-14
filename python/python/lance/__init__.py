@@ -28,6 +28,7 @@ from .dataset import (
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     DatasetBasePath,
+    FFILanceTableProvider,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
@@ -51,11 +52,6 @@ from .namespace import (
 from .progress import IndexProgress
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
-
-try:
-    from .lance import FFILanceTableProvider
-except ImportError:
-    FFILanceTableProvider = None
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -97,6 +93,7 @@ __all__ = [
     "schema_to_json",
     "set_logger",
     "write_dataset",
+    "FFILanceTableProvider",
     "IndexProgress",
     "ExecutionPlan",
     "LsmPointLookupPlanner",
@@ -109,9 +106,6 @@ __all__ = [
     "ShardingSpec",
     "evaluate_sharding_spec",
 ]
-
-if FFILanceTableProvider is not None:
-    __all__.append("FFILanceTableProvider")
 
 
 def dataset(

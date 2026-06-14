@@ -17,7 +17,7 @@ GitHub organization.
 
 | Integration | Description | Source |
 |---|---|---|
-| [Apache DataFusion](datafusion.md) | Register Lance datasets as DataFusion tables and run SQL with predicate/projection pushdown from Rust. | Built-in |
+| [Apache DataFusion](datafusion.md) | Register Lance datasets as DataFusion tables and run SQL with predicate/projection pushdown. Available in both Rust and Python. | Built-in |
 | [Apache Spark](spark/index.md) | Read and write Lance datasets from Spark SQL and DataFrames. | [lance-format/lance-spark](https://github.com/lance-format/lance-spark) |
 | [DuckDB](duckdb) | Query Lance datasets directly from DuckDB. | [lance-format/lance-duckdb](https://github.com/lance-format/lance-duckdb) |
 | [Trino](trino) | Federate Lance into Trino alongside other connectors. | [lance-format/lance-trino](https://github.com/lance-format/lance-trino) |

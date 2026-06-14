@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
-from lance import LanceDataset
+from lance import FFILanceTableProvider, LanceDataset
 
 
 def normalize(batches: list[pa.RecordBatch]) -> pa.RecordBatch:
@@ -21,9 +21,6 @@ def normalize(batches: list[pa.RecordBatch]) -> pa.RecordBatch:
 def test_table_loading():
     pytest.importorskip("datafusion")
     from datafusion import SessionContext, col
-
-    if lance.FFILanceTableProvider is None:
-        pytest.skip("FFILanceTableProvider is not built in this release")
 
     lancedb_temp_path = "/tmp/test.lance"
     shutil.rmtree(lancedb_temp_path, ignore_errors=True)
@@ -57,7 +54,7 @@ def test_table_loading():
         ctx = SessionContext()
 
         dataset = lance.dataset(lancedb_temp_path)
-        ffi_lance_table = lance.FFILanceTableProvider(
+        ffi_lance_table = FFILanceTableProvider(
             dataset, with_row_id=True, with_row_addr=True
         )
         ctx.register_table("ffi_lance_table", ffi_lance_table)
