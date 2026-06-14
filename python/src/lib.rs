@@ -25,16 +25,12 @@
 use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 
 use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
-use ::lance::datafusion::LanceTableProvider;
 use ::lance::index::DatasetIndexExt;
-use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
-use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
@@ -51,13 +47,10 @@ use file::{
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
-use pyo3::ffi::c_str;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
+use pyo3::types::{PyAny, PyAnyMethods};
 use scanner::ScanStatistics;
 use session::Session;
-use std::ffi::CString;
-use std::ptr::NonNull;
 
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
@@ -245,7 +238,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     set_log_file_target(&mut log_builder);
     init_logging(log_builder);
 
-    m.add_class::<FFILanceTableProvider>()?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
@@ -379,74 +371,4 @@ fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(::lance::io::commit::manifest_needs_migration(
         &manifest, &indices,
     ))
-}
-
-#[pyclass(
-    name = "FFILanceTableProvider",
-    module = "lance",
-    subclass,
-    skip_from_py_object
-)]
-#[derive(Clone)]
-struct FFILanceTableProvider {
-    dataset: Arc<::lance::Dataset>,
-    with_row_id: bool,
-    with_row_addr: bool,
-}
-
-#[pymethods]
-impl FFILanceTableProvider {
-    #[new]
-    #[pyo3(signature = (dataset, *, with_row_id = false, with_row_addr = false))]
-    fn new(dataset: &Bound<'_, PyAny>, with_row_id: bool, with_row_addr: bool) -> PyResult<Self> {
-        let py = dataset.py();
-        let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-        let dataset_ref = &dataset.bind(py).borrow().ds;
-        // TODO: https://github.com/lance-format/lance/issues/3966 remove this workaround
-        let _ = rt().block_on(Some(py), dataset_ref.load_indices())?;
-        Ok(Self {
-            dataset: dataset_ref.clone(),
-            with_row_id,
-            with_row_addr,
-        })
-    }
-
-    fn __datafusion_table_provider__<'py>(
-        &self,
-        py: Python<'py>,
-        session: Bound<PyAny>,
-    ) -> PyResult<Bound<'py, PyCapsule>> {
-        let name = CString::new("datafusion_table_provider").unwrap();
-        let a_lance_table_provider = Arc::new(LanceTableProvider::new(
-            self.dataset.clone(),
-            self.with_row_id,
-            self.with_row_addr,
-        ));
-
-        let codec = ffi_logical_codec_from_pycapsule(session)?;
-        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(
-            a_lance_table_provider,
-            true,
-            rt().get_runtime_handle(),
-            codec,
-        );
-        PyCapsule::new(py, ffi_provider, Some(name.clone()))
-    }
-}
-
-fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
-    let attr_name = "__datafusion_logical_extension_codec__";
-    let capsule = if obj.hasattr(attr_name)? {
-        obj.getattr(attr_name)?.call0()?
-    } else {
-        obj
-    };
-
-    let capsule = capsule.cast::<PyCapsule>()?;
-    let data: NonNull<FFI_LogicalExtensionCodec> = capsule
-        .pointer_checked(Some(c_str!("datafusion_logical_extension_codec")))?
-        .cast();
-    let codec = unsafe { data.as_ref() };
-
-    Ok(codec.clone())
 }

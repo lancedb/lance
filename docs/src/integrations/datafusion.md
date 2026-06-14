@@ -114,20 +114,6 @@ let df = ctx.sql("
 
 ## Python
 
-In Python, this integration is done via [Datafusion FFI](https://docs.rs/datafusion-ffi/latest/datafusion_ffi/).
-An FFI table provider `FFILanceTableProvider` is included in `pylance`.
-For example, if I want to query `my_lance_dataset`:
-
-```python
-from datafusion import SessionContext # pip install datafusion
-from lance import FFILanceTableProvider
-
-ctx = SessionContext()
-
-table1 = FFILanceTableProvider(
-    my_lance_dataset, with_row_id=True, with_row_addr=True
-)
-ctx.register_table("table1", table1)
-ctx.table("table1")
-ctx.sql("SELECT * FROM table1 LIMIT 10")
-```
+`pylance` does not include a Python DataFusion FFI table provider in the
+default build. The Rust integration above remains available through
+`lance::datafusion::LanceTableProvider`.
