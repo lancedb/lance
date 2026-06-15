@@ -4,6 +4,7 @@
 from enum import Enum
 
 from .. import lance as _lance
+from . import distributed_kmeans  # noqa: F401
 from .builder import IndexConfig, IndicesBuilder
 from .ivf import IvfModel
 from .pq import PqModel

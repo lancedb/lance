@@ -748,6 +748,143 @@ impl PyIndexDescription {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Distributed kmeans primitives
+// ---------------------------------------------------------------------------
+
+use lance::index::vector::ivf::distributed as l2;
+use lance_index::vector::kmeans::distributed as l1;
+
+fn parse_distance_type(s: &str) -> PyResult<DistanceType> {
+    DistanceType::try_from(s).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn array_data_to_fsl(array: ArrayData) -> PyResult<FixedSizeListArray> {
+    Ok(FixedSizeListArray::from(array))
+}
+
+#[pyfunction]
+#[pyo3(signature = (dataset, column, target, distance_type, rng_seed, fragment_ids=None))]
+fn distributed_sample_round_0<'py>(
+    py: Python<'py>,
+    dataset: &Dataset,
+    column: &str,
+    target: usize,
+    distance_type: &str,
+    rng_seed: u64,
+    fragment_ids: Option<Vec<u32>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dt = parse_distance_type(distance_type)?;
+    let column = column.to_string();
+    let dataset = dataset.ds.clone();
+    let batch = rt().block_on(Some(py), async move {
+        l2::sample_round_0(
+            dataset.as_ref(),
+            &column,
+            fragment_ids.as_deref(),
+            target,
+            dt,
+            rng_seed,
+        )
+        .await
+    })?;
+    let batch = batch.infer_error()?;
+    batch.to_pyarrow(py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (dataset, column, centroids, distance_type, fragment_ids=None))]
+fn distributed_compute_partial_stats<'py>(
+    py: Python<'py>,
+    dataset: &Dataset,
+    column: &str,
+    centroids: PyArrowType<ArrayData>,
+    distance_type: &str,
+    fragment_ids: Option<Vec<u32>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dt = parse_distance_type(distance_type)?;
+    let centroids_fsl = array_data_to_fsl(centroids.0)?;
+    let column = column.to_string();
+    let dataset = dataset.ds.clone();
+    let stats = rt().block_on(Some(py), async move {
+        l2::compute_partial_stats(
+            dataset.as_ref(),
+            &column,
+            fragment_ids.as_deref(),
+            &centroids_fsl,
+            dt,
+        )
+        .await
+    })?;
+    let stats = stats.infer_error()?;
+    stats.into_record_batch().to_pyarrow(py)
+}
+
+#[pyfunction]
+fn distributed_merge_partial_stats<'py>(
+    py: Python<'py>,
+    a: PyArrowType<arrow_array::RecordBatch>,
+    b: PyArrowType<arrow_array::RecordBatch>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let sa = l1::PartialStats::from_record_batch(a.0).infer_error()?;
+    let sb = l1::PartialStats::from_record_batch(b.0).infer_error()?;
+    let merged = l1::merge_partial_stats(sa, sb).infer_error()?;
+    merged.into_record_batch().to_pyarrow(py)
+}
+
+#[pyfunction]
+fn distributed_reduce_partial_stats<'py>(
+    py: Python<'py>,
+    stats: Vec<PyArrowType<arrow_array::RecordBatch>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let mut parsed = Vec::with_capacity(stats.len());
+    for batch in stats {
+        parsed.push(l1::PartialStats::from_record_batch(batch.0).infer_error()?);
+    }
+    let merged = l1::reduce_partial_stats(parsed).infer_error()?;
+    merged.into_record_batch().to_pyarrow(py)
+}
+
+#[pyfunction]
+fn distributed_finalize_centroids<'py>(
+    py: Python<'py>,
+    stats: PyArrowType<arrow_array::RecordBatch>,
+    prev: PyArrowType<ArrayData>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let s = l1::PartialStats::from_record_batch(stats.0).infer_error()?;
+    let prev_fsl = array_data_to_fsl(prev.0)?;
+    let new = l1::finalize_centroids(&s, &prev_fsl).infer_error()?;
+    new.to_data().to_pyarrow(py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (samples, k, rng_seed))]
+fn distributed_select_initial_centroids<'py>(
+    py: Python<'py>,
+    samples: Vec<PyArrowType<arrow_array::RecordBatch>>,
+    k: usize,
+    rng_seed: u64,
+) -> PyResult<Bound<'py, PyAny>> {
+    let batches: Vec<arrow_array::RecordBatch> = samples.into_iter().map(|s| s.0).collect();
+    let centroids = l1::select_initial_centroids(batches, k, rng_seed).infer_error()?;
+    centroids.to_data().to_pyarrow(py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (samples, k, distance_type, rng_seed))]
+fn distributed_bootstrap_centroids<'py>(
+    py: Python<'py>,
+    samples: Vec<PyArrowType<arrow_array::RecordBatch>>,
+    k: usize,
+    distance_type: &str,
+    rng_seed: u64,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dt = parse_distance_type(distance_type)?;
+    let batches: Vec<arrow_array::RecordBatch> = samples.into_iter().map(|s| s.0).collect();
+    let centroids = l1::bootstrap_centroids(batches, k, dt, rng_seed).infer_error()?;
+    centroids.to_data().to_pyarrow(py)
+}
+
 pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
@@ -756,6 +893,13 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
+    indices.add_wrapped(wrap_pyfunction!(distributed_sample_round_0))?;
+    indices.add_wrapped(wrap_pyfunction!(distributed_compute_partial_stats))?;
+    indices.add_wrapped(wrap_pyfunction!(distributed_merge_partial_stats))?;
+    indices.add_wrapped(wrap_pyfunction!(distributed_reduce_partial_stats))?;
+    indices.add_wrapped(wrap_pyfunction!(distributed_finalize_centroids))?;
+    indices.add_wrapped(wrap_pyfunction!(distributed_select_initial_centroids))?;
+    indices.add_wrapped(wrap_pyfunction!(distributed_bootstrap_centroids))?;
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
     indices.add_class::<PyIndexSegment>()?;
