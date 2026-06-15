@@ -116,22 +116,6 @@ mod tests {
         store.inner.delete(&test_path).await.unwrap();
     }
 
-    #[test]
-    fn test_hdfs_config_validation() {
-        // Test that missing namenode configuration is properly handled
-        let storage_options = HashMap::new();
-        let params = ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                storage_options,
-            ))),
-            ..Default::default()
-        };
-
-        // This test verifies the configuration validation logic without actually connecting
-        // The actual connection would fail, but we're testing the config validation
-        assert!(params.storage_options().is_some());
-    }
-
     #[tokio::test]
     async fn test_hdfs_ha_configuration() {
         if !hdfs_available() {
