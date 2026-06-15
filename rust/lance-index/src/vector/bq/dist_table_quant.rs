@@ -831,13 +831,18 @@ mod tests {
         assert_eq!(quantized, vec![0; 64]);
     }
 
-    /// The SIMD quantizers must round with static nearest-even regardless of
+    /// The SIMD quantizers must round with static nearest-even independent of
     /// the dynamic MXCSR rounding mode. Run them with MXCSR forced to
-    /// round-toward-zero and require they still match the scalar reference
-    /// (whose `round_ties_even` is unaffected by MXCSR). `factor == 0.5` puts
-    /// odd integers on exact .5 ties, where truncation (e.g. 1.5 -> 1) and
-    /// nearest-even (1.5 -> 2) disagree, so a kernel that honored MXCSR would
-    /// fail here.
+    /// round-toward-zero and require they still match the nearest-even
+    /// reference (computed under the default mode). `factor == 0.5` puts odd
+    /// integers on exact .5 ties, where truncation (1.5 -> 1) and nearest-even
+    /// (1.5 -> 2) disagree, so a kernel that honored MXCSR would fail here.
+    ///
+    /// The scalar fallback is intentionally excluded: `f32::round_ties_even`
+    /// can itself lower to an MXCSR-honoring instruction on x86, which is
+    /// precisely the hazard the SIMD kernels avoid with static rounding. The
+    /// scalar path is only reached when no SIMD is available and only matters
+    /// under the default rounding mode that lance runs in.
     #[cfg(target_arch = "x86_64")]
     #[test]
     #[allow(deprecated)] // _mm_getcsr/_mm_setcsr: no stable non-asm replacement.
@@ -845,12 +850,18 @@ mod tests {
         use std::arch::x86_64::{_MM_ROUND_MASK, _MM_ROUND_TOWARD_ZERO, _mm_getcsr, _mm_setcsr};
 
         let values = (0..=510).map(|v| v as f32).collect::<Vec<_>>();
+        // Computed under the default (nearest-even) rounding mode.
         let (_, expected_u8) = reference_u8(&values);
         let (_, expected_u16) = reference_u16(&values);
         let factor_u8 = u8::MAX as f32 / 510.0;
         let factor_u16 = u16::MAX as f32 / 510.0;
 
+        let mut simd_kernels_tested = 0usize;
         for (name, _, quantize_u8_fn, quantize_u16_fn) in available_kernels() {
+            if name == "scalar" {
+                continue;
+            }
+            simd_kernels_tested += 1;
             let mut out_u8 = Vec::with_capacity(values.len());
             let mut out_u16 = Vec::with_capacity(values.len());
             // SAFETY: SSE is baseline on x86_64. MXCSR is restored before any
@@ -880,6 +891,10 @@ mod tests {
                 "kernel={name} under truncating MXCSR"
             );
         }
+        assert!(
+            simd_kernels_tested > 0 || !std::arch::is_x86_feature_detected!("avx2"),
+            "AVX2 detected but no SIMD kernel was exercised"
+        );
     }
 
     /// The scratch buffer must be fully overwritten across reuses with
