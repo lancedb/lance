@@ -19,9 +19,13 @@ arrow-cast = "58.0.0"
 arrow-data = "58.0.0"
 arrow-schema = "58.0.0"
 object_store = "0.13.2"
-datafusion = "53.0.0"
+datafusion = { version = "53.0.0", default-features = false }
 datafusion-ffi = "53.0.0"
 datafusion-common = "53.0.0"
+# Keep the Python FFI build on the working Brotli allocator resolution until
+# datafusion-ffi no longer enables datafusion-proto/default.
+# See https://github.com/lance-format/lance/issues/7271.
+alloc-stdlib = "=0.2.2"
 async-trait = "0.1"
 chrono = "0.4.42"
 env_logger = "0.11.7"

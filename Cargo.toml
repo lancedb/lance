@@ -133,13 +133,13 @@ datafusion = { version = "53.0.0", default-features = false, features = [
     "unicode_expressions",
 ] }
 datafusion-common = "53.0.0"
-datafusion-functions = { version = "53.0.0", features = ["regex_expressions"] }
+datafusion-functions = { version = "53.0.0", default-features = false, features = ["regex_expressions"] }
 datafusion-sql = "53.0.0"
 datafusion-expr = "53.0.0"
 datafusion-ffi = "53.0.0"
 datafusion-physical-expr = "53.0.0"
 datafusion-physical-plan = "53.0.0"
-datafusion-substrait = "53.0.0"
+datafusion-substrait = { version = "53.0.0", default-features = false }
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
