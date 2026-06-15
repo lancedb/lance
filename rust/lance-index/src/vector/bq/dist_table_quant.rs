@@ -18,12 +18,14 @@
 //! and the `qmin == qmax` early-out are arithmetically identical either way.
 //!
 //! Quantization rounds half-to-even so that the scalar fallback and the SIMD
-//! kernels agree bit-exactly; the SIMD paths round with explicit static
-//! rounding rather than the dynamic MXCSR mode, so the result is independent
-//! of any rounding mode native code may have installed. Relative to the
-//! pre-SIMD implementation (`f32::round`, half-away-from-zero) this can move a
-//! LUT entry by 1 on exact .5 ties, which is within the table's inherent
-//! quantization error.
+//! kernels agree bit-exactly. All paths round with fixed-mode rounding,
+//! independent of the dynamic MXCSR rounding mode native code may have
+//! installed: the SIMD kernels use the converts' static rounding and the
+//! scalar path (also the SIMD tails) rounds via `f32::floor` rather than
+//! `f32::round_ties_even`, which can lower to an MXCSR-honoring instruction on
+//! x86. Relative to the pre-SIMD implementation (`f32::round`,
+//! half-away-from-zero) this can move a LUT entry by 1 on exact .5 ties, which
+//! is within the table's inherent quantization error.
 
 use std::mem::MaybeUninit;
 use std::sync::LazyLock;
@@ -228,17 +230,34 @@ fn min_max_fold(values: &[f32]) -> (f32, f32) {
     (min, max)
 }
 
+/// Round `x` to the nearest integer, ties to even — the same rule the SIMD
+/// converts use. Built from `f32::floor`, which is a fixed-mode rounding on
+/// every target, so (unlike `f32::round_ties_even`, which can lower to an
+/// MXCSR-honoring instruction on x86) the result is independent of the
+/// dynamic rounding mode. `x` is a non-negative quantization product, so only
+/// the upward tie case is reachable, but the form is written for any finite
+/// `x` whose floor fits in `i64`. Branchless to keep the aarch64 quantize
+/// loop (which has no dedicated SIMD kernel) autovectorizable.
+#[inline(always)]
+fn round_ties_even_fixed(x: f32) -> f32 {
+    let lower = x.floor();
+    let frac = x - lower;
+    let lower_is_odd = (lower as i64 & 1) != 0;
+    let round_up = frac > 0.5 || (frac == 0.5 && lower_is_odd);
+    lower + f32::from(round_up)
+}
+
 fn quantize_u8_scalar(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u8>]) {
     debug_assert_eq!(values.len(), out.len());
     for (quantized, &d) in out.iter_mut().zip(values) {
-        quantized.write(((d - qmin) * factor).round_ties_even() as u8);
+        quantized.write(round_ties_even_fixed((d - qmin) * factor) as u8);
     }
 }
 
 fn quantize_u16_scalar(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u16>]) {
     debug_assert_eq!(values.len(), out.len());
     for (quantized, &d) in out.iter_mut().zip(values) {
-        quantized.write(((d - qmin) * factor).round_ties_even() as u16);
+        quantized.write(round_ties_even_fixed((d - qmin) * factor) as u16);
     }
 }
 
@@ -340,7 +359,7 @@ mod x86 {
     /// Load 16 floats and affine-quantize them into `i32` lanes, rounding to
     /// nearest-even with static rounding (`_MM_FROUND_TO_NEAREST_INT`) so the
     /// result does not depend on the dynamic MXCSR rounding mode and matches
-    /// the scalar `round_ties_even`.
+    /// the scalar [`super::round_ties_even_fixed`].
     #[inline]
     #[target_feature(enable = "avx512f")]
     unsafe fn quantize16_epi32(src: *const f32, min: __m512, factor: __m512) -> __m512i {
@@ -422,7 +441,8 @@ mod x86 {
     /// embedded-rounding convert, so round to nearest-even explicitly with
     /// `_mm256_round_ps` (which ignores MXCSR); the subsequent convert then
     /// sees an integral value, so its dynamic rounding mode cannot change the
-    /// result, keeping it bit-identical to the scalar `round_ties_even`.
+    /// result, keeping it bit-identical to the scalar
+    /// [`super::round_ties_even_fixed`].
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn quantize8_epi32(src: *const f32, min: __m256, factor: __m256) -> __m256i {
@@ -831,22 +851,19 @@ mod tests {
         assert_eq!(quantized, vec![0; 64]);
     }
 
-    /// The SIMD quantizers must round with static nearest-even independent of
-    /// the dynamic MXCSR rounding mode. Run them with MXCSR forced to
-    /// round-toward-zero and require they still match the nearest-even
+    /// Every quantizer — scalar, AVX2, AVX-512, including the SIMD kernels'
+    /// scalar tails — must round with fixed nearest-even, independent of the
+    /// dynamic MXCSR rounding mode. Run each with MXCSR forced to
+    /// round-toward-zero and require it still matches the nearest-even
     /// reference (computed under the default mode). `factor == 0.5` puts odd
     /// integers on exact .5 ties, where truncation (1.5 -> 1) and nearest-even
-    /// (1.5 -> 2) disagree, so a kernel that honored MXCSR would fail here.
-    ///
-    /// The scalar fallback is intentionally excluded: `f32::round_ties_even`
-    /// can itself lower to an MXCSR-honoring instruction on x86, which is
-    /// precisely the hazard the SIMD kernels avoid with static rounding. The
-    /// scalar path is only reached when no SIMD is available and only matters
-    /// under the default rounding mode that lance runs in.
+    /// (1.5 -> 2) disagree, so a path that honored MXCSR would fail. The
+    /// length (511) is deliberately not a multiple of the SIMD step so the
+    /// kernels' scalar tails are exercised too.
     #[cfg(target_arch = "x86_64")]
     #[test]
     #[allow(deprecated)] // _mm_getcsr/_mm_setcsr: no stable non-asm replacement.
-    fn test_simd_rounding_ignores_mxcsr() {
+    fn test_quantize_rounding_ignores_mxcsr() {
         use std::arch::x86_64::{_MM_ROUND_MASK, _MM_ROUND_TOWARD_ZERO, _mm_getcsr, _mm_setcsr};
 
         let values = (0..=510).map(|v| v as f32).collect::<Vec<_>>();
@@ -856,12 +873,7 @@ mod tests {
         let factor_u8 = u8::MAX as f32 / 510.0;
         let factor_u16 = u16::MAX as f32 / 510.0;
 
-        let mut simd_kernels_tested = 0usize;
         for (name, _, quantize_u8_fn, quantize_u16_fn) in available_kernels() {
-            if name == "scalar" {
-                continue;
-            }
-            simd_kernels_tested += 1;
             let mut out_u8 = Vec::with_capacity(values.len());
             let mut out_u16 = Vec::with_capacity(values.len());
             // SAFETY: SSE is baseline on x86_64. MXCSR is restored before any
@@ -891,10 +903,6 @@ mod tests {
                 "kernel={name} under truncating MXCSR"
             );
         }
-        assert!(
-            simd_kernels_tested > 0 || !std::arch::is_x86_feature_detected!("avx2"),
-            "AVX2 detected but no SIMD kernel was exercised"
-        );
     }
 
     /// The scratch buffer must be fully overwritten across reuses with
