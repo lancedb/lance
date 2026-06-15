@@ -992,13 +992,10 @@ pub async fn write_fragments_internal(
     }
 
     if storage_version >= LanceFileVersion::V2_2
-        && schema
-            .fields
-            .iter()
-            .any(|f| f.metadata.contains_key(BLOB_META_KEY))
+        && let Some(blob_field_path) = legacy_blob_field_path(&schema)
     {
         return Err(Error::invalid_input(format!(
-            "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
+            "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Found legacy blob field: {blob_field_path}. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
         )));
     }
 
@@ -1015,6 +1012,17 @@ pub async fn write_fragments_internal(
     .await?;
 
     Ok((fragments, schema))
+}
+
+fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
+    schema
+        .fields_pre_order()
+        .find(|field| field.metadata.contains_key(BLOB_META_KEY))
+        .map(|field| {
+            schema
+                .field_path(field.id)
+                .unwrap_or_else(|_| field.name.clone())
+        })
 }
 
 #[async_trait::async_trait]
