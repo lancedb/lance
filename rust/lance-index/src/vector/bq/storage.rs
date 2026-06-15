@@ -41,6 +41,9 @@ use serde::{Deserialize, Serialize};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::vector::ApproxMode;
+use crate::vector::bq::dist_table_quant::{
+    DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
+};
 use crate::vector::bq::ex_dot::{
     EX_DOT_BLOCK_DIMS, ExDotFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
@@ -897,6 +900,22 @@ impl<'a> RabitDistCalculator<'a> {
         )
     }
 
+    /// Fill `dists[0..n]` with exact per-row binary distances computed
+    /// directly from the f32 dist table — the fallback when the quantized
+    /// reconstruction scale would be non-finite ([`DistTableDequant::Exact`]).
+    #[allow(clippy::uninit_vec)]
+    fn fill_exact_binary_distances(&self, n: usize, code_len: usize, dists: &mut Vec<f32>) {
+        dists.clear();
+        dists.reserve(n);
+        // SAFETY: the loop initializes every element in [0, n).
+        unsafe {
+            dists.set_len(n);
+        }
+        dists.iter_mut().enumerate().for_each(|(id, dist)| {
+            *dist = compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table);
+        });
+    }
+
     #[allow(clippy::uninit_vec)]
     fn binary_distances_with_scratch(
         &self,
@@ -918,7 +937,16 @@ impl<'a> RabitDistCalculator<'a> {
             );
         }
 
-        let (qmin, qmax) = quantize_dist_table_into(&self.dist_table, quantized_dists_table);
+        let (qmin, qmax) = match quantize_dist_table_into(&self.dist_table, quantized_dists_table) {
+            DistTableDequant::Affine { qmin, qmax } => (qmin, qmax),
+            DistTableDequant::Exact => {
+                // The affine reconstruction would be non-finite; compute every
+                // binary distance exactly and report no SIMD rows so the
+                // ex-rerank caller takes the per-row path for all of them.
+                self.fill_exact_binary_distances(n, code_len, dists);
+                return 0;
+            }
+        };
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
         quantized_dists.clear();
@@ -978,7 +1006,16 @@ impl<'a> RabitDistCalculator<'a> {
         hacc_dist_table: &mut Vec<u8>,
         quantized_dists: &mut Vec<u32>,
     ) -> usize {
-        let (qmin, qmax) = quantize_dist_table_u16_into(&self.dist_table, quantized_dist_table);
+        let (qmin, qmax) =
+            match quantize_dist_table_u16_into(&self.dist_table, quantized_dist_table) {
+                DistTableDequant::Affine { qmin, qmax } => (qmin, qmax),
+                DistTableDequant::Exact => {
+                    // See binary_distances_with_scratch: non-finite affine
+                    // scale falls back to exact per-row distances.
+                    self.fill_exact_binary_distances(n, code_len, dists);
+                    return 0;
+                }
+            };
         simd::dist_table::transfer_4bit_dist_table_u16(quantized_dist_table, hacc_dist_table);
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
@@ -1343,68 +1380,6 @@ where
         // where lowbit(0b1010) = 0b10, LOWBIT_IDX[0b1010] = LOWBIT_IDX[0b10] = 1.
         dist_table[j] = dist_table[j - lowbit(j)] + sub_vec[LOWBIT_IDX[j]].as_();
     })
-}
-
-// Quantize the distance table into a caller-owned buffer.
-#[inline]
-fn quantize_dist_table_into(dist_table: &[f32], quantized_dist_table: &mut Vec<u8>) -> (f32, f32) {
-    let (qmin, qmax) = dist_table
-        .iter()
-        .cloned()
-        .minmax_by(|a, b| a.total_cmp(b))
-        .into_option()
-        .unwrap();
-    // this happens if the query is all zeros
-    if qmin == qmax {
-        quantized_dist_table.clear();
-        quantized_dist_table.resize(dist_table.len(), 0);
-        return (qmin, qmax);
-    }
-    let factor = 255.0 / (qmax - qmin);
-    quantized_dist_table.clear();
-    quantized_dist_table.reserve(dist_table.len());
-    let spare = quantized_dist_table.spare_capacity_mut();
-    for (quantized, &d) in spare[..dist_table.len()].iter_mut().zip(dist_table.iter()) {
-        quantized.write(((d - qmin) * factor).round() as u8);
-    }
-    // SAFETY: every element in the reserved range was initialized in the loop above.
-    unsafe {
-        quantized_dist_table.set_len(dist_table.len());
-    }
-
-    (qmin, qmax)
-}
-
-#[inline]
-fn quantize_dist_table_u16_into(
-    dist_table: &[f32],
-    quantized_dist_table: &mut Vec<u16>,
-) -> (f32, f32) {
-    let (qmin, qmax) = dist_table
-        .iter()
-        .cloned()
-        .minmax_by(|a, b| a.total_cmp(b))
-        .into_option()
-        .unwrap();
-    if qmin == qmax {
-        quantized_dist_table.clear();
-        quantized_dist_table.resize(dist_table.len(), 0);
-        return (qmin, qmax);
-    }
-
-    let factor = u16::MAX as f32 / (qmax - qmin);
-    quantized_dist_table.clear();
-    quantized_dist_table.reserve(dist_table.len());
-    let spare = quantized_dist_table.spare_capacity_mut();
-    for (quantized, &d) in spare[..dist_table.len()].iter_mut().zip(dist_table.iter()) {
-        quantized.write(((d - qmin) * factor).round() as u16);
-    }
-    // SAFETY: every element in the reserved range was initialized in the loop above.
-    unsafe {
-        quantized_dist_table.set_len(dist_table.len());
-    }
-
-    (qmin, qmax)
 }
 
 /// Build the u8 FastScan LUT for the ex codes directly from the rotated
@@ -2551,6 +2526,7 @@ mod tests {
     use arrow_array::{ArrayRef, Float32Array, Float64Array, UInt64Array};
     use lance_core::ROW_ID;
     use lance_linalg::distance::DistanceType;
+    use rstest::rstest;
 
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
@@ -3544,6 +3520,97 @@ mod tests {
             // Gated indexes (with error factors) skip the FastScan artifacts
             // and score the bulk path with the exact kernels.
             assert_raw_query_multi_bit_distance_all_uses_fastscan(num_bits, false, true);
+        }
+    }
+
+    /// A dist table whose `num_tables`-scaled reconstruction overflows `f32`
+    /// must fall back to exact distances rather than the affine dequant's
+    /// `0 * inf = NaN`. Covers both the u8 (Normal) and u16 (Accurate) LUT
+    /// paths end-to-end through `distance_all`, asserting the result is
+    /// NaN-free and bit-identical to the always-exact per-row computation.
+    #[rstest]
+    fn test_degenerate_dist_table_falls_back_to_exact_distances(
+        #[values(ApproxMode::Normal, ApproxMode::Accurate)] approx_mode: ApproxMode,
+    ) {
+        let code_dim = 8usize;
+        let num_rows = BATCH_SIZE + 5;
+        let num_bits = 3;
+        let ex_bits = rabit_ex_bits(num_bits).unwrap();
+        let identity = Float32Array::from_iter_values(
+            (0..code_dim)
+                .flat_map(|row| (0..code_dim).map(move |col| if row == col { 1.0 } else { 0.0 })),
+        );
+        let rotate_mat =
+            FixedSizeListArray::try_new_from_values(identity, code_dim as i32).unwrap();
+        let metadata = RabitQuantizationMetadata {
+            rotate_mat: Some(rotate_mat),
+            rotate_mat_position: None,
+            fast_rotation_signs: None,
+            rotation_type: RQRotationType::Matrix,
+            code_dim: code_dim as u32,
+            num_bits,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values((0..num_rows).map(|idx| (idx * 19) as u8)),
+            rabit_binary_code_bytes(code_dim) as i32,
+        )
+        .unwrap();
+        let ex_codes = make_test_ex_codes(num_rows, code_dim, num_bits);
+        let batch = make_test_batch_with_ex(codes, ex_codes);
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+        let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
+
+        let mut calc = storage.dist_calculator(query, 4.0);
+        calc.approx_mode = approx_mode;
+        // num_tables = (code_dim * 4) / SEGMENT_NUM_CODES = 2; the extrema sum
+        // (qmax - qmin = 4e38) overflows when scaled by num_tables, so the
+        // quantizer returns `Exact`. Per-row sums stay finite (each row reads
+        // one entry per segment), so the exact path is well-defined.
+        let mut degenerate = vec![0.0f32; code_dim * 4];
+        degenerate[0] = -2e38;
+        degenerate[1] = 2e38;
+        calc.dist_table = Cow::Owned(degenerate);
+
+        let code_len = rabit_binary_code_bytes(code_dim);
+        let ex_codes = calc.ex_codes.unwrap();
+        let ex_add_factors = calc.ex_add_factors.unwrap();
+        let ex_scale_factors = calc.ex_scale_factors.unwrap();
+        let expected = (0..num_rows)
+            .map(|id| {
+                let binary_ip = compute_single_rq_distance(
+                    calc.codes,
+                    id,
+                    num_rows,
+                    code_len,
+                    &calc.dist_table,
+                );
+                calc.raw_query_multi_bit_exact_distance(
+                    id,
+                    binary_ip,
+                    ex_bits,
+                    ex_codes,
+                    ex_add_factors,
+                    ex_scale_factors,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let actual = calc.distance_all(0);
+        assert_eq!(actual.len(), num_rows);
+        for id in 0..num_rows {
+            assert!(
+                !actual[id].is_nan(),
+                "approx_mode={approx_mode:?} id={id}: degenerate table produced NaN"
+            );
+            assert_eq!(
+                actual[id].to_bits(),
+                expected[id].to_bits(),
+                "approx_mode={approx_mode:?} id={id}: distance_all must match the exact path"
+            );
         }
     }
 
