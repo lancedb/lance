@@ -17,42 +17,64 @@
 //! divergence is the sign of zero, which callers cannot observe: `d - qmin`
 //! and the `qmin == qmax` early-out are arithmetically identical either way.
 //!
-//! Quantization rounds half-to-even (the SSE/AVX default rounding mode)
-//! rather than `f32::round`'s half-away-from-zero so that the scalar
-//! fallback and the SIMD kernels agree bit-exactly; relative to the pre-SIMD
-//! implementation this can move a LUT entry by 1 on exact .5 ties, which is
-//! within the table's inherent quantization error.
+//! Quantization rounds half-to-even so that the scalar fallback and the SIMD
+//! kernels agree bit-exactly; the SIMD paths round with explicit static
+//! rounding rather than the dynamic MXCSR mode, so the result is independent
+//! of any rounding mode native code may have installed. Relative to the
+//! pre-SIMD implementation (`f32::round`, half-away-from-zero) this can move a
+//! LUT entry by 1 on exact .5 ties, which is within the table's inherent
+//! quantization error.
 
 use std::mem::MaybeUninit;
 use std::sync::LazyLock;
+
+use super::storage::SEGMENT_NUM_CODES;
 
 type MinMaxFn = fn(&[f32]) -> (f32, f32);
 type QuantizeU8Fn = fn(&[f32], f32, f32, &mut [MaybeUninit<u8>]);
 type QuantizeU16Fn = fn(&[f32], f32, f32, &mut [MaybeUninit<u16>]);
 
+/// How the caller reconstructs binary inner-product distances from the
+/// FastScan accumulator sums computed against the quantized LUT.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DistTableDequant {
+    /// Reconstruct each distance with the affine map
+    /// `q_sum * (qmax - qmin) / SCALE + num_tables * qmin`. Returned whenever
+    /// that map is finite, including a zero/sub-resolution range — then the
+    /// LUT is zeroed and every distance collapses to the constant
+    /// `num_tables * qmin`.
+    Affine { qmin: f32, qmax: f32 },
+    /// `num_tables * {qmin, qmax, qmax - qmin}` overflowed f32, so the affine
+    /// reconstruction would yield NaN/inf. The LUT is zeroed; the caller must
+    /// compute exact distances directly from the f32 table.
+    Exact,
+}
+
 /// Quantize `dist_table` into `u8` FastScan LUT entries in the caller-owned
-/// scratch buffer, returning the table's `(min, max)`.
-///
-/// An all-equal table (e.g. from an all-zero query) produces a zeroed LUT;
-/// callers reconstruct distances from `min` alone. `dist_table` must be
-/// non-empty and all values finite.
+/// scratch buffer, returning how the caller must dequantize the FastScan
+/// sums (see [`DistTableDequant`]). `dist_table` must be non-empty and all
+/// values finite.
 pub fn quantize_dist_table_into(
     dist_table: &[f32],
     quantized_dist_table: &mut Vec<u8>,
-) -> (f32, f32) {
+) -> DistTableDequant {
     debug_assert!(!dist_table.is_empty(), "dist table must be non-empty");
     let (qmin, qmax) = min_max(dist_table);
-    let range = qmax - qmin;
-    let factor = u8::MAX as f32 / range;
-    // A zero range happens if the query is all zeros. A non-finite `range`
-    // or `factor` (table spread overflowing f32 or below ~255/f32::MAX)
-    // would produce NaN/inf products on which the kernels' saturating
-    // narrows disagree. Either way the table carries no information at u8
-    // resolution: emit a zeroed LUT that callers reconstruct from `min`.
-    if !range.is_finite() || !factor.is_finite() {
+    if dequant_overflows(dist_table.len(), qmin, qmax) {
+        // The caller's affine reconstruction would be non-finite; it computes
+        // exact distances and ignores the LUT, but keep the buffer valid.
         quantized_dist_table.clear();
         quantized_dist_table.resize(dist_table.len(), 0);
-        return (qmin, qmax);
+        return DistTableDequant::Exact;
+    }
+    let factor = u8::MAX as f32 / (qmax - qmin);
+    if !factor.is_finite() {
+        // Zero or sub-u8-resolution range (e.g. an all-zeros query): the LUT
+        // carries no information, but the finite affine map sends every sum
+        // to the constant `num_tables * qmin`.
+        quantized_dist_table.clear();
+        quantized_dist_table.resize(dist_table.len(), 0);
+        return DistTableDequant::Affine { qmin, qmax };
     }
     quantized_dist_table.clear();
     quantized_dist_table.reserve(dist_table.len());
@@ -66,7 +88,7 @@ pub fn quantize_dist_table_into(
     unsafe {
         quantized_dist_table.set_len(dist_table.len());
     }
-    (qmin, qmax)
+    DistTableDequant::Affine { qmin, qmax }
 }
 
 /// `u16` variant of [`quantize_dist_table_into`] for the accurate approx
@@ -74,17 +96,19 @@ pub fn quantize_dist_table_into(
 pub fn quantize_dist_table_u16_into(
     dist_table: &[f32],
     quantized_dist_table: &mut Vec<u16>,
-) -> (f32, f32) {
+) -> DistTableDequant {
     debug_assert!(!dist_table.is_empty(), "dist table must be non-empty");
     let (qmin, qmax) = min_max(dist_table);
-    let range = qmax - qmin;
-    let factor = u16::MAX as f32 / range;
-    // See quantize_dist_table_into: degenerate ranges collapse to a zeroed
-    // LUT to keep all kernels bit-exact.
-    if !range.is_finite() || !factor.is_finite() {
+    if dequant_overflows(dist_table.len(), qmin, qmax) {
         quantized_dist_table.clear();
         quantized_dist_table.resize(dist_table.len(), 0);
-        return (qmin, qmax);
+        return DistTableDequant::Exact;
+    }
+    let factor = u16::MAX as f32 / (qmax - qmin);
+    if !factor.is_finite() {
+        quantized_dist_table.clear();
+        quantized_dist_table.resize(dist_table.len(), 0);
+        return DistTableDequant::Affine { qmin, qmax };
     }
     quantized_dist_table.clear();
     quantized_dist_table.reserve(dist_table.len());
@@ -98,7 +122,24 @@ pub fn quantize_dist_table_u16_into(
     unsafe {
         quantized_dist_table.set_len(dist_table.len());
     }
-    (qmin, qmax)
+    DistTableDequant::Affine { qmin, qmax }
+}
+
+/// Whether the caller's affine dequantization
+/// `q_sum * (qmax - qmin) / SCALE + num_tables * qmin` would overflow `f32`
+/// for some row. Each row's reconstructed binary IP lies in
+/// `[num_tables * qmin, num_tables * qmax]` and its quantized term is at most
+/// `num_tables * (qmax - qmin)`, so if any of those is non-finite the table
+/// must fall back to exact distances. The bound is scale-independent — the
+/// `1 / SCALE` factor and the `q_sum <= num_tables * SCALE` range cancel.
+/// Real dist tables are bounded sums of rotated-query components and never
+/// approach this; the guard exists so a pathological query degrades to exact
+/// distances instead of producing NaN.
+fn dequant_overflows(table_len: usize, qmin: f32, qmax: f32) -> bool {
+    let num_tables = (table_len / SEGMENT_NUM_CODES) as f32;
+    !(num_tables * qmin).is_finite()
+        || !(num_tables * qmax).is_finite()
+        || !(num_tables * (qmax - qmin)).is_finite()
 }
 
 fn min_max(values: &[f32]) -> (f32, f32) {
@@ -296,14 +337,17 @@ mod x86 {
         _mm_cvtss_f32(single)
     }
 
-    /// Load 16 floats and affine-quantize them into `i32` lanes; the convert
-    /// rounds to nearest-even (the MXCSR default).
+    /// Load 16 floats and affine-quantize them into `i32` lanes, rounding to
+    /// nearest-even with static rounding (`_MM_FROUND_TO_NEAREST_INT`) so the
+    /// result does not depend on the dynamic MXCSR rounding mode and matches
+    /// the scalar `round_ties_even`.
     #[inline]
     #[target_feature(enable = "avx512f")]
     unsafe fn quantize16_epi32(src: *const f32, min: __m512, factor: __m512) -> __m512i {
         // SAFETY: the caller guarantees 16 floats are readable at `src`.
         let v = unsafe { _mm512_loadu_ps(src) };
-        _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_sub_ps(v, min), factor))
+        let scaled = _mm512_mul_ps(_mm512_sub_ps(v, min), factor);
+        _mm512_cvt_roundps_epi32::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(scaled)
     }
 
     pub(super) fn quantize_u8_avx512_dispatch(
@@ -374,14 +418,19 @@ mod x86 {
         quantize_u16_scalar(&values[full..], qmin, factor, &mut out[full..]);
     }
 
-    /// Load 8 floats and affine-quantize them into `i32` lanes; the convert
-    /// rounds to nearest-even (the MXCSR default).
+    /// Load 8 floats and affine-quantize them into `i32` lanes. AVX2 has no
+    /// embedded-rounding convert, so round to nearest-even explicitly with
+    /// `_mm256_round_ps` (which ignores MXCSR); the subsequent convert then
+    /// sees an integral value, so its dynamic rounding mode cannot change the
+    /// result, keeping it bit-identical to the scalar `round_ties_even`.
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn quantize8_epi32(src: *const f32, min: __m256, factor: __m256) -> __m256i {
         // SAFETY: the caller guarantees 8 floats are readable at `src`.
         let v = unsafe { _mm256_loadu_ps(src) };
-        _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_sub_ps(v, min), factor))
+        let scaled = _mm256_mul_ps(_mm256_sub_ps(v, min), factor);
+        let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(scaled);
+        _mm256_cvtps_epi32(rounded)
     }
 
     pub(super) fn quantize_u8_avx2_dispatch(
@@ -491,32 +540,42 @@ mod tests {
         (min, max)
     }
 
-    fn reference_u8(values: &[f32]) -> (Vec<u8>, f32, f32) {
+    fn reference_u8(values: &[f32]) -> (DistTableDequant, Vec<u8>) {
         let (qmin, qmax) = reference_min_max(values);
-        let range = qmax - qmin;
-        let factor = u8::MAX as f32 / range;
-        if !range.is_finite() || !factor.is_finite() {
-            return (vec![0; values.len()], qmin, qmax);
+        if dequant_overflows(values.len(), qmin, qmax) {
+            return (DistTableDequant::Exact, vec![0; values.len()]);
+        }
+        let factor = u8::MAX as f32 / (qmax - qmin);
+        if !factor.is_finite() {
+            return (
+                DistTableDequant::Affine { qmin, qmax },
+                vec![0; values.len()],
+            );
         }
         let quantized = values
             .iter()
             .map(|&d| ((d - qmin) * factor).round_ties_even() as u8)
             .collect();
-        (quantized, qmin, qmax)
+        (DistTableDequant::Affine { qmin, qmax }, quantized)
     }
 
-    fn reference_u16(values: &[f32]) -> (Vec<u16>, f32, f32) {
+    fn reference_u16(values: &[f32]) -> (DistTableDequant, Vec<u16>) {
         let (qmin, qmax) = reference_min_max(values);
-        let range = qmax - qmin;
-        let factor = u16::MAX as f32 / range;
-        if !range.is_finite() || !factor.is_finite() {
-            return (vec![0; values.len()], qmin, qmax);
+        if dequant_overflows(values.len(), qmin, qmax) {
+            return (DistTableDequant::Exact, vec![0; values.len()]);
+        }
+        let factor = u16::MAX as f32 / (qmax - qmin);
+        if !factor.is_finite() {
+            return (
+                DistTableDequant::Affine { qmin, qmax },
+                vec![0; values.len()],
+            );
         }
         let quantized = values
             .iter()
             .map(|&d| ((d - qmin) * factor).round_ties_even() as u16)
             .collect();
-        (quantized, qmin, qmax)
+        (DistTableDequant::Affine { qmin, qmax }, quantized)
     }
 
     fn available_kernels() -> Vec<(&'static str, MinMaxFn, QuantizeU8Fn, QuantizeU16Fn)> {
@@ -553,8 +612,9 @@ mod tests {
     /// Every available kernel must agree bit-exactly with the reference on
     /// the given input.
     fn check_against_reference(values: &[f32]) {
-        let (expected_u8, expected_min, expected_max) = reference_u8(values);
-        let (expected_u16, ..) = reference_u16(values);
+        let (expected_dequant_u8, expected_u8) = reference_u8(values);
+        let (expected_dequant_u16, expected_u16) = reference_u16(values);
+        let (expected_min, expected_max) = reference_min_max(values);
 
         for (name, min_max_fn, quantize_u8_fn, quantize_u16_fn) in available_kernels() {
             let (qmin, qmax) = min_max_fn(values);
@@ -565,10 +625,11 @@ mod tests {
                 values.len()
             );
 
-            // The public entry points never hand a degenerate factor to the
-            // quantize kernels; mirror that here.
+            // The quantize kernels are only invoked on the populated path, so
+            // mirror that guard before exercising them directly.
+            let overflows = dequant_overflows(values.len(), qmin, qmax);
             let factor_u8 = u8::MAX as f32 / (qmax - qmin);
-            if (qmax - qmin).is_finite() && factor_u8.is_finite() {
+            if !overflows && factor_u8.is_finite() {
                 let mut out_u8 = Vec::with_capacity(values.len());
                 quantize_u8_fn(
                     values,
@@ -582,7 +643,7 @@ mod tests {
             }
 
             let factor_u16 = u16::MAX as f32 / (qmax - qmin);
-            if (qmax - qmin).is_finite() && factor_u16.is_finite() {
+            if !overflows && factor_u16.is_finite() {
                 let mut out_u16 = Vec::with_capacity(values.len());
                 quantize_u16_fn(
                     values,
@@ -596,20 +657,24 @@ mod tests {
             }
         }
 
-        // The public entry points exercise the dispatched kernels plus the
-        // scratch-buffer handling.
+        // The public entry points exercise the dispatched kernels, the
+        // dequantization classification, and the scratch-buffer handling.
         let mut out_u8 = Vec::new();
         assert_eq!(
             quantize_dist_table_into(values, &mut out_u8),
-            (expected_min, expected_max)
+            expected_dequant_u8,
+            "len={}",
+            values.len()
         );
-        assert_eq!(out_u8, expected_u8);
+        assert_eq!(out_u8, expected_u8, "len={}", values.len());
         let mut out_u16 = Vec::new();
         assert_eq!(
             quantize_dist_table_u16_into(values, &mut out_u16),
-            (expected_min, expected_max)
+            expected_dequant_u16,
+            "len={}",
+            values.len()
         );
-        assert_eq!(out_u16, expected_u16);
+        assert_eq!(out_u16, expected_u16, "len={}", values.len());
     }
 
     #[rstest]
@@ -632,8 +697,13 @@ mod tests {
         let values = (0..=510).map(|v| v as f32).collect::<Vec<_>>();
         check_against_reference(&values);
         let mut quantized = Vec::new();
-        let (qmin, qmax) = quantize_dist_table_into(&values, &mut quantized);
-        assert_eq!((qmin, qmax), (0.0, 510.0));
+        assert_eq!(
+            quantize_dist_table_into(&values, &mut quantized),
+            DistTableDequant::Affine {
+                qmin: 0.0,
+                qmax: 510.0
+            }
+        );
         // Spot-check nearest-even: 0.5 -> 0, 1.5 -> 2, 127.5 -> 128,
         // 254.5 -> 254.
         assert_eq!(&quantized[..6], &[0, 0, 1, 2, 2, 2]);
@@ -645,8 +715,13 @@ mod tests {
         let values = (0..=510).map(|v| (v * 257) as f32).collect::<Vec<_>>();
         check_against_reference(&values);
         let mut quantized = Vec::new();
-        let (qmin, qmax) = quantize_dist_table_u16_into(&values, &mut quantized);
-        assert_eq!((qmin, qmax), (0.0, 131070.0));
+        assert_eq!(
+            quantize_dist_table_u16_into(&values, &mut quantized),
+            DistTableDequant::Affine {
+                qmin: 0.0,
+                qmax: 131070.0
+            }
+        );
         // value * 0.5 = 128.5 -> 128, 385.5 -> 386 under nearest-even.
         assert_eq!(&quantized[..4], &[0, 128, 257, 386]);
         assert_eq!(quantized[510], u16::MAX);
@@ -669,26 +744,34 @@ mod tests {
     fn test_all_equal_input_zeroes_table(#[values(0.0, -7.25, 3.5)] value: f32) {
         let values = vec![value; 100];
         check_against_reference(&values);
+        // Zero range: a zeroed LUT plus the finite affine map (every sum maps
+        // to `num_tables * value`).
+        let expected = DistTableDequant::Affine {
+            qmin: value,
+            qmax: value,
+        };
         let mut quantized = vec![1u8; 5];
-        let (qmin, qmax) = quantize_dist_table_into(&values, &mut quantized);
-        assert_eq!((qmin, qmax), (value, value));
+        assert_eq!(quantize_dist_table_into(&values, &mut quantized), expected);
         assert_eq!(quantized, vec![0; 100]);
         let mut quantized = vec![1u16; 5];
-        let (qmin, qmax) = quantize_dist_table_u16_into(&values, &mut quantized);
-        assert_eq!((qmin, qmax), (value, value));
+        assert_eq!(
+            quantize_dist_table_u16_into(&values, &mut quantized),
+            expected
+        );
         assert_eq!(quantized, vec![0; 100]);
     }
 
-    /// Degenerate finite ranges make `factor` (or `range` itself) non-finite
-    /// and must collapse to a zeroed LUT on every kernel: NaN/inf products
-    /// would otherwise hit the saturating narrows, which disagree across
-    /// scalar, AVX2, and AVX-512.
+    /// A finite sub-resolution range zeroes the LUT but still dequantizes
+    /// with the finite affine map (`Affine`), whereas a range whose
+    /// `num_tables`-scaled reconstruction overflows must signal `Exact` so the
+    /// caller computes exact distances instead of `0 * inf = NaN`.
     #[test]
-    fn test_degenerate_range_zeroes_table() {
-        // factor = 255 / 1e-38 overflows to +inf.
+    fn test_degenerate_range_classification() {
+        // factor = 255 / 1e-38 overflows to +inf, but the reconstruction
+        // (num_tables * {0, 1e-38}) stays finite -> Affine, zeroed LUT.
         let mut tiny_range = vec![0.0f32; 32];
         tiny_range[1] = 1e-38;
-        // qmax - qmin overflows to +inf, so factor is 0 and products are NaN.
+        // num_tables * (2e38 - (-2e38)) overflows f32 -> Exact.
         let mut huge_range = vec![0.0f32; 32];
         huge_range[0] = -2e38;
         huge_range[1] = 2e38;
@@ -701,28 +784,102 @@ mod tests {
             check_against_reference(values);
         }
         let mut quantized_u8 = Vec::new();
-        let (qmin, qmax) = quantize_dist_table_into(&tiny_range, &mut quantized_u8);
-        assert_eq!((qmin, qmax), (0.0, 1e-38));
+        assert_eq!(
+            quantize_dist_table_into(&tiny_range, &mut quantized_u8),
+            DistTableDequant::Affine {
+                qmin: 0.0,
+                qmax: 1e-38
+            }
+        );
         assert_eq!(quantized_u8, vec![0; 32]);
-        quantize_dist_table_into(&huge_range, &mut quantized_u8);
+        assert_eq!(
+            quantize_dist_table_into(&huge_range, &mut quantized_u8),
+            DistTableDequant::Exact
+        );
         assert_eq!(quantized_u8, vec![0; 32]);
         let mut quantized_u16 = Vec::new();
-        quantize_dist_table_u16_into(&u16_only, &mut quantized_u16);
+        assert_eq!(
+            quantize_dist_table_u16_into(&u16_only, &mut quantized_u16),
+            DistTableDequant::Affine {
+                qmin: 0.0,
+                qmax: 1e-35
+            }
+        );
         assert_eq!(quantized_u16, vec![0; 32]);
-        quantize_dist_table_into(&u16_only, &mut quantized_u8);
+        assert_eq!(
+            quantize_dist_table_into(&u16_only, &mut quantized_u8),
+            DistTableDequant::Affine {
+                qmin: 0.0,
+                qmax: 1e-35
+            }
+        );
         assert_eq!(quantized_u8[1], u8::MAX);
     }
 
-    /// `-0.0 == 0.0` must keep taking the all-equal early-out even though
-    /// SIMD min/max may pick either sign for the extremes.
+    /// `-0.0 == 0.0` must keep taking the zero-range path (zeroed LUT,
+    /// `Affine`) even though SIMD min/max may pick either sign for the
+    /// extremes.
     #[test]
     fn test_signed_zero_mix_zeroes_table() {
         let mut values = vec![0.0f32; 64];
         values.iter_mut().step_by(2).for_each(|v| *v = -0.0);
         let mut quantized = Vec::new();
-        let (qmin, qmax) = quantize_dist_table_into(&values, &mut quantized);
-        assert_eq!(qmin, qmax);
+        match quantize_dist_table_into(&values, &mut quantized) {
+            DistTableDequant::Affine { qmin, qmax } => assert_eq!(qmin, qmax),
+            other => panic!("expected Affine, got {other:?}"),
+        }
         assert_eq!(quantized, vec![0; 64]);
+    }
+
+    /// The SIMD quantizers must round with static nearest-even regardless of
+    /// the dynamic MXCSR rounding mode. Run them with MXCSR forced to
+    /// round-toward-zero and require they still match the scalar reference
+    /// (whose `round_ties_even` is unaffected by MXCSR). `factor == 0.5` puts
+    /// odd integers on exact .5 ties, where truncation (e.g. 1.5 -> 1) and
+    /// nearest-even (1.5 -> 2) disagree, so a kernel that honored MXCSR would
+    /// fail here.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[allow(deprecated)] // _mm_getcsr/_mm_setcsr: no stable non-asm replacement.
+    fn test_simd_rounding_ignores_mxcsr() {
+        use std::arch::x86_64::{_MM_ROUND_MASK, _MM_ROUND_TOWARD_ZERO, _mm_getcsr, _mm_setcsr};
+
+        let values = (0..=510).map(|v| v as f32).collect::<Vec<_>>();
+        let (_, expected_u8) = reference_u8(&values);
+        let (_, expected_u16) = reference_u16(&values);
+        let factor_u8 = u8::MAX as f32 / 510.0;
+        let factor_u16 = u16::MAX as f32 / 510.0;
+
+        for (name, _, quantize_u8_fn, quantize_u16_fn) in available_kernels() {
+            let mut out_u8 = Vec::with_capacity(values.len());
+            let mut out_u16 = Vec::with_capacity(values.len());
+            // SAFETY: SSE is baseline on x86_64. MXCSR is restored before any
+            // assertion so a failure cannot leak the truncating mode.
+            let saved = unsafe { _mm_getcsr() };
+            unsafe {
+                _mm_setcsr((saved & !_MM_ROUND_MASK) | _MM_ROUND_TOWARD_ZERO);
+                quantize_u8_fn(
+                    &values,
+                    0.0,
+                    factor_u8,
+                    &mut out_u8.spare_capacity_mut()[..values.len()],
+                );
+                quantize_u16_fn(
+                    &values,
+                    0.0,
+                    factor_u16,
+                    &mut out_u16.spare_capacity_mut()[..values.len()],
+                );
+                _mm_setcsr(saved);
+                out_u8.set_len(values.len());
+                out_u16.set_len(values.len());
+            }
+            assert_eq!(out_u8, expected_u8, "kernel={name} under truncating MXCSR");
+            assert_eq!(
+                out_u16, expected_u16,
+                "kernel={name} under truncating MXCSR"
+            );
+        }
     }
 
     /// The scratch buffer must be fully overwritten across reuses with
@@ -737,9 +894,9 @@ mod tests {
                 .map(|_| rng.random_range(-1.0f32..1.0))
                 .collect::<Vec<_>>();
             quantize_dist_table_into(&values, &mut scratch_u8);
-            assert_eq!(scratch_u8, reference_u8(&values).0);
+            assert_eq!(scratch_u8, reference_u8(&values).1);
             quantize_dist_table_u16_into(&values, &mut scratch_u16);
-            assert_eq!(scratch_u16, reference_u16(&values).0);
+            assert_eq!(scratch_u16, reference_u16(&values).1);
         }
     }
 }
