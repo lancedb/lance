@@ -231,20 +231,30 @@ fn min_max_fold(values: &[f32]) -> (f32, f32) {
 }
 
 /// Round `x` to the nearest integer, ties to even — the same rule the SIMD
-/// converts use. Built from `f32::floor`, which is a fixed-mode rounding on
-/// every target, so (unlike `f32::round_ties_even`, which can lower to an
-/// MXCSR-honoring instruction on x86) the result is independent of the
-/// dynamic rounding mode. `x` is a non-negative quantization product, so only
-/// the upward tie case is reachable, but the form is written for any finite
-/// `x` whose floor fits in `i64`. Branchless to keep the aarch64 quantize
-/// loop (which has no dedicated SIMD kernel) autovectorizable.
+/// converts use — with fixed-mode operations only, so the result never
+/// depends on the dynamic rounding mode native code may have installed.
+///
+/// On x86, `f32::round_ties_even` can lower to an MXCSR-honoring instruction
+/// (outside an SSE4.1 context), so nearest-even is built from `f32::floor`,
+/// which is always fixed-mode. `x` is a non-negative quantization product, so
+/// only the upward tie case is reachable, but the form is correct for any
+/// finite `x` whose floor fits in `i64`. Elsewhere (e.g. aarch64) the standard
+/// `round_ties_even` is already a fixed-mode instruction (`frintn`) that the
+/// quantize loop — which has no dedicated SIMD kernel there — vectorizes, so
+/// it is kept.
 #[inline(always)]
 fn round_ties_even_fixed(x: f32) -> f32 {
-    let lower = x.floor();
-    let frac = x - lower;
-    let lower_is_odd = (lower as i64 & 1) != 0;
-    let round_up = frac > 0.5 || (frac == 0.5 && lower_is_odd);
-    lower + f32::from(round_up)
+    #[cfg(target_arch = "x86_64")]
+    {
+        let lower = x.floor();
+        let frac = x - lower;
+        let round_up = frac > 0.5 || (frac == 0.5 && (lower as i64 & 1) != 0);
+        lower + f32::from(round_up)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        x.round_ties_even()
+    }
 }
 
 fn quantize_u8_scalar(values: &[f32], qmin: f32, factor: f32, out: &mut [MaybeUninit<u8>]) {
