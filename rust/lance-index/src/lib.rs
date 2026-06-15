@@ -312,6 +312,7 @@ impl IndexType {
             Self::IvfFlat => 4096,
             Self::IvfSq => 8192,
             Self::IvfPq => 8192,
+            Self::IvfRq => 4096,
             Self::IvfHnswFlat => 1 << 20,
             Self::IvfHnswSq => 1 << 20,
             Self::IvfHnswPq => 1 << 20,
@@ -380,6 +381,11 @@ mod tests {
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
         assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+    }
+
+    #[test]
+    fn test_ivf_rq_target_partition_size() {
+        assert_eq!(IndexType::IvfRq.target_partition_size(), 4096);
     }
 
     #[test]
