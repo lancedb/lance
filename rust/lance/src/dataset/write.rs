@@ -183,12 +183,15 @@ fn validate_blob_threshold_metadata_for_append(
         let Some(dataset_field) = dataset_schema.field(&input_field.name) else {
             continue;
         };
-        let is_blob_v2_field = input_field
+        let input_is_blob_v2 = input_field
             .metadata
             .get(ARROW_EXT_NAME_KEY)
-            .or_else(|| dataset_field.metadata.get(ARROW_EXT_NAME_KEY))
             .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
-        if !is_blob_v2_field {
+        let dataset_is_blob_v2 = dataset_field
+            .metadata
+            .get(ARROW_EXT_NAME_KEY)
+            .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
+        if !input_is_blob_v2 && !dataset_is_blob_v2 {
             continue;
         }
 

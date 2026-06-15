@@ -4194,6 +4194,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_v2_append_rejects_threshold_mismatch_with_non_blob_input_extension() {
+        let dataset_dir = TempDir::default();
+        let payload = vec![0u8; 2048];
+
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let mut initial_builder = BlobArrayBuilder::new(1);
+        initial_builder.push_bytes(payload.clone()).unwrap();
+        let initial_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(initial_builder.finish().unwrap()) as ArrayRef],
+        )
+        .unwrap();
+        let initial_reader = RecordBatchIterator::new(vec![Ok(initial_batch)], schema);
+        let dataset = Dataset::write(
+            initial_reader,
+            &dataset_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut append_field = blob_field("blob", true);
+        let mut append_metadata = append_field.metadata().clone();
+        append_metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            "some.other.extension".to_string(),
+        );
+        append_metadata.insert(
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+            "1024".to_string(),
+        );
+        append_field = append_field.with_metadata(append_metadata);
+        let append_schema = Arc::new(Schema::new(vec![append_field]));
+        let mut append_builder = BlobArrayBuilder::new(1);
+        append_builder.push_bytes(payload).unwrap();
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(append_builder.finish().unwrap()) as ArrayRef],
+        )
+        .unwrap();
+        let append_reader = RecordBatchIterator::new(vec![Ok(append_batch)], append_schema);
+
+        let result = Dataset::write(
+            append_reader,
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("append with ignored blob threshold metadata should fail");
+        };
+        let message = err.to_string();
+        assert!(message.contains("Cannot append data with blob threshold metadata"));
+        assert!(message.contains(BLOB_INLINE_SIZE_THRESHOLD_META_KEY));
+    }
+
+    #[tokio::test]
     async fn test_blob_v2_append_accepts_explicit_default_inline_threshold() {
         let dataset_dir = TempDir::default();
         let payload = vec![0u8; 2048];
