@@ -77,6 +77,7 @@ impl HdfsStoreProvider {
         let name_node = storage_options
             .0
             .get("hdfs_name_node")
+            .filter(|v| !v.is_empty())
             .cloned()
             .or_else(|| env_vars.get("HDFS_NAME_NODE").cloned())
             .unwrap_or_else(|| format!("hdfs://{}", base_path.authority()));
@@ -89,6 +90,7 @@ impl HdfsStoreProvider {
         let user = storage_options
             .0
             .get("hdfs_user")
+            .filter(|v| !v.is_empty())
             .cloned()
             .or_else(|| env_vars.get("HADOOP_USER_NAME").cloned())
             .or_else(|| env_vars.get("HDFS_USER").cloned());
