@@ -3,8 +3,20 @@
 
 //! Integration tests for HDFS object store provider
 //!
-//! These tests require a running HDFS cluster. They can be run with:
-//! cargo test --features hdfs hdfs_integration_test
+//! These tests need an existing HDFS cluster and are skipped unless
+//! `HDFS_NAME_NODE` or `HDFS_TEST_ENABLED` is set.
+//!
+//! Set `HDFS_NAME_NODE` to the name node or nameservice address
+//! (e.g., `hdfs://namenode:9000` or `hdfs://mycluster`). Set
+//! `HDFS_TEST_ENABLED` to any value to run the tests when the name node is
+//! provided by Hadoop configuration files instead. `HDFS_TEST_ENABLED` only
+//! controls whether the tests are skipped; it does not configure HDFS or
+//! verify connectivity.
+//!
+//! Example:
+//!   HDFS_NAME_NODE=hdfs://localhost:9000 cargo test --features hdfs hdfs_integration_test
+//!   HDFS_TEST_ENABLED=1 cargo test --features hdfs hdfs_integration_test
+//!
 
 #[cfg(feature = "hdfs")]
 mod tests {
@@ -17,6 +29,7 @@ mod tests {
     use object_store::ObjectStoreExt;
     use object_store::path::Path;
 
+    /// Returns whether the environment explicitly enables the HDFS integration tests.
     fn hdfs_available() -> bool {
         std::env::var("HDFS_NAME_NODE").is_ok() || std::env::var("HDFS_TEST_ENABLED").is_ok()
     }
