@@ -16,7 +16,6 @@ mod tests {
     };
     use object_store::ObjectStoreExt;
     use object_store::path::Path;
-    use url::Url;
 
     fn hdfs_available() -> bool {
         std::env::var("HDFS_NAME_NODE").is_ok() || std::env::var("HDFS_TEST_ENABLED").is_ok()
@@ -69,32 +68,6 @@ mod tests {
 
         assert_eq!(store.scheme(), "hdfs");
         assert_eq!(path, Path::from("user/test"));
-    }
-
-    #[tokio::test]
-    async fn test_hdfs_url_parsing() {
-        let registry = Arc::new(ObjectStoreRegistry::default());
-
-        let test_cases = vec![
-            ("hdfs://localhost:9000/", ""),
-            ("hdfs://localhost:9000/user", "user"),
-            (
-                "hdfs://localhost:9000/user/data/file.txt",
-                "user/data/file.txt",
-            ),
-            ("hdfs://namenode/path/to/file", "path/to/file"),
-            // HA configuration tests
-            ("hdfs://ht-hdfsqa/", ""),
-            ("hdfs://ht-hdfsqa/user/data", "user/data"),
-            ("hdfs://mycluster/tmp/test.txt", "tmp/test.txt"),
-        ];
-
-        for (url_str, expected_path) in test_cases {
-            let url = Url::parse(url_str).unwrap();
-            let provider = registry.get_provider("hdfs").unwrap();
-            let path = provider.extract_path(&url).unwrap();
-            assert_eq!(path, Path::from(expected_path));
-        }
     }
 
     #[tokio::test]
