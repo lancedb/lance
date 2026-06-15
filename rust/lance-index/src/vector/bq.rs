@@ -18,6 +18,7 @@ use crate::vector::bq::storage::RabitQuantizationMetadata;
 use crate::vector::quantizer::QuantizerBuildParams;
 
 pub mod builder;
+pub(crate) mod dist_table_quant;
 pub mod ex_dot;
 pub mod rotation;
 pub mod storage;
