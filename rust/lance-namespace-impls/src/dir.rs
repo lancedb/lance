@@ -2948,12 +2948,31 @@ impl LanceNamespace for DirectoryNamespace {
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
 
-        let mut dataset = Dataset::open(&table_uri).await.map_err(|e| {
-            Error::io_source(box_error(std::io::Error::other(format!(
-                "Failed to open dataset: {}",
-                e
-            ))))
-        })?;
+        // Check table existence and deregistration status before opening the dataset
+        let status = self.check_table_status(&table_name).await;
+        if !status.exists {
+            return Err(NamespaceError::TableNotFound {
+                message: table_name,
+            }
+            .into());
+        }
+        if status.is_deregistered {
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_name),
+            }
+            .into());
+        }
+
+        let mut dataset = self
+            .configured_builder(&table_uri)
+            .load()
+            .await
+            .map_err(|e| {
+                Error::io_source(box_error(std::io::Error::other(format!(
+                    "Failed to open dataset: {}",
+                    e
+                ))))
+            })?;
 
         let sql_expressions = build_sql_expressions(&request.new_columns)?;
 
@@ -2986,12 +3005,31 @@ impl LanceNamespace for DirectoryNamespace {
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
 
-        let mut dataset = Dataset::open(&table_uri).await.map_err(|e| {
-            Error::io_source(box_error(std::io::Error::other(format!(
-                "Failed to open dataset: {}",
-                e
-            ))))
-        })?;
+        // Check table existence and deregistration status before opening the dataset
+        let status = self.check_table_status(&table_name).await;
+        if !status.exists {
+            return Err(NamespaceError::TableNotFound {
+                message: table_name,
+            }
+            .into());
+        }
+        if status.is_deregistered {
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_name),
+            }
+            .into());
+        }
+
+        let mut dataset = self
+            .configured_builder(&table_uri)
+            .load()
+            .await
+            .map_err(|e| {
+                Error::io_source(box_error(std::io::Error::other(format!(
+                    "Failed to open dataset: {}",
+                    e
+                ))))
+            })?;
 
         let alterations = build_column_alterations(&request.alterations)?;
 
@@ -3017,12 +3055,31 @@ impl LanceNamespace for DirectoryNamespace {
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
 
-        let mut dataset = Dataset::open(&table_uri).await.map_err(|e| {
-            Error::io_source(box_error(std::io::Error::other(format!(
-                "Failed to open dataset: {}",
-                e
-            ))))
-        })?;
+        // Check table existence and deregistration status before opening the dataset
+        let status = self.check_table_status(&table_name).await;
+        if !status.exists {
+            return Err(NamespaceError::TableNotFound {
+                message: table_name,
+            }
+            .into());
+        }
+        if status.is_deregistered {
+            return Err(NamespaceError::TableNotFound {
+                message: format!("Table is deregistered: {}", table_name),
+            }
+            .into());
+        }
+
+        let mut dataset = self
+            .configured_builder(&table_uri)
+            .load()
+            .await
+            .map_err(|e| {
+                Error::io_source(box_error(std::io::Error::other(format!(
+                    "Failed to open dataset: {}",
+                    e
+                ))))
+            })?;
 
         let columns: Vec<&str> = request.columns.iter().map(|s| s.as_str()).collect();
         dataset.drop_columns(&columns).await.map_err(|e| {

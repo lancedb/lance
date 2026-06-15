@@ -3558,7 +3558,16 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
-                let mut dataset = Dataset::open(&table_uri).await.map_err(|e| {
+                // Use DatasetBuilder with storage options to align with describe_table
+                // and to support custom storage backends (e.g. S3 with custom endpoints).
+                let mut builder = DatasetBuilder::from_uri(&table_uri);
+                if let Some(opts) = &self.storage_options {
+                    builder = builder.with_storage_options(opts.clone());
+                }
+                if let Some(session) = &self.session {
+                    builder = builder.with_session(session.clone());
+                }
+                let mut dataset = builder.load().await.map_err(|e| {
                     Error::io_source(box_error(std::io::Error::other(format!(
                         "Failed to open dataset: {}",
                         e
@@ -3576,18 +3585,16 @@ impl LanceNamespace for ManifestNamespace {
                     )
                     .await
                     .map_err(|e| {
-                        Error::io_source(box_error(std::io::Error::other(format!(
-                            "Failed to add columns: {}",
-                            e
-                        ))))
+                        // Surface specific commit/conflict errors (CommitConflict,
+                        // RetryableCommitConflict, IncompatibleTransaction, ...) rather than
+                        // collapsing every failure into a generic IO error.
+                        convert_lance_commit_error(&e, "add_columns", Some(&object_id))
                     })?;
 
                 let version = dataset.version().version as i64;
                 Ok(AlterTableAddColumnsResponse::new(version))
             }
-            None => Err(Error::namespace_source(
-                format!("Table '{}' not found", object_id).into(),
-            )),
+            None => Err(NamespaceError::TableNotFound { message: object_id }.into()),
         }
     }
 
@@ -3616,7 +3623,14 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
-                let mut dataset = Dataset::open(&table_uri).await.map_err(|e| {
+                let mut builder = DatasetBuilder::from_uri(&table_uri);
+                if let Some(opts) = &self.storage_options {
+                    builder = builder.with_storage_options(opts.clone());
+                }
+                if let Some(session) = &self.session {
+                    builder = builder.with_session(session.clone());
+                }
+                let mut dataset = builder.load().await.map_err(|e| {
                     Error::io_source(box_error(std::io::Error::other(format!(
                         "Failed to open dataset: {}",
                         e
@@ -3627,18 +3641,13 @@ impl LanceNamespace for ManifestNamespace {
                 let alterations = super::build_column_alterations(&request.alterations)?;
 
                 dataset.alter_columns(&alterations).await.map_err(|e| {
-                    Error::io_source(box_error(std::io::Error::other(format!(
-                        "Failed to alter columns: {}",
-                        e
-                    ))))
+                    convert_lance_commit_error(&e, "alter_columns", Some(&object_id))
                 })?;
 
                 let version = dataset.version().version as i64;
                 Ok(AlterTableAlterColumnsResponse::new(version))
             }
-            None => Err(Error::namespace_source(
-                format!("Table '{}' not found", object_id).into(),
-            )),
+            None => Err(NamespaceError::TableNotFound { message: object_id }.into()),
         }
     }
 
@@ -3666,7 +3675,14 @@ impl LanceNamespace for ManifestNamespace {
         match table_info {
             Some(info) => {
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
-                let mut dataset = Dataset::open(&table_uri).await.map_err(|e| {
+                let mut builder = DatasetBuilder::from_uri(&table_uri);
+                if let Some(opts) = &self.storage_options {
+                    builder = builder.with_storage_options(opts.clone());
+                }
+                if let Some(session) = &self.session {
+                    builder = builder.with_session(session.clone());
+                }
+                let mut dataset = builder.load().await.map_err(|e| {
                     Error::io_source(box_error(std::io::Error::other(format!(
                         "Failed to open dataset: {}",
                         e
@@ -3675,18 +3691,13 @@ impl LanceNamespace for ManifestNamespace {
 
                 let columns: Vec<&str> = request.columns.iter().map(|s| s.as_str()).collect();
                 dataset.drop_columns(&columns).await.map_err(|e| {
-                    Error::io_source(box_error(std::io::Error::other(format!(
-                        "Failed to drop columns: {}",
-                        e
-                    ))))
+                    convert_lance_commit_error(&e, "drop_columns", Some(&object_id))
                 })?;
 
                 let version = dataset.version().version as i64;
                 Ok(AlterTableDropColumnsResponse::new(version))
             }
-            None => Err(Error::namespace_source(
-                format!("Table '{}' not found", object_id).into(),
-            )),
+            None => Err(NamespaceError::TableNotFound { message: object_id }.into()),
         }
     }
 }
