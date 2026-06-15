@@ -3591,33 +3591,35 @@ impl Scanner {
             .clone();
 
         let mut columns = vec![column];
-        if let Some(expr) = filter_plan.full_expr.as_ref() {
-            let filter_columns = Planner::column_names_in_expr(expr);
-            columns.extend(filter_columns);
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            columns.extend(Planner::column_names_in_expr(refine_expr));
         }
-        let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
-        let mut scan_node = self.scan_fragments(
-            true,
-            false,
-            false,
-            false,
-            false,
-            flat_fts_scan_schema,
-            Arc::new(fragments),
-            None,
-            false,
-        );
+        let scan_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(&columns, OnMissing::Error)?;
 
-        if let Some(expr) = filter_plan.full_expr.as_ref() {
-            // If there is a prefilter we need to manually apply it to the new data
-            scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+        let PlannedFilteredScan { mut plan, .. } = self
+            .filtered_read(
+                filter_plan,
+                scan_projection,
+                /*make_deletions_null=*/ false,
+                Some(Arc::new(fragments)),
+                None,
+                /*is_prefilter=*/ true,
+            )
+            .await?;
+
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
 
         let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
-            scan_node,
+            plan,
         ));
         Ok(flat_match_plan)
     }
