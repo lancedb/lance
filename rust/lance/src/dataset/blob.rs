@@ -12,15 +12,17 @@ use std::{
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
-use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
-use arrow_schema::DataType as ArrowDataType;
+use arrow_array::{Array, ArrayRef};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::{
     BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY, FieldExt,
+    r#struct::StructArrayExt,
 };
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -259,10 +261,7 @@ pub struct BlobPreprocessor {
     data_file_key: String,
     local_counter: u32,
     pack_writer: PackWriter,
-    blob_v2_cols: Vec<bool>,
-    inline_thresholds: Vec<usize>,
-    dedicated_thresholds: Vec<usize>,
-    writer_metadata: Vec<HashMap<String, String>>,
+    field_processors: Vec<BlobPreprocessField>,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
@@ -285,6 +284,64 @@ struct ExternalBlobSource {
 enum BlobWriteSource<'a> {
     Bytes(&'a [u8]),
     External(&'a ExternalBlobSource),
+}
+
+#[derive(Clone, Debug)]
+struct BlobPreprocessField {
+    kind: BlobPreprocessFieldKind,
+}
+
+#[derive(Clone, Debug)]
+enum BlobPreprocessFieldKind {
+    BlobV2 {
+        inline_threshold: usize,
+        dedicated_threshold: usize,
+        writer_metadata: HashMap<String, String>,
+    },
+    Struct {
+        children: Vec<BlobPreprocessField>,
+    },
+    Passthrough,
+}
+
+impl BlobPreprocessField {
+    fn new(field: &ArrowField) -> Result<Self> {
+        if field.is_blob_v2() {
+            return Ok(Self {
+                kind: BlobPreprocessFieldKind::BlobV2 {
+                    inline_threshold: blob_inline_threshold_from_metadata(
+                        field.metadata(),
+                        field.name(),
+                    )?,
+                    dedicated_threshold: blob_dedicated_threshold_from_metadata(
+                        field.metadata(),
+                        field.name(),
+                    )?,
+                    writer_metadata: field.metadata().clone(),
+                },
+            });
+        }
+
+        if let ArrowDataType::Struct(children) = field.data_type() {
+            let children = children
+                .iter()
+                .map(|child| Self::new(child.as_ref()))
+                .collect::<Result<Vec<_>>>()?;
+            if children.iter().any(|child| child.requires_preprocessing()) {
+                return Ok(Self {
+                    kind: BlobPreprocessFieldKind::Struct { children },
+                });
+            }
+        }
+
+        Ok(Self {
+            kind: BlobPreprocessFieldKind::Passthrough,
+        })
+    }
+
+    fn requires_preprocessing(&self) -> bool {
+        !matches!(self.kind, BlobPreprocessFieldKind::Passthrough)
+    }
 }
 
 impl ExternalBlobSource {
@@ -378,37 +435,11 @@ impl BlobPreprocessor {
             pack_writer.max_pack_size = max_bytes;
         }
         let arrow_schema = arrow_schema::Schema::from(schema);
-        let fields = arrow_schema.fields();
-        let blob_v2_cols = fields
+        let field_processors = arrow_schema
+            .fields()
             .iter()
-            .map(|field| field.is_blob_v2())
-            .collect::<Vec<_>>();
-        let inline_thresholds = fields
-            .iter()
-            .zip(blob_v2_cols.iter())
-            .map(|(field, is_blob_v2)| {
-                if *is_blob_v2 {
-                    blob_inline_threshold_from_metadata(field.metadata(), field.name())
-                } else {
-                    Ok(INLINE_MAX)
-                }
-            })
+            .map(|field| BlobPreprocessField::new(field.as_ref()))
             .collect::<Result<Vec<_>>>()?;
-        let dedicated_thresholds = fields
-            .iter()
-            .zip(blob_v2_cols.iter())
-            .map(|(field, is_blob_v2)| {
-                if *is_blob_v2 {
-                    blob_dedicated_threshold_from_metadata(field.metadata(), field.name())
-                } else {
-                    Ok(DEDICATED_THRESHOLD)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let writer_metadata = fields
-            .iter()
-            .map(|field| field.metadata().clone())
-            .collect();
         Ok(Self {
             object_store,
             data_dir,
@@ -416,10 +447,7 @@ impl BlobPreprocessor {
             // Start at 1 to avoid a potential all-zero blob_id value.
             local_counter: 1,
             pack_writer,
-            blob_v2_cols,
-            inline_thresholds,
-            dedicated_thresholds,
-            writer_metadata,
+            field_processors,
             external_base_resolver,
             allow_external_blob_outside_bases,
             external_blob_mode,
@@ -520,7 +548,7 @@ impl BlobPreprocessor {
     }
 
     pub(crate) async fn preprocess_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let expected_columns = self.blob_v2_cols.len();
+        let expected_columns = self.field_processors.len();
         if batch.num_columns() != expected_columns {
             return Err(Error::invalid_input(format!(
                 "Unexpected number of columns: expected {}, got {}",
@@ -531,234 +559,21 @@ impl BlobPreprocessor {
 
         let batch_schema = batch.schema();
         let batch_fields = batch_schema.fields();
+        let field_processors = self.field_processors.clone();
 
         let mut new_columns = Vec::with_capacity(batch.num_columns());
         let mut new_fields = Vec::with_capacity(batch.num_columns());
 
-        for idx in 0..batch.num_columns() {
-            let array = batch.column(idx);
-            let field = &batch_fields[idx];
-            if !self.blob_v2_cols[idx] {
-                new_columns.push(array.clone());
-                new_fields.push(field.clone());
-                continue;
-            }
-
-            let struct_arr = array
-                .as_any()
-                .downcast_ref::<arrow_array::StructArray>()
-                .ok_or_else(|| Error::invalid_input("Blob column was not a struct array"))?;
-
-            let data_col = struct_arr
-                .column_by_name("data")
-                .ok_or_else(|| Error::invalid_input("Blob struct missing `data` field"))?
-                .as_binary::<i64>();
-            let uri_col = struct_arr
-                .column_by_name("uri")
-                .ok_or_else(|| Error::invalid_input("Blob struct missing `uri` field"))?
-                .as_string::<i32>();
-            let position_col = struct_arr
-                .column_by_name("position")
-                .map(|col| col.as_primitive::<UInt64Type>());
-            let size_col = struct_arr
-                .column_by_name("size")
-                .map(|col| col.as_primitive::<UInt64Type>());
-
-            let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
-            let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
-            let mut blob_id_builder =
-                PrimitiveBuilder::<arrow_array::types::UInt32Type>::with_capacity(struct_arr.len());
-            let mut blob_size_builder =
-                PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(struct_arr.len());
-            let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(struct_arr.len());
-            let mut position_builder =
-                PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(struct_arr.len());
-
-            let struct_nulls = struct_arr.nulls();
-
-            for i in 0..struct_arr.len() {
-                if struct_arr.is_null(i) {
-                    data_builder.append_null();
-                    uri_builder.append_null();
-                    blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                    kind_builder.append_null();
-                    position_builder.append_null();
-                    continue;
-                }
-
-                let has_data = !data_col.is_null(i);
-                let has_uri = !uri_col.is_null(i);
-                let has_position = position_col
-                    .as_ref()
-                    .map(|col| !col.is_null(i))
-                    .unwrap_or(false);
-                let has_size = size_col
-                    .as_ref()
-                    .map(|col| !col.is_null(i))
-                    .unwrap_or(false);
-                let data_len = if has_data { data_col.value(i).len() } else { 0 };
-
-                let dedicated_threshold = self.dedicated_thresholds[idx];
-                let inline_threshold = self.inline_thresholds[idx];
-                if has_data && data_len > dedicated_threshold {
-                    let blob_id = self.next_blob_id();
-                    self.write_dedicated(blob_id, BlobWriteSource::Bytes(data_col.value(i)))
-                        .await?;
-
-                    kind_builder.append_value(BlobKind::Dedicated as u8);
-                    data_builder.append_null();
-                    uri_builder.append_null();
-                    blob_id_builder.append_value(blob_id);
-                    blob_size_builder.append_value(data_len as u64);
-                    position_builder.append_null();
-                    continue;
-                }
-
-                if has_data && data_len > inline_threshold {
-                    let (pack_blob_id, position) = self
-                        .write_packed(BlobWriteSource::Bytes(data_col.value(i)))
-                        .await?;
-
-                    kind_builder.append_value(BlobKind::Packed as u8);
-                    data_builder.append_null();
-                    uri_builder.append_null();
-                    blob_id_builder.append_value(pack_blob_id);
-                    blob_size_builder.append_value(data_len as u64);
-                    position_builder.append_value(position);
-                    continue;
-                }
-
-                if has_uri {
-                    let uri_val = uri_col.value(i);
-                    if self.external_blob_mode == ExternalBlobMode::Ingest {
-                        let position = if has_position {
-                            Some(
-                                position_col
-                                    .as_ref()
-                                    .expect("position column must exist")
-                                    .value(i),
-                            )
-                        } else {
-                            None
-                        };
-                        let size = if has_size {
-                            Some(size_col.as_ref().expect("size column must exist").value(i))
-                        } else {
-                            None
-                        };
-                        let source = self.open_external_source(uri_val, position, size).await?;
-                        let data_len = source.size();
-
-                        if data_len > dedicated_threshold as u64 {
-                            let blob_id = self.next_blob_id();
-                            self.write_dedicated(blob_id, BlobWriteSource::External(&source))
-                                .await?;
-
-                            kind_builder.append_value(BlobKind::Dedicated as u8);
-                            data_builder.append_null();
-                            uri_builder.append_null();
-                            blob_id_builder.append_value(blob_id);
-                            blob_size_builder.append_value(data_len);
-                            position_builder.append_null();
-                            continue;
-                        }
-
-                        if data_len > inline_threshold as u64 {
-                            let (pack_blob_id, position) = self
-                                .write_packed(BlobWriteSource::External(&source))
-                                .await?;
-
-                            kind_builder.append_value(BlobKind::Packed as u8);
-                            data_builder.append_null();
-                            uri_builder.append_null();
-                            blob_id_builder.append_value(pack_blob_id);
-                            blob_size_builder.append_value(data_len);
-                            position_builder.append_value(position);
-                            continue;
-                        }
-
-                        let data = source.read_all().await?;
-
-                        kind_builder.append_value(BlobKind::Inline as u8);
-                        data_builder.append_value(data.as_ref());
-                        uri_builder.append_null();
-                        blob_id_builder.append_null();
-                        blob_size_builder.append_null();
-                        position_builder.append_null();
-                        continue;
-                    }
-
-                    let (external_base_id, external_uri_or_path) =
-                        self.resolve_external_reference(uri_val).await?;
-                    kind_builder.append_value(BlobKind::External as u8);
-                    data_builder.append_null();
-                    uri_builder.append_value(external_uri_or_path);
-                    blob_id_builder.append_value(external_base_id);
-                    if has_position && has_size {
-                        let position = position_col
-                            .as_ref()
-                            .expect("position column must exist")
-                            .value(i);
-                        let size = size_col.as_ref().expect("size column must exist").value(i);
-                        blob_size_builder.append_value(size);
-                        position_builder.append_value(position);
-                    } else {
-                        blob_size_builder.append_null();
-                        position_builder.append_null();
-                    }
-                    continue;
-                }
-
-                if has_data {
-                    kind_builder.append_value(BlobKind::Inline as u8);
-                    let value = data_col.value(i);
-                    data_builder.append_value(value);
-                    uri_builder.append_null();
-                    blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                    position_builder.append_null();
-                } else {
-                    data_builder.append_null();
-                    uri_builder.append_null();
-                    blob_id_builder.append_null();
-                    blob_size_builder.append_null();
-                    kind_builder.append_null();
-                    position_builder.append_null();
-                }
-            }
-
-            let child_fields = vec![
-                arrow_schema::Field::new("kind", ArrowDataType::UInt8, true),
-                arrow_schema::Field::new("data", ArrowDataType::LargeBinary, true),
-                arrow_schema::Field::new("uri", ArrowDataType::Utf8, true),
-                arrow_schema::Field::new("blob_id", ArrowDataType::UInt32, true),
-                arrow_schema::Field::new("blob_size", ArrowDataType::UInt64, true),
-                arrow_schema::Field::new("position", ArrowDataType::UInt64, true),
-            ];
-
-            let struct_array = arrow_array::StructArray::try_new(
-                child_fields.clone().into(),
-                vec![
-                    Arc::new(kind_builder.finish()),
-                    Arc::new(data_builder.finish()),
-                    Arc::new(uri_builder.finish()),
-                    Arc::new(blob_id_builder.finish()),
-                    Arc::new(blob_size_builder.finish()),
-                    Arc::new(position_builder.finish()),
-                ],
-                struct_nulls.cloned(),
-            )?;
-
-            new_columns.push(Arc::new(struct_array));
-            new_fields.push(Arc::new(
-                arrow_schema::Field::new(
-                    field.name(),
-                    ArrowDataType::Struct(child_fields.into()),
-                    field.is_nullable(),
-                )
-                .with_metadata(self.writer_metadata[idx].clone()),
-            ));
+        for ((processor, array), field) in field_processors
+            .iter()
+            .zip(batch.columns().iter())
+            .zip(batch_fields.iter())
+        {
+            let (new_column, new_field) = self
+                .preprocess_field(processor, array.clone(), field)
+                .await?;
+            new_columns.push(new_column);
+            new_fields.push(new_field);
         }
 
         let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
@@ -771,6 +586,313 @@ impl BlobPreprocessor {
 
         RecordBatch::try_new(new_schema, new_columns)
             .map_err(|e| Error::invalid_input(e.to_string()))
+    }
+
+    fn preprocess_field<'a>(
+        &'a mut self,
+        processor: &'a BlobPreprocessField,
+        array: ArrayRef,
+        field: &'a Arc<ArrowField>,
+    ) -> BoxFuture<'a, Result<(ArrayRef, Arc<ArrowField>)>> {
+        async move {
+            match &processor.kind {
+                BlobPreprocessFieldKind::Passthrough => Ok((array, field.clone())),
+                BlobPreprocessFieldKind::BlobV2 {
+                    inline_threshold,
+                    dedicated_threshold,
+                    writer_metadata,
+                } => {
+                    self.preprocess_blob_array(
+                        array,
+                        field.as_ref(),
+                        *inline_threshold,
+                        *dedicated_threshold,
+                        writer_metadata,
+                    )
+                    .await
+                }
+                BlobPreprocessFieldKind::Struct { children } => {
+                    self.preprocess_struct_array(array, field.as_ref(), children)
+                        .await
+                }
+            }
+        }
+        .boxed()
+    }
+
+    async fn preprocess_struct_array(
+        &mut self,
+        array: ArrayRef,
+        field: &ArrowField,
+        children: &[BlobPreprocessField],
+    ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        let struct_arr = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::invalid_input("Struct field was not a struct array"))?;
+        if struct_arr.num_columns() != children.len() {
+            return Err(Error::invalid_input(format!(
+                "Struct field '{}' expected {} children, got {}",
+                field.name(),
+                children.len(),
+                struct_arr.num_columns()
+            )));
+        }
+
+        let struct_arr = struct_arr.normalize_slicing()?;
+        let parent_nulls = struct_arr.nulls().cloned();
+        let pushed_down = struct_arr.pushdown_nulls()?;
+        let child_fields = pushed_down.fields().clone();
+        let child_columns = pushed_down.columns().to_vec();
+
+        let mut new_columns = Vec::with_capacity(children.len());
+        let mut new_fields = Vec::with_capacity(children.len());
+        for ((child_processor, child_array), child_field) in children
+            .iter()
+            .zip(child_columns.into_iter())
+            .zip(child_fields.iter())
+        {
+            let (new_column, new_field) = self
+                .preprocess_field(child_processor, child_array, child_field)
+                .await?;
+            new_columns.push(new_column);
+            new_fields.push(new_field);
+        }
+
+        let struct_array =
+            StructArray::try_new(new_fields.clone().into(), new_columns, parent_nulls)?;
+        let field = Arc::new(
+            ArrowField::new(
+                field.name(),
+                ArrowDataType::Struct(new_fields.into()),
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone()),
+        );
+        Ok((Arc::new(struct_array), field))
+    }
+
+    async fn preprocess_blob_array(
+        &mut self,
+        array: ArrayRef,
+        field: &ArrowField,
+        inline_threshold: usize,
+        dedicated_threshold: usize,
+        writer_metadata: &HashMap<String, String>,
+    ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        let struct_arr = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::invalid_input("Blob column was not a struct array"))?;
+
+        let data_col = struct_arr
+            .column_by_name("data")
+            .ok_or_else(|| Error::invalid_input("Blob struct missing `data` field"))?
+            .as_binary::<i64>();
+        let uri_col = struct_arr
+            .column_by_name("uri")
+            .ok_or_else(|| Error::invalid_input("Blob struct missing `uri` field"))?
+            .as_string::<i32>();
+        let position_col = struct_arr
+            .column_by_name("position")
+            .map(|col| col.as_primitive::<UInt64Type>());
+        let size_col = struct_arr
+            .column_by_name("size")
+            .map(|col| col.as_primitive::<UInt64Type>());
+
+        let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
+        let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
+        let mut blob_id_builder =
+            PrimitiveBuilder::<arrow_array::types::UInt32Type>::with_capacity(struct_arr.len());
+        let mut blob_size_builder =
+            PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(struct_arr.len());
+        let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(struct_arr.len());
+        let mut position_builder =
+            PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(struct_arr.len());
+
+        let struct_nulls = struct_arr.nulls();
+
+        for i in 0..struct_arr.len() {
+            if struct_arr.is_null(i) {
+                data_builder.append_null();
+                uri_builder.append_null();
+                blob_id_builder.append_null();
+                blob_size_builder.append_null();
+                kind_builder.append_null();
+                position_builder.append_null();
+                continue;
+            }
+
+            let has_data = !data_col.is_null(i);
+            let has_uri = !uri_col.is_null(i);
+            let has_position = position_col
+                .as_ref()
+                .map(|col| !col.is_null(i))
+                .unwrap_or(false);
+            let has_size = size_col
+                .as_ref()
+                .map(|col| !col.is_null(i))
+                .unwrap_or(false);
+            let data_len = if has_data { data_col.value(i).len() } else { 0 };
+
+            if has_data && data_len > dedicated_threshold {
+                let blob_id = self.next_blob_id();
+                self.write_dedicated(blob_id, BlobWriteSource::Bytes(data_col.value(i)))
+                    .await?;
+
+                kind_builder.append_value(BlobKind::Dedicated as u8);
+                data_builder.append_null();
+                uri_builder.append_null();
+                blob_id_builder.append_value(blob_id);
+                blob_size_builder.append_value(data_len as u64);
+                position_builder.append_null();
+                continue;
+            }
+
+            if has_data && data_len > inline_threshold {
+                let (pack_blob_id, position) = self
+                    .write_packed(BlobWriteSource::Bytes(data_col.value(i)))
+                    .await?;
+
+                kind_builder.append_value(BlobKind::Packed as u8);
+                data_builder.append_null();
+                uri_builder.append_null();
+                blob_id_builder.append_value(pack_blob_id);
+                blob_size_builder.append_value(data_len as u64);
+                position_builder.append_value(position);
+                continue;
+            }
+
+            if has_uri {
+                let uri_val = uri_col.value(i);
+                if self.external_blob_mode == ExternalBlobMode::Ingest {
+                    let position = if has_position {
+                        Some(
+                            position_col
+                                .as_ref()
+                                .expect("position column must exist")
+                                .value(i),
+                        )
+                    } else {
+                        None
+                    };
+                    let size = if has_size {
+                        Some(size_col.as_ref().expect("size column must exist").value(i))
+                    } else {
+                        None
+                    };
+                    let source = self.open_external_source(uri_val, position, size).await?;
+                    let data_len = source.size();
+
+                    if data_len > dedicated_threshold as u64 {
+                        let blob_id = self.next_blob_id();
+                        self.write_dedicated(blob_id, BlobWriteSource::External(&source))
+                            .await?;
+
+                        kind_builder.append_value(BlobKind::Dedicated as u8);
+                        data_builder.append_null();
+                        uri_builder.append_null();
+                        blob_id_builder.append_value(blob_id);
+                        blob_size_builder.append_value(data_len);
+                        position_builder.append_null();
+                        continue;
+                    }
+
+                    if data_len > inline_threshold as u64 {
+                        let (pack_blob_id, position) = self
+                            .write_packed(BlobWriteSource::External(&source))
+                            .await?;
+
+                        kind_builder.append_value(BlobKind::Packed as u8);
+                        data_builder.append_null();
+                        uri_builder.append_null();
+                        blob_id_builder.append_value(pack_blob_id);
+                        blob_size_builder.append_value(data_len);
+                        position_builder.append_value(position);
+                        continue;
+                    }
+
+                    let data = source.read_all().await?;
+
+                    kind_builder.append_value(BlobKind::Inline as u8);
+                    data_builder.append_value(data.as_ref());
+                    uri_builder.append_null();
+                    blob_id_builder.append_null();
+                    blob_size_builder.append_null();
+                    position_builder.append_null();
+                    continue;
+                }
+
+                let (external_base_id, external_uri_or_path) =
+                    self.resolve_external_reference(uri_val).await?;
+                kind_builder.append_value(BlobKind::External as u8);
+                data_builder.append_null();
+                uri_builder.append_value(external_uri_or_path);
+                blob_id_builder.append_value(external_base_id);
+                if has_position && has_size {
+                    let position = position_col
+                        .as_ref()
+                        .expect("position column must exist")
+                        .value(i);
+                    let size = size_col.as_ref().expect("size column must exist").value(i);
+                    blob_size_builder.append_value(size);
+                    position_builder.append_value(position);
+                } else {
+                    blob_size_builder.append_null();
+                    position_builder.append_null();
+                }
+                continue;
+            }
+
+            if has_data {
+                kind_builder.append_value(BlobKind::Inline as u8);
+                let value = data_col.value(i);
+                data_builder.append_value(value);
+                uri_builder.append_null();
+                blob_id_builder.append_null();
+                blob_size_builder.append_null();
+                position_builder.append_null();
+            } else {
+                data_builder.append_null();
+                uri_builder.append_null();
+                blob_id_builder.append_null();
+                blob_size_builder.append_null();
+                kind_builder.append_null();
+                position_builder.append_null();
+            }
+        }
+
+        let child_fields = vec![
+            ArrowField::new("kind", ArrowDataType::UInt8, true),
+            ArrowField::new("data", ArrowDataType::LargeBinary, true),
+            ArrowField::new("uri", ArrowDataType::Utf8, true),
+            ArrowField::new("blob_id", ArrowDataType::UInt32, true),
+            ArrowField::new("blob_size", ArrowDataType::UInt64, true),
+            ArrowField::new("position", ArrowDataType::UInt64, true),
+        ];
+
+        let struct_array = StructArray::try_new(
+            child_fields.clone().into(),
+            vec![
+                Arc::new(kind_builder.finish()),
+                Arc::new(data_builder.finish()),
+                Arc::new(uri_builder.finish()),
+                Arc::new(blob_id_builder.finish()),
+                Arc::new(blob_size_builder.finish()),
+                Arc::new(position_builder.finish()),
+            ],
+            struct_nulls.cloned(),
+        )?;
+
+        let field = Arc::new(
+            ArrowField::new(
+                field.name(),
+                ArrowDataType::Struct(child_fields.into()),
+                field.is_nullable(),
+            )
+            .with_metadata(writer_metadata.clone()),
+        );
+        Ok((Arc::new(struct_array), field))
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
@@ -2171,7 +2293,7 @@ mod tests {
     };
     use arrow_array::RecordBatch;
     use arrow_array::{
-        ArrayRef, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+        Array, ArrayRef, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -2225,6 +2347,32 @@ mod tests {
         _test_dir: TempDir,
         dataset: Arc<Dataset>,
         expected: Vec<u8>,
+    }
+
+    fn nested_blob_v2_batch(blob_array: ArrayRef) -> (Arc<Schema>, RecordBatch) {
+        let blob_field = blob_field("blob", true);
+        let info_fields = vec![Field::new("name", DataType::Utf8, false), blob_field];
+        let info_array: ArrayRef = Arc::new(
+            StructArray::try_new(
+                info_fields.clone().into(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        (0..blob_array.len()).map(|idx| format!("name-{idx}")),
+                    )) as ArrayRef,
+                    blob_array,
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(info_fields.into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![info_array]).unwrap();
+        (schema, batch)
     }
 
     #[cfg(feature = "azure")]
@@ -3112,6 +3260,114 @@ mod tests {
         let second = blobs[1].read().await.unwrap();
         assert_eq!(first.as_ref(), b"hello");
         assert_eq!(second.as_ref(), b"world");
+    }
+
+    #[tokio::test]
+    async fn test_write_and_take_nested_blob_v2() {
+        let test_dir = TempStrDir::default();
+        let packed_payload = vec![0x4A; super::INLINE_MAX + 1024];
+
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        blob_builder.push_bytes(b"hello").unwrap();
+        blob_builder.push_bytes(&packed_payload).unwrap();
+        blob_builder.push_null().unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let (schema, batch) = nested_blob_v2_batch(blob_array);
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let info_batch = dataset
+            .scan()
+            .project(&["info"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let blob_desc = info_batch
+            .column(0)
+            .as_struct()
+            .column_by_name("blob")
+            .unwrap()
+            .as_struct();
+        assert_eq!(
+            blob_desc
+                .column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(0),
+            BlobKind::Inline as u8
+        );
+        assert_eq!(
+            blob_desc
+                .column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(1),
+            BlobKind::Packed as u8
+        );
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1], "info.blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"hello");
+        assert_eq!(
+            blobs[1].read().await.unwrap().as_ref(),
+            packed_payload.as_slice()
+        );
+
+        let null_blobs = dataset
+            .take_blobs_by_indices(&[2], "info.blob")
+            .await
+            .unwrap();
+        assert!(null_blobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_nested_blob_v2_requires_v2_2() {
+        let test_dir = TempStrDir::default();
+
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(b"hello").unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let (schema, batch) = nested_blob_v2_batch(blob_array);
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let result = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Nested blob v2 should be rejected for file version 2.1"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Blob v2 requires file version >= 2.2")
+        );
     }
 
     #[tokio::test]

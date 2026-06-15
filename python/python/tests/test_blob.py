@@ -1460,6 +1460,38 @@ def test_read_blobs_resolves_nested_field_path(dataset_with_nested_blobs):
     assert [data for _, data in results] == [b"foo", b"baz"]
 
 
+def test_write_nested_blob_v2_and_take_by_field_path(tmp_path):
+    packed = b"x" * (70 * 1024)
+    blob_field = lance.blob_field("blob")
+    info_fields = [pa.field("name", pa.string()), blob_field]
+    info_type = pa.struct(info_fields)
+    info_array = pa.StructArray.from_arrays(
+        [pa.array(["a", "b", "c"]), lance.blob_array([b"foo", packed, None])],
+        fields=info_fields,
+    )
+    table = pa.table(
+        [info_array],
+        schema=pa.schema([pa.field("info", info_type)]),
+    )
+
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "nested_blob_v2",
+        data_storage_version="2.2",
+    )
+
+    desc = dataset.to_table(columns=["info.blob"]).column("info.blob").chunk(0)
+    assert desc.field("kind").to_pylist()[:2] == [0, 1]
+
+    blobs = dataset.take_blobs("info.blob", indices=[0, 1])
+    with blobs[0] as f:
+        assert f.read() == b"foo"
+    with blobs[1] as f:
+        assert f.read() == packed
+
+    assert dataset.take_blobs("info.blob", indices=[2]) == []
+
+
 def test_to_pandas_returns_blob_files_for_projected_nested_fields(
     dataset_with_nested_blobs,
 ):

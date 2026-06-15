@@ -575,6 +575,18 @@ impl Field {
         }
     }
 
+    /// Convert blob fields in this field tree to their descriptor view.
+    pub fn unload_blobs_recursive(&mut self) {
+        if self.is_blob() {
+            self.unloaded_mut();
+            return;
+        }
+
+        for child in &mut self.children {
+            child.unload_blobs_recursive();
+        }
+    }
+
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),

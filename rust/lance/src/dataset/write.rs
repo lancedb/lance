@@ -583,7 +583,7 @@ pub async fn do_write_fragments(
     };
 
     let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
-        && schema.fields.iter().any(|field| field.is_blob_v2())
+        && schema.fields_pre_order().any(|field| field.is_blob_v2())
     {
         Some(Arc::new(
             build_external_base_resolver(dataset, &params).await?,
@@ -1061,7 +1061,8 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
-    if storage_version < LanceFileVersion::V2_2 && schema.fields.iter().any(|f| f.is_blob_v2()) {
+    if storage_version < LanceFileVersion::V2_2 && schema.fields_pre_order().any(|f| f.is_blob_v2())
+    {
         return Err(Error::invalid_input(format!(
             "Blob v2 requires file version >= 2.2 (got {:?})",
             storage_version
@@ -1070,8 +1071,7 @@ pub async fn write_fragments_internal(
 
     if storage_version >= LanceFileVersion::V2_2
         && schema
-            .fields
-            .iter()
+            .fields_pre_order()
             .any(|f| f.metadata.contains_key(BLOB_META_KEY))
     {
         return Err(Error::invalid_input(format!(
@@ -1234,7 +1234,7 @@ pub(super) async fn open_update_writer(
     // flow through WriteParams. Rebuild the external base resolver here so blob
     // v2 reference columns can resolve dataset-registered external URIs.
     let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
-        && schema.fields.iter().any(|f| f.is_blob_v2())
+        && schema.fields_pre_order().any(|f| f.is_blob_v2())
     {
         Some(Arc::new(
             build_external_base_resolver(Some(dataset), &WriteParams::default()).await?,
