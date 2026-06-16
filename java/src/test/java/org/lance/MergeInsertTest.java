@@ -330,15 +330,21 @@ public class MergeInsertTest {
       try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
         String originalDataset = readAll(dataset).toString();
 
-        Assertions.assertThrows(
-            Exception.class,
-            () ->
-                dataset.mergeInsert(
-                    new MergeInsertParams(Collections.singletonList("id"))
-                        .withMatchedUpdateAll()
-                        .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
-                        .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
-                    sourceStream));
+        Exception ex =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.mergeInsert(
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedUpdateAll()
+                            .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                            .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                        sourceStream));
+
+        Assertions.assertNotNull(ex.getMessage(), "exception should carry a message");
+        Assertions.assertTrue(
+            ex.getMessage().contains("Ambiguous merge inserts are prohibited"),
+            "Fail should report the ambiguous-merge cause, got: " + ex.getMessage());
 
         Assertions.assertEquals(
             originalDataset,
