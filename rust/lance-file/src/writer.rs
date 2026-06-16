@@ -633,7 +633,7 @@ impl FileWriter {
     async fn write_global_buffers(&mut self) -> Result<Vec<(u64, u64)>> {
         let schema = self.schema.as_mut().ok_or(Error::invalid_input("No schema provided on writer open and no data provided.  Schema is unknown and file cannot be created"))?;
         schema.metadata = std::mem::take(&mut self.schema_metadata);
-        // Use descriptor layout for blob fields in the footer to avoid exposing logical child fields.
+        // Use descriptor layout for blob v2 fields in the footer to avoid exposing logical child fields.
         schema
             .fields
             .iter_mut()
