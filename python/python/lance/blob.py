@@ -32,6 +32,9 @@ class Blob:
     uri: Optional[str] = None
     position: Optional[int] = None
     size: Optional[int] = None
+    # Rows sharing the same positive ref_id are de-duplicated in storage.
+    # 0 / None means no sharing.
+    ref_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.data is not None and self.uri is not None:
@@ -83,6 +86,7 @@ class BlobType(pa.ExtensionType):
                 pa.field("uri", pa.utf8(), nullable=True),
                 pa.field("position", pa.uint64(), nullable=True),
                 pa.field("size", pa.uint64(), nullable=True),
+                pa.field("ref_id", pa.uint32(), nullable=True),
             ]
         )
         pa.ExtensionType.__init__(self, storage_type, "lance.blob.v2")
@@ -128,6 +132,7 @@ class BlobArray(pa.ExtensionArray):
         uri_values: list[Optional[str]] = []
         position_values: list[Optional[int]] = []
         size_values: list[Optional[int]] = []
+        ref_id_values: list[Optional[int]] = []
         null_mask: list[bool] = []
 
         for v in values:
@@ -136,6 +141,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(None)
                 position_values.append(None)
                 size_values.append(None)
+                ref_id_values.append(None)
                 null_mask.append(True)
                 continue
 
@@ -144,6 +150,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(v.uri)
                 position_values.append(v.position)
                 size_values.append(v.size)
+                ref_id_values.append(v.ref_id)
                 null_mask.append(False)
                 continue
 
@@ -154,6 +161,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(v)
                 position_values.append(None)
                 size_values.append(None)
+                ref_id_values.append(None)
                 null_mask.append(False)
                 continue
 
@@ -162,6 +170,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(None)
                 position_values.append(None)
                 size_values.append(None)
+                ref_id_values.append(None)
                 null_mask.append(False)
                 continue
 
@@ -174,10 +183,11 @@ class BlobArray(pa.ExtensionArray):
         uri_arr = pa.array(uri_values, type=pa.utf8())
         position_arr = pa.array(position_values, type=pa.uint64())
         size_arr = pa.array(size_values, type=pa.uint64())
+        ref_id_arr = pa.array(ref_id_values, type=pa.uint32())
         mask_arr = pa.array(null_mask, type=pa.bool_())
         storage = pa.StructArray.from_arrays(
-            [data_arr, uri_arr, position_arr, size_arr],
-            names=["data", "uri", "position", "size"],
+            [data_arr, uri_arr, position_arr, size_arr, ref_id_arr],
+            names=["data", "uri", "position", "size", "ref_id"],
             mask=mask_arr,
         )
         return pa.ExtensionArray.from_storage(BlobType(), storage)  # type: ignore[return-value]

@@ -268,6 +268,20 @@ pub struct BlobPreprocessor {
     external_blob_mode: ExternalBlobMode,
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
+    // Cache for ref_id sharing on Packed / Dedicated sidecar paths.
+    // Inline dedup lives in the encoder (only it knows buffer positions).
+    ref_id_sidecar_cache: HashMap<u32, SidecarRef>,
+}
+
+/// Cached sidecar reference for ref_id deduplication.
+///
+/// First row with a given ref_id writes the blob to a sidecar (Packed or
+/// Dedicated). Subsequent rows with the same ref_id reuse the cached coordinates
+/// instead of writing again.
+#[derive(Clone, Copy)]
+enum SidecarRef {
+    Dedicated { blob_id: u32, size: u64 },
+    Packed { blob_id: u32, position: u64, size: u64 },
 }
 
 /// A logical slice of an external blob that can be materialized or streamed into Lance-managed
@@ -423,6 +437,7 @@ impl BlobPreprocessor {
             external_base_resolver,
             allow_external_blob_outside_bases,
             external_blob_mode,
+            ref_id_sidecar_cache: HashMap::new(),
             source_store_registry,
             source_store_params,
         })
@@ -563,6 +578,9 @@ impl BlobPreprocessor {
             let size_col = struct_arr
                 .column_by_name("size")
                 .map(|col| col.as_primitive::<UInt64Type>());
+            let ref_id_col = struct_arr
+                .column_by_name("ref_id")
+                .map(|col| col.as_primitive::<arrow_array::types::UInt32Type>());
 
             let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
             let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
@@ -573,6 +591,8 @@ impl BlobPreprocessor {
             let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(struct_arr.len());
             let mut position_builder =
                 PrimitiveBuilder::<arrow_array::types::UInt64Type>::with_capacity(struct_arr.len());
+            let mut ref_id_builder =
+                PrimitiveBuilder::<arrow_array::types::UInt32Type>::with_capacity(struct_arr.len());
 
             let struct_nulls = struct_arr.nulls();
 
@@ -584,6 +604,7 @@ impl BlobPreprocessor {
                     blob_size_builder.append_null();
                     kind_builder.append_null();
                     position_builder.append_null();
+                    ref_id_builder.append_null();
                     continue;
                 }
 
@@ -598,6 +619,41 @@ impl BlobPreprocessor {
                     .map(|col| !col.is_null(i))
                     .unwrap_or(false);
                 let data_len = if has_data { data_col.value(i).len() } else { 0 };
+                // 0 (or null) means no sharing; non-zero values participate in dedup.
+                let ref_id = ref_id_col
+                    .as_ref()
+                    .filter(|col| !col.is_null(i))
+                    .map(|col| col.value(i))
+                    .unwrap_or(0);
+
+                // Early cache hit: reuse a previously-written sidecar blob.
+                if ref_id > 0 {
+                    if let Some(cached) = self.ref_id_sidecar_cache.get(&ref_id).copied() {
+                        match cached {
+                            SidecarRef::Dedicated { blob_id, size } => {
+                                kind_builder.append_value(BlobKind::Dedicated as u8);
+                                data_builder.append_null();
+                                uri_builder.append_null();
+                                blob_id_builder.append_value(blob_id);
+                                blob_size_builder.append_value(size);
+                                position_builder.append_null();
+                                ref_id_builder.append_value(ref_id);
+                                continue;
+                            }
+                            SidecarRef::Packed { blob_id, position, size } => {
+                                kind_builder.append_value(BlobKind::Packed as u8);
+                                data_builder.append_null();
+                                uri_builder.append_null();
+                                blob_id_builder.append_value(blob_id);
+                                blob_size_builder.append_value(size);
+                                position_builder.append_value(position);
+                                ref_id_builder.append_value(ref_id);
+                                continue;
+                            }
+                        }
+                    }
+                    // Not cached: falls through to normal write path; then cached below.
+                }
 
                 let dedicated_threshold = self.dedicated_thresholds[idx];
                 let inline_threshold = self.inline_thresholds[idx];
@@ -612,6 +668,13 @@ impl BlobPreprocessor {
                     blob_id_builder.append_value(blob_id);
                     blob_size_builder.append_value(data_len as u64);
                     position_builder.append_null();
+                    ref_id_builder.append_value(ref_id);
+                    if ref_id > 0 {
+                        self.ref_id_sidecar_cache.insert(
+                            ref_id,
+                            SidecarRef::Dedicated { blob_id, size: data_len as u64 },
+                        );
+                    }
                     continue;
                 }
 
@@ -626,6 +689,17 @@ impl BlobPreprocessor {
                     blob_id_builder.append_value(pack_blob_id);
                     blob_size_builder.append_value(data_len as u64);
                     position_builder.append_value(position);
+                    ref_id_builder.append_value(ref_id);
+                    if ref_id > 0 {
+                        self.ref_id_sidecar_cache.insert(
+                            ref_id,
+                            SidecarRef::Packed {
+                                blob_id: pack_blob_id,
+                                position,
+                                size: data_len as u64,
+                            },
+                        );
+                    }
                     continue;
                 }
 
@@ -661,6 +735,13 @@ impl BlobPreprocessor {
                             blob_id_builder.append_value(blob_id);
                             blob_size_builder.append_value(data_len);
                             position_builder.append_null();
+                            ref_id_builder.append_value(ref_id);
+                            if ref_id > 0 {
+                                self.ref_id_sidecar_cache.insert(
+                                    ref_id,
+                                    SidecarRef::Dedicated { blob_id, size: data_len },
+                                );
+                            }
                             continue;
                         }
 
@@ -675,6 +756,17 @@ impl BlobPreprocessor {
                             blob_id_builder.append_value(pack_blob_id);
                             blob_size_builder.append_value(data_len);
                             position_builder.append_value(position);
+                            ref_id_builder.append_value(ref_id);
+                            if ref_id > 0 {
+                                self.ref_id_sidecar_cache.insert(
+                                    ref_id,
+                                    SidecarRef::Packed {
+                                        blob_id: pack_blob_id,
+                                        position,
+                                        size: data_len,
+                                    },
+                                );
+                            }
                             continue;
                         }
 
@@ -686,6 +778,7 @@ impl BlobPreprocessor {
                         blob_id_builder.append_null();
                         blob_size_builder.append_null();
                         position_builder.append_null();
+                        ref_id_builder.append_value(ref_id);
                         continue;
                     }
 
@@ -707,6 +800,7 @@ impl BlobPreprocessor {
                         blob_size_builder.append_null();
                         position_builder.append_null();
                     }
+                    ref_id_builder.append_value(ref_id);
                     continue;
                 }
 
@@ -718,6 +812,7 @@ impl BlobPreprocessor {
                     blob_id_builder.append_null();
                     blob_size_builder.append_null();
                     position_builder.append_null();
+                    ref_id_builder.append_value(ref_id);
                 } else {
                     data_builder.append_null();
                     uri_builder.append_null();
@@ -725,6 +820,7 @@ impl BlobPreprocessor {
                     blob_size_builder.append_null();
                     kind_builder.append_null();
                     position_builder.append_null();
+                    ref_id_builder.append_null();
                 }
             }
 
@@ -735,6 +831,7 @@ impl BlobPreprocessor {
                 arrow_schema::Field::new("blob_id", ArrowDataType::UInt32, true),
                 arrow_schema::Field::new("blob_size", ArrowDataType::UInt64, true),
                 arrow_schema::Field::new("position", ArrowDataType::UInt64, true),
+                arrow_schema::Field::new("ref_id", ArrowDataType::UInt32, true),
             ];
 
             let struct_array = arrow_array::StructArray::try_new(
@@ -746,6 +843,7 @@ impl BlobPreprocessor {
                     Arc::new(blob_id_builder.finish()),
                     Arc::new(blob_size_builder.finish()),
                     Arc::new(position_builder.finish()),
+                    Arc::new(ref_id_builder.finish()),
                 ],
                 struct_nulls.cloned(),
             )?;
@@ -1857,17 +1955,19 @@ fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVers
     if fields.len() == 2 && fields[0].name() == "position" && fields[1].name() == "size" {
         return Ok(BlobVersion::V1);
     }
-    if fields.len() == 5
+    // V2 required 5 fields; V2.1 adds an optional trailing `ref_id` column.
+    if fields.len() >= 5
         && fields[0].name() == "kind"
         && fields[1].name() == "position"
         && fields[2].name() == "size"
         && fields[3].name() == "blob_id"
         && fields[4].name() == "blob_uri"
+        && (fields.len() == 5 || (fields.len() == 6 && fields[5].name() == "ref_id"))
     {
         return Ok(BlobVersion::V2);
     }
     Err(Error::invalid_input_source(format!(
-        "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri) but got {:?}",
+        "Unrecognized blob descriptions schema: expected v1 (position,size) or v2 (kind,position,size,blob_id,blob_uri[,ref_id]) but got {:?}",
         fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
     )
     .into()))

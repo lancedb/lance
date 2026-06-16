@@ -754,7 +754,23 @@ impl CoreFieldDecoderStrategy {
 
                     return Ok(scheduler);
                 }
-                // Maybe a blob descriptions struct?
+                // Blob v2 extension type: route the 6-field descriptor struct
+                // through the structural scheduler. We match by type name because
+                // PyArrow extension metadata may not round-trip through Lance's
+                // schema serialization.
+                let type_str = data_type.to_string();
+                if type_str.contains("lance.blob.v2") || type_str.contains("BlobType>") {
+                    let column_info = column_infos.expect_next()?;
+                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                        column_info.as_ref(),
+                        self.decompressor_strategy.as_ref(),
+                        self.cache_repetition_index,
+                        field,
+                    )?);
+                    column_infos.next_top_level();
+                    return Ok(scheduler);
+                }
+                // Maybe a blob descriptions struct? (Blob v1)
                 if field.is_blob() {
                     let column_info = column_infos.peek();
                     if column_info.page_infos.iter().any(|page| {

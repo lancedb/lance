@@ -228,9 +228,14 @@ impl FieldEncoder for BlobStructuralEncoder {
     }
 }
 
-/// Blob v2 structural encoder
+/// Blob v2 structural encoder with ref_id deduplication on the Inline path.
 pub struct BlobV2StructuralEncoder {
     descriptor_encoder: Box<dyn FieldEncoder>,
+    /// Maps ref_id -> (position, size) for Inline blobs already appended to
+    /// the out-of-line buffer. Subsequent rows with the same ref_id reuse the
+    /// cached coordinates instead of re-appending identical bytes.
+    /// Lives only for the duration of this encoder (single write session).
+    ref_dedup_tmp_map: HashMap<u32, (u64, u64)>,
 }
 
 impl BlobV2StructuralEncoder {
@@ -258,7 +263,10 @@ impl BlobV2StructuralEncoder {
             Arc::new(HashMap::new()),
         )?);
 
-        Ok(Self { descriptor_encoder })
+        Ok(Self {
+            descriptor_encoder,
+            ref_dedup_tmp_map: HashMap::new(),
+        })
     }
 }
 
@@ -314,6 +322,11 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                 Error::invalid_input_source("Blob v2 struct missing `position` field".into())
             })?
             .as_primitive::<UInt64Type>();
+        // Optional ref_id column: if present and > 0, dedup Inline bytes by
+        // sharing the same out-of-line buffer position across rows.
+        let ref_id_col = struct_arr
+            .column_by_name("ref_id")
+            .map(|c| c.as_primitive::<UInt32Type>());
 
         let row_count = struct_arr.len();
 
@@ -322,8 +335,15 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let mut size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(row_count);
         let mut blob_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(row_count);
         let mut uri_builder = StringBuilder::with_capacity(row_count, row_count * 16);
+        let mut ref_id_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(row_count);
 
         for i in 0..row_count {
+            let ref_id = ref_id_col
+                .as_ref()
+                .filter(|col| !col.is_null(i))
+                .map(|col| col.value(i))
+                .unwrap_or(0);
+
             let (kind_value, position_value, size_value, blob_id_value, uri_value) =
                 if struct_arr.is_null(i) || kind_col.is_null(i) {
                     (BlobKind::Inline as u8, 0, 0, 0, "".to_string())
@@ -370,18 +390,41 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                             "".to_string(),
                         ),
                         BlobKind::Inline => {
-                            let data_val = data_col.value(i);
-                            let blob_len = data_val.len() as u64;
-                            let position = external_buffers
-                                .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
-
-                            (
-                                BlobKind::Inline as u8,
-                                position,
-                                blob_len,
-                                0,
-                                "".to_string(),
-                            )
+                            // ref_id dedup: only first occurrence appends to
+                            // the out-of-line buffer; later rows reuse (pos, size).
+                            if ref_id > 0 {
+                                if let Some(&(pos, size)) =
+                                    self.ref_dedup_tmp_map.get(&ref_id)
+                                {
+                                    (BlobKind::Inline as u8, pos, size, 0, "".to_string())
+                                } else {
+                                    let data_val = data_col.value(i);
+                                    let blob_len = data_val.len() as u64;
+                                    let position = external_buffers
+                                        .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
+                                    self.ref_dedup_tmp_map
+                                        .insert(ref_id, (position, blob_len));
+                                    (
+                                        BlobKind::Inline as u8,
+                                        position,
+                                        blob_len,
+                                        0,
+                                        "".to_string(),
+                                    )
+                                }
+                            } else {
+                                let data_val = data_col.value(i);
+                                let blob_len = data_val.len() as u64;
+                                let position = external_buffers
+                                    .add_buffer(LanceBuffer::from(Buffer::from(data_val)));
+                                (
+                                    BlobKind::Inline as u8,
+                                    position,
+                                    blob_len,
+                                    0,
+                                    "".to_string(),
+                                )
+                            }
                         }
                     }
                 };
@@ -391,6 +434,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
             size_builder.append_value(size_value);
             blob_id_builder.append_value(blob_id_value);
             uri_builder.append_value(uri_value);
+            ref_id_builder.append_value(ref_id);
         }
         let children: Vec<ArrayRef> = vec![
             Arc::new(kind_builder.finish()),
@@ -398,6 +442,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
             Arc::new(size_builder.finish()),
             Arc::new(blob_id_builder.finish()),
             Arc::new(uri_builder.finish()),
+            Arc::new(ref_id_builder.finish()),
         ];
 
         let descriptor_array = Arc::new(StructArray::try_new(
