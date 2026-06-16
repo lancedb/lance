@@ -57,7 +57,7 @@ use lance_io::utils::{
     read_version,
 };
 use lance_table::format::{Fragment, SelfDescribingFileReader};
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -166,7 +166,8 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
         let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-        if index_details.type_url.ends_with("InvertedIndexDetails") {
+        let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
+        if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
                 name: index_name.to_string(),
@@ -183,7 +184,10 @@ pub(crate) async fn build_index_metadata_from_segments(
                 .await?;
         }
         let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        if is_inverted_index {
+            retain_committed_inverted_files(&mut files);
+        }
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
@@ -199,6 +203,10 @@ pub(crate) async fn build_index_metadata_from_segments(
     }
 
     Ok(new_indices)
+}
+
+fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
+    files.retain(|file| !file.path.starts_with("staging/"));
 }
 
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
