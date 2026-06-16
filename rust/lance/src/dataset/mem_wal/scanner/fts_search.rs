@@ -53,7 +53,7 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{DedupDirection, PkHashFilterExec, WithinSourceDedupExec};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::flushed_cache::{FlushedMemTableCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::session::Session;
@@ -77,6 +77,8 @@ pub struct LsmFtsSearchPlanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
     /// Over-fetch multiple for blocked sources (clamped to `>= 1.0`).
     overfetch_factor: f64,
 }
@@ -94,6 +96,7 @@ impl LsmFtsSearchPlanner {
             base_schema,
             session: None,
             flushed_cache: None,
+            warmer: None,
             overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
         }
     }
@@ -116,6 +119,12 @@ impl LsmFtsSearchPlanner {
     /// searches against the same generation a pure `Arc::clone`.
     pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
         self
     }
 
@@ -278,9 +287,13 @@ impl LsmFtsSearchPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset =
-                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
-                        .await?;
+                let dataset = open_flushed_dataset(
+                    path,
+                    self.session.as_ref(),
+                    self.flushed_cache.as_ref(),
+                    self.warmer.as_ref(),
+                )
+                .await?;
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;

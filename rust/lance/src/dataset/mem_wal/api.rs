@@ -601,7 +601,8 @@ impl DatasetMemWalExt for Dataset {
                 snapshot.flushed_generations.iter().map(move |flushed| {
                     let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, flushed.path);
                     async move {
-                        let dataset = open_flushed_dataset(&path, Some(session), cache).await?;
+                        let dataset =
+                            open_flushed_dataset(&path, Some(session), cache, None).await?;
                         prewarm_all_indexes(&dataset).await
                     }
                 })

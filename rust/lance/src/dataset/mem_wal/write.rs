@@ -47,6 +47,7 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
+use super::scanner::GenerationWarmer;
 use super::wal::{
     TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, WalTailer, empty_flush_result,
 };
@@ -216,6 +217,11 @@ pub struct ShardWriterConfig {
     ///
     /// Default: empty.
     pub hnsw_params: HashMap<String, HnswBuildParams>,
+
+    /// Optional warmer fired pre-commit for each new generation (zero cold reads
+    /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
+    /// WAL pod). Default: `None`.
+    pub warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
 impl Default for ShardWriterConfig {
@@ -238,6 +244,7 @@ impl Default for ShardWriterConfig {
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
             enable_memtable: true,
             hnsw_params: HashMap::new(),
+            warmer: None,
         }
     }
 }
@@ -1357,13 +1364,10 @@ impl ShardWriter {
 
         let (memtable_flush_tx, memtable_flush_rx) = mpsc::unbounded_channel();
 
-        let flusher = Arc::new(MemTableFlusher::new(
-            object_store,
-            base_path,
-            base_uri,
-            shard_id,
-            manifest_store,
-        ));
+        let flusher = Arc::new(
+            MemTableFlusher::new(object_store, base_path, base_uri, shard_id, manifest_store)
+                .with_warmer(config.warmer.clone()),
+        );
 
         let backpressure = BackpressureController::new(config.clone());
 

@@ -175,37 +175,21 @@ async fn flushed_pk_hashes(
 ) -> Result<Arc<HashSet<u64>>> {
     match flushed_cache {
         Some(cache) => {
-            let build_cache = cache.clone();
-            let build_path = path.to_string();
-            let build_session = session.cloned();
-            let build_pk = pk_columns.to_vec();
             cache
-                .get_or_build_pk_hashes(
-                    path,
-                    // `Box::pin` keeps this build future off the caller's future
-                    // (avoids `clippy::large_futures`).
-                    Box::pin(async move {
-                        let dataset = open_flushed_dataset(
-                            &build_path,
-                            build_session.as_ref(),
-                            Some(&build_cache),
-                        )
-                        .await?;
-                        scan_pk_hashes(&dataset, &build_pk).await
-                    }),
-                )
+                .get_or_build_pk_hashes(path, session.cloned(), pk_columns)
                 .await
         }
         None => {
-            let dataset = open_flushed_dataset(path, session, None).await?;
+            let dataset = open_flushed_dataset(path, session, None, None).await?;
             Ok(Arc::new(scan_pk_hashes(&dataset, pk_columns).await?))
         }
     }
 }
 
 /// Scan a dataset's PK columns and fold them into a membership set, one batch
-/// resident at a time (no full PK-column buffer).
-async fn scan_pk_hashes(dataset: &Dataset, pk_columns: &[String]) -> Result<HashSet<u64>> {
+/// resident at a time (no full PK-column buffer). Exposed so the dataset
+/// cache's self-contained `get_or_build_pk_hashes` can reuse it.
+pub async fn scan_pk_hashes(dataset: &Dataset, pk_columns: &[String]) -> Result<HashSet<u64>> {
     let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
     let mut scanner = dataset.scan();
     scanner.project(&pk_refs)?;

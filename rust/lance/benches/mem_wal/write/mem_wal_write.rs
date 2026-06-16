@@ -651,6 +651,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     stats_log_interval: default_config.stats_log_interval,
                                     enable_memtable,
                                     hnsw_params: default_config.hnsw_params,
+                                    warmer: None,
                                 };
 
                                 // Get writer through Dataset API (index configs loaded automatically)

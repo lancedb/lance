@@ -16,7 +16,7 @@ use tracing::instrument;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkHashFilterExec, ROW_ADDRESS_COLUMN};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::flushed_cache::{FlushedMemTableCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
 };
@@ -34,6 +34,8 @@ pub struct LsmScanPlanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
 impl LsmScanPlanner {
@@ -49,6 +51,7 @@ impl LsmScanPlanner {
             base_schema,
             session: None,
             flushed_cache: None,
+            warmer: None,
         }
     }
 
@@ -63,6 +66,12 @@ impl LsmScanPlanner {
     /// queries against the same generation a pure `Arc::clone`.
     pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
         self
     }
 
@@ -251,9 +260,13 @@ impl LsmScanPlanner {
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset =
-                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
-                        .await?;
+                let dataset = open_flushed_dataset(
+                    path,
+                    self.session.as_ref(),
+                    self.flushed_cache.as_ref(),
+                    self.warmer.as_ref(),
+                )
+                .await?;
                 let mut scanner = dataset.scan();
 
                 let cols =

@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::ShardSnapshot;
-use super::flushed_cache::FlushedMemTableCache;
+use super::flushed_cache::{FlushedMemTableCache, GenerationWarmer};
 use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use crate::dataset::Dataset;
@@ -125,6 +125,8 @@ pub struct LsmScanner {
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
 impl LsmScanner {
@@ -160,6 +162,7 @@ impl LsmScanner {
             pk_columns,
             session,
             flushed_cache: None,
+            warmer: None,
         }
     }
 
@@ -198,6 +201,7 @@ impl LsmScanner {
             pk_columns,
             session: None,
             flushed_cache: None,
+            warmer: None,
         }
     }
 
@@ -250,6 +254,13 @@ impl LsmScanner {
     /// set by default, so behavior is unchanged unless opted in.
     pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation. Not set by
+    /// default, so behavior is unchanged unless opted in.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
         self
     }
 
@@ -354,6 +365,9 @@ impl LsmScanner {
             if let Some(cache) = &self.flushed_cache {
                 planner = planner.with_flushed_cache(cache.clone());
             }
+            if let Some(warmer) = &self.warmer {
+                planner = planner.with_warmer(warmer.clone());
+            }
             let plan = planner
                 .plan_point_lookup(&keys, self.projection.as_deref())
                 .await?;
@@ -369,6 +383,9 @@ impl LsmScanner {
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
+        }
+        if let Some(warmer) = &self.warmer {
+            planner = planner.with_warmer(warmer.clone());
         }
 
         planner
@@ -404,6 +421,9 @@ impl LsmScanner {
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
+        }
+        if let Some(warmer) = &self.warmer {
+            planner = planner.with_warmer(warmer.clone());
         }
         planner
             .plan_search(column, query, k, self.projection.as_deref())

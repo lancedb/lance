@@ -18,7 +18,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
-use log::info;
+use log::{info, warn};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -29,6 +29,7 @@ use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
 use crate::Dataset;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
+use crate::dataset::mem_wal::scanner::GenerationWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
 
@@ -68,6 +69,9 @@ pub struct MemTableFlusher {
     base_uri: String,
     shard_id: Uuid,
     manifest_store: Arc<ShardManifestStore>,
+    /// When present, each new generation is warmed before it is committed, so
+    /// the first query sees zero cold reads. `None` ⇒ no warming.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
 impl MemTableFlusher {
@@ -84,6 +88,32 @@ impl MemTableFlusher {
             base_uri: base_uri.into(),
             shard_id,
             manifest_store,
+            warmer: None,
+        }
+    }
+
+    /// Attach the warmer fired pre-commit for each new generation.
+    pub fn with_warmer(mut self, warmer: Option<Arc<dyn GenerationWarmer>>) -> Self {
+        self.warmer = warmer;
+        self
+    }
+
+    /// Warm a just-written generation before it is committed. Best-effort: a
+    /// failure is logged and the flush proceeds — warming is never a commit
+    /// gate. No-op without a warmer. `uri` must be the resolved reader path
+    /// (`path_to_uri(gen_path)`) so warmed entries key-match later queries.
+    async fn warm_generation(&self, uri: &str, memtable: &MemTable) {
+        let Some(warmer) = &self.warmer else {
+            return;
+        };
+        let pk_columns: Vec<String> = memtable
+            .lance_schema()
+            .unenforced_primary_key()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        if let Err(e) = warmer.warm(uri, &pk_columns).await {
+            warn!("pre-commit warm failed for generation {uri}; committing cold: {e}");
         }
     }
 
@@ -177,6 +207,10 @@ impl MemTableFlusher {
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
+
+        // Warm before commit (zero cold window); no-op without a warmer.
+        let warm_uri = self.path_to_uri(&gen_path);
+        self.warm_generation(&warm_uri, memtable).await;
 
         let new_manifest = self
             .update_manifest(
@@ -458,6 +492,10 @@ impl MemTableFlusher {
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
+
+        // Warm before commit (zero cold window); no-op without a warmer.
+        let warm_uri = self.path_to_uri(&gen_path);
+        self.warm_generation(&warm_uri, memtable).await;
 
         let new_manifest = self
             .update_manifest(
