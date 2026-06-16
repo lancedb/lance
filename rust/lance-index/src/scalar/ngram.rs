@@ -5,7 +5,10 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::once;
 use std::time::Instant;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::lance_format::LanceIndexStore;
 use super::{
@@ -48,6 +51,9 @@ use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
 use tracing::instrument;
+
+mod ngram_regex;
+pub(crate) use ngram_regex::regex_can_use_index;
 
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
@@ -475,6 +481,45 @@ impl ScalarIndex for NGramIndex {
                 let list_refs = posting_lists.iter().map(|list| list.as_ref());
                 let row_ids = NGramPostingList::intersect(list_refs);
                 Ok(SearchResult::at_most(RowAddrTreeMap::from(row_ids)))
+            }
+            TextQuery::Regex(pattern) => {
+                let trigram_query = ngram_regex::regex_to_trigram_query(pattern);
+                match &trigram_query {
+                    // No usable trigram structure (e.g. `a.b`, `.*`): the index
+                    // cannot prune, so every row must be rechecked.
+                    ngram_regex::TrigramQuery::All => {
+                        Ok(SearchResult::at_least(RowAddrTreeMap::new()))
+                    }
+                    // The pattern is provably unsatisfiable.
+                    ngram_regex::TrigramQuery::None => {
+                        Ok(SearchResult::exact(RowAddrTreeMap::new()))
+                    }
+                    _ => {
+                        let mut tokens = HashSet::new();
+                        ngram_regex::collect_tokens(&trigram_query, &mut tokens);
+                        // Fetch the posting list for every trigram the condition
+                        // references; a token absent from the index contributes
+                        // an empty list, which `eval_trigram_query` handles.
+                        let present = tokens.into_iter().filter_map(|token| {
+                            self.tokens.get(&token).map(|offset| (token, *offset))
+                        });
+                        let lists = futures::stream::iter(present.map(|(token, offset)| {
+                            self.list_reader
+                                .ngram_list(offset, metrics)
+                                .map(move |result| result.map(|list| (token, list)))
+                        }))
+                        .buffer_unordered(self.io_parallelism)
+                        .try_collect::<Vec<(u32, Arc<NGramPostingList>)>>()
+                        .await?;
+                        metrics.record_comparisons(lists.len());
+                        let bitmaps: HashMap<u32, RoaringTreemap> = lists
+                            .into_iter()
+                            .map(|(token, list)| (token, list.bitmap.clone()))
+                            .collect();
+                        let row_ids = ngram_regex::eval_trigram_query(&trigram_query, &bitmaps);
+                        Ok(SearchResult::at_most(RowAddrTreeMap::from(row_ids)))
+                    }
+                }
             }
         }
     }
@@ -1279,6 +1324,9 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         Some(Box::new(TextQueryParser::new(
             index_name,
             self.name().to_string(),
+            // needs_recheck: ngram results are an inexact candidate superset.
+            true,
+            // supports_regex: the ngram index can answer regex queries.
             true,
         )))
     }
@@ -1536,6 +1584,107 @@ mod tests {
             .unwrap();
         let expected = SearchResult::at_most(RowAddrTreeMap::from_iter([8]));
         assert_eq!(expected, res);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_regex_search() {
+        // Same corpus as test_basic_ngram_index.
+        let data = StringArray::from_iter_values([
+            "cat",         // 0
+            "dog",         // 1
+            "cat dog",     // 2
+            "dog cat",     // 3
+            "elephant",    // 4
+            "mouse",       // 5
+            "rhino",       // 6
+            "giraffe",     // 7
+            "rhinos nose", // 8
+        ]);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        async fn search(index: &NGramIndex, pattern: &str) -> SearchResult {
+            index
+                .search(
+                    &TextQuery::Regex(pattern.to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap()
+        }
+
+        // A plain literal yields the same candidates as contains("cat").
+        assert_eq!(
+            search(&index, "cat").await,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0, 2, 3]))
+        );
+
+        // Alternation -> union of each branch's rows.
+        assert_eq!(
+            search(&index, "(cat|dog)").await,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0, 1, 2, 3]))
+        );
+
+        // AND across `.*`: must contain both the `rhino` and `nose` trigrams, so
+        // row 6 ("rhino") is correctly excluded and only row 8 survives.
+        assert_eq!(
+            search(&index, "rhino.*nose").await,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([8]))
+        );
+
+        // No derivable trigram -> recheck everything.
+        assert_eq!(
+            search(&index, "a.b").await,
+            SearchResult::at_least(RowAddrTreeMap::new())
+        );
+
+        // A trigram that is absent from the index -> empty candidate set.
+        assert_eq!(
+            search(&index, "zzz").await,
+            SearchResult::at_most(RowAddrTreeMap::new())
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_regex_search_nulls() {
+        // Rows: cat(0), dog(1), NULL(2), NULL(3), cat dog(4).
+        let data = simple_data_with_nulls();
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        // The NULL rows (2, 3) must never appear in the candidate set.
+        let res = index
+            .search(&TextQuery::Regex("cat".to_string()), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0, 4]))
+        );
+
+        let res = index
+            .search(
+                &TextQuery::Regex("(cat|dog)".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0, 1, 4]))
+        );
     }
 
     fn test_data_schema() -> Arc<Schema> {
