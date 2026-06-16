@@ -461,9 +461,9 @@ impl LsmScanner {
 
     /// As-of variant of [`Self::contains_pks`]. Membership is evaluated against
     /// a snapshot-consistent cut of the fresh tier, supplied per shard via
-    /// `as_of` (see [`AsOfCut`]), so a caller can match the exact tier a prior
-    /// scan observed and avoid the two-snapshot skew that would drop a base row
-    /// with no delivered replacement. `None` evaluates against the live tier.
+    /// `as_of` (see [`AsOfCut`]), matching the tier a prior scan observed and
+    /// avoiding the two-snapshot skew that would drop a base row with no
+    /// delivered replacement. `None` evaluates against the live tier.
     pub async fn contains_pks_as_of(
         &self,
         pks: &RecordBatch,

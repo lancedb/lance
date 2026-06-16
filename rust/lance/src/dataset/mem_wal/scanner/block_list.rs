@@ -111,13 +111,10 @@ pub async fn compute_source_block_lists(
 /// The base source, if present, is skipped (it is what gets shadowed).
 ///
 /// When `as_of` carries a cut for a source's shard, membership is bounded to
-/// that snapshot (see [`AsOfCut`]): in-memory sources at a generation above
-/// `active_generation` are excluded (they appeared after the snapshot); the
-/// active generation is bounded to its first `active_batch_count` batches;
-/// everything below the active generation (frozen and flushed) is immutable and
-/// included whole. A shard absent from `as_of` (or `as_of == None`) uses the
-/// live tier. The bound only excludes rows, so it can under-count (a tolerable
-/// stale read) but never over-count.
+/// that snapshot (see [`AsOfCut`]): higher generations are excluded, the active
+/// generation is bounded to its first `active_batch_count` batches, and lower
+/// generations (frozen and flushed) are immutable and included whole. A shard
+/// absent from `as_of` (or `as_of == None`) uses the live tier.
 pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     pk_columns: &[String],
@@ -138,13 +135,11 @@ pub async fn fresh_tier_block_list(
                 Some(cut) => {
                     let g = generation.as_u64();
                     if g > cut.active_generation {
-                        // A newer in-memory generation that rolled in after the
-                        // snapshot — not observed by the scan arm.
+                        // Rolled in after the snapshot; the arm never saw it.
                         continue;
                     }
-                    // The active generation grew between the arm and now; bound
-                    // it to the batches the arm saw. Lower (frozen) generations
-                    // are immutable, so all their batches were observed.
+                    // Bound the active generation to the batches the arm saw;
+                    // lower (frozen) generations are immutable, so include all.
                     let limit = if g == cut.active_generation {
                         cut.active_batch_count as usize
                     } else {
@@ -164,10 +159,8 @@ pub async fn fresh_tier_block_list(
                 generation,
                 ..
             } => {
-                // A flushed generation at or above the active generation was
-                // produced by a flush after the snapshot (and may hold rows the
-                // arm never saw), so it must not contribute. Lower generations
-                // are immutable and were fully observed.
+                // A generation at or above the active one was flushed after the
+                // snapshot; exclude it. Lower generations are immutable.
                 let flushed_after_snapshot = as_of
                     .and_then(|m| m.get(shard_id))
                     .is_some_and(|cut| generation.as_u64() >= cut.active_generation);
@@ -200,10 +193,8 @@ pub fn pk_hashes_from_batch_store(
 }
 
 /// As-of variant of [`pk_hashes_from_batch_store`]: includes only the first
-/// `limit` batches (by append index) — the batches a prior scan observed before
-/// the memtable grew. `usize::MAX` includes all (an immutable lower generation).
-/// Bounding the membership to what the arm saw keeps the block-list from
-/// dropping a base row whose replacement the arm did not deliver.
+/// `limit` batches (by append index) — those a prior scan observed before the
+/// memtable grew. `usize::MAX` includes all (an immutable lower generation).
 pub fn pk_hashes_from_batch_store_bounded(
     store: &BatchStore,
     pk_columns: &[String],
@@ -530,10 +521,9 @@ mod tests {
     }
 
     /// An as-of cut bounds the active generation to the first
-    /// `active_batch_count` batches — the ones the scan arm observed before the
-    /// memtable grew. A later append (higher batch index) is invisible to the
-    /// check, so a base row is never dropped without the arm having delivered
-    /// its replacement.
+    /// `active_batch_count` batches — those the arm observed before the memtable
+    /// grew. A later append is invisible, so a base row is never dropped without
+    /// the arm having delivered its replacement.
     #[tokio::test]
     async fn as_of_cut_bounds_active_memtable_by_batch_count() {
         use crate::dataset::mem_wal::scanner::data_source::{
@@ -582,9 +572,9 @@ mod tests {
         }
     }
 
-    /// A generation above the active generation rolled in after the snapshot and
-    /// is excluded whole; a generation below it is immutable (frozen) and
-    /// included whole regardless of the active batch count.
+    /// A generation above the active one rolled in after the snapshot and is
+    /// excluded whole; a lower one is immutable (frozen) and included whole
+    /// regardless of the active batch count.
     #[tokio::test]
     async fn as_of_cut_excludes_newer_gen_includes_lower_gen() {
         use crate::dataset::mem_wal::scanner::data_source::{
