@@ -127,6 +127,9 @@ pub struct LsmScanner {
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
     warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Over-fetch multiple for block-listed sources in search plans
+    /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
+    overfetch_factor: Option<f64>,
 }
 
 impl LsmScanner {
@@ -163,6 +166,7 @@ impl LsmScanner {
             session,
             flushed_cache: None,
             warmer: None,
+            overfetch_factor: None,
         }
     }
 
@@ -202,6 +206,7 @@ impl LsmScanner {
             session: None,
             flushed_cache: None,
             warmer: None,
+            overfetch_factor: None,
         }
     }
 
@@ -262,6 +267,14 @@ impl LsmScanner {
     /// default, so behavior is unchanged unless opted in.
     pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
         self.warmer = Some(warmer);
+        self
+    }
+
+    /// Set the over-fetch multiple block-listed sources use in search plans
+    /// so they still yield `k` live rows after cross-generation dedup.
+    /// Threaded into [`super::LsmFtsSearchPlanner`]; clamped to `>= 1.0`.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = Some(factor);
         self
     }
 
@@ -388,6 +401,9 @@ impl LsmScanner {
         if let Some(warmer) = &self.warmer {
             planner = planner.with_warmer(warmer.clone());
         }
+        if let Some(factor) = self.overfetch_factor {
+            planner = planner.with_overfetch_factor(factor);
+        }
 
         planner
             .plan_scan(
@@ -425,6 +441,9 @@ impl LsmScanner {
         }
         if let Some(warmer) = &self.warmer {
             planner = planner.with_warmer(warmer.clone());
+        }
+        if let Some(factor) = self.overfetch_factor {
+            planner = planner.with_overfetch_factor(factor);
         }
         planner
             .plan_search(column, query, k, self.projection.as_deref())

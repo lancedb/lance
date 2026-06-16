@@ -575,6 +575,18 @@ impl Field {
         }
     }
 
+    /// Convert blob v2 fields in this field tree to their descriptor view.
+    pub fn unload_blobs_recursive(&mut self) {
+        if self.is_blob_v2() {
+            self.unloaded_mut();
+            return;
+        }
+
+        for child in &mut self.children {
+            child.unload_blobs_recursive();
+        }
+    }
+
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -1862,6 +1874,54 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 5);
         assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+    }
+
+    #[test]
+    fn unload_blobs_recursive_only_unloads_blob_v2() {
+        let legacy_metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob_v2_metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+
+        let mut field: Field = ArrowField::new(
+            "parent",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("legacy_blob", DataType::LargeBinary, true)
+                    .with_metadata(legacy_metadata),
+                ArrowField::new(
+                    "blob_v2",
+                    DataType::Struct(
+                        vec![
+                            ArrowField::new("data", DataType::LargeBinary, true),
+                            ArrowField::new("uri", DataType::Utf8, true),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                )
+                .with_metadata(blob_v2_metadata),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        field.unload_blobs_recursive();
+
+        let legacy_blob = field
+            .children
+            .iter()
+            .find(|f| f.name == "legacy_blob")
+            .unwrap();
+        assert_eq!(
+            legacy_blob.logical_type,
+            LogicalType::try_from(&DataType::LargeBinary).unwrap()
+        );
+        assert_eq!(legacy_blob.children.len(), 0);
+        assert!(legacy_blob.metadata.contains_key(BLOB_META_KEY));
+
+        let blob_v2 = field.children.iter().find(|f| f.name == "blob_v2").unwrap();
+        assert_eq!(blob_v2.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        assert_eq!(blob_v2.children.len(), 5);
     }
 
     #[test]

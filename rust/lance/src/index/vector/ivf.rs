@@ -6266,7 +6266,7 @@ mod tests {
         );
 
         // PQ code is on residual space
-        let pq_store = ivf_idx.load_partition_storage(0).await.unwrap();
+        let pq_store = ivf_idx.load_partition_storage(0, None).await.unwrap();
         pq_store
             .codebook()
             .values()
