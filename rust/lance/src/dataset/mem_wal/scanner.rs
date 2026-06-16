@@ -47,7 +47,9 @@ pub use builder::LsmScanner;
 pub use collector::{
     ActiveMemTableRef, InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector,
 };
-pub use data_source::{AsOfCut, FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
+pub use data_source::{
+    FlushedGeneration, FreshTierWatermark, LsmDataSource, LsmGeneration, ShardSnapshot,
+};
 pub use flushed_cache::FlushedMemTableCache;
 pub use fts_search::{LsmFtsSearchPlanner, SCORE_COLUMN};
 pub use point_lookup::LsmPointLookupPlanner;

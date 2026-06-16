@@ -184,7 +184,7 @@ pub struct ShardWriterConfig {
     /// the maximum elapsed time of any query. While pinned, a generation is
     /// served from its in-memory batches, which preserve per-batch boundaries;
     /// once evicted, the flushed dataset has lost them and as-of membership
-    /// (see [`crate::dataset::mem_wal::scanner::AsOfCut`]) can no longer be
+    /// (see [`crate::dataset::mem_wal::scanner::FreshTierWatermark`]) can no longer be
     /// bounded to the snapshot a
     /// query observed. A query whose lifetime exceeds this window can therefore
     /// observe a generation evicted mid-read and serve a stale row. Size it

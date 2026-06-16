@@ -21,7 +21,7 @@ use lance_core::Result;
 
 use uuid::Uuid;
 
-use super::data_source::{AsOfCut, LsmDataSource, LsmGeneration};
+use super::data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration};
 use super::exec::{compute_pk_hash, resolve_pk_indices};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use crate::dataset::Dataset;
@@ -110,17 +110,17 @@ pub async fn compute_source_block_lists(
 /// consumes; a base/external reader can drop any row whose PK is in one of them.
 /// The base source, if present, is skipped (it is what gets shadowed).
 ///
-/// When `as_of` carries a cut for a source's shard, membership is bounded to
-/// that snapshot (see [`AsOfCut`]): higher generations are excluded, the active
-/// generation is bounded to its first `active_batch_count` batches, and lower
-/// generations (frozen and flushed) are immutable and included whole. A shard
-/// absent from `as_of` (or `as_of == None`) uses the live tier.
+/// When `watermarks` carries a watermark for a source's shard, membership is bounded
+/// to it (see [`FreshTierWatermark`]): higher generations are excluded, the
+/// active generation is bounded to its first `active_batch_count` batches, and
+/// lower generations (frozen and flushed) are immutable and included whole. A
+/// shard absent from `watermarks` (or `watermarks == None`) uses the live tier.
 pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
-    as_of: Option<&HashMap<Uuid, AsOfCut>>,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<Arc<HashSet<u64>>>> {
     let mut sets = Vec::new();
     for source in sources {
@@ -131,17 +131,17 @@ pub async fn fresh_tier_block_list(
                 shard_id,
                 generation,
                 ..
-            } => match as_of.and_then(|m| m.get(shard_id)) {
-                Some(cut) => {
+            } => match watermarks.and_then(|m| m.get(shard_id)) {
+                Some(watermark) => {
                     let g = generation.as_u64();
-                    if g > cut.active_generation {
+                    if g > watermark.active_generation {
                         // Rolled in after the snapshot; the arm never saw it.
                         continue;
                     }
                     // Bound the active generation to the batches the arm saw;
                     // lower (frozen) generations are immutable, so include all.
-                    let limit = if g == cut.active_generation {
-                        cut.active_batch_count as usize
+                    let limit = if g == watermark.active_generation {
+                        watermark.active_batch_count as usize
                     } else {
                         usize::MAX
                     };
@@ -161,9 +161,9 @@ pub async fn fresh_tier_block_list(
             } => {
                 // A generation at or above the active one was flushed after the
                 // snapshot; exclude it. Lower generations are immutable.
-                let flushed_after_snapshot = as_of
+                let flushed_after_snapshot = watermarks
                     .and_then(|m| m.get(shard_id))
-                    .is_some_and(|cut| generation.as_u64() >= cut.active_generation);
+                    .is_some_and(|watermark| generation.as_u64() >= watermark.active_generation);
                 if flushed_after_snapshot {
                     continue;
                 }
@@ -520,14 +520,14 @@ mod tests {
         assert!(!blocked.contains_key(&(Some(b), g2)));
     }
 
-    /// An as-of cut bounds the active generation to the first
+    /// A fresh-tier watermark bounds the active generation to the first
     /// `active_batch_count` batches — those the arm observed before the memtable
     /// grew. A later append is invisible, so a base row is never dropped without
     /// the arm having delivered its replacement.
     #[tokio::test]
-    async fn as_of_cut_bounds_active_memtable_by_batch_count() {
+    async fn fresh_tier_watermark_bounds_active_memtable_by_batch_count() {
         use crate::dataset::mem_wal::scanner::data_source::{
-            AsOfCut, LsmDataSource, LsmGeneration,
+            FreshTierWatermark, LsmDataSource, LsmGeneration,
         };
         use crate::dataset::mem_wal::write::IndexStore;
         use std::collections::HashMap;
@@ -546,24 +546,25 @@ mod tests {
             generation: LsmGeneration::memtable(1),
         }];
 
-        // Cut at 2 batches of gen 1: pk=1,2 are members; pk=3 (batch 2) is not.
-        let as_of: HashMap<Uuid, AsOfCut> = [(
+        // Watermark at 2 batches of gen 1: pk=1,2 are members; pk=3 (batch 2) is not.
+        let watermarks: HashMap<Uuid, FreshTierWatermark> = [(
             shard,
-            AsOfCut {
+            FreshTierWatermark {
                 active_generation: 1,
                 active_batch_count: 2,
             },
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, &["id".to_string()], None, None, Some(&as_of))
-            .await
-            .unwrap();
+        let sets =
+            fresh_tier_block_list(&sources, &["id".to_string()], None, None, Some(&watermarks))
+                .await
+                .unwrap();
         assert!(blocks(&sets, 1));
         assert!(blocks(&sets, 2));
         assert!(!blocks(&sets, 3));
 
-        // No cut → live tier: all three are members.
+        // No watermark → live tier: all three are members.
         let sets = fresh_tier_block_list(&sources, &["id".to_string()], None, None, None)
             .await
             .unwrap();
@@ -576,9 +577,9 @@ mod tests {
     /// excluded whole; a lower one is immutable (frozen) and included whole
     /// regardless of the active batch count.
     #[tokio::test]
-    async fn as_of_cut_excludes_newer_gen_includes_lower_gen() {
+    async fn fresh_tier_watermark_excludes_newer_gen_includes_lower_gen() {
         use crate::dataset::mem_wal::scanner::data_source::{
-            AsOfCut, LsmDataSource, LsmGeneration,
+            FreshTierWatermark, LsmDataSource, LsmGeneration,
         };
         use crate::dataset::mem_wal::write::IndexStore;
         use std::collections::HashMap;
@@ -601,22 +602,23 @@ mod tests {
         // gen 1 lower/immutable (whole).
         let sources = vec![mk(&[100], 3), mk(&[20, 21], 2), mk(&[1, 2], 1)];
 
-        let as_of: HashMap<Uuid, AsOfCut> = [(
+        let watermarks: HashMap<Uuid, FreshTierWatermark> = [(
             shard,
-            AsOfCut {
+            FreshTierWatermark {
                 active_generation: 2,
                 active_batch_count: 1,
             },
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, &["id".to_string()], None, None, Some(&as_of))
-            .await
-            .unwrap();
+        let sets =
+            fresh_tier_block_list(&sources, &["id".to_string()], None, None, Some(&watermarks))
+                .await
+                .unwrap();
         assert!(blocks(&sets, 1)); // gen 1, whole
         assert!(blocks(&sets, 2)); // gen 1, whole
         assert!(blocks(&sets, 20)); // gen 2, batch 0
-        assert!(!blocks(&sets, 21)); // gen 2, batch 1 — past the cut
+        assert!(!blocks(&sets, 21)); // gen 2, batch 1 — past the watermark
         assert!(!blocks(&sets, 100)); // gen 3 — after the snapshot
     }
 
@@ -624,9 +626,9 @@ mod tests {
     /// flush after the snapshot and is excluded; one strictly below it is
     /// immutable and included.
     #[tokio::test]
-    async fn as_of_cut_excludes_flushed_at_or_above_active() {
+    async fn fresh_tier_watermark_excludes_flushed_at_or_above_active() {
         use crate::dataset::mem_wal::scanner::data_source::{
-            AsOfCut, LsmDataSource, LsmGeneration,
+            FreshTierWatermark, LsmDataSource, LsmGeneration,
         };
         use crate::dataset::{Dataset, WriteParams};
         use arrow_array::RecordBatchIterator;
@@ -650,9 +652,9 @@ mod tests {
         }];
 
         // active_generation 2 (gen 2 flushed at/after the snapshot): excluded.
-        let at: HashMap<Uuid, AsOfCut> = [(
+        let at: HashMap<Uuid, FreshTierWatermark> = [(
             shard,
-            AsOfCut {
+            FreshTierWatermark {
                 active_generation: 2,
                 active_batch_count: u64::MAX,
             },
@@ -665,9 +667,9 @@ mod tests {
         assert!(!blocks(&sets, 5));
 
         // active_generation 3 (gen 2 strictly below, immutable): included.
-        let above: HashMap<Uuid, AsOfCut> = [(
+        let above: HashMap<Uuid, FreshTierWatermark> = [(
             shard,
-            AsOfCut {
+            FreshTierWatermark {
                 active_generation: 3,
                 active_batch_count: u64::MAX,
             },
