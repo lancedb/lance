@@ -17,10 +17,10 @@ use bytes::Bytes;
 use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
-use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::{Error, ROW_ID, Result};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -504,7 +504,7 @@ pub struct LabelListIndexState {
 }
 
 impl DeepSizeOf for LabelListIndexState {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.bitmap_state.deep_size_of_children(context)
             + self.list_nulls.deep_size_of_children(context)
     }

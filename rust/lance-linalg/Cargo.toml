@@ -13,7 +13,6 @@ categories = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
-deepsize = { workspace = true }
 half = { workspace = true }
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }

@@ -1083,19 +1083,19 @@ wheels = [
 
 [[package]]
 name = "lance-namespace"
-version = "0.8.0"
+version = "0.8.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lance-namespace-urllib3-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/21/80/2b6eaa08c5e25915acaa6368a70211a25b5ba9d2d6006450e68a73936164/lance_namespace-0.8.0.tar.gz", hash = "sha256:c4a79ee221a3b2315c29863ad12d85fcf219a13158e26149d63e21dc4b4673a7", size = 10756, upload-time = "2026-06-01T08:47:10.183Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d0/22/3d8eb4e913edf36cda416f1dca287147af508abe3ca89bf0e619b9fa9f54/lance_namespace-0.8.5.tar.gz", hash = "sha256:b4a5967afcbf9924300a0b9d2fb74c44a23f76907e8734ebed6e0e3a561b0df0", size = 11531, upload-time = "2026-06-11T16:20:26.77Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4b/bd/7b40a08fb132fab39a6caebf832fdf6b9befc71be9413beb9be0a9d927d4/lance_namespace-0.8.0-py3-none-any.whl", hash = "sha256:782cf9e332f46bf06836722dd98b53ca8495ad98bb541501ff6876c89b67ec90", size = 12579, upload-time = "2026-06-01T08:47:10.91Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/da/afc3cdc42fc2dcf885a9d3524bf2c3bd2a9df89b1668b1806dec5e436263/lance_namespace-0.8.5-py3-none-any.whl", hash = "sha256:6d3e2b8da586d06409494b56955a63c3152eeae2883cd2e8ba4e80d20dc0de0f", size = 13383, upload-time = "2026-06-11T16:20:26.004Z" },
 ]
 
 [[package]]
 name = "lance-namespace-urllib3-client"
-version = "0.8.0"
+version = "0.8.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
@@ -1104,9 +1104,9 @@ dependencies = [
     { name = "urllib3", version = "1.26.20", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "urllib3", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8c/37/06fcd5a8969381e0ba953d51990af8d331bdccbc62458bf2eed30d064573/lance_namespace_urllib3_client-0.8.0.tar.gz", hash = "sha256:4f060f05ebf3c04aeaeb0d2022cbe77648a3df290f02cd2c305e5797d0fc1fdd", size = 203710, upload-time = "2026-06-01T08:47:13.404Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/6f/1291523488523656342d1b424b76b4d91f3af6413b3b4ada43b888a87043/lance_namespace_urllib3_client-0.8.5.tar.gz", hash = "sha256:29922ffb5b0621e24a83183454ec3e5a5828f46d91a95d58efc35db05dec4e62", size = 228595, upload-time = "2026-06-11T16:20:23.985Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/43/e280727feee958f303bc58d5fa912b07734a0831f756d841654d500c2c34/lance_namespace_urllib3_client-0.8.0-py3-none-any.whl", hash = "sha256:6734e341b726e5cc96a0cd257cef27eb9d03013f2d151526ee426cef8e63e228", size = 336669, upload-time = "2026-06-01T08:47:11.88Z" },
+    { url = "https://files.pythonhosted.org/packages/10/e2/62883d1f43a283ac08f00af993c6a2b92e4ca206fa1ccba032420d8dc578/lance_namespace_urllib3_client-0.8.5-py3-none-any.whl", hash = "sha256:8af211ddc6e73df713ffb59368c94780508e732b19dacb4239d937aaff2f8e3c", size = 369857, upload-time = "2026-06-11T16:20:25.006Z" },
 ]
 
 [[package]]
@@ -2676,7 +2676,7 @@ requires-dist = [
     { name = "duckdb", marker = "extra == 'tests'" },
     { name = "geoarrow-rust-core", marker = "extra == 'geo'" },
     { name = "geoarrow-rust-io", marker = "extra == 'geo'" },
-    { name = "lance-namespace", specifier = ">=0.8.0,<0.9" },
+    { name = "lance-namespace", specifier = ">=0.8.5,<0.9" },
     { name = "ml-dtypes", marker = "extra == 'tests'" },
     { name = "numpy", specifier = ">=1.22" },
     { name = "pandas", marker = "extra == 'tests'" },

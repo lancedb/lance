@@ -6,7 +6,10 @@ use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt, TryStreamExt};
-use lance_arrow::BLOB_META_KEY;
+use lance_arrow::{
+    ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+    BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME,
+};
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
@@ -35,7 +38,9 @@ use tracing::{info, instrument};
 
 use crate::Dataset;
 use crate::dataset::blob::{
-    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver, preprocess_blob_batches,
+    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
+    blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
+    preprocess_blob_batches,
 };
 use crate::session::Session;
 
@@ -165,6 +170,77 @@ fn validate_external_blob_write_params(params: &WriteParams) -> Result<()> {
         return Err(Error::invalid_input(
             "allow_external_blob_outside_bases only applies when external_blob_mode=\"reference\"",
         ));
+    }
+
+    Ok(())
+}
+
+fn validate_blob_threshold_metadata_for_append(
+    input_schema: &Schema,
+    dataset_schema: &Schema,
+) -> Result<()> {
+    for input_field in &input_schema.fields {
+        let Some(dataset_field) = dataset_schema.field(&input_field.name) else {
+            continue;
+        };
+        let input_is_blob_v2 = input_field
+            .metadata
+            .get(ARROW_EXT_NAME_KEY)
+            .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
+        let dataset_is_blob_v2 = dataset_field
+            .metadata
+            .get(ARROW_EXT_NAME_KEY)
+            .is_some_and(|extension_name| extension_name == BLOB_V2_EXT_NAME);
+        if !input_is_blob_v2 && !dataset_is_blob_v2 {
+            continue;
+        }
+
+        let has_inline_threshold = input_field
+            .metadata
+            .contains_key(BLOB_INLINE_SIZE_THRESHOLD_META_KEY);
+        let has_dedicated_threshold = input_field
+            .metadata
+            .contains_key(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY);
+        if !has_inline_threshold && !has_dedicated_threshold {
+            continue;
+        }
+
+        if has_inline_threshold {
+            let input_inline_threshold =
+                blob_inline_threshold_from_metadata(&input_field.metadata, &input_field.name)?;
+            let dataset_inline_threshold =
+                blob_inline_threshold_from_metadata(&dataset_field.metadata, &dataset_field.name)?;
+            if input_inline_threshold != dataset_inline_threshold {
+                return Err(Error::invalid_input(format!(
+                    "Cannot append data with blob threshold metadata {}={} for field '{}'; \
+                     the dataset schema has effective value {}. Blob thresholds for existing \
+                     columns are stored in the dataset schema.",
+                    BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
+                    input_inline_threshold,
+                    input_field.name,
+                    dataset_inline_threshold,
+                )));
+            }
+        }
+        if has_dedicated_threshold {
+            let input_dedicated_threshold =
+                blob_dedicated_threshold_from_metadata(&input_field.metadata, &input_field.name)?;
+            let dataset_dedicated_threshold = blob_dedicated_threshold_from_metadata(
+                &dataset_field.metadata,
+                &dataset_field.name,
+            )?;
+            if input_dedicated_threshold != dataset_dedicated_threshold {
+                return Err(Error::invalid_input(format!(
+                    "Cannot append data with blob threshold metadata {}={} for field '{}'; \
+                     the dataset schema has effective value {}. Blob thresholds for existing \
+                     columns are stored in the dataset schema.",
+                    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+                    input_dedicated_threshold,
+                    input_field.name,
+                    dataset_dedicated_threshold,
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -507,7 +583,7 @@ pub async fn do_write_fragments(
     };
 
     let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
-        && schema.fields.iter().any(|field| field.is_blob_v2())
+        && schema.fields_pre_order().any(|field| field.is_blob_v2())
     {
         Some(Arc::new(
             build_external_base_resolver(dataset, &params).await?,
@@ -953,6 +1029,7 @@ pub async fn write_fragments_internal(
                         ..Default::default()
                     },
                 )?;
+                validate_blob_threshold_metadata_for_append(&converted_schema, dataset.schema())?;
                 let write_schema = dataset.schema().project_by_schema(
                     &converted_schema,
                     OnMissing::Error,
@@ -984,7 +1061,8 @@ pub async fn write_fragments_internal(
         (converted_schema, params.storage_version_or_default())
     };
 
-    if storage_version < LanceFileVersion::V2_2 && schema.fields.iter().any(|f| f.is_blob_v2()) {
+    if storage_version < LanceFileVersion::V2_2 && schema.fields_pre_order().any(|f| f.is_blob_v2())
+    {
         return Err(Error::invalid_input(format!(
             "Blob v2 requires file version >= 2.2 (got {:?})",
             storage_version
@@ -992,13 +1070,10 @@ pub async fn write_fragments_internal(
     }
 
     if storage_version >= LanceFileVersion::V2_2
-        && schema
-            .fields
-            .iter()
-            .any(|f| f.metadata.contains_key(BLOB_META_KEY))
+        && let Some(blob_field_path) = legacy_blob_field_path(&schema)
     {
         return Err(Error::invalid_input(format!(
-            "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
+            "Legacy blob columns (field metadata key {BLOB_META_KEY:?}) are not supported for file version >= 2.2. Found legacy blob field: {blob_field_path}. Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder)."
         )));
     }
 
@@ -1017,10 +1092,23 @@ pub async fn write_fragments_internal(
     Ok((fragments, schema))
 }
 
+fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
+    schema
+        .fields_pre_order()
+        .find(|field| field.metadata.contains_key(BLOB_META_KEY))
+        .map(|field| {
+            schema
+                .field_path(field.id)
+                .unwrap_or_else(|_| field.name.clone())
+        })
+}
+
 #[async_trait::async_trait]
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+    /// Get the file path and base ID for the data file being written.
+    fn data_file_path(&self) -> (&str, Option<u32>);
     /// Get the current position in the file
     ///
     /// We use this to know when the file is too large and we need to start
@@ -1046,6 +1134,9 @@ where
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
+    }
+    fn data_file_path(&self) -> (&str, Option<u32>) {
+        (&self.path, self.base_id)
     }
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await? as u64)
@@ -1086,6 +1177,9 @@ impl GenericWriter for V2WriterAdapter {
             }
         }
         Ok(())
+    }
+    fn data_file_path(&self) -> (&str, Option<u32>) {
+        (&self.path, self.base_id)
     }
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await?)
@@ -1134,6 +1228,39 @@ pub async fn open_writer(
         storage_version,
         WriterOptions {
             add_data_dir: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub(super) async fn open_update_writer(
+    dataset: &Dataset,
+    schema: &Schema,
+    storage_version: LanceFileVersion,
+) -> Result<Box<dyn GenericWriter>> {
+    // add_columns / alter_columns reuse the normal writer stack, but they do not
+    // flow through WriteParams. Rebuild the external base resolver here so blob
+    // v2 reference columns can resolve dataset-registered external URIs.
+    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
+        && schema.fields_pre_order().any(|f| f.is_blob_v2())
+    {
+        Some(Arc::new(
+            build_external_base_resolver(Some(dataset), &WriteParams::default()).await?,
+        ))
+    } else {
+        None
+    };
+
+    open_writer_with_options(
+        &dataset.object_store,
+        schema,
+        &dataset.base,
+        storage_version,
+        WriterOptions {
+            add_data_dir: true,
+            external_base_resolver,
+            source_store_registry: dataset.session.store_registry(),
             ..Default::default()
         },
     )
@@ -1216,7 +1343,7 @@ async fn open_writer_with_options(
                 source_store_registry,
                 source_store_params,
                 blob_pack_file_size_threshold,
-            ))
+            )?)
         } else {
             None
         };

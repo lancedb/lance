@@ -108,6 +108,23 @@ def _commit_segmented_btree_index(dataset, column, index_name):
     return dataset.commit_existing_index_segments(index_name, column, segments)
 
 
+def test_create_scalar_index_rejects_invalid_uuid(tmp_path):
+    """Invalid UUID strings passed to create_scalar_index and merge_index_metadata
+    must surface as a Python ValueError at the FFI boundary."""
+    data = pa.table({"id": pa.array(range(100), type=pa.int64())})
+    dataset = lance.write_dataset(data, tmp_path / "ds")
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.create_scalar_index(
+            column="id",
+            index_type="BTREE",
+            index_uuid="not-a-uuid",
+        )
+
+    with pytest.raises(ValueError, match="Invalid UUID"):
+        dataset.merge_index_metadata("also-not-a-uuid", index_type="BTREE")
+
+
 @pytest.fixture
 def btree_comparison_datasets(tmp_path):
     """Setup datasets for B-tree comparison tests"""
@@ -3360,6 +3377,52 @@ def test_build_distributed_fts_index_basic(tmp_path):
     assert results.num_rows > 0, "No results found for search term 'frodo'"
 
 
+@pytest.mark.parametrize("index_type", ["INVERTED", "FTS"])
+def test_segment_fts(tmp_path, index_type):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = f"text_{index_type.lower()}_segment_idx"
+    segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type=index_type,
+            name=index_name,
+            fragment_ids=[fragment.fragment_id],
+            with_position=False,
+            remove_stop_words=False,
+        )
+        for fragment in ds.get_fragments()
+    ]
+    committed_ds = ds.commit_existing_index_segments(index_name, "text", segments)
+
+    query = MatchQuery("frodo", "text")
+    results_without_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    results_with_index = committed_ds.scanner(
+        full_text_query=query,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    compare_fts_results(results_without_index, results_with_index)
+    assert any(
+        idx.name == index_name and idx.index_type == "Inverted"
+        for idx in committed_ds.describe_indices()
+    )
+    assert (
+        "FlatMatchQuery"
+        not in committed_ds.scanner(
+            full_text_query=query,
+            use_scalar_index=True,
+        ).explain_plan()
+    )
+
+
 def test_compare_fts_results_identical(tmp_path):
     """
     Test compare_fts_results function with identical results.
@@ -3985,6 +4048,79 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     assert with_index.num_rows == without_index.num_rows
     assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
     assert set(with_index["category"].to_pylist()) == {3}
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
+def test_zonemap_fragment_ids_parameter_validation(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=100
+    )
+
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index(
+            column="id",
+            index_type="ZONEMAP",
+            fragment_ids=[fragment_ids[0]],
+        )
+
+
+def test_zonemap_segment_merge_and_commit_from_python(tmp_path):
+    rows_per_fragment = 20_000
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=rows_per_fragment
+    )
+
+    index_name = "id_zonemap_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="id",
+            index_type="ZONEMAP",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    assert len({segment.uuid for segment in staged_segments}) == len(staged_segments)
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        files = segment.files
+        assert files is not None
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "zonemap.lance" for file in files)
+        assert all(not file.path.startswith("part_") for file in files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    merged_files = merged_segment.files
+    assert merged_files is not None
+    assert merged_segment.uuid not in {segment.uuid for segment in staged_segments}
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "zonemap.lance" for file in merged_files)
+    assert all(not file.path.startswith("part_") for file in merged_files)
+
+    ds = ds.commit_existing_index_segments(index_name, "id", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "ZoneMap"
+    assert len(descriptions[index_name].segments) == 1
+
+    filter_expr = "id >= 8200 AND id < 8300"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.num_rows == without_index.num_rows
+    assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
     assert (
         "ScalarIndexQuery"
         in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()

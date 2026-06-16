@@ -28,10 +28,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
-use lance_core::{Error, Result};
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, ROW_ADDR, Result};
 use roaring::RoaringBitmap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -40,6 +40,7 @@ use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
@@ -57,7 +58,7 @@ const SENTINEL_BYTE: u8 = 0xFF;
 const SA_SAMPLE_RATE: usize = 32;
 
 fn fmindex_partition_path(partition_id: u64) -> String {
-    format!("part_{partition_id}_fmindex.lance")
+    format!("part_{partition_id}_fm.lance")
 }
 
 // ── Bitvector with O(1) rank ─────────────────────────────────────────────────
@@ -631,7 +632,7 @@ pub struct FMIndex {
 }
 
 impl DeepSizeOf for FMIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.wavelet.deep_size()
             + self.row_ids.len() * 8
             + self.sa_samples.len() * 8
@@ -761,6 +762,7 @@ impl FMIndex {
         (lo, hi)
     }
 
+    #[cfg(test)]
     fn search(&self, pattern: &[u8]) -> RoaringBitmap {
         let (lo, hi) = self.backward_search(pattern);
         if lo >= hi {
@@ -771,6 +773,25 @@ impl FMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             result.insert(self.row_ids[doc_idx] as u32);
+        }
+        result
+    }
+
+    /// Search returning full u64 row addresses (preserving fragment ID in upper bits).
+    fn search_row_addrs(&self, pattern: &[u8]) -> Vec<u64> {
+        let (lo, hi) = self.backward_search(pattern);
+        if lo >= hi {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for i in lo..hi {
+            let text_pos = self.locate(i);
+            let doc_idx = self.doc_for_position(text_pos);
+            let row_addr = self.row_ids[doc_idx];
+            if seen.insert(row_addr) {
+                result.push(row_addr);
+            }
         }
         result
     }
@@ -987,6 +1008,7 @@ impl LazyFMIndex {
         }
     }
 
+    #[cfg(test)]
     fn search(&self, pattern: &[u8]) -> RoaringBitmap {
         let (lo, hi) = self.backward_search(pattern);
         if lo >= hi {
@@ -997,6 +1019,25 @@ impl LazyFMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             result.insert(self.row_ids[doc_idx] as u32);
+        }
+        result
+    }
+
+    /// Search returning full u64 row addresses (preserving fragment ID in upper bits).
+    fn search_row_addrs(&self, pattern: &[u8]) -> Vec<u64> {
+        let (lo, hi) = self.backward_search(pattern);
+        if lo >= hi {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for i in lo..hi {
+            let text_pos = self.locate(i);
+            let doc_idx = self.doc_for_position(text_pos);
+            let row_addr = self.row_ids[doc_idx];
+            if seen.insert(row_addr) {
+                result.push(row_addr);
+            }
         }
         result
     }
@@ -1139,7 +1180,7 @@ pub struct FMIndexScalarIndex {
 }
 
 impl DeepSizeOf for FMIndexScalarIndex {
-    fn deep_size_of_children(&self, _ctx: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _ctx: &mut lance_core::deepsize::Context) -> usize {
         self.partitions.iter().map(|p| p.fm.deep_size()).sum()
     }
 }
@@ -1226,7 +1267,7 @@ impl FMIndexScalarIndex {
             if let Some(id) = f
                 .path
                 .strip_prefix("part_")
-                .and_then(|r| r.strip_suffix("_fmindex.lance"))
+                .and_then(|r| r.strip_suffix("_fm.lance"))
                 .and_then(|s| s.parse::<u64>().ok())
             {
                 pfiles.push((id, f.path.clone()));
@@ -1256,7 +1297,7 @@ impl Index for FMIndexScalarIndex {
     }
     fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
         Err(Error::invalid_input_source(
-            "FMIndex is not a vector index".into(),
+            "Fm is not a vector index".into(),
         ))
     }
     async fn prewarm(&self) -> Result<()> {
@@ -1264,14 +1305,14 @@ impl Index for FMIndexScalarIndex {
     }
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "type": "FMIndex",
+            "type": "Fm",
             "num_partitions": self.partitions.len(),
             "total_bwt_len": self.partitions.iter().map(|p| p.fm.wavelet.len).sum::<usize>(),
             "total_docs": self.partitions.iter().map(|p| p.fm.row_ids.len()).sum::<usize>(),
         }))
     }
     fn index_type(&self) -> IndexType {
-        IndexType::FMIndex
+        IndexType::Fm
     }
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frags = RoaringBitmap::new();
@@ -1294,7 +1335,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         let tq = query
             .as_any()
             .downcast_ref::<TextQuery>()
-            .ok_or_else(|| Error::invalid_input("FMIndex only supports TextQuery"))?;
+            .ok_or_else(|| Error::invalid_input("Fm only supports TextQuery"))?;
         match tq {
             TextQuery::StringContains(pattern) => {
                 let pb = pattern.as_bytes();
@@ -1302,8 +1343,8 @@ impl ScalarIndex for FMIndexScalarIndex {
                 let mut tree = RowAddrTreeMap::new();
                 for p in &self.partitions {
                     p.fm.prewarm().await?;
-                    for rid in p.fm.search(pb).iter() {
-                        tree.insert(rid as u64);
+                    for row_addr in p.fm.search_row_addrs(pb) {
+                        tree.insert(row_addr);
                     }
                 }
                 Ok(SearchResult::Exact(lance_select::NullableRowAddrSet::new(
@@ -1311,6 +1352,12 @@ impl ScalarIndex for FMIndexScalarIndex {
                     Default::default(),
                 )))
             }
+            // Regex queries are routed only to the ngram index (the FM-index's
+            // query parser advertises `supports_regex = false`), so this is
+            // unreachable in practice; reject it explicitly rather than silently.
+            TextQuery::Regex(_) => Err(Error::invalid_input(
+                "FMIndex does not support regular expression queries",
+            )),
         }
     }
     fn can_remap(&self) -> bool {
@@ -1321,13 +1368,13 @@ impl ScalarIndex for FMIndexScalarIndex {
         _: &HashMap<u64, Option<u64>>,
         _: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::not_supported("FMIndex does not support remap"))
+        Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest: &dyn IndexStore,
-        _: Option<OldIndexDataFilter>,
+        _old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let texts = collect_texts(new_data).await?;
         let files = write_partitioned_fmindex(&texts, dest).await?;
@@ -1338,10 +1385,12 @@ impl ScalarIndex for FMIndexScalarIndex {
         })
     }
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None))
+        UpdateCriteria::requires_old_data(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+        )
     }
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Fm))
     }
 }
 
@@ -1349,20 +1398,23 @@ impl ScalarIndex for FMIndexScalarIndex {
 
 async fn collect_texts(mut stream: SendableRecordBatchStream) -> Result<Vec<(u64, Vec<u8>)>> {
     let mut texts = Vec::new();
-    let mut next_id = 0u64;
     while let Some(batch) = stream.next().await {
         let batch = batch?;
-        let row_ids: Option<&arrow_array::UInt64Array> = batch
-            .column_by_name("_rowid")
-            .or_else(|| batch.column_by_name("_rowaddr"))
-            .and_then(|c| c.as_any().downcast_ref());
-        let value_col = batch.column(0);
+        // Prefer _rowaddr (global row address) over _rowid to ensure stable,
+        // globally unique identifiers across segments.
+        let row_addrs: &arrow_array::UInt64Array = batch
+            .column_by_name(ROW_ADDR)
+            .or_else(|| batch.column_by_name("_rowid"))
+            .and_then(|c| c.as_any().downcast_ref())
+            .ok_or_else(|| {
+                Error::invalid_input("Fm training data must include _rowaddr or _rowid column")
+            })?;
+        // Use the named value column; fall back to column(0) for legacy streams
+        let value_col = batch
+            .column_by_name(VALUE_COLUMN_NAME)
+            .unwrap_or_else(|| batch.column(0));
         for i in 0..batch.num_rows() {
-            let rid = row_ids.map(|ids| ids.value(i)).unwrap_or_else(|| {
-                let id = next_id;
-                next_id += 1;
-                id
-            });
+            let rid = row_addrs.value(i);
             if let Some(bytes) = extract_text_bytes(value_col.as_ref(), i)? {
                 let sanitized: Vec<u8> = bytes
                     .iter()
@@ -1421,7 +1473,7 @@ fn extract_text_bytes(array: &dyn arrow_array::Array, index: usize) -> Result<Op
                 .to_vec(),
         )),
         _ => Err(Error::invalid_input(format!(
-            "FMIndex does not support data type: {:?}",
+            "Fm does not support data type: {:?}",
             array.data_type()
         ))),
     }
@@ -1549,7 +1601,7 @@ pub struct FMIndexPlugin;
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
     fn name(&self) -> &str {
-        "FMIndex"
+        "Fm"
     }
     fn new_training_request(
         &self,
@@ -1566,7 +1618,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             }
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
     async fn train_index(
@@ -1599,6 +1651,9 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         Some(Box::new(TextQueryParser::new(
             index_name,
             self.name().to_string(),
+            // needs_recheck: the FM-index returns exact substring matches.
+            false,
+            // supports_regex: regex acceleration is only implemented for ngram.
             false,
         )))
     }
@@ -2018,23 +2073,23 @@ mod tests {
         use arrow_array::{StringArray, UInt64Array};
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::stream;
-        use lance_core::ROW_ID;
+        use lance_core::ROW_ADDR;
 
         let docs = vec!["hello world", "hello rust", "goodbye world"];
-        let row_ids: Vec<u64> = vec![0, 1, 2];
+        let row_addrs: Vec<u64> = vec![0, 1, 2];
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(
                 crate::scalar::registry::VALUE_COLUMN_NAME,
                 DataType::Utf8,
                 false,
             ),
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(docs)),
-                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt64Array::from(row_addrs)),
             ],
         )
         .unwrap();
@@ -2153,7 +2208,7 @@ mod tests {
                 .unwrap();
 
             let stats = index.statistics().unwrap();
-            assert_eq!(stats["type"], "FMIndex");
+            assert_eq!(stats["type"], "Fm");
             assert_eq!(stats["total_docs"], 10);
             assert!(stats["total_bwt_len"].as_u64().unwrap() > 0);
         });

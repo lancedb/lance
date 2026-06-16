@@ -542,8 +542,7 @@ async fn run_checkpoint(
         let uuid = idx_metas
             .first()
             .ok_or_else(|| lance_core::Error::io("flushed gen has no vector index".to_string()))?
-            .uuid
-            .to_string();
+            .uuid;
         let vidx = gen_ds
             .open_vector_index(VECTOR_COL, &uuid, &NoOpMetricsCollector)
             .await?;
@@ -590,6 +589,7 @@ async fn run_checkpoint(
                     use_index: true,
                     query_parallelism: 1,
                     dist_q_c: 0.0,
+                    approx_mode: Default::default(),
                 };
                 // IVFIndex::search is intentionally unimplemented (top-level does
                 // partition-aware search); replicate the ANN exec node: pick the

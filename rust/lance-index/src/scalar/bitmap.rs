@@ -17,12 +17,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_arrow::ipc::{
     read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
     write_len_prefixed_bytes,
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
@@ -180,7 +180,7 @@ pub struct BitmapIndexState {
 }
 
 impl DeepSizeOf for BitmapIndexState {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.lookup_batch.get_array_memory_size()
             + self.null_map.deep_size_of_children(context)
             + self.index_map.deep_size_of_children(context)
@@ -473,7 +473,7 @@ impl BitmapIndex {
 }
 
 impl DeepSizeOf for BitmapIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.index_map.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }

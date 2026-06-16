@@ -148,7 +148,7 @@ pub(crate) async fn merge_segments(
     .await?;
 
     let output_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid.to_string())?;
+    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
     // Pure segment consolidation: no dataset scan, so `new_data` is an empty
     // stream and the merge is driven entirely by the source page data.
     let empty_new_data = empty_btree_update_stream(dataset, field_id)?;

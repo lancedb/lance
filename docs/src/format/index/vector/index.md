@@ -198,6 +198,7 @@ Compresses vectors using RabitQ with random rotation and binary quantization for
 | `_rabit_codes`       | list<uint8>[dimension / 8]                       | false                    | Binary quantized codes (1 bit per dimension, packed into bytes) |
 | `__add_factors`      | float32                                          | false                    | Additive correction factors for distance computation            |
 | `__scale_factors`    | float32                                          | false                    | Scale correction factors for distance computation               |
+| `__error_factors`    | float32                                          | false for `raw_query`    | Error factors for raw-query lower-bound pruning                 |
 | `__ex_codes`         | list<uint8>[ceil(dimension * (num_bits - 1) / 8)] | false for `num_bits > 1` | Extra RabitQ code bits for multi-bit RQ                         |
 | `__add_factors_ex`   | float32                                          | false for `num_bits > 1` | Additive correction factors for ex-code distance computation    |
 | `__scale_factors_ex` | float32                                          | false for `num_bits > 1` | Scale correction factors for ex-code distance computation       |
@@ -254,6 +255,7 @@ For **RabitQ (RQ)**:
 | `num_bits`            | u8   | Number of bits per dimension, in the range 1..=9     |
 | `code_dim`            | u32  | Rotated vector dimension for the 1-bit binary code   |
 | `packed`              | bool | Whether codes are packed for optimized computation   |
+| `query_estimator`     | string | Distance estimator layout: `residual_query` or `raw_query`. Missing values are read as `residual_query` for compatibility with released 1-bit IVF_RQ indexes. |
 
 #### Lance File Global Buffer
 
@@ -279,8 +281,9 @@ to rotate vectors before binary quantization:
 The rotation matrix has shape `[code_dim, code_dim]` where `code_dim` is the rotated vector
 dimension. IVF_RQ always stores the 1-bit binary sign code in `_rabit_codes`; for `num_bits > 1`,
 the remaining `num_bits - 1` ex-code bits are stored in `__ex_codes` instead of widening the
-binary code path. `num_bits=1` indexes only store the binary-code factor columns; multi-bit indexes
-also store separate ex-code additive and scale factors.
+binary code path. New IVF_RQ indexes store raw-query estimator factors. `num_bits=1` indexes only
+store the binary-code factor columns; multi-bit indexes also store separate ex-code additive and
+scale factors.
 
 ## Appendices
 
@@ -345,7 +348,7 @@ auxiliary schema also includes `__ex_codes`, `__add_factors_ex`, and `__scale_fa
 - Arrow Schema Metadata:
   - `"distance_type"` → `"l2"`
   - `"lance:ivf"` → tracks per-partition `offsets` and `lengths` (no centroids here)
-  - `"lance:rabit"` → `"{"rotate_mat_position":1,"num_bits":1,"packed":true}"`
+  - `"lance:rabit"` → `"{"rotate_mat_position":1,"num_bits":1,"packed":true,"query_estimator":"raw_query"}"`
 - Lance File Global buffer:
   - `Tensor` rotation matrix with shape `[code_dim, code_dim]` = `[128, 128]` (float32)
 - Rows with Arrow schema:
@@ -356,6 +359,7 @@ pa.schema([
     pa.field("_rabit_codes", pa.list(pa.uint8(), list_size=16)), # dimension/8 = 128/8 = 16 bytes
     pa.field("__add_factors", pa.float32()),
     pa.field("__scale_factors", pa.float32()),
+    pa.field("__error_factors", pa.float32()),
 ])
 ```
 

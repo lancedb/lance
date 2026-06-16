@@ -1,0 +1,78 @@
+# On-demand cross-version index compatibility run between two arbitrary refs.
+#
+# The PR path lives in python.yml (compat-sequence job), which ages the two previous
+# majors into the PR head reusing the prebuilt wheel. This workflow is the manual escape
+# hatch for any other pairing: each ref (version, sha, branch, or tag) is provisioned by
+# the framework -- a published release installs a wheel, anything else is built from a
+# worktree via maturin -- so two arbitrary refs can be compared even when neither has a
+# published wheel. The suite ages an index under the writer ref and exercises it under the
+# reader, searching maintenance-op sequences for panics or correctness divergence.
+name: Compat (index ref pair)
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_ref:
+        description: "Writer ref (version / sha / branch). Blank = 2nd most recent release."
+        required: false
+        default: ""
+      to_ref:
+        description: "Reader ref (version / sha / branch). Blank = most recent release."
+        required: false
+        default: ""
+      kinds:
+        description: "Comma-separated index kinds (INVERTED,BTREE,...) or 'all'."
+        required: false
+        default: "all"
+      max_length:
+        description: "Max maintenance-op sequence length to search (deeper = slower)."
+        required: false
+        default: "5"
+
+jobs:
+  compat-pair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: python
+    env:
+      COMPAT_FROM_REF: ${{ inputs.from_ref }}
+      COMPAT_TO_REF: ${{ inputs.to_ref }}
+      COMPAT_MAX_LENGTH: ${{ inputs.max_length || '5' }}
+    steps:
+      # Full history so arbitrary refs can be checked out for builds.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      # Toolchain for the build-from-source provisioning path (refs without a wheel).
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install build deps
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install host deps
+        run: pip install pytest pytest-xdist pyarrow packaging maturin
+      - name: Resolve kinds
+        id: kinds
+        env:
+          KINDS_IN: ${{ inputs.kinds }}
+        run: |
+          if [ -z "$KINDS_IN" ] || [ "$KINDS_IN" = "all" ]; then
+            echo "value=INVERTED,BTREE,BITMAP,LABEL_LIST,NGRAM,ZONEMAP,BLOOMFILTER" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$KINDS_IN" >> "$GITHUB_OUTPUT"
+          fi
+      # Oversubscribe (4x cores): each scenario writes a small dataset to disk and the
+      # reader spends most of its time in short subprocess round-trips, so a worker waiting
+      # on disk or the sub-venv pipe overlaps another's compute.
+      - name: Run compat suite (${{ inputs.from_ref }} -> ${{ inputs.to_ref }})
+        env:
+          COMPAT_KINDS: ${{ steps.kinds.outputs.value }}
+        run: |
+          python -m pytest python/tests/compat/test_index_sequence.py \
+            --run-compat -n "$(( $(nproc) * 4 ))" -v --no-header

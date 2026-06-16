@@ -33,10 +33,10 @@ use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
 use lance_core::cache::LanceCache;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -58,7 +58,7 @@ struct BloomFilterStatistics {
 }
 
 impl DeepSizeOf for BloomFilterStatistics {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Estimate the size of the bloom filter
         // We could try to get the actual size from the Sbbf if it has a method for that,
         // but for now we'll estimate based on the number of bytes it serializes to
@@ -82,7 +82,7 @@ pub struct BloomFilterIndex {
 }
 
 impl DeepSizeOf for BloomFilterIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.zones.deep_size_of_children(context)
     }
 }

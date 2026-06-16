@@ -78,8 +78,9 @@ use lance_index::{
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
-        ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
+        ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+        sq::builder::SQBuildParams,
     },
 };
 use lance_io::object_store::{
@@ -817,8 +818,14 @@ impl Dataset {
 
             // Set up commit handler only if namespace manages versioning
             if namespace_client_managed_versioning {
-                let external_store =
-                    LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
+                // The store derives the branch a request targets from the base
+                // path it is handed, resolved against the table root.
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    ns_client,
+                    tid.clone(),
+                    &uri,
+                )
+                .infer_error()?;
                 let commit_handler: Arc<dyn CommitHandler> =
                     Arc::new(ExternalManifestCommitHandler {
                         external_manifest_store: Arc::new(external_store),
@@ -1227,6 +1234,7 @@ impl Dataset {
                 use_index,
                 ef,
                 query_parallelism,
+                approx_mode,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1293,6 +1301,7 @@ impl Dataset {
                         s = s.ef(ef);
                     }
                     s = s.query_parallelism(query_parallelism);
+                    s = s.approx_mode(approx_mode);
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
@@ -2159,6 +2168,7 @@ impl Dataset {
             "LABEL_LIST" => IndexType::LabelList,
             "RTREE" => IndexType::RTree,
             "INVERTED" | "FTS" => IndexType::Inverted,
+            "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
@@ -2198,6 +2208,27 @@ impl Dataset {
                 index_type: "rtree".to_string(),
                 params: None,
             }),
+            "FM" => {
+                let mut params_json = serde_json::Map::new();
+                if let Some(kwargs) = kwargs
+                    && let Some(num_segments) = kwargs.get_item("num_segments")?
+                {
+                    let n: u32 = num_segments.extract()?;
+                    params_json.insert(
+                        "num_segments".to_string(),
+                        serde_json::Value::Number(n.into()),
+                    );
+                }
+                let params = if params_json.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(params_json).to_string())
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "fm".to_string(),
+                    params,
+                })
+            }
             "SCALAR" => {
                 let Some(kwargs) = kwargs else {
                     return Err(PyValueError::new_err(
@@ -2304,10 +2335,22 @@ impl Dataset {
             None
         };
 
-        let index_uuid: Option<String> = if let Some(kwargs) = kwargs {
+        let index_uuid: Option<Uuid> = if let Some(kwargs) = kwargs {
             kwargs
                 .get_item("index_uuid")?
-                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .and_then(|v| {
+                    if v.is_none() {
+                        None
+                    } else {
+                        Some(v.extract::<String>())
+                    }
+                })
+                .transpose()?
+                .map(|s| {
+                    Uuid::parse_str(&s).map_err(|e| {
+                        PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+                    })
+                })
                 .transpose()?
         } else {
             None
@@ -2410,6 +2453,9 @@ impl Dataset {
         batch_readhead: Option<usize>,
         progress_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let parsed_uuid = Uuid::parse_str(index_uuid).map_err(|e| {
+            PyValueError::new_err(format!("Invalid UUID string for index_uuid: {e}"))
+        })?;
         let mut progress_handler =
             Self::make_index_progress_handler_from_callback(progress_callback)?;
         let progress: Arc<dyn IndexBuildProgress> = progress_handler
@@ -2421,7 +2467,7 @@ impl Dataset {
             async {
                 self.ds
                     .merge_index_metadata(
-                        index_uuid,
+                        &parsed_uuid,
                         IndexType::try_from(index_type)?,
                         batch_readhead,
                         progress,
@@ -2615,9 +2661,16 @@ impl Dataset {
                 && let (Some(ns_client), Some(tid)) = (namespace_client, table_id)
             {
                 // Create ExternalManifestCommitHandler from namespace client and table_id
-                // only when namespace manages versioning
+                // only when namespace manages versioning. The store derives the
+                // branch a request targets from the base path it is handed,
+                // resolved against the table root.
                 let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_client, tid);
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    ns_client,
+                    tid,
+                    &dest.table_root_uri()?,
+                )
+                .infer_error()?;
                 Some(Arc::new(ExternalManifestCommitHandler {
                     external_manifest_store: Arc::new(external_store),
                 }) as Arc<dyn CommitHandler>)
@@ -3070,11 +3123,7 @@ impl Dataset {
 
             let vindex = self
                 .ds
-                .open_vector_index(
-                    column_name,
-                    &idx_meta.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
+                .open_vector_index(column_name, &idx_meta.uuid, &NoOpMetricsCollector)
                 .await
                 .infer_error()?;
 
@@ -3578,6 +3627,15 @@ impl PyWriteDest {
             Self::Uri(uri) => WriteDestination::Uri(uri),
         }
     }
+
+    /// The table root uri of this destination (a branch dataset resolves to
+    /// its main location). Used to root the namespace manifest store.
+    pub fn table_root_uri(&self) -> PyResult<String> {
+        match self {
+            Self::Dataset(ds) => Ok(ds.ds.branch_location().find_main().infer_error()?.uri),
+            Self::Uri(uri) => Ok(uri.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3933,7 +3991,7 @@ pub fn write_dataset(
     dest: PyWriteDest,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
-    let params = get_write_params(options)?;
+    let params = get_write_params(options, &dest.table_root_uri()?)?;
     let py = options.py();
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
@@ -4002,8 +4060,13 @@ fn get_dict_opt<'py, D: FromPyObjectOwned<'py>>(
         .transpose()
 }
 
+/// `table_uri` is the destination table's root uri; it roots the namespace
+/// manifest store when `namespace_client_managed_versioning` is requested.
 #[allow(deprecated)]
-pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WriteParams>> {
+pub fn get_write_params(
+    options: &Bound<'_, PyDict>,
+    table_uri: &str,
+) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
@@ -4173,9 +4236,15 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             && let (Some(ns_client), Some(table_id)) =
                 (namespace_client_opt.as_ref(), table_id_opt.as_ref())
         {
+            // The store derives the branch a request targets from the base path
+            // it is handed, resolved against the table root.
             let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(ns_client, table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                ns_client,
+                table_id.clone(),
+                table_uri,
+            )
+            .infer_error()?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -4673,6 +4742,7 @@ type VectorQueryParams = (
     bool,
     Option<usize>,
     i32,
+    ApproxMode,
 );
 
 fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
@@ -4691,6 +4761,23 @@ fn vector_query_query_parallelism_from_dict(dict: &Bound<'_, PyDict>) -> PyResul
         extract_query_parallelism(&query_parallelism)
     } else {
         Ok(DEFAULT_QUERY_PARALLELISM)
+    }
+}
+
+fn vector_query_approx_mode_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<ApproxMode> {
+    if let Some(approx_mode) = dict.get_item("approx_mode")?
+        && !approx_mode.is_none()
+    {
+        match approx_mode.to_string().to_lowercase().as_str() {
+            "fast" => Ok(ApproxMode::Fast),
+            "normal" => Ok(ApproxMode::Normal),
+            "accurate" => Ok(ApproxMode::Accurate),
+            value => Err(PyValueError::new_err(format!(
+                "approx_mode must be one of 'fast', 'normal', or 'accurate', got '{value}'"
+            ))),
+        }
+    } else {
+        Ok(ApproxMode::Normal)
     }
 }
 
@@ -4800,6 +4887,7 @@ fn vector_query_params_from_dict(
     };
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
+    let approx_mode = vector_query_approx_mode_from_dict(dict)?;
 
     Ok((
         column,
@@ -4812,6 +4900,7 @@ fn vector_query_params_from_dict(
         use_index,
         ef,
         query_parallelism,
+        approx_mode,
     ))
 }
 
@@ -4848,6 +4937,7 @@ impl PySearchFilter {
             use_index,
             ef,
             query_parallelism,
+            approx_mode,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -4866,6 +4956,7 @@ impl PySearchFilter {
             use_index,
             query_parallelism,
             dist_q_c: 0.0,
+            approx_mode,
         };
 
         Ok(Self {

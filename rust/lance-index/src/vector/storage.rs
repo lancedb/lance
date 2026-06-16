@@ -7,17 +7,20 @@ use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
-use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
 use lance_io::ReadBatchParams;
+use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
 use std::{
     any::Any,
+    borrow::Cow,
+    collections::BinaryHeap,
     mem::size_of,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -34,10 +37,10 @@ use crate::{
     },
 };
 
-use super::DISTANCE_TYPE_KEY;
 use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
 use super::quantizer::{Quantizer, QuantizerMetadata};
+use super::{ApproxMode, DISTANCE_TYPE_KEY};
 
 /// <section class="warning">
 ///  Internal API
@@ -58,11 +61,95 @@ pub trait DistCalculator {
         dists: &mut Vec<f32>,
         _u16_scratch: &mut Vec<u16>,
         _u8_scratch: &mut Vec<u8>,
+        _u32_scratch: &mut Vec<u32>,
     ) {
         *dists = self.distance_all(k_hint);
     }
 
     fn prefetch(&self, _id: u32) {}
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
+        if k == 0 {
+            return;
+        }
+
+        self.distance_all_with_scratch(k, dists, u16_scratch, u8_scratch, u32_scratch);
+        let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+        let mut max_dist = res.peek().map(|node| node.dist);
+
+        for (id, dist) in dists.iter().copied().enumerate() {
+            let dist = OrderedFloat(dist);
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
+            if res.len() < k {
+                res.push(OrderedNode::new(row_id(id as u32), dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                res.pop();
+                res.push(OrderedNode::new(row_id(id as u32), dist));
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_filtered_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (u32, u64)>,
+        accept_row: impl Fn(u64) -> bool,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        _dists: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+        _u32_scratch: &mut Vec<u32>,
+    ) {
+        if k == 0 {
+            return;
+        }
+
+        let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+        let mut max_dist = res.peek().map(|node| node.dist);
+
+        for (id, row_id) in row_ids {
+            if !accept_row(row_id) {
+                continue;
+            }
+            let dist = OrderedFloat(self.distance(id));
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
+            if res.len() < k {
+                res.push(OrderedNode::new(row_id, dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                res.pop();
+                res.push(OrderedNode::new(row_id, dist));
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+    }
 }
 
 pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
@@ -73,6 +160,7 @@ pub struct QueryScratch {
     pub query_f32: Vec<f32>,
     pub u16: Vec<u16>,
     pub u8: Vec<u8>,
+    pub u32: Vec<u32>,
 }
 
 impl QueryScratch {
@@ -82,6 +170,7 @@ impl QueryScratch {
             query_f32: Vec::new(),
             u16: Vec::new(),
             u8: Vec::new(),
+            u32: Vec::new(),
         }
     }
 
@@ -91,6 +180,7 @@ impl QueryScratch {
             query_f32: vec![0.0; capacity.query_f32],
             u16: vec![0; capacity.u16],
             u8: vec![0; capacity.u8],
+            u32: vec![0; capacity.u32],
         }
     }
 }
@@ -102,11 +192,12 @@ impl Default for QueryScratch {
 }
 
 impl DeepSizeOf for QueryScratch {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.distances.capacity() * size_of::<f32>()
             + self.query_f32.capacity() * size_of::<f32>()
             + self.u16.capacity() * size_of::<u16>()
             + self.u8.capacity() * size_of::<u8>()
+            + self.u32.capacity() * size_of::<u32>()
     }
 }
 
@@ -116,15 +207,27 @@ pub struct QueryScratchCapacity {
     pub query_f32: usize,
     pub u16: usize,
     pub u8: usize,
+    pub u32: usize,
 }
 
 impl QueryScratchCapacity {
     pub const fn new(distances: usize, query_f32: usize, u16: usize, u8: usize) -> Self {
+        Self::new_with_u32(distances, query_f32, u16, u8, 0)
+    }
+
+    pub const fn new_with_u32(
+        distances: usize,
+        query_f32: usize,
+        u16: usize,
+        u8: usize,
+        u32: usize,
+    ) -> Self {
         Self {
             distances,
             query_f32,
             u16,
             u8,
+            u32,
         }
     }
 
@@ -133,12 +236,35 @@ impl QueryScratchCapacity {
             + self.query_f32 * size_of::<f32>()
             + self.u16 * size_of::<u16>()
             + self.u8 * size_of::<u8>()
+            + self.u32 * size_of::<u32>()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DistanceCalculatorOptions {
+    pub approx_mode: ApproxMode,
+}
+
+#[derive(Debug)]
+pub struct RabitRawQueryContext {
+    pub code_dim: usize,
+    pub ex_bits: u8,
+    pub rotated_query: Vec<f32>,
+    pub dist_table: Vec<f32>,
+    /// The rotated query zero-padded to a 64-dim multiple for the ex-dot
+    /// kernels; empty when `code_dim` is already aligned (the kernels then
+    /// read `rotated_query` directly).
+    pub ex_query: Vec<f32>,
+    pub sum_q: f32,
 }
 
 #[derive(Clone, Copy)]
 pub enum QueryResidual<'a> {
     Centroid(&'a dyn arrow_array::Array),
+    RabitRawQuery {
+        rotated_centroid: Option<&'a [f32]>,
+        query: Option<&'a RabitRawQueryContext>,
+    },
 }
 
 #[derive(Debug)]
@@ -224,7 +350,7 @@ impl Drop for QueryScratchGuard<'_> {
 }
 
 impl DeepSizeOf for QueryScratchPool {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut total = self.scratches.capacity() * size_of::<QueryScratch>();
         let mut scratches = Vec::new();
         while let Some(scratch) = self.scratches.pop() {
@@ -295,8 +421,9 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
         &'a self,
         query: ArrayRef,
         dist_q_c: f32,
-        _residual: Option<QueryResidual<'_>>,
+        _residual: Option<QueryResidual<'a>>,
         _f32_scratch: &'a mut Vec<f32>,
+        _options: DistanceCalculatorOptions,
     ) -> Self::DistanceCalculator<'a> {
         self.dist_calculator(query, dist_q_c)
     }
@@ -381,7 +508,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
     }
 }
@@ -498,15 +625,29 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
-    pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
+    /// Load a partition's quantization storage, optionally measuring the exact
+    /// I/O it performs into `io_stats`.
+    ///
+    /// When `io_stats` is `Some`, the partition is read through a reader whose
+    /// scheduler also records into the sink (a cheap clone that shares all
+    /// cached metadata, so no file is re-opened).  When `None`, the normal
+    /// uninstrumented reader is used.
+    pub async fn load_partition(
+        &self,
+        part_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
         let batch = if range.is_empty() {
             let schema = self.reader.schema();
             let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
             RecordBatch::new_empty(Arc::new(arrow_schema))
         } else {
-            let batches = self
-                .reader
+            let reader = match &io_stats {
+                Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
+                None => Cow::Borrowed(&self.reader),
+            };
+            let batches = reader
                 .read_stream(
                     ReadBatchParams::Range(range),
                     u32::MAX,
@@ -531,7 +672,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{QueryScratchCapacity, QueryScratchPool};
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
 
     #[test]
     fn test_query_scratch_pool_reuses_buffers() {
@@ -545,11 +686,14 @@ mod tests {
             scratch.u16.resize(4, 3);
             scratch.u8.clear();
             scratch.u8.resize(2, 4);
+            scratch.u32.clear();
+            scratch.u32.resize(3, 5);
             (
                 scratch.query_f32.as_ptr(),
                 scratch.distances.as_ptr(),
                 scratch.u16.as_ptr(),
                 scratch.u8.as_ptr(),
+                scratch.u32.as_ptr(),
             )
         });
 
@@ -562,11 +706,14 @@ mod tests {
             assert!(scratch.u16.iter().all(|value| *value == 3));
             assert_eq!(scratch.u8.len(), 2);
             assert!(scratch.u8.iter().all(|value| *value == 4));
+            assert_eq!(scratch.u32.len(), 3);
+            assert!(scratch.u32.iter().all(|value| *value == 5));
             (
                 scratch.query_f32.as_ptr(),
                 scratch.distances.as_ptr(),
                 scratch.u16.as_ptr(),
                 scratch.u8.as_ptr(),
+                scratch.u32.as_ptr(),
             )
         });
 
@@ -592,7 +739,8 @@ mod tests {
 
     #[test]
     fn test_query_scratch_pool_uses_temporary_scratch_when_empty() {
-        let pool = QueryScratchPool::with_capacity(1, QueryScratchCapacity::new(8, 16, 4, 2));
+        let pool =
+            QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
         let pooled = pool.scratch();
         assert!(pooled.pooled);
 
@@ -602,12 +750,14 @@ mod tests {
         assert_eq!(temporary.query_f32.len(), 16);
         assert_eq!(temporary.u16.len(), 4);
         assert_eq!(temporary.u8.len(), 2);
+        assert_eq!(temporary.u32.len(), 3);
     }
 
     #[test]
     fn test_query_scratch_pool_deep_size_includes_buffer_capacity() {
         let empty_size = QueryScratchPool::new(1).deep_size_of();
-        let pool = QueryScratchPool::with_capacity(1, QueryScratchCapacity::new(8, 16, 4, 2));
+        let pool =
+            QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
 
         assert!(pool.deep_size_of() > empty_size);
 
@@ -619,7 +769,8 @@ mod tests {
 
     #[test]
     fn test_query_scratch_pool_initializes_buffer_capacity() {
-        let pool = QueryScratchPool::with_capacity(1, QueryScratchCapacity::new(8, 16, 4, 2));
+        let pool =
+            QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
 
         pool.with_scratch(|scratch| {
             assert_eq!(scratch.distances.len(), 8);
@@ -630,6 +781,8 @@ mod tests {
             assert_eq!(scratch.u16.capacity(), 4);
             assert_eq!(scratch.u8.len(), 2);
             assert_eq!(scratch.u8.capacity(), 2);
+            assert_eq!(scratch.u32.len(), 3);
+            assert_eq!(scratch.u32.capacity(), 3);
         });
     }
 }

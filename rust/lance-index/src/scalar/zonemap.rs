@@ -40,9 +40,9 @@ use crate::scalar::FragReuseIndex;
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -66,7 +66,7 @@ struct ZoneMapStatistics {
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Estimate sizes for ScalarValue
         let min_size = self.min.size() - std::mem::size_of::<ScalarValue>();
         let max_size = self.max.size() - std::mem::size_of::<ScalarValue>();
@@ -126,7 +126,7 @@ impl std::fmt::Debug for ZoneMapIndex {
 }
 
 impl DeepSizeOf for ZoneMapIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.zones.deep_size_of_children(context)
     }
 }
@@ -659,6 +659,57 @@ impl ScalarIndex for ZoneMapIndex {
         let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
     }
+}
+
+/// Merge caller-selected ZoneMap segments into one self-contained segment.
+pub async fn merge_zonemap_indices(
+    source_indices: &[&ZoneMapIndex],
+    dest_store: &dyn IndexStore,
+    fragment_filter: &RoaringBitmap,
+) -> Result<CreatedIndex> {
+    let first = source_indices.first().ok_or_else(|| {
+        Error::invalid_input("merge_zonemap_indices requires at least one source index")
+    })?;
+    let rows_per_zone = first.rows_per_zone;
+    let data_type = first.data_type.clone();
+
+    let mut zones = Vec::new();
+    for source in source_indices {
+        if source.rows_per_zone != rows_per_zone {
+            return Err(Error::invalid_input(format!(
+                "cannot merge ZoneMap segments with different rows_per_zone values: {} and {}",
+                rows_per_zone, source.rows_per_zone
+            )));
+        }
+        if source.data_type != data_type {
+            return Err(Error::invalid_input(format!(
+                "cannot merge ZoneMap segments with different value types: {:?} and {:?}",
+                data_type, source.data_type
+            )));
+        }
+        zones.extend(
+            source
+                .zones
+                .iter()
+                .filter(|zone| {
+                    u32::try_from(zone.bound.fragment_id)
+                        .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+                })
+                .cloned(),
+        );
+    }
+    zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
+
+    let mut builder =
+        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(rows_per_zone), data_type)?;
+    builder.maps = zones;
+    builder.write_index(dest_store).await?;
+
+    Ok(CreatedIndex {
+        index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap(),
+        index_version: ZONEMAP_INDEX_VERSION,
+        files: dest_store.list_files_with_sizes().await?,
+    })
 }
 
 fn default_rows_per_zone() -> u64 {

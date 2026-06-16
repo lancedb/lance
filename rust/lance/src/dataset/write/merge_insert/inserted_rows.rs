@@ -13,8 +13,8 @@ use arrow_array::{
     StringArray, StructArray,
 };
 use arrow_schema::DataType;
-use deepsize::DeepSizeOf;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_table::format::pb;
 

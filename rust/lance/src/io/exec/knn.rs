@@ -58,6 +58,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -67,8 +68,8 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedChildInputStream,
-    InstrumentedRecordBatchStreamAdapter, PreFilterSource, SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
+    SelectionVectorToPrefilter,
 };
 
 pub const QUERY_INDEX_COL: &str = "query_index";
@@ -533,43 +534,35 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 &self.metrics,
             )) as SendableRecordBatchStream);
         }
-        let input_schema = self.input.schema();
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
         let schema = self.schema();
 
         // Empty batches don't have a vector column to score; filter them out
-        // before reaching the helper so the transform always sees real work.
-        let filtered_input = Box::pin(RecordBatchStreamAdapter::new(
-            input_schema,
-            input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0)),
-        )) as SendableRecordBatchStream;
+        // before the transform so it always sees real work.
+        let filtered_input = input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0));
 
-        // Mirror of the helper's elapsed_compute counter; used to attribute
-        // wall-clock from the spawn_blocking distance kernel back onto the
-        // node's `elapsed_compute` metric.
-        let elapsed_compute = BaselineMetrics::new(&self.metrics, partition)
-            .elapsed_compute()
-            .clone();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
 
-        let stream = InstrumentedChildInputStream::new(
-            filtered_input,
-            schema,
-            move |batch| {
+        let stream = filtered_input
+            .map(move |batch_result| {
                 let key = key.clone();
                 let column = column.clone();
                 let elapsed_compute = elapsed_compute.clone();
                 async move {
+                    let batch = batch_result?;
                     // Time around the .await to capture the spawn_blocking
                     // distance work, which otherwise runs while this future is
-                    // Pending and is missed by the helper's own poll timer.
+                    // Pending and is missed by a poll-time timer.
                     let start = Instant::now();
                     let batch = compute_distance(key, dt, &column, batch)
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     elapsed_compute.add_duration(start.elapsed());
 
+                    let _t = elapsed_compute.timer();
                     let distances = batch[DIST_COL].as_primitive::<Float32Type>();
                     let distance_values = distances.values();
                     let mask = BooleanArray::from_iter((0..distances.len()).map(|row_index| {
@@ -578,12 +571,17 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                     arrow::compute::filter_record_batch(&batch, &mask)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
-            },
-            get_num_compute_intensive_cpus(),
-            partition,
-            &self.metrics,
-        );
-        Ok(Box::pin(stream) as SendableRecordBatchStream)
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus());
+
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
@@ -717,7 +715,7 @@ pub fn new_knn_exec(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
-        indices.iter().map(|idx| idx.uuid.to_string()).collect_vec(),
+        indices.iter().map(|idx| idx.uuid).collect_vec(),
         query.clone(),
     )?;
 
@@ -763,7 +761,7 @@ pub struct ANNIvfPartitionExec {
     pub query: Query,
 
     /// The UUIDs of the indices to search.
-    pub index_uuids: Vec<String>,
+    pub index_uuids: Vec<Uuid>,
 
     pub properties: Arc<PlanProperties>,
 
@@ -771,7 +769,7 @@ pub struct ANNIvfPartitionExec {
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<Uuid>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
@@ -913,7 +911,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     dist_q_c_list_builder.append_value(dist_q_c.iter());
                     let dist_q_c_col = dist_q_c_list_builder.finish();
 
-                    let uuid_col = StringArray::from(vec![uuid.as_str()]);
+                    let uuid_col = StringArray::from(vec![uuid.to_string()]);
                     let batch = RecordBatch::try_new(
                         KNN_PARTITION_SCHEMA.clone(),
                         vec![
@@ -928,6 +926,9 @@ impl ExecutionPlan for ANNIvfPartitionExec {
             })
             .buffered(self.index_uuids.len().min(target_partitions).max(1))
             .finally(move || {
+                // Partition ranking reads centroids from memory, so this is
+                // typically zero; flushed for symmetry with ANNSubIndex.
+                metrics_clone.index_metrics.flush_io();
                 metrics_clone.baseline_metrics.done();
                 metrics_clone
                     .baseline_metrics
@@ -1552,7 +1553,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             Arc::new(part_id.unwrap().as_primitive::<UInt32Type>().clone());
                         let dist_q_c =
                             Arc::new(dist_q_c.unwrap().as_primitive::<Float32Type>().clone());
-                        let uuid = uuid.unwrap().to_string();
+                        let uuid = Uuid::parse_str(uuid.unwrap()).map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Invalid UUID in __index_uuid column: {e}"
+                            ))
+                        })?;
                         Ok((partitions, dist_q_c, uuid))
                     })
                     .collect_vec();
@@ -1625,6 +1630,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
                 .finally(move || {
+                    // Publish the exact index-file I/O measured for this query
+                    // (cache misses only) to the iops/requests/bytes_read gauges.
+                    metrics_clone.index_metrics.flush_io();
                     metrics_clone
                         .baseline_metrics
                         .elapsed_compute()
@@ -1895,7 +1903,7 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
@@ -1932,6 +1940,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         }
     }
 
@@ -2691,6 +2700,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         };
 
         async fn multivector_scoring(
@@ -2913,6 +2923,128 @@ mod tests {
             assert!(*stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap() < 100 * num_deltas);
         }
         assert_find_partitions_elapsed_recorded(&stats);
+    }
+
+    /// The ANN operators report the exact index-file I/O performed for a query
+    /// (bytes_read / iops), measured only on cache misses.  A cold search loads
+    /// partitions from storage and reports non-zero I/O; an immediately
+    /// following warm search serves every partition from the index cache and
+    /// reports zero -- which is the cache-effectiveness signal the metric adds.
+    #[tokio::test]
+    async fn test_io_metrics_cold_vs_warm() {
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let q = fixture.get_centroid(0);
+
+        let run = |holder: &StatsHolder| {
+            let setter = holder.get_setter();
+            async {
+                fixture
+                    .dataset
+                    .scan()
+                    .nearest("vector", q.as_ref(), 10)
+                    .unwrap()
+                    .minimum_nprobes(10)
+                    .scan_stats_callback(setter)
+                    .project(&Vec::<String>::new())
+                    .unwrap()
+                    .with_row_id()
+                    .try_into_batch()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Cold: a freshly opened dataset has an empty index cache, so the
+        // sub-index search must read partitions (and their quantization storage)
+        // from disk.  Those reads flow through the per-query I/O sink.
+        let cold_holder = StatsHolder::default();
+        run(&cold_holder).await;
+        let cold = cold_holder.consume();
+        assert!(
+            cold.parts_loaded > 0,
+            "cold search should load partitions, got parts_loaded={}",
+            cold.parts_loaded
+        );
+        assert!(
+            cold.bytes_read > 0,
+            "cold search should report index-file I/O, got bytes_read={}",
+            cold.bytes_read
+        );
+        assert!(
+            cold.iops > 0,
+            "cold search should report index-file IOPS, got iops={}",
+            cold.iops
+        );
+
+        // Warm: the same query on the same dataset finds every partition it
+        // needs already cached, so no index-file I/O is performed.
+        let warm_holder = StatsHolder::default();
+        run(&warm_holder).await;
+        let warm = warm_holder.consume();
+        assert_eq!(
+            warm.parts_loaded, 0,
+            "warm search should not reload partitions, got parts_loaded={}",
+            warm.parts_loaded
+        );
+        assert_eq!(
+            warm.bytes_read, 0,
+            "warm search should report no index-file I/O, got bytes_read={}",
+            warm.bytes_read
+        );
+    }
+
+    /// The new I/O metrics must actually surface in `EXPLAIN ANALYZE` text on
+    /// the ANN operators: non-zero on a cold query (partition reads on
+    /// `ANNSubIndex`, index-open reads on `ANNIvfPartition`) and zero on a warm
+    /// query (everything served from the index cache).
+    #[tokio::test]
+    async fn test_io_metrics_visible_in_explain_analyze() {
+        // Returns the value of `metric=` from the analyzed-plan line for `node`.
+        fn node_metric<'a>(plan: &'a str, node: &str, metric: &str) -> &'a str {
+            let line = plan
+                .lines()
+                .find(|l| l.trim_start().starts_with(node))
+                .unwrap_or_else(|| panic!("plan missing node {node}:\n{plan}"));
+            let after = line
+                .split_once(&format!("{metric}="))
+                .unwrap_or_else(|| panic!("node {node} line missing {metric}=:\n{line}"))
+                .1;
+            after.split([',', ']']).next().unwrap().trim()
+        }
+
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let q = fixture.get_centroid(0);
+
+        // Cold: a freshly opened dataset must show real index-file I/O.
+        let cold = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(10)
+            .analyze_plan()
+            .await
+            .unwrap();
+        // Sub-index partition reads.
+        assert_ne!(node_metric(&cold, "ANNSubIndex", "bytes_read"), "0");
+        assert_ne!(node_metric(&cold, "ANNSubIndex", "iops"), "0");
+        // Index-open reads (centroids/metadata) now attributed to the partition
+        // operator -- the value this part of the change adds.
+        assert_ne!(node_metric(&cold, "ANNIvfPartition", "bytes_read"), "0");
+        assert_ne!(node_metric(&cold, "ANNIvfPartition", "iops"), "0");
+
+        // Warm: same query, everything cache-resident -> zero index-file I/O.
+        let warm = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(10)
+            .analyze_plan()
+            .await
+            .unwrap();
+        assert_eq!(node_metric(&warm, "ANNSubIndex", "bytes_read"), "0");
+        assert_eq!(node_metric(&warm, "ANNIvfPartition", "bytes_read"), "0");
     }
 
     #[rstest]

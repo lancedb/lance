@@ -274,6 +274,16 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
             return {"LANCE_COMPAT_CURRENT_RUNTIME": "1"}
         return {}
 
+    def skip_read_after_current_write(self, version: str) -> bool:
+        # Newly written IVF_RQ indexes carry raw-query estimator metadata and
+        # split-code schema that older runtimes cannot query or optimize safely.
+        # The upgrade_downgrade variant still covers old 1-bit residual-query
+        # indexes being read and rewritten by the current runtime.
+        return True
+
+    def skip_write_after_current_write(self, version: str) -> bool:
+        return True
+
     def create(self):
         """Create dataset with IVF_RQ vector index."""
         shutil.rmtree(self.path, ignore_errors=True)

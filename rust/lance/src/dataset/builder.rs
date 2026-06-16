@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_core::cache::CacheBackend;
 
-use super::refs::{Ref, Refs};
+use super::refs::{Branches, Ref, Refs, check_valid_branch, normalize_branch, standardize_branch};
 use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -53,6 +53,12 @@ pub struct DatasetBuilder {
     storage_options_override: Option<HashMap<String, String>>,
     /// Runtime-only exact object store bindings keyed by base path URI.
     base_store_params: HashMap<String, ObjectStoreParams>,
+    /// Namespace-managed table info `(client, table_id)`, set by `from_namespace`
+    /// when the table uses managed versioning. The commit handler is built in
+    /// `build_object_store`, rooted at the resolved table path; the branch a
+    /// namespace request targets is derived per call from the base path the
+    /// handler is handed.
+    namespace_managed: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
 }
 
 impl std::fmt::Debug for DatasetBuilder {
@@ -71,6 +77,7 @@ impl std::fmt::Debug for DatasetBuilder {
                 &self.storage_options_override.is_some(),
             )
             .field("base_store_params", &!self.base_store_params.is_empty())
+            .field("namespace_managed", &self.namespace_managed.is_some())
             .finish()
     }
 }
@@ -90,6 +97,7 @@ impl DatasetBuilder {
             file_reader_options: None,
             storage_options_override: None,
             base_store_params: HashMap::new(),
+            namespace_managed: None,
         }
     }
 
@@ -149,16 +157,11 @@ impl DatasetBuilder {
 
         let mut builder = Self::from_uri(&table_uri);
 
-        // Check managed_versioning flag to determine if namespace-managed commits should be used
+        // Defer building the commit handler to load(): the manifest store is
+        // rooted at the resolved table path, which is only known once the
+        // object store is built.
         if response.managed_versioning == Some(true) {
-            let external_store = LanceNamespaceExternalManifestStore::new(
-                namespace_client.clone(),
-                table_id.clone(),
-            );
-            let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            });
-            builder.commit_handler = Some(commit_handler);
+            builder.namespace_managed = Some((namespace_client.clone(), table_id.clone()));
         }
 
         // Use namespace storage options if available
@@ -524,13 +527,8 @@ impl DatasetBuilder {
 
     /// Build a lance object store for the given config
     pub async fn build_object_store(
-        self,
+        mut self,
     ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
-        let commit_handler = match self.commit_handler {
-            Some(commit_handler) => Ok(commit_handler),
-            None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
-        }?;
-
         let storage_options = self
             .options
             .storage_options()
@@ -546,13 +544,13 @@ impl DatasetBuilder {
             .unwrap_or_default();
 
         #[allow(deprecated)]
-        match &self.options.object_store {
-            Some(store) => Ok((
+        let (object_store, base_path) = match &self.options.object_store {
+            Some(store) => (
                 Arc::new(ObjectStore::new(
                     store.0.clone(),
                     store.1.clone(),
                     self.options.block_size,
-                    self.options.object_store_wrapper,
+                    self.options.object_store_wrapper.clone(),
                     self.options.use_constant_size_upload_parts,
                     store.1.scheme() != "file",
                     // If user supplied an object store then we just assume it's probably
@@ -562,18 +560,35 @@ impl DatasetBuilder {
                     None, // No storage_options available here
                 )),
                 Path::from(store.1.path()),
-                commit_handler,
-            )),
+            ),
             None => {
-                let (store, path) = ObjectStore::from_uri_and_params(
-                    store_registry,
-                    &self.table_uri,
-                    &self.options,
-                )
-                .await?;
-                Ok((store, path, commit_handler))
+                ObjectStore::from_uri_and_params(store_registry, &self.table_uri, &self.options)
+                    .await?
             }
-        }
+        };
+
+        // Resolve the commit handler: an explicitly set one wins; otherwise a
+        // namespace-managed table builds a manifest store rooted at the resolved
+        // table path (the branch a request targets is derived per call from the
+        // base path the handler is handed); otherwise fall back to the default
+        // for the uri. Resolving here (not in load) keeps this pub method
+        // consistent for every caller.
+        let commit_handler: Arc<dyn CommitHandler> =
+            if let Some(commit_handler) = self.commit_handler.take() {
+                commit_handler
+            } else if let Some((namespace_client, table_id)) = self.namespace_managed.take() {
+                Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(LanceNamespaceExternalManifestStore::new(
+                        namespace_client,
+                        table_id,
+                        base_path.clone(),
+                    )),
+                })
+            } else {
+                commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await?
+            };
+
+        Ok((object_store, base_path, commit_handler))
     }
 
     #[instrument(skip_all)]
@@ -656,6 +671,14 @@ impl DatasetBuilder {
         let store_params = self.options.clone();
         let base_store_params = (!self.base_store_params.is_empty())
             .then(|| Arc::new(std::mem::take(&mut self.base_store_params)));
+
+        // A namespace-managed table is always addressed at its root uri, so the
+        // effective branch is resolvable before loading: the base path is
+        // qualified up front and the manifest store derives the branch from it.
+        // An explicitly supplied commit handler opts out of the managed flow.
+        let managed_store_active =
+            self.namespace_managed.is_some() && self.commit_handler.is_none();
+
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         // Two cases that need to check out after loading the manifest:
@@ -667,7 +690,7 @@ impl DatasetBuilder {
         let mut need_delay_checkout = false;
         let (mut branch, mut version_number) = match target_ref.clone() {
             Some(Ref::Version(branch, version_number)) => {
-                if branch.is_some() {
+                if branch.is_some() && !managed_store_active {
                     need_delay_checkout = true;
                 }
                 (branch, version_number)
@@ -687,15 +710,55 @@ impl DatasetBuilder {
                         branch: None,
                     },
                 );
-                let tag_content = refs.tags().get(&tag_name).await;
-                if let Ok(tag_content) = tag_content {
-                    (tag_content.branch.clone(), Some(tag_content.version))
-                } else {
-                    need_delay_checkout = true;
-                    (None, None)
+                match refs.tags().get(&tag_name).await {
+                    Ok(tag_content) => {
+                        if tag_content.branch.is_some() && !managed_store_active {
+                            // The tag's chain lives under a different base path
+                            // and the unmanaged handler resolves versions by
+                            // base path only, so load the root's latest first
+                            // and check the tag's branch/version out from it.
+                            need_delay_checkout = true;
+                            (tag_content.branch, None)
+                        } else {
+                            (tag_content.branch.clone(), Some(tag_content.version))
+                        }
+                    }
+                    Err(e) => {
+                        // A managed table is always rooted at the namespace
+                        // location, so a tag missing here is missing.
+                        if managed_store_active {
+                            return Err(e);
+                        }
+                        need_delay_checkout = true;
+                        (None, None)
+                    }
                 }
             }
             None => (None, None),
+        };
+
+        // Reject malformed branch names at the boundary (mirroring the branch
+        // CRUD paths) so they fail as InvalidRef instead of resolving oddly
+        if let Some(branch_name) = branch.as_deref()
+            && !Branches::is_main_branch(Some(branch_name))
+        {
+            check_valid_branch(branch_name)?;
+        }
+
+        // For a managed table the branch is known before loading; point the base
+        // path and uri at the branch chain so the loaded dataset is rooted there
+        // (data placement, refs and the path-derived store branch all follow the
+        // base path).
+        let (base_path, table_uri) = if managed_store_active && branch.is_some() {
+            let branch_location = BranchLocation {
+                path: base_path,
+                uri: table_uri,
+                branch: None,
+            }
+            .find_branch(branch.as_deref())?;
+            (branch_location.path, branch_location.uri)
+        } else {
+            (base_path, table_uri)
         };
 
         let dataset = Self::load_by_uri(
@@ -711,6 +774,20 @@ impl DatasetBuilder {
             base_store_params,
         )
         .await?;
+
+        if managed_store_active {
+            // The base path was qualified above, so the loaded manifest must
+            // already be on the requested branch; a mismatch means the namespace
+            // resolved another chain.
+            let requested_branch = branch.as_deref().and_then(standardize_branch);
+            if dataset.manifest.branch.as_deref() != requested_branch.as_deref() {
+                return Err(Error::internal(format!(
+                    "open of branch '{}' resolved a manifest belonging to branch '{}'",
+                    normalize_branch(branch.as_deref()),
+                    normalize_branch(dataset.manifest.branch.as_deref()),
+                )));
+            }
+        }
 
         if need_delay_checkout {
             if let Some(Ref::Tag(tag_name)) = target_ref {

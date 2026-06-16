@@ -145,11 +145,7 @@ async fn do_get_ivf_model(dataset: &Dataset, index_name: &str) -> PyResult<IvfMo
     // Open the vector index
     let vindex = dataset
         .ds
-        .open_vector_index(
-            column_name,
-            &idx_meta.uuid.to_string(),
-            &NoOpMetricsCollector,
-        )
+        .open_vector_index(column_name, &idx_meta.uuid, &NoOpMetricsCollector)
         .await
         .infer_error()?;
 
