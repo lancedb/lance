@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
+use datafusion::prelude::Expr;
 use lance_core::Result;
+use lance_index::mem_wal::ShardingSpec;
 use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration, ShardSnapshot};
@@ -66,6 +68,12 @@ pub struct LsmDataSourceCollector {
     shard_snapshots: Vec<ShardSnapshot>,
     /// In-memory memtables by shard (active + frozen-awaiting-flush).
     in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
+    /// Optional sharding spec for read-path shard pruning.
+    sharding_spec: Option<ShardingSpec>,
+    /// Mapping from source field id to column name, for sharding evaluation.
+    source_id_to_column: HashMap<i32, String>,
+    /// Base schema for type coercion during shard pruning.
+    base_schema: Option<SchemaRef>,
 }
 
 impl LsmDataSourceCollector {
@@ -84,6 +92,9 @@ impl LsmDataSourceCollector {
             base_path,
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            sharding_spec: None,
+            source_id_to_column: HashMap::new(),
+            base_schema: None,
         }
     }
 
@@ -101,6 +112,9 @@ impl LsmDataSourceCollector {
             base_path: base_path.into().trim_end_matches('/').to_string(),
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            sharding_spec: None,
+            source_id_to_column: HashMap::new(),
+            base_schema: None,
         }
     }
 
@@ -129,6 +143,25 @@ impl LsmDataSourceCollector {
         memtables: InMemoryMemTables,
     ) -> Self {
         self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Set the sharding spec and source-column mapping for read-path shard
+    /// pruning. When set, [`Self::collect_pruned`] can skip shards whose
+    /// field values do not match the query filter.
+    pub fn with_sharding_spec(
+        mut self,
+        spec: ShardingSpec,
+        source_id_to_column: HashMap<i32, String>,
+    ) -> Self {
+        self.sharding_spec = Some(spec);
+        self.source_id_to_column = source_id_to_column;
+        self
+    }
+
+    /// Set the base schema used for type coercion during shard pruning.
+    pub fn with_base_schema(mut self, schema: SchemaRef) -> Self {
+        self.base_schema = Some(schema);
         self
     }
 
@@ -304,6 +337,33 @@ impl LsmDataSourceCollector {
         Ok(sources)
     }
 
+    /// Collect data sources, pruning shards when the filter references the
+    /// sharding column and a [`ShardingSpec`] has been configured via
+    /// [`Self::with_sharding_spec`].
+    ///
+    /// Falls back to [`Self::collect`] when pruning is not possible (no spec,
+    /// no filter, or the filter does not match the sharding column).
+    pub fn collect_pruned(&self, filter: Option<&Expr>) -> Result<Vec<LsmDataSource>> {
+        if let Some(spec) = &self.sharding_spec
+            && let Some(filter) = filter
+            && let Some(shard_ids) = super::shard_pruning::prune_shards(
+                filter,
+                spec,
+                &self.shard_snapshots,
+                &self.source_id_to_column,
+                self.base_schema.as_ref(),
+            )
+        {
+            tracing::debug!(
+                pruned_to = shard_ids.len(),
+                total = self.shard_snapshots.len(),
+                "shard pruning applied"
+            );
+            return self.collect_for_shards(&shard_ids);
+        }
+        self.collect()
+    }
+
     /// Get the total number of data sources.
     pub fn num_sources(&self) -> usize {
         let flushed_count: usize = self
@@ -353,6 +413,7 @@ mod tests {
                         path: "def_gen_2".to_string(),
                     },
                 ],
+                shard_field_values: HashMap::new(),
             },
             ShardSnapshot {
                 shard_id: shard_b,
@@ -362,6 +423,7 @@ mod tests {
                     generation: 1,
                     path: "xyz_gen_1".to_string(),
                 }],
+                shard_field_values: HashMap::new(),
             },
         ]
     }

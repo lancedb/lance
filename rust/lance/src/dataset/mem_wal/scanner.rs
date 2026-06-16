@@ -41,6 +41,7 @@ mod fts_search;
 mod planner;
 mod point_lookup;
 mod projection;
+pub(crate) mod shard_pruning;
 mod vector_search;
 
 pub use builder::LsmScanner;

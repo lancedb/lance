@@ -106,8 +106,8 @@ impl LsmScanPlanner {
             .unwrap_or(false);
         let keep_row_address = keep_row_address || user_wants_rowaddr;
 
-        // 1. Collect all data sources
-        let sources = self.collector.collect()?;
+        // 1. Collect all data sources (with shard pruning when possible)
+        let sources = self.collector.collect_pruned(filter)?;
 
         if sources.is_empty() {
             // Return empty plan
@@ -1804,6 +1804,304 @@ mod integration_tests {
         assert!(
             msg.contains("_rowaddr"),
             "rejection message should mention the offending column, got: {msg}",
+        );
+    }
+
+    /// Shard pruning: a query with a filter matching the sharding column reads
+    /// only the targeted shard, skipping data in other shards.
+    ///
+    /// Layout:
+    /// - Two shards (A and B), bucketed on `id` with 4 buckets.
+    /// - Shard A's bucket contains id=1, shard B's bucket contains id=2.
+    /// - Filter `id = 1` prunes shard B.
+    #[tokio::test]
+    async fn test_shard_pruning_skips_non_matching_shards() {
+        use crate::dataset::mem_wal::sharding::hash_scalar_to_bucket;
+        use datafusion::common::ScalarValue;
+        use lance_index::mem_wal::{ShardingField, ShardingSpec};
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+        let base_uri = format!("{}/base", base_path);
+
+        let shard_a = Uuid::new_v4();
+        let shard_b = Uuid::new_v4();
+
+        // Compute bucket ids for id=1 and id=2 with num_buckets=4.
+        let bucket_a = hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), 4).unwrap();
+        let bucket_b = hash_scalar_to_bucket(&ScalarValue::Int32(Some(2)), 4).unwrap();
+        // Ensure distinct buckets to have a meaningful test.
+        assert_ne!(
+            bucket_a, bucket_b,
+            "id=1 and id=2 must hash to different buckets for this test"
+        );
+
+        // Shard A: active memtable with id=1, name="shard_a_1"
+        let store_a = Arc::new(BatchStore::with_capacity(16));
+        store_a
+            .append(create_test_batch(&schema, &[1], "shard_a"))
+            .unwrap();
+        let in_memory_a = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store: store_a,
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation: 1,
+            },
+            frozen: vec![],
+        };
+
+        // Shard B: active memtable with id=2, name="shard_b_2"
+        let store_b = Arc::new(BatchStore::with_capacity(16));
+        store_b
+            .append(create_test_batch(&schema, &[2], "shard_b"))
+            .unwrap();
+        let in_memory_b = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store: store_b,
+                index_store: Arc::new(IndexStore::new()),
+                schema: schema.clone(),
+                generation: 1,
+            },
+            frozen: vec![],
+        };
+
+        // Shard snapshots with shard_field_values populated.
+        let snapshot_a = ShardSnapshot::new(shard_a)
+            .with_current_generation(1)
+            .with_shard_field_values(std::collections::HashMap::from([(
+                "bucket".to_string(),
+                bucket_a.to_le_bytes().to_vec(),
+            )]));
+        let snapshot_b = ShardSnapshot::new(shard_b)
+            .with_current_generation(1)
+            .with_shard_field_values(std::collections::HashMap::from([(
+                "bucket".to_string(),
+                bucket_b.to_le_bytes().to_vec(),
+            )]));
+
+        let sharding_spec = ShardingSpec {
+            spec_id: 1,
+            fields: vec![ShardingField {
+                field_id: "bucket".to_string(),
+                source_ids: vec![],
+                transform: Some("bucket".to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: std::collections::HashMap::from([
+                    ("num_buckets".to_string(), "4".to_string()),
+                    ("column".to_string(), "id".to_string()),
+                ]),
+            }],
+        };
+
+        // Build scanner with sharding spec -- filter `id = 1`
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri.clone(),
+            vec![snapshot_a.clone(), snapshot_b.clone()],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_a, in_memory_a.clone())
+        .with_in_memory_memtables(shard_b, in_memory_b.clone())
+        .with_sharding_spec(sharding_spec.clone(), std::collections::HashMap::new())
+        .filter("id = 1")
+        .unwrap();
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+
+        // Only id=1 from shard_a should be returned.
+        assert_eq!(results.len(), 1, "expected 1 result, got {:?}", results);
+        assert_eq!(
+            results.get(&1),
+            Some(&"shard_a_1".to_string()),
+            "shard_a row must survive"
+        );
+        assert!(!results.contains_key(&2), "shard_b row must be pruned");
+
+        // Verify that WITHOUT the sharding spec, both rows appear (no pruning).
+        let scanner_no_pruning = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri.clone(),
+            vec![snapshot_a, snapshot_b],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_a, in_memory_a)
+        .with_in_memory_memtables(shard_b, in_memory_b)
+        .filter("id = 1")
+        .unwrap();
+
+        let batches_no_pruning: Vec<RecordBatch> = scanner_no_pruning
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        // Without pruning, the filter still returns only id=1, but both
+        // shards are scanned (one just happens to have no matching rows).
+        // The end result is the same -- but the key difference is in the
+        // number of data sources collected. We verify the collector behavior
+        // separately below.
+        let mut results_no_pruning: HashMap<i32, String> = HashMap::new();
+        for batch in &batches_no_pruning {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                results_no_pruning.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(
+            results_no_pruning.len(),
+            1,
+            "filter still returns 1 row without pruning"
+        );
+
+        // Direct collector-level verification is done in the separate
+        // test_collect_pruned_reduces_sources test below.
+    }
+
+    /// Verify that `collect_pruned` actually reduces the number of
+    /// in-memory sources when sharding spec is configured and filter matches.
+    #[tokio::test]
+    async fn test_collect_pruned_reduces_sources() {
+        use crate::dataset::mem_wal::scanner::collector::LsmDataSourceCollector;
+        use crate::dataset::mem_wal::sharding::hash_scalar_to_bucket;
+        use datafusion::common::ScalarValue;
+        use lance_index::mem_wal::{ShardingField, ShardingSpec};
+
+        let schema = create_pk_schema();
+
+        let shard_a = Uuid::new_v4();
+        let shard_b = Uuid::new_v4();
+
+        let bucket_a = hash_scalar_to_bucket(&ScalarValue::Int32(Some(1)), 4).unwrap();
+        let bucket_b = hash_scalar_to_bucket(&ScalarValue::Int32(Some(2)), 4).unwrap();
+        assert_ne!(bucket_a, bucket_b);
+
+        let mk_memtable = |ids: &[i32], generation: u64| {
+            let store = Arc::new(BatchStore::with_capacity(16));
+            store.append(create_test_batch(&schema, ids, "v")).unwrap();
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store: store,
+                    index_store: Arc::new(IndexStore::new()),
+                    schema: schema.clone(),
+                    generation,
+                },
+                frozen: vec![],
+            }
+        };
+
+        let sharding_spec = ShardingSpec {
+            spec_id: 1,
+            fields: vec![ShardingField {
+                field_id: "bucket".to_string(),
+                source_ids: vec![],
+                transform: Some("bucket".to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: std::collections::HashMap::from([
+                    ("num_buckets".to_string(), "4".to_string()),
+                    ("column".to_string(), "id".to_string()),
+                ]),
+            }],
+        };
+
+        let collector = LsmDataSourceCollector::without_base_table(
+            "memory:///test",
+            vec![
+                ShardSnapshot::new(shard_a)
+                    .with_current_generation(1)
+                    .with_shard_field_values(std::collections::HashMap::from([(
+                        "bucket".to_string(),
+                        bucket_a.to_le_bytes().to_vec(),
+                    )])),
+                ShardSnapshot::new(shard_b)
+                    .with_current_generation(1)
+                    .with_shard_field_values(std::collections::HashMap::from([(
+                        "bucket".to_string(),
+                        bucket_b.to_le_bytes().to_vec(),
+                    )])),
+            ],
+        )
+        .with_in_memory_memtables(shard_a, mk_memtable(&[1], 1))
+        .with_in_memory_memtables(shard_b, mk_memtable(&[2], 1))
+        .with_sharding_spec(sharding_spec, std::collections::HashMap::new())
+        .with_base_schema(schema.clone());
+
+        // Without filter: both shards' memtables are collected.
+        let all = collector.collect().unwrap();
+        assert_eq!(all.len(), 2, "both shards' memtables without pruning");
+
+        // With a filter on the sharding column: only matching shard collected.
+        let filter_expr = {
+            use datafusion::common::ToDFSchema;
+            let ctx = datafusion::prelude::SessionContext::new();
+            let df_schema = schema.as_ref().clone().to_dfschema().unwrap();
+            ctx.parse_sql_expr("id = 1", &df_schema).unwrap()
+        };
+        let pruned = collector.collect_pruned(Some(&filter_expr)).unwrap();
+        assert_eq!(
+            pruned.len(),
+            1,
+            "only shard_a's memtable after pruning on id=1"
+        );
+        assert_eq!(
+            pruned[0].shard_id(),
+            Some(shard_a),
+            "pruned source must be shard_a"
+        );
+
+        // Non-prunable filter (range predicate): falls back to all sources.
+        let range_filter = {
+            use datafusion::common::ToDFSchema;
+            let ctx = datafusion::prelude::SessionContext::new();
+            let df_schema = schema.as_ref().clone().to_dfschema().unwrap();
+            ctx.parse_sql_expr("id > 0", &df_schema).unwrap()
+        };
+        let not_pruned = collector.collect_pruned(Some(&range_filter)).unwrap();
+        assert_eq!(
+            not_pruned.len(),
+            2,
+            "range filter cannot prune; both shards collected"
         );
     }
 }

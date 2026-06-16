@@ -199,6 +199,46 @@ fn source_column_name(
     })
 }
 
+/// Resolve a sharding field's source column name from the field-id-to-column mapping.
+pub fn source_column_for_field(
+    field: &ShardingField,
+    source_id_to_column: &HashMap<i32, String>,
+) -> Result<String> {
+    source_column_name(field, source_id_to_column)
+}
+
+/// Compute the bucket id for a single scalar value using the same Murmur3
+/// hash that the bucket sharding transform applies per-row. Returns `None` if
+/// the scalar type is unsupported or `num_buckets` is non-positive.
+pub fn hash_scalar_to_bucket(
+    scalar: &datafusion::common::ScalarValue,
+    num_buckets: i32,
+) -> Option<i32> {
+    use datafusion::common::ScalarValue;
+    if num_buckets <= 0 {
+        return None;
+    }
+    let hash = match scalar {
+        ScalarValue::Boolean(Some(v)) => hash_int(if *v { 1 } else { 0 }, MURMUR3_SEED),
+        ScalarValue::Int8(Some(v)) => hash_int(*v as i32, MURMUR3_SEED),
+        ScalarValue::Int16(Some(v)) => hash_int(*v as i32, MURMUR3_SEED),
+        ScalarValue::Int32(Some(v)) => hash_int(*v, MURMUR3_SEED),
+        ScalarValue::Int64(Some(v)) => hash_long(*v, MURMUR3_SEED),
+        ScalarValue::UInt8(Some(v)) => hash_int(*v as i32, MURMUR3_SEED),
+        ScalarValue::UInt16(Some(v)) => hash_int(*v as i32, MURMUR3_SEED),
+        ScalarValue::UInt32(Some(v)) => hash_int(*v as i32, MURMUR3_SEED),
+        ScalarValue::UInt64(Some(v)) => hash_long(*v as i64, MURMUR3_SEED),
+        ScalarValue::Float32(Some(v)) => hash_int(canonical_f32_bits(*v) as i32, MURMUR3_SEED),
+        ScalarValue::Float64(Some(v)) => hash_long(canonical_f64_bits(*v) as i64, MURMUR3_SEED),
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
+            hash_bytes(v.as_bytes(), MURMUR3_SEED)
+        }
+        ScalarValue::Date32(Some(v)) => hash_int(*v, MURMUR3_SEED),
+        _ => return None, // NULL or unsupported type
+    };
+    Some((hash & i32::MAX) % num_buckets)
+}
+
 fn hash_array_value(array: &dyn Array, row_idx: usize, seed: i32) -> Result<i32> {
     if array.is_null(row_idx) {
         return Ok(seed);
