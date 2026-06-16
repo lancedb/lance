@@ -52,7 +52,7 @@ use tracing::instrument;
 use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{DedupDirection, PkHashFilterExec, WithinSourceDedupExec, spawn_union_arms};
+use super::exec::{DedupDirection, PkHashFilterExec, WithinSourceDedupExec};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
@@ -235,11 +235,11 @@ impl LsmFtsSearchPlanner {
             per_source_plans.into_iter().next().unwrap()
         } else {
             #[allow(deprecated)]
-            let union: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(per_source_plans));
-            // Per-arm driver tasks: without this the downstream merge polls
-            // every arm from one task and per-arm CPU (posting decode, BM25)
-            // serializes.
-            spawn_union_arms(union)?
+            // The downstream `SortPreservingMergeExec` already spawns one driver
+            // task per input partition (one per union arm) via `spawn_buffered`,
+            // so each arm's per-arm CPU (posting decode, BM25) runs on its own
+            // task without an extra repartition.
+            Arc::new(UnionExec::new(per_source_plans))
         };
 
         let score_idx = merged.schema().index_of(SCORE_COLUMN).map_err(|_| {

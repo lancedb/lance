@@ -27,7 +27,7 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{DedupDirection, WithinSourceDedupExec, spawn_union_arms};
+use super::exec::{DedupDirection, WithinSourceDedupExec};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
@@ -318,11 +318,11 @@ impl LsmVectorSearchPlanner {
         // No cross-source dedup needed (see struct doc): SortExec(per partition)
         // + SortPreservingMerge does the p-way distance-ordered top-k merge.
         #[allow(deprecated)]
-        let union: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
-        // Per-arm driver tasks: without this the downstream merge polls every
-        // arm from one task and per-arm CPU (HNSW search, distance refine)
-        // serializes.
-        let merged = spawn_union_arms(union)?;
+        // The downstream `SortPreservingMergeExec` already spawns one driver
+        // task per input partition (one per union arm) via `spawn_buffered`, so
+        // each arm's per-arm CPU (HNSW search, distance refine) runs on its own
+        // task without an extra repartition.
+        let merged: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
 
         let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
             lance_core::Error::invalid_input(format!(
