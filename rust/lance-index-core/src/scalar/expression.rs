@@ -539,7 +539,18 @@ fn visit_node(
         Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
         Expr::IsTrue(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, true)),
         Expr::IsNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, false)),
-        Expr::IsNotNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, true)),
+        Expr::IsNotNull(expr) => {
+            // `regexp_match(col, pat)` returns a list and is coerced to
+            // `IsNotNull(regexp_match(...))` before it reaches here. Unwrap that
+            // so the regex acceleration applies; everything else is a genuine
+            // IS NOT NULL check.
+            if let Expr::ScalarFunction(scalar_fn) = expr.as_ref()
+                && scalar_fn.func.name() == "regexp_match"
+            {
+                return Ok(visit_scalar_fn(scalar_fn, index_info));
+            }
+            Ok(visit_is_null(expr.as_ref(), index_info, true))
+        }
         Expr::Not(expr) => visit_not(expr.as_ref(), index_info, depth),
         Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info, depth),
         Expr::ScalarFunction(scalar_fn) => Ok(visit_scalar_fn(scalar_fn, index_info)),
@@ -554,10 +565,50 @@ fn visit_node(
     }
 }
 
+// Extract the full nested column path from a get_field expression chain.
+// For example: get_field(get_field(metadata, "status"), "code") -> "metadata.`status.code`"
+fn extract_nested_column_path(expr: &Expr) -> Option<String> {
+    let mut current_expr = expr;
+    let mut parts = Vec::new();
+
+    loop {
+        match current_expr {
+            Expr::ScalarFunction(udf) if udf.name() == "get_field" => {
+                if udf.args.len() != 2 {
+                    return None;
+                }
+                if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = &udf.args[1] {
+                    parts.push(field_name.clone());
+                } else {
+                    return None;
+                }
+                current_expr = &udf.args[0];
+            }
+            Expr::Column(col) => {
+                parts.push(col.name.clone());
+                break;
+            }
+            _ => return None,
+        }
+    }
+
+    parts.reverse();
+    let field_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+    Some(lance_core::datatypes::format_field_path(&field_refs))
+}
+
 fn maybe_indexed_column<'b>(
     expr: &Expr,
     index_info: &'b dyn IndexInformationProvider,
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
+    // First try to extract the full nested column path for get_field expressions
+    if let Some(nested_path) = extract_nested_column_path(expr)
+        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
+        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+    {
+        return Some((nested_path, data_type, parser));
+    }
+
     match expr {
         Expr::Column(col) => {
             let col = col.name.as_str();

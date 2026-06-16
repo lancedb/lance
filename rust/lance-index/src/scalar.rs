@@ -4,10 +4,8 @@
 //! Scalar indices for metadata search & filtering
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
-use arrow_schema::{Field, Schema};
-use async_trait::async_trait;
-use bytes::Bytes;
+use arrow_array::ListArray;
+use arrow_schema::Field;
 use datafusion::functions::regex::regexplike::RegexpLikeFunc;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
@@ -17,12 +15,7 @@ use std::{any::Any, ops::Bound, sync::Arc};
 
 use datafusion_expr::{Expr, expr::ScalarFunction};
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
-use lance_core::deepsize::DeepSizeOf;
-use lance_core::{Error, Result};
-use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
-use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
-use roaring::RoaringBitmap;
-use serde::Serialize;
+use lance_core::Result;
 
 use crate::IndexParams;
 use crate::metrics::MetricsCollector;

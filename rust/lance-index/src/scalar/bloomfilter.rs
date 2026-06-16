@@ -27,7 +27,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::{Index, IndexType};
+use crate::{Index, IndexType, pb};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -36,6 +36,7 @@ use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_index_core::row_id_remap::RowIdRemapper;
 use roaring::RoaringBitmap;
+use std::any::Any;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
 
@@ -456,7 +457,7 @@ impl ScalarIndex for BloomFilterIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: vec![file],
+            files: Some(vec![file]),
         })
     }
 
@@ -1071,7 +1072,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: vec![file],
+            files: Some(vec![file]),
         })
     }
 

@@ -1973,7 +1973,6 @@ mod tests {
         storage::STORAGE_METADATA_KEY,
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
-    use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_io::{
         ReadBatchParams,
         object_store::ObjectStore,

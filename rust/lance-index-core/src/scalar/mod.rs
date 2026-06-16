@@ -8,7 +8,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
 /// Metadata about a single file within an index.
-#[derive(Debug, Clone, PartialEq, deepsize::DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct IndexFile {
     /// Path relative to the index directory
     pub path: String,
@@ -238,6 +238,11 @@ pub trait IndexReader: Send + Sync {
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
     fn schema(&self) -> &lance_core::datatypes::Schema;
+    /// Best-effort on-disk byte size of the file when the reader already knows it
+    /// without extra I/O, else `None`. Used to size prewarm chunks.
+    fn file_size_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Trait abstracting I/O away from index logic

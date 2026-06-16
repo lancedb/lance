@@ -21,9 +21,9 @@ bytes.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
-deepsize.workspace = true
 futures.workspace = true
 lance-core.workspace = true
+lance-derive.workspace = true
 lance-io = { workspace = true }
 lance-select.workspace = true
 prost.workspace = true

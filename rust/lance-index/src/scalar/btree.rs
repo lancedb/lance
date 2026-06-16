@@ -1520,17 +1520,6 @@ pub struct BTreeIndex {
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-
-    /// The raw lookup batch this index was built from (the contents of
-    /// `page_lookup.lance`). Retained so the index can be serialized into a
-    /// cache as a [`BTreeIndexState`] without re-reading it from storage.
-    ///
-    /// TODO: this duplicates the min/max values already held in `page_lookup`.
-    /// A follow-up could rewrite `BTreeLookup` to query this batch directly
-    /// (binary search on the sorted `min` column + linear scan, type-dispatched
-    /// per column type), eliminating the duplication and making this batch the
-    /// single source of truth.
-    lookup_batch: RecordBatch,
 }
 
 impl DeepSizeOf for BTreeIndex {
@@ -1543,7 +1532,6 @@ impl DeepSizeOf for BTreeIndex {
 }
 
 impl BTreeIndex {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         page_lookup: Arc<BTreeLookup>,
         store: Arc<dyn IndexStore>,
@@ -1552,7 +1540,6 @@ impl BTreeIndex {
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        lookup_batch: RecordBatch,
     ) -> Self {
         Self {
             page_lookup,
@@ -1562,7 +1549,6 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-            lookup_batch,
         }
     }
 
@@ -1712,7 +1698,6 @@ impl BTreeIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let data_type = data.column(0).data_type().clone();
-        let lookup_batch = data.clone();
         let page_lookup = Arc::new(BTreeLookup::try_new(data)?);
 
         Ok(Self::new(
@@ -1723,7 +1708,6 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
-            lookup_batch,
         ))
     }
 
@@ -1929,7 +1913,7 @@ impl BTreeIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files,
+            files: Some(files),
         })
     }
 }
@@ -2313,7 +2297,7 @@ impl ScalarIndex for BTreeIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files: remapped_files,
+            files: Some(remapped_files),
         })
     }
 
@@ -3290,7 +3274,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
-            files,
+            files: Some(files),
         })
     }
 

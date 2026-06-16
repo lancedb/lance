@@ -476,7 +476,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "BloomFilter" => IndexType::BloomFilter.to_string(),
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
-        "FMIndex" => IndexType::Fm.to_string(),
+        "FMIndex" => IndexType::FMIndex.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),

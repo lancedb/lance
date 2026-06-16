@@ -37,12 +37,7 @@ impl IndexPluginRegistry {
     fn get_plugin_name_from_details_name(&self, details_name: &str) -> String {
         let details_name = Self::normalize_plugin_name(details_name);
         if details_name.ends_with("indexdetails") {
-            let plugin_name = details_name.replace("indexdetails", "");
-            if plugin_name == "fmindex" {
-                "fm".to_string()
-            } else {
-                plugin_name
-            }
+            details_name.replace("indexdetails", "")
         } else {
             details_name
         }

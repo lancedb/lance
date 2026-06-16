@@ -86,7 +86,7 @@ mod tests {
             ("NGRAM", "NGram"),
             ("ZONEMAP", "ZoneMap"),
             ("BLOOMFILTER", "BloomFilter"),
-            ("FM", "Fm"),
+            ("FMINDEX", "Fm"),
             ("JSON", "Json"),
         ] {
             let plugin = registry.get_plugin_by_name(requested_name).unwrap();

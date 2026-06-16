@@ -219,7 +219,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::BTree
                 | IndexType::Inverted
                 | IndexType::NGram
-                | IndexType::Fm
+                | IndexType::FMIndex
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
@@ -565,7 +565,7 @@ impl<'a> CreateIndexBuilder<'a> {
     }
     /// Extract `num_segments` from FM-Index params if this is an FM-Index build.
     fn fmindex_num_segments(&self) -> Option<u32> {
-        if self.index_type != IndexType::Fm {
+        if self.index_type != IndexType::FMIndex {
             return None;
         }
         let scalar_params = self.params.as_any().downcast_ref::<ScalarIndexParams>()?;
@@ -643,7 +643,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 self.dataset,
                 &column,
                 segment_uuid,
-                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::FMIndex),
                 false,
                 None,
                 None,
@@ -660,7 +660,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 index_version: created_index.index_version as i32,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
-                files: Some(created_index.files),
+                files: created_index.files.map(|files| {
+                    files
+                        .into_iter()
+                        .map(crate::index::index_file_to_table)
+                        .collect()
+                }),
             };
             let segments = vec![metadata.into_index_segment()?];
             let new_indices =
@@ -711,7 +716,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 self.dataset,
                 &column,
                 segment_uuid,
-                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::FMIndex),
                 true,
                 Some(fragment_ids.clone()),
                 None,
@@ -729,7 +734,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 index_version: created_index.index_version as i32,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
-                files: Some(created_index.files),
+                files: created_index.files.map(|files| {
+                    files
+                        .into_iter()
+                        .map(crate::index::index_file_to_table)
+                        .collect()
+                }),
             });
         }
 

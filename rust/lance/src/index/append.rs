@@ -666,12 +666,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
                         new_index_version: created_index.index_version as i32,
                         new_index_details: created_index.index_details,
-                        files: created_index.files.map(|files| {
-                            files
-                                .into_iter()
-                                .map(crate::index::index_file_to_table)
-                                .collect()
-                        }),
+                        files: created_index
+                            .files
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(crate::index::index_file_to_table)
+                            .collect(),
                     }));
                 }
 
@@ -787,12 +787,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
-        files: created_index.files.map(|files| {
-            files
-                .into_iter()
-                .map(crate::index::index_file_to_table)
-                .collect()
-        }),
+        files: created_index
+            .files
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::index::index_file_to_table)
+            .collect(),
     }))
 }
 
@@ -1552,11 +1552,11 @@ mod tests {
         .await
         .unwrap();
 
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex);
         dataset
             .create_index(
                 &["text"],
-                IndexType::Fm,
+                IndexType::FMIndex,
                 Some("text_fmindex".to_string()),
                 &params,
                 true,

@@ -1306,7 +1306,7 @@ impl Index for FMIndexScalarIndex {
         }))
     }
     fn index_type(&self) -> IndexType {
-        IndexType::Fm
+        IndexType::FMIndex
     }
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frags = RoaringBitmap::new();
@@ -1374,7 +1374,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
-            files,
+            files: Some(files),
         })
     }
     fn update_criteria(&self) -> UpdateCriteria {
@@ -1383,7 +1383,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         )
     }
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Fm))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex))
     }
 }
 
@@ -1704,7 +1704,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
-            files,
+            files: Some(files),
         })
     }
     fn provides_exact_answer(&self) -> bool {

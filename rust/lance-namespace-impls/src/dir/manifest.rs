@@ -33,7 +33,7 @@ use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
 use lance_core::{Error, ROW_ID, Result};
 use lance_index::progress::noop_progress;
-use lance_index::registry::IndexPluginRegistry;
+use lance_index::registry::{IndexPluginRegistry, with_default_plugins};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, ScalarIndexParams};
@@ -1213,7 +1213,15 @@ impl ManifestNamespace {
             index_version: trained_index.created_index.index_version as i32,
             created_at: None,
             base_id: None,
-            files: Some(trained_index.created_index.files),
+            files: trained_index.created_index.files.map(|files| {
+                files
+                    .into_iter()
+                    .map(|f| lance_table::format::IndexFile {
+                        path: f.path,
+                        size_bytes: f.size_bytes,
+                    })
+                    .collect()
+            }),
         })
     }
 
@@ -1267,7 +1275,7 @@ impl ManifestNamespace {
             ..
         } = index_data;
         let [object_id_uuid, object_type_uuid, base_objects_uuid] = index_uuids;
-        let registry = IndexPluginRegistry::with_default_plugins();
+        let registry = with_default_plugins();
 
         let dataset_version = manifest.version;
         let object_id_index_fut = Self::build_manifest_index(

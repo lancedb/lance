@@ -153,7 +153,7 @@ impl InvertedIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: current_fts_format_version().index_version(),
-            files,
+            files: Some(files),
         })
     }
 

@@ -348,6 +348,67 @@ impl FragReuseIndex {
     }
 }
 
+impl lance_index_core::row_id_remap::RowIdRemapper for FragReuseIndex {
+    fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+        Self::remap_row_id(self, row_id)
+    }
+
+    fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+        Self::remap_row_addrs_tree_map(self, row_addrs)
+    }
+
+    fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
+        Self::remap_row_ids_roaring_tree_map(self, row_ids)
+    }
+
+    fn remap_row_ids_record_batch(
+        &self,
+        batch: RecordBatch,
+        row_id_idx: usize,
+    ) -> Result<RecordBatch> {
+        Self::remap_row_ids_record_batch(self, batch, row_id_idx)
+    }
+}
+
+#[async_trait::async_trait]
+impl lance_index_core::index::Index for FragReuseIndex {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn lance_index_core::index::Index> {
+        self
+    }
+
+    fn statistics(&self) -> lance_core::Result<serde_json::Value> {
+        #[derive(Serialize)]
+        struct FragReuseStatistics {
+            num_versions: usize,
+        }
+        let stats = FragReuseStatistics {
+            num_versions: self.details.versions.len(),
+        };
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize fragment reuse index statistics: {}",
+                e
+            ))
+        })
+    }
+
+    async fn prewarm(&self) -> lance_core::Result<()> {
+        Ok(())
+    }
+
+    fn index_type(&self) -> lance_index_core::index::IndexType {
+        lance_index_core::index::IndexType::FragmentReuse
+    }
+
+    async fn calculate_included_frags(&self) -> lance_core::Result<RoaringBitmap> {
+        unimplemented!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

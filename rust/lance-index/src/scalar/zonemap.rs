@@ -629,7 +629,7 @@ impl ScalarIndex for ZoneMapIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: vec![file],
+            files: Some(vec![file]),
         })
     }
 
@@ -692,7 +692,7 @@ pub async fn merge_zonemap_indices(
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap(),
         index_version: ZONEMAP_INDEX_VERSION,
-        files: dest_store.list_files_with_sizes().await?,
+        files: Some(dest_store.list_files_with_sizes().await?),
     })
 }
 
@@ -1022,7 +1022,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: vec![file],
+            files: Some(vec![file]),
         })
     }
 

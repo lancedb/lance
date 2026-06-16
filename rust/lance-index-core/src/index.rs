@@ -4,8 +4,8 @@
 use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 

@@ -4843,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "8.0.0-beta.5"
+version = "8.0.0-beta.15"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4854,9 +4854,9 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
- "deepsize",
  "futures",
  "lance-core",
+ "lance-derive",
  "lance-io",
  "lance-select",
  "prost",
@@ -5066,6 +5066,7 @@ dependencies = [
  "lance-core",
  "lance-datagen",
  "lance-file",
+ "lance-index-core",
  "lance-io",
  "lance-select",
  "lance-testing",
