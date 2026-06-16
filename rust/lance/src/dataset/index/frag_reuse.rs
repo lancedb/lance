@@ -243,4 +243,91 @@ mod tests {
             Err(Error::RetryableCommitConflict { .. })
         ));
     }
+
+    /// With more than one index on the table, remapping every index must catch
+    /// all of them up so the reuse index can be trimmed.
+    ///
+    /// Regression: `remap_column_index` used to decide whether to remap an
+    /// index's data from the presence of the old fragments in its fragment
+    /// bitmap. But `load_indices` coverage-remaps the bitmap onto the new
+    /// fragments in memory, and remapping the *first* index commits a manifest
+    /// that persists that cleaned bitmap for the others — so remapping the
+    /// remaining indexes became a silent no-op (their data was never remapped
+    /// and their `dataset_version` never advanced), and the reuse index could
+    /// never be trimmed.
+    #[tokio::test]
+    async fn test_cleanup_frag_reuse_index_multiple_indices() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col("j", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        for col in ["i", "j"] {
+            dataset
+                .create_index(
+                    &[col],
+                    IndexType::Scalar,
+                    Some(format!("{col}_idx")),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 1);
+
+        for col in ["i", "j"] {
+            remapping::remap_column_index(&mut dataset, &[col], Some(format!("{col}_idx")))
+                .await
+                .unwrap();
+        }
+
+        // Every index must now be caught up (data remapped, version advanced).
+        let indices = dataset.load_indices().await.unwrap();
+        for col in ["i", "j"] {
+            let index = indices
+                .iter()
+                .find(|idx| idx.name == format!("{col}_idx"))
+                .unwrap();
+            assert!(
+                is_index_remap_caught_up(&frag_reuse_details.versions[0], index).unwrap(),
+                "index {col}_idx was not caught up after remap"
+            );
+        }
+
+        // ... so the reuse index trims down to zero versions.
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+        let frag_reuse_details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(frag_reuse_details.versions.len(), 0);
+    }
 }
