@@ -649,6 +649,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     backpressure_log_interval: default_config
                                         .backpressure_log_interval,
                                     stats_log_interval: default_config.stats_log_interval,
+                                    frozen_memtable_grace: default_config.frozen_memtable_grace,
                                     enable_memtable,
                                     hnsw_params: default_config.hnsw_params,
                                 };
