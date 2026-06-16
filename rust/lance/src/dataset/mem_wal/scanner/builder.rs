@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::ShardSnapshot;
-use super::flushed_cache::{FlushedMemTableCache, GenerationWarmer};
+use super::flushed_cache::{DatasetCache, GenerationWarmer};
 use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use crate::dataset::Dataset;
@@ -124,7 +124,7 @@ pub struct LsmScanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
     warmer: Option<Arc<dyn GenerationWarmer>>,
 }
@@ -250,9 +250,10 @@ impl LsmScanner {
     ///
     /// With a cache, repeated queries against the same generation become a
     /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
-    /// is owned and sized by the caller (see [`FlushedMemTableCache`]); not
-    /// set by default, so behavior is unchanged unless opted in.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    /// is owned and sized by the caller (any [`DatasetCache`] impl, e.g.
+    /// [`FlushedMemTableCache`](super::FlushedMemTableCache)); not set by
+    /// default, so behavior is unchanged unless opted in.
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
         self
     }
@@ -474,7 +475,7 @@ impl LsmScanner {
     /// the primary-key columns; the returned `Vec<bool>` is aligned with its
     /// rows. Hashing matches the scanner's internal dedup, so the caller never
     /// hashes PKs itself. Flushed membership comes from the injected
-    /// [`FlushedMemTableCache`] when one is set.
+    /// [`DatasetCache`] when one is set.
     pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
         let sources = self.build_collector().collect()?;
         let sets = super::block_list::fresh_tier_block_list(

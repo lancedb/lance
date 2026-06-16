@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration};
 use super::exec::{compute_pk_hash, resolve_pk_indices};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::flushed_cache::{DatasetCache, open_flushed_dataset};
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::BatchStore;
 use crate::session::Session;
@@ -44,7 +44,7 @@ pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
     // Hash each non-base source's membership, grouped by shard (generations are
     // per-shard, so supersession is within-shard only).
@@ -113,7 +113,7 @@ pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Vec<Arc<HashSet<u64>>>> {
     let mut sets = Vec::new();
     for source in sources {
@@ -171,7 +171,7 @@ async fn flushed_pk_hashes(
     path: &str,
     pk_columns: &[String],
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<HashSet<u64>>> {
     match flushed_cache {
         Some(cache) => {

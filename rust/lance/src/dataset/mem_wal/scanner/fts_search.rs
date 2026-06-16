@@ -53,7 +53,7 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{DedupDirection, PkHashFilterExec, WithinSourceDedupExec};
-use super::flushed_cache::{FlushedMemTableCache, GenerationWarmer, open_flushed_dataset};
+use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::project_to_canonical;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::session::Session;
@@ -76,7 +76,7 @@ pub struct LsmFtsSearchPlanner {
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
     warmer: Option<Arc<dyn GenerationWarmer>>,
     /// Over-fetch multiple for blocked sources (clamped to `>= 1.0`).
@@ -117,7 +117,7 @@ impl LsmFtsSearchPlanner {
 
     /// Inject a cache of opened flushed-generation datasets, making repeated
     /// searches against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
         self
     }

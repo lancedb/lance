@@ -212,7 +212,7 @@ pub trait GenerationWarmer: Send + Sync + std::fmt::Debug {
 pub async fn open_flushed_dataset(
     path: &str,
     session: Option<&Arc<Session>>,
-    cache: Option<&Arc<FlushedMemTableCache>>,
+    cache: Option<&Arc<dyn DatasetCache>>,
     warmer: Option<&Arc<dyn GenerationWarmer>>,
 ) -> Result<Arc<Dataset>> {
     let dataset = match cache {
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(a.count_rows(None).await.unwrap(), 3);
 
         // With a cache, the second call is a shared clone.
-        let cache = Arc::new(FlushedMemTableCache::new(8));
+        let cache: Arc<dyn DatasetCache> = Arc::new(FlushedMemTableCache::new(8));
         let c = open_flushed_dataset(&uri, None, Some(&cache), None)
             .await
             .unwrap();
