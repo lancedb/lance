@@ -2947,10 +2947,9 @@ impl DeepSizeOf for CompressedPositionStorage {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SharedPositionStream {
     codec: PositionStreamCodec,
-    block_offsets: Vec<u32>,
-    // Stored as `Bytes` so that the cache deserialization path can hand
-    // ownership of an IPC-decoded slice in without copying. Cloning the
-    // stream is then an `Arc` bump rather than an O(N) buffer copy.
+    block_offsets: Arc<[u32]>,
+    // Stored with shared ownership so cache hits can clone position streams
+    // without copying either offsets or bytes.
     bytes: bytes::Bytes,
 }
 
@@ -2958,7 +2957,7 @@ impl SharedPositionStream {
     pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
             codec,
-            block_offsets,
+            block_offsets: Arc::from(block_offsets.into_boxed_slice()),
             bytes,
         }
     }
@@ -2991,11 +2990,11 @@ impl SharedPositionStream {
     }
 
     pub fn block_offsets(&self) -> &[u32] {
-        &self.block_offsets
+        self.block_offsets.as_ref()
     }
 
     pub fn size(&self) -> usize {
-        self.block_offsets.capacity() * std::mem::size_of::<u32>() + self.bytes.len()
+        self.block_offsets.len() * std::mem::size_of::<u32>() + self.bytes.len()
     }
 }
 
@@ -5476,6 +5475,21 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_position_stream_clone_shares_block_offsets() {
+        let stream = SharedPositionStream::new(
+            PositionStreamCodec::PackedDelta,
+            vec![0_u32, 4, 11],
+            bytes::Bytes::from_static(b"shared position bytes"),
+        );
+        let original_offsets = stream.block_offsets().as_ptr();
+
+        let cloned = stream.clone();
+
+        assert_eq!(cloned.block_offsets(), stream.block_offsets());
+        assert_eq!(cloned.block_offsets().as_ptr(), original_offsets);
+    }
+
+    #[test]
     fn test_posting_builder_roundtrip_shared_positions() {
         let entries = vec![
             (0_u32, vec![1_u32, 5]),
@@ -6445,6 +6459,16 @@ mod tests {
             dest_store: &dyn IndexStore,
         ) -> Result<crate::scalar::IndexFile> {
             self.inner.copy_index_file(name, dest_store).await
+        }
+        async fn copy_index_file_to(
+            &self,
+            name: &str,
+            new_name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner
+                .copy_index_file_to(name, new_name, dest_store)
+                .await
         }
         async fn rename_index_file(
             &self,

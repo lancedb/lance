@@ -176,6 +176,10 @@ name = "scalar_index"
 harness = false
 
 [[bench]]
+name = "regex_ngram"
+harness = false
+
+[[bench]]
 name = "merge_insert"
 harness = false
 

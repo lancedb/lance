@@ -14,7 +14,23 @@ use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use object_store::ObjectStore as OSObjectStore;
 use object_store::path::Path;
 
+use lance_namespace::error::NamespaceError;
+
 use crate::dataset::branch_location::BranchLocation;
+
+/// Whether `e` says the requested chain (table or branch) does not exist, as
+/// opposed to a failure talking to the namespace.
+fn is_chain_not_found(e: &lance_core::Error) -> bool {
+    if let lance_core::Error::Namespace { source, .. } = e
+        && let Some(ns_err) = source.downcast_ref::<NamespaceError>()
+    {
+        return matches!(
+            ns_err,
+            NamespaceError::TableNotFound { .. } | NamespaceError::TableBranchNotFound { .. }
+        );
+    }
+    false
+}
 
 #[derive(Debug)]
 pub struct LanceNamespaceExternalManifestStore {
@@ -90,7 +106,15 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             ..Default::default()
         };
 
-        let response = self.namespace_client.list_table_versions(request).await?;
+        let response = match self.namespace_client.list_table_versions(request).await {
+            Ok(response) => response,
+            // A chain that does not exist yet (e.g. probing a branch location
+            // before the branch is created) has no latest version; the
+            // ExternalManifestStore contract reports that as None, not an
+            // error, so existence checks can treat it as a missing dataset.
+            Err(e) if is_chain_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
 
         if response.versions.is_empty() {
             return Ok(None);
@@ -180,5 +204,95 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
         Err(lance_core::Error::not_supported_source(
             "put_if_exists is not supported for namespace-backed stores".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_namespace::models::ListTableVersionsResponse;
+
+    /// A namespace whose list_table_versions always fails with the configured
+    /// error, to pin how get_latest_version classifies failures.
+    #[derive(Debug)]
+    struct FailingNamespace {
+        error: fn() -> lance_core::Error,
+    }
+
+    #[async_trait]
+    impl LanceNamespace for FailingNamespace {
+        fn namespace_id(&self) -> String {
+            "failing".to_string()
+        }
+
+        async fn list_table_versions(
+            &self,
+            _request: ListTableVersionsRequest,
+        ) -> Result<ListTableVersionsResponse> {
+            Err((self.error)())
+        }
+    }
+
+    fn store_with(error: fn() -> lance_core::Error) -> LanceNamespaceExternalManifestStore {
+        LanceNamespaceExternalManifestStore::new(
+            Arc::new(FailingNamespace { error }),
+            vec!["t".to_string()],
+            Path::parse("data/t.lance").unwrap(),
+        )
+    }
+
+    /// A chain that does not exist (missing table or branch) has no latest
+    /// version; everything else is a real failure and must propagate so an
+    /// outage is never mistaken for an absent dataset.
+    #[tokio::test]
+    async fn test_get_latest_version_error_classification() {
+        use lance_namespace::error::NamespaceError;
+
+        let absent = [
+            store_with(|| {
+                NamespaceError::TableNotFound {
+                    message: "missing table".to_string(),
+                }
+                .into()
+            }),
+            store_with(|| {
+                NamespaceError::TableBranchNotFound {
+                    message: "missing branch".to_string(),
+                }
+                .into()
+            }),
+        ];
+        for store in absent {
+            let latest = store.get_latest_version("data/t.lance/tree/dev").await;
+            assert!(
+                matches!(latest, Ok(None)),
+                "a missing chain must read as no latest version, got: {:?}",
+                latest
+            );
+        }
+
+        let failures = [
+            store_with(|| {
+                NamespaceError::Internal {
+                    message: "server error".to_string(),
+                }
+                .into()
+            }),
+            store_with(|| {
+                NamespaceError::Throttling {
+                    message: "slow down".to_string(),
+                }
+                .into()
+            }),
+            store_with(|| lance_core::Error::io("connection reset".to_string())),
+        ];
+        for store in failures {
+            let latest = store.get_latest_version("data/t.lance/tree/dev").await;
+            assert!(
+                latest.is_err(),
+                "a real failure must propagate, got: {:?}",
+                latest
+            );
+        }
     }
 }

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import ctypes
 import io
 from dataclasses import dataclass
 from typing import IO, Any, Iterator, Optional, Union
@@ -8,6 +9,12 @@ from typing import IO, Any, Iterator, Optional, Union
 import pyarrow as pa
 
 from .lance import LanceBlobFile
+
+_BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
+_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-dedicated-size-threshold"
+)
+_MAX_RUST_USIZE = ctypes.c_size_t(-1).value
 
 
 @dataclass(frozen=True)
@@ -190,9 +197,63 @@ def blob_array(values: list[Any]) -> BlobArray:
     return BlobArray.from_pylist(values)
 
 
-def blob_field(name: str, *, nullable: bool = True) -> pa.Field:
-    """Construct an Arrow field for a Lance blob column."""
-    return pa.field(name, BlobType(), nullable=nullable)
+def _validate_threshold(name: str, value: Optional[int], *, allow_zero: bool) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if allow_zero:
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    elif value <= 0:
+        raise ValueError(f"{name} must be positive")
+    if value > _MAX_RUST_USIZE:
+        raise OverflowError(f"{name} must fit in a Rust usize")
+
+
+def blob_field(
+    name: str,
+    *,
+    nullable: bool = True,
+    inline_size_threshold: Optional[int] = None,
+    dedicated_size_threshold: Optional[int] = None,
+) -> pa.Field:
+    """
+    Construct an Arrow field for a Lance blob column.
+
+    Parameters
+    ----------
+    name : str
+        Field name.
+    nullable : bool, default True
+        Whether the blob column accepts null values.
+    inline_size_threshold : optional, int
+        Maximum payload size in bytes to keep inline in the data file before
+        using packed blob storage.
+    dedicated_size_threshold : optional, int
+        Maximum payload size in bytes to store in packed blob storage before
+        using dedicated blob storage. This threshold is checked before
+        ``inline_size_threshold``.
+    """
+    _validate_threshold("inline_size_threshold", inline_size_threshold, allow_zero=True)
+    _validate_threshold(
+        "dedicated_size_threshold", dedicated_size_threshold, allow_zero=False
+    )
+
+    field = pa.field(name, BlobType(), nullable=nullable)
+    if inline_size_threshold is None and dedicated_size_threshold is None:
+        return field
+
+    metadata = dict(field.metadata or {})
+    if inline_size_threshold is not None:
+        metadata[_BLOB_INLINE_SIZE_THRESHOLD_META_KEY] = str(
+            inline_size_threshold
+        ).encode()
+    if dedicated_size_threshold is not None:
+        metadata[_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY] = str(
+            dedicated_size_threshold
+        ).encode()
+    return field.with_metadata(metadata)
 
 
 class BlobIterator:

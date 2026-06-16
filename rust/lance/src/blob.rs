@@ -7,12 +7,16 @@
 //! tagged with `ARROW:extension:name = "lance.blob.v2"`. This module offers a
 //! type-safe builder to construct that struct without manually wiring metadata
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, StructArray, builder::LargeBinaryBuilder, builder::StringBuilder};
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field};
-use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+use lance_arrow::{
+    ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+    BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME,
+};
 
 use crate::{Error, Result};
 
@@ -21,9 +25,71 @@ use crate::{Error, Result};
 /// Blob v2 expects a column shaped as `Struct<data: LargeBinary?, uri: Utf8?>` and
 /// tagged with `ARROW:extension:name = "lance.blob.v2"`.
 pub fn blob_field(name: &str, nullable: bool) -> Field {
-    let metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
+    blob_field_with_options(name, nullable, BlobFieldOptions::default())
+}
+
+/// Options for constructing a blob v2 field.
+#[derive(Clone, Debug, Default)]
+pub struct BlobFieldOptions {
+    /// Maximum payload size to keep inline in the data file before using packed blob storage.
+    pub inline_size_threshold: Option<usize>,
+    /// Maximum payload size to store in packed blob storage before using dedicated blob storage.
+    ///
+    /// A zero threshold is invalid because dedicated blob storage is selected when
+    /// the payload size is greater than this value.
+    pub dedicated_size_threshold: Option<NonZeroUsize>,
+}
+
+impl BlobFieldOptions {
+    /// Set the maximum payload size to keep inline in the data file.
+    pub fn with_inline_size_threshold(mut self, threshold: usize) -> Self {
+        self.inline_size_threshold = Some(threshold);
+        self
+    }
+
+    /// Set the maximum payload size to store in packed blob storage.
+    pub fn with_dedicated_size_threshold(mut self, threshold: NonZeroUsize) -> Self {
+        self.dedicated_size_threshold = Some(threshold);
+        self
+    }
+}
+
+/// Construct the Arrow field for a blob v2 column with storage layout options.
+///
+/// Blob v2 expects a column shaped as `Struct<data: LargeBinary?, uri: Utf8?>` and
+/// tagged with `ARROW:extension:name = "lance.blob.v2"`.
+///
+/// ```
+/// # use lance::{BlobFieldOptions, blob_field_with_options};
+/// let field = blob_field_with_options(
+///     "blob",
+///     true,
+///     BlobFieldOptions::default().with_inline_size_threshold(16 * 1024),
+/// );
+/// assert_eq!(
+///     field
+///         .metadata()
+///         .get("lance-encoding:blob-inline-size-threshold")
+///         .map(String::as_str),
+///     Some("16384"),
+/// );
+/// ```
+pub fn blob_field_with_options(name: &str, nullable: bool, options: BlobFieldOptions) -> Field {
+    let mut metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
         .into_iter()
-        .collect();
+        .collect::<std::collections::HashMap<_, _>>();
+    if let Some(threshold) = options.inline_size_threshold {
+        metadata.insert(
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+            threshold.to_string(),
+        );
+    }
+    if let Some(threshold) = options.dedicated_size_threshold {
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            threshold.get().to_string(),
+        );
+    }
     Field::new(
         name,
         DataType::Struct(
@@ -142,6 +208,8 @@ impl BlobArrayBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
@@ -153,6 +221,31 @@ mod tests {
         assert_eq!(
             field.metadata().get(ARROW_EXT_NAME_KEY).unwrap(),
             BLOB_V2_EXT_NAME
+        );
+    }
+
+    #[test]
+    fn test_field_metadata_with_options() {
+        let field = blob_field_with_options(
+            "blob",
+            true,
+            BlobFieldOptions::default()
+                .with_inline_size_threshold(16 * 1024)
+                .with_dedicated_size_threshold(NonZeroUsize::new(2 * 1024 * 1024).unwrap()),
+        );
+        assert_eq!(
+            field
+                .metadata()
+                .get(BLOB_INLINE_SIZE_THRESHOLD_META_KEY)
+                .unwrap(),
+            "16384"
+        );
+        assert_eq!(
+            field
+                .metadata()
+                .get(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY)
+                .unwrap(),
+            "2097152"
         );
     }
 
