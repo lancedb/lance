@@ -12,7 +12,8 @@ use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
-    MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeStats, SourceDedupeBehavior, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
 use lance_index::mem_wal::CompactedSsTable;
@@ -53,6 +54,7 @@ fn inner_merge_insert<'local>(
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
     let use_index = extract_use_index(env, &jparam)?;
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
+    let source_dedupe_behavior = extract_source_dedupe_behavior(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -72,6 +74,7 @@ fn inner_merge_insert<'local>(
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
             .mark_sstables_as_compacted(compacted_sstables)
+            .source_dedupe_behavior(source_dedupe_behavior)
             .try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
@@ -239,6 +242,29 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
 fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<bool> {
     let use_index = env.call_method(jparam, "useIndex", "()Z", &[])?.z()?;
     Ok(use_index)
+}
+
+fn extract_source_dedupe_behavior<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<SourceDedupeBehavior> {
+    let behavior: JString = env
+        .call_method(
+            jparam,
+            "sourceDedupeBehaviorValue",
+            "()Ljava/lang/String;",
+            &[],
+        )?
+        .l()?
+        .into();
+    let behavior = behavior.extract(env)?;
+    match behavior.as_str() {
+        "Fail" => Ok(SourceDedupeBehavior::Fail),
+        "FirstSeen" => Ok(SourceDedupeBehavior::FirstSeen),
+        _ => Err(Error::input_error(format!(
+            "Illegal source_dedupe_behavior: {behavior}",
+        ))),
+    }
 }
 
 fn extract_compacted_sstables<'local>(

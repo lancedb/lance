@@ -257,6 +257,30 @@ public class MergeInsertTest {
     return root;
   }
 
+  /**
+   * Build a source whose join key {@code id=0} appears twice ("First 0", then "Second 0"), so the
+   * source-dedupe behavior is exercised. Remaining ids (3, 4) are unique matches.
+   */
+  private VectorSchemaRoot buildDuplicateKeySource(Schema schema, RootAllocator allocator) {
+    List<Integer> sourceIds = Arrays.asList(0, 0, 3, 4);
+    List<String> sourceNames = Arrays.asList("First 0", "Second 0", "Source 3", "Source 4");
+
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+
+    IntVector idVector = (IntVector) root.getVector("id");
+    VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+    for (int i = 0; i < sourceIds.size(); i++) {
+      idVector.setSafe(i, sourceIds.get(i));
+      nameVector.setSafe(i, sourceNames.get(i).getBytes(StandardCharsets.UTF_8));
+    }
+
+    root.setRowCount(sourceIds.size());
+
+    return root;
+  }
+
   private ArrowArrayStream convertToStream(VectorSchemaRoot root, RootAllocator allocator)
       throws Exception {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -273,6 +297,55 @@ public class MergeInsertTest {
     Data.exportArrayStream(allocator, reader, stream);
 
     return stream;
+  }
+
+  @Test
+  public void testSourceDedupeFirstSeenKeepsFirst() throws Exception {
+    // Source has two rows for id=0 ("First 0" then "Second 0"). FirstSeen keeps
+    // the first encountered row and skips the duplicate.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            "{0=First 0, 1=Person 1, 2=Person 2, 3=Source 3, 4=Source 4}",
+            readAll(result.dataset()).toString(),
+            "FirstSeen should keep the first duplicate source row (id=0) and update unique matches");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeFailWithDuplicates() throws Exception {
+    // Default behavior (Fail) must error when the source contains duplicate join keys.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        String originalDataset = readAll(dataset).toString();
+
+        Assertions.assertThrows(
+            Exception.class,
+            () ->
+                dataset.mergeInsert(
+                    new MergeInsertParams(Collections.singletonList("id"))
+                        .withMatchedUpdateAll()
+                        .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                        .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                    sourceStream));
+
+        Assertions.assertEquals(
+            originalDataset,
+            readAll(dataset).toString(),
+            "Dataset should remain unchanged after a failed mergeInsert");
+      }
+    }
   }
 
   @Test

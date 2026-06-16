@@ -40,6 +40,7 @@ public class MergeInsertParams {
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
   private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+  private SourceDedupeBehavior sourceDedupeBehavior = SourceDedupeBehavior.Fail;
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -245,6 +246,25 @@ public class MergeInsertParams {
   }
 
   /**
+   * Control how duplicate source rows that match the same target row are handled.
+   *
+   * <p>Default is {@link SourceDedupeBehavior#Fail}, which errors if the source contains duplicate
+   * join keys. Use {@link SourceDedupeBehavior#FirstSeen} to keep the first encountered row and
+   * skip subsequent duplicates.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation.
+   *
+   * @param sourceDedupeBehavior The behavior to apply when duplicate source rows are found
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withSourceDedupeBehavior(SourceDedupeBehavior sourceDedupeBehavior) {
+    Preconditions.checkNotNull(sourceDedupeBehavior);
+    this.sourceDedupeBehavior = sourceDedupeBehavior;
+    return this;
+  }
+
+  /**
    * Mark MemWAL SSTables as compacted into the base table.
    *
    * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
@@ -325,6 +345,14 @@ public class MergeInsertParams {
     return useIndex;
   }
 
+  public SourceDedupeBehavior sourceDedupeBehavior() {
+    return sourceDedupeBehavior;
+  }
+
+  public String sourceDedupeBehaviorValue() {
+    return sourceDedupeBehavior.name();
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -343,6 +371,7 @@ public class MergeInsertParams {
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
         .add("useIndex", useIndex)
+        .add("sourceDedupeBehavior", sourceDedupeBehavior)
         .toString();
   }
 
@@ -401,5 +430,19 @@ public class MergeInsertParams {
      * This can be used to replace a region of data with new data
      */
     DeleteIf,
+  }
+
+  /**
+   * Describes how to handle duplicate source rows that match the same target row.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation.
+   */
+  public enum SourceDedupeBehavior {
+    /** Fail the operation if duplicates are found (default). */
+    Fail,
+
+    /** Keep the first seen value and skip subsequent duplicates. */
+    FirstSeen,
   }
 }
