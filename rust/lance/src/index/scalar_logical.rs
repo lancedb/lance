@@ -31,7 +31,17 @@ pub struct LogicalScalarIndex {
 }
 
 impl LogicalScalarIndex {
-    fn try_new(name: String, column: String, segments: Vec<Arc<dyn ScalarIndex>>) -> Result<Self> {
+    /// Merge several already-opened segments of one scalar index into a single
+    /// searchable [`ScalarIndex`].
+    ///
+    /// Used internally by `open_named_scalar_index`, and exposed so a
+    /// distributed query engine can open an explicit subset of a scalar
+    /// index's segments and present them as one index.
+    pub fn try_new(
+        name: String,
+        column: String,
+        segments: Vec<Arc<dyn ScalarIndex>>,
+    ) -> Result<Self> {
         let Some(first) = segments.first() else {
             return Err(Error::invalid_input(format!(
                 "LogicalScalarIndex '{}' on column '{}' must contain at least one segment",
@@ -210,7 +220,14 @@ fn index_intersects_dataset(index: &IndexMetadata, dataset: &Dataset) -> bool {
         .is_some_and(|index_bitmap| index_bitmap.intersection_len(&dataset.fragment_bitmap) > 0)
 }
 
-async fn load_named_scalar_segments(
+/// List the committed, dataset-intersecting segments of a named scalar index.
+///
+/// Returns one [`IndexMetadata`] per usable segment. The result length is the
+/// segment count: `1` means a single (non-segmented) index, `> 1` means the
+/// index is split across multiple segments that a distributed engine may route
+/// to different executors. All returned segments are validated to share the
+/// same underlying index type.
+pub async fn load_named_scalar_segments(
     dataset: &Dataset,
     column: &str,
     index_name: &str,

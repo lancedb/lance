@@ -12,6 +12,8 @@ pub(crate) mod zonemap;
 
 pub use inverted::{load_segment_details, load_segments};
 
+pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
+
 use std::sync::{Arc, LazyLock};
 
 use uuid::Uuid;
