@@ -498,8 +498,7 @@ impl LsmScanner {
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
             .map_err(|e| Error::invalid_input(e.to_string()))?;
-        // One key per row, in the index key space — both in-memory and flushed
-        // generations probe by the same key (the typed value, or the encoded
+        // One key per row, in the index key space (typed value, or encoded
         // `Binary` tuple for a composite PK).
         let keys: Vec<ScalarValue> = (0..pks.num_rows())
             .map(|row| {
@@ -513,8 +512,7 @@ impl LsmScanner {
             .collect::<Result<_>>()?;
 
         // A row is contained if any generation contains its key. Probe each
-        // generation once (batched) rather than once per row, narrowing to the
-        // still-unblocked rows so an already-found row isn't re-probed.
+        // generation once (batched), narrowing to still-unfound rows.
         let mut contained = vec![false; keys.len()];
         let mut live: Vec<usize> = (0..keys.len()).collect();
         for membership in &memberships {

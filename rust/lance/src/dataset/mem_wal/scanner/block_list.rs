@@ -163,10 +163,8 @@ pub async fn compute_source_block_lists(
     // per-shard, so supersession is within-shard only).
     let mut by_shard: ShardGenSets = HashMap::new();
     let mut has_base = false;
-    // Flushed generations open a cold on-disk PK BTree (an S3 round-trip on a
-    // cold cache); collect their loads and overlap them with `try_join_all`
-    // instead of opening one generation at a time. Order is irrelevant — each
-    // shard's gens are sorted by generation below.
+    // Flushed PK-BTree opens are cold S3 reads; overlap them with
+    // `try_join_all`. Order is irrelevant — gens are sorted per-shard below.
     let mut flushed_loads = Vec::new();
     for source in sources {
         match source {
@@ -243,10 +241,9 @@ pub async fn fresh_tier_block_list(
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<GenMembership>> {
-    // Membership per source, in source order (`None` = skipped). In-memory
-    // memberships resolve synchronously; flushed generations open a cold
-    // on-disk PK BTree, so collect their loads (tagged with the slot to fill)
-    // and overlap them with `try_join_all` rather than opening one at a time.
+    // Membership per source, in source order (`None` = skipped). Flushed
+    // PK-BTree opens are cold S3 reads, so collect them tagged with their slot
+    // and overlap with `try_join_all` rather than opening one at a time.
     let mut slots: Vec<Option<GenMembership>> = Vec::with_capacity(sources.len());
     let mut flushed_loads = Vec::new();
     for source in sources {
