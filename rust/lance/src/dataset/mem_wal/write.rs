@@ -177,20 +177,19 @@ pub struct ShardWriterConfig {
     /// Default: 60 seconds
     pub stats_log_interval: Option<Duration>,
 
-    /// How long a frozen memtable is kept in memory after its flush commits,
+    /// How long a frozen memtable lingers in memory after its flush commits,
     /// before it is evicted and served only from the on-disk flushed dataset.
     ///
-    /// SNAPSHOT ISOLATION CONTRACT: this duration MUST be strictly greater than
-    /// the maximum elapsed time of any query. While pinned, a generation is
-    /// served from its in-memory batches, which preserve per-batch boundaries;
-    /// once evicted, the flushed dataset has lost them and as-of membership
-    /// (see [`crate::dataset::mem_wal::scanner::FreshTierWatermark`]) can no longer be
-    /// bounded to the snapshot a
-    /// query observed. A query whose lifetime exceeds this window can therefore
-    /// observe a generation evicted mid-read and serve a stale row. Size it
-    /// above the worst-case query latency, with margin.
+    /// `Duration::ZERO` (the default) disables retention: evict on commit, no
+    /// sweep ticker. Correct for single-shot queries, which can't observe a
+    /// generation evicted mid-read.
     ///
-    /// Default: 3 seconds
+    /// A non-zero value is required only for queries split across reads (e.g.
+    /// fresh tier and base table read separately, then deduped): the flushed
+    /// dataset loses the per-batch boundaries that bound as-of membership
+    /// (see [`crate::dataset::mem_wal::scanner::FreshTierWatermark`]), so a
+    /// generation evicted between a query's reads can serve a stale row. Set it
+    /// above the worst-case multi-part query latency, with margin.
     pub frozen_memtable_grace: Duration,
 
     /// Whether to maintain an in-memory MemTable on top of the WAL.
@@ -252,7 +251,7 @@ impl Default for ShardWriterConfig {
             async_index_buffer_rows: 10_000,
             async_index_interval: Duration::from_secs(1),
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
-            frozen_memtable_grace: Duration::from_secs(3),
+            frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
             hnsw_params: HashMap::new(),
         }
@@ -2267,6 +2266,10 @@ impl MemTableFlushHandler {
 #[async_trait]
 impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
     fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerMemTableFlush>)> {
+        // Zero grace evicts on commit, so no sweeper is needed.
+        if self.grace.is_zero() {
+            return vec![];
+        }
         // Sweep often enough that eviction lags the grace by at most ~1/3, so a
         // generation lives no more than ~grace * 4/3 past its flush commit.
         let tick = (self.grace / 3).max(Duration::from_millis(100));
@@ -2379,18 +2382,24 @@ impl MemTableFlushHandler {
                 state.frozen_memtable_bytes =
                     state.frozen_memtable_bytes.saturating_sub(memtable_size);
             }
-            // Stamp the grace clock ONLY on commit success — the handle then
-            // lingers `frozen_memtable_grace` for in-flight as-of reads before
-            // `SweepExpired` evicts it. On failure leave it un-stamped: rows
-            // must stay in the read union until a later flush or WAL replay,
-            // else a transient flush error reopens the hole. Keyed by
-            // generation, so non-FIFO completion is fine.
+            // Retire the frozen handle on commit success, keyed by generation
+            // (non-FIFO completion is fine). Zero grace evicts here; otherwise
+            // stamp the grace clock so it lingers for multi-part as-of reads
+            // until `SweepExpired`. On failure leave it un-stamped: rows stay in
+            // the read union until a later flush or WAL replay, else a transient
+            // error reopens the hole.
             if flush_result.is_ok() {
                 let flushed_generation = memtable.generation();
-                let now = now_millis();
-                for frozen in state.frozen_memtables.iter_mut() {
-                    if frozen.memtable.generation() == flushed_generation {
-                        frozen.flushed_at_ms = Some(now);
+                if self.grace.is_zero() {
+                    state
+                        .frozen_memtables
+                        .retain(|frozen| frozen.memtable.generation() != flushed_generation);
+                } else {
+                    let now = now_millis();
+                    for frozen in state.frozen_memtables.iter_mut() {
+                        if frozen.memtable.generation() == flushed_generation {
+                            frozen.flushed_at_ms = Some(now);
+                        }
                     }
                 }
             }
@@ -4332,6 +4341,56 @@ mod tests {
         assert!(
             refs.frozen.is_empty(),
             "frozen handle must be swept once the grace elapses"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// With zero grace (the default) a frozen handle is evicted synchronously on
+    /// flush commit — no sweep tick, no lingering window.
+    #[tokio::test]
+    async fn test_frozen_evicted_immediately_with_zero_grace() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            frozen_memtable_grace: Duration::ZERO,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        // Rows are durably in the manifest...
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        assert!(
+            manifest
+                .flushed_generations
+                .iter()
+                .any(|g| g.generation == initial_gen),
+            "flushed generation must be recorded in the manifest"
+        );
+
+        // ...and the in-memory handle is already gone, no sweep tick needed.
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        assert!(
+            refs.frozen.is_empty(),
+            "frozen handle must be evicted on commit when grace is zero"
         );
 
         writer.close().await.unwrap();

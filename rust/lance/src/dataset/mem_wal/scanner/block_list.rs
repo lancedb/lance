@@ -174,7 +174,11 @@ pub async fn fresh_tier_block_list(
                 ..
             } => {
                 // A generation at or above the active one was flushed after the
-                // snapshot; exclude it. Lower generations are immutable.
+                // snapshot; exclude it. Lower generations are immutable. The
+                // `==` case is the active generation flushed between the two
+                // reads: excluding the flushed copy loses nothing, since its
+                // rows are already captured by the in-memory arm above (bounded
+                // to `active_batch_count`).
                 let flushed_after_snapshot = watermarks
                     .and_then(|m| m.get(shard_id))
                     .is_some_and(|watermark| generation.as_u64() >= watermark.active_generation);
