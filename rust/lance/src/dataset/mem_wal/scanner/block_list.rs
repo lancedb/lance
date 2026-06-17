@@ -163,6 +163,11 @@ pub async fn compute_source_block_lists(
     // per-shard, so supersession is within-shard only).
     let mut by_shard: ShardGenSets = HashMap::new();
     let mut has_base = false;
+    // Flushed generations open a cold on-disk PK BTree (an S3 round-trip on a
+    // cold cache); collect their loads and overlap them with `try_join_all`
+    // instead of opening one generation at a time. Order is irrelevant — each
+    // shard's gens are sorted by generation below.
+    let mut flushed_loads = Vec::new();
     for source in sources {
         match source {
             LsmDataSource::BaseTable { .. } => has_base = true,
@@ -184,14 +189,17 @@ pub async fn compute_source_block_lists(
                 shard_id,
                 generation,
                 ..
-            } => {
+            } => flushed_loads.push(async move {
                 let index = open_pk_index(path, session, flushed_cache).await?;
-                by_shard
-                    .entry(*shard_id)
-                    .or_default()
-                    .push((*generation, GenMembership::OnDisk(index)));
-            }
+                Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
+            }),
         }
+    }
+    for (shard_id, generation, membership) in futures::future::try_join_all(flushed_loads).await? {
+        by_shard
+            .entry(shard_id)
+            .or_default()
+            .push((generation, membership));
     }
 
     let mut blocked: SourceBlockLists = HashMap::new();
@@ -235,36 +243,44 @@ pub async fn fresh_tier_block_list(
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<GenMembership>> {
-    let mut memberships = Vec::new();
+    // Membership per source, in source order (`None` = skipped). In-memory
+    // memberships resolve synchronously; flushed generations open a cold
+    // on-disk PK BTree, so collect their loads (tagged with the slot to fill)
+    // and overlap them with `try_join_all` rather than opening one at a time.
+    let mut slots: Vec<Option<GenMembership>> = Vec::with_capacity(sources.len());
+    let mut flushed_loads = Vec::new();
     for source in sources {
-        let membership = match source {
-            LsmDataSource::BaseTable { .. } => continue,
+        match source {
+            LsmDataSource::BaseTable { .. } => slots.push(None),
             LsmDataSource::ActiveMemTable {
                 batch_store,
                 index_store,
                 shard_id,
                 generation,
                 ..
-            } => match watermarks.and_then(|m| m.get(shard_id)) {
-                None => in_memory_membership(batch_store, index_store),
-                Some(watermark) => {
-                    let g = generation.as_u64();
-                    if g > watermark.active_generation {
-                        // Rolled in after the snapshot; the arm never saw it.
-                        continue;
-                    } else if g == watermark.active_generation {
-                        // Bound the active generation to the batches the arm saw.
-                        bounded_in_memory_membership(
-                            batch_store,
-                            index_store,
-                            watermark.active_batch_count,
-                        )
-                    } else {
-                        // Lower (frozen) generations are immutable — include all.
-                        in_memory_membership(batch_store, index_store)
+            } => {
+                let membership = match watermarks.and_then(|m| m.get(shard_id)) {
+                    None => Some(in_memory_membership(batch_store, index_store)),
+                    Some(watermark) => {
+                        let g = generation.as_u64();
+                        if g > watermark.active_generation {
+                            // Rolled in after the snapshot; the arm never saw it.
+                            None
+                        } else if g == watermark.active_generation {
+                            // Bound the active generation to the batches the arm saw.
+                            Some(bounded_in_memory_membership(
+                                batch_store,
+                                index_store,
+                                watermark.active_batch_count,
+                            ))
+                        } else {
+                            // Lower (frozen) generations are immutable — include all.
+                            Some(in_memory_membership(batch_store, index_store))
+                        }
                     }
-                }
-            },
+                };
+                slots.push(membership);
+            }
             LsmDataSource::FlushedMemTable {
                 path,
                 shard_id,
@@ -281,16 +297,26 @@ pub async fn fresh_tier_block_list(
                     .and_then(|m| m.get(shard_id))
                     .is_some_and(|watermark| generation.as_u64() >= watermark.active_generation);
                 if flushed_after_snapshot {
-                    continue;
+                    slots.push(None);
+                } else {
+                    let slot = slots.len();
+                    slots.push(None);
+                    flushed_loads.push(async move {
+                        let index = open_pk_index(path, session, flushed_cache).await?;
+                        Ok::<_, Error>((slot, GenMembership::OnDisk(index)))
+                    });
                 }
-                GenMembership::OnDisk(open_pk_index(path, session, flushed_cache).await?)
             }
-        };
-        if !membership.is_empty() {
-            memberships.push(membership);
         }
     }
-    Ok(memberships)
+    for (slot, membership) in futures::future::try_join_all(flushed_loads).await? {
+        slots[slot] = Some(membership);
+    }
+    Ok(slots
+        .into_iter()
+        .flatten()
+        .filter(|membership| !membership.is_empty())
+        .collect())
 }
 
 /// Cross-source membership of an in-memory (active / frozen) memtable: a

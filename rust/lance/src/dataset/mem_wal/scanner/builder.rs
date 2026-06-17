@@ -498,24 +498,40 @@ impl LsmScanner {
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
             .map_err(|e| Error::invalid_input(e.to_string()))?;
-        let mut contained = Vec::with_capacity(pks.num_rows());
-        for row in 0..pks.num_rows() {
-            // Both in-memory and flushed generations probe by the same key (the
-            // typed value, or the encoded `Binary` tuple for a composite PK).
-            let values: Vec<ScalarValue> = pk_indices
-                .iter()
-                .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|e| Error::invalid_input(e.to_string()))?;
-            let key = super::block_list::on_disk_pk_key(&values)?;
-            let mut found = false;
-            for membership in &memberships {
-                if membership.contains(&key).await? {
-                    found = true;
-                    break;
+        // One key per row, in the index key space — both in-memory and flushed
+        // generations probe by the same key (the typed value, or the encoded
+        // `Binary` tuple for a composite PK).
+        let keys: Vec<ScalarValue> = (0..pks.num_rows())
+            .map(|row| {
+                let values: Vec<ScalarValue> = pk_indices
+                    .iter()
+                    .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| Error::invalid_input(e.to_string()))?;
+                super::block_list::on_disk_pk_key(&values)
+            })
+            .collect::<Result<_>>()?;
+
+        // A row is contained if any generation contains its key. Probe each
+        // generation once (batched) rather than once per row, narrowing to the
+        // still-unblocked rows so an already-found row isn't re-probed.
+        let mut contained = vec![false; keys.len()];
+        let mut live: Vec<usize> = (0..keys.len()).collect();
+        for membership in &memberships {
+            if live.is_empty() {
+                break;
+            }
+            let live_keys: Vec<ScalarValue> = live.iter().map(|&i| keys[i].clone()).collect();
+            let mask = membership.contains_keys(&live_keys).await?;
+            let mut next_live = Vec::with_capacity(live.len());
+            for (pos, &row) in live.iter().enumerate() {
+                if mask[pos] {
+                    contained[row] = true;
+                } else {
+                    next_live.push(row);
                 }
             }
-            contained.push(found);
+            live = next_live;
         }
         Ok(contained)
     }
