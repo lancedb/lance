@@ -51,6 +51,14 @@ message PositionsHeader {
   PositionStreamCodec position_stream_codec = 2;
 }
 
+// Header for a serialized `PostingListGroup`: a member count followed by that
+// many `PostingList` bodies written inline. Each member body is
+// self-delimiting, so members need no length prefixes, and writing them inline
+// keeps their Arrow IPC sections 64-byte aligned within the group entry.
+message PostingListGroupHeader {
+  uint32 count = 1;
+}
+
 // Tail-block encoding of a compressed posting list.
 enum PostingTailCodec {
   POSTING_TAIL_CODEC_FIXED32 = 0;

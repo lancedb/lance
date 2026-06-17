@@ -30,13 +30,12 @@ use arrow_array::{
     Array, Float32Array, LargeBinaryArray, ListArray, RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 
 use crate::cache_pb::{
     CompressedPostingHeader, PlainPostingHeader, PositionStorage as PbPositionStorage,
-    PositionStreamCodec as PbPositionStreamCodec, PositionsHeader,
+    PositionStreamCodec as PbPositionStreamCodec, PositionsHeader, PostingListGroupHeader,
     PostingTailCodec as PbPostingTailCodec,
 };
 
@@ -337,48 +336,31 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
 // PostingListGroup codec
 // ---------------------------------------------------------------------------
 
-/// Serializes a [`PostingListGroup`] as a count followed by each member
-/// posting list, length-prefixed so the existing [`PostingList`] codec can be
-/// reused per entry (and its byte buffers read back zero-copy). See issue
-/// #7040.
+/// Serializes a [`PostingListGroup`] as a member-count header followed by each
+/// member posting list written **inline** through the same writer. Reusing the
+/// [`PostingList`] codec inline (rather than into per-member sub-buffers) keeps
+/// each member's Arrow IPC sections 64-byte aligned within the group entry, so
+/// they read back zero-copy. Member bodies are self-delimiting, so they need no
+/// length prefixes to separate them. See issue #7040.
 impl CacheCodecImpl for PostingListGroup {
     const TYPE_ID: &'static str = "lance.fts.PostingListGroup";
     const CURRENT_VERSION: u32 = 1;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        let writer = w.raw_writer();
         let count = u32::try_from(self.posting_lists.len())
             .map_err(|_| Error::io("posting list group too large to serialize".to_string()))?;
-        writer
-            .write_all(&count.to_le_bytes())
-            .map_err(|e| Error::io(format!("failed to write group count: {e}")))?;
+        w.write_header(&PostingListGroupHeader { count })?;
         for posting in &self.posting_lists {
-            let mut buf = Vec::new();
-            let mut sub = CacheEntryWriter::new(&mut buf);
-            posting.serialize(&mut sub)?;
-            write_len_prefixed_bytes(writer, &buf)?;
+            posting.serialize(w)?;
         }
         Ok(())
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
-        let body = r.body();
-        let data = &body;
-        let mut offset = 0;
-        if data.len() < 4 {
-            return Err(Error::io(
-                "truncated posting list group: missing count".to_string(),
-            ));
-        }
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        offset += 4;
-        let version = r.version();
-        let mut posting_lists = Vec::with_capacity(count);
-        for _ in 0..count {
-            let entry = read_len_prefixed_bytes_at(data, &mut offset)
-                .map_err(|e| Error::io(e.to_string()))?;
-            let mut sub = CacheEntryReader::new(&entry, 0, version);
-            posting_lists.push(PostingList::deserialize(&mut sub)?);
+        let header: PostingListGroupHeader = r.read_header()?;
+        let mut posting_lists = Vec::with_capacity(header.count as usize);
+        for _ in 0..header.count {
+            posting_lists.push(PostingList::deserialize(r)?);
         }
         Ok(Self::new(posting_lists))
     }
@@ -811,6 +793,54 @@ mod tests {
                 panic!("expected shared stream");
             };
             assert!(points_in(stream.bytes().as_ptr() as usize));
+        }
+
+        /// Every member of a `PostingListGroup` must also decode zero-copy. The
+        /// group writes its members inline so each member's IPC sections stay
+        /// 64-byte aligned within the entry; embedding members in per-member
+        /// sub-buffers would land them at arbitrary offsets and force a
+        /// realigning memcpy on load.
+        #[test]
+        fn group_member_sections_are_zero_copy_through_envelope() {
+            let make_member = |fill: u8| {
+                let blocks =
+                    LargeBinaryArray::from_opt_vec(vec![Some(&[fill; 48][..]), Some(&[fill; 48])]);
+                PostingList::Compressed(CompressedPostingList::new(
+                    blocks,
+                    7.0,
+                    3,
+                    PostingTailCodec::VarintDelta,
+                    None,
+                ))
+            };
+            let group = PostingListGroup::new(vec![make_member(9), make_member(1)]);
+
+            let group_codec = CacheCodec::from_impl::<PostingListGroup>();
+            let any: ArcAny = Arc::new(group);
+            let mut buf = Vec::new();
+            group_codec.serialize(&any, &mut buf).unwrap();
+            let serialized = aligned_bytes(&buf);
+
+            let restored = group_codec.deserialize(&serialized).hit().unwrap();
+            let restored = restored.downcast::<PostingListGroup>().unwrap();
+
+            let base = serialized.as_ptr() as usize;
+            let end = base + serialized.len();
+            let points_in = |ptr: usize| ptr >= base && ptr < end;
+
+            assert_eq!(restored.posting_lists.len(), 2);
+            for member in &restored.posting_lists {
+                let PostingList::Compressed(member) = member else {
+                    panic!("expected Compressed member");
+                };
+                for buf in member.blocks.to_data().buffers() {
+                    assert!(
+                        points_in(buf.as_ptr() as usize),
+                        "group member blocks buffer was realigned out of the input — \
+                         misaligned IPC section",
+                    );
+                }
+            }
         }
 
         /// The plain posting's row-id/frequency IPC section must also decode
