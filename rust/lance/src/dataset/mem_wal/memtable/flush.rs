@@ -102,17 +102,11 @@ impl MemTableFlusher {
     /// failure is logged and the flush proceeds — warming is never a commit
     /// gate. No-op without a warmer. `uri` must be the resolved reader path
     /// (`path_to_uri(gen_path)`) so warmed entries key-match later queries.
-    async fn warm_generation(&self, uri: &str, memtable: &MemTable) {
+    async fn warm_generation(&self, uri: &str) {
         let Some(warmer) = &self.warmer else {
             return;
         };
-        let pk_columns: Vec<String> = memtable
-            .lance_schema()
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.name.clone())
-            .collect();
-        if let Err(e) = warmer.warm(uri, &pk_columns).await {
+        if let Err(e) = warmer.warm(uri).await {
             warn!("pre-commit warm failed for generation {uri}; committing cold: {e}");
         }
     }
@@ -216,7 +210,7 @@ impl MemTableFlusher {
 
         // Warm before commit (zero cold window); no-op without a warmer.
         let warm_uri = self.path_to_uri(&gen_path);
-        self.warm_generation(&warm_uri, memtable).await;
+        self.warm_generation(&warm_uri).await;
 
         let new_manifest = self
             .update_manifest(
@@ -505,7 +499,7 @@ impl MemTableFlusher {
 
         // Warm before commit (zero cold window); no-op without a warmer.
         let warm_uri = self.path_to_uri(&gen_path);
-        self.warm_generation(&warm_uri, memtable).await;
+        self.warm_generation(&warm_uri).await;
 
         let new_manifest = self
             .update_manifest(

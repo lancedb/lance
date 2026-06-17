@@ -144,11 +144,21 @@ impl DatasetCache for FlushedMemTableCache {
 /// Proactively warms a flushed generation into the shared caches: open the
 /// dataset and pre-load its secondary indexes and PK dedup sidecar so the first
 /// query sees no cold reads. This is the **seam** the flush and read paths fire
-/// — lance defines it; the consumer (e.g. the WAL pod) implements it. `None` ⇒
+/// — lance defines it; the consumer (e.g. the WAL pod) implements it. `None` =>
 /// no warming, generations warm lazily on first read.
+///
+/// Everything a warmer touches is keyed by the immutable generation `path`
+/// (opened dataset, its secondary indexes, its PK dedup sidecar), so `path` is
+/// the only input it needs.
+///
+/// `warm` is fired fire-and-forget from every read path that opens a generation
+/// (all four LSM planners) as well as pre-commit on flush, so the same path may
+/// be warmed concurrently and repeatedly. Implementations **must be idempotent
+/// and cheap when the path is already warm** (e.g. dedup in-flight and
+/// completed paths) — a redundant call must not re-do work or fail.
 #[async_trait]
 pub trait GenerationWarmer: Send + Sync + std::fmt::Debug {
-    async fn warm(&self, path: &str, pk_columns: &[String]) -> Result<()>;
+    async fn warm(&self, path: &str) -> Result<()>;
 }
 
 /// Open a flushed-generation dataset, shared by all three LSM open sites
@@ -182,7 +192,7 @@ pub async fn open_flushed_dataset(
         let warmer = Arc::clone(warmer);
         let path = path.to_string();
         tokio::spawn(async move {
-            if let Err(e) = warmer.warm(&path, &[]).await {
+            if let Err(e) = warmer.warm(&path).await {
                 tracing::debug!(generation = %path, error = %e, "warm-on-open failed");
             }
         });
