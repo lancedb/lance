@@ -283,7 +283,9 @@ class ImageURIArray(ImageArray):
             if parsed_uri.scheme in ("http", "https"):
                 images.append(download(uri))
             else:
-                filesystem, path = fs.FileSystem.from_uri(uri.as_py())
+                filesystem, path = fs.FileSystem.from_uri(  # pyright: ignore[reportPrivateImportUsage]
+                    uri.as_py()
+                )
                 with filesystem.open_input_stream(path) as f:
                     images.append(f.read())
 
@@ -303,7 +305,7 @@ class EncodedImageArray(ImageArray):
         def pillow_metadata_decoder(images):
             import io
 
-            from PIL import Image
+            from PIL import Image  # pyright: ignore[reportMissingImports]
 
             img = Image.open(io.BytesIO(images[0].as_py()))
             return img
@@ -374,7 +376,7 @@ class EncodedImageArray(ImageArray):
             def pillow_decoder(images) -> "np.ndarray":
                 import io
 
-                from PIL import Image
+                from PIL import Image  # pyright: ignore[reportMissingImports]
 
                 return np.stack(
                     [
@@ -389,7 +391,6 @@ class EncodedImageArray(ImageArray):
                 decoded_to_tensor = tuple(
                     tf.io.decode_image(img) for img in images.to_pylist()
                 )
-                # tf.stack is typed as ``None`` by tensorflow's incomplete stubs.
                 return tf.stack(  # pyright: ignore[reportOptionalCall]
                     decoded_to_tensor, axis=0
                 ).numpy()
@@ -489,7 +490,7 @@ class FixedShapeImageTensorArray(ImageArray):
         def pillow_encoder(x):
             import io
 
-            from PIL import Image
+            from PIL import Image  # pyright: ignore[reportMissingImports]
 
             encoded_images = []
             for y in x:

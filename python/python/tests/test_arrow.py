@@ -11,7 +11,7 @@ import lance.arrow
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pytest
+import pytest  # pyright: ignore[reportMissingImports]
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
