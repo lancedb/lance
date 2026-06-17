@@ -3760,6 +3760,52 @@ mod tests {
         Ok(())
     }
 
+    /// Reproduces #7313: `with_position` indexing panics when `tokens.next_id` exceeds
+    /// `posting_lists.len()`, as observed during `optimize_indices` on legacy FTS partitions.
+    #[tokio::test]
+    #[should_panic(expected = "index out of bounds")]
+    async fn test_process_batch_with_position_panics_when_token_id_exceeds_posting_lists_len() {
+        const VOCAB_SIZE: usize = 1731;
+        const STALE_NEXT_ID: u32 = 4456;
+
+        let tokenizer = InvertedIndexParams::default().with_position(true).build().unwrap();
+        let store = Arc::new(CountingStore::new());
+        let id_alloc = Arc::new(AtomicU64::new(0));
+        let mut worker = IndexWorker::new(
+            tokenizer,
+            store,
+            id_alloc,
+            IndexWorkerConfig {
+                with_position: true,
+                format_version: InvertedListFormatVersion::V1,
+                fragment_mask: None,
+                token_set_format: TokenSetFormat::default(),
+                worker_memory_limit_bytes: u64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut tokens = TokenSet::default();
+        for i in 0..VOCAB_SIZE {
+            tokens.add(format!("tok_{i}"));
+        }
+        tokens.next_id = STALE_NEXT_ID;
+        worker.builder.set_tokens(tokens);
+        let posting_tail_codec = worker.builder.posting_tail_codec;
+        worker
+            .builder
+            .posting_lists
+            .resize_with(VOCAB_SIZE, || {
+                PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec)
+            });
+
+        worker
+            .process_batch(make_doc_batch("unseen_token_xyz", 0))
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn test_resolve_worker_memory_limit_uses_default_when_unset() {
         let params = InvertedIndexParams::default();
