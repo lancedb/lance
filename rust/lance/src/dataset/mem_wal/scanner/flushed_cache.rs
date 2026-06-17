@@ -119,7 +119,7 @@ impl std::fmt::Debug for FlushedMemTableCache {
 /// Caching of opened flushed-generation datasets, keyed by immutable path. The
 /// opened dataset carries the session index cache, which also backs each
 /// generation's secondary indexes and its PK dedup sidecar (see
-/// [`super::block_list::open_pk_index`]) — so a single `get_or_open` is the
+/// `block_list::open_pk_index`) — so a single `get_or_open` is the
 /// whole caching surface. Implemented by [`FlushedMemTableCache`]; a
 /// [`GenerationWarmer`] composes one to warm through it, and a consumer may
 /// supply its own implementation.
