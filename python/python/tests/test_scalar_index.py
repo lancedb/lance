@@ -4054,6 +4054,60 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     )
 
 
+def test_fm_segment_merge_and_commit(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = "text_fm_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type="FM",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    assert len({segment.uuid for segment in staged_segments}) == len(staged_segments)
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.uuid not in {segment.uuid for segment in staged_segments}
+    assert merged_segment.fragment_ids == set(fragment_ids)
+
+    ds = ds.commit_existing_index_segments(index_name, "text", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "Fm"
+    assert len(descriptions[index_name].segments) == 1
+
+    # FM-Index answers exact substring search via `contains`.
+    filter_expr = "contains(text, 'frodo')"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.num_rows > 0
+    assert with_index.num_rows == without_index.num_rows
+    assert sorted(with_index["id"].to_pylist()) == sorted(
+        without_index["id"].to_pylist()
+    )
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
 def test_zonemap_fragment_ids_parameter_validation(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=2, rows_per_fragment=100

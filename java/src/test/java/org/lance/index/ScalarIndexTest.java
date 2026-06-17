@@ -17,6 +17,7 @@ import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
+import org.lance.index.scalar.FMIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -315,6 +316,56 @@ public class ScalarIndexTest {
         // Currently the Java API doesn't expose index configuration details,
         // but we could add a getIndexDetails() method in the future to verify
         // that the rows_per_zone parameter was correctly set to 1024
+      }
+    }
+  }
+
+  @Test
+  public void testCreateFMIndexDistributively(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fm_index_distributed").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      // Write two fragments, each with names "Person 0" .. "Person 9".
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertEquals(2, fragments.size());
+
+        IndexParams indexParams =
+            IndexParams.builder().setScalarIndexParams(FMIndexParams.builder().build()).build();
+        String indexName = "fm_name_index";
+
+        // Build one uncommitted FM segment per fragment.
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : fragments) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(Collections.singletonList("name"), IndexType.FM, indexParams)
+                      .withIndexName(indexName)
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
+
+        assertFalse(
+            dataset.listIndexes().contains(indexName),
+            "Partially created index should not present");
+
+        // FM segments support merge before commit.
+        Index merged = dataset.mergeExistingIndexSegments(segments);
+
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(
+                indexName, "name", Collections.singletonList(merged));
+        assertEquals(1, committed.size());
+        assertTrue(dataset.listIndexes().contains(indexName));
+
+        // FM-Index answers exact substring search via `contains`.
+        assertEquals(
+            2, dataset.countIndexedRows(indexName, "contains(name, 'Person 5')", Optional.empty()));
+        assertEquals(
+            20, dataset.countIndexedRows(indexName, "contains(name, 'Person')", Optional.empty()));
       }
     }
   }
