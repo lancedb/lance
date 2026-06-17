@@ -70,7 +70,7 @@ pub struct MemTableFlusher {
     shard_id: Uuid,
     manifest_store: Arc<ShardManifestStore>,
     /// When present, each new generation is warmed before it is committed, so
-    /// the first query sees zero cold reads. `None` ⇒ no warming.
+    /// the first query sees zero cold reads. `None` => no warming.
     warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
@@ -1222,6 +1222,79 @@ mod tests {
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
         assert_eq!(updated_manifest.flushed_generations.len(), 1);
+    }
+
+    /// A `GenerationWarmer` that counts calls and optionally fails.
+    #[derive(Debug)]
+    struct CountingWarmer {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl GenerationWarmer for CountingWarmer {
+        async fn warm(&self, _path: &str) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                Err(Error::io("simulated warm failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Warming is a best-effort optimization, never a commit gate: a warmer that
+    /// errors pre-commit must still let the flush commit the generation. The
+    /// warm fires exactly once on the pre-commit path.
+    #[tokio::test]
+    async fn test_flusher_commits_when_warm_fails() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let schema = create_test_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let frag_id = memtable
+            .insert(create_test_batch(&schema, 10))
+            .await
+            .unwrap();
+        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let warmer: Arc<dyn GenerationWarmer> = Arc::new(CountingWarmer {
+            calls: calls.clone(),
+            fail: true,
+        });
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path,
+            base_uri,
+            shard_id,
+            manifest_store.clone(),
+        )
+        .with_warmer(Some(warmer));
+        // Flush must succeed despite the warmer erroring.
+        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+
+        assert_eq!(result.generation.generation, 1);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "pre-commit warm fires exactly once"
+        );
+        let updated = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(
+            updated.flushed_generations.len(),
+            1,
+            "generation still committed after a failed warm"
+        );
     }
 
     /// Flushing a generation with within-generation duplicate PKs writes a

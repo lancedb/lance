@@ -175,7 +175,7 @@ pub trait GenerationWarmer: Send + Sync + std::fmt::Debug {
 ///   still reuses the shared index / metadata caches; `None`/`None`
 ///   reproduces the original per-query cold-open behavior exactly.
 /// - `warmer` present: fire a fire-and-forget warm-on-open backstop behind the
-///   returned handle (the warmer dedups already-warm paths). `None` ⇒ no warming.
+///   returned handle (the warmer dedups already-warm paths). `None` => no warming.
 pub async fn open_flushed_dataset(
     path: &str,
     session: Option<&Arc<Session>>,
@@ -338,5 +338,49 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&c, &d), "cached path must reuse the Arc");
+    }
+
+    /// A warmer that records calls and signals each one.
+    #[derive(Debug)]
+    struct NotifyingWarmer {
+        calls: Arc<AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl GenerationWarmer for NotifyingWarmer {
+        async fn warm(&self, _path: &str) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_flushed_dataset_fires_warm_on_open() {
+        // The warm-on-open backstop fires the warmer (fire-and-forget) when a
+        // generation is opened, so generations the flusher never warmed still
+        // get warmed lazily on first read.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
+        write_dataset(&uri, &[1, 2, 3]).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let warmer: Arc<dyn GenerationWarmer> = Arc::new(NotifyingWarmer {
+            calls: calls.clone(),
+            notify: notify.clone(),
+        });
+
+        let ds = open_flushed_dataset(&uri, None, None, Some(&warmer))
+            .await
+            .unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+
+        // The warm is spawned fire-and-forget; wait (bounded) for it to run.
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .expect("warm-on-open must fire");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "warmer fired once on open");
     }
 }
