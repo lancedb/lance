@@ -1188,15 +1188,9 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
         }
 
         self.decoder_switch_on = (st_info & (1 << 24)) != 0;
-        // when decoder_switch_on is true, we make sure the out_buf is at least 3 times the size of the in_buf,
-        if self.decoder_switch_on && in_buf.len() * 3 > out_buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "output buffer too small for FSST decoder",
-            ));
-        }
-
-        // when decoder_switch_on is false, we make sure the out_buf is at least the same size of the in_buf,
+        // The compressed path grows `out_buf` to the worst-case decoded size in `decompress`
+        // (see issue #7266), so it is sized there rather than validated here. The uncompressed
+        // path copies `in_buf` verbatim, so the output must be at least that large.
         if !self.decoder_switch_on && in_buf.len() > out_buf.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1221,7 +1215,21 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
             pos += 8;
         }
         for i in 0..symbol_num as usize {
-            self.lens[i] = symbol_table[pos];
+            let len = symbol_table[pos];
+            // A corrupt or malicious symbol table (it is read from untrusted on-disk buffers) could
+            // carry a length byte > 8, which would break the `8 * in_buf.len()` output bound that
+            // `decompress` relies on and let the decode loop write out of bounds (same bug class as
+            // issue #7266). Reject such tables so the bound holds for every accepted input.
+            if len as usize > MAX_SYMBOL_LENGTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FSST symbol table is corrupt: symbol {} has length {} (max {})",
+                        i, len, MAX_SYMBOL_LENGTH
+                    ),
+                ));
+            }
+            self.lens[i] = len;
             pos += 1;
         }
         Ok(())
@@ -1240,6 +1248,22 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
             out_offsets_buf.resize(in_offsets_buf.len(), T::from_usize(0).unwrap());
             out_offsets_buf.copy_from_slice(in_offsets_buf);
             return Ok(());
+        }
+        // Each FSST code decodes to a symbol of at most `MAX_SYMBOL_LENGTH` (8) bytes -- `init`
+        // rejects any symbol table that violates this -- so the decoded output is at most
+        // `8 * in_buf.len()` bytes (worst case: every code expands to an 8-byte symbol). On top of
+        // that, `decompress_bulk` writes a full 8-byte word per code speculatively through raw
+        // pointers, so the write for the final code lands at `out_curr + 8` even when that symbol is
+        // shorter than 8 bytes. Add a trailing word of headroom (`+ 8`) so that last speculative
+        // write can never run past the end -- this keeps the raw-pointer writes in-bounds without
+        // relying on where exactly the final short symbol lands. Growing to this bound is what makes
+        // the writes sound regardless of how well the data compressed; the previous `3x` minimum was
+        // unsound for inputs that compress better than 3:1. `decompress_bulk` shrinks the buffer back
+        // to the exact decoded length afterwards, so the headroom is never visible to callers. See
+        // https://github.com/lance-format/lance/issues/7266.
+        let required = in_buf.len().saturating_mul(8).saturating_add(8);
+        if out_buf.len() < required {
+            out_buf.resize(required, 0);
         }
         let mut out_pos = 0;
         let mut out_offsets_len = 0;
@@ -1288,8 +1312,9 @@ pub fn compress<T: OffsetSizeTrait>(
 // the following 32 bits after FSST_MAGIC contains information about FSST encoding, such as decoder_switch_on, suffix_lim, terminator, n_symbols
 // when the decoder_switch_on is off in the in_buf header, `decompress` first make sure the out_buf is at least the same size as the in_buf, then simply copy the
 // input data to the output
-// when the decoder_switch_on is on, `decompress` first make sure the out_buf is at least 3 times the size of the in_buf, then start decoding the
-// data using the symbol table
+// when the decoder_switch_on is on, `decompress` grows out_buf to the worst-case decoded size (`8 * in_buf.len()`, since each code can expand to an
+// 8-byte symbol) plus a trailing 8-byte word of headroom (the decode loop writes a full 8-byte word per code speculatively) before decoding, so the
+// output buffer never overflows regardless of the compression ratio; `init` rejects any symbol table whose symbol lengths exceed 8 bytes, which is what makes that bound hold
 // the out_offsets_buf should be at least the same size as the in_offsets_buf, otherwise an error is returned
 // the symbol_table is the same symbol table created by `compression`
 pub fn decompress<T: OffsetSizeTrait>(
@@ -1643,5 +1668,119 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
                 std::str::from_utf8(original)
             );
         }
+    }
+
+    // Regression test for https://github.com/lance-format/lance/issues/7266.
+    //
+    // Highly repetitive input compresses far better than 3:1 and makes FSST build 8-byte symbols,
+    // so the decoded output is much larger than the old `3 * input` buffer bound that `decompress`
+    // enforced. Decompressing into a buffer sized at that old minimum used to write past the end of
+    // the allocation (segfault / heap corruption). The decoder must instead grow the output buffer
+    // to the worst-case decoded size. The fix lives in the offset-generic `FsstDecoder<T>`, so it is
+    // exercised for both 32-bit (`StringArray`) and 64-bit (`LargeStringArray`) offsets.
+    #[test]
+    fn test_decompress_better_than_3x_does_not_overflow() {
+        better_than_3x_helper::<i32>();
+    }
+
+    #[test]
+    fn test_decompress_better_than_3x_does_not_overflow_64_bit_offsets() {
+        better_than_3x_helper::<i64>();
+    }
+
+    fn better_than_3x_helper<T: OffsetSizeTrait>() {
+        use arrow_array::GenericStringArray;
+
+        let row = "a".repeat(64);
+        let rows: Vec<&str> = (0..2000).map(|_| row.as_str()).collect();
+        let array = GenericStringArray::<T>::from(rows);
+
+        let mut symbol_table = [0u8; FSST_SYMBOL_TABLE_SIZE];
+        let mut compressed = vec![0u8; array.value_data().len()];
+        let mut compressed_offsets = vec![T::from_usize(0).unwrap(); array.value_offsets().len()];
+        compress(
+            symbol_table.as_mut(),
+            array.value_data(),
+            array.value_offsets(),
+            &mut compressed,
+            &mut compressed_offsets,
+        )
+        .unwrap();
+
+        // The data must compress better than 3:1, otherwise it would not exercise the bug.
+        assert!(
+            array.value_data().len() > compressed.len() * 3,
+            "expected >3:1 compression (input {}, compressed {})",
+            array.value_data().len(),
+            compressed.len(),
+        );
+
+        // Allocate only the old documented minimum (3x the compressed input); the decoder is
+        // responsible for growing it to fit the decoded output.
+        let mut decompressed = vec![0u8; compressed.len() * 3];
+        let mut decompressed_offsets = vec![T::from_usize(0).unwrap(); compressed_offsets.len()];
+        decompress(
+            &symbol_table,
+            &compressed,
+            &compressed_offsets,
+            &mut decompressed,
+            &mut decompressed_offsets,
+        )
+        .unwrap();
+
+        // The whole input must be recovered: the total decoded length, plus every row byte-for-byte.
+        assert_eq!(
+            decompressed_offsets.last().unwrap().as_usize(),
+            array.value_data().len()
+        );
+        for i in 1..decompressed_offsets.len() {
+            let decoded = &decompressed
+                [decompressed_offsets[i - 1].as_usize()..decompressed_offsets[i].as_usize()];
+            assert_eq!(decoded, array.value(i - 1).as_bytes());
+        }
+    }
+
+    // The `8 * in_buf.len()` output bound only holds when every symbol is at most 8 bytes. The
+    // symbol table is read from untrusted on-disk buffers, so a corrupt length byte (> 8) would
+    // otherwise let the decode loop advance past the grown output buffer and write out of bounds
+    // (the class of bug fixed in https://github.com/lance-format/lance/issues/7266). `init` must
+    // reject such a table instead of decompressing it.
+    #[test]
+    fn test_decompress_rejects_oversized_symbol_length() {
+        let row = "a".repeat(64);
+        let rows: Vec<&str> = (0..2000).map(|_| row.as_str()).collect();
+        let array = StringArray::from(rows);
+
+        let mut symbol_table = [0u8; FSST_SYMBOL_TABLE_SIZE];
+        let mut compressed = vec![0u8; array.value_data().len()];
+        let mut compressed_offsets = vec![0i32; array.value_offsets().len()];
+        compress(
+            symbol_table.as_mut(),
+            array.value_data(),
+            array.value_offsets(),
+            &mut compressed,
+            &mut compressed_offsets,
+        )
+        .unwrap();
+
+        // The lengths region is packed immediately after the 8-byte header and the `n_symbols`
+        // 8-byte symbols (see `FsstEncoder::export`). Corrupt the first symbol's length byte to an
+        // impossible value (> MAX_SYMBOL_LENGTH).
+        let st_info = u64::from_ne_bytes(symbol_table[..8].try_into().unwrap());
+        let n_symbols = (st_info & 255) as usize;
+        assert!(n_symbols > 0, "expected the encoder to build symbols");
+        symbol_table[8 + n_symbols * 8] = 255;
+
+        let mut decompressed = vec![0u8; compressed.len() * 8];
+        let mut decompressed_offsets = vec![0i32; compressed_offsets.len()];
+        let err = decompress(
+            &symbol_table,
+            &compressed,
+            &compressed_offsets,
+            &mut decompressed,
+            &mut decompressed_offsets,
+        )
+        .expect_err("a corrupt symbol length must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
