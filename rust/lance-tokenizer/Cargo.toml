@@ -17,6 +17,7 @@ jieba-rs = { workspace = true, optional = true }
 lindera = { workspace = true, optional = true }
 rust-stemmers = "1.2.0"
 serde = { workspace = true, features = ["derive"] }
+stop-words = { version = "0.10.0", default-features = false, features = ["iso", "nltk"] }
 unicode-normalization = "0.1.25"
 
 [features]

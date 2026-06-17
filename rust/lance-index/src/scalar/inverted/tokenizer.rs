@@ -355,16 +355,7 @@ impl InvertedIndexParams {
             builder = builder.filter_dynamic(Stemmer::new(self.language));
         }
         if self.remove_stop_words {
-            let stop_word_filter = match &self.custom_stop_words {
-                Some(words) => StopWordFilter::remove(words.iter().cloned()),
-                None => StopWordFilter::new(self.language).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "removing stop words for language {:?} is not supported yet",
-                        self.language
-                    ))
-                })?,
-            };
-            builder = builder.filter_dynamic(stop_word_filter);
+            builder = builder.filter_dynamic(self.stop_word_filter()?);
         }
         if self.ascii_folding {
             builder = builder.filter_dynamic(AsciiFoldingFilter);
@@ -379,6 +370,19 @@ impl InvertedIndexParams {
                 "unknown lance tokenizer {}",
                 self.lance_tokenizer.as_ref().unwrap()
             ))),
+        }
+    }
+
+    fn stop_word_filter(&self) -> Result<StopWordFilter> {
+        match &self.custom_stop_words {
+            Some(words) => Ok(StopWordFilter::remove(words.iter().cloned())),
+            None if self.base_tokenizer == "icu" => Ok(StopWordFilter::all()),
+            None => StopWordFilter::new(self.language).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "removing stop words for language {:?} is not supported yet",
+                    self.language
+                ))
+            }),
         }
     }
 
@@ -502,5 +506,53 @@ mod tests {
         let mut tokens = Vec::new();
         stream.process(&mut |token| tokens.push(token.text.clone()));
         assert_eq!(tokens, vec!["hello", "こんにちは", "世界"]);
+    }
+
+    #[test]
+    fn test_remove_stop_words_respects_language_for_non_icu_tokenizer() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .stem(false)
+            .base_tokenizer("simple".to_string())
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the 的 lance data");
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        assert_eq!(
+            tokens,
+            vec!["的".to_string(), "lance".to_string(), "data".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_custom_stop_words_replace_language_builtins() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .stem(false)
+            .custom_stop_words(Some(vec!["lance".to_string()]))
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the lance data");
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        assert_eq!(tokens, vec!["the".to_string(), "data".to_string()]);
+    }
+
+    #[test]
+    fn test_icu_stop_words_use_all_builtin_lists() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .stem(false)
+            .base_tokenizer("icu".to_string())
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the 的 lance data");
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        assert_eq!(tokens, vec!["lance".to_string(), "data".to_string()]);
     }
 }
