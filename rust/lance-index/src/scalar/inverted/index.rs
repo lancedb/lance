@@ -42,6 +42,7 @@ use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::{DataFusionResult, LanceOptionExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
@@ -4749,23 +4750,36 @@ impl DocSet {
             });
         }
 
-        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
-        // remapped, we'll need resort to make sure binary_search works.
+        // If frag reuse happened, remap the row_ids through it. Crucially we
+        // must NOT drop the rows the reuse index deleted, because the posting
+        // lists reference doc_ids *positionally* (a doc_id is an index into
+        // these arrays, fixed at build time). Dropping deleted rows would
+        // renumber every later doc_id and desync the posting lists, so wand
+        // would index `num_tokens`/`row_ids` out of bounds or score the wrong
+        // doc. Instead we tombstone deleted rows in place: their slot survives
+        // (so doc_ids stay aligned with the posting lists) carrying
+        // `RowAddress::TOMBSTONE_ROW`, which wand skips, and they are left out
+        // of `inv` so a row_id lookup never resolves to a deleted doc. The
+        // heavyweight physical remap (`DocSet::remap`) is what actually
+        // renumbers and compacts; this load-time path only has to stay
+        // consistent until then.
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             let mut row_ids = Vec::with_capacity(row_id_col.len());
-            let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
-            for (row_id, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
-                if let Some(new_row_id) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    row_ids.push(new_row_id);
-                    num_tokens.push(*num_token);
+            let num_tokens = num_tokens_col.values().to_vec();
+            let mut inv = Vec::with_capacity(row_id_col.len());
+            for (doc_id, row_id) in row_id_col.values().iter().enumerate() {
+                match frag_reuse_index_ref.remap_row_id(*row_id) {
+                    Some(new_row_id) => {
+                        row_ids.push(new_row_id);
+                        inv.push((new_row_id, doc_id as u32));
+                    }
+                    None => {
+                        // Deleted: keep the slot (doc_ids must not shift) but
+                        // tombstone it and leave it out of `inv`.
+                        row_ids.push(RowAddress::TOMBSTONE_ROW);
+                    }
                 }
             }
-
-            let mut inv: Vec<(u64, u32)> = row_ids
-                .iter()
-                .enumerate()
-                .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
-                .collect();
             inv.sort_unstable_by_key(|entry| entry.0);
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();

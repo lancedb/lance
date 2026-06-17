@@ -736,6 +736,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
+            // Skip docs the fragment-reuse remap deleted. They are tombstoned
+            // in the DocSet (slot kept so posting-list doc_ids stay aligned)
+            // and must not surface in results.
+            if docs_has_row_ids && row_id == RowAddress::TOMBSTONE_ROW {
+                if self.operator == Operator::Or {
+                    self.push_back_leads(doc.doc_id() + 1);
+                }
+                continue;
+            }
             if docs_has_row_ids && !mask.selected(row_id) {
                 if self.operator == Operator::Or {
                     self.push_back_leads(doc.doc_id() + 1);

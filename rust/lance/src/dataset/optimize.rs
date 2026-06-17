@@ -4307,6 +4307,133 @@ mod tests {
         assert_eq!(scanner.count_rows().await.unwrap(), count3);
     }
 
+    /// Deferred compaction that materializes deletions must not corrupt an
+    /// inverted (FTS) index read through the fragment-reuse index. The index's
+    /// posting lists reference doc_ids positionally; if the load-time remap
+    /// dropped the deleted rows it would renumber the doc_ids and desync the
+    /// posting lists (out-of-bounds `num_tokens`, wrong/stale row ids). The
+    /// tombstone-preserve-positions load path must keep results correct in the
+    /// FRI window and after the physical remap + trim.
+    #[tokio::test]
+    async fn test_read_inverted_index_with_defer_index_remap_and_deletions() {
+        // Enough surviving docs for several compressed posting-list blocks
+        // (BLOCK_SIZE = 128), split across several fragments so compaction has
+        // real work — but no larger.
+        const ROWS: i32 = 1200;
+        const DELETED: i32 = 400;
+
+        // Every row contains "lance", so the term matches all live rows; `id`
+        // tells us exactly which rows survive.
+        let ids = Int32Array::from_iter_values(0..ROWS);
+        let docs = LargeStringArray::from_iter_values((0..ROWS).map(|_| "lance apple orange"));
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("doc", DataType::LargeUtf8, false),
+            ])
+            .into(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(docs) as ArrayRef],
+        )
+        .unwrap();
+        let schema_ref = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema_ref);
+        let mut dataset = Dataset::write(
+            stream,
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 200, // 6 fragments
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["doc"],
+                IndexType::Inverted,
+                Some("doc_idx".into()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Delete a prefix, then deferred-compact so the deletions are
+        // materialized into the fragment-reuse index the index is read through.
+        dataset.delete(&format!("id < {DELETED}")).await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some(),
+            "deferred compaction must leave a fragment-reuse index"
+        );
+
+        // FTS "lance" → sorted surviving ids. Projecting `id` forces a take, so
+        // a stale row address would error or return a wrong/dead row.
+        async fn search_ids(dataset: &Dataset) -> Vec<i32> {
+            let mut scanner = dataset.scan();
+            scanner
+                .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+                .unwrap();
+            scanner.project::<&str>(&["id"]).unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut ids: Vec<i32> = batches
+                .iter()
+                .flat_map(|b| {
+                    b.column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        }
+
+        let expected = (DELETED..ROWS).collect::<Vec<_>>();
+
+        // FRI window: index read through the reuse index.
+        let during = search_ids(&dataset).await;
+        assert_eq!(
+            during, expected,
+            "FRI-window FTS must return exactly the surviving rows (no resurrection, no loss, no stale rows)"
+        );
+
+        // Physical remap + trim: must still be correct.
+        remapping::remap_column_index(&mut dataset, &["doc"], Some("doc_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let after = search_ids(&dataset).await;
+        assert_eq!(
+            after, expected,
+            "FTS must stay correct after physical remap + fragment-reuse trim"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_ngram_index_with_defer_index_remap() {
         // Generate random words using lance-datagen
