@@ -1196,9 +1196,9 @@ mod tests {
             let d2 = random_fsl_f32(seed.wrapping_add(2), 50, dim);
             let s1 = compute_partial_stats(&centroids, &d1, DistanceType::L2).unwrap();
             let s2 = compute_partial_stats(&centroids, &d2, DistanceType::L2).unwrap();
-            let ab = merge_partial_stats(s1.clone(), s2.clone()).unwrap();
-            let ba = merge_partial_stats(s2, s1).unwrap();
-            assert_partial_stats_close(&ab, &ba, 1e-9);
+            let merged_forward = merge_partial_stats(s1.clone(), s2.clone()).unwrap();
+            let merged_reverse = merge_partial_stats(s2, s1).unwrap();
+            assert_partial_stats_close(&merged_forward, &merged_reverse, 1e-9);
         }
 
         #[test]

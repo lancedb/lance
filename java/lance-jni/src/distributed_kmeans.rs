@@ -7,18 +7,18 @@
 //! `RecordBatch` arguments (centroids, partial stats, samples) and return
 //! either an IPC `byte[]` (for stats) or a flat `float[]` (for centroids).
 
+use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
-use crate::RT;
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, RecordBatch};
+use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
 use jni::sys::{jbyteArray, jfloatArray};
-use jni::JNIEnv;
 
 use lance::index::vector::ivf::distributed as l2;
 use lance_index::vector::kmeans::distributed as l1;
@@ -45,8 +45,7 @@ fn record_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
 
 fn ipc_to_record_batch(env: &mut JNIEnv, jba: &JByteArray) -> Result<RecordBatch> {
     let bytes = env.convert_byte_array(jba)?;
-    let mut reader =
-        StreamReader::try_new(std::io::Cursor::new(bytes), None).map_err(arrow_err)?;
+    let mut reader = StreamReader::try_new(std::io::Cursor::new(bytes), None).map_err(arrow_err)?;
     reader
         .next()
         .ok_or_else(|| Error::input_error("empty IPC stream".to_string()))?
@@ -65,9 +64,7 @@ fn ipc_to_centroids_fsl(env: &mut JNIEnv, jba: &JByteArray) -> Result<FixedSizeL
         .column(0)
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
-        .ok_or_else(|| {
-            Error::input_error("centroids column must be FixedSizeList".to_string())
-        })?
+        .ok_or_else(|| Error::input_error("centroids column must be FixedSizeList".to_string()))?
         .clone())
 }
 
@@ -75,20 +72,13 @@ fn fsl_to_jfloat_array<'a>(
     env: &mut JNIEnv<'a>,
     fsl: &FixedSizeListArray,
 ) -> Result<jni::objects::JFloatArray<'a>> {
-    let values = fsl
-        .values()
-        .as_primitive::<Float32Type>()
-        .values()
-        .to_vec();
+    let values = fsl.values().as_primitive::<Float32Type>().values().to_vec();
     let arr = env.new_float_array(values.len() as i32)?;
     env.set_float_array_region(&arr, 0, &values)?;
     Ok(arr)
 }
 
-fn read_optional_fragment_ids(
-    env: &mut JNIEnv,
-    arr: &JIntArray,
-) -> Result<Option<Vec<u32>>> {
+fn read_optional_fragment_ids(env: &mut JNIEnv, arr: &JIntArray) -> Result<Option<Vec<u32>>> {
     if arr.is_null() {
         return Ok(None);
     }
@@ -143,14 +133,15 @@ pub extern "system" fn Java_org_lance_index_vector_DistributedKMeans_nativeSampl
         ))?;
         record_batch_to_ipc(&batch)
     };
-    crate::ok_or_throw_with_return!(env, inner(), JByteArray::default().into_raw())
-        .pipe(|bytes| match env.byte_array_from_slice(&bytes) {
+    crate::ok_or_throw_with_return!(env, inner(), JByteArray::default().into_raw()).pipe(|bytes| {
+        match env.byte_array_from_slice(&bytes) {
             Ok(arr) => arr.into_raw(),
             Err(e) => {
                 let _ = env.throw_new("java/lang/RuntimeException", e.to_string());
                 JByteArray::default().into_raw()
             }
-        })
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -287,7 +278,11 @@ pub extern "system" fn Java_org_lance_index_vector_DistributedKMeans_nativeSelec
 ) -> jfloatArray {
     let mut inner = || -> Result<FixedSizeListArray> {
         let batches = read_byte_array_2d(&mut env, &samples_arr)?;
-        Ok(l1::select_initial_centroids(batches, k as usize, rng_seed as u64)?)
+        Ok(l1::select_initial_centroids(
+            batches,
+            k as usize,
+            rng_seed as u64,
+        )?)
     };
     let fsl = crate::ok_or_throw_with_return!(
         env,
