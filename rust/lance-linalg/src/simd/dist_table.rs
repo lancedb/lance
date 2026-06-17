@@ -113,6 +113,274 @@ pub fn sum_4bit_dist_table_scalar(
     }
 }
 
+#[inline]
+#[allow(unused)]
+pub fn sum_4bit_dist_table_u16(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u16],
+    dists: &mut [u32],
+) {
+    debug_assert!(n.is_multiple_of(BATCH_SIZE));
+    debug_assert!(dists.len() >= n);
+    debug_assert!(codes.len() >= n * code_len);
+    sum_4bit_dist_table_u16_scalar(
+        code_len,
+        &codes[..n * code_len],
+        dist_table,
+        &mut dists[..n],
+    );
+}
+
+#[inline]
+pub fn transfer_4bit_dist_table_u16(dist_table: &[u16], hacc_dist_table: &mut Vec<u8>) {
+    debug_assert!(dist_table.len().is_multiple_of(32));
+
+    let num_tables = dist_table.len() / 16;
+    hacc_dist_table.clear();
+    hacc_dist_table.resize(dist_table.len() * 2, 0);
+
+    for table_idx in 0..num_tables {
+        let table = &dist_table[table_idx * 16..(table_idx + 1) * 16];
+        let low_offset = (table_idx / 2) * 64 + (table_idx % 2) * 16;
+        let high_offset = low_offset + 32;
+        for (code, value) in table.iter().enumerate() {
+            hacc_dist_table[low_offset + code] = *value as u8;
+            hacc_dist_table[high_offset + code] = (value >> 8) as u8;
+        }
+    }
+}
+
+#[inline]
+pub fn sum_4bit_hacc_dist_table(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    hacc_dist_table: &[u8],
+    dists: &mut [u32],
+) {
+    debug_assert!(n.is_multiple_of(BATCH_SIZE));
+    debug_assert!(dists.len() >= n);
+    debug_assert!(codes.len() >= n * code_len);
+    debug_assert!(hacc_dist_table.len() >= code_len * 64);
+
+    match *SIMD_SUPPORT {
+        #[cfg(target_arch = "x86_64")]
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2
+            if std::arch::is_x86_feature_detected!("avx2") =>
+        {
+            sum_4bit_hacc_dist_table_avx2(n, code_len, codes, hacc_dist_table, dists);
+        }
+        _ => sum_4bit_hacc_dist_table_scalar(code_len, codes, hacc_dist_table, dists),
+    }
+}
+
+#[inline]
+#[allow(unused)]
+pub fn sum_4bit_hacc_dist_table_scalar(
+    code_len: usize,
+    codes: &[u8],
+    hacc_dist_table: &[u8],
+    dists: &mut [u32],
+) {
+    let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
+    dists[..num_full_vectors].fill(0);
+
+    for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
+        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+            let table_offset = sub_vec_idx * 64;
+            let current_low = &hacc_dist_table[table_offset..table_offset + 16];
+            let next_low = &hacc_dist_table[table_offset + 16..table_offset + 32];
+            let current_high = &hacc_dist_table[table_offset + 32..table_offset + 48];
+            let next_high = &hacc_dist_table[table_offset + 48..table_offset + 64];
+
+            for j in 0..16 {
+                let low_current_code = (block[j] & 0x0F) as usize;
+                let high_current_code = (block[j] >> 4) as usize;
+                let low_next_code = (block[j + 16] & 0x0F) as usize;
+                let high_next_code = (block[j + 16] >> 4) as usize;
+
+                let lower_id = vec_block_idx * BATCH_SIZE + PERM0[j];
+                let higher_id = lower_id + 16;
+                dists[lower_id] += ((current_high[low_current_code] as u32) << 8)
+                    + current_low[low_current_code] as u32
+                    + ((next_high[low_next_code] as u32) << 8)
+                    + next_low[low_next_code] as u32;
+                dists[higher_id] += ((current_high[high_current_code] as u32) << 8)
+                    + current_low[high_current_code] as u32
+                    + ((next_high[high_next_code] as u32) << 8)
+                    + next_low[high_next_code] as u32;
+            }
+        }
+    }
+}
+
+#[inline]
+#[allow(unused)]
+pub fn sum_4bit_dist_table_u16_scalar(
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u16],
+    dists: &mut [u32],
+) {
+    let num_full_vectors = codes.len() / (BATCH_SIZE * code_len) * BATCH_SIZE;
+    dists[..num_full_vectors].fill(0);
+
+    for (vec_block_idx, blocks) in codes.chunks_exact(BATCH_SIZE * code_len).enumerate() {
+        for (sub_vec_idx, block) in blocks.chunks_exact(BATCH_SIZE).enumerate() {
+            let current_dist_table = &dist_table[sub_vec_idx * 2 * 16..(sub_vec_idx * 2 + 1) * 16];
+            let next_dist_table =
+                &dist_table[(sub_vec_idx * 2 + 1) * 16..(sub_vec_idx * 2 + 2) * 16];
+
+            for j in 0..16 {
+                let low_current_code = (block[j] & 0x0F) as usize;
+                let high_current_code = (block[j] >> 4) as usize;
+                let low_next_code = (block[j + 16] & 0x0F) as usize;
+                let high_next_code = (block[j + 16] >> 4) as usize;
+
+                let lower_id = vec_block_idx * BATCH_SIZE + PERM0[j];
+                let higher_id = lower_id + 16;
+                dists[lower_id] += current_dist_table[low_current_code] as u32
+                    + next_dist_table[low_next_code] as u32;
+                dists[higher_id] += current_dist_table[high_current_code] as u32
+                    + next_dist_table[high_next_code] as u32;
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sum_4bit_hacc_dist_table_avx2(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    hacc_dist_table: &[u8],
+    dists: &mut [u32],
+) {
+    const SAFE_CODE_LEN: usize = 128;
+
+    for i in (0..n).step_by(BATCH_SIZE) {
+        let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
+        let batch_dists = &mut dists[i..i + BATCH_SIZE];
+        batch_dists.fill(0);
+
+        for code_start in (0..code_len).step_by(SAFE_CODE_LEN) {
+            let code_end = (code_start + SAFE_CODE_LEN).min(code_len);
+            let code_range = code_start * BATCH_SIZE..code_end * BATCH_SIZE;
+            let table_range = code_start * 64..code_end * 64;
+            if code_start == 0 && code_end == code_len {
+                unsafe {
+                    sum_hacc_dist_table_32bytes_batch_avx2(
+                        &batch_codes[code_range],
+                        &hacc_dist_table[table_range],
+                        batch_dists,
+                    );
+                }
+            } else {
+                let mut chunk_dists = [0u32; BATCH_SIZE];
+                unsafe {
+                    sum_hacc_dist_table_32bytes_batch_avx2(
+                        &batch_codes[code_range],
+                        &hacc_dist_table[table_range],
+                        &mut chunk_dists,
+                    );
+                }
+                batch_dists
+                    .iter_mut()
+                    .zip(chunk_dists.iter())
+                    .for_each(|(dist, chunk_dist)| *dist += *chunk_dist);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(unused)]
+unsafe fn sum_hacc_dist_table_32bytes_batch_avx2(
+    codes: &[u8],
+    hacc_dist_table: &[u8],
+    dists: &mut [u32],
+) {
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let mut low_accu0 = _mm256_setzero_si256();
+    let mut low_accu1 = _mm256_setzero_si256();
+    let mut low_accu2 = _mm256_setzero_si256();
+    let mut low_accu3 = _mm256_setzero_si256();
+    let mut high_accu0 = _mm256_setzero_si256();
+    let mut high_accu1 = _mm256_setzero_si256();
+    let mut high_accu2 = _mm256_setzero_si256();
+    let mut high_accu3 = _mm256_setzero_si256();
+
+    for code_offset in (0..codes.len()).step_by(BATCH_SIZE) {
+        let table_offset = code_offset * 2;
+        let c = _mm256_loadu_si256(codes.as_ptr().add(code_offset) as *const __m256i);
+        let lo = _mm256_and_si256(c, low_mask);
+        let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
+
+        let low_lut =
+            _mm256_loadu_si256(hacc_dist_table.as_ptr().add(table_offset) as *const __m256i);
+        let low_res_lo = _mm256_shuffle_epi8(low_lut, lo);
+        let low_res_hi = _mm256_shuffle_epi8(low_lut, hi);
+        low_accu0 = _mm256_add_epi16(low_accu0, low_res_lo);
+        low_accu1 = _mm256_add_epi16(low_accu1, _mm256_srli_epi16(low_res_lo, 8));
+        low_accu2 = _mm256_add_epi16(low_accu2, low_res_hi);
+        low_accu3 = _mm256_add_epi16(low_accu3, _mm256_srli_epi16(low_res_hi, 8));
+
+        let high_lut =
+            _mm256_loadu_si256(hacc_dist_table.as_ptr().add(table_offset + 32) as *const __m256i);
+        let high_res_lo = _mm256_shuffle_epi8(high_lut, lo);
+        let high_res_hi = _mm256_shuffle_epi8(high_lut, hi);
+        high_accu0 = _mm256_add_epi16(high_accu0, high_res_lo);
+        high_accu1 = _mm256_add_epi16(high_accu1, _mm256_srli_epi16(high_res_lo, 8));
+        high_accu2 = _mm256_add_epi16(high_accu2, high_res_hi);
+        high_accu3 = _mm256_add_epi16(high_accu3, _mm256_srli_epi16(high_res_hi, 8));
+    }
+
+    low_accu0 = _mm256_sub_epi16(low_accu0, _mm256_slli_epi16(low_accu1, 8));
+    let low_dis0 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(low_accu0, low_accu1, 0x21),
+        _mm256_blend_epi32(low_accu0, low_accu1, 0xF0),
+    );
+    low_accu2 = _mm256_sub_epi16(low_accu2, _mm256_slli_epi16(low_accu3, 8));
+    let low_dis1 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(low_accu2, low_accu3, 0x21),
+        _mm256_blend_epi32(low_accu2, low_accu3, 0xF0),
+    );
+
+    high_accu0 = _mm256_sub_epi16(high_accu0, _mm256_slli_epi16(high_accu1, 8));
+    let high_dis0 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(high_accu0, high_accu1, 0x21),
+        _mm256_blend_epi32(high_accu0, high_accu1, 0xF0),
+    );
+    high_accu2 = _mm256_sub_epi16(high_accu2, _mm256_slli_epi16(high_accu3, 8));
+    let high_dis1 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(high_accu2, high_accu3, 0x21),
+        _mm256_blend_epi32(high_accu2, high_accu3, 0xF0),
+    );
+
+    let low0 = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(low_dis0));
+    let low1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(low_dis0, 1));
+    let high0 = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(high_dis0));
+    let high1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(high_dis0, 1));
+    let res0 = _mm256_add_epi32(low0, _mm256_slli_epi32(high0, 8));
+    let res1 = _mm256_add_epi32(low1, _mm256_slli_epi32(high1, 8));
+    _mm256_storeu_si256(dists.as_mut_ptr() as *mut __m256i, res0);
+    _mm256_storeu_si256(dists.as_mut_ptr().add(8) as *mut __m256i, res1);
+
+    let low2 = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(low_dis1));
+    let low3 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(low_dis1, 1));
+    let high2 = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(high_dis1));
+    let high3 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(high_dis1, 1));
+    let res2 = _mm256_add_epi32(low2, _mm256_slli_epi32(high2, 8));
+    let res3 = _mm256_add_epi32(low3, _mm256_slli_epi32(high3, 8));
+    _mm256_storeu_si256(dists.as_mut_ptr().add(16) as *mut __m256i, res2);
+    _mm256_storeu_si256(dists.as_mut_ptr().add(24) as *mut __m256i, res3);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -336,6 +604,101 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(actual.iter().all(|dist| *dist != u16::MAX));
+    }
+
+    #[test]
+    fn test_sum_4bit_dist_table_u16_basic() {
+        let n = BATCH_SIZE;
+        let code_len = 2;
+        let codes = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc, 0xde, 0xf0,
+        ];
+        let codes = codes.repeat(n * code_len / codes.len());
+        let dist_table: Vec<u16> = (0..16 * 4).map(|idx| (idx % 16 + 1) as u16).collect();
+
+        let mut dists = vec![0u32; n];
+        sum_4bit_dist_table_u16(n, code_len, &codes, &dist_table, &mut dists);
+
+        assert_eq!(dists[1], 38);
+    }
+
+    #[test]
+    fn test_transfer_4bit_dist_table_u16_layout() {
+        let dist_table: Vec<u16> = (0..32).map(|idx| 0x1200 + idx as u16).collect();
+        let mut hacc_dist_table = Vec::new();
+        transfer_4bit_dist_table_u16(&dist_table, &mut hacc_dist_table);
+
+        assert_eq!(hacc_dist_table.len(), 64);
+        for code in 0..16 {
+            assert_eq!(hacc_dist_table[code], dist_table[code] as u8);
+            assert_eq!(hacc_dist_table[16 + code], dist_table[16 + code] as u8);
+            assert_eq!(hacc_dist_table[32 + code], (dist_table[code] >> 8) as u8);
+            assert_eq!(
+                hacc_dist_table[48 + code],
+                (dist_table[16 + code] >> 8) as u8
+            );
+        }
+    }
+
+    #[test]
+    fn test_sum_4bit_dist_table_u16_matches_reference_multi_batch() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+
+        for code_len in [1, 3, 16, 191, 192, 1024] {
+            let n = BATCH_SIZE * 4;
+            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+            let dist_table: Vec<u16> = (0..BATCH_SIZE * code_len)
+                .map(|_| rng.random::<u16>())
+                .collect();
+
+            let mut expected = vec![0u32; n];
+            sum_4bit_dist_table_u16_scalar(code_len, &codes, &dist_table, &mut expected);
+
+            let mut actual = vec![u32::MAX; n];
+            sum_4bit_dist_table_u16(n, code_len, &codes, &dist_table, &mut actual);
+
+            assert_eq!(
+                actual,
+                expected,
+                "u16 dist-table mismatch for code_len={} (DIM={})",
+                code_len,
+                code_len * 8,
+            );
+        }
+    }
+
+    #[test]
+    fn test_sum_4bit_hacc_dist_table_matches_u16_reference_multi_batch() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(101);
+
+        for code_len in [1, 3, 16, 191, 192, 1024] {
+            let n = BATCH_SIZE * 4;
+            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+            let dist_table: Vec<u16> = (0..BATCH_SIZE * code_len)
+                .map(|_| rng.random::<u16>())
+                .collect();
+
+            let mut hacc_dist_table = Vec::new();
+            transfer_4bit_dist_table_u16(&dist_table, &mut hacc_dist_table);
+
+            let mut expected = vec![0u32; n];
+            sum_4bit_dist_table_u16_scalar(code_len, &codes, &dist_table, &mut expected);
+
+            let mut actual = vec![u32::MAX; n];
+            sum_4bit_hacc_dist_table(n, code_len, &codes, &hacc_dist_table, &mut actual);
+
+            assert_eq!(
+                actual,
+                expected,
+                "hacc dist-table mismatch for code_len={} (DIM={})",
+                code_len,
+                code_len * 8,
+            );
+        }
     }
 
     /// Test that the SIMD path (NEON on ARM, AVX2 on x86) produces identical

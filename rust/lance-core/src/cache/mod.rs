@@ -49,7 +49,7 @@ pub mod backend;
 pub mod codec;
 mod moka;
 
-pub use backend::{CacheBackend, CacheEntry, InternalCacheKey};
+pub use backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
 pub use codec::{CacheCodec, CacheCodecImpl};
 pub use moka::MokaCacheBackend;
 
@@ -243,6 +243,40 @@ impl LanceCache {
 
     pub async fn size_bytes(&self) -> usize {
         self.cache.size_bytes().await
+    }
+
+    /// Return an iterator over keys currently stored under this cache's prefix.
+    ///
+    /// Returns `None` when the backend does not support key inventory. The
+    /// iterator is intended for diagnostics and may be weakly consistent with
+    /// concurrent cache mutations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::{borrow::Cow, sync::Arc};
+    /// # use lance_core::cache::{CacheKey, LanceCache};
+    /// # struct MyKey;
+    /// # impl CacheKey for MyKey {
+    /// #     type ValueType = Vec<i32>;
+    /// #     fn key(&self) -> Cow<'_, str> { Cow::Borrowed("my-key") }
+    /// #     fn type_name() -> &'static str { "VecI32" }
+    /// # }
+    /// # async fn example() {
+    /// let cache = LanceCache::with_capacity(1024);
+    /// cache.insert_with_key(&MyKey, Arc::new(vec![1, 2, 3])).await;
+    ///
+    /// let mut keys = cache.keys().await.expect("Moka supports key inventory");
+    /// assert_eq!(keys.next().unwrap().key(), "my-key");
+    /// # }
+    /// ```
+    pub async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
+        Some(Box::new(
+            self.cache
+                .keys()
+                .await?
+                .filter(|key| key.starts_with(&self.prefix)),
+        ))
     }
 
     // -- Sized insert/get (internal, shared by sized and unsized paths) --------
@@ -557,7 +591,7 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::marker::PhantomData;
 
     struct TestKey<T: 'static> {
@@ -607,6 +641,18 @@ mod tests {
         fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
+    }
+
+    fn key_fields(keys: &[InternalCacheKey]) -> BTreeSet<(String, String, &'static str)> {
+        keys.iter()
+            .map(|key| {
+                (
+                    key.prefix().to_string(),
+                    key.key().to_string(),
+                    key.type_name(),
+                )
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -716,6 +762,99 @@ mod tests {
                 .is_some()
         );
         assert_eq!(base.stats().await.hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_keys_with_prefixes() {
+        let base = LanceCache::with_capacity(1000);
+        let prefixed = base.with_key_prefix("ns");
+        let nested = prefixed.with_key_prefix("index");
+        let other = base.with_key_prefix("ns-other");
+
+        base.insert_with_key(&TestKey::new("root"), Arc::new(vec![0]))
+            .await;
+        prefixed
+            .insert_with_key(&TestKey::new("child"), Arc::new(vec![1]))
+            .await;
+        nested
+            .insert_with_key(&TestKey::new("nested"), Arc::new(vec![2]))
+            .await;
+        other
+            .insert_with_key(&TestKey::new("other"), Arc::new(vec![3]))
+            .await;
+
+        let base_keys = base.keys().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            key_fields(&base_keys),
+            BTreeSet::from([
+                (
+                    "".to_string(),
+                    "root".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns/".to_string(),
+                    "child".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns/index/".to_string(),
+                    "nested".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns-other/".to_string(),
+                    "other".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+            ])
+        );
+
+        let prefixed_keys = prefixed.keys().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            key_fields(&prefixed_keys),
+            BTreeSet::from([
+                (
+                    "ns/".to_string(),
+                    "child".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns/index/".to_string(),
+                    "nested".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_keys_reflect_invalidation_and_clear() {
+        let base = LanceCache::with_capacity(1000);
+        let prefixed = base.with_key_prefix("ns");
+        let other = base.with_key_prefix("other");
+
+        prefixed
+            .insert_with_key(&TestKey::new("child"), Arc::new(vec![1]))
+            .await;
+        other
+            .insert_with_key(&TestKey::new("other"), Arc::new(vec![2]))
+            .await;
+        assert_eq!(base.keys().await.unwrap().count(), 2);
+
+        prefixed.invalidate_prefix("").await;
+        let keys = base.keys().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            key_fields(&keys),
+            BTreeSet::from([(
+                "other/".to_string(),
+                "other".to_string(),
+                TestKey::<Vec<i32>>::type_name()
+            )])
+        );
+
+        base.clear().await;
+        assert_eq!(base.keys().await.unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -833,6 +972,7 @@ mod tests {
                 .await
                 .is_none()
         );
+        assert!(cache.keys().await.is_none());
     }
 
     #[tokio::test]

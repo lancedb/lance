@@ -24,8 +24,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
-    TRACE_DATASET_EVENTS,
+    DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -69,7 +68,7 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
-mod branch_location;
+pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
@@ -104,7 +103,7 @@ use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
+use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -501,17 +500,23 @@ impl Dataset {
     ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
+        let source_location = self
+            .branch_location()
+            .find_branch(source_branch.as_deref())?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: source_branch.clone(),
             ref_version: version_number,
-            ref_path: String::from(self.uri()),
+            ref_path: source_location.uri,
             branch_name: Some(branch.to_string()),
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
-            .with_store_params(store_params.unwrap_or_default())
+            // Fall back to the dataset's own store params
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
@@ -557,6 +562,15 @@ impl Dataset {
         version_number: Option<u64>,
         branch: Option<&str>,
     ) -> Result<Self> {
+        // Reject malformed names at the boundary (mirroring the branch CRUD
+        // paths) so they fail as InvalidRef instead of tripping the wrong-chain
+        // check below
+        if let Some(branch_name) = branch
+            && !Branches::is_main_branch(branch)
+        {
+            refs::check_valid_branch(branch_name)?;
+        }
+
         let new_location = self.branch_location().find_branch(branch)?;
 
         let manifest_location = if let Some(version_number) = version_number {
@@ -584,6 +598,21 @@ impl Dataset {
             self.session.as_ref(),
         )
         .await?;
+
+        // The resolved manifest must belong to the requested branch. A mismatch
+        // means the commit handler resolved against a different chain (for
+        // example an external manifest store that ignores branch-qualified
+        // paths); error loudly rather than hand back another branch's data.
+        let requested_branch = branch.and_then(refs::standardize_branch);
+        if manifest.branch.as_deref() != requested_branch.as_deref() {
+            return Err(Error::internal(format!(
+                "checkout of branch '{}' at version {} resolved a manifest belonging to branch '{}'",
+                refs::normalize_branch(branch),
+                manifest.version,
+                refs::normalize_branch(manifest.branch.as_deref()),
+            )));
+        }
+
         Self::checkout_manifest(
             self.object_store.clone(),
             new_location.path,
@@ -780,12 +809,50 @@ impl Dataset {
         batches: impl RecordBatchReader + Send + 'static,
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        Self::write_into_namespace_impl(batches, namespace_client, table_id, None, params).await
+    }
+
+    /// Write into a branch of a namespace client-managed table.
+    ///
+    /// Behaves like [`write_into_namespace`](Self::write_into_namespace), but APPEND and
+    /// OVERWRITE open and commit against `branch` instead of main. CREATE is rejected,
+    /// since a branch forks from an existing version.
+    pub async fn write_into_namespace_on_branch(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        branch: &str,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        Self::write_into_namespace_impl(
+            batches,
+            namespace_client,
+            table_id,
+            Some(branch.to_string()),
+            params,
+        )
+        .await
+    }
+
+    async fn write_into_namespace_impl(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        branch: Option<String>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut write_params = params.take().unwrap_or_default();
 
         match write_params.mode {
             WriteMode::Create => {
+                if branch.is_some() {
+                    return Err(Error::not_supported_source(
+                        "cannot create a table on a branch; create on main first, then branch it"
+                            .into(),
+                    ));
+                }
                 let declare_request = DeclareTableRequest {
                     id: Some(table_id.clone()),
                     ..Default::default()
@@ -803,10 +870,13 @@ impl Dataset {
 
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
+                    // The store derives the branch a request targets from the
+                    // base path it is handed, resolved against the table root.
+                    let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
                         namespace_client.clone(),
                         table_id.clone(),
-                    );
+                        &uri,
+                    )?;
                     let commit_handler: Arc<dyn CommitHandler> =
                         Arc::new(ExternalManifestCommitHandler {
                             external_manifest_store: Arc::new(external_store),
@@ -858,18 +928,25 @@ impl Dataset {
                     )))
                 })?;
 
-                // Set up commit handler when managed_versioning is enabled
-                if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace_client.clone(),
-                        table_id.clone(),
-                    );
-                    let commit_handler: Arc<dyn CommitHandler> =
-                        Arc::new(ExternalManifestCommitHandler {
+                // Set up commit handler when managed_versioning is enabled.
+                // It must ride on the dataset opened below: InsertBuilder
+                // commits through the destination dataset's handler and does
+                // not consult write params for Dataset destinations.
+                let commit_handler: Option<Arc<dyn CommitHandler>> =
+                    if response.managed_versioning == Some(true) {
+                        // The store derives the branch a request targets from the
+                        // base path it is handed, resolved against the table root.
+                        let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                            namespace_client.clone(),
+                            table_id.clone(),
+                            uri.as_str(),
+                        )?;
+                        Some(Arc::new(ExternalManifestCommitHandler {
                             external_manifest_store: Arc::new(external_store),
-                        });
-                    write_params.commit_handler = Some(commit_handler);
-                }
+                        }))
+                    } else {
+                        None
+                    };
 
                 // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
@@ -907,6 +984,12 @@ impl Dataset {
                     && let Some(accessor) = &store_params.storage_options_accessor
                 {
                     builder = builder.with_storage_options_accessor(accessor.clone());
+                }
+                if let Some(commit_handler) = commit_handler {
+                    builder = builder.with_commit_handler(commit_handler);
+                }
+                if let Some(branch) = &branch {
+                    builder = builder.with_branch(branch, None);
                 }
                 let dataset = Arc::new(builder.load().await?);
 
@@ -1202,8 +1285,15 @@ impl Dataset {
         &self,
         policy: CleanupPolicy,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        cleanup::cleanup_old_versions(self, policy).boxed()
+        async move { self.cleanup(policy).execute().await }.boxed()
+    }
+
+    /// Creates a cleanup operation for this dataset.
+    ///
+    /// The returned operation can be explained without deleting files, or
+    /// executed to re-evaluate the current dataset state and remove files.
+    pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
+        CleanupOperation::new(self, policy)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2151,6 +2241,39 @@ impl Dataset {
             .version)
     }
 
+    /// Return whether the dataset has a newer committed version.
+    pub async fn is_stale(&self) -> Result<bool> {
+        let latest_version = self.latest_version_id().await?;
+        Ok(latest_version != self.manifest.version)
+    }
+
+    /// Return whether the immediate attached successor manifest exists.
+    ///
+    /// This is a fast contiguous-history probe. It does not resolve the latest
+    /// version and may return `false` if intermediate manifests have been
+    /// removed. Callers that need a general freshness check should use
+    /// [`Self::is_stale`].
+    #[doc(hidden)]
+    pub async fn has_successor_version(&self) -> Result<bool> {
+        let Some(next_version) = self.manifest.version.checked_add(1) else {
+            return Ok(false);
+        };
+        if lance_table::format::is_detached_version(next_version) {
+            return Ok(false);
+        }
+
+        let exists = self
+            .commit_handler
+            .version_exists(
+                &self.base,
+                next_version,
+                self.object_store.inner.as_ref(),
+                self.manifest_location.naming_scheme,
+            )
+            .await?;
+        Ok(exists)
+    }
+
     pub fn count_fragments(&self) -> usize {
         self.manifest.fragments.len()
     }
@@ -2511,11 +2634,12 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
+        let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: self.uri.clone(),
+            ref_path: source_location.uri,
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None);

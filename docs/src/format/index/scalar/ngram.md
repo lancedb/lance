@@ -30,3 +30,9 @@ The N-gram index provides inexact results for the following query types:
 | Query Type     | Description              | Operation                                             | Result Type |
 |----------------|--------------------------|-------------------------------------------------------|-------------|
 | **contains**   | Substring search in text | Finds all trigrams in query, intersects posting lists | AtMost      |
+| **regexp_like** / **regexp_match** | Regular-expression match | Derives a necessary trigram condition from the pattern (AND of intersections, OR of unions), then rechecks the true regex | AtMost |
+| **LIKE** (infix) | Wildcard match such as `%foo%bar%` | Uses the literal segments of the pattern as a trigram condition, then rechecks the LIKE | AtMost |
+
+Patterns from which no trigram can be derived - for example `a.b`, `.*`,
+case-insensitive matches, or literal runs shorter than three characters - fall
+back to rechecking every row. This is always correct, just not accelerated.

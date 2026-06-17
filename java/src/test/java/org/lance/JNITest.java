@@ -20,6 +20,7 @@ import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
+import org.lance.ipc.ApproxMode;
 import org.lance.ipc.Query;
 import org.lance.test.JniTestHelper;
 
@@ -28,6 +29,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Arrays;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class JNITest {
@@ -48,6 +50,10 @@ public class JNITest {
 
   @Test
   public void testQuery() {
+    Query defaultQuery =
+        new Query.Builder().setColumn("column").setKey(new float[] {1.0f, 2.0f, 3.0f}).build();
+    assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
+
     JniTestHelper.parseQuery(
         Optional.of(
             new Query.Builder()
@@ -60,6 +66,7 @@ public class JNITest {
                 .setDistanceType(DistanceType.L2)
                 .setUseIndex(true)
                 .setQueryParallelism(-1)
+                .setApproxMode(ApproxMode.ACCURATE)
                 .build()));
   }
 

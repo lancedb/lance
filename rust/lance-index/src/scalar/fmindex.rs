@@ -1352,6 +1352,12 @@ impl ScalarIndex for FMIndexScalarIndex {
                     Default::default(),
                 )))
             }
+            // Regex queries are routed only to the ngram index (the FM-index's
+            // query parser advertises `supports_regex = false`), so this is
+            // unreachable in practice; reject it explicitly rather than silently.
+            TextQuery::Regex(_) => Err(Error::invalid_input(
+                "FMIndex does not support regular expression queries",
+            )),
         }
     }
     fn can_remap(&self) -> bool {
@@ -1645,6 +1651,9 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         Some(Box::new(TextQueryParser::new(
             index_name,
             self.name().to_string(),
+            // needs_recheck: the FM-index returns exact substring matches.
+            false,
+            // supports_regex: regex acceleration is only implemented for ngram.
             false,
         )))
     }

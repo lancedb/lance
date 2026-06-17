@@ -25,7 +25,7 @@ use crate::vector::bq::transform::{
     SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::{
-    RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits, rabit_ex_code_bytes,
+    RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
     rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
     validate_rq_num_bits,
 };
@@ -74,21 +74,6 @@ fn pack_sign_bits(codes: &mut [u8], rotated: &[f32]) {
     for (bit_idx, value) in rotated.iter().enumerate() {
         if value.is_sign_positive() {
             codes[bit_idx / u8::BITS as usize] |= 1u8 << (bit_idx % u8::BITS as usize);
-        }
-    }
-}
-
-#[inline]
-fn pack_ex_code_bits(codes: &mut [u8], ex_values: &[u8], ex_bits: u8) {
-    codes.fill(0);
-    let ex_bits = ex_bits as usize;
-    for (dim_idx, &value) in ex_values.iter().enumerate() {
-        let bit_offset = dim_idx * ex_bits;
-        for bit_idx in 0..ex_bits {
-            if (value >> bit_idx) & 1 != 0 {
-                let dst_bit = bit_offset + bit_idx;
-                codes[dst_bit / u8::BITS as usize] |= 1u8 << (dst_bit % u8::BITS as usize);
-            }
         }
     }
 }
@@ -200,7 +185,7 @@ fn quantize_ex_code(
         *ex_code_value = ex_code;
     }
 
-    pack_ex_code_bits(ex_code_dst, ex_code_values_dst, ex_bits);
+    crate::vector::bq::ex_dot::pack_blocked_row(ex_code_values_dst, ex_bits, ex_code_dst);
     residual_dot_code
 }
 
@@ -599,7 +584,11 @@ impl RabitQuantizer {
             .as_slice();
         let code_dim = self.code_dim();
         let code_bytes = rabit_binary_code_bytes(code_dim);
-        let ex_code_bytes = rabit_ex_code_bytes(code_dim, ex_bits)?;
+        let ex_code_bytes = if ex_bits == 0 {
+            0
+        } else {
+            crate::vector::bq::ex_dot::blocked_ex_code_bytes(code_dim, ex_bits)
+        };
 
         let mut encoded_codes = vec![0u8; n * code_bytes];
         let mut encoded_ex_codes = (ex_bits != 0).then(|| vec![0u8; n * ex_code_bytes]);
@@ -901,7 +890,7 @@ mod tests {
     use lance_linalg::distance::DistanceType;
     use rstest::rstest;
 
-    use crate::vector::bq::storage::RABIT_EX_CODE_COLUMN;
+    use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
 
     #[rstest]
     #[case(8)]
@@ -978,14 +967,14 @@ mod tests {
         assert!(
             !fields
                 .iter()
-                .any(|field| field.name() == RABIT_EX_CODE_COLUMN)
+                .any(|field| field.name() == RABIT_BLOCKED_EX_CODE_COLUMN)
         );
 
         let q = RabitQuantizer::new_with_rotation::<Float32Type>(3, 128, RQRotationType::Fast);
         let fields = q.extra_fields();
         for expected in [
             ERROR_FACTORS_FIELD.name().as_str(),
-            RABIT_EX_CODE_COLUMN,
+            RABIT_BLOCKED_EX_CODE_COLUMN,
             EX_ADD_FACTORS_FIELD.name().as_str(),
             EX_SCALE_FACTORS_FIELD.name().as_str(),
         ] {
@@ -1095,7 +1084,8 @@ mod tests {
                     .unwrap()
                     .as_fixed_size_list()
                     .value_length(),
-                32
+                // dim=32 is padded to one 64-dim block at ex_bits=8.
+                64
             );
         }
 

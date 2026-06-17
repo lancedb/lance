@@ -59,6 +59,14 @@ class CompactionOptions(TypedDict):
 
     The default will use the same default from ``scanner``.
     """
+    io_buffer_size: Optional[int]
+    """
+    The number of bytes to allow to queue up in the I/O buffer when scanning
+    input fragments.  Increasing this can avoid a deadlock that occurs when a
+    single batch of data is larger than the I/O buffer size.
+
+    The default will use the same default from ``scanner``.
+    """
     compaction_mode: Optional[
         Literal["reencode", "try_binary_copy", "force_binary_copy"]
     ]
