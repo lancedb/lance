@@ -11,7 +11,7 @@ use futures::Future;
 use crate::Result;
 
 use super::CacheCodec;
-use super::backend::{CacheBackend, CacheEntry, InternalCacheKey};
+use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
 
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
@@ -121,6 +121,13 @@ impl CacheBackend for MokaCacheBackend {
     async fn clear(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
+    }
+
+    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
+        self.cache.run_pending_tasks().await;
+        Some(Box::new(
+            self.cache.iter().map(|(key, _)| key.as_ref().clone()),
+        ))
     }
 
     async fn num_entries(&self) -> usize {

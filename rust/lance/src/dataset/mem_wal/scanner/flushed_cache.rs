@@ -25,7 +25,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 
-use super::block_list::scan_pk_hashes;
 use crate::dataset::{Dataset, DatasetBuilder};
 use crate::session::Session;
 
@@ -43,12 +42,10 @@ use crate::session::Session;
 pub struct FlushedMemTableCache {
     // `moka`'s async cache gives a bounded size plus single-flight
     // `try_get_with`, so concurrent first-queries on a just-flushed
-    // generation open the dataset exactly once.
+    // generation open the dataset exactly once. The opened dataset carries the
+    // session index cache, which also backs each generation's standalone PK
+    // dedup index (see `block_list::open_pk_index`) — no separate cache path.
     inner: moka::future::Cache<String, Arc<Dataset>>,
-    // Per-generation set of PK hashes for the vector-search block-list, keyed by
-    // the same immutable flushed path. Built lazily on the first query that needs
-    // it (single-flight) so repeated searches skip re-scanning the PK column.
-    pk_hashes: moka::future::Cache<String, Arc<HashSet<u64>>>,
 }
 
 impl FlushedMemTableCache {
@@ -63,10 +60,6 @@ impl FlushedMemTableCache {
                 // Required for `retain_paths`: moka silently ignores
                 // `invalidate_entries_if` unless closure support is opted
                 // into at build time.
-                .support_invalidation_closures()
-                .build(),
-            pk_hashes: moka::future::Cache::builder()
-                .max_capacity(max_entries)
                 .support_invalidation_closures()
                 .build(),
         }
@@ -98,31 +91,6 @@ impl FlushedMemTableCache {
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
     }
 
-    /// Get the cached vector-search block-list (PK-hash set) for `path`, building
-    /// it (exactly once) on a miss by scanning the generation's `pk_columns`.
-    ///
-    /// Self-contained: it opens the generation (through this cache) and scans
-    /// internally, so callers — including an out-of-crate [`GenerationWarmer`] —
-    /// need none of lance's PK-hashing internals. The flushed path is immutable,
-    /// so a cached set is never stale; concurrent first-queries share one build
-    /// via `moka`'s single-flight `try_get_with`.
-    pub async fn get_or_build_pk_hashes(
-        &self,
-        path: &str,
-        session: Option<Arc<Session>>,
-        pk_columns: &[String],
-    ) -> Result<Arc<HashSet<u64>>> {
-        // Open first (a cheap hit once cached); the scan runs only on a miss.
-        let dataset = self.get_or_open(path, session).await?;
-        let pk = pk_columns.to_vec();
-        self.pk_hashes
-            .try_get_with(path.to_string(), async move {
-                scan_pk_hashes(&dataset, &pk).await.map(Arc::new)
-            })
-            .await
-            .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
-    }
-
     /// Drop cached entries whose path is not in `live_paths`.
     ///
     /// Called by the consumer after compaction retires generations. Purely a
@@ -137,10 +105,6 @@ impl FlushedMemTableCache {
         let _ = self
             .inner
             .invalidate_entries_if(move |path, _| !live.contains(path));
-        let live = live_paths.clone();
-        let _ = self
-            .pk_hashes
-            .invalidate_entries_if(move |path, _| !live.contains(path));
     }
 }
 
@@ -152,20 +116,16 @@ impl std::fmt::Debug for FlushedMemTableCache {
     }
 }
 
-/// Caching of opened flushed-generation datasets + their vector block-list,
-/// keyed by immutable path. Implemented by [`FlushedMemTableCache`]; a
+/// Caching of opened flushed-generation datasets, keyed by immutable path. The
+/// opened dataset carries the session index cache, which also backs each
+/// generation's secondary indexes and its PK dedup sidecar (see
+/// [`super::block_list::open_pk_index`]) — so a single `get_or_open` is the
+/// whole caching surface. Implemented by [`FlushedMemTableCache`]; a
 /// [`GenerationWarmer`] composes one to warm through it, and a consumer may
 /// supply its own implementation.
 #[async_trait]
 pub trait DatasetCache: Send + Sync + std::fmt::Debug {
     async fn get_or_open(&self, path: &str, session: Option<Arc<Session>>) -> Result<Arc<Dataset>>;
-
-    async fn get_or_build_pk_hashes(
-        &self,
-        path: &str,
-        session: Option<Arc<Session>>,
-        pk_columns: &[String],
-    ) -> Result<Arc<HashSet<u64>>>;
 
     fn retain_paths(&self, live_paths: &HashSet<String>);
 }
@@ -176,25 +136,16 @@ impl DatasetCache for FlushedMemTableCache {
         Self::get_or_open(self, path, session).await
     }
 
-    async fn get_or_build_pk_hashes(
-        &self,
-        path: &str,
-        session: Option<Arc<Session>>,
-        pk_columns: &[String],
-    ) -> Result<Arc<HashSet<u64>>> {
-        Self::get_or_build_pk_hashes(self, path, session, pk_columns).await
-    }
-
     fn retain_paths(&self, live_paths: &HashSet<String>) {
         Self::retain_paths(self, live_paths)
     }
 }
 
-/// Proactively warms a flushed generation into the shared caches: prewarm its
-/// indexes (into the session index cache) and optionally pre-build the vector
-/// block-list. This is the **seam** the flush and read paths fire — lance
-/// defines it; the consumer (e.g. the WAL pod) implements it. `None` ⇒ no
-/// warming, generations warm lazily on first read.
+/// Proactively warms a flushed generation into the shared caches: open the
+/// dataset and pre-load its secondary indexes and PK dedup sidecar so the first
+/// query sees no cold reads. This is the **seam** the flush and read paths fire
+/// — lance defines it; the consumer (e.g. the WAL pod) implements it. `None` ⇒
+/// no warming, generations warm lazily on first read.
 #[async_trait]
 pub trait GenerationWarmer: Send + Sync + std::fmt::Debug {
     async fn warm(&self, path: &str, pk_columns: &[String]) -> Result<()>;
@@ -203,10 +154,12 @@ pub trait GenerationWarmer: Send + Sync + std::fmt::Debug {
 /// Open a flushed-generation dataset, shared by all three LSM open sites
 /// (scan, point lookup, vector search).
 ///
-/// - `cache` present: route through [`FlushedMemTableCache`] (single-flight,
-///   shared `Arc`, manifest read amortized across queries).
+/// - `cache` present: route through a [`DatasetCache`] (e.g.
+///   [`FlushedMemTableCache`]: single-flight, shared `Arc`, manifest read
+///   amortized across queries).
 /// - `cache` absent: cold open via [`DatasetBuilder`]. Passing `session`
-///   still reuses the shared index / metadata caches.
+///   still reuses the shared index / metadata caches; `None`/`None`
+///   reproduces the original per-query cold-open behavior exactly.
 /// - `warmer` present: fire a fire-and-forget warm-on-open backstop behind the
 ///   returned handle (the warmer dedups already-warm paths). `None` ⇒ no warming.
 pub async fn open_flushed_dataset(
@@ -320,32 +273,6 @@ mod tests {
         }
         cache.inner.run_pending_tasks().await;
         assert_eq!(cache.inner.entry_count(), 1, "exactly one entry cached");
-    }
-
-    #[tokio::test]
-    async fn pk_hashes_cached_reuses_first_build() {
-        // The PK-hash set is keyed by the immutable flushed path: a hit returns
-        // the first-built set and never re-scans. Build once over a real
-        // generation, then a second call on the same path must reuse it.
-        let temp_dir = tempfile::tempdir().unwrap();
-        let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
-        write_dataset(&uri, &[1, 2, 1]).await; // pk=1 duplicated → 2 distinct
-
-        let cache = FlushedMemTableCache::new(8);
-        let cols = ["id".to_string()];
-        let first = cache
-            .get_or_build_pk_hashes(&uri, None, &cols)
-            .await
-            .unwrap();
-        let second = cache
-            .get_or_build_pk_hashes(&uri, None, &cols)
-            .await
-            .unwrap();
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a PK-hash cache hit must reuse the first-built set"
-        );
-        assert_eq!(second.len(), 2, "distinct pks (1, 2)");
     }
 
     #[tokio::test]

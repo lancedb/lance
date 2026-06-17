@@ -1899,9 +1899,15 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
-                .reconstruct(object_store, self.metadata_cache.as_ref(), partition_cache)
+                .reconstruct(
+                    object_store,
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
                 .await;
         }
 

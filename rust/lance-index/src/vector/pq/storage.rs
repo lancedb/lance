@@ -221,7 +221,7 @@ impl ProductQuantizationStorage {
                 "Row ID column not found from PQ storage".to_string(),
             ));
         };
-        let row_ids: Arc<UInt64Array> = row_ids
+        let mut row_ids: Arc<UInt64Array> = row_ids
             .as_primitive_opt::<UInt64Type>()
             .ok_or(Error::index(
                 "Row ID column is not of type UInt64".to_string(),
@@ -293,6 +293,11 @@ impl ProductQuantizationStorage {
                 .as_primitive::<UInt8Type>()
                 .clone()
                 .into();
+            // Refresh the stored row ids from the remapped batch. Without this
+            // the storage keeps the pre-remap (compacted-away) addresses while
+            // its codes are remapped, so search returns stale row ids and the
+            // take fails with "fragment ... does not exist".
+            row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone().into();
         }
 
         let distance_type = match distance_type {

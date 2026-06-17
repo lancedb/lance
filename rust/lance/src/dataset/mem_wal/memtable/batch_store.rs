@@ -615,6 +615,22 @@ impl BatchStore {
         (0..end).collect()
     }
 
+    /// The inclusive maximum visible *row* position at `max_visible_batch_position`,
+    /// or `None` when no rows are visible. The visible batches are the committed
+    /// prefix `[0, last_visible_idx]`; each batch carries its cumulative
+    /// `row_offset`, so this is the end of the last visible batch minus one.
+    /// Used to bound MVCC seeks against the maintained PK-position index.
+    pub fn max_visible_row(&self, max_visible_batch_position: usize) -> Option<u64> {
+        let len = self.committed_len.load(Ordering::Acquire);
+        if len == 0 {
+            return None;
+        }
+        let last_visible_idx = max_visible_batch_position.min(len - 1);
+        let last = self.get(last_visible_idx)?;
+        let visible_end = last.row_offset + last.num_rows as u64; // exclusive
+        visible_end.checked_sub(1)
+    }
+
     /// Check if a specific batch is visible at a given visibility position.
     #[inline]
     pub fn is_batch_visible(
@@ -908,6 +924,37 @@ mod tests {
 
         // Batch 3 doesn't exist
         assert!(!store.is_batch_visible(3, 10));
+    }
+
+    #[test]
+    fn test_max_visible_row() {
+        // (1) Empty store: no rows are visible at any position.
+        let store = BatchStore::with_capacity(10);
+        assert_eq!(store.max_visible_row(0), None);
+        assert_eq!(store.max_visible_row(100), None);
+
+        // Three batches → rows [0,10) [10,30) [30,60); row_offsets 0, 10, 30.
+        store.append(create_test_batch(10)).unwrap(); // position 0
+        store.append(create_test_batch(20)).unwrap(); // position 1
+        store.append(create_test_batch(30)).unwrap(); // position 2
+
+        // (2) A position within range yields the inclusive end of that prefix.
+        assert_eq!(store.max_visible_row(0), Some(9)); // batch 0: 0..10
+        assert_eq!(store.max_visible_row(1), Some(29)); // batch 1: 10..30
+        assert_eq!(store.max_visible_row(2), Some(59)); // batch 2: 30..60
+
+        // (3) A position beyond the committed range clamps to the last batch,
+        // i.e. the inclusive max over all rows.
+        assert_eq!(store.max_visible_row(100), Some(59));
+
+        // (4) An empty leading batch contributes no rows: at its own position
+        // the inclusive end underflows to None, while a later non-empty batch
+        // is reported correctly.
+        let store = BatchStore::with_capacity(10);
+        store.append(create_test_batch(0)).unwrap(); // position 0: rows [0,0)
+        store.append(create_test_batch(5)).unwrap(); // position 1: rows [0,5)
+        assert_eq!(store.max_visible_row(0), None); // empty prefix → no rows
+        assert_eq!(store.max_visible_row(1), Some(4)); // through batch 1
     }
 
     #[test]

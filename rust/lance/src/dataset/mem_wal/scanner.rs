@@ -43,7 +43,7 @@ mod point_lookup;
 mod projection;
 mod vector_search;
 
-pub use block_list::scan_pk_hashes;
+pub use block_list::write_pk_sidecar;
 pub use builder::LsmScanner;
 pub use collector::{
     ActiveMemTableRef, InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector,

@@ -169,6 +169,16 @@ pub fn flushed_memtable_path(
     shard_base_path(base_path, shard_id).join(format!("{}_gen_{}", random_hash, generation))
 }
 
+/// Subdirectory of a flushed generation holding its standalone primary-key
+/// dedup index (a sidecar BTree, not registered in the manifest). Both the
+/// flush writer and the block-list probe join this onto the generation path.
+pub const PK_INDEX_DIR: &str = "_pk_index";
+
+/// Path to a flushed generation's standalone primary-key dedup index.
+pub fn pk_index_path(gen_path: &Path) -> Path {
+    gen_path.clone().join(PK_INDEX_DIR)
+}
+
 /// Generate an 8-character random hex string for flushed MemTable directories.
 pub fn generate_random_hash() -> String {
     let bytes: [u8; 4] = rand::random();

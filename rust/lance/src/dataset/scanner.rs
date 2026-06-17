@@ -3591,33 +3591,35 @@ impl Scanner {
             .clone();
 
         let mut columns = vec![column];
-        if let Some(expr) = filter_plan.full_expr.as_ref() {
-            let filter_columns = Planner::column_names_in_expr(expr);
-            columns.extend(filter_columns);
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            columns.extend(Planner::column_names_in_expr(refine_expr));
         }
-        let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
-        let mut scan_node = self.scan_fragments(
-            true,
-            false,
-            false,
-            false,
-            false,
-            flat_fts_scan_schema,
-            Arc::new(fragments),
-            None,
-            false,
-        );
+        let scan_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(&columns, OnMissing::Error)?;
 
-        if let Some(expr) = filter_plan.full_expr.as_ref() {
-            // If there is a prefilter we need to manually apply it to the new data
-            scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+        let PlannedFilteredScan { mut plan, .. } = self
+            .filtered_read(
+                filter_plan,
+                scan_projection,
+                /*make_deletions_null=*/ false,
+                Some(Arc::new(fragments)),
+                None,
+                /*is_prefilter=*/ true,
+            )
+            .await?;
+
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
 
         let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
-            scan_node,
+            plan,
         ));
         Ok(flat_match_plan)
     }
@@ -10470,7 +10472,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        // The flat-FTS path now reads through `FilteredReadExec`, matching the
+        // brute-force KNN path. With no prefilter the scan still produces no
+        // pushdown, but the operator differs by storage version: legacy emits
+        // a `LanceScan`, v2 emits a `LanceRead` with empty filters.
+        let expected = if data_storage_version == LanceFileVersion::Legacy {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -10478,7 +10485,18 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
           UnionExec
             MatchQuery: column=s, query=hello
             FlatMatchQuery: column=s, query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
+              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
+        } else {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        CoalescePartitionsExec
+          UnionExec
+            MatchQuery: column=s, query=hello
+            FlatMatchQuery: column=s, query=hello
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
+        };
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
@@ -10511,6 +10529,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows and prefilter");
+        // After routing flat FTS through `FilteredReadExec`, the BTree on `i`
+        // pushes into the unindexed-fragment scan too — no more `FilterExec` on
+        // top of an unfiltered `LanceScan`. Legacy uses the `MaterializeIndex`
+        // shape, v2 uses `LanceRead` with `full_filter` set.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
@@ -10526,8 +10548,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
             FlatMatchQuery: column=s, query=hello
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+              CoalescePartitionsExec
+                UnionExec
+                  Take: columns="_rowid, (s)"
+                    CoalesceBatchesExec: target_batch_size=8192
+                      MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                  ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
@@ -10539,8 +10567,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             FlatMatchQuery: column=s, query=hello
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
         };
         assert_plan_equals(
             &dataset.dataset,
