@@ -4809,6 +4809,549 @@ mod tests {
         assert!(checked > 0, "expected to check at least one stored vector");
     }
 
+    /// Build an `id` + `vec` dataset, create the given IVF vector index,
+    /// optionally delete rows, then run deferred compaction (which materializes
+    /// the deletions into the fragment-reuse index) and assert that KNN over
+    /// surviving vectors during the FRI window (a) never returns a deleted row
+    /// and (b) stays consistent with the pre-compaction answer.
+    ///
+    /// The deletion path is the interesting one: materialized deletions drop
+    /// rows from the quantization storage at load time, which shifts storage
+    /// positions. Flat storage (FLAT/PQ/SQ/RQ) is scanned linearly so this is
+    /// fine, but the HNSW graph addresses storage positionally and is not
+    /// frag-reuse aware, so a desync would surface here as recall collapse or a
+    /// resurrected/again-deleted row.
+    /// Top-k `id`s for a KNN query against the `vec` column.
+    async fn vector_knn_ids(dataset: &Dataset, query: &[f32], k: usize) -> Vec<i32> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float32Type, Int32Type};
+        let qa = PrimitiveArray::<Float32Type>::from_iter_values(query.iter().copied());
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &qa, k).unwrap();
+        scanner.project(&["id"]).unwrap();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for b in &batches {
+            ids.extend(b["id"].as_primitive::<Int32Type>().values().iter().copied());
+        }
+        ids
+    }
+
+    async fn check_vector_defer_compaction(
+        params: VectorIndexParams,
+        delete_predicate: Option<&str>,
+        k: usize,
+        min_overlap: usize,
+    ) {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float32Type, Int32Type};
+        use lance_datagen::Dimension;
+
+        const DIM: u32 = 32;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let original_uuid = dataset
+            .load_index_by_name("vec_idx")
+            .await
+            .unwrap()
+            .unwrap()
+            .uuid;
+
+        if let Some(pred) = delete_predicate {
+            dataset.delete(pred).await.unwrap();
+        }
+
+        // Collect surviving (id, vec) pairs and the set of surviving ids.
+        let mut survivors: Vec<(i32, Vec<f32>)> = Vec::new();
+        {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id", "vec"]).unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            for batch in &batches {
+                let ids = batch["id"].as_primitive::<Int32Type>();
+                let vecs = batch["vec"].as_fixed_size_list();
+                for i in 0..batch.num_rows() {
+                    let v = vecs.value(i);
+                    let v = v.as_primitive::<Float32Type>().values().to_vec();
+                    survivors.push((ids.value(i), v));
+                }
+            }
+        }
+        assert!(!survivors.is_empty());
+        let surviving_ids: std::collections::HashSet<i32> =
+            survivors.iter().map(|(id, _)| *id).collect();
+
+        // Sample queries from survivors and capture the pre-compaction answer.
+        let step = (survivors.len() / 16).max(1);
+        let queries: Vec<(i32, Vec<f32>)> = survivors.iter().step_by(step).cloned().collect();
+        let mut baseline: Vec<Vec<i32>> = Vec::new();
+        for (_, q) in &queries {
+            baseline.push(vector_knn_ids(&dataset, q, k).await);
+        }
+
+        // Deferred compaction materializes the deletions into the frag-reuse index.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
+            "deferred compaction must record a frag-reuse index"
+        );
+        assert_eq!(
+            dataset
+                .load_index_by_name("vec_idx")
+                .await
+                .unwrap()
+                .unwrap()
+                .uuid,
+            original_uuid,
+            "index must not be physically remapped yet (FRI window)"
+        );
+
+        // During the FRI window: no deleted rows, and stable vs the baseline.
+        for (i, (_, q)) in queries.iter().enumerate() {
+            let after = vector_knn_ids(&dataset, q, k).await;
+            for id in &after {
+                assert!(
+                    surviving_ids.contains(id),
+                    "KNN returned id {id} that is not a surviving row (query #{i})"
+                );
+            }
+            let overlap = after.iter().filter(|id| baseline[i].contains(id)).count();
+            assert!(
+                overlap >= min_overlap,
+                "KNN top-{k} diverged after deferred compaction: overlap {overlap} < {min_overlap} (query #{i})"
+            );
+        }
+    }
+
+    fn small_ivf() -> lance_index::vector::ivf::IvfBuildParams {
+        lance_index::vector::ivf::IvfBuildParams {
+            max_iters: 2,
+            num_partitions: Some(2),
+            sample_rate: 2,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ivf_flat_defer_compaction_with_deletions() {
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, small_ivf());
+        // Flat storage is scanned linearly; dropping deleted rows is exact.
+        check_vector_defer_compaction(params, Some("id < 1500"), 10, 10).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_sq_defer_compaction_merge_only() {
+        use lance_index::vector::{hnsw::builder::HnswBuildParams, sq::builder::SQBuildParams};
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            small_ivf(),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        // No deletions: storage positions are stable, so the graph stays aligned.
+        check_vector_defer_compaction(params, None, 10, 9).await;
+    }
+
+    // NOTE: IVF_HNSW_* under materialized deletions is a known gap (lance#3993,
+    // HNSW auto-remap not implemented) — the HNSW graph isn't realigned after the
+    // frag-reuse drop. Deferred remap is gated off for HNSW tables, so there is
+    // no lance-level reproducer here; the gate is tested in the data plane.
+    // Merge-only HNSW is covered (see the *_remap_and_trim tests).
+
+    #[tokio::test]
+    async fn test_ivf_pq_defer_compaction_with_deletions() {
+        use lance_index::vector::pq::PQBuildParams;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            small_ivf(),
+            PQBuildParams {
+                max_iters: 2,
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        check_vector_defer_compaction(params, Some("id < 1500"), 10, 8).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_sq_defer_compaction_with_deletions() {
+        use lance_index::vector::sq::builder::SQBuildParams;
+        let params = VectorIndexParams::with_ivf_sq_params(
+            DistanceType::L2,
+            small_ivf(),
+            SQBuildParams::default(),
+        );
+        check_vector_defer_compaction(params, Some("id < 1500"), 10, 8).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_rq_defer_compaction_with_deletions() {
+        use lance_index::vector::bq::RQBuildParams;
+        let params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            small_ivf(),
+            RQBuildParams::new(1),
+        );
+        check_vector_defer_compaction(params, Some("id < 1500"), 10, 8).await;
+    }
+
+    /// Merge-only deferred compaction, then a PHYSICAL remap + FRI trim. Asserts
+    /// the index is rebuilt, the fragment-reuse index trims to zero versions,
+    /// and KNN stays consistent with the pre-compaction answer through both the
+    /// FRI window and the physical remap. (HNSW rebuilds its graph on physical
+    /// remap, so the overlap is recall-tolerant.)
+    async fn check_vector_remap_and_trim(
+        params: VectorIndexParams,
+        k: usize,
+        window_overlap: usize,
+        post_remap_overlap: Option<usize>,
+    ) {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float32Type, Int32Type};
+        use lance_datagen::Dimension;
+
+        const DIM: u32 = 32;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+            )
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let original_uuid = dataset
+            .load_index_by_name("vec_idx")
+            .await
+            .unwrap()
+            .unwrap()
+            .uuid;
+
+        // Sample queries from stored vectors + capture the pre-compaction answer.
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        {
+            let mut scanner = dataset.scan();
+            scanner.project(&["vec"]).unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            for batch in &batches {
+                let vecs = batch["vec"].as_fixed_size_list();
+                for i in 0..batch.num_rows() {
+                    let v = vecs.value(i);
+                    rows.push(v.as_primitive::<Float32Type>().values().to_vec());
+                }
+            }
+        }
+        let step = (rows.len() / 16).max(1);
+        let queries: Vec<Vec<f32>> = rows.iter().step_by(step).cloned().collect();
+        let mut baseline: Vec<Vec<i32>> = Vec::new();
+        for q in &queries {
+            baseline.push(vector_knn_ids(&dataset, q, k).await);
+        }
+
+        // Merge-only deferred compaction.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert_eq!(
+            dataset
+                .load_index_by_name("vec_idx")
+                .await
+                .unwrap()
+                .unwrap()
+                .uuid,
+            original_uuid,
+            "index must not be physically remapped yet (FRI window)"
+        );
+        for (i, q) in queries.iter().enumerate() {
+            let window = vector_knn_ids(&dataset, q, k).await;
+            let overlap = window.iter().filter(|id| baseline[i].contains(id)).count();
+            assert!(
+                overlap >= window_overlap,
+                "FRI-window KNN diverged: overlap {overlap} < {window_overlap} (query #{i})"
+            );
+        }
+
+        // Physical remap + trim the fragment-reuse index.
+        remapping::remap_column_index(&mut dataset, &["vec"], Some("vec_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+        let remapped_uuid = dataset
+            .load_index_by_name("vec_idx")
+            .await
+            .unwrap()
+            .unwrap()
+            .uuid;
+        assert_ne!(
+            remapped_uuid, original_uuid,
+            "index should have been physically remapped"
+        );
+        if let Some(meta) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+        {
+            let versions = load_frag_reuse_index_details(&dataset, &meta)
+                .await
+                .unwrap()
+                .versions
+                .len();
+            assert_eq!(versions, 0, "frag-reuse index must trim to zero versions");
+        }
+
+        for (i, q) in queries.iter().enumerate() {
+            let after = vector_knn_ids(&dataset, q, k).await;
+            // No stale/desynced addresses (a bad address fails the take above).
+            assert!(
+                !after.is_empty(),
+                "post-remap KNN returned no rows (query #{i})"
+            );
+            // Physical remap rebuilds the HNSW graph, so recall is only compared
+            // for the exact (non-HNSW) types.
+            if let Some(min_overlap) = post_remap_overlap {
+                let overlap = after.iter().filter(|id| baseline[i].contains(id)).count();
+                assert!(
+                    overlap >= min_overlap,
+                    "post-remap KNN diverged: overlap {overlap} < {min_overlap} (query #{i})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ivf_flat_remap_and_trim() {
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, small_ivf());
+        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+    }
+
+    // Regression: PQ storage used to remap its codes through the frag-reuse
+    // index but keep the pre-remap `row_ids` field, so search returned stale
+    // (compacted-away) addresses and the take failed with "fragment ... does
+    // not exist" — even merge-only, and only observable when the query fetches
+    // row content (the existing `test_read_ivf_pq_index_v3_with_defer_index_remap`
+    // projects no columns, so it never takes and missed this).
+    #[tokio::test]
+    async fn test_ivf_pq_remap_and_trim() {
+        use lance_index::vector::pq::PQBuildParams;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            small_ivf(),
+            PQBuildParams {
+                max_iters: 2,
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_sq_remap_and_trim() {
+        use lance_index::vector::sq::builder::SQBuildParams;
+        let params = VectorIndexParams::with_ivf_sq_params(
+            DistanceType::L2,
+            small_ivf(),
+            SQBuildParams::default(),
+        );
+        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_rq_remap_and_trim() {
+        use lance_index::vector::bq::RQBuildParams;
+        let params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            small_ivf(),
+            RQBuildParams::new(1),
+        );
+        check_vector_remap_and_trim(params, 10, 8, Some(8)).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_sq_remap_and_trim() {
+        use lance_index::vector::{hnsw::builder::HnswBuildParams, sq::builder::SQBuildParams};
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            small_ivf(),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        // Physical remap rebuilds the HNSW graph, so use a recall-tolerant overlap.
+        check_vector_remap_and_trim(params, 10, 7, None).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_pq_remap_and_trim() {
+        use lance_index::vector::{hnsw::builder::HnswBuildParams, pq::PQBuildParams};
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            DistanceType::L2,
+            small_ivf(),
+            HnswBuildParams::default(),
+            PQBuildParams {
+                max_iters: 2,
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        check_vector_remap_and_trim(params, 10, 7, None).await;
+    }
+
+    // Scalar index correctness across deferred compaction WITH materialized
+    // deletions. The existing test_read_*_index_with_defer_index_remap tests are
+    // merge-only and project no columns (count-only), so they never take and
+    // never exercise the deletion drop path. These add an `id` column, delete a
+    // prefix, defer-compact, then run the indexed query *projecting id* (a take)
+    // and assert no deleted row is returned. Bitmap/BTree have no positional
+    // internal structure so the drop path is exact; the Inverted (FTS) index
+    // does (see its test below), and currently desyncs under deletions.
+
+    #[tokio::test]
+    async fn test_bitmap_index_defer_compaction_with_deletions() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "category",
+                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
+            )
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Bitmap,
+                Some("category_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset.delete("id < 1500").await.unwrap();
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
+            "deferred compaction must record a frag-reuse index"
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.filter("category = 3").unwrap();
+        scanner.project(&["id"]).unwrap();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut returned = 0;
+        for b in &batches {
+            for id in b["id"].as_primitive::<Int32Type>().values() {
+                assert!(
+                    *id >= 1500,
+                    "bitmap returned deleted id {id} in the FRI window"
+                );
+                returned += 1;
+            }
+        }
+        assert!(returned > 0, "expected surviving category=3 rows");
+    }
+
+    // NOTE: Inverted/FTS under materialized deletions is broken (BM25 scores
+    // via positional num_tokens[doc_id]; the frag-reuse drop shifts doc_id
+    // positions -> out-of-bounds). It is gated off defer in the data plane
+    // until fixed, so there is no lance-level reproducer here. Merge-only FTS
+    // is covered by test_read_inverted_index_with_defer_index_remap.
+
     #[tokio::test]
     async fn test_default_compaction_planner() {
         let test_dir = TempStrDir::default();
