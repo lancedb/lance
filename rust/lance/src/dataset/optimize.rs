@@ -191,6 +191,13 @@ pub struct CompactionOptions {
     /// specified then the default (see
     /// [`crate::dataset::Scanner::batch_size`]) will be used.
     pub batch_size: Option<usize>,
+    /// The number of bytes to allow to queue up in the I/O buffer when scanning
+    /// the input fragments.  If not specified then the default (see
+    /// [`crate::dataset::Scanner::io_buffer_size`]) will be used.
+    ///
+    /// Increasing this can avoid a deadlock that occurs when a single batch of
+    /// data is larger than the I/O buffer size.
+    pub io_buffer_size: Option<u64>,
     /// Whether to defer remapping indices during compaction. If true, indices will
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
@@ -237,6 +244,7 @@ impl Default for CompactionOptions {
             num_threads: None,
             max_bytes_per_file: None,
             batch_size: None,
+            io_buffer_size: None,
             defer_index_remap: false,
             compaction_mode: None,
             enable_binary_copy: false,
@@ -264,6 +272,7 @@ impl CompactionOptions {
     /// - `lance.compaction.materialize_deletions_threshold`
     /// - `lance.compaction.defer_index_remap`
     /// - `lance.compaction.batch_size`
+    /// - `lance.compaction.io_buffer_size`
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
@@ -341,6 +350,14 @@ impl CompactionOptions {
                 }
                 "batch_size" => {
                     self.batch_size = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "io_buffer_size" => {
+                    self.io_buffer_size = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
                             key, value
@@ -1194,6 +1211,8 @@ async fn transform_blob_v2_batch(
 ///   and preserve insertion order.
 /// - `batch_size`: Optional batch size; if provided, set it on the scanner to control
 ///   read batching.
+/// - `io_buffer_size`: Optional I/O buffer size in bytes; if provided, set it on the
+///   scanner to control how much data is queued during reads.
 /// - `with_frags`: Whether to scan only the specified old fragments and force
 ///   in-order reading.
 /// - `capture_row_ids`: When index remapping is needed, include and capture the
@@ -1209,6 +1228,7 @@ async fn prepare_reader(
     dataset: &Dataset,
     fragments: &[Fragment],
     batch_size: Option<usize>,
+    io_buffer_size: Option<u64>,
     with_frags: bool,
     capture_row_ids: bool,
 ) -> Result<(
@@ -1233,6 +1253,9 @@ async fn prepare_reader(
     }
     if let Some(bs) = batch_size {
         scanner.batch_size(bs);
+    }
+    if let Some(io_buffer_size) = io_buffer_size {
+        scanner.io_buffer_size(io_buffer_size);
     }
     if with_frags {
         scanner
@@ -1515,6 +1538,7 @@ async fn rewrite_files(
             dataset.as_ref(),
             &fragments,
             options.batch_size,
+            options.io_buffer_size,
             true,
             needs_remapping,
         )
@@ -2634,6 +2658,57 @@ mod tests {
         let scanned_data = concat_batches(&batches[0].schema(), &batches).unwrap();
 
         assert_eq!(scanned_data, data);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_compact_with_io_buffer_size(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        // Compaction should succeed and produce correct results when an
+        // explicit io_buffer_size is provided via CompactionOptions.
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+
+        // Create a table with 2 small fragments so there is something to compact.
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 5_000,
+            max_rows_per_group: 1_000,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let options = CompactionOptions {
+            // A generous buffer so the read does not deadlock on large batches.
+            io_buffer_size: Some(256 * 1024 * 1024),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+
+        // All rows are preserved after compaction.
+        let scanner = dataset.scan();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let scanned_data = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(scanned_data.num_rows(), data.num_rows());
     }
 
     #[rstest]
@@ -4616,6 +4691,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_ivf_rq_index_v3_with_defer_index_remap() {
+        use arrow_array::cast::AsArray;
+        use lance_index::vector::bq::RQBuildParams;
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(128)),
+            )
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+
+        let stored: Vec<Vec<f32>> = {
+            let mut scanner = dataset.scan();
+            scanner.project(&["vec"]).unwrap();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            for batch in &batches {
+                let vecs = batch["vec"].as_fixed_size_list();
+                for i in 0..batch.num_rows() {
+                    let values = vecs.value(i);
+                    let values = values.as_primitive::<Float32Type>();
+                    out.push(values.values().to_vec());
+                }
+            }
+            out
+        };
+
+        let index_name = Some("vec_idx".into());
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                index_name.clone(),
+                &VectorIndexParams {
+                    metric_type: DistanceType::L2,
+                    stages: vec![
+                        StageParams::Ivf(IvfBuildParams {
+                            max_iters: 2,
+                            num_partitions: Some(2),
+                            sample_rate: 2,
+                            ..Default::default()
+                        }),
+                        StageParams::RQ(RQBuildParams::new(1)),
+                    ],
+                    version: crate::index::vector::IndexFileVersion::V3,
+                    skip_transpose: false,
+                    runtime_hints: Default::default(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let original_index = indices.iter().find(|idx| idx.name == "vec_idx").unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert!(metrics.fragments_added > 0);
+
+        let Some(current_index) = dataset.load_index_by_name("vec_idx").await.unwrap() else {
+            panic!("vec index must be available");
+        };
+        assert_eq!(current_index.uuid, original_index.uuid);
+
+        let frag_reuse_present = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+        assert!(
+            frag_reuse_present,
+            "defer_index_remap must record a {} index",
+            FRAG_REUSE_INDEX_NAME
+        );
+
+        let sample_step = (stored.len() / 8).max(1);
+        let mut checked = 0;
+        for query in stored.iter().step_by(sample_step) {
+            let query_vec = PrimitiveArray::<Float32Type>::from_iter_values(query.iter().copied());
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &query_vec, 5).unwrap();
+            scanner.project(&["vec"]).unwrap().with_row_id();
+            let batches = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(!batches.is_empty(), "query returned no batches");
+            let top = &batches[0];
+            assert!(top.num_rows() > 0, "query returned empty top batch");
+            let top_vec = top["vec"].as_fixed_size_list().value(0);
+            let top_vec = top_vec.as_primitive::<Float32Type>();
+            assert_eq!(
+                top_vec.values(),
+                query.as_slice(),
+                "top-1 self-recall returned a different vector than the query"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "expected to check at least one stored vector");
+    }
+
+    #[tokio::test]
     async fn test_default_compaction_planner() {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -4684,6 +4878,10 @@ mod tests {
                 "4096".to_string(),
             ),
             (
+                "lance.compaction.io_buffer_size".to_string(),
+                "1073741824".to_string(),
+            ),
+            (
                 "lance.compaction.compaction_mode".to_string(),
                 "try_binary_copy".to_string(),
             ),
@@ -4701,6 +4899,7 @@ mod tests {
         assert!((opts.materialize_deletions_threshold - 0.25).abs() < f32::EPSILON);
         assert!(opts.defer_index_remap);
         assert_eq!(opts.batch_size, Some(4096));
+        assert_eq!(opts.io_buffer_size, Some(1_073_741_824));
         assert_eq!(opts.compaction_mode, Some(CompactionMode::TryBinaryCopy));
         assert_eq!(opts.binary_copy_read_batch_bytes, Some(8_388_608));
     }

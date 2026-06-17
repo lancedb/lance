@@ -1527,8 +1527,7 @@ mod tests {
             }
 
             /// Like [`Self::new`], with managed versioning (table version
-            /// tracking through the `__manifest` catalog) enabled on the
-            /// backend.
+            /// tracking) enabled on the backend.
             async fn new_managed() -> Self {
                 Self::build(true).await
             }
@@ -1540,9 +1539,7 @@ mod tests {
                 // Create DirectoryNamespace backend with manifest enabled
                 let mut builder = DirectoryNamespaceBuilder::new(&temp_path).manifest_enabled(true);
                 if managed_versioning {
-                    builder = builder
-                        .table_version_tracking_enabled(true)
-                        .table_version_storage_enabled(true);
+                    builder = builder.table_version_tracking_enabled(true);
                 }
                 let backend = builder.build().await.unwrap();
                 let backend = Arc::new(backend);

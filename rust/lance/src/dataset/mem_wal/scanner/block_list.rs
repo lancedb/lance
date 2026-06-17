@@ -47,9 +47,12 @@ pub async fn compute_source_block_lists(
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
 ) -> Result<SourceBlockLists> {
     // Hash each non-base source's membership, grouped by shard (generations are
-    // per-shard, so supersession is within-shard only).
+    // per-shard, so supersession is within-shard only). Flushed-generation PK
+    // scans (cold-cache S3 reads) run concurrently; order is irrelevant — the
+    // per-shard lists are sorted by generation below.
     let mut by_shard: ShardGenSets = HashMap::new();
     let mut has_base = false;
+    let mut flushed_loads = Vec::new();
     for source in sources {
         match source {
             LsmDataSource::BaseTable { .. } => has_base = true,
@@ -72,13 +75,19 @@ pub async fn compute_source_block_lists(
                 ..
             } => {
                 // Cached by immutable path so repeated searches skip the PK scan.
-                let hashes = flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?;
-                by_shard
-                    .entry(*shard_id)
-                    .or_default()
-                    .push((*generation, hashes));
+                flushed_loads.push(async move {
+                    flushed_pk_hashes(path, pk_columns, session, flushed_cache)
+                        .await
+                        .map(|hashes| (*shard_id, *generation, hashes))
+                });
             }
         }
+    }
+    for (shard_id, generation, hashes) in futures::future::try_join_all(flushed_loads).await? {
+        by_shard
+            .entry(shard_id)
+            .or_default()
+            .push((generation, hashes));
     }
 
     let mut blocked: SourceBlockLists = HashMap::new();
@@ -115,22 +124,25 @@ pub async fn fresh_tier_block_list(
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<FlushedMemTableCache>>,
 ) -> Result<Vec<Arc<HashSet<u64>>>> {
-    let mut sets = Vec::new();
-    for source in sources {
-        let set = match source {
-            LsmDataSource::BaseTable { .. } => continue,
-            LsmDataSource::ActiveMemTable { batch_store, .. } => {
-                Arc::new(pk_hashes_from_batch_store(batch_store, pk_columns)?)
-            }
+    // Flushed PK scans run concurrently (cold-cache S3 reads); ordered
+    // try_join_all keeps the source order of the returned sets.
+    let sets = futures::future::try_join_all(sources.iter().map(|source| async move {
+        Ok::<_, lance_core::Error>(match source {
+            LsmDataSource::BaseTable { .. } => None,
+            LsmDataSource::ActiveMemTable { batch_store, .. } => Some(Arc::new(
+                pk_hashes_from_batch_store(batch_store, pk_columns)?,
+            )),
             LsmDataSource::FlushedMemTable { path, .. } => {
-                flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?
+                Some(flushed_pk_hashes(path, pk_columns, session, flushed_cache).await?)
             }
-        };
-        if !set.is_empty() {
-            sets.push(set);
-        }
-    }
-    Ok(sets)
+        })
+    }))
+    .await?;
+    Ok(sets
+        .into_iter()
+        .flatten()
+        .filter(|set| !set.is_empty())
+        .collect())
 }
 
 /// Hash the PK membership of an in-memory memtable (active or frozen) from its

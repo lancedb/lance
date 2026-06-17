@@ -324,6 +324,47 @@ def test_defer_index_remap(tmp_path: Path):
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
+@pytest.mark.parametrize("use_commit_options", [True, False])
+def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options: bool):
+    """Compaction.commit respects defer_index_remap passed in options.
+
+    When options={"defer_index_remap": True} is supplied to Compaction.commit
+    the __lance_frag_reuse system index must appear in describe_indices().
+    When the option is omitted (default) no such system index is written.
+    """
+    base_dir = tmp_path / f"dataset_commit_opts_{use_commit_options}"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    dataset.delete("i < 500")
+
+    plan = Compaction.plan(
+        dataset,
+        options=dict(target_rows_per_fragment=2_000, num_threads=1),
+    )
+    rewrites = [task.execute(dataset) for task in plan.tasks]
+
+    if use_commit_options:
+        Compaction.commit(dataset, rewrites, options={"defer_index_remap": True})
+    else:
+        Compaction.commit(dataset, rewrites)
+
+    dataset = lance.dataset(base_dir)
+    indices = dataset.describe_indices()
+    has_frag_reuse = any(idx.name == "__lance_frag_reuse" for idx in indices)
+
+    if use_commit_options:
+        assert has_frag_reuse, (
+            "expected __lance_frag_reuse system index when defer_index_remap=True "
+            "is passed to Compaction.commit"
+        )
+    else:
+        assert not has_frag_reuse, (
+            "did not expect __lance_frag_reuse system index when options is omitted "
+            "from Compaction.commit"
+        )
+
+
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_describe_indices_matches_list_indices_for_frag_reuse(tmp_path: Path):
     """describe_indices() and list_indices() must agree on the index_type

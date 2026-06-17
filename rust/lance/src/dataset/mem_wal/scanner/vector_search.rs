@@ -233,30 +233,47 @@ impl LsmVectorSearchPlanner {
         // `block_lists` is non-empty exactly when a newer generation exists.
         let refine_base = refine_base_table || !block_lists.is_empty();
 
+        // Stage per-source over-fetch decisions, then build every KNN plan
+        // concurrently — the builds are independent and a sequential loop was
+        // the dominant serial planning cost at multiple generations.
+        let arm_inputs: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                let generation = source.generation();
+                let is_base = matches!(source, LsmDataSource::BaseTable { .. });
+                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+                // Over-fetch when the post-source filter can drop candidates: a
+                // blocked source loses superseded rows; the active source's
+                // within-source dedup collapses duplicate-PK HNSW nodes. Block
+                // lookup is per shard — generations are per-shard.
+                let blocked = block_lists.get(&(source.shard_id(), generation));
+                let fetch_k = if blocked.is_some() || is_active {
+                    ((k as f64) * overfetch_factor).ceil() as usize
+                } else {
+                    k
+                };
+                (source, is_base, is_active, blocked, fetch_k)
+            })
+            .collect();
+        let built = futures::future::try_join_all(arm_inputs.iter().map(
+            |(source, is_base, _, _, fetch_k)| {
+                Box::pin(self.build_knn_plan(
+                    source,
+                    query_vector,
+                    *fetch_k,
+                    nprobes,
+                    projection,
+                    *is_base && refine_base,
+                ))
+            },
+        ))
+        .await?;
+
         let mut knn_plans = Vec::new();
-        for source in &sources {
-            let generation = source.generation();
-            let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
-            // Over-fetch when the post-source filter can drop candidates: a
-            // blocked source loses superseded rows; the active source's
-            // within-source dedup collapses duplicate-PK HNSW nodes. Block
-            // lookup is per shard — generations are per-shard.
-            let blocked = block_lists.get(&(source.shard_id(), generation));
-            let fetch_k = if blocked.is_some() || is_active {
-                ((k as f64) * overfetch_factor).ceil() as usize
-            } else {
-                k
-            };
-            let knn = Box::pin(self.build_knn_plan(
-                source,
-                query_vector,
-                fetch_k,
-                nprobes,
-                projection,
-                is_base && refine_base,
-            ))
-            .await?;
+        for ((_, is_base, is_active, blocked, _), knn) in arm_inputs.iter().zip(built) {
+            let is_base = *is_base;
+            let is_active = *is_active;
+            let blocked = *blocked;
             // Make each source independently newest-per-PK before the union:
             //  * active: the append-only HNSW returns one node per inserted
             //    version, so collapse duplicate PKs to the newest insert
@@ -301,6 +318,10 @@ impl LsmVectorSearchPlanner {
         // No cross-source dedup needed (see struct doc): SortExec(per partition)
         // + SortPreservingMerge does the p-way distance-ordered top-k merge.
         #[allow(deprecated)]
+        // The downstream `SortPreservingMergeExec` already spawns one driver
+        // task per input partition (one per union arm) via `spawn_buffered`, so
+        // each arm's per-arm CPU (HNSW search, distance refine) runs on its own
+        // task without an extra repartition.
         let merged: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
 
         let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {

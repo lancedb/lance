@@ -125,6 +125,9 @@ pub struct LsmScanner {
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
     flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    /// Over-fetch multiple for block-listed sources in search plans
+    /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
+    overfetch_factor: Option<f64>,
 }
 
 impl LsmScanner {
@@ -160,6 +163,7 @@ impl LsmScanner {
             pk_columns,
             session,
             flushed_cache: None,
+            overfetch_factor: None,
         }
     }
 
@@ -198,6 +202,7 @@ impl LsmScanner {
             pk_columns,
             session: None,
             flushed_cache: None,
+            overfetch_factor: None,
         }
     }
 
@@ -250,6 +255,14 @@ impl LsmScanner {
     /// set by default, so behavior is unchanged unless opted in.
     pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Set the over-fetch multiple block-listed sources use in search plans
+    /// so they still yield `k` live rows after cross-generation dedup.
+    /// Threaded into [`super::LsmFtsSearchPlanner`]; clamped to `>= 1.0`.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = Some(factor);
         self
     }
 
@@ -370,6 +383,9 @@ impl LsmScanner {
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
         }
+        if let Some(factor) = self.overfetch_factor {
+            planner = planner.with_overfetch_factor(factor);
+        }
 
         planner
             .plan_scan(
@@ -404,6 +420,9 @@ impl LsmScanner {
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
+        }
+        if let Some(factor) = self.overfetch_factor {
+            planner = planner.with_overfetch_factor(factor);
         }
         planner
             .plan_search(column, query, k, self.projection.as_deref())

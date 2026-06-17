@@ -6,13 +6,13 @@ use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_table::format::Fragment;
+use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
 use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
-use super::write::{GenericWriter, open_writer};
+use super::write::{GenericWriter, cleanup_data_fragments, open_update_writer};
 use crate::dataset::FileFragment;
 use crate::dataset::utils::SchemaAdapter;
 
@@ -146,13 +146,7 @@ impl Updater {
             .data_storage_format
             .lance_file_version()?;
 
-        open_writer(
-            &self.fragment.dataset().object_store,
-            &schema,
-            &self.fragment.dataset().base,
-            data_storage_version,
-        )
-        .await
+        open_update_writer(self.dataset(), &schema, data_storage_version).await
     }
 
     /// Update one batch.
@@ -219,6 +213,34 @@ impl Updater {
         }
 
         Ok(self.fragment.metadata().clone())
+    }
+
+    /// Clean up any data file and blob sidecars created by the current unfinished writer.
+    pub(super) async fn cleanup_unfinished_writer(&mut self) {
+        let Some(writer) = self.writer.take() else {
+            return;
+        };
+        let (path, base_id) = writer.data_file_path();
+        let path = path.to_string();
+        drop(writer);
+
+        if path.is_empty() {
+            return;
+        }
+
+        let mut fragment = Fragment::new(self.fragment.id() as u64);
+        // cleanup_data_fragments only needs path/base_id to remove the unfinished
+        // data file and any blob sidecars. Build a minimal synthetic fragment so
+        // we can reuse the shared cleanup path without fabricating full metadata.
+        fragment
+            .files
+            .push(DataFile::new(path, vec![], vec![], 0, 0, None, base_id));
+        cleanup_data_fragments(
+            &self.dataset().object_store,
+            &self.dataset().base,
+            &[fragment],
+        )
+        .await;
     }
 
     /// Get the final schema of the fragment after the update.
