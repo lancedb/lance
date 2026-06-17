@@ -366,6 +366,14 @@ impl MemTableScanner {
         self
     }
 
+    /// The `max_visible_batch_position` snapshot this scanner latched at
+    /// construction. A downstream recency filter must key on this same snapshot
+    /// (not a fresh read of the IndexStore watermark, which a concurrent append
+    /// could have advanced) so it stays consistent with the rows the search saw.
+    pub fn max_visible_batch_position(&self) -> usize {
+        self.max_visible_batch_position
+    }
+
     /// Include the _rowaddr column in output.
     ///
     /// Same value as _rowid but named for compatibility with LSM scanner.

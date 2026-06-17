@@ -60,9 +60,16 @@ def _write_flushed_gen(base_path: str, shard_id: str, gen_folder: str, data: pa.
 
     The collector resolves flushed generation paths as:
         {base_dataset_path}/_mem_wal/{shard_id}/{gen_folder}
+
+    Production flush also writes a primary-key dedup sidecar (`_pk_index/`) that
+    the LSM scanner opens to dedup across generations; stage it here too so the
+    flushed generation faithfully matches what flush produces.
     """
+    from lance.lance import _write_pk_sidecar
+
     gen_path = os.path.join(base_path, "_mem_wal", shard_id, gen_folder)
     lance.write_dataset(data, gen_path, schema=_LOOKUP_SCHEMA)
+    _write_pk_sidecar(gen_path, data, ["id"])
 
 
 def test_point_lookup_with_memtables(tmp_path):

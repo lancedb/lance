@@ -9,11 +9,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::SchemaRef;
+use arrow_schema::{SchemaRef, SortOptions};
 use datafusion::common::ScalarValue;
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
@@ -27,10 +30,7 @@ use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{
-    BloomFilterGuardExec, CoalesceFirstExec, DedupDirection, WithinSourceDedupExec,
-    compute_pk_hash_from_scalars,
-};
+use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
 use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
@@ -573,19 +573,29 @@ impl LsmPointLookupPlanner {
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
                 let raw = scanner.create_plan().await?;
-                // Within the active memtable, larger `_rowid` = newer
-                // insert. After dedup there is exactly one row per PK.
-                let deduped: Arc<dyn ExecutionPlan> = Arc::new(WithinSourceDedupExec::new(
-                    raw,
-                    self.pk_columns.clone(),
-                    lance_core::ROW_ID,
-                    DedupDirection::KeepMaxRowAddr,
-                ));
+                // The filter already restricts to the exact PK value, so the
+                // scan yields that key's insert history. Within the active
+                // memtable larger `_rowid` = newer insert, so sorting `_rowid`
+                // DESC and keeping the first row picks the newest version — one
+                // row per (value-exact) PK.
+                let rowid_idx = raw.schema().index_of(lance_core::ROW_ID)?;
+                let ordering = LexOrdering::new(vec![PhysicalSortExpr {
+                    expr: Arc::new(Column::new(lance_core::ROW_ID, rowid_idx)),
+                    options: SortOptions {
+                        descending: true,
+                        nulls_first: false,
+                    },
+                }])
+                .ok_or_else(|| {
+                    lance_core::Error::internal("point-lookup: failed to build _rowid ordering")
+                })?;
+                let newest: Arc<dyn ExecutionPlan> =
+                    Arc::new(SortExec::new(ordering, raw).with_fetch(Some(1)));
                 // Per-source `_rowid` would collide with the base table's;
                 // NULL it before canonicalization (the value is internal to
                 // this arm). project_to_canonical drops it entirely when
                 // the user didn't request `_rowid` in the projection.
-                null_columns(deduped, &[lance_core::ROW_ID])?
+                null_columns(newest, &[lance_core::ROW_ID])?
             }
         };
         project_to_canonical(scan, &target)
@@ -642,10 +652,6 @@ fn probe_position(
     pk_column: &str,
     pk_value: &ScalarValue,
 ) -> Result<ProbePos> {
-    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
-        return Ok(ProbePos::NoIndex);
-    };
-
     // Visible batches are the committed prefix [0, last_visible_idx]; each
     // `StoredBatch` carries its cumulative `row_offset`, so visibility and the
     // position→batch mapping are O(1)/O(log) with no per-probe allocation.
@@ -661,22 +667,37 @@ fn probe_position(
     if visible_end == 0 {
         return Ok(ProbePos::Miss);
     }
+    let max_visible_row = visible_end - 1;
 
-    // Newest visible position of the key — a single seek-and-stop on the
-    // ordered skiplist (largest key ≤ (value, max_visible_row)). No range
-    // collect, no allocation.
-    let Some(pos) = btree.get_newest_visible(pk_value, visible_end - 1) else {
+    // A single-column primary key always has a value-keyed BTree (reused or
+    // auto-created — see `IndexStore::enable_pk_index`): collision-free, so one
+    // seek yields the answer with no re-check. Absent only when the table has no
+    // PK index, where the caller falls back to the plan path.
+    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
+        return Ok(ProbePos::NoIndex);
+    };
+    let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
         return Ok(ProbePos::Miss);
     };
+    let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
+    Ok(ProbePos::Found { batch_idx, row })
+}
 
-    // Binary-search the owning batch by `row_offset` (appended in order).
+/// Map a global row `position` to its `(batch_idx, row_in_batch)` by binary
+/// searching the visible batch prefix on cumulative `row_offset` (batches are
+/// appended in order).
+fn resolve_position(
+    batch_store: &BatchStore,
+    last_visible_idx: usize,
+    position: u64,
+) -> Result<(usize, usize)> {
     let (mut lo, mut hi) = (0usize, last_visible_idx);
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         let off = batch_store.get(mid).map(|b| b.row_offset).ok_or_else(|| {
             lance_core::Error::internal("point-lookup: batch index out of range during search")
         })?;
-        if off <= pos {
+        if off <= position {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -685,10 +706,7 @@ fn probe_position(
     let stored = batch_store
         .get(lo)
         .ok_or_else(|| lance_core::Error::internal("point-lookup: resolved batch missing"))?;
-    Ok(ProbePos::Found {
-        batch_idx: lo,
-        row: (pos - stored.row_offset) as usize,
-    })
+    Ok((lo, (position - stored.row_offset) as usize))
 }
 
 /// Gather `rows` from `batch_store`'s batch `batch_idx` into the `target`
@@ -1097,8 +1115,8 @@ mod tests {
         // Regression: same primary key inserted twice into one active
         // memtable must return the *newest* row. The bug was that
         // `FilterExec → LIMIT 1` over an insert-ordered scan returned the
-        // first (oldest) match. `WithinSourceDedupExec` collapses by PK,
-        // keeping the row with the largest `_rowid` (insert order).
+        // first (oldest) match. The plan-path active arm now sorts `_rowid`
+        // DESC and keeps the first row (largest `_rowid` = newest insert).
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use futures::TryStreamExt;
@@ -1118,17 +1136,17 @@ mod tests {
         let b_old = create_test_batch(&schema, &[1], "old");
         let b_new = create_test_batch(&schema, &[1], "new");
         let b_other = create_test_batch(&schema, &[2], "two");
-        let (_, _, bp_old) = batch_store.append(b_old.clone()).unwrap();
+        let (bp_old, off_old, _) = batch_store.append(b_old.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_old, 0, Some(bp_old))
+            .insert_with_batch_position(&b_old, off_old, Some(bp_old))
             .unwrap();
-        let (_, _, bp_new) = batch_store.append(b_new.clone()).unwrap();
+        let (bp_new, off_new, _) = batch_store.append(b_new.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_new, 1, Some(bp_new))
+            .insert_with_batch_position(&b_new, off_new, Some(bp_new))
             .unwrap();
-        let (_, _, bp_other) = batch_store.append(b_other.clone()).unwrap();
+        let (bp_other, off_other, _) = batch_store.append(b_other.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_other, 2, Some(bp_other))
+            .insert_with_batch_position(&b_other, off_other, Some(bp_other))
             .unwrap();
         let index_store = Arc::new(index_store);
 
@@ -1165,6 +1183,88 @@ mod tests {
             name_arr.value(0),
             "new_1",
             "active-arm lookup must return the newer insert, not the oldest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_probes_auto_created_pk_btree() {
+        // No user `add_btree` on the PK column — only `enable_pk_index`, which
+        // auto-creates a BTree on the primary key (the production default). The
+        // fast probe must resolve the newest visible version through that
+        // collision-free BTree rather than falling back to the plan path.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        // No `add_btree` — `enable_pk_index` auto-creates the PK BTree.
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+
+        // pk=1 written twice (the newer second), plus an unrelated pk=2.
+        let b_old = create_test_batch(&schema, &[1], "old");
+        let b_new = create_test_batch(&schema, &[1], "new");
+        let b_other = create_test_batch(&schema, &[2], "two");
+        let (bp_old, off_old, _) = batch_store.append(b_old.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_old, off_old, Some(bp_old))
+            .unwrap();
+        let (bp_new, off_new, _) = batch_store.append(b_new.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_new, off_new, Some(bp_new))
+            .unwrap();
+        let (bp_other, off_other, _) = batch_store.append(b_other.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_other, off_other, Some(bp_other))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        // `lookup` takes the fast probe path (single-column PK, no system cols).
+        let hit = planner
+            .lookup(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap()
+            .expect("pk=1 must be found via the PK-position index probe");
+        assert_eq!(hit.num_rows(), 1);
+        let name = hit
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            name.value(0),
+            "new_1",
+            "probe must return the newest version"
+        );
+
+        // An absent key resolves to None (no on-disk sources to consult).
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(999))], None)
+                .await
+                .unwrap()
+                .is_none(),
+            "absent key must miss"
         );
     }
 

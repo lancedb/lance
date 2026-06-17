@@ -235,6 +235,13 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         .find(|idx| idx.uuid == curr_index_id)
         .unwrap();
 
+        // Whether the index data predates this reuse version, i.e. its stored
+        // row addresses still point at the compacted-away fragments. The
+        // fragment bitmap alone cannot tell us this: `load_indices`
+        // coverage-remaps the bitmap onto the new fragments in memory, and a
+        // later commit can persist that cleaned bitmap to disk without the index
+        // data ever being remapped (e.g. while remapping a *sibling* index).
+        let data_predates_version = curr_index_meta.dataset_version < version.dataset_version;
         let maybe_index_bitmap = curr_index_meta.fragment_bitmap.clone();
         let (should_remap, bitmap_after_remap) = match maybe_index_bitmap {
             Some(mut index_frag_bitmap) => {
@@ -260,6 +267,19 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                         }
                         index_frag_bitmap
                             .extend(group.new_frags.clone().into_iter().map(|f| f.id as u32));
+                        should_remap = true;
+                    } else if data_predates_version
+                        && group
+                            .new_frags
+                            .iter()
+                            .any(|new_frag| index_frag_bitmap.contains(new_frag.id as u32))
+                    {
+                        // The bitmap was already coverage-remapped onto this
+                        // group's new fragments and persisted before the data was
+                        // remapped, so the old fragments are gone from the bitmap
+                        // but the index data still needs remapping. Without this
+                        // the data remap is silently skipped and the reuse index
+                        // can never be trimmed.
                         should_remap = true;
                     }
                 }

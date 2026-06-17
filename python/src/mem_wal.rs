@@ -51,6 +51,31 @@ pub fn py_evaluate_sharding_spec<'py>(
     result.to_pyarrow(py)
 }
 
+/// Write a primary-key dedup sidecar (`_pk_index/`) for a flushed-generation
+/// dataset already written at `gen_path`, mirroring what production flush emits.
+///
+/// Test-support only: lets Python tests stage a *faithful* flushed generation
+/// (dataset + sidecar). Production always writes the sidecar during flush, so a
+/// dataset-without-sidecar is not a state the system otherwise produces.
+#[pyfunction(name = "_write_pk_sidecar", signature = (gen_path, data, pk_columns))]
+pub fn py_write_pk_sidecar(
+    py: Python<'_>,
+    gen_path: String,
+    data: &Bound<'_, PyAny>,
+    pk_columns: Vec<String>,
+) -> PyResult<()> {
+    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))?;
+    rt().block_on(Some(py), async move {
+        let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
+        lance::dataset::mem_wal::scanner::write_pk_sidecar(&gen_path, &batches, &pk_refs).await
+    })?
+    .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))
+}
+
 fn sharding_spec_from_py(spec: &Bound<'_, PyAny>) -> PyResult<ShardingSpec> {
     let spec_id = get_py_value(spec, "spec_id")?.extract::<u32>()?;
     let fields_obj = get_py_value(spec, "fields")?;

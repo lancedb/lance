@@ -25,14 +25,18 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -315,6 +319,80 @@ public class ScalarIndexTest {
         // Currently the Java API doesn't expose index configuration details,
         // but we could add a getIndexDetails() method in the future to verify
         // that the rows_per_zone parameter was correctly set to 1024
+      }
+    }
+  }
+
+  @Test
+  public void testCreateRTreeIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("rtree_test").toString();
+    ArrowType f64 = new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+    Field geometryField =
+        new Field(
+            "geometry",
+            new FieldType(
+                true,
+                new ArrowType.Struct(),
+                null,
+                Collections.singletonMap("ARROW:extension:name", "geoarrow.point")),
+            Arrays.asList(Field.notNullable("x", f64), Field.notNullable("y", f64)));
+    Schema schema = new Schema(Collections.singletonList(geometryField), null);
+
+    int rowCount = 3;
+    try (RootAllocator allocator = new RootAllocator();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      StructVector geometry = (StructVector) root.getVector("geometry");
+      Float8Vector x = (Float8Vector) geometry.getChild("x");
+      Float8Vector y = (Float8Vector) geometry.getChild("y");
+      for (int i = 0; i < rowCount; i++) {
+        geometry.setIndexDefined(i);
+        x.setSafe(i, (double) i);
+        y.setSafe(i, i * 2.0);
+      }
+      geometry.setValueCount(rowCount);
+      root.setRowCount(rowCount);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+        writer.start();
+        writer.writeBatch();
+        writer.end();
+      }
+
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
+          Dataset dataset =
+              Dataset.write()
+                  .reader(reader)
+                  .uri(datasetPath)
+                  .allocator(allocator)
+                  .mode(WriteParams.WriteMode.CREATE)
+                  .execute()) {
+        // The point data round-trips through Lance.
+        assertEquals(rowCount, dataset.countRows());
+        try (ArrowReader scan = dataset.newScan(new ScanOptions.Builder().build()).scanBatches()) {
+          assertTrue(scan.loadNextBatch());
+          StructVector readGeometry =
+              (StructVector) scan.getVectorSchemaRoot().getVector("geometry");
+          assertEquals(2.0, ((Float8Vector) readGeometry.getChild("x")).get(2));
+          assertEquals(4.0, ((Float8Vector) readGeometry.getChild("y")).get(2));
+        }
+
+        // Creating and listing an RTree index via the typed IndexType works end-to-end.
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList("geometry"),
+                IndexType.RTREE,
+                Optional.of("rtree_geometry_index"),
+                IndexParams.builder()
+                    .setScalarIndexParams(ScalarIndexParams.create("rtree"))
+                    .build(),
+                true);
+        assertEquals(IndexType.RTREE, index.indexType());
+        assertTrue(
+            dataset.listIndexes().contains("rtree_geometry_index"),
+            "Expected 'rtree_geometry_index' in: " + dataset.listIndexes());
       }
     }
   }
