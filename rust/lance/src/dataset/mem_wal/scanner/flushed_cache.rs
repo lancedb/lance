@@ -127,7 +127,11 @@ impl std::fmt::Debug for FlushedMemTableCache {
 pub trait DatasetCache: Send + Sync + std::fmt::Debug {
     async fn get_or_open(&self, path: &str, session: Option<Arc<Session>>) -> Result<Arc<Dataset>>;
 
-    fn retain_paths(&self, live_paths: &HashSet<String>);
+    /// Drop cached entries whose path is not in `live_paths`. Async so an
+    /// implementation can evict retired generations' index objects (e.g.
+    /// `Session::invalidate_index_prefix`) without a later breaking signature
+    /// change; [`FlushedMemTableCache`]'s own eviction is synchronous.
+    async fn retain_paths(&self, live_paths: &HashSet<String>);
 }
 
 #[async_trait]
@@ -136,7 +140,7 @@ impl DatasetCache for FlushedMemTableCache {
         Self::get_or_open(self, path, session).await
     }
 
-    fn retain_paths(&self, live_paths: &HashSet<String>) {
+    async fn retain_paths(&self, live_paths: &HashSet<String>) {
         Self::retain_paths(self, live_paths)
     }
 }
