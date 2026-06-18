@@ -632,39 +632,42 @@ mod tests {
         assert_eq!(memtable_ref.generation, 10);
     }
 
+    /// Single-column `id: Int32` schema used by the PK-membership tests.
+    fn pk_schema() -> SchemaRef {
+        use arrow_schema::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    /// A `RecordBatch` of `id` values against [`pk_schema`].
+    fn id_pk_batch(ids: &[i32]) -> RecordBatch {
+        use arrow_array::Int32Array;
+        RecordBatch::try_new(pk_schema(), vec![Arc::new(Int32Array::from(ids.to_vec()))]).unwrap()
+    }
+
+    /// An active/frozen memtable holding `ids` at `generation`, with a single
+    /// batch and a maintained primary-key index on `id`.
+    fn mk_pk_memtable(ids: &[i32], generation: u64) -> InMemoryMemTableRef {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        let store = BatchStore::with_capacity(8);
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        let b = id_pk_batch(ids);
+        let (bp, off, _) = store.append(b.clone()).unwrap();
+        index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
+        InMemoryMemTableRef {
+            batch_store: Arc::new(store),
+            index_store: Arc::new(index),
+            schema: pk_schema(),
+            generation,
+        }
+    }
+
     #[tokio::test]
     async fn contains_pks_reports_fresh_tier_membership() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
-        use arrow_array::Int32Array;
-        use arrow_schema::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let id_batch = |ids: &[i32]| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from(ids.to_vec()))],
-            )
-            .unwrap()
-        };
-        let mk = |ids: &[i32], generation: u64| {
-            let store = BatchStore::with_capacity(8);
-            let mut index = IndexStore::new();
-            index.enable_pk_index(&[("id".to_string(), 0)]);
-            let b = id_batch(ids);
-            let (bp, off, _) = store.append(b.clone()).unwrap();
-            index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
-            InMemoryMemTableRef {
-                batch_store: Arc::new(store),
-                index_store: Arc::new(index),
-                schema: schema.clone(),
-                generation,
-            }
-        };
-
         // Fresh-tier only: active gen 2 (pk=1,2) + frozen gen 1 (pk=3).
         let shard = Uuid::new_v4();
         let scanner = LsmScanner::without_base_table(
-            schema.clone(),
+            pk_schema(),
             "memory://t",
             vec![],
             vec!["id".to_string()],
@@ -672,14 +675,66 @@ mod tests {
         .with_in_memory_memtables(
             shard,
             InMemoryMemTables {
-                active: mk(&[1, 2], 2),
-                frozen: vec![mk(&[3], 1)],
+                active: mk_pk_memtable(&[1, 2], 2),
+                frozen: vec![mk_pk_memtable(&[3], 1)],
             },
         );
 
         // pk=1 (active), pk=4 (absent), pk=3 (frozen).
-        let result = scanner.contains_pks(&id_batch(&[1, 4, 3])).await.unwrap();
+        let result = scanner
+            .contains_pks(&id_pk_batch(&[1, 4, 3]))
+            .await
+            .unwrap();
         assert_eq!(result, vec![true, false, true]);
+    }
+
+    /// `contains_pks_at` probes each generation once over the still-unfound
+    /// rows, so a multi-PK batch spanning several generations resolves to the
+    /// right per-row mask — and a watermark bounds which generations count.
+    #[tokio::test]
+    async fn contains_pks_at_batched_probe_respects_watermark() {
+        use crate::dataset::mem_wal::scanner::data_source::FreshTierWatermark;
+
+        // active gen 2 (pk=1,2) + frozen gen 1 (pk=3,4).
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            shard,
+            InMemoryMemTables {
+                active: mk_pk_memtable(&[1, 2], 2),
+                frozen: vec![mk_pk_memtable(&[3, 4], 1)],
+            },
+        );
+
+        // Duplicate and out-of-order keys exercise the live-row narrowing: each
+        // generation only re-probes the rows earlier generations didn't claim.
+        let probe = id_pk_batch(&[4, 1, 9, 3, 2, 1]);
+
+        // watermark=None → live tier: every PK present in either generation.
+        let live = scanner.contains_pks_at(&probe, None).await.unwrap();
+        assert_eq!(live, vec![true, true, false, true, true, true]);
+
+        // watermark at gen 1 → active gen 2 rolled in after the snapshot and is
+        // excluded; only the frozen gen 1 keys (3,4) remain members.
+        let watermarks: HashMap<Uuid, FreshTierWatermark> = [(
+            shard,
+            FreshTierWatermark {
+                active_generation: 1,
+                active_batch_count: u64::MAX,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let bounded = scanner
+            .contains_pks_at(&probe, Some(&watermarks))
+            .await
+            .unwrap();
+        assert_eq!(bounded, vec![true, false, false, true, false, false]);
     }
 
     /// One active memtable with a maintained BTree on `id`, all rows visible.
