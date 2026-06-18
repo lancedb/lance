@@ -469,7 +469,6 @@ impl InvertedIndexBuilder {
         stream: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
-        check_fts_posting_pipeline_cpu_threads()?;
         let num_workers = resolve_num_workers(&self.params);
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
@@ -2209,6 +2208,22 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    fn run_test_in_child(test_name: &str, child_env: &str, cpu_threads: usize) {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .env(child_env, "1")
+            .env("LANCE_CPU_THREADS", cpu_threads.to_string())
+            .args(["--exact", test_name, "--nocapture"])
+            .output()
+            .expect("spawn test child process");
+
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[test]
     fn test_fts_posting_pipeline_cpu_threads_error_message() {
         let message = fts_posting_pipeline_insufficient_cpu_threads_message(1);
@@ -2284,22 +2299,62 @@ mod tests {
             return;
         }
 
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .env("LANCE_FTS_DEADLOCK_CHILD", "1")
-            .env("LANCE_CPU_THREADS", "1")
-            .args([
-                "--exact",
-                "scalar::inverted::builder::tests::test_fts_posting_pipeline_write_posting_lists_deadlocks_with_one_cpu_thread",
-                "--nocapture",
-            ])
-            .output()
-            .expect("spawn FTS posting-list deadlock reproducer child");
+        run_test_in_child(
+            "scalar::inverted::builder::tests::test_fts_posting_pipeline_write_posting_lists_deadlocks_with_one_cpu_thread",
+            "LANCE_FTS_DEADLOCK_CHILD",
+            1,
+        );
+    }
 
-        assert!(
-            output.status.success(),
-            "child deadlock reproducer failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+    #[test]
+    fn test_empty_update_with_one_cpu_thread_records_deleted_fragments() {
+        if std::env::var("LANCE_FTS_EMPTY_UPDATE_CHILD").as_deref() == Ok("1") {
+            assert_eq!(
+                get_num_compute_intensive_cpus(),
+                1,
+                "empty-update child must run with LANCE_CPU_THREADS=1"
+            );
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .expect("build tokio runtime for empty update");
+            runtime.block_on(async {
+                let index_dir = TempDir::default();
+                let store = Arc::new(LanceIndexStore::new(
+                    ObjectStore::local().into(),
+                    index_dir.obj_path(),
+                    Arc::new(LanceCache::no_cache()),
+                ));
+                let schema = make_doc_batch("unused", 0).schema();
+                let stream = RecordBatchStreamAdapter::new(
+                    schema,
+                    stream::empty::<lance_core::error::DataFusionResult<RecordBatch>>(),
+                );
+                let old_data_filter = Some(crate::scalar::OldIndexDataFilter::Fragments {
+                    to_keep: RoaringBitmap::new(),
+                    to_remove: RoaringBitmap::from_iter([3, 7]),
+                });
+
+                let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
+                builder
+                    .update(Box::pin(stream), store.as_ref(), old_data_filter)
+                    .await
+                    .expect("empty update should not require the posting-list writer");
+
+                let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+                    .await
+                    .expect("load updated index");
+                assert_eq!(index.deleted_fragments(), &RoaringBitmap::from_iter([3, 7]));
+            });
+            return;
+        }
+
+        run_test_in_child(
+            "scalar::inverted::builder::tests::test_empty_update_with_one_cpu_thread_records_deleted_fragments",
+            "LANCE_FTS_EMPTY_UPDATE_CHILD",
+            1,
         );
     }
 
