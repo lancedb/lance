@@ -40,7 +40,7 @@ use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metr
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
@@ -882,10 +882,6 @@ impl SessionContextExt for SessionContext {
 /// Multi-partition providers are coalesced into a single partition. This adapts a
 /// re-scannable provider back into the one stream the writer pipeline consumes;
 /// re-scanning the same provider (e.g. on a write retry) yields a fresh stream.
-///
-/// The first batch is read eagerly and re-chained onto the stream. This surfaces a
-/// scan error from the source directly, before it can be fed into (and obscured by)
-/// a downstream plan — preserving the original error type for callers.
 pub async fn provider_to_stream(
     provider: Arc<dyn TableProvider>,
 ) -> Result<SendableRecordBatchStream> {
@@ -897,11 +893,7 @@ pub async fn provider_to_stream(
         } else {
             plan
         };
-    let schema = plan.schema();
-    let mut stream = plan.execute(0, ctx.task_ctx())?;
-    let first = stream.try_next().await?;
-    let rechained = stream::iter(first.map(Ok)).chain(stream);
-    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rechained)))
+    Ok(plan.execute(0, ctx.task_ctx())?)
 }
 
 #[derive(Clone, Debug)]

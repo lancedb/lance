@@ -5,13 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
-use datafusion::catalog::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
 use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
-use lance_datafusion::exec::provider_to_stream;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -96,19 +94,6 @@ impl<'a> InsertBuilder<'a> {
     pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<Dataset> {
         let (stream, schema) = source.into_stream_and_schema().await?;
         self.execute_stream_impl(stream, schema).await
-    }
-
-    /// Execute the insert operation with a [`TableProvider`] source.
-    ///
-    /// The provider is scanned into a stream and written. This mirrors
-    /// [`crate::dataset::MergeInsertJob::execute_provider`] so the same input
-    /// shapes are accepted across write operations. Inserts do not retry, so the
-    /// provider is scanned only once.
-    ///
-    /// [`TableProvider`]: datafusion::catalog::TableProvider
-    pub async fn execute_provider(&self, provider: Arc<dyn TableProvider>) -> Result<Dataset> {
-        let stream = provider_to_stream(provider).await?;
-        self.execute_stream(stream).await
     }
 
     async fn execute_stream_impl(
@@ -200,18 +185,6 @@ impl<'a> InsertBuilder<'a> {
         let (stream, schema) = source.into_stream_and_schema().await?;
         let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
         Ok(transaction)
-    }
-
-    /// Write data files from a [`TableProvider`] source without committing.
-    ///
-    /// Use [`CommitBuilder`] to commit the returned transaction. See
-    /// [`Self::execute_provider`].
-    pub async fn execute_uncommitted_provider(
-        &self,
-        provider: Arc<dyn TableProvider>,
-    ) -> Result<Transaction> {
-        let stream = provider_to_stream(provider).await?;
-        self.execute_uncommitted_stream(stream).await
     }
 
     async fn write_uncommitted_stream_impl(
@@ -531,26 +504,6 @@ mod test {
                 .unwrap(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn test_execute_provider() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
-        let provider: Arc<dyn TableProvider> = Arc::new(
-            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap(),
-        );
-
-        let dataset = InsertBuilder::new("memory://")
-            .execute_provider(provider)
-            .await
-            .unwrap();
-
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
     }
 
     #[tokio::test]
