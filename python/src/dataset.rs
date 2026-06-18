@@ -456,6 +456,60 @@ impl MergeInsertBuilder {
         Ok((PyLance(transaction), stats))
     }
 
+    /// Execute the merge insert from fully-materialized data.
+    ///
+    /// The data is read into memory and wrapped in an in-memory table, so retries
+    /// never spill to disk and the source's statistics drive the join. Callers
+    /// should only route in-memory inputs (e.g. a `pa.Table`) here.
+    pub fn execute_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (new_dataset, stats) = rt()
+            .spawn(Some(py), job.execute_batches(batches))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let dataset = self.dataset.bind(py);
+        dataset.borrow_mut().ds = new_dataset;
+
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    /// [`Self::execute_batches`] without committing; returns the transaction.
+    pub fn execute_uncommitted_batches<'a>(
+        &mut self,
+        new_data: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = rt()
+            .spawn(Some(py), job.execute_uncommitted_batches(batches))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let stats = Self::build_stats(&stats, py)?;
+
+        Ok((PyLance(transaction), stats))
+    }
+
     #[pyo3(signature=(schema = None, verbose = false))]
     pub fn explain_plan(
         &mut self,

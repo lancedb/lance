@@ -4,8 +4,7 @@
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
@@ -14,12 +13,9 @@ use lance_arrow::{
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
-use lance_core::error::LanceOptionExt;
-use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::spill::{SpillReceiver, SpillSender, create_replay_spill};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::previous::writer::{
     FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
@@ -1768,108 +1764,6 @@ async fn resolve_commit_handler(
                 Ok(commit_handler)
             }
         }
-    }
-}
-
-/// Create an iterator of record batch streams from the given source.
-///
-/// If `enable_retries` is true, then the source will be saved either in memory
-/// or spilled to disk to allow replaying the source in case of a failure. The
-/// source will be kept in memory if either (1) the size hint shows that
-/// there is only one batch or (2) the stream contains less than 100MB of
-/// data. Otherwise, the source will be spilled to a temporary file on disk.
-///
-/// This is used to support retries on write operations.
-async fn new_source_iter(
-    source: SendableRecordBatchStream,
-    enable_retries: bool,
-) -> Result<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>> {
-    if enable_retries {
-        let schema = source.schema();
-
-        // If size hint shows there is only one batch, spilling has no benefit, just keep that
-        // in memory. (This is a pretty common case.)
-        let size_hint = source.size_hint();
-        if size_hint.0 == 1 && size_hint.1 == Some(1) {
-            let batches: Vec<RecordBatch> = source.try_collect().await?;
-            Ok(Box::new(std::iter::repeat_with(move || {
-                Box::pin(RecordBatchStreamAdapter::new(
-                    schema.clone(),
-                    futures::stream::iter(batches.clone().into_iter().map(Ok)),
-                )) as SendableRecordBatchStream
-            })))
-        } else {
-            // Allow buffering up to 100MB in memory before spilling to disk.
-            Ok(Box::new(
-                SpillStreamIter::try_new(source, 100 * 1024 * 1024).await?,
-            ))
-        }
-    } else {
-        Ok(Box::new(std::iter::once(source)))
-    }
-}
-
-struct SpillStreamIter {
-    receiver: SpillReceiver,
-    _sender_handle: tokio::task::JoinHandle<SpillSender>,
-    // This temp dir is used to store the spilled data. It is kept alive by
-    // this struct. When this struct is dropped, the Drop implementation of
-    // tempfile::TempDir will delete the temp dir.
-    _tmp_dir: TempDir,
-}
-
-impl SpillStreamIter {
-    pub async fn try_new(
-        mut source: SendableRecordBatchStream,
-        memory_limit: usize,
-    ) -> Result<Self> {
-        let tmp_dir = tokio::task::spawn_blocking(|| {
-            TempDir::try_new()
-                .map_err(|e| Error::invalid_input(format!("Failed to create temp dir: {}", e)))
-        })
-        .await
-        .ok()
-        .expect_ok()??;
-
-        let tmp_path = tmp_dir.std_path().join("spill.arrows");
-        let (mut sender, receiver) = create_replay_spill(tmp_path, source.schema(), memory_limit);
-
-        let sender_handle = tokio::task::spawn(async move {
-            while let Some(res) = source.next().await {
-                match res {
-                    Ok(batch) => match sender.write(batch).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            sender.send_error(e);
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        sender.send_error(e);
-                        break;
-                    }
-                }
-            }
-
-            if let Err(err) = sender.finish().await {
-                sender.send_error(err);
-            }
-            sender
-        });
-
-        Ok(Self {
-            receiver,
-            _tmp_dir: tmp_dir,
-            _sender_handle: sender_handle,
-        })
-    }
-}
-
-impl Iterator for SpillStreamIter {
-    type Item = SendableRecordBatchStream;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(self.receiver.read())
     }
 }
 
@@ -3733,6 +3627,7 @@ mod tests {
     async fn test_write_interruption_recovery() {
         use super::commit::CommitBuilder;
         use arrow_array::record_batch;
+        use lance_core::utils::tempfile::TempDir;
 
         // Create a temporary directory for testing
         let temp_dir = TempDir::default();

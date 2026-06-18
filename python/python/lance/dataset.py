@@ -71,7 +71,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import FullTextQuery
-from .types import _coerce_reader
+from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -397,6 +397,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         reader = _coerce_reader(data_obj, schema)
 
+        # Materialized sources are wrapped in an in-memory table so retries never
+        # spill and the source's statistics can drive the join; everything else is
+        # treated as a one-shot stream.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_batches(reader)
+
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
@@ -420,6 +426,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             source is some kind of generator.
         """
         reader = _coerce_reader(data_obj, schema)
+
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 

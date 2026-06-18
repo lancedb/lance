@@ -76,6 +76,8 @@ use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
 use datafusion::{
+    catalog::{TableProvider, streaming::StreamingTable},
+    datasource::MemTable,
     execution::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
@@ -114,9 +116,10 @@ use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::BatchStreamGrouper,
     exec::{
-        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, analyze_plan, execute_plan,
-        get_session_context,
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, OneShotPartitionStream,
+        analyze_plan, execute_plan, get_session_context, provider_to_stream,
     },
+    spill::spilling_table_provider,
     utils::{StreamingWriteSource, reader_to_stream},
 };
 use lance_file::version::LanceFileVersion;
@@ -340,6 +343,12 @@ struct MergeInsertParams {
     // Controls whether data that is not matched by the source is deleted or not
     delete_not_matched_by_source: WhenNotMatchedBySource,
     conflict_retries: u32,
+    // When the source is a one-shot stream and `conflict_retries > 0`, the source
+    // is spilled (memory, then disk) so it can be replayed on each retry. Set to
+    // false to fail fast on contention instead of buffering the stream. Has no
+    // effect on re-scannable sources (materialized batches, files), which never
+    // spill.
+    spill_for_retry: bool,
     retry_timeout: Duration,
     // List of MemWAL region generations to mark as merged when this commit succeeds.
     merged_generations: Vec<MergedGeneration>,
@@ -477,6 +486,7 @@ impl MergeInsertBuilder {
                 insert_not_matched: true,
                 delete_not_matched_by_source: WhenNotMatchedBySource::Keep,
                 conflict_retries: 10,
+                spill_for_retry: true,
                 retry_timeout: Duration::from_secs(30),
                 merged_generations: Vec::new(),
                 skip_auto_cleanup: false,
@@ -524,6 +534,27 @@ impl MergeInsertBuilder {
     /// Default is 10.
     pub fn conflict_retries(&mut self, retries: u32) -> &mut Self {
         self.params.conflict_retries = retries;
+        self
+    }
+
+    /// Controls whether a one-shot stream source is spilled so it can be replayed
+    /// across retries.
+    ///
+    /// When the source is a one-shot stream (e.g. [`MergeInsertJob::execute`]) and
+    /// `conflict_retries > 0`, the source is buffered in memory and spilled to disk
+    /// so each retry can re-read it. Set this to `false` to skip that buffering and
+    /// fail fast with a contention error instead of writing the stream to disk.
+    ///
+    /// This has no effect on re-scannable sources (materialized batches via
+    /// [`MergeInsertJob::execute_batches`], or a [`TableProvider`] via
+    /// [`MergeInsertJob::execute_provider`]), which are replayed directly and never
+    /// spill.
+    ///
+    /// Default is true.
+    ///
+    /// [`TableProvider`]: datafusion::catalog::TableProvider
+    pub fn spill_for_retry(&mut self, spill: bool) -> &mut Self {
+        self.params.spill_for_retry = spill;
         self
     }
 
@@ -696,6 +727,16 @@ async fn resolve_target_bases(
 enum SchemaComparison {
     FullCompatible,
     Subschema,
+}
+
+/// Wrap a one-shot stream in a non-replayable [`StreamingTable`] provider.
+///
+/// The provider can only be scanned once (its single partition hands out the
+/// underlying stream), so it must not be used where retries may re-scan it.
+fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableProvider>> {
+    let schema = stream.schema();
+    let partition = Arc::new(OneShotPartitionStream::new(stream));
+    Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
 }
 
 impl MergeInsertJob {
@@ -1597,24 +1638,142 @@ impl MergeInsertJob {
         ))
     }
 
-    /// Executes the merge insert job
+    /// Executes the merge insert job from a one-shot stream source.
     ///
     /// This will take in the source, merge it with the existing target data, and insert new
-    /// rows, update existing rows, and delete existing rows
+    /// rows, update existing rows, and delete existing rows.
+    ///
+    /// A stream can only be read once, so when `conflict_retries > 0` the stream is
+    /// spilled (in memory, then to disk) so it can be replayed on each retry. See
+    /// [`MergeInsertBuilder::spill_for_retry`] to fail fast instead, and
+    /// [`Self::execute_batches`] / [`Self::execute_provider`] for re-scannable
+    /// sources that never spill.
     pub async fn execute(
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let source_iter = super::new_source_iter(source, self.params.conflict_retries > 0).await?;
+        let (provider, replayable) = self.stream_source_to_provider(source).await?;
+        // A stream-derived provider reports no statistics, so there is nothing to
+        // gain from planning against it directly; adapting it back to a stream also
+        // preserves the source's original error type.
+        self.execute_inner(provider, replayable, false).await
+    }
+
+    /// Executes the merge insert job from a re-scannable [`TableProvider`].
+    ///
+    /// This is the canonical entry point: [`Self::execute`] and
+    /// [`Self::execute_batches`] are thin wrappers that build a provider and call
+    /// this method. Because a provider can be scanned repeatedly, retries re-read
+    /// the source directly and never spill to disk. The provider's reported
+    /// statistics (e.g. from a [`MemTable`] or file source) also let DataFusion
+    /// optimize the merge join.
+    ///
+    /// [`MemTable`]: datafusion::datasource::MemTable
+    pub async fn execute_provider(
+        self,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
+        // A genuine TableProvider is re-scannable by contract, so retries are safe,
+        // and planning against it directly lets its statistics drive the join.
+        self.execute_inner(provider, true, true).await
+    }
+
+    /// Executes the merge insert job from materialized record batches.
+    ///
+    /// The batches are wrapped in an in-memory [`MemTable`], which is re-scannable
+    /// (retries replay from memory, never spilling) and reports exact statistics to
+    /// the merge join. This is the preferred entry point when the full source is
+    /// already in memory.
+    pub async fn execute_batches(
+        self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let provider = self.batches_to_provider(batches)?;
+        self.execute_inner(provider, true, true).await
+    }
+
+    /// Like [`Self::execute_batches`] but returns the uncommitted transaction.
+    ///
+    /// Use [`CommitBuilder`] to commit the returned transaction.
+    pub async fn execute_uncommitted_batches(
+        self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<UncommittedMergeInsert> {
+        let provider = self.batches_to_provider(batches)?;
+        self.execute_uncommitted_impl(provider, true).await
+    }
+
+    /// Wrap materialized batches in a multi-partition in-memory [`MemTable`].
+    fn batches_to_provider(&self, batches: Vec<RecordBatch>) -> Result<Arc<dyn TableProvider>> {
+        let schema = batches
+            .first()
+            .map(|batch| batch.schema())
+            .unwrap_or_else(|| Arc::new(Schema::from(self.dataset.schema())));
+        // Spread batches across partitions so the source can be scanned in parallel
+        // and reports per-partition statistics. A single inner Vec would be one
+        // partition with no parallelism.
+        let partitions = Self::batches_into_partitions(batches);
+        Ok(Arc::new(MemTable::try_new(schema, partitions)?))
+    }
+
+    /// Distribute batches round-robin across up to `num_compute_intensive_cpus`
+    /// partitions, so a [`MemTable`] built from them can be scanned in parallel.
+    /// Always returns at least one (possibly empty) partition so an empty source
+    /// still produces a valid provider.
+    fn batches_into_partitions(batches: Vec<RecordBatch>) -> Vec<Vec<RecordBatch>> {
+        let num_partitions = batches.len().min(get_num_compute_intensive_cpus()).max(1);
+        let mut partitions = vec![Vec::new(); num_partitions];
+        for (idx, batch) in batches.into_iter().enumerate() {
+            partitions[idx % num_partitions].push(batch);
+        }
+        partitions
+    }
+
+    /// Wrap a one-shot stream source in a provider, returning whether it can be
+    /// replayed across retries.
+    ///
+    /// With retries enabled and spilling allowed, the stream is drained into a
+    /// replayable spill (memory up to 100MB, then disk). Otherwise the stream is
+    /// wrapped in a non-replayable one-shot provider and any conflict fails fast.
+    async fn stream_source_to_provider(
+        &self,
+        source: SendableRecordBatchStream,
+    ) -> Result<(Arc<dyn TableProvider>, bool)> {
+        if self.params.conflict_retries > 0 && self.params.spill_for_retry {
+            // Allow buffering up to 100MB in memory before spilling to disk.
+            let provider = spilling_table_provider(source, 100 * 1024 * 1024).await?;
+            Ok((provider, true))
+        } else {
+            Ok((one_shot_provider(source)?, false))
+        }
+    }
+
+    /// Run the retry loop against a provider, re-scanning it on each attempt.
+    ///
+    /// `replayable` indicates whether the provider can be scanned more than once.
+    /// When it cannot (a one-shot stream that was not spilled), retries are
+    /// disabled so we never scan it twice; the operation runs once and surfaces any
+    /// commit conflict directly.
+    async fn execute_inner(
+        self,
+        provider: Arc<dyn TableProvider>,
+        replayable: bool,
+        scan_provider_directly: bool,
+    ) -> Result<(Arc<Dataset>, MergeStats)> {
         let dataset = self.dataset.clone();
         let config = RetryConfig {
-            max_retries: self.params.conflict_retries,
+            max_retries: if replayable {
+                self.params.conflict_retries
+            } else {
+                0
+            },
             retry_timeout: self.params.retry_timeout,
         };
 
-        let wrapper = MergeInsertJobWithIterator {
+        let wrapper = MergeInsertJobWithProvider {
             job: self,
-            source_iter: Arc::new(Mutex::new(source_iter)),
+            provider,
+            scan_provider_directly,
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
@@ -1629,7 +1788,8 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
-        self.execute_uncommitted_impl(stream).await
+        self.execute_uncommitted_impl(one_shot_provider(stream)?, false)
+            .await
     }
 
     fn create_plan_join_type(&self) -> JoinType {
@@ -1649,14 +1809,22 @@ impl MergeInsertJob {
 
     async fn create_plan(
         self,
-        source: SendableRecordBatchStream,
+        provider: Arc<dyn TableProvider>,
+        scan_provider_directly: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Goal: we shouldn't manually have to specify which columns to scan.
         //       DataFusion's optimizer should be able to automatically perform
         //       projection pushdown for us.
         // Goal: we shouldn't have to add new branches in this code to handle
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
-        let session_config = SessionConfig::default();
+        let session_config = if scan_provider_directly {
+            // A provider may expose multiple partitions; keep the plan single-
+            // partition so it satisfies the merge write node's contract (the
+            // provider's statistics still drive join-side selection).
+            SessionConfig::default().with_target_partitions(1)
+        } else {
+            SessionConfig::default()
+        };
         let session_ctx = SessionContext::new_with_config(session_config);
         let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
         // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
@@ -1667,7 +1835,15 @@ impl MergeInsertJob {
             .map(|name| format!("\"{}\"", name))
             .collect::<Vec<_>>();
         let on_cols_refs = on_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-        let source_df = session_ctx.read_one_shot(source)?;
+        // Plan against the provider directly so its statistics reach the optimizer;
+        // otherwise adapt it to a one-shot stream (which carries no statistics but
+        // preserves the source's original error type).
+        let source_df = if scan_provider_directly {
+            session_ctx.read_table(provider)?
+        } else {
+            let source = provider_to_stream(provider).await?;
+            session_ctx.read_one_shot(source)?
+        };
         // Capture the source field names *before* aliasing / joining so we
         // can tell which dataset columns are missing from the source and
         // need to be filled from the target side of the join below.
@@ -1746,14 +1922,15 @@ impl MergeInsertJob {
 
     async fn execute_uncommitted_v2(
         self,
-        source: SendableRecordBatchStream,
+        provider: Arc<dyn TableProvider>,
+        scan_provider_directly: bool,
     ) -> Result<(
         Transaction,
         MergeStats,
         Option<RowAddrTreeMap>,
         Option<KeyExistenceFilter>,
     )> {
-        let plan = self.create_plan(source).await?;
+        let plan = self.create_plan(provider, scan_provider_directly).await?;
 
         // Execute the plan
         // Assert that we have exactly one partition since we're designed for single-partition execution
@@ -1942,14 +2119,16 @@ impl MergeInsertJob {
 
     async fn execute_uncommitted_impl(
         self,
-        source: SendableRecordBatchStream,
+        provider: Arc<dyn TableProvider>,
+        scan_provider_directly: bool,
     ) -> Result<UncommittedMergeInsert> {
         // Check if we can use the fast path
-        let can_use_fast_path = self.can_use_create_plan(source.schema().as_ref()).await?;
+        let can_use_fast_path = self.can_use_create_plan(provider.schema().as_ref()).await?;
 
         if can_use_fast_path {
-            let (transaction, stats, affected_rows, inserted_rows_filter) =
-                self.execute_uncommitted_v2(source).await?;
+            let (transaction, stats, affected_rows, inserted_rows_filter) = self
+                .execute_uncommitted_v2(provider, scan_provider_directly)
+                .await?;
             return Ok(UncommittedMergeInsert {
                 transaction,
                 affected_rows,
@@ -1960,6 +2139,8 @@ impl MergeInsertJob {
 
         let target_bases_info = resolve_target_bases(&self.dataset, &self.params).await?;
 
+        // The slow path consumes a single stream; adapt the provider back into one.
+        let source = provider_to_stream(provider).await?;
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
@@ -2285,7 +2466,9 @@ impl MergeInsertJob {
 
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
-        let plan = cloned_job.create_plan(Box::pin(stream)).await?;
+        let plan = cloned_job
+            .create_plan(one_shot_provider(Box::pin(stream))?, false)
+            .await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
         Ok(format!("{}", display.indent(verbose)))
@@ -2318,7 +2501,9 @@ impl MergeInsertJob {
 
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
-        let plan = cloned_job.create_plan(source).await?;
+        let plan = cloned_job
+            .create_plan(one_shot_provider(source)?, false)
+            .await?;
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
         let options = LanceExecutionOptions::default();
@@ -2368,15 +2553,18 @@ pub struct UncommittedMergeInsert {
     pub inserted_rows_filter: Option<KeyExistenceFilter>,
 }
 
-/// Wrapper struct that combines MergeInsertJob with the source iterator for retry functionality
+/// Wrapper struct that combines MergeInsertJob with the source provider for retry functionality
 #[derive(Clone)]
-struct MergeInsertJobWithIterator {
+struct MergeInsertJobWithProvider {
     job: MergeInsertJob,
-    source_iter: Arc<Mutex<Box<dyn Iterator<Item = SendableRecordBatchStream> + Send + 'static>>>,
+    provider: Arc<dyn TableProvider>,
+    // Whether to plan against the provider directly (using its statistics) or adapt
+    // it to a one-shot stream. See `MergeInsertJob::execute_inner`.
+    scan_provider_directly: bool,
     attempt_count: Arc<AtomicU32>,
 }
 
-impl RetryExecutor for MergeInsertJobWithIterator {
+impl RetryExecutor for MergeInsertJobWithProvider {
     type Data = UncommittedMergeInsert;
     type Result = (Arc<Dataset>, MergeStats);
 
@@ -2384,10 +2572,11 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         // Increment attempt counter
         self.attempt_count.fetch_add(1, Ordering::SeqCst);
 
-        // We need to get a fresh stream for each retry attempt
-        // The source_iter provides unlimited streams from the same source data
-        let stream = self.source_iter.lock().unwrap().next().unwrap();
-        self.job.clone().execute_uncommitted_impl(stream).await
+        // Re-scan the provider on each retry attempt.
+        self.job
+            .clone()
+            .execute_uncommitted_impl(self.provider.clone(), self.scan_provider_directly)
+            .await
     }
 
     async fn commit(&self, dataset: Arc<Dataset>, mut data: Self::Data) -> Result<Self::Result> {
@@ -6531,7 +6720,10 @@ mod tests {
         let new_data = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
         let new_data_stream = reader_to_stream(Box::new(new_data));
 
-        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+        let plan = merge_insert_job
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
+            .await
+            .unwrap();
 
         // Assert the plan structure using portable plan matching
         // The optimized plan should have:
@@ -6584,7 +6776,10 @@ mod tests {
         let new_data_stream = reader_to_stream(Box::new(new_data));
 
         // This should use the fast path (execute_uncommitted_v2)
-        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+        let plan = merge_insert_job
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
+            .await
+            .unwrap();
 
         // The optimized plan should use Inner join instead of Right join since we're not
         // inserting unmatched rows.  The sentinel IS NOT NULL condition is folded away by
@@ -6632,7 +6827,10 @@ mod tests {
         let new_data_reader = new_data.into_reader_rows(RowCount::from(512), BatchCount::from(16));
         let new_data_stream = reader_to_stream(Box::new(new_data_reader));
 
-        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+        let plan = merge_insert_job
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
+            .await
+            .unwrap();
 
         // The optimized plan should use Inner join and include the UpdateIf condition.
         // The sentinel IS NOT NULL condition is folded away (sentinel is lit(true)).
@@ -6684,7 +6882,10 @@ mod tests {
 
         // Should reach the v2 fast path (`create_plan` + FullSchemaMergeInsertExec).
         // Dropping to v1 here would return an error from create_plan instead.
-        let plan = merge_insert_job.create_plan(new_data_stream).await.unwrap();
+        let plan = merge_insert_job
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
+            .await
+            .unwrap();
 
         // The join is Right because we keep unmatched source rows (InsertAll)
         // but discard unmatched target rows (DoNothing on when_matched,
@@ -9609,7 +9810,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             [Ok(new_batch.clone())],
             schema.clone(),
         )));
-        let plan = plan_job.create_plan(plan_stream).await.unwrap();
+        let plan = plan_job
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
+            .await
+            .unwrap();
         assert_plan_node_equals(
             plan,
             "DeleteOnlyMergeInsert: on=[key], when_matched=Delete, when_not_matched=DoNothing
@@ -9691,7 +9895,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             [Ok(new_batch.clone())],
             id_only_schema.clone(),
         )));
-        let plan = plan_job.create_plan(plan_stream).await.unwrap();
+        let plan = plan_job
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
+            .await
+            .unwrap();
         assert_plan_node_equals(
             plan,
             "DeleteOnlyMergeInsert: on=[key], when_matched=Delete, when_not_matched=DoNothing
@@ -9773,7 +9980,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             [Ok(new_batch.clone())],
             schema.clone(),
         )));
-        let plan = plan_job.create_plan(plan_stream).await.unwrap();
+        let plan = plan_job
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
+            .await
+            .unwrap();
         assert_plan_node_equals(
             plan,
             "MergeInsert: on=[key], when_matched=Delete, when_not_matched=InsertAll, when_not_matched_by_source=Keep...THEN 2 WHEN...THEN 3 ELSE 0 END as __action]...projection=[key, value, filterme]"
@@ -9878,7 +10088,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             [Ok(non_matching_batch.clone())],
             schema.clone(),
         )));
-        let plan = plan_job.create_plan(plan_stream).await.unwrap();
+        let plan = plan_job
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
+            .await
+            .unwrap();
         assert_plan_node_equals(
             plan,
             "DeleteOnlyMergeInsert: on=[key], when_matched=Delete, when_not_matched=DoNothing
@@ -9998,7 +10211,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 [Ok(new_batch)],
                 schema.clone(),
             )));
-            let plan = job.create_plan(plan_stream).await.unwrap();
+            let plan = job
+                .create_plan(one_shot_provider(plan_stream).unwrap(), false)
+                .await
+                .unwrap();
 
             let plan_str = datafusion::physical_plan::displayable(plan.as_ref())
                 .indent(true)
@@ -11447,5 +11663,307 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 );
             }
         }
+    }
+
+    fn id_value_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]))
+    }
+
+    /// `execute_provider` is the canonical entry point; a `MemTable` source merges
+    /// the same way a stream does.
+    #[tokio::test]
+    async fn test_merge_insert_execute_provider() {
+        let schema = id_value_schema();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        // Update id=1, insert id=3.
+        let new_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 3])),
+                Arc::new(UInt32Array::from(vec![10, 30])),
+            ],
+        )
+        .unwrap();
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![new_data]])
+                .unwrap(),
+        );
+
+        let (merged, stats) = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_provider(provider)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+
+        let batch = merged.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<UInt32Type>();
+        let values = batch["value"].as_primitive::<UInt32Type>();
+        let merged_rows: HashMap<u32, u32> = ids
+            .values()
+            .iter()
+            .zip(values.values().iter())
+            .map(|(id, value)| (*id, *value))
+            .collect();
+        assert_eq!(
+            merged_rows,
+            HashMap::from([(0, 0), (1, 10), (2, 0), (3, 30)])
+        );
+    }
+
+    /// `execute_batches` merges materialized batches; multiple batches are spread
+    /// across partitions and merged correctly.
+    #[tokio::test]
+    async fn test_merge_insert_execute_batches() {
+        let schema = id_value_schema();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        // Two batches: update id=1 (batch 0), insert id=3 (batch 1).
+        let batch0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![3])),
+                Arc::new(UInt32Array::from(vec![30])),
+            ],
+        )
+        .unwrap();
+
+        let (merged, stats) = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_batches(vec![batch0, batch1])
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+
+        let batch = merged.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<UInt32Type>();
+        let values = batch["value"].as_primitive::<UInt32Type>();
+        let merged_rows: HashMap<u32, u32> = ids
+            .values()
+            .iter()
+            .zip(values.values().iter())
+            .map(|(id, value)| (*id, *value))
+            .collect();
+        assert_eq!(
+            merged_rows,
+            HashMap::from([(0, 0), (1, 10), (2, 0), (3, 30)])
+        );
+    }
+
+    fn collect_exact_row_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
+        if let Ok(stats) = plan.partition_statistics(None)
+            && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
+        {
+            out.push(n);
+        }
+        for child in plan.children() {
+            collect_exact_row_counts(child, out);
+        }
+    }
+
+    /// Use case 3: planning against a provider directly exposes its exact source
+    /// statistics to the optimizer. Adapting it to a one-shot stream does not.
+    #[tokio::test]
+    async fn test_merge_insert_source_statistics_in_plan() {
+        let schema = id_value_schema();
+        let target_rows = 1000u32;
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..target_rows)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    0,
+                    target_rows as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        // A small source whose exact row count is distinct from the target's.
+        let source_rows = 10usize;
+        let new_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..source_rows as u32)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(
+                    1,
+                    source_rows,
+                ))),
+            ],
+        )
+        .unwrap();
+        let provider: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema.clone(), vec![vec![new_data]]).unwrap());
+
+        let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+
+        // Planning against the provider directly: its exact row count reaches the plan.
+        let plan_with_stats = job
+            .clone()
+            .create_plan(provider.clone(), true)
+            .await
+            .unwrap();
+        let mut with_stats = Vec::new();
+        collect_exact_row_counts(&plan_with_stats, &mut with_stats);
+        assert!(
+            with_stats.contains(&source_rows),
+            "source provider's exact row count ({source_rows}) should reach the plan; got {with_stats:?}"
+        );
+
+        // Adapting to a one-shot stream: the source carries no statistics.
+        let plan_without_stats = job.create_plan(provider, false).await.unwrap();
+        let mut without_stats = Vec::new();
+        collect_exact_row_counts(&plan_without_stats, &mut without_stats);
+        assert!(
+            !without_stats.contains(&source_rows),
+            "one-shot stream source should not report exact row count; got {without_stats:?}"
+        );
+    }
+
+    /// With a one-shot stream source and `spill_for_retry(false)`, a commit
+    /// conflict fails fast instead of replaying the stream. The non-replayable
+    /// one-shot provider must be scanned exactly once (scanning it twice would
+    /// panic), proving retries are disabled even though `conflict_retries > 0`.
+    #[tokio::test]
+    async fn test_merge_insert_spill_for_retry_false_fails_fast() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false).with_metadata(
+                vec![(
+                    "lance-schema:unenforced-primary-key".to_string(),
+                    "true".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        // Merge insert job based on version 1, with retries enabled but spilling off.
+        let new_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![100])),
+                Arc::new(UInt32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .conflict_retries(10)
+            .spill_for_retry(false)
+            .try_build()
+            .unwrap();
+
+        // An append commits first (version 2), so the merge built on version 1 hits
+        // an unresolvable conflict on commit.
+        let append_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![50])),
+                Arc::new(UInt32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![append_batch])
+            .await
+            .unwrap();
+
+        let source = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter(vec![Ok(new_data)]),
+        );
+        let merge_result = job
+            .execute(Box::pin(source) as SendableRecordBatchStream)
+            .await;
+
+        assert!(
+            matches!(
+                merge_result,
+                Err(crate::Error::TooMuchWriteContention { .. })
+            ),
+            "Expected fail-fast TooMuchWriteContention, got: {:?}",
+            merge_result
+        );
     }
 }

@@ -9,13 +9,17 @@ use std::{
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_array::RecordBatch;
-use arrow_schema::{ArrowError, Schema};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion::{
-    execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
+    catalog::{TableProvider, streaming::StreamingTable},
+    execution::{SendableRecordBatchStream, TaskContext},
+    physical_plan::{stream::RecordBatchStreamAdapter, streaming::PartitionStream},
 };
 use datafusion_common::DataFusionError;
+use futures::StreamExt;
 use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::tempfile::TempDir;
 
 /// Start a spill of Arrow data to a file that can be read later multiple times.
 ///
@@ -58,6 +62,101 @@ pub fn create_replay_spill(
     };
 
     (sender, receiver)
+}
+
+/// Wrap a one-shot [`SendableRecordBatchStream`] in a re-scannable [`TableProvider`].
+///
+/// The source is drained in the background into a replayable spill: up to
+/// `memory_limit` bytes are buffered in memory before spilling to a temporary file
+/// on disk. Each scan of the returned provider replays the full source from the
+/// spill, which is what makes a one-shot stream usable in the write retry loop.
+///
+/// The provider reports no statistics — the source size is not known until it has
+/// been fully drained — so callers that need source statistics (e.g. to drive join
+/// ordering) should prefer a materialized or file-backed provider instead.
+pub async fn spilling_table_provider(
+    mut source: SendableRecordBatchStream,
+    memory_limit: usize,
+) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    let schema = source.schema();
+    let tmp_dir = tokio::task::spawn_blocking(TempDir::try_new)
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("Failed to spawn temp dir task: {e}")))?
+        .map_err(|e| DataFusionError::Execution(format!("Failed to create temp dir: {e}")))?;
+    let tmp_path = tmp_dir.std_path().join("spill.arrows");
+    let (mut sender, receiver) = create_replay_spill(tmp_path, schema.clone(), memory_limit);
+
+    // Drain the one-shot source into the spill once, in the background. The spill
+    // tees to memory/disk so the first reader can consume batches as they arrive
+    // while later readers replay the complete source.
+    let drain_handle = tokio::task::spawn(async move {
+        let mut errored = false;
+        while let Some(res) = source.next().await {
+            match res {
+                Ok(batch) => {
+                    if let Err(e) = sender.write(batch).await {
+                        sender.send_error(e);
+                        errored = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    sender.send_error(e);
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        // Only finish on a clean drain. Calling finish() after an error would
+        // overwrite the original (replayable) error with a generic one, losing
+        // the source error's type (e.g. an external error from user code).
+        if !errored && let Err(err) = sender.finish().await {
+            sender.send_error(err);
+        }
+        sender
+    });
+
+    let partition = Arc::new(SpillPartition {
+        schema: schema.clone(),
+        receiver,
+        _tmp_dir: Arc::new(tmp_dir),
+        _drain_handle: Arc::new(drain_handle),
+    });
+    Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
+}
+
+/// A [`PartitionStream`] backed by a replayable spill.
+///
+/// Each call to [`PartitionStream::execute`] opens a fresh stream over the spill,
+/// so the partition can be scanned repeatedly. The spill file and the background
+/// task draining the source are kept alive for as long as this partition exists.
+struct SpillPartition {
+    schema: SchemaRef,
+    receiver: SpillReceiver,
+    // The spilled data lives in this temp dir; dropping it deletes the spill file.
+    _tmp_dir: Arc<TempDir>,
+    // Keeps the background drain task (which owns the `SpillSender`) alive. The
+    // `SpillSender` must outlive the readers or they error out, so we hold the
+    // handle rather than detaching it.
+    _drain_handle: Arc<tokio::task::JoinHandle<SpillSender>>,
+}
+
+impl std::fmt::Debug for SpillPartition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpillPartition")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl PartitionStream for SpillPartition {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        self.receiver.read()
+    }
 }
 
 #[derive(Clone)]

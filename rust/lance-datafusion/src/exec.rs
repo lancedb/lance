@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
-    catalog::streaming::StreamingTable,
+    catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
     execution::{
         TaskContext,
@@ -40,7 +40,7 @@ use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metr
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
@@ -875,6 +875,33 @@ impl SessionContextExt for SessionContext {
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))
     }
+}
+
+/// Scan a [`TableProvider`] into a single-partition [`SendableRecordBatchStream`].
+///
+/// Multi-partition providers are coalesced into a single partition. This adapts a
+/// re-scannable provider back into the one stream the writer pipeline consumes;
+/// re-scanning the same provider (e.g. on a write retry) yields a fresh stream.
+///
+/// The first batch is read eagerly and re-chained onto the stream. This surfaces a
+/// scan error from the source directly, before it can be fed into (and obscured by)
+/// a downstream plan — preserving the original error type for callers.
+pub async fn provider_to_stream(
+    provider: Arc<dyn TableProvider>,
+) -> Result<SendableRecordBatchStream> {
+    let ctx = SessionContext::new();
+    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+    let plan: Arc<dyn ExecutionPlan> =
+        if plan.properties().output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(plan))
+        } else {
+            plan
+        };
+    let schema = plan.schema();
+    let mut stream = plan.execute(0, ctx.task_ctx())?;
+    let first = stream.try_next().await?;
+    let rechained = stream::iter(first.map(Ok)).chain(stream);
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rechained)))
 }
 
 #[derive(Clone, Debug)]
