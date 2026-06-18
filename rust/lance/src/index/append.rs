@@ -65,14 +65,87 @@ async fn build_stable_row_id_filter(
         .try_collect::<Vec<_>>()
         .await?;
 
-    let row_id_maps = row_id_sequences
-        .iter()
-        .map(|(_, seq)| RowAddrTreeMap::from(seq.as_ref()))
-        .collect::<Vec<_>>();
+    let frag_by_id: std::collections::HashMap<u32, _> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(|f| (f.id() as u32, f))
+        .collect();
+
+    let mut row_id_maps = Vec::with_capacity(row_id_sequences.len());
+    for (frag_id, seq) in &row_id_sequences {
+        row_id_maps.push(live_row_ids(frag_by_id.get(frag_id), seq).await?);
+    }
     let row_id_map_refs = row_id_maps.iter().collect::<Vec<_>>();
 
     // Merge all fragment-local row-id sets into one exact membership structure.
     Ok(<RowAddrTreeMap as RowSetOps>::union_all(&row_id_map_refs))
+}
+
+/// The fragment's live row ids: its persisted row-id sequence minus the rows
+/// its deletion vector marks gone. A persisted sequence covers every row the
+/// fragment ever held, so a row whose old copy was deleted (e.g. rewritten by an
+/// update under the same stable row id) would otherwise be retained as a stale
+/// old-index entry.
+async fn live_row_ids(
+    fragment: Option<&crate::dataset::fragment::FileFragment>,
+    seq: &lance_table::rowids::RowIdSequence,
+) -> Result<RowAddrTreeMap> {
+    let deletion_vector = match fragment {
+        Some(f) if f.metadata().deletion_file.is_some() => {
+            f.get_deletion_vector().await.ok().flatten()
+        }
+        _ => None,
+    };
+    Ok(match deletion_vector {
+        Some(dv) => seq
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| !dv.contains(*offset as u32))
+            .map(|(_, row_id)| row_id)
+            .collect(),
+        None => RowAddrTreeMap::from(seq),
+    })
+}
+
+/// Open the selected inverted (FTS) segments and merge `new_data` into them
+/// through the segment-merge primitive, which materializes each old partition
+/// and applies `old_data_filter` (dropping stale rows -- e.g. updated rows under
+/// stable row ids). The fast `ScalarIndex::update` path only references old
+/// partitions by id and cannot honor a row-level `RowIds` filter, so it must not
+/// be used when old rows need to be removed.
+async fn open_and_merge_inverted_segments(
+    dataset: &Dataset,
+    field_path: &str,
+    segments: &[&IndexMetadata],
+    new_data: datafusion::execution::SendableRecordBatchStream,
+    new_store: &LanceIndexStore,
+    old_data_filter: Option<OldIndexDataFilter>,
+) -> Result<CreatedIndex> {
+    let mut source_indices = Vec::with_capacity(segments.len());
+    for &segment in segments {
+        let scalar_index = dataset
+            .open_scalar_index(field_path, &segment.uuid, &NoOpMetricsCollector)
+            .await?;
+        let inverted = scalar_index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "Inverted merge: expected inverted segment {}, got {:?}",
+                    segment.uuid,
+                    scalar_index.index_type()
+                ))
+            })?;
+        source_indices.push(Arc::new(inverted.clone()));
+    }
+    InvertedIndex::merge_segments(
+        &source_indices,
+        new_data,
+        new_store,
+        old_data_filter,
+        Arc::new(NoopIndexBuildProgress),
+    )
+    .await
 }
 
 /// Build the [`OldIndexDataFilter`] that must be applied to existing index
@@ -292,6 +365,17 @@ async fn merge_scalar_indices<'a>(
                     new_data_stream,
                     &new_store,
                     &old_data_filters,
+                )
+                .await?
+            }
+            IndexType::Inverted => {
+                open_and_merge_inverted_segments(
+                    dataset.as_ref(),
+                    field_path,
+                    selected_old_indices,
+                    new_data_stream,
+                    &new_store,
+                    old_data_filter,
                 )
                 .await?
             }
@@ -1920,6 +2004,141 @@ mod tests {
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
+    }
+
+    /// Under stable row ids, updating an indexed column and then calling
+    /// `optimize_indices` must not leave stale entries (old value -> updated row)
+    /// in the scalar index. An update deletes the old copy of each row and
+    /// rewrites it under the same stable row id, so the old index entry is stale
+    /// and must be dropped on merge. Covers BTree, Bitmap, and Inverted (FTS),
+    /// which take three different merge paths.
+    #[tokio::test]
+    async fn test_optimize_scalar_index_drops_stale_rows_after_update() {
+        use crate::dataset::UpdateBuilder;
+        use arrow_array::Int32Array;
+        use lance_index::scalar::FullTextSearchQuery;
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        // 100 rows: num == id; cat = "A" for id<50 else "B"; body = "alpha" for
+        // id<50 else "beta".
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("num", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|i| if i < 50 { "A" } else { "B" }),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|i| if i < 50 { "alpha" } else { "beta" }),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["num"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["cat"],
+                IndexType::Bitmap,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["body"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Update the first 25 rows (id < 25): num -> -1, cat -> 'B', body -> 'beta'.
+        let res = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 25")
+            .unwrap()
+            .set("num", "-1")
+            .unwrap()
+            .set("cat", "'B'")
+            .unwrap()
+            .set("body", "'beta'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = res.new_dataset.as_ref().clone();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        // BTree: `num >= 0` matches ids 25..99 (75 rows); the 25 updated rows
+        // hold num = -1 and must not appear.
+        let btree_count = dataset
+            .scan()
+            .filter("num >= 0")
+            .unwrap()
+            .count_rows()
+            .await
+            .unwrap();
+        assert_eq!(btree_count, 75, "btree returned stale/incorrect rows");
+
+        // Bitmap: only the 25 rows (ids 25..49) that still carry cat = 'A' match;
+        // the 25 rows updated to 'B' must not.
+        let bitmap_count = dataset
+            .scan()
+            .filter("cat = 'A'")
+            .unwrap()
+            .count_rows()
+            .await
+            .unwrap();
+        assert_eq!(bitmap_count, 25, "bitmap returned stale rows");
+
+        // FTS: only the 25 rows (ids 25..49) whose body still reads "alpha" match;
+        // the 25 rows updated to "beta" must not.
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+            .unwrap();
+        let fts_count = scan.count_rows().await.unwrap();
+        assert_eq!(fts_count, 25, "FTS index returned stale rows");
     }
 
     #[tokio::test]
