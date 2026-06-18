@@ -181,6 +181,38 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
         .unwrap_or(default_worker_memory_limit_bytes)
 }
 
+/// Minimum [`get_num_compute_intensive_cpus`] for the pipelined FTS posting write path.
+///
+/// `write_posting_lists` runs batch encoding on `spawn_cpu` while `FileWriter::write_batch`
+/// also submits column page encoding via `spawn_cpu`. With only one `lance-cpu` blocking
+/// thread the producer blocks on the bounded channel while the writer waits for encoding,
+/// which deadlocks with no further log output.
+const MIN_CPU_THREADS_FOR_FTS_POSTING_PIPELINE: usize = 2;
+
+fn fts_posting_pipeline_insufficient_cpu_threads_message(available_cpu_threads: usize) -> String {
+    format!(
+        "FTS inverted index build requires at least {MIN_CPU_THREADS_FOR_FTS_POSTING_PIPELINE} \
+         lance-cpu blocking threads, but only {available_cpu_threads} is available. \
+         Posting-list batch encoding and Lance file page encoding both use the same global \
+         `spawn_cpu` pool; with a single thread the pipelined writer deadlocks silently \
+         after logging \"writing N posting lists\". \
+         Set environment variable LANCE_CPU_THREADS to at least \
+         {MIN_CPU_THREADS_FOR_FTS_POSTING_PIPELINE}, or use a machine where \
+         num_cpus > LANCE_IO_CORE_RESERVATION (currently reserving {} cores for I/O).",
+        *IO_CORE_RESERVATION
+    )
+}
+
+fn check_fts_posting_pipeline_cpu_threads() -> Result<()> {
+    let available_cpu_threads = get_num_compute_intensive_cpus();
+    if available_cpu_threads < MIN_CPU_THREADS_FOR_FTS_POSTING_PIPELINE {
+        let message = fts_posting_pipeline_insufficient_cpu_threads_message(available_cpu_threads);
+        log::error!("{message}");
+        return Err(Error::invalid_input(message));
+    }
+    Ok(())
+}
+
 fn merge_all_tail_partitions(tails: Vec<TailPartition>) -> Result<Option<InnerBuilder>> {
     if tails.is_empty() {
         return Ok(None);
@@ -437,6 +469,7 @@ impl InvertedIndexBuilder {
         stream: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
+        check_fts_posting_pipeline_cpu_threads()?;
         let num_workers = resolve_num_workers(&self.params);
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
@@ -1035,6 +1068,20 @@ impl InnerBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn write_posting_lists(
+        &mut self,
+        store: &dyn IndexStore,
+        docs: Arc<DocSet>,
+        path: &str,
+    ) -> Result<IndexFile> {
+        check_fts_posting_pipeline_cpu_threads()?;
+        self.write_posting_lists_pipelined(store, docs, path).await
+    }
+
+    /// Pipelined posting-list writer used by [`Self::write_posting_lists`].
+    ///
+    /// Exposed for deadlock regression tests that must bypass the CPU-thread guard.
+    #[instrument(level = "debug", skip_all)]
+    async fn write_posting_lists_pipelined(
         &mut self,
         store: &dyn IndexStore,
         docs: Arc<DocSet>,
@@ -2161,6 +2208,100 @@ mod tests {
     use std::ops::Range;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn test_fts_posting_pipeline_cpu_threads_error_message() {
+        let message = fts_posting_pipeline_insufficient_cpu_threads_message(1);
+        assert!(
+            message.contains("LANCE_CPU_THREADS"),
+            "message should mention LANCE_CPU_THREADS: {message}"
+        );
+        assert!(
+            message.contains("deadlock"),
+            "message should mention deadlock: {message}"
+        );
+        assert!(
+            message.contains("writing N posting lists"),
+            "message should reference the last log line users see: {message}"
+        );
+    }
+
+    async fn fts_posting_pipeline_deadlock_reproducer() -> Result<()> {
+        assert_eq!(
+            get_num_compute_intensive_cpus(),
+            1,
+            "deadlock reproducer child must run with LANCE_CPU_THREADS=1"
+        );
+
+        let (tx, rx) = async_channel::bounded(1usize);
+        let producer = spawn_cpu(move || -> Result<()> {
+            tx.send_blocking(1u32)
+                .map_err(|err| Error::execution(format!("send batch 1: {err}")))?;
+            tx.send_blocking(2u32)
+                .map_err(|err| Error::execution(format!("send batch 2: {err}")))?;
+            // Third send blocks on the full queue while the consumer awaits nested `spawn_cpu`.
+            tx.send_blocking(3u32)
+                .map_err(|err| Error::execution(format!("send batch 3: {err}")))?;
+            Ok(())
+        });
+
+        while let Ok(_batch) = rx.recv().await {
+            // Stand in for Lance `FileWriter::write_batch` page encoding (`spawn_cpu`).
+            spawn_cpu(|| Ok::<(), Error>(())).await?;
+        }
+
+        producer.await?;
+        Ok(())
+    }
+
+    /// Reproduces the historical FTS posting-list write deadlock in a fresh child process
+    /// with `LANCE_CPU_THREADS=1` (single `lance-cpu` blocking thread).
+    ///
+    /// Mirrors [`InnerBuilder::write_posting_lists_pipelined`]: producer on `spawn_cpu` with a
+    /// depth-1 channel, consumer awaiting nested `spawn_cpu` (as in Lance page encoding).
+    /// The guarded [`InnerBuilder::write_posting_lists`] fails fast instead.
+    #[test]
+    fn test_fts_posting_pipeline_write_posting_lists_deadlocks_with_one_cpu_thread() {
+        if std::env::var("LANCE_FTS_DEADLOCK_CHILD").as_deref() == Ok("1") {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .expect("build tokio runtime for deadlock reproducer");
+
+            let timed_out = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    fts_posting_pipeline_deadlock_reproducer(),
+                )
+                .await
+            });
+
+            assert!(
+                timed_out.is_err(),
+                "unguarded posting-list pipeline should deadlock with LANCE_CPU_THREADS=1"
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .env("LANCE_FTS_DEADLOCK_CHILD", "1")
+            .env("LANCE_CPU_THREADS", "1")
+            .args([
+                "--exact",
+                "scalar::inverted::builder::tests::test_fts_posting_pipeline_write_posting_lists_deadlocks_with_one_cpu_thread",
+                "--nocapture",
+            ])
+            .output()
+            .expect("spawn FTS posting-list deadlock reproducer child");
+
+        assert!(
+            output.status.success(),
+            "child deadlock reproducer failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
