@@ -188,6 +188,10 @@ name = "scan"
 harness = false
 
 [[bench]]
+name = "count_pushdown"
+harness = false
+
+[[bench]]
 name = "vector_index"
 harness = false
 
