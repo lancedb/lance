@@ -976,41 +976,37 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             }
 
-            let Some(doc) = self.lead.first().and_then(|posting| posting.doc()) else {
+            let Some(first_doc) = self.lead.first().and_then(|posting| posting.doc()) else {
                 self.push_back_leads(target + 1);
                 continue;
             };
-            let doc_length = match &doc {
+            let doc_length = match &first_doc {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
-            let mut lead_score = self
-                .lead
-                .iter()
-                .filter_map(|posting| {
-                    posting.doc().map(|lead_doc| {
-                        posting.score(&self.scorer, lead_doc.frequency(), doc_length)
-                    })
-                })
-                .sum::<f32>();
+            let mut lead_score = 0.0;
+            if let Some(first_posting) = self.lead.first() {
+                lead_score += first_posting.score(&self.scorer, first_doc.frequency(), doc_length);
+            }
+            for posting in self.lead.iter().skip(1) {
+                if let Some(lead_doc) = posting.doc() {
+                    lead_score += posting.score(&self.scorer, lead_doc.frequency(), doc_length);
+                }
+            }
 
             while lead_score <= self.threshold {
                 if lead_score + self.tail_max_score <= self.threshold {
-                    self.push_back_leads(doc.doc_id() + 1);
+                    self.push_back_leads(first_doc.doc_id() + 1);
                     break;
                 }
                 if !self.advance_tail_top(target, doc_length, &mut lead_score) {
-                    self.push_back_leads(doc.doc_id() + 1);
+                    self.push_back_leads(first_doc.doc_id() + 1);
                     break;
                 }
             }
 
             if !self.lead.is_empty() {
-                return Ok(self
-                    .lead
-                    .first()
-                    .and_then(|posting| posting.doc())
-                    .map(|doc| (doc, lead_score)));
+                return Ok(Some((first_doc, lead_score)));
             }
         }
 
@@ -1401,10 +1397,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         };
         self.tail_max_score -= upper_bound;
         posting.next(target);
-        match posting.doc().map(|doc| doc.doc_id()) {
-            Some(doc_id) if doc_id == target => {
-                let frequency = posting.doc().expect("posting must exist").frequency();
-                *lead_score += posting.score(&self.scorer, frequency, doc_length);
+        match posting.doc() {
+            Some(doc) if doc.doc_id() == target => {
+                *lead_score += posting.score(&self.scorer, doc.frequency(), doc_length);
                 self.lead.push(posting);
             }
             Some(_) => self.push_head(posting),
@@ -1427,14 +1422,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         for tail_posting in tail.into_vec() {
             let mut posting = tail_posting.posting;
             posting.next(target);
-            match posting.doc().map(|doc| doc.doc_id()) {
-                Some(doc_id) if doc_id == target => {
+            match posting.doc() {
+                Some(doc) if doc.doc_id() == target => {
                     if let (Some(doc_length), Some(score)) = (doc_length, score.as_deref_mut()) {
-                        let frequency = posting
-                            .doc()
-                            .expect("posting moved to target should have doc")
-                            .frequency();
-                        *score += posting.score(&self.scorer, frequency, doc_length);
+                        *score += posting.score(&self.scorer, doc.frequency(), doc_length);
                     }
                     self.lead.push(posting)
                 }
