@@ -3701,12 +3701,7 @@ struct SerializedFullZip {
 //
 // If we directly record the size in bytes with 12 bits we would be limited to
 // 4KiB which is too small.  Since we know each mini-block consists of 8 byte
-// words we can store the # of words instead which gives us 32KiB.  We want
-// at least 24KiB so we can handle even the worst case of
-// - values compressed into an 8186 byte buffer
-// - 4 bytes to describe rep & def lengths
-// - 16KiB of rep & def buffer (this will almost never happen but life is easier if we
-//   plan for it)
+// words we can store the # of words instead which gives us 32KiB.
 //
 // Second, each chunk in a mini-block is aligned to 8 bytes.  This allows multi-byte
 // values like offsets to be stored in a mini-block and safely read back out.  It also
