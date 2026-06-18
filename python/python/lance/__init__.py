@@ -230,7 +230,9 @@ def dataset(
                 "Both 'namespace_client' and 'table_id' must be provided together."
             )
 
-        request = DescribeTableRequest(id=table_id, version=version)
+        # Resolve the latest table metadata here. The requested dataset version is
+        # applied by the lower-level dataset open path after namespace resolution.
+        request = DescribeTableRequest(id=table_id, version=None)
         response = namespace_client.describe_table(request)
 
         uri = response.location

@@ -15,6 +15,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::pb;
+use lance_core::cache::{CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 
 /// Metadata about a single file within an index segment.
@@ -235,24 +236,26 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
 /// orphan rule prevents `impl CacheCodecImpl for Vec<IndexMetadata>`.
 type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
 
+/// Stable type identifier for the `Vec<IndexMetadata>` cache entry.
+const INDEX_METADATA_TYPE_ID: &str = "lance.table.IndexMetadataList";
+/// Body schema version written by this build.
+const INDEX_METADATA_VERSION: u32 = 1;
+
 fn serialize_index_metadata(
     any: &ArcAny,
-    writer: &mut dyn std::io::Write,
+    writer: &mut CacheEntryWriter<'_>,
 ) -> lance_core::Result<()> {
-    use prost::Message;
     let vec = any
         .downcast_ref::<Vec<IndexMetadata>>()
         .expect("index_metadata_codec: wrong type (this is a bug in the cache layer)");
     let section = pb::IndexSection {
         indices: vec.iter().map(pb::IndexMetadata::from).collect(),
     };
-    writer.write_all(&section.encode_to_vec())?;
-    Ok(())
+    writer.write_header(&section)
 }
 
-fn deserialize_index_metadata(data: &bytes::Bytes) -> lance_core::Result<ArcAny> {
-    use prost::Message;
-    let section = pb::IndexSection::decode(data.as_ref())?;
+fn deserialize_index_metadata(reader: &mut CacheEntryReader<'_>) -> lance_core::Result<ArcAny> {
+    let section: pb::IndexSection = reader.read_header()?;
     let indices: Vec<IndexMetadata> = section
         .indices
         .into_iter()
@@ -262,7 +265,12 @@ fn deserialize_index_metadata(data: &bytes::Bytes) -> lance_core::Result<ArcAny>
 }
 
 pub fn index_metadata_codec() -> lance_core::cache::CacheCodec {
-    lance_core::cache::CacheCodec::new(serialize_index_metadata, deserialize_index_metadata)
+    lance_core::cache::CacheCodec::new(
+        INDEX_METADATA_TYPE_ID,
+        INDEX_METADATA_VERSION,
+        serialize_index_metadata,
+        deserialize_index_metadata,
+    )
 }
 
 /// List all files in an index directory with their sizes.
@@ -348,7 +356,8 @@ mod tests {
         let bytes = store.get(&key).unwrap();
         let recovered = codec
             .deserialize(&bytes::Bytes::copy_from_slice(bytes))
-            .unwrap();
+            .hit()
+            .expect("entry should decode as a hit");
         let recovered = recovered
             .downcast::<Vec<IndexMetadata>>()
             .expect("downcast should succeed");

@@ -3,7 +3,6 @@
 
 //! IVF - Inverted File index.
 
-use std::io::Write as IoWrite;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -26,8 +25,10 @@ use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
-use lance_arrow::ipc::write_len_prefixed_bytes;
-use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+    WeakLanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
@@ -35,6 +36,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
+use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
@@ -217,28 +219,6 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
     }
 }
 
-/// Serialization header for the `IvfIndexState` wire format.
-///
-/// Kept as a flat, non-generic struct so the JSON header format is stable
-/// regardless of `Q`. `quantizer_metadata_json` holds the serialized
-/// `Q::Metadata`; large blobs (PQ codebook, RQ matrix) follow as raw bytes.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct IvfIndexStateHeader {
-    index_file_path: String,
-    uuid: String,
-    distance_type: String,
-    sub_index_metadata: Vec<String>,
-    sub_index_type: String,
-    quantization_type: String,
-    quantizer_metadata_json: String,
-    #[serde(default)]
-    cache_key_prefix: String,
-    #[serde(default)]
-    index_file_size: u64,
-    #[serde(default)]
-    aux_file_size: u64,
-}
-
 /// Object-safe interface for a type-erased `IvfIndexState<Q>`.
 ///
 /// Stored as `Arc<dyn IvfStateEntry>` inside [`IvfStateEntryBox`], which is
@@ -246,7 +226,7 @@ struct IvfIndexStateHeader {
 /// wrapper lets the cache infrastructure work with a sized type while the
 /// hot paths call `reconstruct` without knowing `Q`.
 pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
-    fn serialize_state(&self, writer: &mut dyn IoWrite) -> Result<()>;
+    fn serialize_state(&self, w: &mut CacheEntryWriter<'_>) -> Result<()>;
 
     fn reconstruct<'a>(
         &'a self,
@@ -271,42 +251,39 @@ impl DeepSizeOf for IvfStateEntryBox {
     }
 }
 
-/// Wire format (unchanged from the non-generic `IvfIndexState`):
-/// `[header_json_len: u64 LE][header JSON][ivf_pb_len: u64 LE][ivf protobuf]
-///  [extra_len: u64 LE][extra bytes][aux_ivf_pb_len: u64 LE][aux_ivf protobuf]`
+/// Wire format:
+/// ```text
+/// HEADER   : IvfStateHeader proto (paths, types, quantizer metadata JSON)
+/// RAW_BLOB : IVF model protobuf
+/// RAW_BLOB : quantizer extra-metadata buffer (may be empty)
+/// RAW_BLOB : auxiliary IVF model protobuf
+/// ```
 impl CacheCodecImpl for IvfStateEntryBox {
-    fn serialize(&self, writer: &mut dyn IoWrite) -> Result<()> {
-        self.0.serialize_state(writer)
+    const TYPE_ID: &'static str = "lance.vector.ivf.IvfState";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        self.0.serialize_state(w)
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
-        use lance_arrow::ipc::read_len_prefixed_bytes_at;
-
-        // Parse the common wire format, then dispatch on quantization_type to
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        // Parse the common header, then dispatch on quantization_type to
         // construct the right IvfIndexState<Q>.
-        let mut offset = 0;
-        let header_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
-        let header: IvfIndexStateHeader = serde_json::from_slice(&header_bytes)
-            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
+        let header: IvfStateHeader = r.read_header()?;
 
-        let ivf_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let ivf_bytes = r.read_raw()?;
         let ivf = IvfModel::try_from(
             pb::Ivf::decode(ivf_bytes.as_ref())
                 .map_err(|e| lance_core::Error::io(format!("IvfIndexState IVF decode: {e}")))?,
         )?;
 
-        let extra_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let extra_bytes = r.read_raw()?;
 
-        // aux_ivf was added after initial deployment; fall back to ivf on
-        // clean EOF (legacy format without the field).
-        let aux_ivf = if offset + 8 <= data.len() {
-            let aux_ivf_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let aux_ivf_bytes = r.read_raw()?;
+        let aux_ivf =
             IvfModel::try_from(pb::Ivf::decode(aux_ivf_bytes.as_ref()).map_err(|e| {
                 lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}"))
-            })?)?
-        } else {
-            ivf.clone()
-        };
+            })?)?;
 
         let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
         let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
@@ -315,7 +292,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
         // Helper: parse Q::Metadata from the JSON+extra_bytes in the header,
         // then build an IvfStateEntryBox wrapping IvfIndexState<Q>.
         fn make_entry<Q: Quantization + 'static>(
-            header: IvfIndexStateHeader,
+            header: IvfStateHeader,
             ivf: IvfModel,
             aux_ivf: IvfModel,
             extra_bytes: bytes::Bytes,
@@ -401,13 +378,13 @@ impl CacheCodecImpl for IvfStateEntryBox {
 }
 
 impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
-    fn serialize_state(&self, writer: &mut dyn IoWrite) -> Result<()> {
+    fn serialize_state(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let quantizer_metadata_json = serde_json::to_string(&self.metadata)
             .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;
         let extra = self.metadata.extra_metadata()?;
         let extra = extra.as_deref().unwrap_or(&[]);
 
-        let header = IvfIndexStateHeader {
+        let header = IvfStateHeader {
             index_file_path: self.index_file_path.clone(),
             uuid: self.uuid.to_string(),
             distance_type: self.distance_type.to_string(),
@@ -419,15 +396,13 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             index_file_size: self.index_file_size,
             aux_file_size: self.aux_file_size,
         };
-        let header_json = serde_json::to_vec(&header)
-            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
         let ivf_bytes = pb::Ivf::try_from(&self.ivf)?.encode_to_vec();
         let aux_ivf_bytes = pb::Ivf::try_from(&self.aux_ivf)?.encode_to_vec();
 
-        write_len_prefixed_bytes(writer, &header_json)?;
-        write_len_prefixed_bytes(writer, &ivf_bytes)?;
-        write_len_prefixed_bytes(writer, extra)?;
-        write_len_prefixed_bytes(writer, &aux_ivf_bytes)?;
+        w.write_header(&header)?;
+        w.write_raw(&ivf_bytes)?;
+        w.write_raw(extra)?;
+        w.write_raw(&aux_ivf_bytes)?;
         Ok(())
     }
 
@@ -6240,11 +6215,9 @@ mod tests {
             // Try serialized store first
             let guard = self.serialized.lock().await;
             if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return Some(
-                    stored_codec
-                        .deserialize(&bytes::Bytes::copy_from_slice(bytes))
-                        .expect("deserialization should succeed"),
-                );
+                return stored_codec
+                    .deserialize(&bytes::Bytes::copy_from_slice(bytes))
+                    .hit();
             }
             drop(guard);
             // Fall through to passthrough

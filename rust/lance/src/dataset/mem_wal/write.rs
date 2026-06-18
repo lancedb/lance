@@ -846,6 +846,16 @@ async fn replay_memtable_from_wal(
     Ok(position)
 }
 
+/// Pair each primary-key column name with its field id (both derived from the
+/// schema's primary key, in the same order) for [`IndexStore::enable_pk_index`].
+fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String, i32)> {
+    pk_columns
+        .iter()
+        .cloned()
+        .zip(pk_field_ids.iter().copied())
+        .collect()
+}
+
 /// Shared state for writer operations.
 struct SharedWriterState {
     state: Arc<RwLock<WriterState>>,
@@ -855,6 +865,9 @@ struct SharedWriterState {
     config: ShardWriterConfig,
     schema: Arc<ArrowSchema>,
     pk_field_ids: Vec<i32>,
+    /// Primary-key column names, used to (re)enable the PK-position index on
+    /// each fresh active memtable created at freeze.
+    pk_columns: Vec<String>,
     max_memtable_batches: usize,
     max_memtable_rows: usize,
     index_configs: Vec<MemIndexConfig>,
@@ -870,6 +883,7 @@ impl SharedWriterState {
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
         pk_field_ids: Vec<i32>,
+        pk_columns: Vec<String>,
         max_memtable_batches: usize,
         max_memtable_rows: usize,
         index_configs: Vec<MemIndexConfig>,
@@ -882,6 +896,7 @@ impl SharedWriterState {
             config,
             schema,
             pk_field_ids,
+            pk_columns,
             max_memtable_batches,
             max_memtable_rows,
             index_configs,
@@ -907,13 +922,17 @@ impl SharedWriterState {
             self.max_memtable_batches,
         )?;
 
-        if !self.index_configs.is_empty() {
-            let indexes = Arc::new(IndexStore::from_configs(
+        // Build an IndexStore when there are user indexes *or* a primary key:
+        // the PK dedup index (and its flushed on-disk sidecar) is required for
+        // cross-generation dedup even when no secondary index is configured.
+        if !self.index_configs.is_empty() || !self.pk_columns.is_empty() {
+            let mut indexes = IndexStore::from_configs(
                 &self.index_configs,
                 self.max_memtable_rows,
                 self.max_memtable_batches,
-            )?);
-            new_memtable.set_indexes_arc(indexes);
+            )?;
+            indexes.enable_pk_index(&pk_index_columns(&self.pk_columns, &self.pk_field_ids));
+            new_memtable.set_indexes_arc(Arc::new(indexes));
         }
 
         let mut old_memtable = std::mem::replace(&mut state.memtable, new_memtable);
@@ -1287,11 +1306,9 @@ impl ShardWriter {
     ) -> Result<WriterMode> {
         // Create MemTable with primary key field IDs from schema
         let lance_schema = Schema::try_from(schema.as_ref())?;
-        let pk_field_ids: Vec<i32> = lance_schema
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.id)
-            .collect();
+        let pk_fields = lance_schema.unenforced_primary_key();
+        let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
+        let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
         let mut memtable = MemTable::with_capacity(
             schema.clone(),
             manifest.current_generation,
@@ -1300,14 +1317,18 @@ impl ShardWriter {
             config.max_memtable_batches,
         )?;
 
-        // Create indexes if configured and set them on the MemTable.
-        if !index_configs.is_empty() {
-            let indexes = Arc::new(IndexStore::from_configs(
+        // Create indexes if configured and set them on the MemTable. The
+        // PK-position index is enabled before any WAL replay below so replayed
+        // rows are recorded in it. A primary key alone (no secondary index)
+        // still needs the PK index so flush writes its on-disk dedup sidecar.
+        if !index_configs.is_empty() || !pk_columns.is_empty() {
+            let mut indexes = IndexStore::from_configs(
                 index_configs,
                 config.max_memtable_rows,
                 config.max_memtable_batches,
-            )?);
-            memtable.set_indexes_arc(indexes);
+            )?;
+            indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
+            memtable.set_indexes_arc(Arc::new(indexes));
         }
 
         // Replay any WAL entries written after the last successfully-flushed
@@ -1395,6 +1416,7 @@ impl ShardWriter {
             config.clone(),
             schema.clone(),
             pk_field_ids,
+            pk_columns,
             config.max_memtable_batches,
             config.max_memtable_rows,
             index_configs.to_vec(),

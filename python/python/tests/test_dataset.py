@@ -93,6 +93,25 @@ def test_roundtrip_types(tmp_path: Path):
     assert dataset.to_table() == table
 
 
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable", "2.1"])
+def test_write_zero_dimension_fixed_size_list(
+    tmp_path: Path, data_storage_version: str
+):
+    # Zero-dimension fixed-size lists must be rejected with a clean error
+    # instead of a divide-by-zero panic (#5102)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("vec", pa.list_(pa.float32(), 0)),
+        ]
+    )
+    table = pa.table({"id": [1], "vec": [[]]}, schema=schema)
+    with pytest.raises(OSError, match="dimension must be a positive integer"):
+        lance.write_dataset(
+            table, tmp_path / "ds.lance", data_storage_version=data_storage_version
+        )
+
+
 def test_dataset_overwrite(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"

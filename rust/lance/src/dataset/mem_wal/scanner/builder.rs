@@ -476,21 +476,34 @@ impl LsmScanner {
     /// [`FlushedMemTableCache`] when one is set.
     pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
         let sources = self.build_collector().collect()?;
-        let sets = super::block_list::fresh_tier_block_list(
+        let memberships = super::block_list::fresh_tier_block_list(
             &sources,
-            &self.pk_columns,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
         )
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
             .map_err(|e| Error::invalid_input(e.to_string()))?;
-        Ok((0..pks.num_rows())
-            .map(|row| {
-                let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
-                sets.iter().any(|set| set.contains(&hash))
-            })
-            .collect())
+        let mut contained = Vec::with_capacity(pks.num_rows());
+        for row in 0..pks.num_rows() {
+            // Both in-memory and flushed generations probe by the same key (the
+            // typed value, or the encoded `Binary` tuple for a composite PK).
+            let values: Vec<ScalarValue> = pk_indices
+                .iter()
+                .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
+            let key = super::block_list::on_disk_pk_key(&values)?;
+            let mut found = false;
+            for membership in &memberships {
+                if membership.contains(&key).await? {
+                    found = true;
+                    break;
+                }
+            }
+            contained.push(found);
+        }
+        Ok(contained)
     }
 
     /// Build the data source collector.
@@ -607,10 +620,14 @@ mod tests {
         };
         let mk = |ids: &[i32], generation: u64| {
             let store = BatchStore::with_capacity(8);
-            store.append(id_batch(ids)).unwrap();
+            let mut index = IndexStore::new();
+            index.enable_pk_index(&[("id".to_string(), 0)]);
+            let b = id_batch(ids);
+            let (bp, off, _) = store.append(b.clone()).unwrap();
+            index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
             InMemoryMemTableRef {
                 batch_store: Arc::new(store),
-                index_store: Arc::new(IndexStore::new()),
+                index_store: Arc::new(index),
                 schema: schema.clone(),
                 generation,
             }

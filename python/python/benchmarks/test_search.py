@@ -78,10 +78,12 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
         rows_remaining -= next_batch_length
         table = create_table(next_batch_length, offset)
         if offset == 0:
-            dataset = lance.write_dataset(table, tmp_path, use_legacy_format=False)
+            dataset = lance.write_dataset(
+                table, tmp_path, data_storage_version="stable"
+            )
         else:
             dataset = lance.write_dataset(
-                table, tmp_path, mode="append", use_legacy_format=False
+                table, tmp_path, mode="append", data_storage_version="stable"
             )
         offset += next_batch_length
 
@@ -98,7 +100,7 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
     dataset.create_scalar_index("category", "BITMAP")
     dataset.create_scalar_index("genres", "LABEL_LIST")
 
-    return lance.dataset(tmp_path, index_cache_size=64 * 1024)
+    return lance.dataset(tmp_path, index_cache_size_bytes=512 * 1024 * 1024)
 
 
 def create_delete_dataset(data_dir):
@@ -113,7 +115,7 @@ def create_delete_dataset(data_dir):
     dataset = lance.dataset(tmp_path)
     dataset.delete("filterable % 2 != 0")
 
-    return lance.dataset(tmp_path, index_cache_size=64 * 1024)
+    return lance.dataset(tmp_path, index_cache_size_bytes=512 * 1024 * 1024)
 
 
 def create_new_rows_dataset(data_dir):
@@ -129,7 +131,7 @@ def create_new_rows_dataset(data_dir):
     table = create_table(NEW_ROWS, offset=NUM_ROWS)
     dataset = lance.write_dataset(table, tmp_path, mode="append")
 
-    return lance.dataset(tmp_path, index_cache_size=64 * 1024)
+    return lance.dataset(tmp_path, index_cache_size_bytes=512 * 1024 * 1024)
 
 
 class Datasets(NamedTuple):

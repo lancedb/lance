@@ -7,6 +7,7 @@
 //! that stores tables as Lance datasets in a filesystem directory structure.
 
 pub mod manifest;
+pub mod manifest_feature_flags;
 
 use arrow::array::Float32Array;
 use arrow::record_batch::RecordBatchIterator;
@@ -682,6 +683,12 @@ impl DirectoryNamespaceBuilder {
             .await
             {
                 Ok(ns) => Some(Arc::new(ns)),
+                Err(e) if manifest_feature_flags::is_incompatible_manifest_error(&e) => {
+                    // The manifest exists but was written with a feature flag this
+                    // build does not understand. Refuse rather than silently
+                    // degrading to a directory-listing view that ignores it.
+                    return Err(e);
+                }
                 Err(e) => {
                     // Failed to initialize manifest namespace, fall back to directory listing only
                     log::warn!(
@@ -1371,6 +1378,11 @@ impl DirectoryNamespace {
                         response.managed_versioning = Some(true);
                     }
                     return Ok(response);
+                }
+                Err(e) if manifest_feature_flags::is_incompatible_manifest_error(&e) => {
+                    // An incompatible manifest must surface "please upgrade"
+                    // rather than degrading to a directory-listing view.
+                    return Err(e);
                 }
                 Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
@@ -2599,6 +2611,11 @@ impl LanceNamespace for DirectoryNamespace {
         {
             match manifest_ns.table_exists(request.clone()).await {
                 Ok(()) => return Ok(()),
+                Err(e) if manifest_feature_flags::is_incompatible_manifest_error(&e) => {
+                    // An incompatible manifest must surface "please upgrade"
+                    // rather than degrading to a directory-listing view.
+                    return Err(e);
+                }
                 Err(_) if self.dir_listing_enabled && is_root_level => {
                     // Fall through to directory check only for single-level IDs
                 }

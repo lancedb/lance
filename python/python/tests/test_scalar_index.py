@@ -648,7 +648,10 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     assert "ScalarIndexQuery" in plan
     assert "MaterializeIndex" not in plan
     assert "FlatMatchQuery" in plan
-    assert "LanceScan" in plan
+    # Flat FTS now reads via FilteredReadExec (prints as `LanceRead`) so the
+    # BTree on `id` pushes into the unindexed-fragment scan too.
+    assert "LanceRead" in plan
+    assert "LanceScan" not in plan
     assert make_fts_search(ds).to_table().num_rows == 12
 
     # Update vector index but NOT scalar index
