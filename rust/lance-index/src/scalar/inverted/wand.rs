@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
@@ -587,22 +586,18 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     docs: &'a DocSet,
     scorer: S,
-    // Shared cross-partition top-k floor. Each partition publishes its local
-    // k-th score (`atomic_store_max_f32`) and prunes against the running value
-    // -- a lower bound on the global k-th, so it never drops a real top-k doc.
-    shared_threshold: Option<Arc<AtomicU32>>,
+    // Segment-local top-k floor. The segment search worker walks partitions
+    // serially, so a mutable f32 is enough to publish each partition's local
+    // k-th score and prune later partitions against the running floor.
+    shared_threshold: Option<&'a mut f32>,
 }
 
-/// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
-/// bit-max) so it stays correct for negative scores -- BM25 idf can go negative.
-fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
-    let mut cur = slot.load(Ordering::Relaxed);
-    while val > f32::from_bits(cur) {
-        match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(actual) => cur = actual,
-        }
-    }
+#[derive(Default)]
+pub(super) struct WandScratch {
+    head: BinaryHeap<HeadPosting>,
+    #[allow(clippy::vec_box)]
+    lead: Vec<Box<PostingIterator>>,
+    tail: BinaryHeap<TailPosting>,
 }
 
 // we were using row id as doc id in the past, which is u64,
@@ -615,34 +610,47 @@ impl<'a, S: Scorer> Wand<'a, S> {
         docs: &'a DocSet,
         scorer: S,
     ) -> Self {
-        let mut head = BinaryHeap::new();
-        let mut lead = Vec::new();
+        Self::new_with_scratch(operator, postings, docs, scorer, WandScratch::default())
+    }
+
+    pub(super) fn new_with_scratch(
+        operator: Operator,
+        postings: impl Iterator<Item = PostingIterator>,
+        docs: &'a DocSet,
+        scorer: S,
+        mut scratch: WandScratch,
+    ) -> Self {
+        scratch.head.clear();
+        scratch.lead.clear();
+        scratch.tail.clear();
         for posting in postings {
             if posting.doc().is_none() {
                 continue;
             }
             let posting = Box::new(posting);
             if operator == Operator::And {
-                lead.push(posting);
+                scratch.lead.push(posting);
             } else {
-                head.push(HeadPosting::new(posting));
+                scratch.head.push(HeadPosting::new(posting));
             }
         }
         if operator == Operator::And {
-            lead.sort_unstable_by_key(|posting| posting.cost());
+            scratch.lead.sort_unstable_by_key(|posting| posting.cost());
         }
+
+        let num_terms = if operator == Operator::And {
+            scratch.lead.len()
+        } else {
+            scratch.head.len()
+        };
 
         Self {
             threshold: 0.0,
             operator,
-            num_terms: if operator == Operator::And {
-                lead.len()
-            } else {
-                head.len()
-            },
-            head,
-            lead,
-            tail: BinaryHeap::new(),
+            num_terms,
+            head: scratch.head,
+            lead: scratch.lead,
+            tail: scratch.tail,
             tail_max_score: 0.0,
             up_to: None,
             and_max_score: f32::INFINITY,
@@ -653,19 +661,36 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
     }
 
-    /// Share one cross-partition top-k floor across a query's partitions.
-    pub(crate) fn with_shared_threshold(mut self, shared: Arc<AtomicU32>) -> Self {
+    pub(super) fn recycle_into(self, scratch: &mut WandScratch) {
+        let Self {
+            mut head,
+            mut lead,
+            mut tail,
+            ..
+        } = self;
+        head.clear();
+        lead.clear();
+        tail.clear();
+        scratch.head = head;
+        scratch.lead = lead;
+        scratch.tail = tail;
+    }
+
+    /// Share one segment-local top-k floor across a query's partitions.
+    pub(crate) fn with_shared_threshold(mut self, shared: &'a mut f32) -> Self {
         self.shared_threshold = Some(shared);
         self
     }
 
     /// Set the pruning threshold from this partition's k-th best, raised to the
-    /// shared cross-partition floor when one is attached.
+    /// segment-local floor when one is attached.
     fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
         let mut t = local_kth * wand_factor;
-        if let Some(shared) = self.shared_threshold.as_ref() {
-            atomic_store_max_f32(shared, local_kth);
-            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+        if let Some(shared) = self.shared_threshold.as_deref_mut() {
+            if local_kth > *shared {
+                *shared = local_kth;
+            }
+            let g = *shared * wand_factor;
             if g > t {
                 t = g;
             }
@@ -673,11 +698,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
         self.threshold = t;
     }
 
-    /// Raise the local threshold to the shared cross-partition floor, picking up
-    /// updates published by sibling partitions.
+    /// Raise the local threshold to the segment-local floor published by
+    /// partitions searched earlier in the worker.
     fn raise_to_shared_floor(&mut self, wand_factor: f32) {
-        if let Some(shared) = self.shared_threshold.as_ref() {
-            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+        if let Some(shared) = self.shared_threshold.as_deref() {
+            let g = *shared * wand_factor;
             if g > self.threshold {
                 self.threshold = g;
             }
@@ -1206,9 +1231,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 .unwrap_or(TERMINATED_DOC_ID);
             up_to = up_to.min(block_end);
         }
-        let head = std::mem::take(&mut self.head);
-        let mut rebuilt_head = BinaryHeap::with_capacity(head.len());
-        for mut posting in head.into_vec() {
+        let mut head = std::mem::take(&mut self.head).into_vec();
+        for posting in &mut head {
             if posting.posting.cost() <= lead_cost {
                 posting.posting.shallow_next(posting.doc_id());
                 let block_end = posting
@@ -1218,9 +1242,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     .unwrap_or(TERMINATED_DOC_ID);
                 up_to = up_to.min(block_end);
             }
-            rebuilt_head.push(posting);
         }
-        self.head = rebuilt_head;
+        self.head = BinaryHeap::from(head);
         if up_to == TERMINATED_DOC_ID
             && let Some(top) = self.tail.peek()
             && top.cost <= lead_cost
@@ -1235,6 +1258,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         self.up_to = Some(up_to);
 
         let tail = std::mem::take(&mut self.tail);
+        self.tail = BinaryHeap::with_capacity(tail.capacity());
         self.tail_max_score = 0.0;
         for mut tail_posting in tail.into_vec() {
             tail_posting.posting.shallow_next(target);
@@ -1281,6 +1305,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn collect_tail_matches(&mut self, target: u64) {
         let mut remaining = Vec::with_capacity(self.tail.len());
         let tail = std::mem::take(&mut self.tail);
+        self.tail = BinaryHeap::with_capacity(tail.capacity());
         self.tail_max_score = 0.0;
         for tail_posting in tail.into_vec() {
             let mut posting = tail_posting.posting;
@@ -1311,7 +1336,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
     }
 
     fn advance_lead_to_head(&mut self, least_id: u64) {
+        let lead_capacity = self.lead.capacity();
         let lead = std::mem::take(&mut self.lead);
+        self.lead = Vec::with_capacity(lead_capacity);
         for mut posting in lead {
             posting.next(least_id);
             self.push_head(posting);
@@ -1418,6 +1445,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // only done once we have already decided to fully score / validate the
         // candidate.
         let tail = std::mem::take(&mut self.tail);
+        self.tail = BinaryHeap::with_capacity(tail.capacity());
         self.tail_max_score = 0.0;
         for tail_posting in tail.into_vec() {
             let mut posting = tail_posting.posting;
@@ -1805,7 +1833,6 @@ mod tests {
     #[test]
     fn cross_partition_threshold_sharing_prunes() {
         use crate::metrics::MetricsCollector;
-        use std::sync::atomic::AtomicUsize;
 
         #[derive(Default)]
         struct CountComparisons(AtomicUsize);
@@ -1824,13 +1851,18 @@ mod tests {
             .chain((1..8).map(|i| (1.0, i * part_docs..(i + 1) * part_docs)))
             .collect();
 
-        let new_floor = || Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
-
-        // Total comparisons across all partitions. `Some(floor)` makes every
-        // partition share that one floor; `None` gives each its own.
-        let total_comparisons = |shared_floor: Option<&Arc<AtomicU32>>| -> usize {
+        // Total comparisons across all partitions. `true` makes every
+        // partition share one mutable floor; `false` gives each its own.
+        let total_comparisons = |use_shared_floor: bool| -> usize {
             let metrics = CountComparisons::default();
+            let mut shared_floor = f32::NEG_INFINITY;
             for (qw, rows) in &parts {
+                let mut private_floor = f32::NEG_INFINITY;
+                let floor = if use_shared_floor {
+                    &mut shared_floor
+                } else {
+                    &mut private_floor
+                };
                 let mut docs = DocSet::default();
                 for d in rows.clone() {
                     docs.append(d as u64, 1);
@@ -1843,7 +1875,6 @@ mod tests {
                     generate_posting_list(rows.clone().collect(), *qw, None, false),
                     docs.len(),
                 )];
-                let floor = shared_floor.cloned().unwrap_or_else(new_floor);
                 Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer)
                     .with_shared_threshold(floor)
                     .search(&params, Arc::new(RowAddrMask::default()), &metrics)
@@ -1852,14 +1883,112 @@ mod tests {
             metrics.0.load(Ordering::Relaxed)
         };
 
-        let one_floor = new_floor();
-        let with_shared_floor = total_comparisons(Some(&one_floor));
-        let with_private_floors = total_comparisons(None);
+        let with_shared_floor = total_comparisons(true);
+        let with_private_floors = total_comparisons(false);
         assert!(
             with_shared_floor < with_private_floors,
             "shared floor should prune comparisons: \
              shared={with_shared_floor} private={with_private_floors}"
         );
+    }
+
+    #[test]
+    fn wand_scratch_reuses_containers() {
+        let mut docs = DocSet::default();
+        for i in 0..8 {
+            docs.append(i, 1);
+        }
+        let scratch = WandScratch {
+            head: BinaryHeap::with_capacity(8),
+            lead: Vec::with_capacity(4),
+            tail: BinaryHeap::with_capacity(6),
+        };
+        let head_capacity = scratch.head.capacity();
+        let lead_capacity = scratch.lead.capacity();
+        let tail_capacity = scratch.tail.capacity();
+
+        let postings = vec![
+            PostingIterator::new(
+                String::from("first"),
+                0,
+                0,
+                generate_posting_list(vec![0, 2, 4, 6], 1.0, None, false),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("second"),
+                1,
+                1,
+                generate_posting_list(vec![1, 3, 5, 7], 1.0, None, false),
+                docs.len(),
+            ),
+        ];
+        let mut wand = Wand::new_with_scratch(
+            Operator::Or,
+            postings.into_iter(),
+            &docs,
+            UnitScorer,
+            scratch,
+        );
+        let first_hits = wand
+            .search(
+                &FtsSearchParams::default(),
+                Arc::new(RowAddrMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut first_rows = first_hits
+            .iter()
+            .map(|candidate| match candidate.addr {
+                CandidateAddr::RowId(row_id) => row_id,
+                CandidateAddr::Pending(_) => panic!("loaded DocSet should emit row ids"),
+            })
+            .collect::<Vec<_>>();
+        first_rows.sort_unstable();
+        assert_eq!(first_rows, Vec::from_iter(0..8));
+
+        let mut recycled = WandScratch::default();
+        wand.recycle_into(&mut recycled);
+        assert!(recycled.head.capacity() >= head_capacity);
+        assert!(recycled.lead.capacity() >= lead_capacity);
+        assert!(recycled.tail.capacity() >= tail_capacity);
+
+        let postings = vec![PostingIterator::new(
+            String::from("third"),
+            0,
+            0,
+            generate_posting_list(vec![0, 1, 2], 1.0, None, false),
+            docs.len(),
+        )];
+        let mut wand = Wand::new_with_scratch(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            UnitScorer,
+            recycled,
+        );
+        let second_hits = wand
+            .search(
+                &FtsSearchParams::default(),
+                Arc::new(RowAddrMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut second_rows = second_hits
+            .iter()
+            .map(|candidate| match candidate.addr {
+                CandidateAddr::RowId(row_id) => row_id,
+                CandidateAddr::Pending(_) => panic!("loaded DocSet should emit row ids"),
+            })
+            .collect::<Vec<_>>();
+        second_rows.sort_unstable();
+        assert_eq!(second_rows, vec![0, 1, 2]);
+
+        let mut recycled = WandScratch::default();
+        wand.recycle_into(&mut recycled);
+        assert!(recycled.head.capacity() >= head_capacity);
+        assert!(recycled.lead.capacity() >= lead_capacity);
+        assert!(recycled.tail.capacity() >= tail_capacity);
     }
 
     #[test]

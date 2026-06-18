@@ -206,15 +206,27 @@ impl FromStr for InvertedListFormatVersion {
 
 #[derive(Debug)]
 struct PartitionCandidates {
+    part: Arc<InvertedPartition>,
     tokens_by_position: Vec<String>,
     candidates: Vec<DocCandidate>,
 }
 
-impl PartitionCandidates {
-    fn empty() -> Self {
-        Self {
-            tokens_by_position: Vec::new(),
-            candidates: Vec::new(),
+struct PreparedPartitionSearch {
+    part: Arc<InvertedPartition>,
+    docs_for_wand: Arc<DocSet>,
+    tokens_by_position: Vec<String>,
+    postings: Vec<PostingIterator>,
+}
+
+/// Compatibility helper for the public partition search wrapper. The segment
+/// worker path uses a plain `f32`; only direct callers of the old public method
+/// need this atomic publication step.
+fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
+    let mut cur = slot.load(Ordering::Relaxed);
+    while val > f32::from_bits(cur) {
+        match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
         }
     }
 }
@@ -701,11 +713,42 @@ impl InvertedIndex {
         let mask = prefilter.mask();
 
         let mut candidates = BinaryHeap::new();
-        // Shared top-k floor across this query's partitions. Seeded to -inf so
-        // the first real score wins; each partition publishes its local k-th
-        // and prunes against the running global k-th (a lower bound on the true
-        // global k-th — see `Wand::shared_threshold`).
-        let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let io_parallelism = self.store.io_parallelism().max(1);
+        let (part_tx, mut part_rx) =
+            tokio::sync::mpsc::channel::<PreparedPartitionSearch>(io_parallelism);
+        let params_for_wand = params.clone();
+        let mask_for_wand = mask.clone();
+        let metrics_for_wand = metrics.clone();
+        let worker = spawn_cpu(move || {
+            let mut shared_threshold = f32::NEG_INFINITY;
+            let mut scratch = WandScratch::default();
+            let mut results = Vec::new();
+            while let Some(PreparedPartitionSearch {
+                part,
+                docs_for_wand,
+                tokens_by_position,
+                postings,
+            }) = part_rx.blocking_recv()
+            {
+                let candidates = part.bm25_search_with_scratch(
+                    docs_for_wand.as_ref(),
+                    params_for_wand.as_ref(),
+                    operator,
+                    mask_for_wand.clone(),
+                    postings,
+                    metrics_for_wand.as_ref(),
+                    &mut shared_threshold,
+                    &mut scratch,
+                )?;
+                results.push(PartitionCandidates {
+                    part,
+                    tokens_by_position,
+                    candidates,
+                });
+            }
+            std::result::Result::<_, Error>::Ok(results)
+        });
+
         let parts = self
             .partitions
             .iter()
@@ -715,7 +758,6 @@ impl InvertedIndex {
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
-                let shared_threshold = shared_threshold.clone();
                 async move {
                     let postings = part
                         .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
@@ -724,7 +766,7 @@ impl InvertedIndex {
                         // No hits in this partition; its DocSet stays
                         // unloaded, so we never pay the per-doc
                         // row_id/num_tokens download for it.
-                        return Result::Ok(PartitionCandidates::empty());
+                        return Result::Ok(None);
                     }
                     let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
                     let max_position = postings
@@ -737,38 +779,39 @@ impl InvertedIndex {
                         let idx = posting.term_index() as usize;
                         tokens_by_position[idx] = posting.token().to_owned();
                     }
-                    let params = params.clone();
-                    let mask = mask.clone();
-                    let metrics = metrics.clone();
-                    let part_for_wand = part.clone();
-                    let mut partition_result = spawn_cpu(move || {
-                        let candidates = part_for_wand.bm25_search(
-                            docs_for_wand.as_ref(),
-                            params.as_ref(),
-                            operator,
-                            mask,
-                            postings,
-                            metrics.as_ref(),
-                            shared_threshold,
-                        )?;
-                        std::result::Result::<_, Error>::Ok(PartitionCandidates {
-                            tokens_by_position,
-                            candidates,
-                        })
-                    })
-                    .await?;
-                    resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
-                        .await?;
-                    Result::Ok(partition_result)
+                    Result::Ok(Some(PreparedPartitionSearch {
+                        part,
+                        docs_for_wand,
+                        tokens_by_position,
+                        postings,
+                    }))
                 }
             })
             .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        let producer_result = async move {
+            let mut parts = stream::iter(parts).buffer_unordered(io_parallelism);
+            while let Some(prepared) = parts.try_next().await? {
+                let Some(prepared) = prepared else {
+                    continue;
+                };
+                if part_tx.send(prepared).await.is_err() {
+                    // The worker exits early only after it has already hit an
+                    // error. Let the worker result carry the underlying cause.
+                    break;
+                }
+            }
+            Result::Ok(())
+        }
+        .await;
+        let parts = worker.await;
+        producer_result?;
+        let parts = parts?;
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
-        while let Some(res) = parts.try_next().await? {
+        for mut res in parts {
             if res.candidates.is_empty() {
                 continue;
             }
+            resolve_deferred_candidates(&res.part.docs, &mut res.candidates).await?;
             let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
             for token in &res.tokens_by_position {
                 let idf_weight = match idf_cache.get(token) {
@@ -1390,9 +1433,8 @@ impl InvertedPartition {
     }
 
     #[instrument(level = "debug", skip_all)]
-    // Deferred-DocSet adds the `docs` param (caller materializes it) on top of
-    // the cross-partition `shared_threshold`, tipping this hot-path search fn
-    // one over the limit. Bundling args isn't worth the churn here.
+    // Compatibility wrapper for direct callers. The hot segment-worker path
+    // below avoids atomic threshold sharing and reuses caller-owned scratch.
     #[allow(clippy::too_many_arguments)]
     pub fn bm25_search(
         &self,
@@ -1408,14 +1450,49 @@ impl InvertedPartition {
             return Ok(Vec::new());
         }
 
+        let scorer = IndexBM25Scorer::new(std::iter::once(self));
+        let mut threshold = f32::from_bits(shared_threshold.load(Ordering::Relaxed));
+        let mut wand = Wand::new(operator, postings.into_iter(), docs, scorer)
+            .with_shared_threshold(&mut threshold);
+        let hits = wand.search(params, mask, metrics)?;
+        atomic_store_max_f32(&shared_threshold, threshold);
+        Ok(hits)
+    }
+
+    // Deferred-DocSet adds the `docs` param (caller materializes it), while the
+    // segment worker passes the reusable WAND scratch and mutable threshold.
+    // Bundling args isn't worth the churn here.
+    #[allow(clippy::too_many_arguments)]
+    fn bm25_search_with_scratch(
+        &self,
+        docs: &DocSet,
+        params: &FtsSearchParams,
+        operator: Operator,
+        mask: Arc<RowAddrMask>,
+        postings: Vec<PostingIterator>,
+        metrics: &dyn MetricsCollector,
+        shared_threshold: &mut f32,
+        scratch: &mut WandScratch,
+    ) -> Result<Vec<DocCandidate>> {
+        if postings.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Caller selects the DocSet shape via `LazyDocSet::docs_for_wand`
         // and passes it in here; wand uses `docs.has_row_ids()` to
         // handle the num_tokens-only case.
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
-        let mut wand = Wand::new(operator, postings.into_iter(), docs, scorer)
-            .with_shared_threshold(shared_threshold);
-        let hits = wand.search(params, mask, metrics)?;
-        Ok(hits)
+        let mut wand = Wand::new_with_scratch(
+            operator,
+            postings.into_iter(),
+            docs,
+            scorer,
+            std::mem::take(scratch),
+        )
+        .with_shared_threshold(shared_threshold);
+        let hits = wand.search(params, mask, metrics);
+        wand.recycle_into(scratch);
+        hits
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
@@ -5913,7 +5990,7 @@ mod tests {
         let mut builder1 = InnerBuilder::new(0, false, TokenSetFormat::default());
         builder1.tokens.add("test".to_owned());
         builder1.posting_lists.push(PostingListBuilder::new(false));
-        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(5));
         builder1.docs.append(100, 1); // row_id=100, num_tokens=1
         builder1.write(store.as_ref()).await.unwrap();
 
@@ -5921,13 +5998,13 @@ mod tests {
         let mut builder2 = InnerBuilder::new(1, false, TokenSetFormat::default());
         builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
         builder2.posting_lists.push(PostingListBuilder::new(false));
-        builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
+        builder2.posting_lists[0].add(0, PositionRecorder::Count(4));
         builder2.posting_lists[0].add(1, PositionRecorder::Count(1));
         builder2.posting_lists[0].add(2, PositionRecorder::Count(3));
-        builder2.posting_lists[0].add(3, PositionRecorder::Count(1));
-        builder2.docs.append(200, 2); // row_id=200, num_tokens=2
+        builder2.posting_lists[0].add(3, PositionRecorder::Count(2));
+        builder2.docs.append(200, 1); // row_id=200, num_tokens=1
         builder2.docs.append(201, 1); // row_id=201, num_tokens=1
-        builder2.docs.append(202, 3); // row_id=202, num_tokens=3
+        builder2.docs.append(202, 1); // row_id=202, num_tokens=1
         builder2.docs.append(203, 1); // row_id=203, num_tokens=1
         builder2.write(store.as_ref()).await.unwrap();
 
@@ -6023,6 +6100,30 @@ mod tests {
             row_ids.iter().any(|&id| id >= 200),
             "Should contain row_id from partition 1"
         );
+
+        let tokens = Arc::new(Tokens::new(vec!["test".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(3)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids, vec![100, 200, 202]);
+        let expected_idf = idf(5, 5);
+        let expected_scores = [5.0, 4.0, 3.0]
+            .into_iter()
+            .map(|freq| expected_idf * (K1 + 1.0) * freq / (freq + K1))
+            .collect::<Vec<_>>();
+        assert_eq!(scores.len(), expected_scores.len());
+        for (actual, expected) in scores.iter().zip(expected_scores) {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "actual={actual}, expected={expected}"
+            );
+        }
     }
 
     #[tokio::test]
