@@ -46,8 +46,11 @@ use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     union::UnionExec,
 };
-use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
+use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_physical_expr::{
+    PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
+};
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
@@ -1643,11 +1646,28 @@ impl BTreeIndex {
         FlatIndex::try_new(serialized_page)
     }
 
+    /// Compile a sargable predicate into a physical expr against the per-page
+    /// schema ([values, ids]). Built once in `search` and shared across pages so
+    /// a large IN-list is not re-materialized for every page.
+    fn compile_predicate(&self, query: &SargableQuery) -> Result<Arc<dyn PhysicalExpr>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(BTREE_VALUES_COLUMN, self.data_type.clone(), true),
+            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+        ]));
+        let df_schema = DFSchema::try_from(schema)?;
+        Ok(create_physical_expr(
+            &query.to_expr(BTREE_VALUES_COLUMN.to_string()),
+            &df_schema,
+            &ExecutionProps::default(),
+        )?)
+    }
+
     async fn search_page(
         &self,
         query: &SargableQuery,
         matches: Matches,
         index_reader: LazyIndexReader,
+        prebuilt: Option<&Arc<dyn PhysicalExpr>>,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
         let subindex = self
@@ -1655,13 +1675,12 @@ impl BTreeIndex {
             .await?;
 
         match matches {
-            Matches::Some(_) => {
-                // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
-                // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-                // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
-                // to search for X IN [5, 3]
-                subindex.search(query, metrics)
-            }
+            // For a large IsIn the predicate is compiled once (see `search`) and
+            // reused here, instead of rebuilding the whole IN-list per page.
+            Matches::Some(_) => match prebuilt {
+                Some(expr) => subindex.search_prebuilt(expr, metrics),
+                None => subindex.search(query, metrics),
+            },
             Matches::All(_) => Ok(match query {
                 // This means we hit an all-null page so just grab all row ids as true
                 SargableQuery::IsNull() => subindex.all_ignore_nulls(),
@@ -2119,13 +2138,27 @@ impl ScalarIndex for BTreeIndex {
             }
         }
 
+        // Compile a large IsIn predicate once and reuse it across every page;
+        // rebuilding the full IN-list per page is O(pages * values) and dominates
+        // the lookup for sets with many values.
+        let prebuilt = match query {
+            SargableQuery::IsIn(_) => Some(self.compile_predicate(query)?),
+            _ => None,
+        };
+
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
-                self.search_page(query, page_index, lazy_index_reader.clone(), metrics)
-                    .boxed()
+                self.search_page(
+                    query,
+                    page_index,
+                    lazy_index_reader.clone(),
+                    prebuilt.as_ref(),
+                    metrics,
+                )
+                .boxed()
             })
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());

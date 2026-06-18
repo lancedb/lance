@@ -11,7 +11,7 @@ use arrow_array::{
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
 use lance_core::Result;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
@@ -237,7 +237,22 @@ impl FlatIndex {
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
         let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        self.eval_expr(&expr)
+    }
 
+    /// Evaluate a predicate compiled once by the caller. Lets a large IsIn that
+    /// spans many pages build the physical expr a single time instead of
+    /// rebuilding the whole IN-list per page (the dominant cost of a big lookup).
+    pub fn search_prebuilt(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableRowAddrSet> {
+        metrics.record_comparisons(self.data.num_rows());
+        self.eval_expr(expr)
+    }
+
+    fn eval_expr(&self, expr: &Arc<dyn PhysicalExpr>) -> Result<NullableRowAddrSet> {
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate

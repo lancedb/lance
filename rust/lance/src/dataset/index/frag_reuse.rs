@@ -329,5 +329,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 0);
+
+        // Data correctness, not just version bookkeeping: with the reuse index
+        // trimmed there is no auto-remap safety net, so each index must resolve
+        // to LIVE rows. An index whose data was not actually remapped (e.g. one
+        // whose bitmap was coverage-remapped by a sibling's commit before its
+        // own data remap) points at compacted-away fragments and errors on take.
+        use futures::TryStreamExt;
+        for col in ["i", "j"] {
+            let rows: usize = dataset
+                .scan()
+                .filter(&format!("{col} >= 2000 AND {col} < 3000"))
+                .unwrap()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.num_rows())
+                .sum();
+            assert_eq!(
+                rows, 1000,
+                "index {col}_idx must resolve to live rows after remap+trim"
+            );
+        }
+    }
+
+    /// When the reuse index has accumulated several versions, a single remap
+    /// must compose them and rebuild + commit the index exactly ONCE, not once
+    /// per version.
+    #[tokio::test]
+    async fn test_remap_index_batches_multiple_reuse_versions() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(8), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Accumulate multiple reuse versions: each round deletes a prefix, which
+        // shrinks fragments below target and forces another deferred compaction.
+        let options = CompactionOptions {
+            target_rows_per_fragment: 4_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        for round in 0..4 {
+            dataset
+                .delete(&format!("i < {}", 1_000 * (round + 1)))
+                .await
+                .unwrap();
+            compact_files(&mut dataset, options.clone(), None)
+                .await
+                .unwrap();
+        }
+
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+        let num_versions = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap()
+            .versions
+            .len();
+        assert!(
+            num_versions >= 2,
+            "test needs multiple reuse versions to exercise batching, got {num_versions}"
+        );
+
+        // A single remap must commit exactly once, regardless of version count.
+        let version_before = dataset.manifest.version;
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        let commits = dataset.manifest.version - version_before;
+        assert_eq!(
+            commits, 1,
+            "batched remap must commit once, not once per reuse version ({num_versions})"
+        );
+
+        // ... and the reuse index then trims to zero.
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+        assert_eq!(
+            load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+                .await
+                .unwrap()
+                .versions
+                .len(),
+            0
+        );
     }
 }
