@@ -683,9 +683,10 @@ the default mini-block size is negligible. You should only consider changing thi
 confirmed — through profiling — that mini-block read amplification is saturating your available bandwidth
 (for example, accessing a remote object store over a constrained network link).
 
-The maximum number of values per mini-block can be lowered via an environment variable:
+The maximum number of values per mini-block can be tuned via an environment variable:
 
-- `LANCE_MINIBLOCK_MAX_VALUES` (default `4096`): upper bound on the number of values in a single mini-block chunk.
+- `LANCE_MINIBLOCK_MAX_VALUES` (default `4096`, maximum `32768`): upper bound on the number of values in a single mini-block chunk.
 
 Reducing this value produces smaller mini-blocks, which reduces the amount of data fetched per read at the
-cost of more mini-blocks and slightly more metadata overhead.
+cost of more mini-blocks and slightly more metadata overhead. Increasing it can reduce metadata overhead and
+improve throughput for highly compressible data, but it may increase random-read amplification.
