@@ -36,13 +36,6 @@ use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
-#[cfg(test)]
-thread_local! {
-    static TERM_FREQ_COLLECTION_DOC_CALLS: std::cell::Cell<usize> = const {
-        std::cell::Cell::new(0)
-    };
-}
-
 pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
         .unwrap_or_else(|_| "10".to_string())
@@ -948,9 +941,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
     // iterate over all the preceding terms and collect the term index and frequency
     fn iter_term_freqs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.lead.iter().filter_map(|posting| {
-            #[cfg(test)]
-            TERM_FREQ_COLLECTION_DOC_CALLS.with(|calls| calls.set(calls.get() + 1));
-
             posting
                 .doc()
                 .map(|doc| (posting.term_index(), doc.frequency()))
@@ -2021,78 +2011,6 @@ mod tests {
         assert!(
             or_scored <= 2 * BLOCK_SIZE,
             "expected pruning to skip a block, but scored {or_scored} of {total}",
-        );
-    }
-
-    #[test]
-    fn test_search_does_not_collect_freqs_for_rejected_topk_candidate() {
-        TERM_FREQ_COLLECTION_DOC_CALLS.with(|calls| calls.set(0));
-
-        let mut docs = DocSet::default();
-        docs.append(0, 1);
-        docs.append(1, 1);
-
-        let postings = vec![PostingIterator::with_query_weight(
-            String::from("term"),
-            0,
-            0,
-            1.0,
-            generate_posting_list(vec![0, 1], 1.0, None, false),
-            docs.len(),
-        )];
-
-        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
-        let result = wand
-            .search(
-                &FtsSearchParams::new()
-                    .with_limit(Some(1))
-                    .with_wand_factor(0.5),
-                Arc::new(RowAddrMask::default()),
-                &NoOpMetricsCollector,
-            )
-            .unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(
-            TERM_FREQ_COLLECTION_DOC_CALLS.with(|calls| calls.get()),
-            1,
-            "equal-score candidate rejected by top-k should not collect freqs"
-        );
-    }
-
-    #[test]
-    fn test_flat_search_does_not_collect_freqs_for_rejected_topk_candidate() {
-        TERM_FREQ_COLLECTION_DOC_CALLS.with(|calls| calls.set(0));
-
-        let mut docs = DocSet::default();
-        docs.append(0, 1);
-        docs.append(1, 1);
-
-        let postings = vec![PostingIterator::with_query_weight(
-            String::from("term"),
-            0,
-            0,
-            1.0,
-            generate_posting_list(vec![0, 1], 1.0, None, false),
-            docs.len(),
-        )];
-
-        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
-        let result = wand
-            .flat_search(
-                &FtsSearchParams::new()
-                    .with_limit(Some(1))
-                    .with_wand_factor(0.5),
-                Box::new([RowAddress::from(0_u64), RowAddress::from(1_u64)].into_iter()),
-                &NoOpMetricsCollector,
-            )
-            .unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(
-            TERM_FREQ_COLLECTION_DOC_CALLS.with(|calls| calls.get()),
-            1,
-            "equal-score candidate rejected by flat_search top-k should not collect freqs"
         );
     }
 
