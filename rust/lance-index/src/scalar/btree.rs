@@ -73,7 +73,7 @@ use lance_datafusion::{
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
 use lance_index_core::row_id_remap::RowIdRemapper;
-use lance_select::NullableRowAddrSet;
+use lance_select::{NullableRowAddrSet, RowSetOps};
 use log::{debug, warn};
 use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
@@ -1949,7 +1949,7 @@ fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
 
 fn remap_row_ids(
     stream: SendableRecordBatchStream,
-    frag_reuse_index: Arc<FragReuseIndex>,
+    frag_reuse_index: Arc<dyn RowIdRemapper>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let remapped = stream.map(move |batch_result| {

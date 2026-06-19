@@ -1175,10 +1175,10 @@ mod tests {
     }
 
     impl IndexInformationProvider for MockIndexInfoProvider {
-        fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+        fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
             self.indexed_columns
                 .get(col)
-                .map(|col_info| (&col_info.data_type, col_info.parser.as_ref() as &dyn ScalarQueryParser))
+                .map(|col_info| (&col_info.data_type, col_info.parser.as_ref()))
         }
     }
 

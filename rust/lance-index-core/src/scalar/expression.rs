@@ -235,6 +235,18 @@ impl MultiQueryParser {
     pub fn add(&mut self, other: Box<dyn ScalarQueryParser>) {
         self.parsers.push(other);
     }
+
+    /// Pick the first underlying parser whose `is_valid_reference` accepts `expr`.
+    pub fn select(
+        &self,
+        expr: &Expr,
+        data_type: &DataType,
+    ) -> Option<(&dyn ScalarQueryParser, DataType)> {
+        self.parsers.iter().find_map(|p| {
+            p.is_valid_reference(expr, data_type)
+                .map(|dt| (p.as_ref(), dt))
+        })
+    }
 }
 
 impl ScalarQueryParser for MultiQueryParser {
@@ -477,7 +489,7 @@ impl ScalarIndexExpr {
 pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
     /// as well as a query parser that can parse queries for that column
-    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)>;
 
     /// The set of fragments covered by `(column, index_name)`.
     ///
@@ -603,8 +615,8 @@ fn maybe_indexed_column<'b>(
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions
     if let Some(nested_path) = extract_nested_column_path(expr)
-        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
-        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+        && let Some((data_type, multi)) = index_info.get_index(&nested_path)
+        && let Some((parser, data_type)) = multi.select(expr, data_type)
     {
         return Some((nested_path, data_type, parser));
     }
@@ -612,8 +624,8 @@ fn maybe_indexed_column<'b>(
     match expr {
         Expr::Column(col) => {
             let col = col.name.as_str();
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
+            let (data_type, multi) = index_info.get_index(col)?;
+            if let Some((parser, data_type)) = multi.select(expr, data_type) {
                 Some((col.to_string(), data_type, parser))
             } else {
                 None
@@ -627,8 +639,8 @@ fn maybe_indexed_column<'b>(
                 Expr::Column(col) => col.name.as_str(),
                 _ => return None,
             };
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
+            let (data_type, multi) = index_info.get_index(col)?;
+            if let Some((parser, data_type)) = multi.select(expr, data_type) {
                 Some((col.to_string(), data_type, parser))
             } else {
                 None
