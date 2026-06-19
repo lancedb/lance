@@ -194,8 +194,9 @@ fn fts_posting_pipeline_insufficient_cpu_threads_message(available_cpu_threads: 
         "FTS inverted index build requires at least {MIN_CPU_THREADS_FOR_FTS_POSTING_PIPELINE} \
          lance-cpu blocking threads, but only {available_cpu_threads} is available. \
          Posting-list batch encoding and Lance file page encoding both use the same global \
-         `spawn_cpu` pool; with a single thread the pipelined writer deadlocks silently \
-         after logging \"writing N posting lists\". \
+         `spawn_cpu` pool; with fewer than \
+         {MIN_CPU_THREADS_FOR_FTS_POSTING_PIPELINE} threads the pipelined writer deadlocks \
+         silently after logging \"writing N posting lists\". \
          Set environment variable LANCE_CPU_THREADS to at least \
          {MIN_CPU_THREADS_FOR_FTS_POSTING_PIPELINE}, or use a machine where \
          num_cpus > LANCE_IO_CORE_RESERVATION (currently reserving {} cores for I/O).",
@@ -211,6 +212,25 @@ fn check_fts_posting_pipeline_cpu_threads() -> Result<()> {
         return Err(Error::invalid_input(message));
     }
     Ok(())
+}
+
+/// Limits concurrent [`InnerBuilder::write_posting_lists_pipelined`] calls so that
+/// at least one [`spawn_cpu`] thread remains free for nested page encoding inside
+/// `FileWriter::write_batch`.
+///
+/// Each pipelined writer holds one `spawn_cpu` thread for its producer. Without
+/// a free thread, the consumer deadlocks while waiting for page encoding.
+/// The semaphore permits `available - 1` concurrent writers regardless of how
+/// many workers exist or how many flush simultaneously.
+fn fts_posting_write_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEMAPHORE: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
+        let available = get_num_compute_intensive_cpus();
+        // With available < 2 the permit count would be 0, but the early guard
+        // in write_posting_lists rejects before we reach acquire.
+        let permits = available.saturating_sub(1).max(1);
+        tokio::sync::Semaphore::new(permits)
+    });
+    &SEMAPHORE
 }
 
 fn merge_all_tail_partitions(tails: Vec<TailPartition>) -> Result<Option<InnerBuilder>> {
@@ -1073,6 +1093,10 @@ impl InnerBuilder {
         path: &str,
     ) -> Result<IndexFile> {
         check_fts_posting_pipeline_cpu_threads()?;
+        let _permit = fts_posting_write_semaphore()
+            .acquire()
+            .await
+            .expect("fts posting write semaphore is never closed");
         self.write_posting_lists_pipelined(store, docs, path).await
     }
 
@@ -2355,6 +2379,91 @@ mod tests {
             "scalar::inverted::builder::tests::test_empty_update_with_one_cpu_thread_records_deleted_fragments",
             "LANCE_FTS_EMPTY_UPDATE_CHILD",
             1,
+        );
+    }
+
+    /// With LANCE_CPU_THREADS=2 the semaphore grants only 1 permit. Two concurrent
+    /// pipelined writers should serialize without deadlock.
+    #[test]
+    fn test_fts_posting_semaphore_serializes_with_two_cpu_threads() {
+        if std::env::var("LANCE_FTS_SEMAPHORE_CHILD").as_deref() == Ok("1") {
+            assert_eq!(
+                get_num_compute_intensive_cpus(),
+                2,
+                "semaphore child must run with LANCE_CPU_THREADS=2"
+            );
+
+            let semaphore = fts_posting_write_semaphore();
+            assert_eq!(
+                semaphore.available_permits(),
+                1,
+                "with 2 CPU threads the semaphore should have 1 permit"
+            );
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+                .expect("build tokio runtime for semaphore test");
+
+            runtime.block_on(async {
+                // Two tasks both acquire the semaphore.
+                let task1 = tokio::spawn(async {
+                    let _permit = semaphore.acquire().await.expect("acquire permit");
+                    spawn_cpu(|| Ok::<_, Error>(()))
+                        .await
+                        .expect("spawn_cpu ok");
+                });
+                let task2 = tokio::spawn(async {
+                    let _permit = semaphore.acquire().await.expect("acquire permit");
+                    spawn_cpu(|| Ok::<_, Error>(()))
+                        .await
+                        .expect("spawn_cpu ok");
+                });
+
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    task1.await.expect("task1 join");
+                    task2.await.expect("task2 join");
+                })
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "two semaphore-controlled tasks should complete without deadlock"
+                );
+            });
+            return;
+        }
+
+        run_test_in_child(
+            "scalar::inverted::builder::tests::test_fts_posting_semaphore_serializes_with_two_cpu_threads",
+            "LANCE_FTS_SEMAPHORE_CHILD",
+            2,
+        );
+    }
+
+    /// With LANCE_CPU_THREADS=4 the semaphore should have 3 permits.
+    #[test]
+    fn test_fts_posting_semaphore_permits_scale_with_threads() {
+        if std::env::var("LANCE_FTS_SEMAPHORE_PERMITS_CHILD").as_deref() == Ok("1") {
+            assert_eq!(
+                get_num_compute_intensive_cpus(),
+                4,
+                "semaphore permits child must run with LANCE_CPU_THREADS=4"
+            );
+
+            let semaphore = fts_posting_write_semaphore();
+            assert_eq!(
+                semaphore.available_permits(),
+                3,
+                "with 4 CPU threads the semaphore should have 3 permits (4 - 1)"
+            );
+            return;
+        }
+
+        run_test_in_child(
+            "scalar::inverted::builder::tests::test_fts_posting_semaphore_permits_scale_with_threads",
+            "LANCE_FTS_SEMAPHORE_PERMITS_CHILD",
+            4,
         );
     }
 
