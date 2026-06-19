@@ -11735,6 +11735,44 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
+    /// An empty batch list still produces a valid (single, empty) partition, so the
+    /// merge is a no-op and the target is unchanged.
+    #[tokio::test]
+    async fn test_merge_insert_execute_batches_empty() {
+        let initial =
+            record_batch!(("id", UInt32, [0, 1, 2]), ("value", UInt32, [0, 0, 0])).unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new("memory://")
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+
+        let (merged, stats) = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_batches(vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 0);
+
+        let batch = merged.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<UInt32Type>();
+        let values = batch["value"].as_primitive::<UInt32Type>();
+        let merged_rows: HashMap<u32, u32> = ids
+            .values()
+            .iter()
+            .zip(values.values().iter())
+            .map(|(id, value)| (*id, *value))
+            .collect();
+        assert_eq!(merged_rows, HashMap::from([(0, 0), (1, 0), (2, 0)]));
+    }
+
     fn collect_exact_row_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
         if let Ok(stats) = plan.partition_statistics(None)
             && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
