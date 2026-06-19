@@ -169,6 +169,16 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display(
+        "Disk spill quota exceeded: cap={cap_bytes} bytes, used={used_bytes} bytes, requested={requested_bytes} bytes, {location}"
+    ))]
+    DiskCapExceeded {
+        cap_bytes: u64,
+        used_bytes: u64,
+        requested_bytes: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index {
         message: String,
@@ -264,6 +274,16 @@ impl Error {
     #[track_caller]
     pub fn io_source(source: BoxedError) -> Self {
         IOSnafu.into_error(source)
+    }
+
+    #[track_caller]
+    pub fn disk_cap_exceeded(cap_bytes: u64, used_bytes: u64, requested_bytes: u64) -> Self {
+        DiskCapExceededSnafu {
+            cap_bytes,
+            used_bytes,
+            requested_bytes,
+        }
+        .build()
     }
 
     #[track_caller]
@@ -512,7 +532,16 @@ impl From<&ArrowError> for Error {
 impl From<std::io::Error> for Error {
     #[track_caller]
     fn from(e: std::io::Error) -> Self {
-        Self::io_source(box_error(e))
+        if e.get_ref().is_some() {
+            match e.into_inner().expect("io error source checked above") {
+                source => match source.downcast::<Self>() {
+                    Ok(lance_err) => *lance_err,
+                    Err(source) => Self::io_source(source),
+                },
+            }
+        } else {
+            Self::io_source(box_error(e))
+        }
     }
 }
 

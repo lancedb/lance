@@ -46,7 +46,7 @@ pub(crate) mod test_utils;
 pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
-use crate::object_writer::{LocalWriter, WriteResult};
+use crate::object_writer::{DiskQuota, LocalWriter, WriteResult};
 use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
@@ -146,6 +146,8 @@ pub struct ObjectStore {
     download_retry_count: usize,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
+    /// Optional local write budget used by spill stores.
+    disk_quota: Option<DiskQuota>,
     /// The datastore prefix that uniquely identifies this object store. It encodes information
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
@@ -479,6 +481,7 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
+                disk_quota: None,
                 store_prefix,
             };
             let path = Path::parse(path.path())?;
@@ -534,6 +537,13 @@ impl ObjectStore {
             .now_or_never()
             .unwrap()
             .unwrap()
+    }
+
+    /// Local object store with a shared local write quota.
+    pub fn local_with_disk_quota(disk_quota: DiskQuota) -> Self {
+        let mut store = Self::local();
+        store.disk_quota = Some(disk_quota);
+        store
     }
 
     /// Create a in-memory object store directly for testing.
@@ -756,11 +766,36 @@ impl ObjectStore {
                         .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
-                Ok(Box::new(LocalWriter::new(
+                Ok(Box::new(LocalWriter::new_with_disk_quota(
                     file,
                     path.clone(),
                     temp_path,
                     Arc::new(self.io_tracker.clone()),
+                    self.disk_quota.clone(),
+                )))
+            }
+            "file+uring" => {
+                let local_path = super::local::to_local_path(path);
+                let local_path = std::path::PathBuf::from(&local_path);
+                if let Some(parent) = local_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let parent = local_path
+                    .parent()
+                    .expect("file path must have parent")
+                    .to_owned();
+                let named_temp =
+                    tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent))
+                        .await
+                        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
+                let (std_file, temp_path) = named_temp.into_parts();
+                let file = tokio::fs::File::from_std(std_file);
+                Ok(Box::new(LocalWriter::new_with_disk_quota(
+                    file,
+                    path.clone(),
+                    temp_path,
+                    Arc::new(self.io_tracker.clone()),
+                    self.disk_quota.clone(),
                 )))
             }
             _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
@@ -1109,6 +1144,7 @@ impl ObjectStore {
             io_parallelism,
             download_retry_count,
             io_tracker,
+            disk_quota: None,
             store_prefix,
         }
     }

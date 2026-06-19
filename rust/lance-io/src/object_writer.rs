@@ -3,6 +3,7 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 
@@ -518,11 +519,73 @@ pub struct LocalWriter {
     state: LocalWriteState,
 }
 
+/// Shared byte budget for local spill writes.
+#[derive(Debug, Clone)]
+pub struct DiskQuota {
+    cap_bytes: u64,
+    used_bytes: Arc<AtomicU64>,
+}
+
+impl DiskQuota {
+    pub fn new(cap_bytes: u64) -> Self {
+        Self {
+            cap_bytes,
+            used_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn cap_bytes(&self) -> u64 {
+        self.cap_bytes
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+
+    pub fn reserve(&self, requested_bytes: u64) -> Result<()> {
+        let mut used = self.used_bytes();
+        loop {
+            let Some(next_used) = used.checked_add(requested_bytes) else {
+                return Err(Error::disk_cap_exceeded(
+                    self.cap_bytes,
+                    used,
+                    requested_bytes,
+                ));
+            };
+            if next_used > self.cap_bytes {
+                return Err(Error::disk_cap_exceeded(
+                    self.cap_bytes,
+                    used,
+                    requested_bytes,
+                ));
+            }
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                next_used,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    pub fn release(&self, bytes: u64) {
+        let _ = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+}
+
 #[derive(Default)]
 enum LocalWriteState {
     Writing(WritingState),
     Finishing {
         size: usize,
+        disk_quota: Option<DiskQuota>,
         future: BoxFuture<'static, Result<WriteResult>>,
     },
     Done(WriteResult),
@@ -536,6 +599,7 @@ struct WritingState {
     /// Temp path that auto-deletes on drop. Set to `None` after `persist()`.
     temp_path: tempfile::TempPath,
     io_tracker: Arc<IOTracker>,
+    disk_quota: Option<DiskQuota>,
 }
 
 impl LocalWriter {
@@ -545,6 +609,16 @@ impl LocalWriter {
         temp_path: tempfile::TempPath,
         io_tracker: Arc<IOTracker>,
     ) -> Self {
+        Self::new_with_disk_quota(file, path, temp_path, io_tracker, None)
+    }
+
+    pub fn new_with_disk_quota(
+        file: tokio::fs::File,
+        path: Path,
+        temp_path: tempfile::TempPath,
+        io_tracker: Arc<IOTracker>,
+        disk_quota: Option<DiskQuota>,
+    ) -> Self {
         Self {
             path,
             state: LocalWriteState::Writing(WritingState {
@@ -552,6 +626,7 @@ impl LocalWriter {
                 cursor: 0,
                 temp_path,
                 io_tracker,
+                disk_quota,
             }),
         }
     }
@@ -606,9 +681,41 @@ impl AsyncWrite for LocalWriter {
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
         if let LocalWriteState::Writing(state) = &mut self.state {
-            let poll = Pin::new(&mut state.writer).poll_write(cx, buf);
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+
+            let requested = if let Some(disk_quota) = state.disk_quota.as_ref() {
+                let available = disk_quota
+                    .cap_bytes()
+                    .saturating_sub(disk_quota.used_bytes())
+                    as usize;
+                let requested = available.min(buf.len());
+                if requested == 0 {
+                    let err = Error::disk_cap_exceeded(
+                        disk_quota.cap_bytes(),
+                        disk_quota.used_bytes(),
+                        buf.len() as u64,
+                    );
+                    return Poll::Ready(Err(io::Error::other(err)));
+                }
+                if let Err(err) = disk_quota.reserve(requested as u64) {
+                    return Poll::Ready(Err(io::Error::other(err)));
+                }
+                requested
+            } else {
+                buf.len()
+            };
+
+            let poll = Pin::new(&mut state.writer).poll_write(cx, &buf[..requested]);
             if let Poll::Ready(Ok(n)) = &poll {
                 state.cursor += *n;
+            }
+            if let Some(disk_quota) = state.disk_quota.as_ref() {
+                match &poll {
+                    Poll::Ready(Ok(n)) => disk_quota.release((requested - *n) as u64),
+                    Poll::Ready(Err(_)) | Poll::Pending => disk_quota.release(requested as u64),
+                }
             }
             poll
         } else {
@@ -648,6 +755,7 @@ impl AsyncWrite for LocalWriter {
                     let size = state.cursor;
                     mut_self.state = LocalWriteState::Finishing {
                         size,
+                        disk_quota: state.disk_quota,
                         future: Box::pin(Self::persist(
                             state.temp_path,
                             mut_self.path.clone(),
@@ -668,6 +776,26 @@ impl AsyncWrite for LocalWriter {
                     return Poll::Ready(Err(Self::poisoned_err(&self.path)));
                 }
             }
+        }
+    }
+}
+
+impl Drop for LocalWriter {
+    fn drop(&mut self) {
+        match &self.state {
+            LocalWriteState::Writing(state) => {
+                if let Some(disk_quota) = state.disk_quota.as_ref() {
+                    disk_quota.release(state.cursor as u64);
+                }
+            }
+            LocalWriteState::Finishing {
+                size, disk_quota, ..
+            } => {
+                if let Some(disk_quota) = disk_quota.as_ref() {
+                    disk_quota.release(*size as u64);
+                }
+            }
+            LocalWriteState::Done(_) | LocalWriteState::Poisoned => {}
         }
     }
 }

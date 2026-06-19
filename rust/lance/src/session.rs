@@ -9,6 +9,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::spill::{LocalSpillStore, SpillStore};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -53,6 +54,8 @@ pub struct Session {
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
     store_registry: Arc<ObjectStoreRegistry>,
+
+    spill_store: Arc<dyn SpillStore>,
 }
 
 impl DeepSizeOf for Session {
@@ -83,6 +86,7 @@ impl std::fmt::Debug for Session {
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
+            .field("spill_store", &self.spill_store)
             .finish()
     }
 }
@@ -107,6 +111,7 @@ impl Session {
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
+            spill_store: Arc::new(LocalSpillStore::new(u64::MAX)),
         }
     }
 
@@ -124,7 +129,14 @@ impl Session {
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
+            spill_store: Arc::new(LocalSpillStore::new(u64::MAX)),
         }
+    }
+
+    /// Set the spill store used for temporary index-build scratch.
+    pub fn with_spill_store(mut self, spill_store: Arc<dyn SpillStore>) -> Self {
+        self.spill_store = spill_store;
+        self
     }
 
     /// Register a new index extension.
@@ -193,6 +205,11 @@ impl Session {
     /// Get the object store registry.
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
         self.store_registry.clone()
+    }
+
+    /// Get the session spill store.
+    pub fn spill_store(&self) -> Arc<dyn SpillStore> {
+        self.spill_store.clone()
     }
 
     /// Get a reference to the raw metadata cache (for use in index reconstruction).

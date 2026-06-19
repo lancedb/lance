@@ -730,6 +730,19 @@ impl ScanScheduler {
         self.open_file_with_priority(path, 0, file_size_bytes).await
     }
 
+    /// Open a scheduler over an already-open reader.
+    pub fn open_reader(self: &Arc<Self>, reader: Arc<dyn Reader>) -> FileScheduler {
+        FileScheduler {
+            block_size: reader.block_size() as u64,
+            max_iop_size: self.object_store.max_iop_size(),
+            reader,
+            root: self.clone(),
+            base_priority: 0,
+            bypass_backpressure: false,
+            extra_stats: None,
+        }
+    }
+
     fn do_submit_request(
         &self,
         reader: Arc<dyn Reader>,
