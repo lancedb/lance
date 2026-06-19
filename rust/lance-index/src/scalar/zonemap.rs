@@ -28,10 +28,9 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use arrow_array::{
-    ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
-};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array};
 use arrow_schema::{DataType, Field};
+use lance_select::RowAddrTreeMap;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use std::sync::Arc;
@@ -50,6 +49,7 @@ const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
+const NULL_BITMAP_META_KEY: &str = "lance:null_bitmap";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
@@ -110,6 +110,9 @@ pub struct ZoneMapIndex {
     store: Arc<dyn IndexStore>,
     fri: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
+    // Exact set of null row addresses across all zones; None when loaded from an
+    // older index that did not persist this bitmap.
+    null_rows: Option<RowAddrTreeMap>,
 }
 
 impl std::fmt::Debug for ZoneMapIndex {
@@ -127,7 +130,7 @@ impl std::fmt::Debug for ZoneMapIndex {
 
 impl DeepSizeOf for ZoneMapIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.zones.deep_size_of_children(context)
+        self.zones.deep_size_of_children(context) + self.null_rows.deep_size_of_children(context)
     }
 }
 
@@ -469,12 +472,24 @@ impl ZoneMapIndex {
             .get(ZONEMAP_SIZE_META_KEY)
             .and_then(|bs| bs.parse().ok())
             .unwrap_or(ROWS_PER_ZONE_DEFAULT);
+
+        let null_rows = if let Some(idx_str) = file_schema.metadata.get(NULL_BITMAP_META_KEY) {
+            let idx = idx_str.parse::<u32>().map_err(|e| {
+                Error::invalid_input(format!("invalid null bitmap buffer index: {e}"))
+            })?;
+            let bytes = index_file.read_global_buffer(idx).await?;
+            Some(RowAddrTreeMap::deserialize_from(bytes.as_ref())?)
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self::try_from_serialized(
             zone_maps,
             store,
             fri,
             index_cache,
             rows_per_zone,
+            null_rows,
         )?))
     }
 
@@ -484,6 +499,7 @@ impl ZoneMapIndex {
         fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         rows_per_zone: u64,
+        null_rows: Option<RowAddrTreeMap>,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
         let min_col = data
@@ -545,6 +561,7 @@ impl ZoneMapIndex {
                 store,
                 fri,
                 index_cache: WeakLanceCache::from(index_cache),
+                null_rows,
             });
         }
 
@@ -576,6 +593,7 @@ impl ZoneMapIndex {
             store,
             fri,
             index_cache: WeakLanceCache::from(index_cache),
+            null_rows,
         })
     }
 }
@@ -626,6 +644,11 @@ impl ScalarIndex for ZoneMapIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        if let SargableQuery::IsNull() = query {
+            if let Some(null_rows) = &self.null_rows {
+                return Ok(SearchResult::exact(null_rows.clone()));
+            }
+        }
         search_zones(&self.zones, metrics, |zone| {
             self.evaluate_zone_against_query(zone, query)
         })
@@ -660,19 +683,24 @@ impl ScalarIndex for ZoneMapIndex {
         let options = ZoneMapIndexBuilderParams::new(self.rows_per_zone);
         let processor = ZoneMapProcessor::new(value_type.clone())?;
         let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?;
-        let updated_zones = rebuild_zones(&self.zones, trainer, new_data).await?;
+        let (updated_zones, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
+
+        // Merge existing and new null rows
+        let mut merged_null_rows = self.null_rows.clone().unwrap_or_default();
+        merged_null_rows |= &new_null_rows;
 
         // Serialize the combined zones back into the index file
         let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
         builder.options.rows_per_zone = self.rows_per_zone;
         builder.maps = updated_zones;
-        let file = builder.write_index(dest_store).await?;
+        builder.null_rows = merged_null_rows;
+        let files = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: vec![file],
+            files,
         })
     }
 
@@ -707,6 +735,8 @@ pub async fn merge_zonemap_indices(
     let data_type = first.data_type.clone();
 
     let mut zones = Vec::new();
+    let mut merged_null_rows = RowAddrTreeMap::new();
+    let mut any_null_bitmap = false;
     for source in source_indices {
         if source.rows_per_zone != rows_per_zone {
             return Err(Error::invalid_input(format!(
@@ -730,18 +760,27 @@ pub async fn merge_zonemap_indices(
                 })
                 .cloned(),
         );
+        if let Some(null_rows) = &source.null_rows {
+            any_null_bitmap = true;
+            let mut filtered = null_rows.clone();
+            filtered.retain_fragments(fragment_filter.iter());
+            merged_null_rows |= &filtered;
+        }
     }
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
     let mut builder =
         ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(rows_per_zone), data_type)?;
     builder.maps = zones;
-    builder.write_index(dest_store).await?;
+    if any_null_bitmap {
+        builder.null_rows = merged_null_rows;
+    }
+    let files = builder.write_index(dest_store).await?;
 
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap(),
         index_version: ZONEMAP_INDEX_VERSION,
-        files: dest_store.list_files_with_sizes().await?,
+        files,
     })
 }
 
@@ -786,6 +825,7 @@ pub struct ZoneMapIndexBuilder {
 
     items_type: DataType,
     maps: Vec<ZoneMapStatistics>,
+    null_rows: RowAddrTreeMap,
 }
 
 impl ZoneMapIndexBuilder {
@@ -794,6 +834,7 @@ impl ZoneMapIndexBuilder {
             options,
             items_type,
             maps: Vec::new(),
+            null_rows: RowAddrTreeMap::new(),
         })
     }
 
@@ -803,7 +844,9 @@ impl ZoneMapIndexBuilder {
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
         let processor = ZoneMapProcessor::new(self.items_type.clone())?;
         let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?;
-        self.maps = trainer.train(batches_source).await?;
+        let (maps, null_rows) = trainer.train(batches_source).await?;
+        self.maps = maps;
+        self.null_rows = null_rows;
         Ok(())
     }
 
@@ -856,7 +899,7 @@ impl ZoneMapIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
         let record_batch = self.zonemap_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -869,7 +912,21 @@ impl ZoneMapIndexBuilder {
             .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await
+
+        let mut null_bitmap_bytes = Vec::with_capacity(self.null_rows.serialized_size());
+        self.null_rows.serialize_into(&mut null_bitmap_bytes)?;
+        let null_bitmap_idx = index_file
+            .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
+            .await?;
+
+        let zonemap_file = index_file
+            .finish_with_metadata(HashMap::from([(
+                NULL_BITMAP_META_KEY.to_string(),
+                null_bitmap_idx.to_string(),
+            )]))
+            .await?;
+
+        Ok(vec![zonemap_file])
     }
 }
 
@@ -974,8 +1031,7 @@ impl ZoneMapIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<ZoneMapIndexBuilderParams>,
-    ) -> Result<IndexFile> {
-        // train_zonemap_index: calling scan_aligned_chunks
+    ) -> Result<Vec<IndexFile>> {
         let value_type = batches_source.schema().field(0).data_type().clone();
 
         let mut builder = ZoneMapIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
@@ -1042,12 +1098,12 @@ impl BasicTrainer for ZoneMapIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        let file = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        let files = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: vec![file],
+            files,
         })
     }
 }
@@ -1117,7 +1173,7 @@ mod tests {
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
-    use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
+    use lance_select::RowAddrTreeMap;
 
     use crate::scalar::{
         SargableQuery, ScalarIndex, SearchResult,
@@ -1676,7 +1732,7 @@ mod tests {
         // Test IsNull query (should match nothing since there are no null values)
         let query = SargableQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::AtMost(NullableRowAddrSet::empty()));
+        assert_eq!(result, SearchResult::exact(RowAddrTreeMap::new()));
 
         // Test range queries with NaN bounds
         // Range with NaN as start bound (included)
@@ -1719,7 +1775,7 @@ mod tests {
         );
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
         // Should match nothing since nothing is greater than NaN
-        assert_eq!(result, SearchResult::AtMost(NullableRowAddrSet::empty()));
+        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
 
         // Test IsIn query with mixed float types (Float16, Float32, Float64)
         let query = SargableQuery::IsIn(vec![
@@ -1903,7 +1959,7 @@ mod tests {
         // 8. IsNull query (no nulls in data, should match nothing)
         let query = SargableQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new()));
+        assert_eq!(result, SearchResult::exact(RowAddrTreeMap::new()));
         // 9. IsIn query: [0, 100, 101, 50]
         let query = SargableQuery::IsIn(vec![
             ScalarValue::Int32(Some(0)),
@@ -2612,6 +2668,7 @@ mod tests {
             store: test_store,
             fri: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+            null_rows: None,
         };
 
         // Test LikePrefix query for "foo"
@@ -2684,6 +2741,7 @@ mod tests {
             store: test_store,
             fri: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+            null_rows: None,
         };
 
         // Test LikePrefix "test"
@@ -2751,6 +2809,7 @@ mod tests {
             store: test_store,
             fri: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+            null_rows: None,
         };
 
         // Test LikePrefix with LargeUtf8
@@ -2802,5 +2861,72 @@ mod tests {
         assert_eq!(compute_next_prefix("ab\u{10FFFF}"), Some("ac".to_string()));
         // All max characters
         assert_eq!(compute_next_prefix("\u{10FFFF}\u{10FFFF}"), None);
+    }
+
+    // Writes a zonemap file in the legacy format (no null bitmap global buffer),
+    // simulating an index created before the null bitmap feature was added.
+    async fn write_legacy_zonemap(store: &dyn IndexStore, null_count: u32) {
+        use arrow_array::{Int32Array, UInt32Array};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(0)])) as _,
+                Arc::new(Int32Array::from(vec![Some(99)])) as _,
+                Arc::new(UInt32Array::from(vec![null_count])) as _,
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![100u64])) as _,
+            ],
+        )
+        .unwrap();
+        let mut file_schema = schema.as_ref().clone();
+        file_schema
+            .metadata
+            .insert(ZONEMAP_SIZE_META_KEY.to_string(), "8192".to_string());
+        let mut writer = store
+            .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_legacy_zonemap_no_null_bitmap() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Write a legacy index with one zone that has nulls but no null bitmap.
+        write_legacy_zonemap(store.as_ref(), 10).await;
+
+        let index = ZoneMapIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .expect("failed to load legacy zonemap");
+
+        assert!(index.null_rows.is_none(), "legacy index should have no null bitmap");
+
+        // IS NULL should fall back to the zone-scan path and return AtMost, not Exact.
+        let result = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_exact(),
+            "IS NULL on a legacy index should not be exact"
+        );
     }
 }
