@@ -3133,34 +3133,33 @@ fn inner_explain_cleanup_with_policy<'local>(
 }
 
 fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<CleanupPolicy> {
-    let before_ts_millis =
-        env.get_optional_u64_from_method(&jpolicy, "getBeforeTimestampMillis")?;
+    let before_ts_millis = env.get_optional_u64_from_method(jpolicy, "getBeforeTimestampMillis")?;
     let before_timestamp = before_ts_millis.map(|millis| {
         let st = UNIX_EPOCH + Duration::from_millis(millis);
         DateTime::<Utc>::from(st)
     });
 
-    let before_version = env.get_optional_u64_from_method(&jpolicy, "getBeforeVersion")?;
+    let before_version = env.get_optional_u64_from_method(jpolicy, "getBeforeVersion")?;
 
     let delete_unverified = env
-        .get_optional_from_method(&jpolicy, "getDeleteUnverified", |env, obj| {
+        .get_optional_from_method(jpolicy, "getDeleteUnverified", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
         })?
         .unwrap_or(false);
 
     let error_if_tagged_old_versions = env
-        .get_optional_from_method(&jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
+        .get_optional_from_method(jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
         })?
         .unwrap_or(true);
 
     let clean_referenced_branches = env
-        .get_optional_from_method(&jpolicy, "getCleanReferencedBranches", |env, obj| {
+        .get_optional_from_method(jpolicy, "getCleanReferencedBranches", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
         })?
         .unwrap_or(false);
 
-    let delete_rate_limit = env.get_optional_u64_from_method(&jpolicy, "getDeleteRateLimit")?;
+    let delete_rate_limit = env.get_optional_u64_from_method(jpolicy, "getDeleteRateLimit")?;
 
     Ok(CleanupPolicy {
         before_timestamp,
