@@ -112,6 +112,27 @@ impl HdfsStoreProvider {
 
         Ok(config)
     }
+
+    /// Calculate the object store prefix from the resolved effective NameNode.
+    ///
+    /// The prefix identifies the datastore for caching and must reflect the
+    /// actual HDFS cluster the client connects to — not just the URI authority.
+    /// NameNode resolution follows the same priority as `build_config`:
+    /// `hdfs_name_node` → `HDFS_NAME_NODE` → URI authority.
+    fn calculate_object_store_prefix_with_env(
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+        env_vars: &HashMap<String, String>,
+    ) -> Result<String> {
+        let authority = storage_options
+            .and_then(|opts| opts.get("hdfs_name_node"))
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .or_else(|| env_vars.get("HDFS_NAME_NODE").cloned())
+            .unwrap_or_else(|| url.authority().to_string());
+
+        Ok(format!("{}${}", url.scheme(), authority))
+    }
 }
 
 #[async_trait::async_trait]
@@ -144,6 +165,15 @@ impl ObjectStoreProvider for HdfsStoreProvider {
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
         })
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        let env_vars = std::env::vars().collect::<HashMap<String, String>>();
+        Self::calculate_object_store_prefix_with_env(url, storage_options, &env_vars)
     }
 }
 
