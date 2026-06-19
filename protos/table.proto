@@ -115,6 +115,9 @@ message Manifest {
   // * 1 << 3: table config is present
   // * 1 << 4: dataset uses multiple base paths
   // * 1 << 5: transaction file writes are disabled
+  // * 1 << 6: data overlay files are present (see DataOverlayFile). Readers that do
+  //   not understand overlays must refuse the dataset, since ignoring an overlay
+  //   would silently return stale base values.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -313,6 +316,15 @@ message DataFragment {
 
   repeated DataFile files = 2;
 
+  // Optional overlay files for this fragment, which supply new values for a
+  // subset of cells without rewriting the base data files. This MUST be empty
+  // if the data overlay files feature flag (64) is not set in the manifest.
+  //
+  // Order is significant: a later entry is newer than an earlier one. When two
+  // overlays cover the same (offset, field) and share a `committed_version`, the
+  // later entry wins. See DataOverlayFile for the full resolution rules.
+  repeated DataOverlayFile overlays = 11;
+
   // File that indicates which rows, if any, should be considered deleted.
   DeletionFile deletion_file = 3;
 
@@ -434,6 +446,66 @@ message DataFile {
   // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
   optional uint32 base_id = 7;
 } // DataFile
+
+// An overlay file supplies new values for a subset of (row offset, field) cells
+// within a fragment, without rewriting the fragment's base data files. It is
+// used for efficient updates when only a small fraction of rows and/or columns
+// change.
+//
+// On read, a cell is resolved by consulting the fragment's overlays from newest
+// to oldest: the first overlay that covers that (offset, field) wins; if none
+// cover it, the value falls through to the base data file. Because deletions
+// take precedence over overlays, an overlay value for an offset that is also
+// marked deleted is dead and is ignored.
+//
+// The overlay's data file does NOT store a row-offset key column. Within a value
+// column, the position of a covered offset's value is the rank (0-based count of
+// set bits below it) of that offset within the field's coverage bitmap. Because
+// fields may cover different offset sets, the value columns of a single overlay
+// data file may have different lengths (which the Lance file format permits).
+message DataOverlayFile {
+  // The data file storing the overlay's new cell values, one value column per
+  // field in `data_file.fields`. No row-offset key column is stored.
+  DataFile data_file = 1;
+
+  // Which (offset, field) cells this overlay provides values for.
+  oneof coverage {
+    // A single 32-bit Roaring bitmap of physical row offsets that applies to
+    // every field in `data_file.fields` (a "dense" / rectangular overlay).
+    // Every covered offset has a value for every field. This is the common case
+    // for a plain UPDATE, where one SET list is applied to one set of rows.
+    bytes shared_offset_bitmap = 2;
+    // Per-field coverage for a "sparse" overlay, used when different fields cover
+    // different offset sets (e.g. a MERGE with multiple WHEN MATCHED branches).
+    FieldCoverage field_coverage = 4;
+  }
+
+  // The dataset version at which this overlay became effective: the version of
+  // the commit that introduced it, NOT the version it was read from. It is
+  // stamped at commit time and re-stamped if the commit is retried, in the same
+  // way as the created-at / last-updated-at version sequences.
+  //
+  // This drives two orderings:
+  //  * Versus index builds: an index whose `dataset_version` >= this value
+  //    already incorporates this overlay. Otherwise the overlay's covered cells
+  //    are excluded from index results for the affected fields and re-evaluated
+  //    against their current values (see the Data Overlay Files specification).
+  //  * Versus other overlays: when two overlays cover the same (offset, field),
+  //    the one with the higher `committed_version` wins. Overlays that share a
+  //    `committed_version` are ordered by their position in
+  //    `DataFragment.overlays`, where a later entry is newer and wins.
+  uint64 committed_version = 3;
+}
+
+// Per-field coverage for a sparse overlay.
+message FieldCoverage {
+  // One entry per field in the overlay's `data_file.fields`, in the same order.
+  // Each is a 32-bit Roaring bitmap of the physical row offsets covered for that
+  // field. An offset present in a field's bitmap but mapped to a NULL value
+  // means the cell is overridden to NULL (distinct from an offset that is absent,
+  // which falls through to the base data file).
+  repeated bytes offset_bitmaps = 1;
+}
 
 // Deletion File
 //

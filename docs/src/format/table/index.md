@@ -168,6 +168,35 @@ However, this invalidates row addresses and requires rebuilding indices, which c
 
 </details>
 
+## Data Overlay Files
+
+!!! note "Overlay files require feature flag 64 (data overlay files)"
+
+Overlay files supply new values for a subset of `(row offset, field)` cells within
+a fragment without rewriting the base data files. They make updates cheap when only
+a small percentage of rows and/or columns change: a writer appends a small file
+carrying just the changed cells instead of rewriting whole columns or moving rows
+to a new fragment.
+
+On read, each cell is resolved by consulting the fragment's overlays from newest to
+oldest; the first overlay covering that `(offset, field)` wins, otherwise the value
+falls through to the base data file. Indices keep covering the fragment and reconcile
+overlays at query time through a field-aware exclusion set.
+
+For the full specification — coverage and resolution rules, dense vs. sparse layout,
+versioning, index integration, compaction, and a worked example — see the
+[Data Overlay Files Specification](data_overlay_file.md).
+
+<details>
+<summary>DataOverlayFile protobuf message</summary>
+
+```protobuf
+%%% proto.message.DataOverlayFile %%%
+```
+
+</details>
+
+
 ## Related Specifications
 
 ### Storage Layout
