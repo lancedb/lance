@@ -7,6 +7,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_select::RowAddrTreeMap;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -105,6 +106,10 @@ impl TryFrom<pb::fragment_reuse_index_details::Group> for FragReuseGroup {
 pub struct FragReuseVersion {
     pub dataset_version: u64,
     pub groups: Vec<FragReuseGroup>,
+    /// Fragments an index covered that were gone from the manifest at commit
+    /// time and not part of any rewrite group (e.g. fully deleted before
+    /// compaction). Pruned by ID since their rows can't be enumerated by address.
+    pub removed_frags: Vec<u32>,
 }
 
 impl From<&FragReuseVersion> for pb::fragment_reuse_index_details::Version {
@@ -112,6 +117,7 @@ impl From<&FragReuseVersion> for pb::fragment_reuse_index_details::Version {
         Self {
             dataset_version: version.dataset_version,
             groups: version.groups.iter().map(|g| g.into()).collect(),
+            removed_fragments: version.removed_frags.clone(),
         }
     }
 }
@@ -127,6 +133,7 @@ impl TryFrom<pb::fragment_reuse_index_details::Version> for FragReuseVersion {
                 .into_iter()
                 .map(FragReuseGroup::try_from)
                 .collect::<Result<_>>()?,
+            removed_frags: version.removed_fragments,
         })
     }
 }
@@ -194,6 +201,15 @@ impl FragReuseIndexDetails {
                 .flat_map(|v| v.new_frag_ids().into_iter().map(|id| id as u32)),
         )
     }
+
+    /// Union of every version's `removed_frags`.
+    pub fn removed_frag_bitmap(&self) -> RoaringBitmap {
+        RoaringBitmap::from_iter(
+            self.versions
+                .iter()
+                .flat_map(|v| v.removed_frags.iter().copied()),
+        )
+    }
 }
 
 /// An index that stores row ID maps.
@@ -204,6 +220,9 @@ pub struct FragReuseIndex {
     pub uuid: Uuid,
     pub row_id_maps: Vec<HashMap<u64, Option<u64>>>,
     pub details: FragReuseIndexDetails,
+    /// Cache of `details.removed_frag_bitmap()`; rebuilt in `new`, so skipped.
+    #[serde(skip)]
+    removed_frags: RoaringBitmap,
 }
 
 impl DeepSizeOf for FragReuseIndex {
@@ -218,10 +237,12 @@ impl FragReuseIndex {
         row_id_maps: Vec<HashMap<u64, Option<u64>>>,
         details: FragReuseIndexDetails,
     ) -> Self {
+        let removed_frags = details.removed_frag_bitmap();
         Self {
             uuid,
             row_id_maps,
             details,
+            removed_frags,
         }
     }
 
@@ -234,6 +255,20 @@ impl FragReuseIndex {
                     .copied()
                     .unwrap_or(mapped_value);
             }
+        }
+
+        // Prune rows whose final address lands in a fully-deleted fragment
+        // (tracked by ID in `removed_frags`). Checked after chaining, since an
+        // earlier compaction may have rewritten the row into a fragment that was
+        // later deleted. Fragment IDs are never reused, so a live row is never
+        // pruned.
+        if let Some(addr) = mapped_value
+            && !self.removed_frags.is_empty()
+            && self
+                .removed_frags
+                .contains(RowAddress::new_from_u64(addr).fragment_id())
+        {
+            return None;
         }
 
         mapped_value
@@ -307,6 +342,13 @@ impl FragReuseIndex {
     }
 
     pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {
+        // Orphaned fragments (fully deleted before compaction) are deliberately
+        // NOT removed from index coverage here. Their rows are already pruned
+        // from the index data by `remap_row_id`, and a fragment that no longer
+        // exists is masked out at query time by `effective_fragment_bitmap`'s
+        // intersection with the live fragments. Stripping a deleted fragment's
+        // coverage instead makes the planner treat its (now nonexistent) row
+        // range as an unindexed flat-scan fallback, which fails on `take`.
         for version in self.details.versions.iter() {
             for group in version.groups.iter() {
                 let mut removed = 0;
@@ -378,6 +420,7 @@ mod tests {
                     },
                 ],
             }],
+            removed_frags: vec![],
         };
 
         let version2 = FragReuseVersion {
@@ -402,6 +445,7 @@ mod tests {
                     },
                 ],
             }],
+            removed_frags: vec![],
         };
 
         // Create FragReuseIndexDetails with versions in reverse order

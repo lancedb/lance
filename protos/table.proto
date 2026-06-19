@@ -514,6 +514,17 @@ message FragmentReuseIndexDetails {
     uint64 dataset_version = 1;
 
     repeated Group groups = 3;
+
+    // Fragment IDs that some index covered but that were no longer present in
+    // the dataset when this version was committed, and were not part of any
+    // rewrite group (e.g. a fragment that was fully deleted before compaction,
+    // so it never entered a compaction task / Group.old_fragments).
+    //
+    // Such fragments are gone from the manifest, so their rows cannot be
+    // enumerated by address. Their stale index entries are pruned by fragment
+    // ID instead: the fragment-reuse index maps every row address whose
+    // fragment ID is in this list to "deleted" (None).
+    repeated uint32 removed_fragments = 4;
   }
 }
 
