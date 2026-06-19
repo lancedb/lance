@@ -4905,6 +4905,7 @@ dependencies = [
  "num-traits",
  "proptest",
  "rand 0.9.4",
+ "rayon",
 ]
 
 [[package]]
