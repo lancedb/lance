@@ -2176,12 +2176,13 @@ public class Dataset implements Closeable {
 
   private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
 
-  CleanupExplanation explainCleanup(CleanupPolicy policy) {
+  CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeExplainCleanupWithPolicy(policy);
+      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles);
     }
   }
 
-  private native CleanupExplanation nativeExplainCleanupWithPolicy(CleanupPolicy policy);
+  private native CleanupExplanation nativeExplainCleanupWithPolicy(
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles);
 }

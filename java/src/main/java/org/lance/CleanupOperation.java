@@ -19,6 +19,8 @@ import org.lance.cleanup.RemovalStats;
 
 import org.apache.arrow.util.Preconditions;
 
+import java.util.Optional;
+
 /**
  * A cleanup operation with separate read-only explain and destructive execute actions.
  *
@@ -28,10 +30,28 @@ import org.apache.arrow.util.Preconditions;
 public class CleanupOperation {
   private final Dataset dataset;
   private final CleanupPolicy policy;
+  private Optional<Long> maxCandidateFiles = Optional.empty();
 
   CleanupOperation(Dataset dataset, CleanupPolicy policy) {
     this.dataset = Preconditions.checkNotNull(dataset, "dataset cannot be null");
     this.policy = Preconditions.checkNotNull(policy, "policy cannot be null");
+  }
+
+  /**
+   * Set the maximum number of candidate files included in the {@link #explain()} result.
+   *
+   * <p>Defaults to 1000 if not set. The aggregate {@link RemovalStats} returned by {@link
+   * #explain()} still account for all files that would be removed regardless of this limit; only
+   * the per-file {@code candidateFiles} list is truncated.
+   *
+   * @param maxCandidateFiles maximum number of candidate files to include; must be positive
+   * @return this operation for chaining
+   */
+  public CleanupOperation withMaxCandidateFiles(long maxCandidateFiles) {
+    Preconditions.checkArgument(
+        maxCandidateFiles > 0, "maxCandidateFiles must be positive, got %s", maxCandidateFiles);
+    this.maxCandidateFiles = Optional.of(maxCandidateFiles);
+    return this;
   }
 
   /**
@@ -40,7 +60,7 @@ public class CleanupOperation {
    * @return cleanup explanation
    */
   public CleanupExplanation explain() {
-    return dataset.explainCleanup(policy);
+    return dataset.explainCleanup(policy, maxCandidateFiles);
   }
 
   /**

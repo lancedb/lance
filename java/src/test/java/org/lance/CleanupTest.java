@@ -153,6 +153,39 @@ public class CleanupTest {
   }
 
   @Test
+  public void testExplainCleanupWithMaxCandidateFiles(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      testDataset.createEmptyDataset().close();
+
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+
+      try (Dataset dataset = testDataset.write(3, 10)) {
+        CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
+        CleanupExplanation full = dataset.cleanup(policy).explain();
+        assertTrue(full.getCandidateFiles().size() > 1);
+        assertEquals(1000L, full.getCandidateFileLimit());
+
+        CleanupExplanation truncated = dataset.cleanup(policy).withMaxCandidateFiles(1L).explain();
+        assertEquals(1L, truncated.getCandidateFileLimit());
+        assertEquals(1, truncated.getCandidateFiles().size());
+        assertTrue(truncated.isCandidateFilesTruncated());
+        assertTrue(!truncated.getWarnings().isEmpty());
+        // Aggregate stats stay accurate even when the per-file list is truncated.
+        assertEquals(full.getStats().getOldVersions(), truncated.getStats().getOldVersions());
+
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.cleanup(policy).withMaxCandidateFiles(0L));
+      }
+    }
+  }
+
+  @Test
   public void testCleanupWithRateLimit(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

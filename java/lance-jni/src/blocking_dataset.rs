@@ -417,8 +417,16 @@ impl BlockingDataset {
         Ok(RT.block_on(self.inner.cleanup_with_policy(policy))?)
     }
 
-    pub fn explain_cleanup_with_policy(&self, policy: CleanupPolicy) -> Result<CleanupExplanation> {
-        Ok(RT.block_on(self.inner.cleanup(policy).explain())?)
+    pub fn explain_cleanup_with_policy(
+        &self,
+        policy: CleanupPolicy,
+        max_candidate_files: Option<usize>,
+    ) -> Result<CleanupExplanation> {
+        let mut op = self.inner.cleanup(policy);
+        if let Some(limit) = max_candidate_files {
+            op = op.with_max_candidate_files(limit);
+        }
+        Ok(RT.block_on(op.explain())?)
     }
 
     pub fn close(&self) {}
@@ -3086,10 +3094,11 @@ pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'lo
     mut env: JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jmax_candidate_files: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy)
+        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
     )
 }
 
@@ -3097,13 +3106,27 @@ fn inner_explain_cleanup_with_policy<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jmax_candidate_files: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let max_candidate_files = env
+        .get_optional(&jmax_candidate_files, |env, inner| {
+            Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
+        })?
+        .map(|v| {
+            usize::try_from(v).map_err(|e| {
+                Error::input_error(format!(
+                    "maxCandidateFiles must be a non-negative usize value, got {}: {:?}",
+                    v, e
+                ))
+            })
+        })
+        .transpose()?;
 
     let explanation = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.explain_cleanup_with_policy(policy)
+        dataset.explain_cleanup_with_policy(policy, max_candidate_files)
     }?;
 
     cleanup_explanation_to_java(env, explanation)
@@ -3183,25 +3206,31 @@ fn cleanup_candidate_files_to_java<'local>(
     files: Vec<CleanupCandidateFile>,
 ) -> Result<JObject<'local>> {
     let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    // Wrap each iteration in a local frame so the temporary path/kind/candidate
+    // references do not accumulate on the JNI local reference table for large
+    // explanations (default limit is 1000 candidate files, but users can raise it).
     for file in files {
-        let path = env.new_string(file.path)?;
-        let kind = env.new_string(cleanup_file_kind_to_java(file.kind))?;
-        let candidate = env.new_object(
-            "org/lance/cleanup/CleanupCandidateFile",
-            "(Ljava/lang/String;Ljava/lang/String;ZJ)V",
-            &[
-                JValue::Object(&path),
-                JValue::Object(&kind),
-                JValue::Bool(file.unverified as jboolean),
-                JValue::Long(file.size_bytes as i64),
-            ],
-        )?;
-        env.call_method(
-            &list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[JValue::Object(&candidate)],
-        )?;
+        env.with_local_frame(8, |env| {
+            let path = env.new_string(file.path)?;
+            let kind = env.new_string(cleanup_file_kind_to_java(file.kind))?;
+            let candidate = env.new_object(
+                "org/lance/cleanup/CleanupCandidateFile",
+                "(Ljava/lang/String;Ljava/lang/String;ZJ)V",
+                &[
+                    JValue::Object(&path),
+                    JValue::Object(&kind),
+                    JValue::Bool(file.unverified as jboolean),
+                    JValue::Long(file.size_bytes as i64),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&candidate)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
     }
     Ok(list)
 }
@@ -3212,22 +3241,25 @@ fn cleanup_referenced_branches_to_java<'local>(
 ) -> Result<JObject<'local>> {
     let list = env.new_object("java/util/ArrayList", "()V", &[])?;
     for branch in branches {
-        let name = env.new_string(branch.name)?;
-        let referenced_branch = env.new_object(
-            "org/lance/cleanup/CleanupReferencedBranch",
-            "(Ljava/lang/String;JZ)V",
-            &[
-                JValue::Object(&name),
-                JValue::Long(branch.referenced_version as i64),
-                JValue::Bool(branch.cleanup_candidate as jboolean),
-            ],
-        )?;
-        env.call_method(
-            &list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[JValue::Object(&referenced_branch)],
-        )?;
+        env.with_local_frame(8, |env| {
+            let name = env.new_string(branch.name)?;
+            let referenced_branch = env.new_object(
+                "org/lance/cleanup/CleanupReferencedBranch",
+                "(Ljava/lang/String;JZ)V",
+                &[
+                    JValue::Object(&name),
+                    JValue::Long(branch.referenced_version as i64),
+                    JValue::Bool(branch.cleanup_candidate as jboolean),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&referenced_branch)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
     }
     Ok(list)
 }
@@ -3238,13 +3270,16 @@ fn cleanup_warnings_to_java<'local>(
 ) -> Result<JObject<'local>> {
     let list = env.new_object("java/util/ArrayList", "()V", &[])?;
     for warning in warnings {
-        let warning = env.new_string(warning)?;
-        env.call_method(
-            &list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[JValue::Object(&warning)],
-        )?;
+        env.with_local_frame(4, |env| {
+            let warning = env.new_string(warning)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&warning)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
     }
     Ok(list)
 }
