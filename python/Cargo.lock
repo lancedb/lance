@@ -4644,6 +4644,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hdrs",
  "lance-arrow",
  "lance-core",
  "lance-file",
