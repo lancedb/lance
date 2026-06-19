@@ -25,7 +25,6 @@ use super::{
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use lance_io::object_store::ObjectStore;
 use lance_io::object_store::ObjectStoreParams;
-use lance_io::object_store::StorageOptionsAccessor;
 
 /// [`CommitHandler`] for HDFS: staging write + atomic rename via libhdfs (same idea as
 /// [`super::RenameCommitHandler`], but uses `hdfsRename` instead of object_store's
@@ -187,6 +186,8 @@ impl CommitHandler for HdfsRenameCommitHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use lance_io::object_store::StorageOptionsAccessor;
 
     #[test]
     fn test_object_store_path_to_hdfs_abs() {
