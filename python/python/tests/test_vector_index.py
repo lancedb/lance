@@ -1961,6 +1961,99 @@ def test_optimize_indices(indexed_dataset):
     assert stats["num_indices"] == 2
 
 
+def test_no_stale_duplicate_after_partial_column_update(tmp_path):
+    # Regression test: updating an indexed vector column in place (via the
+    # low-level fragment.update_columns API + LanceOperation.Update) and then
+    # delta-optimizing the index must not leave a stale copy of the row in the
+    # original index segment.
+    #
+    # Mechanism: update_columns rewrites only the column data file, keeping the
+    # fragment id and row address. Committing the Update prunes the fragment
+    # from the old index segment's fragment_bitmap, but that segment's index
+    # file still physically holds the row's OLD vector. optimize_indices then
+    # builds a new delta segment with the NEW vector. Before the fix a KNN query
+    # searched both segments and returned the updated row TWICE - once with the
+    # stale vector (old segment) and once with the new value (delta segment).
+    np.random.seed(42)
+    ndim = 16
+
+    # Fragment 0: a "far" cluster bounded to [-1, 1]. No bulk vector is close to
+    # the query (all-10.8), so the bulk cannot crowd the stale copy out of top-k.
+    n_bulk = 1000
+    bulk = np.random.uniform(-1, 1, (n_bulk, ndim)).astype(np.float32)
+    table0 = pa.table(
+        {
+            "id": pa.array(range(n_bulk), type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(bulk.reshape(-1), type=pa.float32()), list_size=ndim
+            ),
+        }
+    )
+    ds = lance.write_dataset(table0, tmp_path, mode="create")
+
+    # Fragment 1: a single row whose ORIGINAL vector (all 2.0) is closer to the
+    # query than any bulk vector, so its stale copy ranks well inside top-k.
+    orig = np.full((1, ndim), 2.0, dtype=np.float32)
+    table1 = pa.table(
+        {
+            "id": pa.array([10_000], type=pa.int64()),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(orig.reshape(-1), type=pa.float32()), list_size=ndim
+            ),
+        }
+    )
+    ds = lance.write_dataset(table1, tmp_path, mode="append")
+    assert len(ds.get_fragments()) == 2
+
+    # One index segment covering BOTH fragments {0, 1}.
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="l2",
+        num_partitions=1,
+        num_sub_vectors=ndim,
+    )
+
+    # Overwrite fragment 1's vector in place and commit Update(fields_modified).
+    new_vec = [10.8] * ndim
+    frag = ds.get_fragment(1)
+    rowids = frag.to_table(columns=["id"], with_row_id=True)["_rowid"].to_pylist()
+    update_data = pa.table(
+        {
+            "_rowid": pa.array(rowids, type=pa.uint64()),
+            "vector": pa.array(
+                [new_vec] * len(rowids), type=pa.list_(pa.float32(), ndim)
+            ),
+        }
+    )
+    updated_fragment, fields_modified = frag.update_columns(update_data)
+    op = lance.LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    ds = lance.LanceDataset.commit(ds.uri, op, read_version=ds.version)
+
+    # Delta-optimize: appends a new segment for the updated fragment; the old
+    # segment is left intact, still physically holding the stale vector.
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    ds = lance.dataset(ds.uri)
+    assert ds.stats.index_stats("vector_idx")["num_indices"] == 2
+
+    # KNN near the NEW value via the default vector search (searches all
+    # segments). The updated row must appear EXACTLY ONCE.
+    q = np.array(new_vec, dtype=np.float32)
+    res = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "k": 10},
+        with_row_id=True,
+    ).to_pandas()
+    dupes = res[res["id"] == 10_000]
+    assert len(dupes) == 1, (
+        f"updated row id=10000 returned {len(dupes)} times "
+        f"(stale index segment not masked); rowids={res['_rowid'].tolist()}"
+    )
+
+
 @pytest.mark.skip(reason="retrain is deprecated")
 def test_retrain_indices(indexed_dataset):
     data = create_table()

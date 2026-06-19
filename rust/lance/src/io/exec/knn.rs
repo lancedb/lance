@@ -56,7 +56,9 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
+use roaring::RoaringBitmap;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -1634,6 +1636,7 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
+        seg_mask: Option<Arc<RowAddrMask>>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -1667,20 +1670,29 @@ impl ANNIvfSubIndexExec {
 
                 // This next if check should be true, because we wouldn't get max_results otherwise
                 if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
-                    // We only run this on the first delta because the prefilter mask is shared
-                    // by all deltas and we don't want to duplicate the rows.
-                    if state
-                        .took_no_rows_shortcut
-                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                    {
+                    // Emit the prefilter rows that the partition search did not reach.
+                    //
+                    // The prefilter mask is shared by all deltas. When a per-segment
+                    // restriction is in effect (`seg_mask` is `Some`) each delta emits only
+                    // the addresses its own segment owns; the segments partition the
+                    // fragments, so each address is emitted by exactly one delta. Without a
+                    // restriction the mask is global, so only the first delta emits (guarded
+                    // by a shared flag) to avoid duplicating rows across deltas.
+                    let should_emit = seg_mask.is_some()
+                        || state
+                            .took_no_rows_shortcut
+                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok();
+                    if should_emit {
                         let initial_addrs = state.initial_ids.lock().unwrap();
                         let found_addrs = HashSet::<_>::from_iter(initial_addrs.iter().copied());
                         drop(initial_addrs);
-                        let mask_addrs = HashSet::from_iter(iter_addrs.map(u64::from));
-                        let not_found_addrs = mask_addrs.difference(&found_addrs);
-                        let not_found_addrs =
-                            UInt64Array::from_iter_values(not_found_addrs.copied());
+                        let not_found_addrs = UInt64Array::from_iter_values(
+                            iter_addrs.map(u64::from).filter(|addr| {
+                                !found_addrs.contains(addr)
+                                    && seg_mask.as_ref().is_none_or(|m| m.selected(*addr))
+                            }),
+                        );
                         let not_found_distance =
                             Float32Array::from_value(f32::INFINITY, not_found_addrs.len());
                         let not_found_batch = RecordBatch::try_new(
@@ -1690,8 +1702,8 @@ impl ANNIvfSubIndexExec {
                         .unwrap();
                         return futures::stream::once(async move { Ok(not_found_batch) }).boxed();
                     } else {
-                        // We meet all the criteria for an early exit, but we aren't first
-                        // delta so we just return an empty stream and skip the late search
+                        // We meet all the criteria for an early exit, but we aren't the first
+                        // delta and the mask is global, so skip to avoid duplicate rows.
                         return futures::stream::empty().boxed();
                     }
                 }
@@ -1923,6 +1935,19 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
         let indices = self.indices.clone();
+        // Per-segment fragment restriction (applied as a post-filter below).
+        // Only enabled when every segment has a fragment_bitmap, mirroring the
+        // `all_have_bitmaps` gate in DatasetPreFilter::new so we never restrict
+        // more aggressively than the shared prefilter's fallback.
+        let segment_bitmaps: Arc<HashMap<Uuid, RoaringBitmap>> =
+            Arc::new(if indices.iter().all(|idx| idx.fragment_bitmap.is_some()) {
+                indices
+                    .iter()
+                    .map(|idx| (idx.uuid, idx.fragment_bitmap.clone().unwrap()))
+                    .collect()
+            } else {
+                HashMap::new()
+            });
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
@@ -1999,6 +2024,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let metrics = metrics.clone();
                     let pre_filter = pre_filter.clone();
                     let state = state.clone();
+                    let segment_bitmaps = segment_bitmaps.clone();
                     let mut query = query.clone();
                     let pruned_nprobes = early_pruning(q_c_dists.values(), query.k);
                     adjust_probes(&mut query, pruned_nprobes);
@@ -2007,6 +2033,28 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
                         let query = normalize_query_for_index(raw_index.as_ref(), query)?;
+
+                        // A segment's index file may still physically contain rows for
+                        // fragments that were pruned from its fragment_bitmap (e.g. after an
+                        // in-place column update via update_columns). Once a newer delta
+                        // segment owns such a fragment, the stale rows in this segment must
+                        // not be returned, otherwise the same row is emitted by two segments.
+                        // Build a per-segment restriction mask, reusing the scheme-aware
+                        // helper so it is correct for both row-address and stable-row-id
+                        // datasets. The shared prefilter is built from the union of all
+                        // segment bitmaps and cannot express this per-segment rule.
+                        let seg_mask = match segment_bitmaps.get(&index_uuid).cloned() {
+                            Some(bitmap) => {
+                                match DatasetPreFilter::create_restricted_deletion_mask(
+                                    ds.clone(),
+                                    bitmap,
+                                ) {
+                                    Some(fut) => Some(fut.await?),
+                                    None => None,
+                                }
+                            }
+                            None => None,
+                        };
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),
@@ -2027,8 +2075,34 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             metrics,
                             state,
                             target_partitions,
+                            seg_mask.clone(),
                         );
-                        DataFusionResult::Ok(early_search.chain(late_search).boxed())
+                        let combined = early_search.chain(late_search);
+                        // Drop stale rows from this segment's search output (rows whose
+                        // fragment the segment no longer owns). The shortcut path in
+                        // late_search restricts its emitted rows with the same mask.
+                        let restricted = combined.map(move |batch_res| {
+                            let batch = batch_res?;
+                            let Some(seg_mask) = seg_mask.as_ref() else {
+                                return Ok(batch);
+                            };
+                            if batch.num_rows() == 0 {
+                                return Ok(batch);
+                            }
+                            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                            let keep = BooleanArray::from_iter(
+                                row_ids
+                                    .values()
+                                    .iter()
+                                    .map(|&id| Some(seg_mask.selected(id))),
+                            );
+                            if keep.false_count() == 0 {
+                                return Ok(batch);
+                            }
+                            arrow::compute::filter_record_batch(&batch, &keep)
+                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                        });
+                        DataFusionResult::Ok(restricted.boxed())
                     }
                 })
                 // Must use flatten_unordered to avoid deadlock.
@@ -3033,6 +3107,7 @@ mod tests {
             prepared_metrics(),
             state.clone(),
             usize::MAX,
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
