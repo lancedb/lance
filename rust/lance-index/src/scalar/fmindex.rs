@@ -2265,7 +2265,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(created.files.len(), 2);
+        assert_eq!(created.files.as_deref().unwrap_or_default().len(), 2);
 
         let index = FMIndexPlugin
             .load_index(store, &created.index_details, None, &LanceCache::no_cache())

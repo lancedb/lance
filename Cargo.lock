@@ -4843,7 +4843,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "8.0.0-beta.15"
+version = "8.1.0-beta.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",

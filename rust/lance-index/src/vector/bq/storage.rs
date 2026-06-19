@@ -2391,13 +2391,10 @@ pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
 /// to `Some(new_id)` for surviving rows or `None` for rows whose covering
 /// fragment was compacted away, suitable for `RabitQuantizationStorage::remap`.
 fn build_frag_reuse_mapping(
-    fri: Option<&FragReuseIndex>,
+    fri: Option<&dyn RowIdRemapper>,
     row_ids: &UInt64Array,
 ) -> Option<HashMap<u64, Option<u64>>> {
     let fri = fri?;
-    if fri.row_id_maps.is_empty() {
-        return None;
-    }
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
     for row_id in row_ids.values().iter() {
         match fri.remap_row_id(*row_id) {
@@ -2422,7 +2419,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        _fri: Option<Arc<dyn RowIdRemapper>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,

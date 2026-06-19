@@ -38,6 +38,7 @@ use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::RowIdRemapper;
 use lance_index::cache_pb::IvfStateHeader;
+use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -1883,12 +1884,13 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
             (index_reader, aux_reader)
         };
 
+    let fri: Option<Arc<dyn RowIdRemapper>> = frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
     let storage = IvfQuantizationStorage::from_cached(
         aux_reader,
         state.aux_ivf.clone(),
         state.metadata.clone(),
         state.distance_type,
-        frag_reuse_index,
+        fri,
     );
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 

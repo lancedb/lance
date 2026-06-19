@@ -1402,7 +1402,7 @@ mod tests {
     async fn flushed_pk_index_sidecar_is_probeable() {
         use lance_core::cache::LanceCache;
         use lance_index::metrics::NoOpMetricsCollector;
-        use lance_index::registry::IndexPluginRegistry;
+        use lance_index::registry::with_default_plugins;
         use lance_index::scalar::lance_format::LanceIndexStore;
         use lance_index::scalar::{SargableQuery, SearchResult};
 
@@ -1462,7 +1462,7 @@ mod tests {
             pk_index_path(&gen_path),
             Arc::new(LanceCache::no_cache()),
         ));
-        let registry = IndexPluginRegistry::with_default_plugins();
+        let registry = with_default_plugins();
         let plugin = registry.get_plugin_by_name("BTree").unwrap();
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
@@ -1503,7 +1503,7 @@ mod tests {
     async fn plain_flush_writes_pk_sidecar() {
         use lance_core::cache::LanceCache;
         use lance_index::metrics::NoOpMetricsCollector;
-        use lance_index::registry::IndexPluginRegistry;
+        use lance_index::registry::with_default_plugins;
         use lance_index::scalar::lance_format::LanceIndexStore;
         use lance_index::scalar::{SargableQuery, SearchResult};
 
@@ -1559,7 +1559,7 @@ mod tests {
             pk_index_path(&gen_path),
             Arc::new(LanceCache::no_cache()),
         ));
-        let registry = IndexPluginRegistry::with_default_plugins();
+        let registry = with_default_plugins();
         let plugin = registry.get_plugin_by_name("BTree").unwrap();
         let details =
             prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();

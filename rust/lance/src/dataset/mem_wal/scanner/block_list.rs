@@ -23,7 +23,7 @@ use datafusion::common::ScalarValue;
 use lance_core::{Error, Result};
 
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::registry::IndexPluginRegistry;
+use lance_index::registry::{IndexPluginRegistry, with_default_plugins};
 use lance_index::scalar::btree::BTreeIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{
@@ -41,7 +41,7 @@ use crate::session::Session;
 /// Default-plugin registry, used only to load the standalone PK BTree by its
 /// `BTreeIndexDetails` type. Built once.
 static PK_BTREE_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(with_default_plugins);
 
 /// One newer generation's PK membership, used to decide whether it shadows an
 /// older source's row.
