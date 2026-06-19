@@ -494,12 +494,27 @@ impl Field {
                 }
             }
             DataType::List(_) => {
-                let list_arr = arr.as_list::<i32>();
-                self.children[0].set_dictionary(list_arr.values());
+                let values = match arr.data_type() {
+                    DataType::List(_) => arr.as_list::<i32>().values(),
+                    DataType::ListView(_) => arr.as_list_view::<i32>().values(),
+                    data_type => {
+                        panic!("List field had an unexpected array type: {}", data_type);
+                    }
+                };
+                self.children[0].set_dictionary(values);
             }
             DataType::LargeList(_) => {
-                let list_arr = arr.as_list::<i64>();
-                self.children[0].set_dictionary(list_arr.values());
+                let values = match arr.data_type() {
+                    DataType::LargeList(_) => arr.as_list::<i64>().values(),
+                    DataType::LargeListView(_) => arr.as_list_view::<i64>().values(),
+                    data_type => {
+                        panic!(
+                            "LargeList field had an unexpected array type: {}",
+                            data_type
+                        );
+                    }
+                };
+                self.children[0].set_dictionary(values);
             }
             _ => {
                 // Field types that don't support dictionaries
@@ -1094,8 +1109,12 @@ impl TryFrom<&ArrowField> for Field {
                 .iter()
                 .map(|f| Self::try_from(f.as_ref()))
                 .collect::<Result<_>>()?,
-            DataType::List(item) => vec![Self::try_from(item.as_ref())?],
-            DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::List(item) | DataType::ListView(item) => {
+                vec![Self::try_from(item.as_ref())?]
+            }
+            DataType::LargeList(item) | DataType::LargeListView(item) => {
+                vec![Self::try_from(item.as_ref())?]
+            }
             DataType::FixedSizeList(item, _) if matches!(item.data_type(), DataType::Struct(_)) => {
                 vec![Self::try_from(item.as_ref())?]
             }
@@ -1170,9 +1189,11 @@ impl TryFrom<&ArrowField> for Field {
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
                 DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
                 // Use plain encoder to store the offsets of list and map.
-                DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => {
-                    Some(Encoding::Plain)
-                }
+                DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::ListView(_)
+                | DataType::LargeListView(_)
+                | DataType::Map(_, _) => Some(Encoding::Plain),
                 _ => None,
             },
             metadata,
@@ -1316,6 +1337,35 @@ mod tests {
         assert_eq!(
             LogicalType::try_from(&DataType::BinaryView).unwrap().0,
             "binary"
+        );
+
+        let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let field = Field::try_from(&ArrowField::new(
+            "l",
+            DataType::ListView(item.clone()),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(field.data_type(), DataType::List(item.clone()));
+        assert_eq!(
+            LogicalType::try_from(&DataType::ListView(item.clone()))
+                .unwrap()
+                .0,
+            "list"
+        );
+
+        let field = Field::try_from(&ArrowField::new(
+            "ll",
+            DataType::LargeListView(item.clone()),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(field.data_type(), DataType::LargeList(item.clone()));
+        assert_eq!(
+            LogicalType::try_from(&DataType::LargeListView(item))
+                .unwrap()
+                .0,
+            "large_list"
         );
     }
 

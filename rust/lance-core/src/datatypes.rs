@@ -147,7 +147,11 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
 fn is_supported_fixed_size_list_child(data_type: &DataType, nested: bool) -> bool {
     match data_type {
         DataType::Struct(_) => !nested,
-        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => false,
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Map(_, _) => false,
         DataType::FixedSizeList(field, _) => {
             is_supported_fixed_size_list_child(field.data_type(), true)
         }
@@ -211,11 +215,11 @@ impl TryFrom<&DataType> for LogicalType {
                     false
                 )
             }
-            DataType::List(elem) => match elem.data_type() {
+            DataType::List(elem) | DataType::ListView(elem) => match elem.data_type() {
                 DataType::Struct(_) => "list.struct".to_string(),
                 _ => "list".to_string(),
             },
-            DataType::LargeList(elem) => match elem.data_type() {
+            DataType::LargeList(elem) | DataType::LargeListView(elem) => match elem.data_type() {
                 DataType::Struct(_) => "large_list.struct".to_string(),
                 _ => "large_list".to_string(),
             },

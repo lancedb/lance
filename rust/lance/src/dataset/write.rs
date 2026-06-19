@@ -1490,7 +1490,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use arrow_array::{Int32Array, RecordBatchIterator, RecordBatchReader, StructArray};
+    use arrow_array::{
+        Int32Array, LargeListArray, LargeListViewArray, ListArray, ListViewArray,
+        RecordBatchIterator, RecordBatchReader, StructArray,
+    };
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use datafusion_physical_plan::RecordBatchStream;
@@ -1509,6 +1513,153 @@ mod tests {
         let params = WriteParams::default();
         assert!(params.auto_cleanup.is_none());
         assert!(!params.skip_auto_cleanup);
+    }
+
+    #[tokio::test]
+    async fn test_write_list_view_columns_as_offset_lists() {
+        let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let list_view = ListViewArray::new(
+            item.clone(),
+            ScalarBuffer::from(vec![6, 0, 3, 0]),
+            ScalarBuffer::from(vec![3, 1, 3, 2]),
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9])),
+            None,
+        );
+        let large_list_view = LargeListViewArray::new(
+            item.clone(),
+            ScalarBuffer::from(vec![0_i64, 2, 4, 4]),
+            ScalarBuffer::from(vec![0_i64, 0, 1, 0]),
+            Arc::new(Int32Array::from(vec![10, 11, 12, 13, 14])),
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("list", DataType::ListView(item.clone()), true),
+            ArrowField::new("large_list", DataType::LargeListView(item.clone()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(list_view), Arc::new(large_list_view)],
+        )
+        .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        let output = dataset.scan().try_into_batch().await.unwrap();
+        let output_schema = output.schema();
+
+        let DataType::List(output_item) = output_schema.field(0).data_type() else {
+            panic!(
+                "expected List output, got {}",
+                output_schema.field(0).data_type()
+            );
+        };
+        assert_eq!(output_item.data_type(), &DataType::Int32);
+        let DataType::LargeList(output_item) = output_schema.field(1).data_type() else {
+            panic!(
+                "expected LargeList output, got {}",
+                output_schema.field(1).data_type()
+            );
+        };
+        assert_eq!(output_item.data_type(), &DataType::Int32);
+
+        let expected_list = ListArray::new(
+            item.clone(),
+            OffsetBuffer::from_lengths([3, 1, 3, 2]),
+            Arc::new(Int32Array::from(vec![7, 8, 9, 1, 4, 5, 6, 1, 2])),
+            None,
+        );
+        let actual_list = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(actual_list, &expected_list);
+
+        let expected_large_list = LargeListArray::new(
+            item,
+            OffsetBuffer::from_lengths([0, 0, 1, 0]),
+            Arc::new(Int32Array::from(vec![14])),
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+        let actual_large_list = output
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .unwrap();
+        assert_eq!(actual_large_list, &expected_large_list);
+    }
+
+    #[tokio::test]
+    async fn test_append_list_view_to_list_column() {
+        let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let initial_list = ListArray::new(
+            item.clone(),
+            OffsetBuffer::from_lengths([2, 0]),
+            Arc::new(Int32Array::from(vec![10, 11])),
+            None,
+        );
+        let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "list",
+            DataType::List(item.clone()),
+            true,
+        )]));
+        let initial_batch =
+            RecordBatch::try_new(initial_schema.clone(), vec![Arc::new(initial_list)]).unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial_batch)], initial_schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let appended_list_view = ListViewArray::new(
+            item.clone(),
+            ScalarBuffer::from(vec![2, 0, 1]),
+            ScalarBuffer::from(vec![1, 1, 0]),
+            Arc::new(Int32Array::from(vec![20, 21, 22])),
+            None,
+        );
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "list",
+            DataType::ListView(item.clone()),
+            true,
+        )]));
+        let append_batch =
+            RecordBatch::try_new(append_schema.clone(), vec![Arc::new(appended_list_view)])
+                .unwrap();
+
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(append_batch)], append_schema),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let output = dataset.scan().try_into_batch().await.unwrap();
+
+        let expected = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([2, 0, 1, 1, 0]),
+            Arc::new(Int32Array::from(vec![10, 11, 22, 20])),
+            None,
+        );
+        let actual = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(actual, &expected);
     }
 
     #[tokio::test]

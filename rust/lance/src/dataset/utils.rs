@@ -151,11 +151,27 @@ fn physical_field(field: &ArrowField) -> Option<ArrowField> {
             ArrowField::new(field.name(), DataType::Binary, field.is_nullable())
                 .with_metadata(field.metadata().clone()),
         ),
+        DataType::ListView(item) => Some(
+            ArrowField::new(
+                field.name(),
+                DataType::List(Arc::clone(item)),
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone()),
+        ),
+        DataType::LargeListView(item) => Some(
+            ArrowField::new(
+                field.name(),
+                DataType::LargeList(Arc::clone(item)),
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone()),
+        ),
         _ => None,
     }
 }
 
-/// Cast `Utf8View`/`BinaryView` columns in a batch to their classic offset equivalents.
+/// Cast supported Arrow view columns in a batch to their classic offset equivalents.
 fn downcast_view_columns(
     batch: &RecordBatch,
 ) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
