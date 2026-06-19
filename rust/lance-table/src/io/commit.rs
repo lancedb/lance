@@ -47,9 +47,9 @@ use url::Url;
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
+pub mod external_manifest;
 #[cfg(feature = "hdfs")]
 mod hdfs_rename;
-pub mod external_manifest;
 
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};

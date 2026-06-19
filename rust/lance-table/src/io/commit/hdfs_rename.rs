@@ -73,10 +73,8 @@ fn resolve_hdfs_namenode_and_user(
         .ok_or_else(|| Error::invalid_input("HDFS URL must contain namenode host"))?
         .to_string();
 
-    let storage_map: HashMap<String, String> = params
-        .storage_options()
-        .cloned()
-        .unwrap_or_default();
+    let storage_map: HashMap<String, String> =
+        params.storage_options().cloned().unwrap_or_default();
 
     let hadoop_conf_dir = std::env::var("HADOOP_CONF_DIR").ok();
 
@@ -88,17 +86,10 @@ fn resolve_hdfs_namenode_and_user(
 
     let is_logical_name = url.port().is_none() && !namenode.contains('.');
 
-    let name_node = if let Some(nn) = storage_map
-        .get("hdfs_name_node")
-        .filter(|v| !v.is_empty())
-    {
+    let name_node = if let Some(nn) = storage_map.get("hdfs_name_node").filter(|v| !v.is_empty()) {
         nn.clone()
     } else if let Ok(nn) = std::env::var("HDFS_NAME_NODE") {
-        if nn.is_empty() {
-            name_node_url
-        } else {
-            nn
-        }
+        if nn.is_empty() { name_node_url } else { nn }
     } else {
         if is_logical_name && hadoop_conf_dir.is_none() {
             return Err(Error::invalid_input(format!(
@@ -108,10 +99,7 @@ fn resolve_hdfs_namenode_and_user(
         name_node_url
     };
 
-    let user = if let Some(u) = storage_map
-        .get("hdfs_user")
-        .filter(|v| !v.is_empty())
-    {
+    let user = if let Some(u) = storage_map.get("hdfs_user").filter(|v| !v.is_empty()) {
         Some(u.clone())
     } else if let Ok(u) = std::env::var("HADOOP_USER_NAME") {
         if u.is_empty() { None } else { Some(u) }
