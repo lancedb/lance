@@ -25,6 +25,7 @@ use super::{
 use crate::format::{IndexMetadata, Manifest, Transaction};
 use lance_io::object_store::ObjectStore;
 use lance_io::object_store::ObjectStoreParams;
+use lance_io::object_store::StorageOptionsAccessor;
 
 /// [`CommitHandler`] for HDFS: staging write + atomic rename via libhdfs (same idea as
 /// [`super::RenameCommitHandler`], but uses `hdfsRename` instead of object_store's
@@ -180,5 +181,88 @@ impl CommitHandler for HdfsRenameCommitHandler {
                 "HDFS rename task join error: {e}"
             )))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_object_store_path_to_hdfs_abs() {
+        assert_eq!(object_store_path_to_hdfs_abs(&Path::from("")), "/");
+        assert_eq!(
+            object_store_path_to_hdfs_abs(&Path::from("/data/manifest")),
+            "/data/manifest"
+        );
+        assert_eq!(
+            object_store_path_to_hdfs_abs(&Path::from("data/manifest")),
+            "/data/manifest"
+        );
+    }
+
+    #[test]
+    fn test_hdfs_rename_implies_conflict() {
+        let already_exists = io::Error::new(io::ErrorKind::AlreadyExists, "file exists");
+        assert!(hdfs_rename_implies_conflict(&already_exists));
+
+        let other = io::Error::new(io::ErrorKind::Other, "rename destination already exists");
+        assert!(hdfs_rename_implies_conflict(&other));
+
+        let file_exists =
+            io::Error::new(io::ErrorKind::Other, "FileAlreadyExistsException at path");
+        assert!(hdfs_rename_implies_conflict(&file_exists));
+
+        let unrelated = io::Error::new(io::ErrorKind::Other, "connection refused");
+        assert!(!hdfs_rename_implies_conflict(&unrelated));
+    }
+
+    #[test]
+    fn test_resolve_namenode_from_uri_authority() {
+        let url = Url::parse("hdfs://namenode:9000/data").unwrap();
+        let params = ObjectStoreParams::default();
+        let (name_node, _user) = resolve_hdfs_namenode_and_user(&url, &params).unwrap();
+        assert_eq!(name_node, "hdfs://namenode:9000");
+    }
+
+    #[test]
+    fn test_resolve_namenode_from_storage_options() {
+        let url = Url::parse("hdfs://namenode:9000/data").unwrap();
+        let mut opts = HashMap::new();
+        opts.insert(
+            "hdfs_name_node".to_string(),
+            "hdfs://override:8020".to_string(),
+        );
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts),
+            )),
+            ..Default::default()
+        };
+        let (name_node, _user) = resolve_hdfs_namenode_and_user(&url, &params).unwrap();
+        assert_eq!(name_node, "hdfs://override:8020");
+    }
+
+    #[test]
+    fn test_resolve_user_from_storage_options() {
+        let url = Url::parse("hdfs://namenode:9000/data").unwrap();
+        let mut opts = HashMap::new();
+        opts.insert("hdfs_user".to_string(), "hduser".to_string());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance_io::object_store::StorageOptionsAccessor::with_static_options(opts),
+            )),
+            ..Default::default()
+        };
+        let (_name_node, user) = resolve_hdfs_namenode_and_user(&url, &params).unwrap();
+        assert_eq!(user, Some("hduser".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_namenode_rejects_no_host() {
+        let url = Url::parse("hdfs:///data").unwrap();
+        let params = ObjectStoreParams::default();
+        let err = resolve_hdfs_namenode_and_user(&url, &params).unwrap_err();
+        assert!(err.to_string().contains("namenode host"));
     }
 }
