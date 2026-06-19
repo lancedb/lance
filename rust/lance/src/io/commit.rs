@@ -30,6 +30,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
+use lance_table::feature_flags::FLAG_RLE_V2;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
     WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
@@ -183,13 +184,17 @@ async fn do_commit_new_dataset(
                 .max()
                 .map(|id| *id + 1)
                 .unwrap_or(0);
-            let new_manifest = source_manifest.shallow_clone(
+            let mut new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
                 new_base_id,
                 branch_name.clone(),
                 transaction_file.clone(),
             );
+            if source_manifest.uses_rle_v2() {
+                new_manifest.reader_feature_flags |= FLAG_RLE_V2;
+                new_manifest.writer_feature_flags |= FLAG_RLE_V2;
+            }
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
                 let reader = object_store.open(&source_manifest_location.path).await?;

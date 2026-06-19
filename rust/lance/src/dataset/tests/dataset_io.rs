@@ -15,7 +15,7 @@ use crate::session::Session;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
 
-use crate::dataset::write::{WriteMode, WriteParams};
+use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
@@ -856,6 +856,7 @@ async fn test_write_manifest(
             use_legacy_format: None,
             storage_format: None,
             disable_transaction_file: false,
+            use_rle_v2: false,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -888,6 +889,294 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_rle_v2_write_sets_and_preserves_feature_flag() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+    let mut dataset = Dataset::write(
+        batches,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Stable),
+            enable_rle_v2: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let manifest = read_manifest(
+        dataset.object_store.as_ref(),
+        &dataset
+            .commit_handler
+            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .await
+            .unwrap()
+            .path,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        manifest.reader_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+    assert_ne!(
+        manifest.writer_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+
+    let append_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![9; 1000]))],
+    )
+    .unwrap();
+    let append_batches =
+        RecordBatchIterator::new(vec![Ok(append_batch)].into_iter(), schema.clone());
+    dataset = Dataset::write(
+        append_batches,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+
+    let actual = dataset.scan().try_into_batch().await.unwrap();
+    let expected = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(
+            [vec![7; 1000], vec![9; 1000]].concat(),
+        ))],
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_rle_v2_uncommitted_create_commits_feature_flag() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let transaction = InsertBuilder::new(test_uri.as_str())
+        .with_params(&WriteParams {
+            enable_rle_v2: true,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+
+    let dataset = CommitBuilder::new(test_uri.as_str())
+        .execute(transaction)
+        .await
+        .unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_rle_v2_shallow_clone_preserves_feature_flag() {
+    let test_uri = TempStrDir::default();
+    let clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        &test_uri,
+        Some(WriteParams {
+            enable_rle_v2: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let clone = dataset
+        .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+    assert_ne!(
+        clone.manifest.reader_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+    assert_ne!(
+        clone.manifest.writer_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_rle_v2_rejects_enabling_existing_unflagged_dataset() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1; 1000]))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & feature_flags::FLAG_RLE_V2,
+        0
+    );
+
+    let direct_append = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![2; 1000]))],
+    )
+    .unwrap();
+    let result = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(direct_append)].into_iter(), schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            enable_rle_v2: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("only be enabled when creating a new dataset")
+    );
+
+    let overwrite_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![3; 1000]))],
+    )
+    .unwrap();
+    let result = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(overwrite_batch)].into_iter(), schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Overwrite,
+            enable_rle_v2: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("only be enabled when creating a new dataset")
+    );
+
+    let append_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![2; 1000]))],
+    )
+    .unwrap();
+    let dataset = Arc::new(dataset);
+    let uncommitted_result = InsertBuilder::new(dataset.clone())
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            enable_rle_v2: true,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![append_batch])
+        .await;
+    assert!(matches!(
+        uncommitted_result,
+        Err(Error::InvalidInput { .. })
+    ));
+    assert!(
+        uncommitted_result
+            .unwrap_err()
+            .to_string()
+            .contains("only be enabled when creating a new dataset")
+    );
+}
+
+#[tokio::test]
+async fn test_rle_v2_rejects_legacy_storage() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1; 8]))]).unwrap();
+
+    let result = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            enable_rle_v2: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    assert!(result.unwrap_err().to_string().contains("RLE v2 requires"));
 }
 
 #[rstest]

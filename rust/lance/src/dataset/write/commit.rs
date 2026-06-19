@@ -38,6 +38,7 @@ use tracing::info;
 pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
     use_stable_row_ids: Option<bool>,
+    enable_rle_v2: bool,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -59,6 +60,7 @@ impl<'a> CommitBuilder<'a> {
         Self {
             dest: dest.into(),
             use_stable_row_ids: None,
+            enable_rle_v2: false,
             enable_v2_manifest_paths: true,
             storage_format: None,
             commit_handler: None,
@@ -82,6 +84,15 @@ impl<'a> CommitBuilder<'a> {
     /// **Default is false.**
     pub fn use_stable_row_ids(mut self, use_stable_row_ids: bool) -> Self {
         self.use_stable_row_ids = Some(use_stable_row_ids);
+        self
+    }
+
+    /// Require the committed dataset version to allow RLE v2 run length widths.
+    ///
+    /// This can only be used when creating a new dataset. Existing datasets that
+    /// already have the RLE v2 feature flag inherit it automatically.
+    pub fn enable_rle_v2(mut self, enable_rle_v2: bool) -> Self {
+        self.enable_rle_v2 = enable_rle_v2;
         self
     }
 
@@ -345,6 +356,27 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
+        let existing_uses_rle_v2 = dest
+            .dataset()
+            .map(|ds| ds.manifest.uses_rle_v2())
+            .unwrap_or(false);
+        let requires_rle_v2 = self.enable_rle_v2 || transaction.requires_rle_v2();
+        if requires_rle_v2
+            && let Some(ds) = dest.dataset()
+            && !ds.manifest.uses_rle_v2()
+        {
+            return Err(Error::invalid_input(
+                "RLE v2 can only be enabled when creating a new dataset",
+            ));
+        }
+        if requires_rle_v2
+            && self
+                .storage_format
+                .is_some_and(|version| version < LanceFileVersion::V2_1)
+        {
+            return Err(Error::invalid_input("RLE v2 requires file version >= 2.1"));
+        }
+        let use_rle_v2 = requires_rle_v2 || existing_uses_rle_v2;
 
         // Validate storage format matches existing dataset
         if let Some(ds) = dest.dataset()
@@ -365,6 +397,7 @@ impl<'a> CommitBuilder<'a> {
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
+            use_rle_v2,
             ..Default::default()
         };
 
@@ -490,6 +523,15 @@ impl<'a> CommitBuilder<'a> {
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
+        let transaction_properties = if transactions.iter().any(Transaction::requires_rle_v2) {
+            Some(Arc::new(HashMap::from([(
+                crate::dataset::transaction::TRANSACTION_PROPERTY_REQUIRES_RLE_V2.to_string(),
+                "true".to_string(),
+            )])))
+        } else {
+            None
+        };
+
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::Append {
@@ -503,8 +545,7 @@ impl<'a> CommitBuilder<'a> {
             },
             read_version,
             tag: None,
-            //TODO: handle batch transaction merges in the future
-            transaction_properties: None,
+            transaction_properties,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -525,6 +566,7 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
+    use lance_core::datatypes::Schema;
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
     use lance_table::format::{DataFile, Fragment};
@@ -534,6 +576,7 @@ mod tests {
 
     use crate::utils::test::ThrottledStoreWrapper;
 
+    use crate::dataset::transaction::TRANSACTION_PROPERTY_REQUIRES_RLE_V2;
     use crate::dataset::{InsertBuilder, WriteParams};
 
     use super::*;
@@ -569,6 +612,58 @@ mod tests {
             tag: None,
             transaction_properties: None,
         }
+    }
+
+    fn sample_legacy_fragment() -> Fragment {
+        let (major_version, minor_version) = LanceFileVersion::Legacy.to_numbers();
+        Fragment {
+            id: 0,
+            files: vec![DataFile {
+                path: "file.lance".to_string(),
+                fields: Arc::from([0]),
+                column_indices: Arc::from([]),
+                file_major_version: major_version,
+                file_minor_version: minor_version,
+                file_size_bytes: CachedFileSize::new(100),
+                base_id: None,
+            }],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(10),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rle_v2_rejects_inferred_legacy_storage() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let transaction = Transaction {
+            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            operation: Operation::Overwrite {
+                schema,
+                fragments: vec![sample_legacy_fragment()],
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            read_version: 0,
+            tag: None,
+            transaction_properties: Some(Arc::new(HashMap::from([(
+                TRANSACTION_PROPERTY_REQUIRES_RLE_V2.to_string(),
+                "true".to_string(),
+            )]))),
+        };
+
+        let result = CommitBuilder::new("memory://rle-v2-legacy")
+            .execute(transaction)
+            .await;
+        assert!(matches!(result, Err(Error::InvalidInput { .. })));
+        assert!(result.unwrap_err().to_string().contains("RLE v2 requires"));
     }
 
     #[tokio::test]

@@ -3436,6 +3436,7 @@ pub(crate) struct ManifestWriteConfig {
     use_legacy_format: Option<bool>,           // default None
     storage_format: Option<DataStorageFormat>, // default None
     disable_transaction_file: bool,            // default false
+    use_rle_v2: bool,                          // default false
 }
 
 impl Default for ManifestWriteConfig {
@@ -3447,6 +3448,7 @@ impl Default for ManifestWriteConfig {
             disable_transaction_file: false,
             use_legacy_format: None,
             storage_format: None,
+            use_rle_v2: false,
         }
     }
 }
@@ -3474,10 +3476,12 @@ pub(crate) async fn write_manifest_file(
         // Preserve it here so this second apply_feature_flags call does not clear it
         // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
         let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
+        let use_rle_v2 = config.use_rle_v2 || manifest.uses_rle_v2();
         apply_feature_flags(
             manifest,
             use_stable_row_ids,
             config.disable_transaction_file,
+            use_rle_v2,
         )?;
     }
 

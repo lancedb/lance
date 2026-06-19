@@ -16,7 +16,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{FLAG_RLE_V2, FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -492,6 +492,11 @@ impl Manifest {
     /// Whether the dataset uses stable row ids.
     pub fn uses_stable_row_ids(&self) -> bool {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+    }
+
+    /// Whether the dataset may contain RLE v2 pages.
+    pub fn uses_rle_v2(&self) -> bool {
+        self.reader_feature_flags & FLAG_RLE_V2 != 0
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage

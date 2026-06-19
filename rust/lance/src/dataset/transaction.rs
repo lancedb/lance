@@ -53,6 +53,8 @@ use uuid::Uuid;
 /// Version 1 is the initial dataset version in the Lance format.
 const UNKNOWN_CREATED_AT_VERSION: u64 = 1;
 
+pub(crate) const TRANSACTION_PROPERTY_REQUIRES_RLE_V2: &str = "lance.requires_rle_v2";
+
 /// Look up the `created_at` version for a single UPDATE-branch row ID.
 ///
 /// Callers must only call this for row IDs that are confirmed to be present in
@@ -1696,6 +1698,13 @@ impl Transaction {
             .build()
     }
 
+    pub(crate) fn requires_rle_v2(&self) -> bool {
+        self.transaction_properties
+            .as_ref()
+            .and_then(|props| props.get(TRANSACTION_PROPERTY_REQUIRES_RLE_V2))
+            .is_some_and(|value| value == "true")
+    }
+
     fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
@@ -2364,10 +2373,20 @@ impl Transaction {
                 .map(|m| m.uses_stable_row_ids())
                 .unwrap_or(false);
             let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            let inherited_rle_v2 = current_manifest.map(|m| m.uses_rle_v2()).unwrap_or(false);
+            let use_rle_v2 = config.use_rle_v2 || inherited_rle_v2;
+            let storage_version = manifest.data_storage_format.lance_file_version()?;
+            if use_rle_v2 && storage_version < LanceFileVersion::V2_1 {
+                return Err(Error::invalid_input(format!(
+                    "RLE v2 requires file version >= 2.1 (got {:?})",
+                    storage_version
+                )));
+            }
             apply_feature_flags(
                 &mut manifest,
                 use_stable_row_ids,
                 config.disable_transaction_file,
+                use_rle_v2,
             )?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
