@@ -1001,7 +1001,23 @@ impl FileFragment {
         .await
     }
 
-    async fn open_reader_with_metadata_requirement(
+    fn open_reader_with_metadata_requirement<'a>(
+        &'a self,
+        data_file: &'a DataFile,
+        projection: Option<&'a Schema>,
+        read_config: &'a FragReadConfig,
+        metadata_requirement: MetadataRequirement,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn GenericFileReader>>>> {
+        self.open_reader_with_metadata_requirement_impl(
+            data_file,
+            projection,
+            read_config,
+            metadata_requirement,
+        )
+        .boxed()
+    }
+
+    async fn open_reader_with_metadata_requirement_impl(
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
