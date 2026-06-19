@@ -5096,6 +5096,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "hdrs",
  "lance-arrow",
  "lance-core",
  "lance-datagen",

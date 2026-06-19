@@ -47,6 +47,8 @@ use url::Url;
 
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
+#[cfg(feature = "hdfs")]
+mod hdfs_rename;
 pub mod external_manifest;
 
 use lance_core::{Error, Result};
@@ -762,7 +764,7 @@ pub fn list_detached_manifests<'a>(
         .boxed()
 }
 
-fn make_staging_manifest_path(base: &Path) -> Result<Path> {
+pub(super) fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
     Path::parse(format!("{base}-{id}")).map_err(|e| Error::io_source(Box::new(e)))
 }
@@ -1093,6 +1095,12 @@ pub async fn commit_handler_from_url(
         "file" | "file-object-store" => Ok(local_handler),
         "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "shared-memory" => {
             Ok(Arc::new(ConditionalPutCommitHandler))
+        }
+        #[cfg(feature = "hdfs")]
+        "hdfs" => {
+            let params = options.clone().unwrap_or_default();
+            let client = hdfs_rename::connect_hdrs_client(&url, &params).await?;
+            Ok(Arc::new(hdfs_rename::HdfsRenameCommitHandler::new(client)))
         }
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
