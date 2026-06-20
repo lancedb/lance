@@ -236,12 +236,6 @@ impl From<JniError> for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Self::io_error(err.to_string())
-    }
-}
-
 impl From<Utf8Error> for Error {
     fn from(err: Utf8Error) -> Self {
         Self::input_error(err.to_string())

@@ -460,14 +460,18 @@ fn convert_to_java_operation_inner<'local>(
             // Serialize updated_fragment_offsets to Java Map<Long, byte[]>.
             // Values are portable RoaringBitmap bytes so the JNI boundary stays O(bitmap size)
             // rather than O(n rows). Empty HashMap when None so the Java constructor always
-            // receives a non-null map. A per-iteration local frame (capacity 4: Long + byte[] +
-            // put return + slack) bounds local-ref growth for large offset maps.
+            // receives a non-null map.
             let java_offsets_map = {
                 let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
                 if let Some(UpdatedFragmentOffsets(ref map)) = updated_fragment_offsets {
                     for (frag_id, bitmap) in map {
                         let mut buf: Vec<u8> = Vec::new();
-                        bitmap.serialize_into(&mut buf)?;
+                        bitmap.serialize_into(&mut buf).map_err(|e| {
+                            Error::runtime_error(format!(
+                                "failed to serialize updatedFragmentOffsets for fragment \
+                                 {frag_id}: {e}"
+                            ))
+                        })?;
                         // JNI byte arrays are signed i8; reinterpret without copying.
                         let buf_i8: &[i8] = unsafe {
                             std::slice::from_raw_parts(buf.as_ptr() as *const i8, buf.len())
@@ -1283,16 +1287,36 @@ fn convert_to_rust_operation(
                     let jmap = JMap::from_env(env, &offsets_obj)?;
                     let mut iter = jmap.iter(env)?;
                     let mut offsets: HashMap<u64, RoaringBitmap> = HashMap::new();
-                    env.with_local_frame(32, |env| {
-                        while let Some((key, value)) = iter.next(env)? {
-                            let frag_id =
-                                env.call_method(&key, "longValue", "()J", &[])?.j()? as u64;
-                            let buf: Vec<u8> = env.convert_byte_array(JByteArray::from(value))?;
-                            let bitmap = RoaringBitmap::deserialize_from(buf.as_slice())?;
-                            offsets.insert(frag_id, bitmap);
+                    // Per-iteration local frame: iterator key/value JNI refs are released each
+                    // loop so large multi-fragment maps cannot exhaust the local reference table.
+                    loop {
+                        let entry = env.with_local_frame(
+                            8,
+                            |env| -> Result<Option<(u64, RoaringBitmap)>> {
+                                let Some((key, value)) = iter.next(env)? else {
+                                    return Ok(None);
+                                };
+                                let frag_id =
+                                    env.call_method(&key, "longValue", "()J", &[])?.j()? as u64;
+                                let buf: Vec<u8> =
+                                    env.convert_byte_array(JByteArray::from(value))?;
+                                let bitmap = RoaringBitmap::deserialize_from(buf.as_slice())
+                                    .map_err(|e| {
+                                        Error::input_error(format!(
+                                            "invalid updatedFragmentOffsets RoaringBitmap bytes \
+                                         for fragment {frag_id}: {e}"
+                                        ))
+                                    })?;
+                                Ok(Some((frag_id, bitmap)))
+                            },
+                        )?;
+                        match entry {
+                            None => break,
+                            Some((frag_id, bitmap)) => {
+                                offsets.insert(frag_id, bitmap);
+                            }
                         }
-                        Ok::<(), Error>(())
-                    })?;
+                    }
                     if offsets.is_empty() {
                         None
                     } else {
