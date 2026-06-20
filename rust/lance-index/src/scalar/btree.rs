@@ -1802,9 +1802,7 @@ impl BTreeIndex {
         // We add them as Matches::Some (not Matches::All) so that
         // FlatIndex::search() evaluates the predicate and correctly marks
         // the rows as NULL rather than TRUE.
-        //
-        // When a `limit` is set the query is a single positive lookup, so null tracking
-        // is not needed and skipping null pages helps us stop early.
+        // A `limit` implies a single positive lookup, so skip null tracking to stop early.
         if limit.is_none() && !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
             for &page_id in self
@@ -1830,10 +1828,7 @@ impl BTreeIndex {
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
 
-        // Collect row IDs from the pages. `buffered` keeps page order. When a `limit` is
-        // set we read one page at a time and stop once we have enough matches, so we do
-        // not issue I/O for pages we never need. Without a limit we fan out across CPUs
-        // (I/O and compute are mixed, but the important case is the index being cached).
+        // With a `limit`, read one page at a time and stop once we have enough; otherwise fan out across CPUs.
         let parallelism = if limit.is_some() {
             1
         } else {
@@ -1845,8 +1840,7 @@ impl BTreeIndex {
         let mut matches_found: u64 = 0;
         while let Some(page_result) = page_stream.try_next().await? {
             if let Some(limit) = limit {
-                // Count only TRUE matches. NULL rows never match, so they must not count
-                // toward the limit. `len()` already excludes nulls.
+                // Count only TRUE matches toward the limit; `len()` already excludes nulls.
                 matches_found += page_result.len().unwrap_or(0);
                 results.push(page_result);
                 if matches_found >= limit as u64 {
@@ -5025,9 +5019,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Enough rows to span several btree pages, with no nulls so every row matches an
-        // unbounded range. `train_btree_index` makes pages of `DEFAULT_BTREE_BATCH_SIZE`
-        // rows, so this gives five pages.
+        // Five btree pages of `DEFAULT_BTREE_BATCH_SIZE` rows, with no nulls so every row matches.
         let num_rows = 5 * DEFAULT_BTREE_BATCH_SIZE;
         let values: Int32Array = (0..num_rows).map(|i| Some(i as i32)).collect();
         let row_ids = UInt64Array::from_iter_values(0..num_rows);
@@ -5063,8 +5055,7 @@ mod tests {
         let full_len = full.row_addrs().len().unwrap();
         assert_eq!(full_len, num_rows);
 
-        // A limit that reaches into the second page. The search must satisfy it but stop
-        // well before reading all five pages.
+        // A limit reaching into the second page: satisfied but stops before reading all five.
         let limit = (DEFAULT_BTREE_BATCH_SIZE + 100) as usize;
         let limited = index
             .search_limited(&everything, &metrics, Some(limit))

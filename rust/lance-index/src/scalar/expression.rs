@@ -1327,8 +1327,7 @@ impl ScalarIndexExpr {
         limit: Option<usize>,
     ) -> Result<NullableIndexExprResult> {
         match self {
-            // A limit only applies to a single positive lookup. NOT, AND, and OR need the
-            // full result of each side, so the limit is dropped when recursing into them.
+            // A limit applies only to a single positive lookup, so drop it for NOT/AND/OR.
             Self::Not(inner) => {
                 let result = inner.evaluate_nullable(index_loader, metrics, None).await?;
                 Ok(!result)

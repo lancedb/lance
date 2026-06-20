@@ -4084,6 +4084,11 @@ impl Scanner {
     /// rows. The first N matches are as good as any N matches only when all of these hold.
     ///
     /// - There is a positive row limit.
+    /// - The scan is unordered (`scan_in_order(false)`). In the default ordered mode the
+    ///   scan returns the first matches in storage (row address) order, but a B-tree
+    ///   stops after collecting matches in index-value page order. Those are different
+    ///   subsets whenever storage order and index order disagree, so pushing the limit
+    ///   would silently change which rows `LIMIT`/`OFFSET` returns.
     /// - The rows are not reordered before the limit (no `ORDER BY`, vector or FTS search).
     /// - There is no aggregate (the limit applies after aggregation).
     /// - The index result is used as is, with no refine filter and no recheck. Either of
@@ -4101,7 +4106,9 @@ impl Scanner {
         if limit <= 0 {
             return None;
         }
-        if self.ordering.is_some()
+        // Ordered scans return storage-order matches, while a B-tree stops in index-value order.
+        if self.ordered
+            || self.ordering.is_some()
             || self.nearest.is_some()
             || self.full_text_query.is_some()
             || self.aggregate.is_some()
@@ -4150,8 +4157,7 @@ impl Scanner {
             .partition_frags_by_coverage(index_expr, fragments)
             .await?;
 
-        // A limit can be pushed into the index search, but only when its rows are used as
-        // is and the relevant fragments have no deletions.
+        // A limit can be pushed into the index search only when safe; see index_search_limit.
         let pushdown_limit = self.index_search_limit(filter_plan, &relevant_frags);
 
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(
@@ -5882,20 +5888,17 @@ mod test {
 
     #[tokio::test]
     async fn test_limit_pushed_into_scalar_index() {
-        // When a scan filter is fully served by a scalar index (no refine, no recheck, no
-        // ordering) the limit can be pushed into the index search. The result must still
-        // be exactly `limit` rows that all match the filter. Early stop must not drop or
-        // duplicate matches.
+        // A scalar-index limit can be pushed only for an unordered scan, since the B-tree stops in index-value order while an ordered scan returns storage-order matches.
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             DataType::Int32,
             false,
         )]));
-        // Span several btree pages so a small limit short-circuits before the end.
-        let num_rows = 20_000;
+        // Span several btree pages, with ids in descending order so storage order is the reverse of index-value order.
+        let num_rows = 20_000i32;
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+            vec![Arc::new(Int32Array::from_iter_values((0..num_rows).rev()))],
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -5911,17 +5914,15 @@ mod test {
             .await
             .unwrap();
 
-        let limit = 100;
-        let scan_ids = |dataset: Arc<Dataset>| async move {
-            let batch = dataset
-                .scan()
-                .filter("id >= 5")
+        let limit = 100i64;
+        let scan_ids = |dataset: Arc<Dataset>, ordered: bool| async move {
+            let mut scan = dataset.scan();
+            scan.filter("id >= 5")
                 .unwrap()
+                .scan_in_order(ordered)
                 .limit(Some(limit), None)
-                .unwrap()
-                .try_into_batch()
-                .await
                 .unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
             batch
                 .column_by_name("id")
                 .unwrap()
@@ -5930,18 +5931,26 @@ mod test {
                 .to_vec()
         };
 
-        let ids = scan_ids(Arc::new(dataset.clone())).await;
+        // Ordered scan (the default): limit not pushed, so the first matches are the largest ids (descending storage).
+        let ids = scan_ids(Arc::new(dataset.clone()), true).await;
+        assert_eq!(ids.len(), limit as usize);
+        assert!(
+            ids.iter().all(|&id| id >= num_rows - limit as i32),
+            "ordered scan must return the storage-order subset, got {:?}",
+            &ids[..ids.len().min(5)]
+        );
+
+        // Unordered scan: limit pushed into the index, but still exactly `limit` matching rows.
+        let ids = scan_ids(Arc::new(dataset.clone()), false).await;
         assert_eq!(ids.len(), limit as usize);
         assert!(
             ids.iter().all(|&id| id >= 5),
             "every returned row must satisfy the filter"
         );
 
-        // With deletions present the limit must not be pushed, since deleted rows are
-        // pruned after the index search. The scan must still return exactly `limit` live
-        // matches.
+        // With deletions the limit must not be pushed even when unordered, since deleted rows are pruned after the index search.
         dataset.delete("id >= 5 AND id < 10000").await.unwrap();
-        let ids = scan_ids(Arc::new(dataset)).await;
+        let ids = scan_ids(Arc::new(dataset), false).await;
         assert_eq!(ids.len(), limit as usize);
         assert!(
             ids.iter().all(|&id| id >= 10000),

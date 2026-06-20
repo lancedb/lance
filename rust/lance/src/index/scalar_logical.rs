@@ -138,9 +138,7 @@ impl ScalarIndex for LogicalScalarIndex {
         metrics: &dyn MetricsCollector,
         limit: Option<usize>,
     ) -> Result<SearchResult> {
-        // Forwarding the limit to every segment is safe. Each segment returns at least
-        // `limit` matches when it has them, so the combined result still has at least
-        // `limit` matches overall.
+        // Forwarding the limit to every segment is safe: the combined result still has at least `limit` matches.
         let results = try_join_all(
             self.segments
                 .iter()
