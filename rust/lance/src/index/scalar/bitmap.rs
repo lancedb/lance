@@ -53,7 +53,7 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid.to_string())?;
+    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = lance_index::scalar::bitmap::merge_bitmap_indices(
         &source_indices,
         &new_store,
@@ -70,7 +70,7 @@ pub(in crate::index) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: created_index.files,
+        files: Some(created_index.files),
         ..segments[0].clone()
     })
 }

@@ -94,8 +94,8 @@ impl std::fmt::Debug for LazyDocSet {
     }
 }
 
-impl deepsize::DeepSizeOf for LazyDocSet {
-    fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
+impl lance_core::deepsize::DeepSizeOf for LazyDocSet {
+    fn deep_size_of_children(&self, ctx: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Loaded(l) => l.docs.deep_size_of_children(ctx),
             Self::Deferred(d) => {

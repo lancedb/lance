@@ -19,13 +19,14 @@ use lance_core::Result;
 pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
 
 const DEFAULT_MAX_MINIBLOCK_VALUES: u64 = 4096;
+const MAX_CONFIGURABLE_MINIBLOCK_VALUES: u64 = 32768;
 
 fn parse_max_miniblock_values() -> u64 {
     let val = std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES);
-    val.clamp(1, DEFAULT_MAX_MINIBLOCK_VALUES)
+    val.clamp(1, MAX_CONFIGURABLE_MINIBLOCK_VALUES)
 }
 
 pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> =
@@ -58,9 +59,9 @@ pub struct MiniBlockCompressed {
 /// and contain a power-of-two number of values (except for the last chunk)
 ///
 /// By default we limit a chunk to 4Ki values and slightly less than
-/// 8KiB of compressed data.  This means that even in the extreme case
-/// where we have 4 bytes of rep/def then we will have at most 24KiB of
-/// data (values, repetition, and definition) per mini-block.
+/// 8KiB of compressed value data.  The byte budget remains the primary
+/// constraint, so only encodings that compress many values into that
+/// budget can use larger value counts when explicitly configured.
 ///
 /// The maximum number of values per chunk can be configured via the
 /// `LANCE_MINIBLOCK_MAX_VALUES` environment variable.  This is only
@@ -77,8 +78,8 @@ pub struct MiniBlockChunk {
     // then this should be 0 (the number of values will be calculated by subtracting the
     // size of all other chunks from the total size of the page)
     //
-    // For example, 1 would mean there are 2 values in the chunk and 12 would mean there
-    // are 4Ki values in the chunk.
+    // For example, 1 would mean there are 2 values in the chunk and 15 would mean there
+    // are 32Ki values in the chunk.
     //
     // This must be <= log2(MAX_MINIBLOCK_VALUES) (i.e. <= 12 at the default of 4096)
     pub log_num_values: u8,
@@ -137,6 +138,14 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_parse_can_raise_to_32k() {
+        unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "32768") };
+        assert_eq!(parse_max_miniblock_values(), 32768);
+        unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
+    }
+
+    #[test]
+    #[serial]
     fn test_parse_clamps_zero_to_one() {
         unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "0") };
         assert_eq!(parse_max_miniblock_values(), 1);
@@ -147,7 +156,10 @@ mod tests {
     #[serial]
     fn test_parse_clamps_above_max() {
         unsafe { std::env::set_var("LANCE_MINIBLOCK_MAX_VALUES", "99999") };
-        assert_eq!(parse_max_miniblock_values(), DEFAULT_MAX_MINIBLOCK_VALUES);
+        assert_eq!(
+            parse_max_miniblock_values(),
+            MAX_CONFIGURABLE_MINIBLOCK_VALUES
+        );
         unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
     }
 

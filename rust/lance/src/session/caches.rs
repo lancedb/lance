@@ -12,7 +12,7 @@
 
 use std::{borrow::Cow, ops::Deref};
 
-use deepsize::{Context, DeepSizeOf};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
     cache::{CacheKey, LanceCache},
     utils::deletion::DeletionVector,

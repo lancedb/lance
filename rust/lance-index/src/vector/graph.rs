@@ -9,7 +9,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 
 use crate::vector::hnsw::builder::HnswQueryParams;
 

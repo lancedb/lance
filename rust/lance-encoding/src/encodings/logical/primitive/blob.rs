@@ -205,9 +205,9 @@ struct BlobCacheableState {
 }
 
 impl DeepSizeOf for BlobCacheableState {
-    fn deep_size_of_children(&self, context: &mut lance_core::cache::Context) -> usize {
-        self.positions.get_array_memory_size()
-            + self.sizes.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        (self.positions.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
+            + (self.sizes.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
             + self.inner_state.deep_size_of_children(context)
     }
 }

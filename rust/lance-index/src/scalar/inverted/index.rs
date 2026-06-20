@@ -35,13 +35,14 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::{DataFusionResult, LanceOptionExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
@@ -251,7 +252,7 @@ impl FromStr for TokenSetFormat {
 }
 
 impl DeepSizeOf for TokenSetFormat {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         0
     }
 }
@@ -371,7 +372,7 @@ impl Debug for InvertedIndex {
 }
 
 impl DeepSizeOf for InvertedIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.partitions.deep_size_of_children(context)
     }
 }
@@ -538,7 +539,7 @@ impl InvertedIndex {
             .with_token_set_format(first.token_set_format)
             .with_format_version(first.format_version())
             .with_posting_tail_codec(first.posting_tail_codec());
-        builder
+        let files = builder
             .update_from_segments(new_data, dest_store, segments, old_data_filter)
             .await?;
 
@@ -547,7 +548,7 @@ impl InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: first.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -1023,6 +1024,52 @@ impl Index for InvertedIndex {
     }
 }
 
+/// Target on-disk size of one prewarm chunk; a partition is streamed in chunks of
+/// ~this size so its peak resident set is one chunk, not the whole `invert.lance`.
+const PREWARM_CHUNK_TARGET_BYTES: u64 = 32 << 20;
+
+/// Cap on token rows per chunk, bounding the built `Vec` when posting lists are tiny.
+const PREWARM_MAX_CHUNK_TOKENS: usize = 4096;
+
+/// Floor on token rows per chunk, so a partition always makes progress.
+const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
+
+/// Token rows per chunk: byte target / average bytes-per-token, clamped to `[MIN, MAX]`.
+fn prewarm_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
+    if token_count == 0 {
+        return PREWARM_MIN_CHUNK_TOKENS;
+    }
+    let bytes_per_token = (file_size_bytes / token_count as u64).max(1); // >= 1: no div-by-zero
+    let by_bytes = (PREWARM_CHUNK_TARGET_BYTES / bytes_per_token) as usize;
+    by_bytes.clamp(PREWARM_MIN_CHUNK_TOKENS, PREWARM_MAX_CHUNK_TOKENS)
+}
+
+/// Snap a chunk's exclusive token end back to a posting-group boundary so no group
+/// straddles chunks. Returns the largest group boundary in `(tok_start, desired_end]`,
+/// or the next boundary past an oversized group so it runs as one solo chunk.
+fn group_aligned_chunk_end(
+    starts: &[u32],
+    token_count: usize,
+    tok_start: usize,
+    desired_end: usize,
+) -> usize {
+    let fit = starts
+        .iter()
+        .map(|&s| s as usize)
+        .chain(std::iter::once(token_count))
+        .filter(|&b| b > tok_start && b <= desired_end)
+        .max();
+    if let Some(end) = fit {
+        return end;
+    }
+    // Oversized group: extend to its end so it runs as one chunk.
+    starts
+        .iter()
+        .map(|&s| s as usize)
+        .find(|&b| b > tok_start)
+        .unwrap_or(token_count)
+}
+
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         let with_position = options.with_position;
@@ -1107,7 +1154,8 @@ impl ScalarIndex for InvertedIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        self.to_builder()
+        let files = self
+            .to_builder()
             .remap(mapping, self.store.clone(), dest_store)
             .await?;
 
@@ -1116,7 +1164,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: self.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -1126,7 +1174,8 @@ impl ScalarIndex for InvertedIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        self.to_builder()
+        let files = self
+            .to_builder()
             .update(new_data, dest_store, old_data_filter)
             .await?;
 
@@ -1135,7 +1184,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: self.index_version(),
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -1414,7 +1463,7 @@ impl Default for TokenMap {
 }
 
 impl DeepSizeOf for TokenMap {
-    fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, ctx: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::HashMap(map) => map.deep_size_of_children(ctx),
             Self::Fst(map) => map.as_fst().size(),
@@ -1618,15 +1667,13 @@ impl TokenSet {
         let map = fst::Map::new(bytes.to_vec())
             .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
 
-        let next_id_col = batch[TOKEN_NEXT_ID_COL].as_primitive::<datatypes::UInt32Type>();
         let total_length_col =
             batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
 
-        let next_id = next_id_col
-            .values()
-            .first()
-            .copied()
-            .ok_or(Error::index("token next id column is empty".to_owned()))?;
+        // Token ids are dense `[0, len)`, so `next_id` must equal the token count. Recompute
+        // it instead of trusting the persisted value, which writers before #7115 could leave
+        // stale. Mirrors `load_arrow`.
+        let next_id = map.len() as u32;
 
         let total_length = total_length_col
             .values()
@@ -1853,7 +1900,7 @@ impl std::fmt::Debug for PostingListReader {
 }
 
 impl DeepSizeOf for PostingListReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let metadata_size = match &self.metadata {
             PostingMetadata::LegacyV1 {
                 offsets,
@@ -2284,50 +2331,84 @@ impl PostingListReader {
         )
     }
 
-    fn build_prewarm_posting_lists(
-        batch: RecordBatch,
-        offsets: Option<Vec<usize>>,
-        max_scores: Option<Vec<f32>>,
-        lengths: Option<Vec<u32>>,
-        posting_tail_codec: PostingTailCodec,
-        positions_layout: PositionsLayout,
+    /// Build posting lists for one chunk's token range from `chunk_batch`, rebasing
+    /// global offsets to chunk-local rows. Returns `(global token_id, PostingList)`
+    /// pairs identical to the whole-file path, only bounded to one chunk.
+    fn build_prewarm_posting_lists_chunk(
+        chunk_batch: RecordBatch,
+        chunk: PrewarmChunk<'_>,
+        ctx: &PrewarmBuildCtx<'_>,
     ) -> Result<Vec<(u32, PostingList)>> {
-        let token_count = if let Some(offsets) = offsets.as_ref() {
-            offsets.len()
-        } else if let Some(lengths) = lengths.as_ref() {
-            lengths.len()
-        } else {
-            batch.num_rows()
-        };
-
-        let mut posting_lists = Vec::with_capacity(token_count);
-        for token_id in 0..token_count {
-            let batch = if let Some(offsets) = offsets.as_ref() {
-                let start = offsets[token_id];
-                let end = if token_id + 1 < offsets.len() {
-                    offsets[token_id + 1]
+        let mut posting_lists = Vec::with_capacity(chunk.token_count);
+        for local in 0..chunk.token_count {
+            let global = chunk.tok_start + local;
+            let row_batch = if let Some(chunk_offsets) = chunk.offsets {
+                // Legacy v1: rebase global offsets to chunk row 0; the last token
+                // ends at `chunk.end_row` (no trailing sentinel in chunk_offsets).
+                let base = chunk_offsets[0];
+                let start = chunk_offsets[local] - base;
+                let end = if local + 1 < chunk_offsets.len() {
+                    chunk_offsets[local + 1] - base
                 } else {
-                    batch.num_rows()
+                    chunk.end_row - base
                 };
-                batch.slice(start, end - start)
+                chunk_batch.slice(start, end - start)
             } else {
-                batch.slice(token_id, 1)
+                // V2: one posting row per token; row `local` within the chunk.
+                chunk_batch.slice(local, 1)
             };
-            let batch = batch.shrink_to_fit()?;
+            let row_batch = row_batch.shrink_to_fit()?;
             let posting_list = Self::posting_list_from_batch_parts(
-                &batch,
-                max_scores.as_ref().map(|scores| scores[token_id]),
-                lengths.as_ref().map(|lengths| lengths[token_id]),
-                posting_tail_codec,
-                positions_layout,
+                &row_batch,
+                ctx.max_scores.map(|scores| scores[global]),
+                ctx.lengths.map(|lengths| lengths[global]),
+                ctx.posting_tail_codec,
+                ctx.positions_layout,
             )?;
-            posting_lists.push((token_id as u32, posting_list));
+            posting_lists.push((global as u32, posting_list));
         }
 
         Ok(posting_lists)
     }
 
+    /// Read the posting rows for token ids `[tok_start, tok_end)` into one RecordBatch.
+    /// For v2 the token range is the row range; for v1 it's derived from the offsets.
+    async fn read_chunk_batch(
+        &self,
+        tok_start: usize,
+        tok_end: usize,
+        with_position: bool,
+    ) -> Result<RecordBatch> {
+        let columns = self.posting_columns(with_position);
+        let row_range = match &self.metadata {
+            PostingMetadata::LegacyV1 { offsets, .. } => {
+                let start = offsets[tok_start];
+                let end = offsets
+                    .get(tok_end)
+                    .copied()
+                    .unwrap_or_else(|| self.reader.num_rows());
+                start..end
+            }
+            PostingMetadata::V2 { .. } => tok_start..tok_end,
+        };
+        let batch = self.reader.read_range(row_range, Some(&columns)).await?;
+        Ok(batch)
+    }
+
     async fn prewarm_posting_lists(&self, with_position: bool) -> Result<()> {
+        self.prewarm_posting_lists_chunked(with_position, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Stream the partition's posting lists into the cache in bounded token-row chunks
+    /// (read -> build -> insert -> drop), so peak resident set is ~one chunk. Returns
+    /// the chunk count (tests assert it split). `chunk_tokens_override` is test-only.
+    async fn prewarm_posting_lists_chunked(
+        &self,
+        with_position: bool,
+        chunk_tokens_override: Option<usize>,
+    ) -> Result<usize> {
         if with_position && !self.has_positions() {
             return Err(Error::invalid_input(
                 "cannot prewarm positions for an inverted index that was built without positions; recreate the index with with_position=true".to_owned(),
@@ -2339,34 +2420,124 @@ impl PostingListReader {
         // OnceCells.
         self.ensure_metadata_loaded().await?;
 
-        let read_batch_start = Instant::now();
-        let batch = self.read_batch(with_position).await?;
-        let read_batch_elapsed = read_batch_start.elapsed();
+        let state = self.chunk_build_state();
+        // With grouping the cache stores one entry per group, so a group's posting
+        // lists must all be resident at once: align chunk boundaries to whole
+        // groups. Without grouping, chunks are plain token ranges.
+        let group_starts = self.group_starts.clone();
+        let token_count = self.len();
+        let chunk_tokens = chunk_tokens_override
+            .unwrap_or_else(|| prewarm_chunk_tokens(token_count, self.posting_data_size_bytes()))
+            .max(1);
 
-        let (legacy_layout, offsets, max_scores, lengths) = match &self.metadata {
+        let mut chunk_count = 0usize;
+        let read_build_start = Instant::now();
+        let mut tok_start = 0usize;
+        while tok_start < token_count {
+            let mut tok_end = (tok_start + chunk_tokens).min(token_count);
+            // `tok_start` is always a group boundary; snap `tok_end` back to one too.
+            if let Some(starts) = group_starts.as_ref() {
+                tok_end = group_aligned_chunk_end(starts, token_count, tok_start, tok_end);
+            }
+            chunk_count += 1;
+
+            let posting_lists = self
+                .build_chunk_postings(tok_start, tok_end, with_position, &state)
+                .await?;
+            self.publish_chunk_postings(
+                posting_lists,
+                group_starts.as_deref(),
+                tok_start,
+                tok_end,
+                token_count,
+                with_position,
+            )
+            .await;
+
+            tok_start = tok_end;
+        }
+        let read_build_elapsed = read_build_start.elapsed();
+
+        info!(
+            legacy_layout = self.is_legacy_layout(),
+            with_position,
+            token_count,
+            chunk_count,
+            chunk_tokens,
+            read_build_ms = read_build_elapsed.as_secs_f64() * 1000.0,
+            "posting list prewarm timing"
+        );
+
+        Ok(chunk_count)
+    }
+
+    /// Loop-invariant inputs shared by every chunk build: the metadata vecs
+    /// (`Arc`d so chunks share them without re-cloning) plus codec/layout.
+    fn chunk_build_state(&self) -> ChunkBuildState {
+        let (offsets, max_scores, lengths) = match &self.metadata {
             PostingMetadata::LegacyV1 {
                 offsets,
                 max_scores,
-            } => (true, Some(offsets.clone()), max_scores.clone(), None),
+            } => (Some(offsets.clone()), max_scores.clone(), None),
             PostingMetadata::V2 { metadata } => (
-                false,
                 None,
                 metadata.get().map(|loaded| loaded.max_scores.clone()),
                 metadata.get().map(|loaded| loaded.lengths.clone()),
             ),
         };
-        let posting_tail_codec = self.posting_tail_codec;
-        let positions_layout = self.positions_layout;
-        let populate_start = Instant::now();
+        ChunkBuildState {
+            offsets: offsets.map(Arc::new),
+            max_scores: max_scores.map(Arc::new),
+            lengths: lengths.map(Arc::new),
+            posting_tail_codec: self.posting_tail_codec,
+            positions_layout: self.positions_layout,
+        }
+    }
+
+    /// Read one token-row chunk and build its posting lists off the runtime thread.
+    /// The large batch is dropped inside the blocking task once built, bounding
+    /// resident memory to one chunk.
+    async fn build_chunk_postings(
+        &self,
+        tok_start: usize,
+        tok_end: usize,
+        with_position: bool,
+        state: &ChunkBuildState,
+    ) -> Result<Vec<(u32, PostingList)>> {
+        let chunk_token_count = tok_end - tok_start;
+        let chunk_batch = self
+            .read_chunk_batch(tok_start, tok_end, with_position)
+            .await?;
+
+        let (chunk_offsets, chunk_end_row) = match state.offsets.as_ref() {
+            Some(offsets) => {
+                let end_row = offsets
+                    .get(tok_end)
+                    .copied()
+                    .unwrap_or_else(|| self.reader.num_rows());
+                (Some(offsets[tok_start..tok_end].to_vec()), end_row)
+            }
+            // V2 doesn't use chunk_end_row (one row per token); pass tok_end.
+            None => (None, tok_end),
+        };
+        let max_scores = state.max_scores.clone();
+        let lengths = state.lengths.clone();
+        let posting_tail_codec = state.posting_tail_codec;
+        let positions_layout = state.positions_layout;
         let posting_lists = spawn_blocking(move || {
-            Self::build_prewarm_posting_lists(
-                batch,
-                offsets,
-                max_scores,
-                lengths,
+            let ctx = PrewarmBuildCtx {
+                max_scores: max_scores.as_deref().map(|v| v.as_slice()),
+                lengths: lengths.as_deref().map(|v| v.as_slice()),
                 posting_tail_codec,
                 positions_layout,
-            )
+            };
+            let chunk = PrewarmChunk {
+                tok_start,
+                token_count: chunk_token_count,
+                offsets: chunk_offsets.as_deref(),
+                end_row: chunk_end_row,
+            };
+            Self::build_prewarm_posting_lists_chunk(chunk_batch, chunk, &ctx)
         })
         .await
         .map_err(|err| {
@@ -2374,60 +2545,95 @@ impl PostingListReader {
                 "Failed to build prewarm posting lists in blocking task: {err}"
             ))
         })??;
-        // Strip positions into their own per-token cache entries first
-        // (unchanged); the posting cache holds positions-free lists.
-        let mut postings_by_token = Vec::with_capacity(posting_lists.len());
-        for (token_id, mut posting_list) in posting_lists {
-            if with_position && let Some(positions) = posting_list.take_positions() {
-                self.index_cache
-                    .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
-                    .await;
-            }
-            debug_assert_eq!(token_id as usize, postings_by_token.len());
-            postings_by_token.push(posting_list);
-        }
-        // Populate the same cache keys the read path uses: grouped entries when
-        // grouping is active (issue #7040), per-token entries otherwise.
-        match self.group_starts.as_ref() {
+        // The chunk yields its token range as contiguous ascending ids from
+        // `tok_start`; the group publish path relies on this to index the lists.
+        debug_assert_eq!(posting_lists.len(), chunk_token_count);
+        debug_assert!(
+            posting_lists
+                .iter()
+                .enumerate()
+                .all(|(i, (token_id, _))| *token_id as usize == tok_start + i)
+        );
+        Ok(posting_lists)
+    }
+
+    /// Strip positions into their own per-token cache entries (the posting cache
+    /// holds positions-free lists), then populate the same cache keys the read
+    /// path uses: grouped entries when grouping is active, per-token entries
+    /// otherwise. Called once per chunk; the chunk's lists drop on return.
+    async fn publish_chunk_postings(
+        &self,
+        posting_lists: Vec<(u32, PostingList)>,
+        group_starts: Option<&[u32]>,
+        tok_start: usize,
+        tok_end: usize,
+        token_count: usize,
+        with_position: bool,
+    ) {
+        match group_starts {
             Some(starts) => {
-                // The read path derives the last group's `end` from `self.len()`;
-                // match it here so both produce identical `PostingListGroupKey`s.
-                debug_assert_eq!(postings_by_token.len(), self.len());
+                let mut chunk_postings = Vec::with_capacity(posting_lists.len());
+                for (token_id, mut posting_list) in posting_lists {
+                    self.cache_positions(&mut posting_list, token_id, with_position)
+                        .await;
+                    chunk_postings.push(posting_list);
+                }
+                // Chunk is group-aligned, so every group starting in it also ends
+                // in it; `chunk_postings[i]` is token `tok_start + i`. The last
+                // group's `end` derives from `token_count`, matching the read path
+                // so both produce identical `PostingListGroupKey`s.
                 for (k, &start) in starts.iter().enumerate() {
-                    let end = starts.get(k + 1).copied().unwrap_or(self.len() as u32);
-                    let group = PostingListGroup::new(
-                        postings_by_token[start as usize..end as usize].to_vec(),
-                    );
+                    let start_usize = start as usize;
+                    if start_usize < tok_start || start_usize >= tok_end {
+                        continue;
+                    }
+                    let end = starts.get(k + 1).copied().unwrap_or(token_count as u32);
+                    let lo = start_usize - tok_start;
+                    let hi = end as usize - tok_start;
+                    let group = PostingListGroup::new(chunk_postings[lo..hi].to_vec());
                     self.index_cache
                         .insert_with_key(&PostingListGroupKey { start, end }, Arc::new(group))
                         .await;
                 }
             }
             None => {
-                for (token_id, posting_list) in postings_by_token.into_iter().enumerate() {
+                for (token_id, mut posting_list) in posting_lists {
+                    self.cache_positions(&mut posting_list, token_id, with_position)
+                        .await;
                     self.index_cache
-                        .insert_with_key(
-                            &PostingListKey {
-                                token_id: token_id as u32,
-                            },
-                            Arc::new(posting_list),
-                        )
+                        .insert_with_key(&PostingListKey { token_id }, Arc::new(posting_list))
                         .await;
                 }
             }
         }
-        let populate_elapsed = populate_start.elapsed();
+    }
 
-        info!(
-            legacy_layout,
-            with_position,
-            token_count = self.len(),
-            read_batch_ms = read_batch_elapsed.as_secs_f64() * 1000.0,
-            post_read_loop_ms = populate_elapsed.as_secs_f64() * 1000.0,
-            "posting list prewarm timing"
-        );
+    /// Move a posting list's positions (when present and requested) into the
+    /// dedicated per-token position cache, leaving the posting list positions-free.
+    async fn cache_positions(
+        &self,
+        posting_list: &mut PostingList,
+        token_id: u32,
+        with_position: bool,
+    ) {
+        if with_position && let Some(positions) = posting_list.take_positions() {
+            self.index_cache
+                .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
+                .await;
+        }
+    }
 
-        Ok(())
+    /// Cheap `invert.lance` size estimate (file length from object metadata, no
+    /// data read), used only to size prewarm chunks. Falls back to a row-count
+    /// proxy when the reader can't surface the length (legacy v1).
+    pub(crate) fn posting_data_size_bytes(&self) -> u64 {
+        if let Some(size) = self.reader.file_size_bytes() {
+            return size;
+        }
+        // Fallback proxy for readers that don't cache their file length: just needs
+        // to be monotonic in partition size.
+        const ESTIMATED_BYTES_PER_ROW: u64 = 16;
+        (self.reader.num_rows() as u64).saturating_mul(ESTIMATED_BYTES_PER_ROW)
     }
 
     pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
@@ -2569,6 +2775,38 @@ impl PostingListReader {
     }
 }
 
+/// Loop-invariant state for [`InvertedPartition::build_chunk_postings`]. The
+/// metadata vecs are `Arc`d so each chunk's blocking build shares them cheaply.
+struct ChunkBuildState {
+    offsets: Option<Arc<Vec<usize>>>,
+    max_scores: Option<Arc<Vec<f32>>>,
+    lengths: Option<Arc<Vec<u32>>>,
+    posting_tail_codec: PostingTailCodec,
+    positions_layout: PositionsLayout,
+}
+
+/// Chunk-invariant inputs to [`InvertedPartition::build_prewarm_posting_lists_chunk`]:
+/// the per-partition codec/layout and the (shared, whole-partition) metadata
+/// slices indexed by global token id. These don't change across chunks.
+struct PrewarmBuildCtx<'a> {
+    max_scores: Option<&'a [f32]>,
+    lengths: Option<&'a [u32]>,
+    posting_tail_codec: PostingTailCodec,
+    positions_layout: PositionsLayout,
+}
+
+/// Per-chunk inputs to [`InvertedPartition::build_prewarm_posting_lists_chunk`]:
+/// the token sub-range `[tok_start, tok_start + token_count)` and, for legacy
+/// v1, the rebased offset slice plus the chunk's end row.
+struct PrewarmChunk<'a> {
+    tok_start: usize,
+    token_count: usize,
+    /// Legacy v1 only: `offsets[tok_start..tok_start+token_count]` (no sentinel).
+    offsets: Option<&'a [usize]>,
+    /// Legacy v1 only: global row at which this chunk's posting rows end.
+    end_row: usize,
+}
+
 /// New type just to allow Positions implement DeepSizeOf so it can be put
 /// in the cache.
 #[derive(Clone)]
@@ -2618,7 +2856,7 @@ fn sliced_cache_bytes(array: &dyn Array) -> usize {
 }
 
 impl DeepSizeOf for Positions {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.0.deep_size_of_children(context)
     }
 }
@@ -2699,7 +2937,7 @@ pub enum CompressedPositionStorage {
 }
 
 impl DeepSizeOf for CompressedPositionStorage {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::LegacyPerDoc(positions) => sliced_cache_bytes(positions),
             Self::SharedStream(stream) => stream.size(),
@@ -2710,10 +2948,9 @@ impl DeepSizeOf for CompressedPositionStorage {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SharedPositionStream {
     codec: PositionStreamCodec,
-    block_offsets: Vec<u32>,
-    // Stored as `Bytes` so that the cache deserialization path can hand
-    // ownership of an IPC-decoded slice in without copying. Cloning the
-    // stream is then an `Arc` bump rather than an O(N) buffer copy.
+    block_offsets: Arc<[u32]>,
+    // Stored with shared ownership so cache hits can clone position streams
+    // without copying either offsets or bytes.
     bytes: bytes::Bytes,
 }
 
@@ -2721,7 +2958,7 @@ impl SharedPositionStream {
     pub fn new(codec: PositionStreamCodec, block_offsets: Vec<u32>, bytes: bytes::Bytes) -> Self {
         Self {
             codec,
-            block_offsets,
+            block_offsets: Arc::from(block_offsets.into_boxed_slice()),
             bytes,
         }
     }
@@ -2754,11 +2991,11 @@ impl SharedPositionStream {
     }
 
     pub fn block_offsets(&self) -> &[u32] {
-        &self.block_offsets
+        self.block_offsets.as_ref()
     }
 
     pub fn size(&self) -> usize {
-        self.block_offsets.capacity() * std::mem::size_of::<u32>() + self.bytes.len()
+        self.block_offsets.len() * std::mem::size_of::<u32>() + self.bytes.len()
     }
 }
 
@@ -2976,7 +3213,7 @@ pub struct PlainPostingList {
 }
 
 impl DeepSizeOf for PlainPostingList {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.row_ids.len() * std::mem::size_of::<u64>()
             + self.frequencies.len() * std::mem::size_of::<f32>()
             + self
@@ -3079,7 +3316,7 @@ pub struct CompressedPostingList {
 }
 
 impl DeepSizeOf for CompressedPostingList {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         sliced_cache_bytes(&self.blocks)
             + self
                 .positions
@@ -4378,18 +4615,25 @@ impl DocSet {
         self.row_ids[doc_id as usize]
     }
 
-    pub fn doc_id(&self, row_id: u64) -> Option<u64> {
+    /// Resolve a `row_id` to every `doc_id` it owns.
+    ///
+    /// A scalar column maps each row to a single document, but a
+    /// `list<string>` column indexes every element as its own document, so a
+    /// single `row_id` can own several `doc_id`s sharing that key in `inv`.
+    /// The prefilter path (`flat_search`) walks an allow-list of row_ids and
+    /// must evaluate *all* of a row's documents; resolving to one `doc_id`
+    /// silently drops matches at non-last list positions (lancedb#3352).
+    pub fn doc_ids(&self, row_id: u64) -> impl Iterator<Item = u64> + '_ {
         if self.inv.is_empty() {
-            // in legacy format, the row id is doc id
-            match self.row_ids.binary_search(&row_id) {
-                Ok(_) => Some(row_id),
-                Err(_) => None,
-            }
+            // in legacy format, the row id is doc id (one document per row)
+            let found = self.row_ids.binary_search(&row_id).is_ok();
+            Either::Left(found.then_some(row_id).into_iter())
         } else {
-            match self.inv.binary_search_by_key(&row_id, |x| x.0) {
-                Ok(idx) => Some(self.inv[idx].1 as u64),
-                Err(_) => None,
-            }
+            // `inv` is sorted by row_id, so the entries sharing this key form a
+            // contiguous run; yield the doc_id of each.
+            let lo = self.inv.partition_point(|entry| entry.0 < row_id);
+            let hi = self.inv.partition_point(|entry| entry.0 <= row_id);
+            Either::Right(self.inv[lo..hi].iter().map(|entry| entry.1 as u64))
         }
     }
     pub fn total_tokens_num(&self) -> u64 {
@@ -4513,23 +4757,36 @@ impl DocSet {
             });
         }
 
-        // if frag reuse happened, we'll need to remap the row_ids. And after row_ids been
-        // remapped, we'll need resort to make sure binary_search works.
+        // If frag reuse happened, remap the row_ids through it. Crucially we
+        // must NOT drop the rows the reuse index deleted, because the posting
+        // lists reference doc_ids *positionally* (a doc_id is an index into
+        // these arrays, fixed at build time). Dropping deleted rows would
+        // renumber every later doc_id and desync the posting lists, so wand
+        // would index `num_tokens`/`row_ids` out of bounds or score the wrong
+        // doc. Instead we tombstone deleted rows in place: their slot survives
+        // (so doc_ids stay aligned with the posting lists) carrying
+        // `RowAddress::TOMBSTONE_ROW`, which wand skips, and they are left out
+        // of `inv` so a row_id lookup never resolves to a deleted doc. The
+        // heavyweight physical remap (`DocSet::remap`) is what actually
+        // renumbers and compacts; this load-time path only has to stay
+        // consistent until then.
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             let mut row_ids = Vec::with_capacity(row_id_col.len());
-            let mut num_tokens = Vec::with_capacity(num_tokens_col.len());
-            for (row_id, num_token) in row_id_col.values().iter().zip(num_tokens_col.values()) {
-                if let Some(new_row_id) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    row_ids.push(new_row_id);
-                    num_tokens.push(*num_token);
+            let num_tokens = num_tokens_col.values().to_vec();
+            let mut inv = Vec::with_capacity(row_id_col.len());
+            for (doc_id, row_id) in row_id_col.values().iter().enumerate() {
+                match frag_reuse_index_ref.remap_row_id(*row_id) {
+                    Some(new_row_id) => {
+                        row_ids.push(new_row_id);
+                        inv.push((new_row_id, doc_id as u32));
+                    }
+                    None => {
+                        // Deleted: keep the slot (doc_ids must not shift) but
+                        // tombstone it and leave it out of `inv`.
+                        row_ids.push(RowAddress::TOMBSTONE_ROW);
+                    }
                 }
             }
-
-            let mut inv: Vec<(u64, u32)> = row_ids
-                .iter()
-                .enumerate()
-                .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
-                .collect();
             inv.sort_unstable_by_key(|entry| entry.0);
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
@@ -4953,6 +5210,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
+
+    // Pre-await synchronous work: query tokenization + chunk-stream setup.
+    let pre_await_start = std::time::Instant::now();
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
     // A query that tokenizes to no terms (e.g. only stop words) has no
@@ -4982,6 +5242,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
         ACCUMULATE_BYTES,
         SLICE_BYTES,
     );
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(pre_await_start.elapsed());
+    }
 
     // Phase 2 - For each row we need to know the total number of tokens and the count of each
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
@@ -4997,13 +5260,10 @@ pub async fn flat_bm25_search_stream_with_metrics(
     .await?;
 
     // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
-    // Synchronous and single-threaded, so we time it from this thread.
-    let scoring_start = std::time::Instant::now();
+    // All post-await work is synchronous; time the scorer + score + slicing loop together.
+    let post_await_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
-    if let Some(t) = &elapsed_compute {
-        t.add_duration(scoring_start.elapsed());
-    }
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -5012,6 +5272,9 @@ pub async fn flat_bm25_search_stream_with_metrics(
         let start = i * target_batch_size;
         let len = (scores.num_rows() - start).min(target_batch_size);
         batches.push(Ok(scores.slice(start, len)));
+    }
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(post_await_start.elapsed());
     }
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         FTS_SCHEMA.clone(),
@@ -5230,6 +5493,21 @@ mod tests {
                 (2_u32, 1_u32, Some(vec![3_u32])),
             ]
         );
+    }
+
+    #[test]
+    fn test_shared_position_stream_clone_shares_block_offsets() {
+        let stream = SharedPositionStream::new(
+            PositionStreamCodec::PackedDelta,
+            vec![0_u32, 4, 11],
+            bytes::Bytes::from_static(b"shared position bytes"),
+        );
+        let original_offsets = stream.block_offsets().as_ptr();
+
+        let cloned = stream.clone();
+
+        assert_eq!(cloned.block_offsets(), stream.block_offsets());
+        assert_eq!(cloned.block_offsets().as_ptr(), original_offsets);
     }
 
     #[test]
@@ -5833,6 +6111,253 @@ mod tests {
         );
     }
 
+    /// Prewarming a large partition in multiple chunks must end up holding exactly the
+    /// same per-token posting lists (doc ids and frequencies) as the whole-file path.
+    /// Parametrized over layout: the legacy-v1 chunk path rebases global offsets to
+    /// chunk-local rows, which the v2 one-row-per-token path never exercises.
+    #[rstest::rstest]
+    #[case::v1(InvertedListFormatVersion::V1)]
+    #[case::v2(InvertedListFormatVersion::V2)]
+    #[tokio::test]
+    async fn test_prewarm_streams_in_chunks_preserves_content(
+        #[case] format_version: InvertedListFormatVersion,
+    ) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // One partition with many tokens (so it spans many chunks) and several
+        // docs per token (so each token is more than one posting row).
+        const NUM_TOKENS: u32 = 20;
+        const DOCS_PER_TOKEN: u32 = 3;
+        let posting_tail_codec = format_version.posting_tail_codec();
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            false,
+            TokenSetFormat::default(),
+            format_version,
+        );
+        // Small groups so the partition spans several; chunks snap to whole groups,
+        // so several groups are needed to stream in more than one chunk.
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 4,
+        };
+        // expected[token] = [(doc_id, frequency)] in stored (doc-id) order.
+        let mut expected: Vec<Vec<(u32, u32)>> = Vec::new();
+        let mut doc_id = 0u64;
+        for t in 0..NUM_TOKENS {
+            builder.tokens.add(format!("tok_{t:03}"));
+            let mut posting =
+                PostingListBuilder::new_with_posting_tail_codec(false, posting_tail_codec);
+            let mut docs = Vec::new();
+            for _ in 0..DOCS_PER_TOKEN {
+                posting.add(doc_id as u32, PositionRecorder::Count(1));
+                builder.docs.append(doc_id, 1);
+                docs.push((doc_id as u32, 1));
+                doc_id += 1;
+            }
+            expected.push(docs);
+            builder.posting_lists.push(posting);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                posting_tail_codec.as_str().to_owned(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let inverted_list = &index.partitions[0].inverted_list;
+        assert_eq!(inverted_list.len(), NUM_TOKENS as usize);
+
+        // Force a small chunk so the partition deterministically splits; with
+        // CHUNK_TOKENS < NUM_TOKENS each chunk is bounded below the whole partition.
+        const CHUNK_TOKENS: usize = 6;
+        let chunk_count = inverted_list
+            .prewarm_posting_lists_chunked(false, Some(CHUNK_TOKENS))
+            .await
+            .unwrap();
+
+        // (1) The partition was streamed in multiple chunks. The exact count is
+        // group-alignment-dependent (chunks snap to whole groups), so just
+        // require more than one.
+        assert!(
+            chunk_count > 1,
+            "single partition must be streamed in more than one chunk, got {chunk_count}"
+        );
+
+        // (2) Correctness: every token's posting list round-trips with exactly
+        // the doc ids and frequencies of the whole-file path.
+        for token_id in 0..NUM_TOKENS {
+            let actual = inverted_list
+                .posting_list(token_id, false, &NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .iter()
+                .map(|(doc_id, freq, _positions)| (doc_id as u32, freq))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected[token_id as usize],
+                "token {token_id} posting list mismatch after chunked prewarm"
+            );
+        }
+    }
+
+    /// With positions, the chunked prewarm must strip positions into their own
+    /// per-token cache entries (leaving the posting cache positions-free) and still
+    /// round-trip exact doc ids, frequencies, and positions across chunk boundaries.
+    #[tokio::test]
+    async fn test_prewarm_streams_in_chunks_with_positions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let format_version = InvertedListFormatVersion::V2;
+        let posting_tail_codec = format_version.posting_tail_codec();
+        const NUM_TOKENS: u32 = 16;
+        const DOCS_PER_TOKEN: u32 = 3;
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            format_version,
+        );
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 4,
+        };
+        // expected[token] = [(doc_id, frequency, positions)].
+        let mut expected: Vec<Vec<(u32, u32, Vec<u32>)>> = Vec::new();
+        let mut doc_id = 0u64;
+        for t in 0..NUM_TOKENS {
+            builder.tokens.add(format!("tok_{t:03}"));
+            let mut posting =
+                PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec);
+            let mut docs = Vec::new();
+            for _ in 0..DOCS_PER_TOKEN {
+                let positions = vec![t % 3, t % 3 + 2, t % 3 + 5];
+                posting.add(
+                    doc_id as u32,
+                    PositionRecorder::Position(positions.clone().into()),
+                );
+                builder.docs.append(doc_id, positions.len() as u32);
+                docs.push((doc_id as u32, positions.len() as u32, positions));
+                doc_id += 1;
+            }
+            expected.push(docs);
+            builder.posting_lists.push(posting);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default().with_position(true)).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                posting_tail_codec.as_str().to_owned(),
+            ),
+            (
+                POSITIONS_LAYOUT_KEY.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
+            ),
+            (
+                POSITIONS_CODEC_KEY.to_owned(),
+                PositionStreamCodec::PackedDelta.as_str().to_owned(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let inverted_list = &index.partitions[0].inverted_list;
+
+        const CHUNK_TOKENS: usize = 5;
+        let chunk_count = inverted_list
+            .prewarm_posting_lists_chunked(true, Some(CHUNK_TOKENS))
+            .await
+            .unwrap();
+        assert!(
+            chunk_count > 1,
+            "partition must be streamed in more than one chunk, got {chunk_count}"
+        );
+
+        for token_id in 0..NUM_TOKENS {
+            // The prewarmed posting cache entry is positions-free.
+            let (start, end) = inverted_list.group_range_for_token(token_id).unwrap();
+            let group = inverted_list
+                .index_cache
+                .get_with_key(&PostingListGroupKey { start, end })
+                .await
+                .unwrap();
+            let slot = (token_id - start) as usize;
+            assert!(
+                !group.get(slot).unwrap().has_position(),
+                "token {token_id} posting cache entry must be positions-free after prewarm"
+            );
+
+            // Full content (doc ids, frequencies, positions) round-trips; the
+            // positions come from the dedicated per-token cache prewarm populated.
+            let actual = inverted_list
+                .posting_list(token_id, true, &NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .iter()
+                .map(|(doc_id, freq, positions)| {
+                    (doc_id as u32, freq, positions.unwrap().collect::<Vec<_>>())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected[token_id as usize],
+                "token {token_id} posting list / positions mismatch after chunked prewarm"
+            );
+        }
+    }
+
     /// IO accounting for the IO-counting stats test below: tracks bytes
     /// pulled from the posting file so we can assert that the stats path is
     /// O(1) in num_unique_tokens.
@@ -5911,7 +6436,7 @@ mod tests {
     }
 
     impl DeepSizeOf for CountingStore {
-        fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
             self.inner.deep_size_of_children(context)
         }
     }
@@ -5949,10 +6474,28 @@ mod tests {
                 Ok(reader)
             }
         }
-        async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()> {
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
             self.inner.copy_index_file(name, dest_store).await
         }
-        async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()> {
+        async fn copy_index_file_to(
+            &self,
+            name: &str,
+            new_name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner
+                .copy_index_file_to(name, new_name, dest_store)
+                .await
+        }
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> Result<crate::scalar::IndexFile> {
             self.inner.rename_index_file(name, new_name).await
         }
         async fn delete_index_file(&self, name: &str) -> Result<()> {
@@ -6743,6 +7286,90 @@ mod tests {
             .unwrap();
 
         assert_eq!(row_ids, vec![100]);
+    }
+
+    /// Build a multi-partition inverted index in `store` with `num_partitions`
+    /// partitions, each carrying a handful of tokens/docs.
+    async fn build_multi_partition_index(
+        store: &Arc<LanceIndexStore>,
+        num_partitions: u64,
+    ) -> (Arc<InvertedIndex>, Arc<LanceCache>) {
+        for id in 0..num_partitions {
+            let mut builder = InnerBuilder::new_with_format_version(
+                id,
+                false,
+                TokenSetFormat::default(),
+                InvertedListFormatVersion::V1,
+            );
+            // A few distinct tokens per partition so each posting file has real
+            // content to read and materialize during prewarm.
+            for t in 0..4u32 {
+                builder.tokens.add(format!("tok_{id}_{t}"));
+                let mut posting = PostingListBuilder::new_with_posting_tail_codec(
+                    false,
+                    PostingTailCodec::Fixed32,
+                );
+                let base = id * 1000 + t as u64 * 10;
+                for d in 0..5u32 {
+                    posting.add(d, PositionRecorder::Count(1));
+                    builder.docs.append(base + d as u64, 4);
+                }
+                builder.posting_lists.push(posting);
+            }
+            builder.write(store.as_ref()).await.unwrap();
+        }
+
+        let partition_ids: Vec<u64> = (0..num_partitions).collect();
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&partition_ids).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        // Keep the cache alive and return it: the partition readers hold only a
+        // WeakLanceCache, so the prewarmed entries vanish if this Arc is dropped.
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        (index, cache)
+    }
+
+    /// The prewarm cost estimate must come from cheap object metadata (the
+    /// posting file length) without reading the posting data, and must be
+    /// monotonic in the partition's content.
+    #[tokio::test]
+    async fn test_posting_data_size_bytes_uses_file_length() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let (index, _cache) = build_multi_partition_index(&store, 3).await;
+        for part in &index.partitions {
+            // File length is reported by object metadata at open time; it must be
+            // non-trivial for a partition that actually holds postings.
+            let est = part.inverted_list.posting_data_size_bytes();
+            assert!(
+                est > 0,
+                "expected a non-zero posting-data size estimate, got {est}"
+            );
+        }
     }
 
     #[tokio::test]

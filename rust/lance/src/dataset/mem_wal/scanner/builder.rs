@@ -20,8 +20,8 @@ use lance_core::{Error, Result, is_system_column};
 use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
-use super::data_source::ShardSnapshot;
-use super::flushed_cache::FlushedMemTableCache;
+use super::data_source::{FreshTierWatermark, ShardSnapshot};
+use super::flushed_cache::{DatasetCache, GenerationWarmer};
 use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use crate::dataset::Dataset;
@@ -124,7 +124,12 @@ pub struct LsmScanner {
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Over-fetch multiple for block-listed sources in search plans
+    /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
+    overfetch_factor: Option<f64>,
 }
 
 impl LsmScanner {
@@ -160,6 +165,8 @@ impl LsmScanner {
             pk_columns,
             session,
             flushed_cache: None,
+            warmer: None,
+            overfetch_factor: None,
         }
     }
 
@@ -198,6 +205,8 @@ impl LsmScanner {
             pk_columns,
             session: None,
             flushed_cache: None,
+            warmer: None,
+            overfetch_factor: None,
         }
     }
 
@@ -246,10 +255,26 @@ impl LsmScanner {
     ///
     /// With a cache, repeated queries against the same generation become a
     /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
-    /// is owned and sized by the caller (see [`FlushedMemTableCache`]); not
-    /// set by default, so behavior is unchanged unless opted in.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    /// is owned and sized by the caller (any [`DatasetCache`] impl, e.g.
+    /// [`FlushedMemTableCache`](super::FlushedMemTableCache)); not set by
+    /// default, so behavior is unchanged unless opted in.
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation. Not set by
+    /// default, so behavior is unchanged unless opted in.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
+        self
+    }
+
+    /// Set the over-fetch multiple block-listed sources use in search plans
+    /// so they still yield `k` live rows after cross-generation dedup.
+    /// Threaded into [`super::LsmFtsSearchPlanner`]; clamped to `>= 1.0`.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = Some(factor);
         self
     }
 
@@ -354,6 +379,9 @@ impl LsmScanner {
             if let Some(cache) = &self.flushed_cache {
                 planner = planner.with_flushed_cache(cache.clone());
             }
+            if let Some(warmer) = &self.warmer {
+                planner = planner.with_warmer(warmer.clone());
+            }
             let plan = planner
                 .plan_point_lookup(&keys, self.projection.as_deref())
                 .await?;
@@ -369,6 +397,12 @@ impl LsmScanner {
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
+        }
+        if let Some(warmer) = &self.warmer {
+            planner = planner.with_warmer(warmer.clone());
+        }
+        if let Some(factor) = self.overfetch_factor {
+            planner = planner.with_overfetch_factor(factor);
         }
 
         planner
@@ -404,6 +438,12 @@ impl LsmScanner {
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
+        }
+        if let Some(warmer) = &self.warmer {
+            planner = planner.with_warmer(warmer.clone());
+        }
+        if let Some(factor) = self.overfetch_factor {
+            planner = planner.with_overfetch_factor(factor);
         }
         planner
             .plan_search(column, query, k, self.projection.as_deref())
@@ -454,24 +494,65 @@ impl LsmScanner {
     /// the primary-key columns; the returned `Vec<bool>` is aligned with its
     /// rows. Hashing matches the scanner's internal dedup, so the caller never
     /// hashes PKs itself. Flushed membership comes from the injected
-    /// [`FlushedMemTableCache`] when one is set.
+    /// [`DatasetCache`] when one is set.
     pub async fn contains_pks(&self, pks: &RecordBatch) -> Result<Vec<bool>> {
+        self.contains_pks_at(pks, None).await
+    }
+
+    /// As-of variant of [`Self::contains_pks`]. Membership is evaluated against
+    /// a per-shard watermark on the fresh tier, supplied via `watermarks` (see
+    /// [`FreshTierWatermark`]), matching the tier a prior scan observed and
+    /// avoiding the two-snapshot skew that would drop a base row with no
+    /// delivered replacement. `None` evaluates against the live tier.
+    pub async fn contains_pks_at(
+        &self,
+        pks: &RecordBatch,
+        watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+    ) -> Result<Vec<bool>> {
         let sources = self.build_collector().collect()?;
-        let sets = super::block_list::fresh_tier_block_list(
+        let memberships = super::block_list::fresh_tier_block_list(
             &sources,
-            &self.pk_columns,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
+            watermarks,
         )
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
             .map_err(|e| Error::invalid_input(e.to_string()))?;
-        Ok((0..pks.num_rows())
+        // One key per row, in the index key space (typed value, or encoded
+        // `Binary` tuple for a composite PK).
+        let keys: Vec<ScalarValue> = (0..pks.num_rows())
             .map(|row| {
-                let hash = super::exec::compute_pk_hash(pks, &pk_indices, row);
-                sets.iter().any(|set| set.contains(&hash))
+                let values: Vec<ScalarValue> = pk_indices
+                    .iter()
+                    .map(|&col| ScalarValue::try_from_array(pks.column(col), row))
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| Error::invalid_input(e.to_string()))?;
+                super::block_list::on_disk_pk_key(&values)
             })
-            .collect())
+            .collect::<Result<_>>()?;
+
+        // A row is contained if any generation contains its key. Probe each
+        // generation once (batched), narrowing to still-unfound rows.
+        let mut contained = vec![false; keys.len()];
+        let mut live: Vec<usize> = (0..keys.len()).collect();
+        for membership in &memberships {
+            if live.is_empty() {
+                break;
+            }
+            let live_keys: Vec<ScalarValue> = live.iter().map(|&i| keys[i].clone()).collect();
+            let mask = membership.contains_keys(&live_keys).await?;
+            let mut next_live = Vec::with_capacity(live.len());
+            for (pos, &row) in live.iter().enumerate() {
+                if mask[pos] {
+                    contained[row] = true;
+                } else {
+                    next_live.push(row);
+                }
+            }
+            live = next_live;
+        }
+        Ok(contained)
     }
 
     /// Build the data source collector.
@@ -572,35 +653,42 @@ mod tests {
         assert_eq!(memtable_ref.generation, 10);
     }
 
+    /// Single-column `id: Int32` schema used by the PK-membership tests.
+    fn pk_schema() -> SchemaRef {
+        use arrow_schema::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    /// A `RecordBatch` of `id` values against [`pk_schema`].
+    fn id_pk_batch(ids: &[i32]) -> RecordBatch {
+        use arrow_array::Int32Array;
+        RecordBatch::try_new(pk_schema(), vec![Arc::new(Int32Array::from(ids.to_vec()))]).unwrap()
+    }
+
+    /// An active/frozen memtable holding `ids` at `generation`, with a single
+    /// batch and a maintained primary-key index on `id`.
+    fn mk_pk_memtable(ids: &[i32], generation: u64) -> InMemoryMemTableRef {
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        let store = BatchStore::with_capacity(8);
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        let b = id_pk_batch(ids);
+        let (bp, off, _) = store.append(b.clone()).unwrap();
+        index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
+        InMemoryMemTableRef {
+            batch_store: Arc::new(store),
+            index_store: Arc::new(index),
+            schema: pk_schema(),
+            generation,
+        }
+    }
+
     #[tokio::test]
     async fn contains_pks_reports_fresh_tier_membership() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
-        use arrow_array::Int32Array;
-        use arrow_schema::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let id_batch = |ids: &[i32]| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from(ids.to_vec()))],
-            )
-            .unwrap()
-        };
-        let mk = |ids: &[i32], generation: u64| {
-            let store = BatchStore::with_capacity(8);
-            store.append(id_batch(ids)).unwrap();
-            InMemoryMemTableRef {
-                batch_store: Arc::new(store),
-                index_store: Arc::new(IndexStore::new()),
-                schema: schema.clone(),
-                generation,
-            }
-        };
-
         // Fresh-tier only: active gen 2 (pk=1,2) + frozen gen 1 (pk=3).
         let shard = Uuid::new_v4();
         let scanner = LsmScanner::without_base_table(
-            schema.clone(),
+            pk_schema(),
             "memory://t",
             vec![],
             vec!["id".to_string()],
@@ -608,14 +696,66 @@ mod tests {
         .with_in_memory_memtables(
             shard,
             InMemoryMemTables {
-                active: mk(&[1, 2], 2),
-                frozen: vec![mk(&[3], 1)],
+                active: mk_pk_memtable(&[1, 2], 2),
+                frozen: vec![mk_pk_memtable(&[3], 1)],
             },
         );
 
         // pk=1 (active), pk=4 (absent), pk=3 (frozen).
-        let result = scanner.contains_pks(&id_batch(&[1, 4, 3])).await.unwrap();
+        let result = scanner
+            .contains_pks(&id_pk_batch(&[1, 4, 3]))
+            .await
+            .unwrap();
         assert_eq!(result, vec![true, false, true]);
+    }
+
+    /// `contains_pks_at` probes each generation once over the still-unfound
+    /// rows, so a multi-PK batch spanning several generations resolves to the
+    /// right per-row mask — and a watermark bounds which generations count.
+    #[tokio::test]
+    async fn contains_pks_at_batched_probe_respects_watermark() {
+        use crate::dataset::mem_wal::scanner::data_source::FreshTierWatermark;
+
+        // active gen 2 (pk=1,2) + frozen gen 1 (pk=3,4).
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            shard,
+            InMemoryMemTables {
+                active: mk_pk_memtable(&[1, 2], 2),
+                frozen: vec![mk_pk_memtable(&[3, 4], 1)],
+            },
+        );
+
+        // Duplicate and out-of-order keys exercise the live-row narrowing: each
+        // generation only re-probes the rows earlier generations didn't claim.
+        let probe = id_pk_batch(&[4, 1, 9, 3, 2, 1]);
+
+        // watermark=None → live tier: every PK present in either generation.
+        let live = scanner.contains_pks_at(&probe, None).await.unwrap();
+        assert_eq!(live, vec![true, true, false, true, true, true]);
+
+        // watermark at gen 1 → active gen 2 rolled in after the snapshot and is
+        // excluded; only the frozen gen 1 keys (3,4) remain members.
+        let watermarks: HashMap<Uuid, FreshTierWatermark> = [(
+            shard,
+            FreshTierWatermark {
+                active_generation: 1,
+                active_batch_count: u64::MAX,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let bounded = scanner
+            .contains_pks_at(&probe, Some(&watermarks))
+            .await
+            .unwrap();
+        assert_eq!(bounded, vec![true, false, false, true, false, false]);
     }
 
     /// One active memtable with a maintained BTree on `id`, all rows visible.

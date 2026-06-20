@@ -1067,32 +1067,57 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
-@pytest.mark.skip(
-    reason=(
-        "IVF_RQ num_bits>1 creation is gated until split-code search support "
-        "is implemented"
-    )
-)
-def test_create_ivf_rq_multi_bit_gates_search():
-    ds = lance.write_dataset(create_table(), "memory://")
+def _assert_recall_at_least(ds, query, metric=None, k=10, recall_requirement=0.5):
+    nearest = {"column": "vector", "q": query, "k": k}
+    if metric is not None:
+        nearest["metric"] = metric
 
-    ds = ds.create_index(
-        "vector",
-        index_type="IVF_RQ",
-        num_partitions=4,
-        num_bits=9,
+    gt_ids = ds.to_table(nearest=nearest, columns=["id"])["id"].to_numpy()
+    create_index_kwargs = {
+        "index_type": "IVF_RQ",
+        "num_partitions": 4,
+        "num_bits": 9,
+    }
+    if metric is not None:
+        create_index_kwargs["metric"] = metric
+    indexed = ds.create_index("vector", **create_index_kwargs)
+    result_ids = indexed.to_table(nearest=nearest, columns=["id"])["id"].to_numpy()
+
+    assert result_ids.shape[0] == k
+    recall = len(set(gt_ids) & set(result_ids)) / k
+    assert recall >= recall_requirement, (
+        f"recall={recall}, gt={gt_ids}, result={result_ids}"
     )
+    return indexed
+
+
+def test_create_ivf_rq_multi_bit_searches_l2_and_cosine():
+    rng = np.random.default_rng(42)
+    mat = rng.standard_normal((1000, 128)).astype(np.float32)
+    tbl = vec_to_table(data=mat).append_column("id", pa.array(range(len(mat))))
+
+    ds = lance.write_dataset(tbl, "memory://")
+    ds = _assert_recall_at_least(ds, mat[0])
     stats = ds.stats.index_stats("vector_idx")
     assert stats["indices"][0]["sub_index"]["num_bits"] == 9
-
-    with pytest.raises(pa.ArrowInvalid, match="num_bits>1 search is not supported"):
-        ds.to_table(
+    assert stats["indices"][0]["sub_index"]["query_estimator"] == "raw_query"
+    for approx_mode in ["fast", "normal", "accurate"]:
+        result = ds.to_table(
             nearest={
                 "column": "vector",
-                "q": np.random.randn(128).astype(np.float32),
+                "q": mat[0],
                 "k": 10,
-            }
+                "approx_mode": approx_mode,
+            },
+            columns=["id"],
         )
+        assert result.num_rows == 10
+
+    cosine_ds = lance.write_dataset(tbl, "memory://")
+    cosine_ds = _assert_recall_at_least(cosine_ds, mat[1], metric="cosine")
+    cosine_stats = cosine_ds.stats.index_stats("vector_idx")
+    assert cosine_stats["indices"][0]["sub_index"]["num_bits"] == 9
+    assert cosine_stats["indices"][0]["sub_index"]["query_estimator"] == "raw_query"
 
 
 def test_create_ivf_rq_requires_dim_divisible_by_8():
@@ -1747,6 +1772,8 @@ def test_index_cast_centroids(tmp_path):
     values = pa.array([x for arr in centroids for x in arr], pa.float32())
     centroids = pa.FixedSizeListArray.from_arrays(values, 128)
 
+    # Cast invalidates the attached index; drop it first per the new contract.
+    dataset.drop_index(index_name)
     dataset.alter_columns(dict(path="vector", data_type=pa.list_(pa.float16(), 128)))
 
     # centroids are f32, but the column is now f16
@@ -2079,6 +2106,33 @@ def test_vector_index_invalid_query_parallelism(indexed_dataset):
                 "q": np.random.randn(128),
                 "k": 10,
                 "query_parallelism": -2,
+            }
+        )
+
+
+def test_vector_index_with_approx_mode(indexed_dataset):
+    q = np.random.randn(128)
+
+    for approx_mode in ["fast", "normal", "accurate"]:
+        result = indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": 10,
+                "approx_mode": approx_mode,
+            }
+        )
+        assert len(result) == 10
+
+
+def test_vector_index_invalid_approx_mode(indexed_dataset):
+    with pytest.raises(ValueError, match="approx_mode"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "approx_mode": "hacc",
             }
         )
 

@@ -8,8 +8,8 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, UInt32Type};
 use arrow_array::{ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::deepsize::DeepSizeOf;
 
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
@@ -165,7 +165,7 @@ struct HnswCore {
 }
 
 impl DeepSizeOf for HnswCore {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.params.deep_size_of_children(context)
             + self.graph.deep_size_of_children(context)
             + self.level_count.deep_size_of_children(context)
@@ -497,7 +497,7 @@ struct HnswBuilder {
 }
 
 impl DeepSizeOf for HnswBuilder {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.params.deep_size_of_children(context)
             + self.nodes.deep_size_of_children(context)
             + self.level_count.deep_size_of_children(context)
@@ -830,7 +830,7 @@ struct LoadedHnswGraph {
 }
 
 impl DeepSizeOf for LoadedHnswGraph {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // `level_neighbors` are zero-copy views into `batch`, so counting
         // `batch` alone avoids double counting (mirrors
         // `vector/flat/storage.rs`). The upper-level `level_lookup` maps are
@@ -950,7 +950,7 @@ enum HnswGraph {
 }
 
 impl DeepSizeOf for HnswGraph {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Built(nodes) => nodes.deep_size_of_children(context),
             Self::Loaded(graph) => graph.deep_size_of_children(context),
@@ -1306,8 +1306,8 @@ mod tests {
 
     use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array};
     use arrow_schema::Schema;
-    use deepsize::DeepSizeOf;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_file::previous::{
         reader::FileReader as PreviousFileReader,
         writer::{

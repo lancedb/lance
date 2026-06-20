@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
-use deepsize::DeepSizeOf;
 use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 
@@ -25,6 +25,7 @@ pub use field::{
 pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
     escape_field_path_for_project, format_field_path, parse_field_path,
+    validate_fixed_size_list_dimensions,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -408,10 +409,10 @@ pub struct Dictionary {
 }
 
 impl DeepSizeOf for Dictionary {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut crate::deepsize::Context) -> usize {
         self.values
             .as_ref()
-            .map(|v| v.get_array_memory_size())
+            .map(|v| (v.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }

@@ -18,7 +18,6 @@ arrow-schema = { workspace = true }
 byteorder = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
-deepsize = { workspace = true }
 itertools = { workspace = true }
 lance-core = { workspace = true }
 roaring = { workspace = true }

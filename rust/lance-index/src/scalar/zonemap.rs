@@ -19,7 +19,7 @@ use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
-    BuiltinIndexType, CreatedIndex, SargableQuery, ScalarIndexParams, UpdateCriteria,
+    BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,
     compute_next_prefix,
 };
 use lance_arrow_stats::StatisticsAccumulator;
@@ -40,9 +40,9 @@ use crate::scalar::FragReuseIndex;
 use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -66,7 +66,7 @@ struct ZoneMapStatistics {
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Estimate sizes for ScalarValue
         let min_size = self.min.size() - std::mem::size_of::<ScalarValue>();
         let max_size = self.max.size() - std::mem::size_of::<ScalarValue>();
@@ -126,7 +126,7 @@ impl std::fmt::Debug for ZoneMapIndex {
 }
 
 impl DeepSizeOf for ZoneMapIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.zones.deep_size_of_children(context)
     }
 }
@@ -151,26 +151,11 @@ impl ZoneMapIndex {
         Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
     }
 
-    fn finite_value_may_be_in_zone(value: &ScalarValue, zone: &ZoneMapStatistics) -> bool {
-        if !Self::zone_has_finite_min(zone) || value < &zone.min {
-            return false;
-        }
-
-        if Self::scalar_is_nan(&zone.max) {
-            // A NaN max means this zone had both NaNs and finite values.  The
-            // finite max is not persisted, so keep the zone as a false positive
-            // instead of using total ordering to prune it.
-            return true;
-        }
-
-        !zone.max.is_null() && value <= &zone.max
-    }
-
     /// Evaluates whether a zone could potentially contain values matching the query.
     ///
-    /// NaN query values use the explicit `nan_count`.  When the stored max is
-    /// NaN we do not treat it as a finite upper bound; that representation means
-    /// the zone had finite values plus NaNs, and the finite max was not persisted.
+    /// NaN query values use the explicit `nan_count`. For finite query values,
+    /// `ScalarValue` total ordering keeps finite values below a stored NaN max,
+    /// so zones with finite values plus NaNs remain conservative false positives.
     fn evaluate_zone_against_query(
         &self,
         zone: &ZoneMapStatistics,
@@ -206,7 +191,7 @@ impl ZoneMapIndex {
                     return Ok(false);
                 }
 
-                Ok(Self::finite_value_may_be_in_zone(target, zone))
+                Ok(target >= &zone.min && target <= &zone.max)
             }
             SargableQuery::Range(start, end) => {
                 // Zone overlaps with query range if there's any intersection between
@@ -336,22 +321,28 @@ impl ZoneMapIndex {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_finite_min(zone) {
+                                    false
                                 } else {
-                                    Self::finite_value_may_be_in_zone(value, zone)
+                                    value >= &zone.min && value <= &zone.max
                                 }
                             }
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_finite_min(zone) {
+                                    false
                                 } else {
-                                    Self::finite_value_may_be_in_zone(value, zone)
+                                    value >= &zone.min && value <= &zone.max
                                 }
                             }
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_finite_min(zone) {
+                                    false
                                 } else {
-                                    Self::finite_value_may_be_in_zone(value, zone)
+                                    value >= &zone.min && value <= &zone.max
                                 }
                             }
                             _ => {
@@ -639,13 +630,13 @@ impl ScalarIndex for ZoneMapIndex {
         let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
         builder.options.rows_per_zone = self.rows_per_zone;
         builder.maps = updated_zones;
-        builder.write_index(dest_store).await?;
+        let file = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -659,6 +650,57 @@ impl ScalarIndex for ZoneMapIndex {
         let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
     }
+}
+
+/// Merge caller-selected ZoneMap segments into one self-contained segment.
+pub async fn merge_zonemap_indices(
+    source_indices: &[&ZoneMapIndex],
+    dest_store: &dyn IndexStore,
+    fragment_filter: &RoaringBitmap,
+) -> Result<CreatedIndex> {
+    let first = source_indices.first().ok_or_else(|| {
+        Error::invalid_input("merge_zonemap_indices requires at least one source index")
+    })?;
+    let rows_per_zone = first.rows_per_zone;
+    let data_type = first.data_type.clone();
+
+    let mut zones = Vec::new();
+    for source in source_indices {
+        if source.rows_per_zone != rows_per_zone {
+            return Err(Error::invalid_input(format!(
+                "cannot merge ZoneMap segments with different rows_per_zone values: {} and {}",
+                rows_per_zone, source.rows_per_zone
+            )));
+        }
+        if source.data_type != data_type {
+            return Err(Error::invalid_input(format!(
+                "cannot merge ZoneMap segments with different value types: {:?} and {:?}",
+                data_type, source.data_type
+            )));
+        }
+        zones.extend(
+            source
+                .zones
+                .iter()
+                .filter(|zone| {
+                    u32::try_from(zone.bound.fragment_id)
+                        .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+                })
+                .cloned(),
+        );
+    }
+    zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
+
+    let mut builder =
+        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(rows_per_zone), data_type)?;
+    builder.maps = zones;
+    builder.write_index(dest_store).await?;
+
+    Ok(CreatedIndex {
+        index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap(),
+        index_version: ZONEMAP_INDEX_VERSION,
+        files: dest_store.list_files_with_sizes().await?,
+    })
 }
 
 fn default_rows_per_zone() -> u64 {
@@ -772,7 +814,7 @@ impl ZoneMapIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
         let record_batch = self.zonemap_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -785,8 +827,7 @@ impl ZoneMapIndexBuilder {
             .new_index_file(ZONEMAP_FILENAME, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await?;
-        Ok(())
+        index_file.finish().await
     }
 }
 
@@ -891,7 +932,7 @@ impl ZoneMapIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<ZoneMapIndexBuilderParams>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         // train_zonemap_index: calling scan_aligned_chunks
         let value_type = batches_source.schema().field(0).data_type().clone();
 
@@ -899,8 +940,7 @@ impl ZoneMapIndexPlugin {
 
         builder.train(batches_source).await?;
 
-        builder.write_index(index_store).await?;
-        Ok(())
+        builder.write_index(index_store).await
     }
 }
 
@@ -984,12 +1024,12 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        let file = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
                 .unwrap(),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -1388,6 +1428,17 @@ mod tests {
                 i
             );
         }
+
+        let zone = &index.zones[0];
+        assert!(matches!(
+            zone.max,
+            ScalarValue::Float32(Some(value)) if value.is_nan()
+        ));
+        let finite_target = ScalarValue::Float32(Some(1000.0));
+        assert!(
+            finite_target >= zone.min && finite_target <= zone.max,
+            "ScalarValue total ordering keeps finite values below NaN max"
+        );
 
         // Test search for NaN values using Equals with NaN
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));

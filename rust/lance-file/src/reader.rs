@@ -13,8 +13,8 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use deepsize::{Context, DeepSizeOf};
 use futures::{Stream, StreamExt, stream::BoxStream};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_encoding::{
     EncodingsIo,
     decoder::{
@@ -467,6 +467,23 @@ impl FileReader {
             metadata: self.metadata.clone(),
             options: self.options.clone(),
             num_rows: self.num_rows,
+        }
+    }
+
+    /// Returns a clone of this reader whose I/O is additionally recorded into
+    /// `stats`, on top of the scheduler's global accounting.
+    ///
+    /// All cached metadata is shared with `self`, so no file is re-opened and
+    /// only a few `Arc` clones are performed.  If the underlying I/O service
+    /// does not support per-scope statistics (e.g. an in-memory scheduler), the
+    /// returned reader is an ordinary, uninstrumented clone.
+    pub fn with_io_stats(
+        &self,
+        stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
+    ) -> Self {
+        match self.scheduler.with_io_stats(stats) {
+            Some(scheduler) => self.with_scheduler(scheduler),
+            None => self.clone(),
         }
     }
 
@@ -2511,7 +2528,7 @@ mod tests {
         // column_metadatas and column_infos, otherwise the moka cache weigher
         // dramatically underestimates entry sizes and never evicts, causing
         // unbounded memory growth on random-access workloads.
-        use deepsize::DeepSizeOf;
+        use lance_core::deepsize::DeepSizeOf;
 
         let fs = FsFixture::default();
         let _written = create_some_file(&fs, version).await;

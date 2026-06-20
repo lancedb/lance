@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use deepsize::DeepSizeOf;
 use lance_core::Error;
+use lance_core::deepsize::DeepSizeOf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -48,7 +48,7 @@ pub struct MergedGeneration {
 }
 
 impl DeepSizeOf for MergedGeneration {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0 // UUID is 16 bytes fixed size, no heap allocations
     }
 }
@@ -169,7 +169,7 @@ pub struct ShardManifest {
 }
 
 impl DeepSizeOf for ShardManifest {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.shard_field_values.deep_size_of_children(context)
             + self.flushed_generations.deep_size_of_children(context)
     }

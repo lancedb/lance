@@ -50,6 +50,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -141,6 +142,30 @@ public class MemWalTest {
       return Dataset.write().allocator(allocator).reader(reader).uri(path).execute();
     }
   }
+
+  /**
+   * Stage a <em>faithful</em> flushed generation at {@code genPath}: the Lance dataset plus its
+   * primary-key dedup sidecar ({@code _pk_index/}), mirroring what production flush emits. The LSM
+   * scanner's cross-generation block-list opens the sidecar, so a dataset alone (no sidecar) is not
+   * a state production produces. Mirrors the Python {@code _write_flushed_gen} test helper.
+   */
+  private static void writeFlushedGen(
+      BufferAllocator allocator, String genPath, long[] ids, String prefix) throws Exception {
+    writeLookupDataset(allocator, genPath, ids, prefix).close();
+    try (VectorSchemaRoot root = lookupRoot(allocator, ids, prefix);
+        ArrowReader reader = toReader(allocator, root);
+        ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+      Data.exportArrayStream(allocator, reader, stream);
+      nativeWritePkSidecar(genPath, stream.memoryAddress(), Collections.singletonList("id"));
+    }
+  }
+
+  /**
+   * Test-support native: write the primary-key dedup sidecar for a flushed-generation dataset
+   * already staged at {@code genPath}. See {@link #writeFlushedGen}.
+   */
+  private static native void nativeWritePkSidecar(
+      String genPath, long streamAddress, List<String> pkColumns);
 
   /** Read an LSM scanner fully into an {@code id -> name} map. */
   private static Map<Long, String> readByName(ArrowReader reader) throws Exception {
@@ -367,7 +392,7 @@ public class MemWalTest {
 
       // Flushed generation overwrites id=2.
       String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
-      writeLookupDataset(allocator, genPath, new long[] {2}, "gen1").close();
+      writeFlushedGen(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
           new ShardSnapshot(shardId).withFlushedGeneration(1, "gen_1").withCurrentGeneration(2);
@@ -393,7 +418,7 @@ public class MemWalTest {
       dataset.initializeMemWal(new InitializeMemWalParams());
 
       String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
-      writeLookupDataset(allocator, genPath, new long[] {2}, "gen1").close();
+      writeFlushedGen(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
           new ShardSnapshot(shardId).withFlushedGeneration(1, "gen_1").withCurrentGeneration(2);

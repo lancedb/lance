@@ -15,10 +15,10 @@ use arrow_array::{
     types::{Float16Type, Float32Type, Float64Type, Int8Type},
 };
 use arrow_schema::DataType;
-use deepsize::DeepSizeOf;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::assume_eq;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;

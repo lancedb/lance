@@ -9,11 +9,11 @@ use std::{collections::BTreeMap, io::Read};
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
-use lance_core::cache::CacheCodecImpl;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 
@@ -308,7 +308,7 @@ pub enum RowAddrSelection {
 }
 
 impl DeepSizeOf for RowAddrSelection {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Full => 0,
             Self::Partial(bitmap) => bitmap.serialized_size(),
@@ -692,12 +692,17 @@ impl RowAddrTreeMap {
 }
 
 impl CacheCodecImpl for RowAddrTreeMap {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
-        self.serialize_into(writer)
+    const TYPE_ID: &'static str = "lance.RowAddrTreeMap";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        // A roaring bitmap has its own stable, portable serialization; it is
+        // the whole body, so write it raw rather than length-prefixed.
+        self.serialize_into(w.raw_writer())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
-        Self::deserialize_from(data.as_ref())
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        Self::deserialize_from(r.body().as_ref())
     }
 }
 
@@ -1866,7 +1871,7 @@ mod tests {
 
     #[test]
     fn test_row_addr_selection_deep_size_of() {
-        use deepsize::DeepSizeOf;
+        use lance_core::deepsize::DeepSizeOf;
 
         // Test Full variant - should have minimal size (just the enum discriminant)
         let full = RowAddrSelection::Full;

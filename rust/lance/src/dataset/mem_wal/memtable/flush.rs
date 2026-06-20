@@ -18,7 +18,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
-use log::info;
+use log::{info, warn};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -29,6 +29,7 @@ use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
 use crate::Dataset;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
+use crate::dataset::mem_wal::scanner::GenerationWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
 
@@ -68,6 +69,9 @@ pub struct MemTableFlusher {
     base_uri: String,
     shard_id: Uuid,
     manifest_store: Arc<ShardManifestStore>,
+    /// When present, each new generation is warmed before it is committed, so
+    /// the first query sees zero cold reads. `None` => no warming.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
 impl MemTableFlusher {
@@ -84,6 +88,26 @@ impl MemTableFlusher {
             base_uri: base_uri.into(),
             shard_id,
             manifest_store,
+            warmer: None,
+        }
+    }
+
+    /// Attach the warmer fired pre-commit for each new generation.
+    pub fn with_warmer(mut self, warmer: Option<Arc<dyn GenerationWarmer>>) -> Self {
+        self.warmer = warmer;
+        self
+    }
+
+    /// Warm a just-written generation before it is committed. Best-effort: a
+    /// failure is logged and the flush proceeds — warming is never a commit
+    /// gate. No-op without a warmer. `uri` must be the resolved reader path
+    /// (`path_to_uri(gen_path)`) so warmed entries key-match later queries.
+    async fn warm_generation(&self, uri: &str) {
+        let Some(warmer) = &self.warmer else {
+            return;
+        };
+        if let Err(e) = warmer.warm(uri).await {
+            warn!("pre-commit warm failed for generation {uri}; committing cold: {e}");
         }
     }
 
@@ -177,6 +201,16 @@ impl MemTableFlusher {
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
+
+        // Write the standalone primary-key dedup sidecar. A primary key needs
+        // no secondary index, so this is required on the plain-flush path too —
+        // the LSM scanner opens it to dedup the generation. (`flush_with_indexes`
+        // writes it on the indexed path.) No-op when the memtable has no PK.
+        self.create_pk_index(&gen_path, memtable.indexes()).await?;
+
+        // Warm before commit (zero cold window); no-op without a warmer.
+        let warm_uri = self.path_to_uri(&gen_path);
+        self.warm_generation(&warm_uri).await;
 
         let new_manifest = self
             .update_manifest(
@@ -449,6 +483,10 @@ impl MemTableFlusher {
             all_indexes.extend(fts_indexes);
         }
 
+        // Write the standalone primary-key dedup index (sidecar, not a manifest
+        // index — the block-list opens it directly by path).
+        self.create_pk_index(&gen_path, memtable.indexes()).await?;
+
         // Write a single manifest that records the fragments, the
         // within-generation deletion vector, and all indexes, overwriting the
         // data-only v1 manifest created by Dataset::write.
@@ -458,6 +496,10 @@ impl MemTableFlusher {
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
+
+        // Warm before commit (zero cold window); no-op without a warmer.
+        let warm_uri = self.path_to_uri(&gen_path);
+        self.warm_generation(&warm_uri).await;
 
         let new_manifest = self
             .update_manifest(
@@ -541,6 +583,49 @@ impl MemTableFlusher {
         }
 
         Ok(created_indexes)
+    }
+
+    /// Write the standalone primary-key dedup index for this generation.
+    ///
+    /// Unlike user indexes, this is a **sidecar**: it is not registered in the
+    /// manifest. The block-list opens it directly by path
+    /// ([`pk_index_path`]) and probes it with `Equals`. Single-column primary
+    /// keys index the typed value; composite keys index the order-preserving
+    /// `Binary` encoded tuple (see [`super::super::index::encode_pk_tuple`]).
+    /// Row positions line up 1:1 with the forward-written data file, so they are
+    /// the flushed row ids directly. No-op without a primary-key index.
+    async fn create_pk_index(
+        &self,
+        gen_path: &Path,
+        mem_indexes: Option<&super::super::index::IndexStore>,
+    ) -> Result<()> {
+        use datafusion::physical_plan::SendableRecordBatchStream;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_index::scalar::btree::train_btree_index;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+
+        use crate::dataset::mem_wal::util::pk_index_path;
+
+        let Some(registry) = mem_indexes else {
+            return Ok(());
+        };
+        let batches = registry.pk_training_batches(8192)?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let schema = batches[0].schema();
+        let store = LanceIndexStore::new(
+            self.object_store.clone(),
+            pk_index_path(gen_path),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ));
+        train_btree_index(stream, &store, 8192, None, None).await?;
+        Ok(())
     }
 
     /// Create FTS (Full-Text Search) indexes from in-memory data (uncommitted).
@@ -965,21 +1050,30 @@ impl MemTableFlusher {
     }
 }
 
-/// Message to trigger flush of a frozen memtable to Lance storage.
-pub struct TriggerMemTableFlush {
-    /// The frozen memtable to flush.
-    pub memtable: Arc<MemTable>,
-    /// Optional channel to notify when flush completes.
-    pub done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
+/// Message driving the background memtable-flush task.
+pub enum TriggerMemTableFlush {
+    /// Flush a frozen memtable to Lance storage.
+    Flush {
+        /// The frozen memtable to flush.
+        memtable: Arc<MemTable>,
+        /// Optional channel to notify when flush completes.
+        done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
+    },
+    /// Periodic tick: evict frozen memtables whose post-flush grace has elapsed.
+    SweepExpired,
 }
 
 impl std::fmt::Debug for TriggerMemTableFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TriggerMemTableFlush")
-            .field("memtable_gen", &self.memtable.generation())
-            .field("memtable_rows", &self.memtable.row_count())
-            .field("has_done", &self.done.is_some())
-            .finish()
+        match self {
+            Self::Flush { memtable, done } => f
+                .debug_struct("TriggerMemTableFlush::Flush")
+                .field("memtable_gen", &memtable.generation())
+                .field("memtable_rows", &memtable.row_count())
+                .field("has_done", &done.is_some())
+                .finish(),
+            Self::SweepExpired => f.write_str("TriggerMemTableFlush::SweepExpired"),
+        }
     }
 }
 
@@ -1139,6 +1233,79 @@ mod tests {
         assert_eq!(updated_manifest.flushed_generations.len(), 1);
     }
 
+    /// A `GenerationWarmer` that counts calls and optionally fails.
+    #[derive(Debug)]
+    struct CountingWarmer {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl GenerationWarmer for CountingWarmer {
+        async fn warm(&self, _path: &str) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                Err(Error::io("simulated warm failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Warming is a best-effort optimization, never a commit gate: a warmer that
+    /// errors pre-commit must still let the flush commit the generation. The
+    /// warm fires exactly once on the pre-commit path.
+    #[tokio::test]
+    async fn test_flusher_commits_when_warm_fails() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let schema = create_test_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let frag_id = memtable
+            .insert(create_test_batch(&schema, 10))
+            .await
+            .unwrap();
+        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let warmer: Arc<dyn GenerationWarmer> = Arc::new(CountingWarmer {
+            calls: calls.clone(),
+            fail: true,
+        });
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path,
+            base_uri,
+            shard_id,
+            manifest_store.clone(),
+        )
+        .with_warmer(Some(warmer));
+        // Flush must succeed despite the warmer erroring.
+        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+
+        assert_eq!(result.generation.generation, 1);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "pre-commit warm fires exactly once"
+        );
+        let updated = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(
+            updated.flushed_generations.len(),
+            1,
+            "generation still committed after a failed warm"
+        );
+    }
+
     /// Flushing a generation with within-generation duplicate PKs writes a
     /// deletion vector so the flushed dataset exposes newest-per-PK on scan.
     #[tokio::test]
@@ -1225,6 +1392,202 @@ mod tests {
         assert_eq!(rows.get(&1), Some(&"a2".to_string()));
         assert_eq!(rows.get(&2), Some(&"b".to_string()));
         assert_eq!(rows.get(&3), Some(&"c2".to_string()));
+    }
+
+    /// Flushing a memtable with a primary-key index writes a standalone sidecar
+    /// BTree at `{gen}/_pk_index` that the block-list can reopen by path and
+    /// probe by value — including for a within-gen-superseded PK (existence,
+    /// not visibility).
+    #[tokio::test]
+    async fn flushed_pk_index_sidecar_is_probeable() {
+        use lance_core::cache::LanceCache;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::registry::IndexPluginRegistry;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+
+        use super::super::super::index::IndexStore;
+        use crate::dataset::mem_wal::util::pk_index_path;
+        use datafusion::common::ScalarValue;
+
+        let (store, base_path, _base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        // Primary-key index on `id`, no user indexes.
+        let schema = create_pk_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let mut registry = IndexStore::new();
+        registry.enable_pk_index(&[("id".to_string(), 0)]);
+        memtable.set_indexes(registry);
+
+        // id=1 updated in-gen (a -> a2); id=2 unique.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 1])),
+                Arc::new(StringArray::from(vec!["a", "b", "a2"])),
+            ],
+        )
+        .unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            _base_uri.clone(),
+            shard_id,
+            manifest_store.clone(),
+        );
+        let result = flusher
+            .flush_with_indexes(&memtable, epoch, &[], 1)
+            .await
+            .unwrap();
+
+        // Reopen the sidecar directly by path (the block-list's route).
+        let gen_path = base_path
+            .clone()
+            .join("_mem_wal")
+            .join(shard_id.to_string())
+            .join(result.generation.path.as_str());
+        let index_store = Arc::new(LanceIndexStore::new(
+            store.clone(),
+            pk_index_path(&gen_path),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("BTree").unwrap();
+        let details =
+            prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
+        let index = plugin
+            .load_index(index_store, &details, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let contains = |id: i32| {
+            let index = index.clone();
+            async move {
+                let result = index
+                    .search(
+                        &SargableQuery::Equals(ScalarValue::Int32(Some(id))),
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                match result {
+                    SearchResult::Exact(s) | SearchResult::AtMost(s) | SearchResult::AtLeast(s) => {
+                        !s.is_empty()
+                    }
+                }
+            }
+        };
+        // Both PKs present (id=1 even though its first version was superseded);
+        // an absent PK is not.
+        assert!(contains(1).await);
+        assert!(contains(2).await);
+        assert!(!contains(99).await);
+    }
+
+    /// Regression: production dispatches a PK-only flush (a primary key, no
+    /// secondary index) to `flush`, not `flush_with_indexes`. `flush` must still
+    /// write the PK dedup sidecar, otherwise cross-generation dedup fails with
+    /// `page_lookup.lance not found`.
+    #[tokio::test]
+    async fn plain_flush_writes_pk_sidecar() {
+        use lance_core::cache::LanceCache;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::registry::IndexPluginRegistry;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+
+        use super::super::super::index::IndexStore;
+        use crate::dataset::mem_wal::util::pk_index_path;
+        use datafusion::common::ScalarValue;
+
+        let (store, base_path, _base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        // Primary-key index on `id`, no user indexes.
+        let schema = create_pk_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let mut registry = IndexStore::new();
+        registry.enable_pk_index(&[("id".to_string(), 0)]);
+        memtable.set_indexes(registry);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path.clone(),
+            _base_uri.clone(),
+            shard_id,
+            manifest_store.clone(),
+        );
+        // The plain-flush path — what the writer dispatches to with no indexes.
+        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+
+        let gen_path = base_path
+            .clone()
+            .join("_mem_wal")
+            .join(shard_id.to_string())
+            .join(result.generation.path.as_str());
+        let index_store = Arc::new(LanceIndexStore::new(
+            store.clone(),
+            pk_index_path(&gen_path),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("BTree").unwrap();
+        let details =
+            prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default()).unwrap();
+        let index = plugin
+            .load_index(index_store, &details, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let contains = |id: i32| {
+            let index = index.clone();
+            async move {
+                let result = index
+                    .search(
+                        &SargableQuery::Equals(ScalarValue::Int32(Some(id))),
+                        &NoOpMetricsCollector,
+                    )
+                    .await
+                    .unwrap();
+                match result {
+                    SearchResult::Exact(s) | SearchResult::AtMost(s) | SearchResult::AtLeast(s) => {
+                        !s.is_empty()
+                    }
+                }
+            }
+        };
+        assert!(contains(1).await);
+        assert!(contains(2).await);
+        assert!(!contains(99).await);
     }
 
     /// Covers `finalize_generation` writing both a deletion vector *and*

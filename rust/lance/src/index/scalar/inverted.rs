@@ -64,7 +64,7 @@ pub(crate) async fn finalize_segment_files_if_needed(
 
     let store = Arc::new(LanceIndexStore::from_dataset_for_new(
         dataset,
-        &segment.uuid.to_string(),
+        &segment.uuid,
     )?);
     lance_index::scalar::inverted::builder::merge_index_files(
         dataset.object_store.as_ref(),
@@ -118,7 +118,7 @@ pub(crate) async fn merge_segments(
     }
 
     let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid.to_string())?;
+    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, field_id)?,
@@ -137,7 +137,7 @@ pub(crate) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: created_index.files,
+        files: Some(created_index.files),
         ..segments[0].clone()
     })
 }

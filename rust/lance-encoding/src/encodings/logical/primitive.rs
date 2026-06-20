@@ -3701,12 +3701,7 @@ struct SerializedFullZip {
 //
 // If we directly record the size in bytes with 12 bits we would be limited to
 // 4KiB which is too small.  Since we know each mini-block consists of 8 byte
-// words we can store the # of words instead which gives us 32KiB.  We want
-// at least 24KiB so we can handle even the worst case of
-// - 4Ki values compressed into an 8186 byte buffer
-// - 4 bytes to describe rep & def lengths
-// - 16KiB of rep & def buffer (this will almost never happen but life is easier if we
-//   plan for it)
+// words we can store the # of words instead which gives us 32KiB.
 //
 // Second, each chunk in a mini-block is aligned to 8 bytes.  This allows multi-byte
 // values like offsets to be stored in a mini-block and safely read back out.  It also
@@ -3906,9 +3901,9 @@ impl PrimitiveStructuralEncoder {
     // 0xA)  All blocks except the last must have power-of-two number of values.
     // This not only makes metadata smaller but it makes decoding easier since
     // batch sizes are typically a power of 2.  4 bits would allow us to express
-    // up to 16Ki values but we restrict this further to 4Ki values.
+    // up to 32Ki values.
     //
-    // This means blocks can have 1 to 4Ki values and 8 - 32Ki bytes.
+    // This means blocks can have 1 to 32Ki values and 8 - 32Ki bytes.
     //
     // All metadata words are serialized (as little endian) into a single buffer
     // of metadata values.
@@ -4007,7 +4002,13 @@ impl PrimitiveStructuralEncoder {
                 }
             } else {
                 for &buffer_size in &chunk.buffer_sizes {
-                    data_buffer.extend_from_slice(&(buffer_size as u16).to_le_bytes());
+                    let buffer_size = u16::try_from(buffer_size).map_err(|_| {
+                        Error::internal(format!(
+                            "Mini-block buffer size ({} bytes) too large for 16-bit metadata",
+                            buffer_size
+                        ))
+                    })?;
+                    data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
                 }
             }
 
@@ -4041,15 +4042,28 @@ impl PrimitiveStructuralEncoder {
 
             let chunk_bytes = data_buffer.len() - start_pos;
             let max_chunk_size = if support_large_chunk {
-                4 * 1024 * 1024 * 1024 // 4GB limit with u32 metadata
+                1_u64 << 31 // 28 bits of 8-byte words in u32 metadata
             } else {
                 32 * 1024 // 32KiB limit with u16 metadata
             };
-            assert!(chunk_bytes <= max_chunk_size);
-            assert!(chunk_bytes > 0);
-            assert_eq!(chunk_bytes % 8, 0);
-            // 4Ki values max
-            assert!(chunk.log_num_values <= 12);
+            if chunk_bytes == 0 || chunk_bytes as u64 > max_chunk_size {
+                return Err(Error::internal(format!(
+                    "Mini-block chunk size {} bytes exceeds the {} byte metadata limit",
+                    chunk_bytes, max_chunk_size
+                )));
+            }
+            if chunk_bytes % MINIBLOCK_ALIGNMENT != 0 {
+                return Err(Error::internal(format!(
+                    "Mini-block chunk size {} bytes is not aligned to {} bytes",
+                    chunk_bytes, MINIBLOCK_ALIGNMENT
+                )));
+            }
+            if chunk.log_num_values > 15 {
+                return Err(Error::internal(format!(
+                    "Mini-block log_num_values {} exceeds the 4-bit metadata limit",
+                    chunk.log_num_values
+                )));
+            }
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
             // 0xFFF
@@ -5081,13 +5095,19 @@ impl PrimitiveStructuralEncoder {
         let max_encoded_size = (data_size as f64 * threshold_ratio) as u64;
         let max_encoded_size = usize::try_from(max_encoded_size).ok()?;
 
-        // Avoid probing dictionary encoding on data that appears to be near-unique.
-        if Self::sample_is_near_unique(
-            data_block,
-            DEFAULT_SAMPLE_SIZE,
-            DEFAULT_SAMPLE_UNIQUE_RATIO,
-        )? {
-            return None;
+        // Avoid probing dictionary encoding on data that appears to be near-unique
+        // or likely to exceed the dictionary budget.
+        if let Some(sample_unique_ratio) =
+            Self::sample_unique_ratio(data_block, DEFAULT_SAMPLE_SIZE)?
+        {
+            if sample_unique_ratio >= DEFAULT_SAMPLE_UNIQUE_RATIO {
+                return None;
+            }
+
+            let projected_cardinality = (sample_unique_ratio * num_values as f64).ceil() as u64;
+            if projected_cardinality > threshold_cardinality {
+                return None;
+            }
         }
 
         let max_dict_entries = u32::try_from(threshold_cardinality.min(i32::MAX as u64)).ok()?;
@@ -5097,66 +5117,79 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    /// Probe whether a page looks near-unique before attempting dictionary encoding.
+    /// Samples whether a page looks near-unique before attempting dictionary encoding.
     ///
-    /// The probe uses deterministic stride sampling (not RNG sampling), which keeps
+    /// The probe uses deterministic block sampling (not RNG sampling), which keeps
     /// the check cheap and reproducible across runs. The result is only a gate for
     /// whether we try dictionary encoding, not a cardinality statistic.
-    fn sample_is_near_unique(
-        data_block: &DataBlock,
-        max_samples: usize,
-        unique_ratio_threshold: f64,
-    ) -> Option<bool> {
+    /// Returns `Some(None)` when there are too few reliable samples or the block type does not
+    /// support dictionary encoding. Returns `None` for malformed data.
+    fn sample_unique_ratio(data_block: &DataBlock, max_samples: usize) -> Option<Option<f64>> {
         use std::collections::HashSet;
 
-        if unique_ratio_threshold <= 0.0 || unique_ratio_threshold > 1.0 {
-            return None;
-        }
+        const NUM_SAMPLE_BLOCKS: usize = 32;
+        const MIN_RELIABLE_SAMPLES: usize = 1024;
 
         let num_values = usize::try_from(data_block.num_values()).ok()?;
         if num_values == 0 {
-            return Some(false);
+            return Some(None);
         }
 
         let sample_count = num_values.min(max_samples).max(1);
-        // Uniform stride sampling across the page.
-        let step = (num_values / sample_count).max(1);
+        if sample_count < MIN_RELIABLE_SAMPLES {
+            return Some(None);
+        }
 
-        match data_block {
+        let block_count = NUM_SAMPLE_BLOCKS.min(sample_count).min(num_values).max(1);
+        let samples_per_block = (sample_count / block_count).max(1);
+        let mut indices = Vec::with_capacity(sample_count);
+        for block_idx in 0..block_count {
+            let block_start = block_idx * num_values / block_count;
+            let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
+            let block_len = next_block_start.saturating_sub(block_start);
+            let samples_in_block = samples_per_block.min(block_len);
+            indices.extend((0..samples_in_block).map(|offset| block_start + offset));
+        }
+
+        if indices.len() < MIN_RELIABLE_SAMPLES {
+            return Some(None);
+        }
+
+        let ratio = match data_block {
             DataBlock::FixedWidth(fixed) => match fixed.bits_per_value {
                 64 => {
                     let values = fixed.data.borrow_to_typed_slice::<u64>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u64> = HashSet::with_capacity(sample_count.min(1024));
-                    for idx in (0..num_values).step_by(step).take(sample_count) {
+                    let mut unique: HashSet<u64> =
+                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
+                    for idx in indices.iter().copied() {
                         unique.insert(values.get(idx).copied()?);
                     }
-                    let ratio = unique.len() as f64 / sample_count as f64;
-                    // Avoid overreacting to tiny pages with too few samples.
-                    Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                    unique.len() as f64 / indices.len() as f64
                 }
                 128 => {
                     let values = fixed.data.borrow_to_typed_slice::<u128>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u128> = HashSet::with_capacity(sample_count.min(1024));
-                    for idx in (0..num_values).step_by(step).take(sample_count) {
+                    let mut unique: HashSet<u128> =
+                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
+                    for idx in indices.iter().copied() {
                         unique.insert(values.get(idx).copied()?);
                     }
-                    let ratio = unique.len() as f64 / sample_count as f64;
-                    Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                    unique.len() as f64 / indices.len() as f64
                 }
-                _ => Some(false),
+                _ => return Some(None),
             },
             DataBlock::VariableWidth(var) => {
                 use xxhash_rust::xxh3::xxh3_64;
 
                 // Hash variable-width slices instead of storing borrowed slice keys.
-                let mut unique: HashSet<u64> = HashSet::with_capacity(sample_count.min(1024));
+                let mut unique: HashSet<u64> =
+                    HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
                 match var.bits_per_offset {
                     32 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u32>();
                         let offsets: &[u32] = offsets_ref.as_ref();
-                        for i in (0..num_values).step_by(step).take(sample_count) {
+                        for i in indices.iter().copied() {
                             let start = usize::try_from(*offsets.get(i)?).ok()?;
                             let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
                             if start > end || end > var.data.len() {
@@ -5168,7 +5201,7 @@ impl PrimitiveStructuralEncoder {
                     64 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u64>();
                         let offsets: &[u64] = offsets_ref.as_ref();
-                        for i in (0..num_values).step_by(step).take(sample_count) {
+                        for i in indices.iter().copied() {
                             let start = usize::try_from(*offsets.get(i)?).ok()?;
                             let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
                             if start > end || end > var.data.len() {
@@ -5177,13 +5210,14 @@ impl PrimitiveStructuralEncoder {
                             unique.insert(xxh3_64(&var.data[start..end]));
                         }
                     }
-                    _ => return Some(false),
+                    _ => return Some(None),
                 }
-                let ratio = unique.len() as f64 / sample_count as f64;
-                Some(sample_count >= 1024 && ratio >= unique_ratio_threshold)
+                unique.len() as f64 / indices.len() as f64
             }
-            _ => Some(false),
-        }
+            _ => return Some(None),
+        };
+
+        Some(Some(ratio))
     }
 
     fn slice_repdef(repdef: &SerializedRepDefs, range: Range<usize>) -> SerializedRepDefs {
@@ -5748,8 +5782,9 @@ mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
         FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor,
-        PreambleAction, StructuralPageScheduler, VariableFullZipDecoder,
+        FullZipRepIndexDetails, FullZipScheduler, MiniBlockChunk, MiniBlockCompressed,
+        MiniBlockRepIndex, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
+        VariableFullZipDecoder,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::DefaultDecompressionStrategy;
@@ -6947,7 +6982,7 @@ mod tests {
     #[tokio::test]
     async fn test_binary_large_minichunk_size_over_max_miniblock_values() {
         let mut string_data = Vec::new();
-        // 128kb/chunk / 6 bytes (t_9999) = 21845 > max 4096 items per chunk
+        // 128kb/chunk / 6 bytes (t_9999) = 21845 items per chunk
         for i in 0..10000 {
             string_data.push(Some(format!("t_{}", i)));
         }
@@ -7364,6 +7399,24 @@ mod tests {
         DataBlock::from_array(Arc::new(array) as ArrayRef)
     }
 
+    fn create_sorted_string_array(num_values: u64, cardinality: u64) -> ArrayRef {
+        use arrow_array::StringArray;
+
+        assert!(cardinality <= num_values && cardinality > 0);
+
+        let mut values = Vec::with_capacity(num_values as usize);
+        for i in 0..num_values {
+            let value_idx = i * cardinality / num_values;
+            values.push(format!("value_{:016}", value_idx));
+        }
+
+        Arc::new(StringArray::from(values)) as ArrayRef
+    }
+
+    fn create_sorted_variable_width_block(num_values: u64, cardinality: u64) -> DataBlock {
+        DataBlock::from_array(create_sorted_string_array(num_values, cardinality))
+    }
+
     #[test]
     fn test_should_dictionary_encode() {
         use crate::constants::DICT_SIZE_RATIO_META_KEY;
@@ -7388,6 +7441,93 @@ mod tests {
             result.is_some(),
             "Should use dictionary encode based on size"
         );
+    }
+
+    #[test]
+    fn test_block_sampling_detects_low_cardinality_in_short_sorted_runs() {
+        let sample_count: usize = 4096;
+        let num_values: u64 = 200_000;
+        let cardinality: u64 = 8_000;
+        let run_length = num_values / cardinality;
+        let stride = num_values as usize / sample_count;
+        assert!(
+            stride > run_length as usize,
+            "test must construct the stride > run_length case"
+        );
+
+        let block = create_sorted_variable_width_block(num_values, cardinality);
+        let sample_unique_ratio =
+            PrimitiveStructuralEncoder::sample_unique_ratio(&block, sample_count).unwrap();
+
+        assert!(
+            sample_unique_ratio.is_some_and(|ratio| ratio < 0.98),
+            "sorted low-cardinality data must not be classified as near-unique"
+        );
+    }
+
+    #[test]
+    fn test_should_dictionary_encode_sorted_low_cardinality() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let block = create_sorted_variable_width_block(200_000, 8_000);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_2,
+        );
+
+        assert!(
+            result.is_some(),
+            "sorted low-cardinality data should reach dictionary encoding"
+        );
+    }
+
+    #[test]
+    fn test_should_not_dictionary_encode_sorted_high_cardinality_short_runs() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+        use lance_core::datatypes::Field as LanceField;
+
+        let num_values = 200_002;
+        let cardinality = 100_001;
+        let block = create_sorted_variable_width_block(num_values, cardinality);
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let arrow_field =
+            arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+        let field = LanceField::try_from(&arrow_field).unwrap();
+
+        let result = PrimitiveStructuralEncoder::should_dictionary_encode(
+            &block,
+            &field,
+            LanceFileVersion::V2_2,
+        );
+
+        assert!(
+            result.is_none(),
+            "sorted high-cardinality short runs should not trigger a full dictionary probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encode_sorted_low_cardinality_uses_dictionary_layout() {
+        use crate::constants::DICT_SIZE_RATIO_META_KEY;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.8".to_string());
+        let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
+        let array = create_sorted_string_array(200_000, 8_000);
+
+        let page = encode_first_page(field, array, LanceFileVersion::V2_2).await;
+        let _ = dictionary_encoding_from_page(&page);
     }
 
     #[test]
@@ -7438,6 +7578,36 @@ mod tests {
         assert!(
             result.is_none(),
             "Should not probe dictionary encoding for near-unique data"
+        );
+    }
+
+    #[test]
+    fn test_v2_1_miniblock_serializes_log_num_values_15() {
+        let miniblocks = MiniBlockCompressed {
+            data: vec![LanceBuffer::from(vec![1_u8; 16])],
+            chunks: vec![
+                MiniBlockChunk {
+                    buffer_sizes: vec![8],
+                    log_num_values: 15,
+                },
+                MiniBlockChunk {
+                    buffer_sizes: vec![8],
+                    log_num_values: 0,
+                },
+            ],
+            num_values: 32_769,
+        };
+
+        let serialized =
+            PrimitiveStructuralEncoder::serialize_miniblocks(miniblocks, None, None, false)
+                .unwrap();
+
+        let chunk_metadata = serialized.metadata.borrow_to_typed_slice::<u16>();
+        assert_eq!(chunk_metadata.len(), 2);
+        assert_eq!(
+            chunk_metadata[0] & 0x0F,
+            15,
+            "V2.1 metadata should use all 4 bits for log_num_values"
         );
     }
 

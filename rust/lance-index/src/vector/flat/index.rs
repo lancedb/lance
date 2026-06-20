@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::DistanceType;
@@ -20,10 +20,12 @@ use crate::{
     metrics::MetricsCollector,
     prefilter::PreFilter,
     vector::{
-        DIST_COL, Query,
+        ApproxMode, DIST_COL, Query,
         graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
-        storage::{DistCalculator, QueryResidual, QueryScratch, VectorStore},
+        storage::{
+            DistCalculator, DistanceCalculatorOptions, QueryResidual, QueryScratch, VectorStore,
+        },
         v3::subindex::IvfSubIndex,
     },
 };
@@ -48,29 +50,6 @@ fn push_candidate_local(
     }
 }
 
-#[inline(always)]
-fn push_candidate_global(
-    res: &mut BinaryHeap<OrderedNode<u64>>,
-    k: usize,
-    row_id: u64,
-    dist: OrderedFloat,
-    max_dist: &mut Option<OrderedFloat>,
-) {
-    if k == 0 {
-        return;
-    }
-    if res.len() < k {
-        res.push(OrderedNode::new(row_id, dist));
-        if res.len() == k {
-            *max_dist = res.peek().map(|node| node.dist);
-        }
-    } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-        res.pop();
-        res.push(OrderedNode::new(row_id, dist));
-        *max_dist = res.peek().map(|node| node.dist);
-    }
-}
-
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results
 #[derive(Debug, Clone, Default, DeepSizeOf)]
@@ -91,6 +70,7 @@ pub struct FlatQueryParams {
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
     dist_q_c: f32,
+    approx_mode: ApproxMode,
 }
 
 impl From<&Query> for FlatQueryParams {
@@ -99,6 +79,7 @@ impl From<&Query> for FlatQueryParams {
             lower_bound: q.lower_bound,
             upper_bound: q.upper_bound,
             dist_q_c: q.dist_q_c,
+            approx_mode: q.approx_mode,
         }
     }
 }
@@ -159,6 +140,9 @@ impl IvfSubIndex for FlatIndex {
             params.dist_q_c,
             residual,
             &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
         );
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
@@ -170,6 +154,7 @@ impl IvfSubIndex for FlatIndex {
                     &mut scratch.distances,
                     &mut scratch.u16,
                     &mut scratch.u8,
+                    &mut scratch.u32,
                 );
                 let dists = scratch.distances.iter().copied();
 
@@ -271,70 +256,46 @@ impl IvfSubIndex for FlatIndex {
         scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
-        let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
             params.dist_q_c,
             residual,
             &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
         );
-        let mut max_dist = res.peek().map(|node| node.dist);
         metrics.record_comparisons(storage.len());
 
         match prefilter.is_empty() {
             true => {
-                dist_calc.distance_all_with_scratch(
+                dist_calc.accumulate_topk_with_scratch(
                     k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    res,
                     &mut scratch.distances,
                     &mut scratch.u16,
                     &mut scratch.u8,
+                    &mut scratch.u32,
                 );
-                let dists = scratch.distances.iter().copied();
-
-                if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-
-                    for (&row_id, dist) in row_ids.zip(dists) {
-                        let dist = dist.into();
-                        if dist < lower_bound || dist >= upper_bound {
-                            continue;
-                        }
-                        push_candidate_global(res, k, row_id, dist, &mut max_dist);
-                    }
-                } else {
-                    for (&row_id, dist) in row_ids.zip(dists) {
-                        let dist = dist.into();
-                        push_candidate_global(res, k, row_id, dist, &mut max_dist);
-                    }
-                }
             }
             false => {
                 let row_addr_mask = prefilter.mask();
-                if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
-                        if dist < lower_bound || dist >= upper_bound {
-                            continue;
-                        }
-
-                        push_candidate_global(res, k, row_addr, dist, &mut max_dist);
-                    }
-                } else {
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
-                        push_candidate_global(res, k, row_addr, dist, &mut max_dist);
-                    }
-                }
+                dist_calc.accumulate_filtered_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    row_ids.enumerate().map(|(id, &row_id)| (id as u32, row_id)),
+                    |row_id| row_addr_mask.selected(row_id),
+                    res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
             }
         };
         Ok(())

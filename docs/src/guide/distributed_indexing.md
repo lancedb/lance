@@ -18,9 +18,10 @@ write:
 3. Lance plans and builds index artifacts from the worker outputs supplied by the caller
 4. the built artifacts are committed into the dataset manifest
 
-For vector indices, the worker outputs are segments stored directly
-under `indices/<segment_uuid>/`. Lance can turn these outputs into one or more
-physical segments and then commit them as one logical index.
+For vector indices and segment-native scalar indices, the worker outputs are
+segments stored directly under `indices/<segment_uuid>/`. Lance can turn these
+outputs into one or more physical segments and then commit them as one logical
+index.
 
 ![Distributed Vector Segment Build](../images/distributed_vector_segment_build.svg)
 
@@ -81,7 +82,7 @@ launching workers and driving the overall workflow.
 
 ## Current Model
 
-The current model for distributed vector indexing has two layers of parallelism.
+The current model for distributed indexing has two layers of parallelism.
 
 ### Worker Build
 
@@ -105,9 +106,46 @@ or merged into larger segments:
 
 Within a single commit, built segments must have disjoint fragment coverage.
 
+`merge_existing_index_segments(...)` currently supports vector, inverted,
+bitmap, BTree, and zone map segments. Other scalar index families can still
+commit multiple compatible segments directly when their build path supports
+fragment-scoped segments, but cannot be merged into a larger physical segment
+until they add a merge implementation.
+
+### Vector Model Scope
+
+Distributed vector builds support two model scopes.
+
+**Shared model artifacts**: the caller trains or provides IVF centroids once and
+passes the same artifacts to every worker. For IVF-PQ segments that should be
+physically mergeable, workers should also use the same PQ codebook. This makes
+partition ids and quantizer state have the same meaning across segments.
+
+**Independent segment models**: each worker trains the IVF/PQ model for its own
+`fragment_ids`. The resulting segments can be committed together as one logical
+index without sharing centroids or codebooks.
+
+At query time, Lance searches each physical segment independently:
+
+1. Lance opens each segment by index UUID
+2. each segment ranks IVF partitions using its own centroids
+3. each segment searches the selected partitions using its own quantizer storage
+4. Lance merges the candidate rows from all segments by `_distance`
+
+Because partition ids are interpreted only within a segment during this fanout
+query path, independently trained committed segments can return valid results.
+For L2 and cosine IVF-PQ, each segment computes residuals against its own IVF
+centroid during both build and query, so distances remain estimates of the
+original query-to-vector metric.
+
+Physical merge is a separate operation. It rewrites several segment artifacts
+into one artifact with one model metadata scope. Use shared compatible model
+artifacts for segments you plan to merge physically, or keep independently
+trained segments as separate physical segments.
+
 ## Internal Finalize Model
 
-Internally, Lance models distributed vector segment build as:
+Internally, Lance models distributed segment build as:
 
 1. **build** one uncommitted segment per worker
 2. **optionally merge** caller-defined groups of existing segments

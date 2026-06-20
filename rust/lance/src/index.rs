@@ -29,9 +29,7 @@ use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
-};
+use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
@@ -57,7 +55,7 @@ use lance_io::utils::{
     read_version,
 };
 use lance_table::format::{Fragment, SelfDescribingFileReader};
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -166,7 +164,8 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
         let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-        if index_details.type_url.ends_with("InvertedIndexDetails") {
+        let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
+        if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
                 name: index_name.to_string(),
@@ -183,7 +182,10 @@ pub(crate) async fn build_index_metadata_from_segments(
                 .await?;
         }
         let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        if is_inverted_index {
+            retain_committed_inverted_files(&mut files);
+        }
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
@@ -199,6 +201,10 @@ pub(crate) async fn build_index_metadata_from_segments(
     }
 
     Ok(new_indices)
+}
+
+fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
+    files.retain(|file| !file.path.starts_with("staging/"));
 }
 
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -272,15 +278,29 @@ fn segment_has_btree_details(segment: &IndexMetadata) -> bool {
     )
 }
 
+fn segment_has_zonemap_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+}
+
+fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("FMIndexIndexDetails"))
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
-    uuid: &'a str,
+    uuid: &'a Uuid,
     fri_uuid: Option<&'a Uuid>,
 }
 
 impl<'a> LegacyVectorIndexCacheKey<'a> {
-    fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+    fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
@@ -292,7 +312,7 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
         if let Some(fri_uuid) = self.fri_uuid {
             format!("{}-{}", self.uuid, fri_uuid).into()
         } else {
-            self.uuid.into()
+            self.uuid.to_string().into()
         }
     }
 
@@ -308,12 +328,12 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
 /// Legacy indices use `LegacyVectorIndexCacheKey` instead (in-memory only).
 #[derive(Debug, Clone)]
 pub(crate) struct IvfIndexStateCacheKey<'a> {
-    uuid: &'a str,
+    uuid: &'a Uuid,
     fri_uuid: Option<&'a Uuid>,
 }
 
 impl<'a> IvfIndexStateCacheKey<'a> {
-    fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+    fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
@@ -329,7 +349,7 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
         if let Some(fri_uuid) = self.fri_uuid {
             format!("{}-{}", self.uuid, fri_uuid).into()
         } else {
-            self.uuid.into()
+            self.uuid.to_string().into()
         }
     }
 
@@ -340,17 +360,17 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
 
 /// Wrapper that stores a live VectorIndex in the cache.
 /// Used for v0.1/v0.2 indices that don't support serializable caching.
-#[derive(Debug, deepsize::DeepSizeOf)]
+#[derive(Debug, lance_core::deepsize::DeepSizeOf)]
 pub(crate) struct CachedLegacyVectorIndex(Arc<dyn VectorIndex>);
 
 #[derive(Debug, Clone)]
 pub struct FragReuseIndexCacheKey<'a> {
-    pub uuid: &'a str,
+    pub uuid: &'a Uuid,
     pub fri_uuid: Option<&'a Uuid>,
 }
 
 impl<'a> FragReuseIndexCacheKey<'a> {
-    pub fn new(uuid: &'a str, fri_uuid: Option<&'a Uuid>) -> Self {
+    pub fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
         Self { uuid, fri_uuid }
     }
 }
@@ -362,7 +382,7 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
         if let Some(fri_uuid) = self.fri_uuid {
             format!("{}-{}", self.uuid, fri_uuid).into()
         } else {
-            self.uuid.into()
+            self.uuid.to_string().into()
         }
     }
 
@@ -438,7 +458,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "BloomFilter" => IndexType::BloomFilter.to_string(),
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
-        "FMIndex" => IndexType::FMIndex.to_string(),
+        "FMIndex" => IndexType::Fm.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -497,7 +517,7 @@ pub(crate) async fn remap_index(
     let new_id = Uuid::new_v4();
 
     let generic = match dataset
-        .open_generic_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
+        .open_generic_index(&field_path, index_id, &NoOpMetricsCollector)
         .await
     {
         Ok(g) => g,
@@ -515,10 +535,10 @@ pub(crate) async fn remap_index(
 
     let created_index = match generic.index_type() {
         it if it.is_scalar() => {
-            let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id.to_string())?;
+            let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id)?;
 
             let scalar_index = dataset
-                .open_scalar_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
+                .open_scalar_index(&field_path, index_id, &NoOpMetricsCollector)
                 .await?;
             if !scalar_index.can_remap() {
                 return Ok(RemapResult::Drop);
@@ -568,7 +588,7 @@ pub(crate) async fn remap_index(
                     matched.index_version, matched.name
                 ))
             })?;
-            remap_vector_index(
+            let files = remap_vector_index(
                 Arc::new(dataset.clone()),
                 &field_path,
                 index_id,
@@ -578,17 +598,13 @@ pub(crate) async fn remap_index(
             )
             .await?;
 
-            // Capture file sizes for the vector index
-            let index_dir = dataset.indices_dir().join(new_id.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
-
             CreatedIndex {
                 index_details: prost_types::Any::from_msg(
                     &lance_index::pb::VectorIndexDetails::default(),
                 )
                 .unwrap(),
                 index_version,
-                files: Some(files),
+                files,
             }
         }
         _ => {
@@ -604,7 +620,7 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
-        files: created_index.files,
+        files: Some(created_index.files),
     }))
 }
 
@@ -642,10 +658,10 @@ pub struct ScalarIndexInfo {
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
-    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
         self.indexed_columns
             .get(col)
-            .map(|(ty, parser)| (ty, parser.as_ref() as &dyn ScalarQueryParser))
+            .map(|(ty, parser)| (ty, parser.as_ref()))
     }
 
     fn fragment_bitmap(&self, column: &str, index_name: &str) -> Option<RoaringBitmap> {
@@ -959,7 +975,7 @@ impl DatasetIndexExt for Dataset {
 
         for index_meta in indices {
             let index = self
-                .open_generic_index(name, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+                .open_generic_index(name, &index_meta.uuid, &NoOpMetricsCollector)
                 .await?;
             index.prewarm().await?;
         }
@@ -975,7 +991,7 @@ impl DatasetIndexExt for Dataset {
 
         for index_meta in indices {
             let index = self
-                .open_generic_index(name, &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+                .open_generic_index(name, &index_meta.uuid, &NoOpMetricsCollector)
                 .await?;
 
             match options {
@@ -1085,8 +1101,9 @@ impl DatasetIndexExt for Dataset {
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
         {
-            let uuid = frag_reuse_index_meta.uuid.to_string();
-            let fri_key = FragReuseIndexKey { uuid: &uuid };
+            let fri_key = FragReuseIndexKey {
+                uuid: &frag_reuse_index_meta.uuid,
+            };
             let frag_reuse_index = self
                 .index_cache
                 .get_or_insert_with_key(fri_key, || async move {
@@ -1130,7 +1147,10 @@ impl DatasetIndexExt for Dataset {
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
         let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
         let all_btree = source_segments.iter().all(segment_has_btree_details);
-        if !all_vector && !all_inverted && !all_bitmap && !all_btree {
+        let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
+        let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
+        if !all_vector && !all_inverted && !all_bitmap && !all_btree && !all_fmindex && !all_zonemap
+        {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
@@ -1146,8 +1166,12 @@ impl DatasetIndexExt for Dataset {
             .await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
+        } else if all_fmindex {
+            crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+        } else if all_zonemap {
+            crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
@@ -1214,7 +1238,8 @@ impl DatasetIndexExt for Dataset {
                     .is_none_or(|(details, expected)| details.type_url == expected)
             })
             .map(|idx| -> Result<Option<IndexMetadata>> {
-                let Some(existing_fragments) = idx.fragment_bitmap.as_ref() else {
+                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
+                else {
                     if incoming_fragments != dataset_fragments {
                         return Err(Error::invalid_input(format!(
                             "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
@@ -1223,6 +1248,13 @@ impl DatasetIndexExt for Dataset {
                     }
                     return Ok(Some(idx));
                 };
+
+                // A zero-fragment segment can be used to create an index while
+                // deferring the actual build. Such a segment is disjoint from every
+                // other segment but should still be removed.
+                if existing_fragments.is_empty() {
+                    return Ok(Some(idx));
+                }
 
                 if existing_fragments.is_disjoint(&incoming_fragments) {
                     return Ok(None);
@@ -1376,7 +1408,7 @@ impl DatasetIndexExt for Dataset {
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.
-                files: res.files,
+                files: Some(res.files),
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
@@ -1614,7 +1646,7 @@ async fn collect_regular_indices_statistics(
         }
 
         let index = ds
-            .open_generic_index(field_path, &meta.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index(field_path, &meta.uuid, &NoOpMetricsCollector)
             .await?;
 
         indices_stats.push(index.statistics()?);
@@ -1707,21 +1739,21 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn open_generic_index(
         &self,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>>;
     /// Opens the requested scalar index
     async fn open_scalar_index(
         &self,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
     /// Opens the requested vector index
     async fn open_vector_index(
         &self,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>>;
     /// Opens all segments for one logical vector index and returns a materialized snapshot.
@@ -1768,7 +1800,7 @@ impl DatasetIndexInternalExt for Dataset {
     async fn open_generic_index(
         &self,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
         // Checking for cache existence is cheap so we just check the vector caches.
@@ -1813,7 +1845,10 @@ impl DatasetIndexInternalExt for Dataset {
         } else {
             // Fall back to file existence check for older indices without file metadata
             let index_dir = self.indice_files_dir(&index_meta)?;
-            let index_file = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
+            let index_file = index_dir
+                .clone()
+                .join(uuid.to_string())
+                .join(INDEX_FILE_NAME);
             let object_store = self.object_store_for_index(&index_meta).await?;
             object_store.exists(&index_file).await?
         };
@@ -1831,7 +1866,7 @@ impl DatasetIndexInternalExt for Dataset {
     async fn open_scalar_index(
         &self,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         // Caching (including the choice of in-memory vs. serializable state) is
@@ -1847,7 +1882,7 @@ impl DatasetIndexInternalExt for Dataset {
     async fn open_vector_index(
         &self,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
@@ -1862,9 +1897,15 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
-                .reconstruct(object_store, self.metadata_cache.as_ref(), partition_cache)
+                .reconstruct(
+                    object_store,
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
                 .await;
         }
 
@@ -1876,8 +1917,19 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indice_files_dir(&index_meta)?;
-        let index_file = index_dir.clone().join(uuid).join(INDEX_FILE_NAME);
-        let reader: Arc<dyn Reader> = object_store.open(&index_file).await?.into();
+        let index_file = index_dir
+            .clone()
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let file_sizes = index_meta.file_size_map();
+        let reader: Arc<dyn Reader> = vector::open_index_file(
+            object_store.as_ref(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?
+        .into();
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
@@ -1900,7 +1952,7 @@ impl DatasetIndexInternalExt for Dataset {
             minor_version,
         ) {
             (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -1922,7 +1974,7 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = PreviousFileReader::try_new_self_described_from_reader(
                     reader.clone(),
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
@@ -1944,7 +1996,6 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file_sizes = index_meta.file_size_map();
                 let cached_size = file_sizes
                     .get(INDEX_FILE_NAME)
                     .map(|&size| CachedFileSize::new(size))
@@ -1971,7 +2022,7 @@ impl DatasetIndexInternalExt for Dataset {
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
-                info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
@@ -2119,6 +2170,15 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let (index, ivf_entry) = result?;
         metrics.record_index_load();
+        // Attribute the one-time index-open I/O (file footers, IVF centroids,
+        // quantization metadata) to this query's metrics.  This runs only on a
+        // real open; cache hits return earlier, so a warm query reports zero
+        // index-open I/O.
+        if let Some(io_stats) = metrics.io_stats()
+            && let Some(open_stats) = index.open_io_stats()
+        {
+            io_stats.add_scan_stats(&open_stats);
+        }
         if let Some(ivf_entry) = ivf_entry {
             let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
             self.index_cache
@@ -2156,7 +2216,7 @@ impl DatasetIndexInternalExt for Dataset {
         let mut segments = Vec::with_capacity(metadatas.len());
         for metadata in metadatas {
             let index = self
-                .open_vector_index(column, &metadata.uuid.to_string(), &NoOpMetricsCollector)
+                .open_vector_index(column, &metadata.uuid, &NoOpMetricsCollector)
                 .await?;
             segments.push((metadata, index));
         }
@@ -2169,19 +2229,27 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<FragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
-            let uuid = frag_reuse_index_meta.uuid.to_string();
-            let frag_reuse_key = FragReuseIndexKey { uuid: &uuid };
-            let uuid_clone = uuid.clone();
+            let frag_reuse_uuid = frag_reuse_index_meta.uuid;
+            let frag_reuse_key = FragReuseIndexKey {
+                uuid: &frag_reuse_uuid,
+            };
 
             let index = self
                 .index_cache
                 .get_or_insert_with_key(frag_reuse_key, || async move {
-                    let index_meta = self.load_index(&uuid_clone).await?.ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid_clone)))?;
+                    let index_meta =
+                        self.load_index(&frag_reuse_uuid).await?.ok_or_else(|| {
+                            Error::index(format!(
+                                "Index with id {} does not exist",
+                                frag_reuse_uuid
+                            ))
+                        })?;
                     let index_details = load_frag_reuse_index_details(self, &index_meta).await?;
                     let index =
-                        open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await?;
+                        open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref())
+                            .await?;
 
-                    info!(target: TRACE_IO_EVENTS, index_uuid=uuid_clone, r#type=IO_TYPE_OPEN_FRAG_REUSE);
+                    info!(target: TRACE_IO_EVENTS, index_uuid=%frag_reuse_uuid, r#type=IO_TYPE_OPEN_FRAG_REUSE);
                     metrics.record_index_load();
 
                     Ok(index)
@@ -2209,7 +2277,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(Some(index));
         }
 
-        let uuid = mem_wal_meta.uuid.to_string();
+        let uuid = mem_wal_meta.uuid;
 
         let index_meta = self
             .load_index(&uuid)
@@ -2217,7 +2285,7 @@ impl DatasetIndexInternalExt for Dataset {
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let index = open_mem_wal_index(index_meta)?;
 
-        info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
+        info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_MEM_WAL);
         metrics.record_index_load();
 
         self.index_cache
@@ -2580,7 +2648,7 @@ mod tests {
         kmeans::{KMeansParams, train_kmeans},
         sq::builder::SQBuildParams,
     };
-    use lance_io::{assert_io_eq, assert_io_lt};
+    use lance_io::{assert_io_eq, assert_io_lt, utils::tracking_store::IoStats};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
@@ -2619,6 +2687,20 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+        }
+    }
+
+    fn list_io_stats(stats: &IoStats) -> IoStats {
+        let requests = stats
+            .requests
+            .iter()
+            .filter(|request| request.method == "list")
+            .cloned()
+            .collect::<Vec<_>>();
+        IoStats {
+            read_iops: requests.len() as u64,
+            requests,
+            ..Default::default()
         }
     }
 
@@ -3941,7 +4023,7 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         let index = dataset
-            .open_generic_index("tag", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index("tag", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         assert_eq!(index.index_type(), IndexType::Bitmap);
@@ -6757,7 +6839,18 @@ mod tests {
             )
             .into_reader_rows(RowCount::from(20), BatchCount::from(2));
 
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
 
         let field_id = dataset.schema().field("vector").unwrap().id;
         let original = write_vector_segment_metadata(
@@ -6789,6 +6882,69 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("would orphan fragments"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_removes_empty_segment() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let uuid = Uuid::new_v4();
+
+        // Commit a 0-fragment segment, then a real segment covering the dataset.
+        let empty = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            uuid,
+            std::iter::empty::<u32>(),
+            b"empty",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&empty)],
+            )
+            .await
+            .unwrap();
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+
+        // The real segment covers the dataset, so the redundant empty one is removed.
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            committed.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
+            HashSet::from([seg.uuid]),
+            "empty segment should be removed once a real segment covers the dataset",
+        );
     }
 
     #[tokio::test]
@@ -7261,6 +7417,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_create_does_not_list_files() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Int32, false),
+        ]));
+        let ids = Int32Array::from_iter_values(0..128);
+        let categories = Int32Array::from_iter_values((0..128).map(|value| value % 8));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(categories)])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+
+        io_tracker.incremental_stats();
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Bitmap,
+                Some("category_bitmap".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        let list_stats = list_io_stats(&stats);
+        assert_io_eq!(
+            list_stats,
+            read_iops,
+            0,
+            "new scalar index files should be reported by writer return values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_create_does_not_list_files() {
+        let test_dir = TempStrDir::default();
+        let dimension = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+        let ids = Int32Array::from_iter_values(0..256);
+        let vectors = (0..256)
+            .map(|row| {
+                Some(
+                    (0..dimension)
+                        .map(|dim| Some((row * dimension + dim) as f32))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let vector_array =
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, dimension);
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vector_array)])
+                .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let io_tracker = dataset.object_store.as_ref().io_tracker().clone();
+
+        io_tracker.incremental_stats();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_ivf_flat".to_string()),
+                &VectorIndexParams::ivf_flat(4, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let stats = io_tracker.incremental_stats();
+        let list_stats = list_io_stats(&stats);
+        assert_io_eq!(
+            list_stats,
+            read_iops,
+            0,
+            "new V3 vector index files should be reported by builder return values"
+        );
     }
 
     #[tokio::test]

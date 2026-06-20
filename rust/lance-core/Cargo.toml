@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 arrow-array.workspace = true
 arrow-buffer.workspace = true
+arrow-data.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 lance-arrow.workspace = true
@@ -21,7 +22,7 @@ byteorder.workspace = true
 bytes.workspace = true
 datafusion-common = { workspace = true, optional = true }
 datafusion-sql = { workspace = true, optional = true }
-deepsize.workspace = true
+lance-derive.workspace = true
 futures.workspace = true
 itertools.workspace = true
 libc.workspace = true

@@ -12,7 +12,7 @@ use std::{
 };
 
 use arrow::datatypes::{self, UInt8Type};
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
     FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
@@ -21,8 +21,8 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
@@ -70,10 +70,10 @@ pub struct ProductQuantizationMetadata {
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.codebook
             .as_ref()
-            .map(|codebook| codebook.get_array_memory_size())
+            .map(|codebook| (codebook as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }
@@ -166,18 +166,20 @@ pub struct ProductQuantizationStorage {
 }
 
 impl DeepSizeOf for ProductQuantizationStorage {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.batch.deep_size_of_children(context)
             + self
                 .metadata
                 .codebook
                 .as_ref()
-                .map(|codebook| codebook.get_array_memory_size())
+                .map(|codebook| {
+                    (codebook as &dyn arrow_array::Array).deep_size_of_children(context)
+                })
                 .unwrap_or(0)
             + self
                 .pairwise_distance_table
                 .get()
-                .map(|table| table.deep_size_of_children(_context))
+                .map(|table| table.deep_size_of_children(context))
                 .unwrap_or(0)
     }
 }
@@ -219,7 +221,7 @@ impl ProductQuantizationStorage {
                 "Row ID column not found from PQ storage".to_string(),
             ));
         };
-        let row_ids: Arc<UInt64Array> = row_ids
+        let mut row_ids: Arc<UInt64Array> = row_ids
             .as_primitive_opt::<UInt64Type>()
             .ok_or(Error::index(
                 "Row ID column is not of type UInt64".to_string(),
@@ -291,6 +293,11 @@ impl ProductQuantizationStorage {
                 .as_primitive::<UInt8Type>()
                 .clone()
                 .into();
+            // Refresh the stored row ids from the remapped batch. Without this
+            // the storage keeps the pre-remap (compacted-away) addresses while
+            // its codes are remapped, so search returns stale row ids and the
+            // take fails with "fragment ... does not exist".
+            row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone().into();
         }
 
         let distance_type = match distance_type {
