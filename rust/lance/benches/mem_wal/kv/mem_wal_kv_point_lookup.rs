@@ -817,8 +817,12 @@ async fn run_lance(
         };
         while lo < part_end {
             let hi = (lo + args.batch_rows).min(part_end);
-            let batch =
-                make_batch(schema.clone(), &insert_order[lo..hi], args.value_size, key_type);
+            let batch = make_batch(
+                schema.clone(),
+                &insert_order[lo..hi],
+                args.value_size,
+                key_type,
+            );
             writer.put(vec![batch]).await?;
             lo = hi;
         }
@@ -1519,7 +1523,14 @@ async fn run_lance_flushed(
     let peak_rss_mb = sampler.stop();
     println!(
         "[lance] read p50={:.2}us p95={:.2}us p99={:.2}us mean={:.2}us qps_1t={:.0} qps_{}t={:.0} (hits={hits} miss={misses_resolved}) peak_rss={:.0}MB",
-        stats.p50_us, stats.p95_us, stats.p99_us, stats.mean_us, read_qps_1t, args.threads, read_qps_nt, peak_rss_mb
+        stats.p50_us,
+        stats.p95_us,
+        stats.p99_us,
+        stats.mean_us,
+        read_qps_1t,
+        args.threads,
+        read_qps_nt,
+        peak_rss_mb
     );
 
     Ok(EngineResult {
