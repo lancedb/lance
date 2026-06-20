@@ -846,6 +846,45 @@ class LanceDataset(pa.dataset.Dataset):
             base_store_params=base_store_params,
         )
 
+    @classmethod
+    def from_pydantic_model(
+        cls,
+        model_class,
+        data,
+        uri: Optional[Union[str, Path]] = None,
+        mode: str = "create",
+        **kwargs,
+    ) -> "LanceDataset":
+        """Create a LanceDataset from a Pydantic model class and a list of instances.
+
+        The table name is inferred from the model class name converted to snake_case.
+        The schema is inferred from the data.
+
+        Parameters
+        ----------
+        model_class : type
+            A Pydantic BaseModel subclass.
+        data : list
+            A list of Pydantic model instances.
+        uri : str or Path, optional
+            The URI to write the dataset to. If not provided, the model class name
+            converted to snake_case is used as the path.
+        mode : str, optional
+            The write mode. One of "create", "overwrite", or "append".
+        **kwargs
+            Additional arguments passed to write_dataset().
+        """
+        import re
+
+        if uri is None:
+            uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
+        dicts = [
+            item.model_dump() if hasattr(item, "model_dump") else item.dict()
+            for item in data
+        ]
+        table = pa.Table.from_pylist(dicts)
+        return write_dataset(table, uri, mode=mode, **kwargs)
+
     def __reduce__(self):
         return type(self).__deserialize__, (
             self.uri,

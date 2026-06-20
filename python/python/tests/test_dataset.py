@@ -34,9 +34,17 @@ from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
+from pydantic import BaseModel
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
+
+
+class _InputModel(BaseModel):
+    a: float
+    b: int
+
+
 input_data = [
     # (schema, data)
     (None, pa.table({"a": [1.0, 2.0], "b": [20, 30]})),
@@ -59,6 +67,8 @@ input_data = [
             ).to_batches()
         ),
     ),
+    # Pydantic model instances are auto-converted
+    (None, [_InputModel(a=1.0, b=20), _InputModel(a=2.0, b=30)]),
 ]
 
 
@@ -67,6 +77,22 @@ def test_input_data(tmp_path: Path, schema, data):
     base_dir = tmp_path / "test"
     dataset = lance.write_dataset(data, base_dir, schema=schema)
     assert dataset.to_table() == input_data[0][1]
+
+
+def test_from_pydantic_model(tmp_path: Path):
+    class UserRecord(BaseModel):
+        name: str
+        score: float
+
+    data = [UserRecord(name="alice", score=0.9), UserRecord(name="bob", score=0.8)]
+    uri = str(tmp_path / "user_record")
+    ds = lance.LanceDataset.from_pydantic_model(UserRecord, data, uri=uri)
+
+    table = ds.to_table()
+    assert table.num_rows == 2
+    assert table.schema.names == ["name", "score"]
+    assert table.column("name").to_pylist() == ["alice", "bob"]
+    assert table.column("score").to_pylist() == [0.9, 0.8]
 
 
 def test_roundtrip_types(tmp_path: Path):
