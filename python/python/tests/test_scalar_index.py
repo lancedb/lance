@@ -648,7 +648,10 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     assert "ScalarIndexQuery" in plan
     assert "MaterializeIndex" not in plan
     assert "FlatMatchQuery" in plan
-    assert "LanceScan" in plan
+    # Flat FTS now reads via FilteredReadExec (prints as `LanceRead`) so the
+    # BTree on `id` pushes into the unindexed-fragment scan too.
+    assert "LanceRead" in plan
+    assert "LanceScan" not in plan
     assert make_fts_search(ds).to_table().num_rows == 12
 
     # Update vector index but NOT scalar index
@@ -866,6 +869,51 @@ def test_fts_custom_stop_words(tmp_path):
         with_row_id=True,
     )
     assert len(results["_rowid"].to_pylist()) == 1
+
+
+def test_fts_stop_words_respect_language_for_simple_tokenizer(tmp_path):
+    data = pa.table({"text": ["the lance data", "的 lance data"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="simple",
+        stem=False,
+    )
+
+    results = ds.to_table(full_text_query="the", with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(full_text_query="的", with_row_id=True)
+    assert results["text"].to_pylist() == ["的 lance data"]
+
+
+def test_fts_icu_stop_words_are_all_or_none(tmp_path):
+    data = pa.table({"text": ["the 的 lance data", "useful data"]})
+    ds = lance.write_dataset(data, tmp_path / "enabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=True,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="lance", with_row_id=True).num_rows == 1
+
+    ds = lance.write_dataset(data, tmp_path / "disabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 1
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 1
 
 
 def test_rowid_order(dataset):
@@ -4048,6 +4096,79 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     assert with_index.num_rows == without_index.num_rows
     assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
     assert set(with_index["category"].to_pylist()) == {3}
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
+def test_zonemap_fragment_ids_parameter_validation(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=100
+    )
+
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index(
+            column="id",
+            index_type="ZONEMAP",
+            fragment_ids=[fragment_ids[0]],
+        )
+
+
+def test_zonemap_segment_merge_and_commit_from_python(tmp_path):
+    rows_per_fragment = 20_000
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=rows_per_fragment
+    )
+
+    index_name = "id_zonemap_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="id",
+            index_type="ZONEMAP",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    assert len({segment.uuid for segment in staged_segments}) == len(staged_segments)
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        files = segment.files
+        assert files is not None
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "zonemap.lance" for file in files)
+        assert all(not file.path.startswith("part_") for file in files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    merged_files = merged_segment.files
+    assert merged_files is not None
+    assert merged_segment.uuid not in {segment.uuid for segment in staged_segments}
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "zonemap.lance" for file in merged_files)
+    assert all(not file.path.startswith("part_") for file in merged_files)
+
+    ds = ds.commit_existing_index_segments(index_name, "id", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "ZoneMap"
+    assert len(descriptions[index_name].segments) == 1
+
+    filter_expr = "id >= 8200 AND id < 8300"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.num_rows == without_index.num_rows
+    assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
     assert (
         "ScalarIndexQuery"
         in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()

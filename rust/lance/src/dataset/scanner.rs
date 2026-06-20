@@ -72,7 +72,7 @@ use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -1592,6 +1592,7 @@ impl Scanner {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
@@ -1756,6 +1757,19 @@ impl Scanner {
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.use_index = use_index
+        }
+        self
+    }
+
+    /// Configure the speed / accuracy tradeoff for approximate vector search.
+    ///
+    /// This setting is currently only used by RQ-quantized indexes, such as
+    /// IVF_RQ. Other index types ignore this setting.
+    pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.approx_mode = approx_mode;
+        } else {
+            log::warn!("approx_mode is not set because nearest has not been called yet");
         }
         self
     }
@@ -3577,33 +3591,35 @@ impl Scanner {
             .clone();
 
         let mut columns = vec![column];
-        if let Some(expr) = filter_plan.full_expr.as_ref() {
-            let filter_columns = Planner::column_names_in_expr(expr);
-            columns.extend(filter_columns);
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            columns.extend(Planner::column_names_in_expr(refine_expr));
         }
-        let flat_fts_scan_schema = Arc::new(self.dataset.schema().project(&columns).unwrap());
-        let mut scan_node = self.scan_fragments(
-            true,
-            false,
-            false,
-            false,
-            false,
-            flat_fts_scan_schema,
-            Arc::new(fragments),
-            None,
-            false,
-        );
+        let scan_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(&columns, OnMissing::Error)?;
 
-        if let Some(expr) = filter_plan.full_expr.as_ref() {
-            // If there is a prefilter we need to manually apply it to the new data
-            scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
+        let PlannedFilteredScan { mut plan, .. } = self
+            .filtered_read(
+                filter_plan,
+                scan_projection,
+                /*make_deletions_null=*/ false,
+                Some(Arc::new(fragments)),
+                None,
+                /*is_prefilter=*/ true,
+            )
+            .await?;
+
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
 
         let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
-            scan_node,
+            plan,
         ));
         Ok(flat_match_plan)
     }
@@ -8399,6 +8415,198 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_ngram_regex_index_scan() {
+        use arrow::array::AsArray;
+
+        // A small, fixed corpus written across multiple fragments so the ngram
+        // index spans fragment boundaries.
+        let values = [
+            "rhino",       // 0
+            "rhinos nose", // 1
+            "cat",         // 2
+            "dog",         // 3
+            "cat dog",     // 4
+            "elephant",    // 5
+            "catalog",     // 6
+            "scatter",     // 7
+            "rhino horn",  // 8
+            "mouse",       // 9
+            "category",    // 10
+            "dogma",       // 11
+        ];
+        let array = StringArray::from_iter_values(values);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let write_params = WriteParams {
+            max_rows_per_file: 4, // 12 rows -> 3 fragments
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://test_ngram_regex", Some(write_params))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["s"],
+                IndexType::NGram,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            dataset.get_fragments().len() > 1,
+            "expected a multi-fragment dataset"
+        );
+
+        // Scan with `filter` and return the matched `s` values, sorted.
+        async fn matched(dataset: &Dataset, filter: &str) -> Vec<String> {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let batches = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            for batch in batches {
+                let col = batch.column_by_name("s").unwrap().as_string::<i32>();
+                out.extend(col.iter().flatten().map(|s| s.to_string()));
+            }
+            out.sort();
+            out
+        }
+
+        // `regexp_like`: a plain literal substring.
+        assert_eq!(
+            matched(&dataset, "regexp_like(s, 'rhino')").await,
+            ["rhino", "rhino horn", "rhinos nose"]
+        );
+        // `regexp_match` (coerced to `IsNotNull(regexp_match(...))`) accelerates too.
+        assert_eq!(
+            matched(&dataset, "regexp_match(s, 'rhino')").await,
+            ["rhino", "rhino horn", "rhinos nose"]
+        );
+        // Anchored: recheck must drop trigram false positives -- the `cat`
+        // trigram also occurs in cat dog / catalog / scatter / category.
+        assert_eq!(matched(&dataset, "regexp_like(s, 'cat$')").await, ["cat"]);
+        // AND across `.*`: row 8 ("rhino horn") shares the rhino trigrams but
+        // lacks the nose trigrams, so only "rhinos nose" survives.
+        assert_eq!(
+            matched(&dataset, "regexp_like(s, 'rhino.*nose')").await,
+            ["rhinos nose"]
+        );
+        // Alternation.
+        assert_eq!(
+            matched(&dataset, "regexp_like(s, '(catalog|elephant)')").await,
+            ["catalog", "elephant"]
+        );
+        // A non-accelerable pattern (no trigram derivable) still returns correct
+        // results via a full recheck.
+        assert_eq!(matched(&dataset, "regexp_like(s, 'o.m')").await, ["dogma"]);
+        // A case-insensitive flag is not accelerated (the index normalization
+        // disagrees with Unicode case folding) but must still return correct
+        // results via a full recheck -- here matching despite the upper-case
+        // pattern. This exercises the three-argument `regexp_like` flags path.
+        assert_eq!(
+            matched(&dataset, "regexp_like(s, 'RHINO', 'i')").await,
+            ["rhino", "rhino horn", "rhinos nose"]
+        );
+
+        // Infix LIKE is accelerated through the same machinery (a plain-literal
+        // `regexp_like` is rewritten to LIKE before it reaches the index).
+        assert_eq!(
+            matched(&dataset, "s LIKE '%rhino%'").await,
+            ["rhino", "rhino horn", "rhinos nose"]
+        );
+        // Prefix LIKE: recheck drops "scatter", which contains the `cat` trigram
+        // but does not start with "cat".
+        assert_eq!(
+            matched(&dataset, "s LIKE 'cat%'").await,
+            ["cat", "cat dog", "catalog", "category"]
+        );
+
+        // The ngram index is actually engaged for every accelerated form.
+        for filter in [
+            "regexp_like(s, 'rhino')",
+            "regexp_match(s, 'rhino')",
+            "s LIKE '%rhino%'",
+        ] {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let plan = scan.create_plan().await.unwrap();
+            let plan_str = format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            );
+            assert!(
+                plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
+                "expected ngram index usage for `{filter}`, got plan:\n{plan_str}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ngram_regex_non_accelerable_recheck() {
+        // `a.b` yields no trigram, so the index returns "recheck everything".
+        // This must still produce ALL correct matches across fragments, not an
+        // empty set (a regression test for the AtLeast recheck path, which a
+        // single-match case would not catch).
+        let unit = ["acb", "dog", "axb", "cat", "qqq", "rhino"];
+        let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
+        let array = StringArray::from_iter_values(values);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let write_params = WriteParams {
+            max_rows_per_file: 20, // 60 rows -> 3 fragments
+            ..Default::default()
+        };
+        let mut dataset =
+            Dataset::write(reader, "memory://test_ngram_regex_ne", Some(write_params))
+                .await
+                .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        async fn count(dataset: &Dataset, filter: &str) -> usize {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let batches = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            batches.iter().map(|b| b.num_rows()).sum()
+        }
+
+        // "acb" and "axb" each appear 10 times in the 60 rows -> 20 matches.
+        assert_eq!(count(&dataset, "regexp_match(text, 'a.b')").await, 20);
+        assert_eq!(count(&dataset, "regexp_like(text, 'a.b')").await, 20);
+    }
+
+    #[tokio::test]
     async fn test_like_prefix_with_btree_index() {
         // Create dataset with string data that has various prefixes
         // Avoid LIKE special characters (%, _) in data to keep tests simple
@@ -8827,6 +9035,93 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "LIKE '%app%' should not use LikePrefix index, but got: {}",
             plan_str
         );
+    }
+
+    /// Build an in-memory dataset with a single `Dictionary(Int16, Utf8)` column.
+    /// The dictionary cycles through "a", "b", "c" so each value appears in a
+    /// predictable, repeated pattern.
+    async fn dictionary_string_dataset() -> Dataset {
+        use arrow_array::{Int16Array, Int16DictionaryArray};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "etld",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            false,
+        )]));
+
+        let dictionary = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let indices = Int16Array::from((0..30).map(|i| i % 3).collect::<Vec<_>>());
+        let dict_array = Int16DictionaryArray::try_new(indices, dictionary).unwrap();
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dict_array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(reader, "memory://test_dict_filter", None)
+            .await
+            .unwrap()
+    }
+
+    /// Regression test for filtering a dictionary-encoded string column via the
+    /// SQL string path (`Scanner::filter`). This used to fail to plan with
+    /// "could not convert to literal of type 'Dictionary(Int16, Utf8)'".
+    #[tokio::test]
+    async fn test_filter_on_dictionary_string_column() {
+        let dataset = dictionary_string_dataset().await;
+
+        // Equality predicate.
+        let count = dataset
+            .scan()
+            .filter("etld = 'a'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count, 10);
+
+        // IN-list predicate.
+        let count = dataset
+            .scan()
+            .filter("etld IN ('a', 'b')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count, 20);
+    }
+
+    /// An `IN`/`=` predicate on a dictionary column with a scalar index should be
+    /// pushed down to the index rather than falling back to a full scan.
+    #[tokio::test]
+    async fn test_dictionary_string_column_uses_scalar_index() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let mut dataset = dictionary_string_dataset().await;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(&["etld"], IndexType::Scalar, None, &params, true)
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.filter("etld IN ('a', 'b')").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") || plan_str.contains("MaterializeIndex"),
+            "IN on a dictionary column should use the scalar index, but got: {}",
+            plan_str
+        );
+
+        let count = dataset
+            .scan()
+            .filter("etld IN ('a', 'b')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(count, 20);
     }
 
     #[tokio::test]
@@ -10177,7 +10472,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows");
-        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+        // The flat-FTS path now reads through `FilteredReadExec`, matching the
+        // brute-force KNN path. With no prefilter the scan still produces no
+        // pushdown, but the operator differs by storage version: legacy emits
+        // a `LanceScan`, v2 emits a `LanceRead` with empty filters.
+        let expected = if data_storage_version == LanceFileVersion::Legacy {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -10185,7 +10485,18 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
           UnionExec
             MatchQuery: column=s, query=hello
             FlatMatchQuery: column=s, query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"#;
+              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
+        } else {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        CoalescePartitionsExec
+          UnionExec
+            MatchQuery: column=s, query=hello
+            FlatMatchQuery: column=s, query=hello
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
+        };
         dataset.append_new_data().await?;
         assert_plan_equals(
             &dataset.dataset,
@@ -10218,6 +10529,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows and prefilter");
+        // After routing flat FTS through `FilteredReadExec`, the BTree on `i`
+        // pushes into the unindexed-fragment scan too — no more `FilterExec` on
+        // top of an unfiltered `LanceScan`. Legacy uses the `MaterializeIndex`
+        // shape, v2 uses `LanceRead` with `full_filter` set.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
@@ -10233,8 +10548,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
             FlatMatchQuery: column=s, query=hello
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+              CoalescePartitionsExec
+                UnionExec
+                  Take: columns="_rowid, (s)"
+                    CoalesceBatchesExec: target_batch_size=8192
+                      MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                  ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
@@ -10246,8 +10567,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             FlatMatchQuery: column=s, query=hello
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -10883,6 +11204,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         scanner.query_parallelism(-1);
         assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, -1);
+    }
+
+    #[tokio::test]
+    async fn test_knn_approx_mode_defaults_and_setter() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(
+            scanner.nearest_mut().unwrap().approx_mode,
+            ApproxMode::Normal
+        );
+
+        scanner.approx_mode(ApproxMode::Accurate);
+        assert_eq!(
+            scanner.nearest_mut().unwrap().approx_mode,
+            ApproxMode::Accurate
+        );
     }
 
     #[tokio::test]

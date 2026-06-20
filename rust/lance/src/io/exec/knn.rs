@@ -926,6 +926,9 @@ impl ExecutionPlan for ANNIvfPartitionExec {
             })
             .buffered(self.index_uuids.len().min(target_partitions).max(1))
             .finally(move || {
+                // Partition ranking reads centroids from memory, so this is
+                // typically zero; flushed for symmetry with ANNSubIndex.
+                metrics_clone.index_metrics.flush_io();
                 metrics_clone.baseline_metrics.done();
                 metrics_clone
                     .baseline_metrics
@@ -1627,6 +1630,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
                 .finally(move || {
+                    // Publish the exact index-file I/O measured for this query
+                    // (cache misses only) to the iops/requests/bytes_read gauges.
+                    metrics_clone.index_metrics.flush_io();
                     metrics_clone
                         .baseline_metrics
                         .elapsed_compute()
@@ -1934,6 +1940,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         }
     }
 
@@ -2693,6 +2700,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         };
 
         async fn multivector_scoring(
@@ -2915,6 +2923,128 @@ mod tests {
             assert!(*stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap() < 100 * num_deltas);
         }
         assert_find_partitions_elapsed_recorded(&stats);
+    }
+
+    /// The ANN operators report the exact index-file I/O performed for a query
+    /// (bytes_read / iops), measured only on cache misses.  A cold search loads
+    /// partitions from storage and reports non-zero I/O; an immediately
+    /// following warm search serves every partition from the index cache and
+    /// reports zero -- which is the cache-effectiveness signal the metric adds.
+    #[tokio::test]
+    async fn test_io_metrics_cold_vs_warm() {
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let q = fixture.get_centroid(0);
+
+        let run = |holder: &StatsHolder| {
+            let setter = holder.get_setter();
+            async {
+                fixture
+                    .dataset
+                    .scan()
+                    .nearest("vector", q.as_ref(), 10)
+                    .unwrap()
+                    .minimum_nprobes(10)
+                    .scan_stats_callback(setter)
+                    .project(&Vec::<String>::new())
+                    .unwrap()
+                    .with_row_id()
+                    .try_into_batch()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Cold: a freshly opened dataset has an empty index cache, so the
+        // sub-index search must read partitions (and their quantization storage)
+        // from disk.  Those reads flow through the per-query I/O sink.
+        let cold_holder = StatsHolder::default();
+        run(&cold_holder).await;
+        let cold = cold_holder.consume();
+        assert!(
+            cold.parts_loaded > 0,
+            "cold search should load partitions, got parts_loaded={}",
+            cold.parts_loaded
+        );
+        assert!(
+            cold.bytes_read > 0,
+            "cold search should report index-file I/O, got bytes_read={}",
+            cold.bytes_read
+        );
+        assert!(
+            cold.iops > 0,
+            "cold search should report index-file IOPS, got iops={}",
+            cold.iops
+        );
+
+        // Warm: the same query on the same dataset finds every partition it
+        // needs already cached, so no index-file I/O is performed.
+        let warm_holder = StatsHolder::default();
+        run(&warm_holder).await;
+        let warm = warm_holder.consume();
+        assert_eq!(
+            warm.parts_loaded, 0,
+            "warm search should not reload partitions, got parts_loaded={}",
+            warm.parts_loaded
+        );
+        assert_eq!(
+            warm.bytes_read, 0,
+            "warm search should report no index-file I/O, got bytes_read={}",
+            warm.bytes_read
+        );
+    }
+
+    /// The new I/O metrics must actually surface in `EXPLAIN ANALYZE` text on
+    /// the ANN operators: non-zero on a cold query (partition reads on
+    /// `ANNSubIndex`, index-open reads on `ANNIvfPartition`) and zero on a warm
+    /// query (everything served from the index cache).
+    #[tokio::test]
+    async fn test_io_metrics_visible_in_explain_analyze() {
+        // Returns the value of `metric=` from the analyzed-plan line for `node`.
+        fn node_metric<'a>(plan: &'a str, node: &str, metric: &str) -> &'a str {
+            let line = plan
+                .lines()
+                .find(|l| l.trim_start().starts_with(node))
+                .unwrap_or_else(|| panic!("plan missing node {node}:\n{plan}"));
+            let after = line
+                .split_once(&format!("{metric}="))
+                .unwrap_or_else(|| panic!("node {node} line missing {metric}=:\n{line}"))
+                .1;
+            after.split([',', ']']).next().unwrap().trim()
+        }
+
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let q = fixture.get_centroid(0);
+
+        // Cold: a freshly opened dataset must show real index-file I/O.
+        let cold = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(10)
+            .analyze_plan()
+            .await
+            .unwrap();
+        // Sub-index partition reads.
+        assert_ne!(node_metric(&cold, "ANNSubIndex", "bytes_read"), "0");
+        assert_ne!(node_metric(&cold, "ANNSubIndex", "iops"), "0");
+        // Index-open reads (centroids/metadata) now attributed to the partition
+        // operator -- the value this part of the change adds.
+        assert_ne!(node_metric(&cold, "ANNIvfPartition", "bytes_read"), "0");
+        assert_ne!(node_metric(&cold, "ANNIvfPartition", "iops"), "0");
+
+        // Warm: same query, everything cache-resident -> zero index-file I/O.
+        let warm = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(10)
+            .analyze_plan()
+            .await
+            .unwrap();
+        assert_eq!(node_metric(&warm, "ANNSubIndex", "bytes_read"), "0");
+        assert_eq!(node_metric(&warm, "ANNIvfPartition", "bytes_read"), "0");
     }
 
     #[rstest]

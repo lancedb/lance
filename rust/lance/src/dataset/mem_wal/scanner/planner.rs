@@ -15,8 +15,8 @@ use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkHashFilterExec, ROW_ADDRESS_COLUMN};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
+use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
 };
@@ -33,7 +33,13 @@ pub struct LsmScanPlanner {
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Over-fetch multiple for the per-source limit pushdown: block-listed
+    /// sources scan `(offset + limit) * factor` rows so cross-gen dedup drops
+    /// still leave enough live rows. Clamped to `>= 1.0`.
+    overfetch_factor: f64,
 }
 
 impl LsmScanPlanner {
@@ -49,6 +55,8 @@ impl LsmScanPlanner {
             base_schema,
             session: None,
             flushed_cache: None,
+            warmer: None,
+            overfetch_factor: 1.0,
         }
     }
 
@@ -61,8 +69,21 @@ impl LsmScanPlanner {
 
     /// Inject a cache of opened flushed-generation datasets, making repeated
     /// queries against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
+        self
+    }
+
+    /// Set the over-fetch multiple for the per-source limit pushdown
+    /// (see the field docs). Clamped to `>= 1.0` at use.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = factor;
         self
     }
 
@@ -82,7 +103,7 @@ impl LsmScanPlanner {
     /// Each source is independently newest-per-PK (active via the fused
     /// [`MemTableDedupScanExec`](super::super::memtable::scanner), flushed via
     /// its within-generation deletion vector) and a cross-generation block-list
-    /// ([`PkHashFilterExec`]) drops any PK superseded by a newer generation.
+    /// ([`PkBlockFilterExec`]) drops any PK superseded by a newer generation.
     /// Each PK therefore survives in exactly one source, so a plain
     /// `UnionExec` carries at most one row per PK — no cross-source dedup,
     /// sort, or merge needed. `_memtable_gen` / `_rowaddr` are output-only and
@@ -119,7 +140,6 @@ impl LsmScanPlanner {
         // `Box::pin` keeps the future off `clippy::large_futures`.
         let block_lists = Box::pin(super::block_list::compute_source_block_lists(
             &sources,
-            &self.pk_columns,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
         ))
@@ -130,21 +150,57 @@ impl LsmScanPlanner {
         // cross-gen block-list, not from output ordering.
         let sources: Vec<_> = sources.into_iter().rev().collect();
 
+        // Per-source limit pushdown: an unordered LIMIT needs only
+        // `offset + limit` live rows from EACH source to fill the global
+        // limit after dedup (any-N semantics), so cap every on-disk source
+        // instead of scanning whole generations and trimming above the
+        // union. Block-listed sources over-fetch by `overfetch_factor` so
+        // cross-gen dedup drops still leave `n_needed` live rows; the
+        // PkBlockFilter warns when that was not enough. The active memtable
+        // is in-memory and within-gen append duplicates are resolved by its
+        // own dedup, so it is never capped here.
+        let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
+        let overfetch = self.overfetch_factor.max(1.0);
+
         let mut source_plans = Vec::new();
         for source in sources {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            let scan = self.build_source_scan(&source, projection, filter).await?;
+            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+            let blocked = block_lists
+                .get(&(source.shard_id(), source.generation()))
+                .cloned();
+            let fetch = match (n_needed, is_active) {
+                (Some(n), false) => Some(if blocked.is_some() {
+                    ((n as f64) * overfetch).ceil() as usize
+                } else {
+                    n
+                }),
+                _ => None,
+            };
+            let scan = self
+                .build_source_scan(&source, projection, filter, fetch)
+                .await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
-            // `k = 0`: there is no top-k, so the under-fetch warning never fires.
-            let scan = match block_lists.get(&(source.shard_id(), source.generation())) {
-                Some(set) => Arc::new(PkHashFilterExec::new(
+            // With a limit, `k = n_needed` arms the under-fetch warning; with
+            // no limit `k = 0` keeps it silent.
+            let scan = match blocked {
+                Some(set) => Arc::new(PkBlockFilterExec::new(
                     scan,
                     self.pk_columns.clone(),
-                    set.clone(),
-                    0,
+                    set,
+                    n_needed.unwrap_or(0),
                 )) as Arc<dyn ExecutionPlan>,
                 None => scan,
+            };
+
+            // Post-block-list cap: each source contributes at most `n_needed`
+            // live rows toward the global limit.
+            let scan: Arc<dyn ExecutionPlan> = match n_needed {
+                Some(n) if !is_active => Arc::new(
+                    datafusion::physical_plan::limit::LocalLimitExec::new(scan, n),
+                ),
+                _ => scan,
             };
 
             // When `_rowaddr` is surfaced, NULL it for non-base arms: only base
@@ -229,6 +285,7 @@ impl LsmScanPlanner {
         source: &LsmDataSource,
         projection: Option<&[String]>,
         filter: Option<&Expr>,
+        fetch: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -247,13 +304,22 @@ impl LsmScanPlanner {
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
+                // Per-source limit pushdown (post-filter rows): bounds the
+                // physical scan instead of trimming above the union.
+                if let Some(fetch) = fetch {
+                    scanner.limit(Some(fetch as i64), None)?;
+                }
 
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset =
-                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
-                        .await?;
+                let dataset = open_flushed_dataset(
+                    path,
+                    self.session.as_ref(),
+                    self.flushed_cache.as_ref(),
+                    self.warmer.as_ref(),
+                )
+                .await?;
                 let mut scanner = dataset.scan();
 
                 let cols =
@@ -263,6 +329,12 @@ impl LsmScanPlanner {
 
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
+                }
+                // Per-source limit pushdown: flushed generations are
+                // within-gen live (dedup-on-flush deletion vectors), so any
+                // `fetch` post-filter rows are valid contributions.
+                if let Some(fetch) = fetch {
+                    scanner.limit(Some(fetch as i64), None)?;
                 }
 
                 scanner.create_plan().await
@@ -413,13 +485,36 @@ mod integration_tests {
         .unwrap()
     }
 
-    /// Create a dataset at the given URI with the provided batches.
+    /// Create a dataset at the given URI with the provided batches. Also writes
+    /// the standalone PK sidecar (on `id`) so a flushed-generation source can be
+    /// probed by the block-list; harmless for a base table (never probed).
     async fn create_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        Dataset::write(reader, uri, Some(WriteParams::default()))
+        let has_id = schema.column_with_name("id").is_some();
+        let reader = RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, uri, Some(WriteParams::default()))
             .await
-            .unwrap()
+            .unwrap();
+        if has_id {
+            super::super::block_list::write_pk_sidecar(uri, &batches, &["id"])
+                .await
+                .unwrap();
+        }
+        dataset
+    }
+
+    /// Build an in-memory memtable's `(batch_store, index_store)` with the PK
+    /// index enabled and populated (mirrors production — the block-list needs
+    /// the PK index to dedup in-memory generations).
+    fn pk_indexed(batches: &[RecordBatch]) -> (Arc<BatchStore>, Arc<IndexStore>) {
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        for b in batches {
+            let (bp, off, _) = batch_store.append(b.clone()).unwrap();
+            index.insert_with_batch_position(b, off, Some(bp)).unwrap();
+        }
+        (batch_store, Arc::new(index))
     }
 
     /// Setup a multi-level LSM structure with:
@@ -470,10 +565,8 @@ mod integration_tests {
             .with_flushed_generation(2, "gen_2".to_string());
 
         // Create active memtable
-        let batch_store = Arc::new(BatchStore::with_capacity(100));
-        let index_store = Arc::new(IndexStore::new());
-        let active_batch = create_test_batch(&schema, &[5, 6, 7], "active");
-        let _ = batch_store.append(active_batch);
+        let (batch_store, index_store) =
+            pk_indexed(&[create_test_batch(&schema, &[5, 6, 7], "active")]);
 
         let active_memtable = InMemoryMemTables {
             active: InMemoryMemTableRef {
@@ -515,18 +608,18 @@ mod integration_tests {
         // Verify the plan (gen DESC order: active -> gen2 -> gen1 -> base):
         // - plain UnionExec at top
         // - active arm: MemTableDedupScanExec (newest gen, not block-listed)
-        // - older arms: PkHashFilterExec (cross-gen block-list) -> LanceRead
+        // - older arms: PkBlockFilterExec (cross-gen block-list) -> LanceRead
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
   CoalescePartitionsExec
     UnionExec
     MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
-    PkHashFilterExec: pk_cols=[id]...
+    PkBlockFilterExec: pk_cols=[id]...
       LanceRead:...gen_2...
-    PkHashFilterExec: pk_cols=[id]...
+    PkBlockFilterExec: pk_cols=[id]...
       LanceRead:...gen_1...
-    PkHashFilterExec: pk_cols=[id]...
+    PkBlockFilterExec: pk_cols=[id]...
       LanceRead:...base/data...refine_filter=--",
         )
         .await
@@ -549,9 +642,9 @@ mod integration_tests {
 
         // Verify the plan with `_memtable_gen` tags (gen DESC order):
         // - plain UnionExec at top
-        // - each arm: MemtableGenTagExec -> (PkHashFilterExec ->) data source
+        // - each arm: MemtableGenTagExec -> (PkBlockFilterExec ->) data source
         //   - gen3 (active): MemtableGenTagExec -> MemTableDedupScanExec
-        //   - gen2/gen1/base: MemtableGenTagExec -> PkHashFilterExec -> LanceRead
+        //   - gen2/gen1/base: MemtableGenTagExec -> PkBlockFilterExec -> LanceRead
         assert_plan_node_equals(
             plan,
             "ProjectionExec:...
@@ -560,13 +653,13 @@ mod integration_tests {
     MemtableGenTagExec: gen=gen3
       MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
     MemtableGenTagExec: gen=gen2
-      PkHashFilterExec: pk_cols=[id]...
+      PkBlockFilterExec: pk_cols=[id]...
         LanceRead:...gen_2...
     MemtableGenTagExec: gen=gen1
-      PkHashFilterExec: pk_cols=[id]...
+      PkBlockFilterExec: pk_cols=[id]...
         LanceRead:...gen_1...
     MemtableGenTagExec: gen=base
-      PkHashFilterExec: pk_cols=[id]...
+      PkBlockFilterExec: pk_cols=[id]...
         LanceRead:...base/data...refine_filter=--",
         )
         .await
@@ -647,14 +740,14 @@ mod integration_tests {
         }
 
         // base/gen1/gen2 all hold PKs superseded by a newer generation, so each
-        // is wrapped in a `PkHashFilterExec`; the newest (active) arm is not.
+        // is wrapped in a `PkBlockFilterExec`; the newest (active) arm is not.
         let plan = scanner.create_plan().await.unwrap();
         let plan_str = format!(
             "{}",
             datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
         );
         assert!(
-            plan_str.contains("PkHashFilterExec"),
+            plan_str.contains("PkBlockFilterExec"),
             "filtered-read plan must apply the cross-gen block-list, got:\n{}",
             plan_str
         );
@@ -730,21 +823,21 @@ mod integration_tests {
             .with_flushed_generation(2, "gen_2".to_string());
 
         // Frozen gen3 (sealed, NOT in the manifest) and active gen4.
-        let frozen_store = Arc::new(BatchStore::with_capacity(100));
-        let _ = frozen_store.append(create_test_batch(&schema, &[6, 7], "frozen"));
+        let (frozen_store, frozen_index) =
+            pk_indexed(&[create_test_batch(&schema, &[6, 7], "frozen")]);
         let frozen = InMemoryMemTableRef {
             batch_store: frozen_store,
-            index_store: Arc::new(IndexStore::new()),
+            index_store: frozen_index,
             schema: schema.clone(),
             generation: 3,
         };
 
-        let active_store = Arc::new(BatchStore::with_capacity(100));
-        let _ = active_store.append(create_test_batch(&schema, &[7, 8], "active"));
+        let (active_store, active_index) =
+            pk_indexed(&[create_test_batch(&schema, &[7, 8], "active")]);
         let in_memory = InMemoryMemTables {
             active: InMemoryMemTableRef {
                 batch_store: active_store,
-                index_store: Arc::new(IndexStore::new()),
+                index_store: active_index,
                 schema: schema.clone(),
                 generation: 4,
             },
@@ -969,12 +1062,12 @@ mod integration_tests {
     ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
       MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
     ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-      PkHashFilterExec: pk_cols=[id]...
+      PkBlockFilterExec: pk_cols=[id]...
         LanceRead:...gen_2...
     ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-      PkHashFilterExec: pk_cols=[id]...
+      PkBlockFilterExec: pk_cols=[id]...
         LanceRead:...gen_1...
-    PkHashFilterExec: pk_cols=[id]...
+    PkBlockFilterExec: pk_cols=[id]...
       LanceRead:...base/data...refine_filter=--",
         )
         .await
@@ -1037,14 +1130,14 @@ mod integration_tests {
         MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
     MemtableGenTagExec: gen=gen2
       ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-        PkHashFilterExec: pk_cols=[id]...
+        PkBlockFilterExec: pk_cols=[id]...
           LanceRead:...gen_2...
     MemtableGenTagExec: gen=gen1
       ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-        PkHashFilterExec: pk_cols=[id]...
+        PkBlockFilterExec: pk_cols=[id]...
           LanceRead:...gen_1...
     MemtableGenTagExec: gen=base
-      PkHashFilterExec: pk_cols=[id]...
+      PkBlockFilterExec: pk_cols=[id]...
         LanceRead:...base/data...refine_filter=--",
         )
         .await
@@ -1113,6 +1206,8 @@ mod integration_tests {
         let mut index_store = IndexStore::new();
         // Add BTree index on id column (field_id=0)
         index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        // Reuse it as the PK index so the block-list can dedup this generation.
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
 
         let active_batch = create_test_batch(&schema, &[5, 6, 7], "active");
         let _ = batch_store.append(active_batch.clone());
@@ -1177,7 +1272,7 @@ mod integration_tests {
         // 1. Verify overall structure
         assert!(plan_str.contains("UnionExec"), "Should have UnionExec");
         assert!(
-            plan_str.contains("PkHashFilterExec"),
+            plan_str.contains("PkBlockFilterExec"),
             "older generations should be block-list filtered"
         );
         assert!(
@@ -1365,7 +1460,6 @@ mod integration_tests {
 
         // Active memtable: id=10 inserted ("keep") then updated to NULL within
         // the same generation; id=20 ("active_20") is a control that matches.
-        let batch_store = Arc::new(BatchStore::with_capacity(16));
         let active_batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -1378,12 +1472,12 @@ mod integration_tests {
             ],
         )
         .unwrap();
-        batch_store.append(active_batch).unwrap();
+        let (batch_store, index_store) = pk_indexed(&[active_batch]);
 
         let in_memory = InMemoryMemTables {
             active: InMemoryMemTableRef {
                 batch_store,
-                index_store: Arc::new(IndexStore::new()),
+                index_store,
                 schema: schema.clone(),
                 generation: 1,
             },

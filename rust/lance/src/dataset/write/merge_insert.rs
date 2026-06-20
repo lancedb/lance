@@ -2224,18 +2224,13 @@ impl Merger {
         &self.output_schema
     }
 
-    // Retrieves a bitmap of rows where at least one of the columns in the range
-    // col_offset..coll_offset+num_cols is not null.
-    //
-    fn not_all_null(
-        batch: &RecordBatch,
-        col_offset: usize,
-        num_cols: usize,
-    ) -> Result<BooleanArray> {
+    // Retrieves a bitmap of rows where at least one of the given columns is
+    // not null.
+    fn not_all_null(batch: &RecordBatch, cols: &[usize]) -> Result<BooleanArray> {
         // For our purposes we know there is always at least 1 on key
-        debug_assert_ne!(num_cols, 0);
-        let mut at_least_one_valid = arrow::compute::is_not_null(batch.column(col_offset))?;
-        for idx in col_offset + 1..col_offset + num_cols {
+        debug_assert!(!cols.is_empty());
+        let mut at_least_one_valid = arrow::compute::is_not_null(batch.column(cols[0]))?;
+        for &idx in &cols[1..] {
             let is_valid = arrow::compute::is_not_null(batch.column(idx))?;
             at_least_one_valid = arrow::compute::or(&at_least_one_valid, &is_valid)?;
         }
@@ -2263,8 +2258,37 @@ impl Merger {
         right_offset: usize,
         num_keys: usize,
     ) -> Result<(BooleanArray, BooleanArray, BooleanArray)> {
-        let in_left = Self::not_all_null(combined_batch, 0, num_keys)?;
-        let in_right = Self::not_all_null(combined_batch, right_offset, num_keys)?;
+        // The outer join distinguishes its three cases by which side's join
+        // keys were NULL-padded: a present row always has non-null keys, while
+        // the absent side is filled with NULLs. We therefore test the *key*
+        // columns, located by name. They are NOT necessarily the first
+        // `num_keys` columns — a partial-schema source can place a payload
+        // column (e.g. an all-null vector) at position 0, and checking
+        // positions [0, num_keys) there misreads an all-null leading payload
+        // column as an absent join side, silently dropping every matched row
+        // (https://github.com/lancedb/lancedb/issues/3515). The target half
+        // carries the same columns in the same order, offset by `right_offset`.
+        let source_key_cols = self
+            .params
+            .on
+            .iter()
+            .map(|key| {
+                combined_batch.schema().index_of(key).map_err(|_| {
+                    Error::internal(format!(
+                        "merge insert key column '{}' not found in joined batch",
+                        key
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        debug_assert_eq!(source_key_cols.len(), num_keys);
+        let target_key_cols = source_key_cols
+            .iter()
+            .map(|c| c + right_offset)
+            .collect::<Vec<_>>();
+
+        let in_left = Self::not_all_null(combined_batch, &source_key_cols)?;
+        let in_right = Self::not_all_null(combined_batch, &target_key_cols)?;
         let in_both = arrow::compute::and(&in_left, &in_right)?;
         let left_only = arrow::compute::and(&in_left, &arrow::compute::not(&in_right)?)?;
         let right_only = arrow::compute::and(&arrow::compute::not(&in_left)?, &in_right)?;
@@ -3515,6 +3539,116 @@ mod tests {
                 "Row ID should remain stable throughout the entire process of update and merge insert"
             );
         }
+    }
+
+    /// Reproduces https://github.com/lancedb/lancedb/issues/3515:
+    /// a partial-schema `merge_insert` with a scalar index on the join key,
+    /// where every fragment is covered by the index (no unindexed data),
+    /// silently updates 0 rows instead of the expected matches.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_repro_3515_partial_schema_fully_indexed(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+        version: LanceFileVersion,
+    ) {
+        const N: usize = 1000;
+        const UPD: usize = 128;
+        let vec_field = Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            true,
+        );
+        let full_schema = Arc::new(Schema::new(vec![
+            vec_field.clone(),
+            Field::new("path", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+            Field::new("file_size", DataType::Int64, true),
+        ]));
+
+        // 1000 rows: vector all-null, path "/img/{i}.jpg", status "pending".
+        let paths = StringArray::from((0..N).map(|i| format!("/img/{i}.jpg")).collect::<Vec<_>>());
+        let statuses = StringArray::from(vec!["pending"; N]);
+        let file_sizes = Int64Array::from((0..N as i64).map(|i| 1000 + i).collect::<Vec<_>>());
+        let null_vectors = arrow_array::new_null_array(vec_field.data_type(), N);
+        let batch = RecordBatch::try_new(
+            full_schema.clone(),
+            vec![
+                null_vectors,
+                Arc::new(paths),
+                Arc::new(statuses),
+                Arc::new(file_sizes),
+            ],
+        )
+        .unwrap();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], full_schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Scalar index on the merge key, covering every fragment.
+        ds.create_index(
+            &["path"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let ds = Arc::new(ds);
+
+        // Partial-schema source (no `file_size`): update the first 128 rows.
+        let upd_schema = Arc::new(Schema::new(vec![
+            vec_field,
+            Field::new("path", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let upd_paths = StringArray::from(
+            (0..UPD)
+                .map(|i| format!("/img/{i}.jpg"))
+                .collect::<Vec<_>>(),
+        );
+        let upd_vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.1f32; 4 * UPD]), 4)
+                .unwrap();
+        let upd_statuses = StringArray::from(vec!["indexed"; UPD]);
+        let updates = RecordBatch::try_new(
+            upd_schema.clone(),
+            vec![
+                Arc::new(upd_vectors),
+                Arc::new(upd_paths),
+                Arc::new(upd_statuses),
+            ],
+        )
+        .unwrap();
+
+        let (ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["path".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(updates)], upd_schema))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.num_updated_rows, UPD as u64,
+            "expected {UPD} updated rows on {version:?}, got {}",
+            stats.num_updated_rows
+        );
+        let n_indexed = ds
+            .count_rows(Some("status = 'indexed'".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(n_indexed, UPD, "expected {UPD} rows flipped to 'indexed'");
     }
 
     #[tokio::test]

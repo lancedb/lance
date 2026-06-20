@@ -1,13 +1,13 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.8.0,<0.9"]
+dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.8.5,<0.9"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
 repository = "https://github.com/lancedb/lance"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = [
     "data-format",
     "data-science",
@@ -30,7 +30,6 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -61,7 +60,7 @@ tests = [
     # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
     "tensorflow; sys_platform == 'linux'",
     "tqdm",
-    "datafusion>=53,<54; python_version >= '3.10'",
+    "datafusion>=53,<54",
 ]
 dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]
@@ -74,7 +73,7 @@ geo = [
 [dependency-groups]
 tests = [
     "boto3==1.40.43",
-    "datasets==4.1.1; python_version >= '3.10'",
+    "datasets==4.1.1",
     "duckdb==1.4.0",
     "ml_dtypes==0.5.3",
     "pillow==11.3.0",
@@ -82,9 +81,9 @@ tests = [
     "polars[pyarrow,pandas]==1.34.0",
     "psutil==7.1.0",
     "pytest==8.4.2",
-    "tensorflow==2.20.0; sys_platform == 'linux' and python_version >= '3.10'",
+    "tensorflow==2.20.0; sys_platform == 'linux'",
     "tqdm==4.67.1",
-    "datafusion==53.0.0; python_version >= '3.10'",
+    "datafusion==53.0.0",
 ]
 dev = [
     "maturin==1.13.3",

@@ -29,9 +29,7 @@ use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
-};
+use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
@@ -57,7 +55,7 @@ use lance_io::utils::{
     read_version,
 };
 use lance_table::format::{Fragment, SelfDescribingFileReader};
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -166,7 +164,8 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
         let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-        if index_details.type_url.ends_with("InvertedIndexDetails") {
+        let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
+        if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
                 name: index_name.to_string(),
@@ -183,7 +182,10 @@ pub(crate) async fn build_index_metadata_from_segments(
                 .await?;
         }
         let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        if is_inverted_index {
+            retain_committed_inverted_files(&mut files);
+        }
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
@@ -199,6 +201,10 @@ pub(crate) async fn build_index_metadata_from_segments(
     }
 
     Ok(new_indices)
+}
+
+fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
+    files.retain(|file| !file.path.starts_with("staging/"));
 }
 
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -652,10 +658,10 @@ pub struct ScalarIndexInfo {
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
-    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
         self.indexed_columns
             .get(col)
-            .map(|(ty, parser)| (ty, parser.as_ref() as &dyn ScalarQueryParser))
+            .map(|(ty, parser)| (ty, parser.as_ref()))
     }
 
     fn fragment_bitmap(&self, column: &str, index_name: &str) -> Option<RoaringBitmap> {
@@ -1891,9 +1897,15 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
-                .reconstruct(object_store, self.metadata_cache.as_ref(), partition_cache)
+                .reconstruct(
+                    object_store,
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
                 .await;
         }
 
@@ -2158,6 +2170,15 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let (index, ivf_entry) = result?;
         metrics.record_index_load();
+        // Attribute the one-time index-open I/O (file footers, IVF centroids,
+        // quantization metadata) to this query's metrics.  This runs only on a
+        // real open; cache hits return earlier, so a warm query reports zero
+        // index-open I/O.
+        if let Some(io_stats) = metrics.io_stats()
+            && let Some(open_stats) = index.open_io_stats()
+        {
+            io_stats.add_scan_stats(&open_stats);
+        }
         if let Some(ivf_entry) = ivf_entry {
             let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
             self.index_cache

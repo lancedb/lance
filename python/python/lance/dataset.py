@@ -950,6 +950,9 @@ class LanceDataset(pa.dataset.Dataset):
         ds._base_store_params = self._base_store_params
         ds._namespace_client = self._namespace_client
         ds._table_id = self._table_id
+        ds._namespace_client_managed_versioning = (
+            self._namespace_client_managed_versioning
+        )
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
         return ds
@@ -1350,7 +1353,10 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def has_stable_row_ids(self) -> bool:
         """
-        Whether this dataset has stable row IDs enabled
+        Whether this dataset has stable row IDs enabled.
+
+        This is based on the dataset manifest feature flag and does not depend on
+        whether the current version has any fragments.
         """
         return self._ds.has_stable_row_ids
 
@@ -3074,6 +3080,38 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             raise Exception("index_type must be str or IndexConfig")
 
+    @staticmethod
+    def _normalized_index_type(
+        index_type: Union[str, IndexConfig],
+    ) -> str:
+        if isinstance(index_type, IndexConfig):
+            index_type = index_type.index_type
+        return index_type.upper()
+
+    @classmethod
+    def _is_segment_native_scalar_index_type(
+        cls,
+        index_type: Union[str, IndexConfig],
+    ) -> bool:
+        return cls._normalized_index_type(index_type) in {
+            "BTREE",
+            "BITMAP",
+            "INVERTED",
+            "FTS",
+            "ZONEMAP",
+        }
+
+    @classmethod
+    def _requires_uncommitted_scalar_index(
+        cls,
+        index_type: Union[str, IndexConfig],
+    ) -> bool:
+        return cls._normalized_index_type(index_type) in {
+            "BTREE",
+            "BITMAP",
+            "ZONEMAP",
+        }
+
     def create_scalar_index(
         self,
         column: str,
@@ -3291,7 +3329,9 @@ class LanceDataset(pa.dataset.Dataset):
             column, index_type, kwargs
         )
 
-        if fragment_ids is not None and logical_index_type in {"BTREE", "BITMAP"}:
+        if fragment_ids is not None and self._requires_uncommitted_scalar_index(
+            logical_index_type
+        ):
             raise ValueError(
                 f"{logical_index_type} distributed indexing uses "
                 "create_index_uncommitted(..., "
@@ -4004,7 +4044,8 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, and INVERTED scalar index construction. Unlike
+        canonical bitmap scalar, INVERTED scalar, and ZONEMAP scalar index
+        construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4020,11 +4061,8 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE segments do not yet support merging; collect the returned
-        segments and pass them straight to
-        :meth:`commit_existing_index_segments`. BITMAP and INVERTED segments may
+        BTREE, BITMAP, INVERTED, and ZONEMAP segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
-
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
@@ -4050,12 +4088,8 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
-        is_scalar_segment_request = (
-            isinstance(index_type, str)
-            and index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
-        ) or (
-            isinstance(index_type, IndexConfig)
-            and index_type.index_type.upper() in {"BTREE", "BITMAP", "INVERTED", "FTS"}
+        is_scalar_segment_request = self._is_segment_native_scalar_index_type(
+            index_type
         )
         if is_scalar_segment_request:
             if fragment_ids is None:
@@ -4551,6 +4585,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._base_store_params = base_store_params
         ds._namespace_client = None
         ds._table_id = None
+        ds._namespace_client_managed_versioning = False
         ds._default_scan_options = None
         ds._read_params = None
         return BulkCommitResult(
@@ -6255,6 +6290,7 @@ class ScannerBuilder:
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
+        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
@@ -6278,6 +6314,13 @@ class ScannerBuilder:
             the CPU pool size. Value 1 uses the single-worker sequential path.
             Values >= 2 use the partition-parallel path and are clamped to the
             CPU pool size.
+        approx_mode: {"fast", "normal", "accurate"}, default "normal"
+            Controls the speed / accuracy tradeoff for approximate vector search
+            when supported by the selected index. This currently only affects
+            RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
+            setting. ``fast`` favors lower latency and may reduce recall,
+            ``normal`` uses the default balance, and ``accurate`` favors higher
+            recall and may increase latency.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -6292,6 +6335,7 @@ class ScannerBuilder:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            approx_mode=approx_mode,
             distance_range=distance_range,
         )
         return self
@@ -7414,6 +7458,7 @@ def _build_vector_search_query(
     use_index: bool = True,
     ef: Optional[int] = None,
     query_parallelism: Optional[int] = None,
+    approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
     """Configure nearest neighbor search.
@@ -7455,6 +7500,13 @@ def _build_vector_search_query(
         maps to the single-worker sequential path. Value -1 uses the CPU pool
         size. Value 1 uses the single-worker sequential path. Values >= 2 use
         the partition-parallel path and are clamped to the CPU pool size.
+    approx_mode: {"fast", "normal", "accurate"}, default "normal"
+        Controls the speed / accuracy tradeoff for approximate vector search
+        when supported by the selected index. This currently only affects
+        RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
+        setting. ``fast`` favors lower latency and may reduce recall,
+        ``normal`` uses the default balance, and ``accurate`` favors higher
+        recall and may increase latency.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -7528,6 +7580,12 @@ def _build_vector_search_query(
     if query_parallelism is not None and query_parallelism < -1:
         raise ValueError("query_parallelism must be >= -1")
 
+    if approx_mode not in {"fast", "normal", "accurate"}:
+        raise ValueError(
+            "approx_mode must be one of 'fast', 'normal', or 'accurate', "
+            f"got {approx_mode!r}"
+        )
+
     if distance_range is not None:
         if len(distance_range) != 2:
             raise ValueError(
@@ -7545,6 +7603,7 @@ def _build_vector_search_query(
         "use_index": use_index,
         "ef": ef,
         "query_parallelism": query_parallelism,
+        "approx_mode": approx_mode,
         "distance_range": distance_range,
     }
 
@@ -7701,6 +7760,7 @@ class VectorSearchQuery:
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
+        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -7714,6 +7774,7 @@ class VectorSearchQuery:
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
+            approx_mode=approx_mode,
         )
 
     def inner(self):

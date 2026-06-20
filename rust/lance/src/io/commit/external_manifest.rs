@@ -365,6 +365,32 @@ mod test {
         assert_eq!(ds.version().version, 6);
         assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
+        {
+            inner_store.lock().await.remove(&(ds.base.to_string(), 6));
+        }
+        assert!(
+            handler
+                .version_exists(
+                    &ds.base,
+                    6,
+                    ds.object_store.inner.as_ref(),
+                    ds.manifest_location().naming_scheme,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handler
+                .version_exists(
+                    &ds.base,
+                    7,
+                    ds.object_store.inner.as_ref(),
+                    ds.manifest_location().naming_scheme,
+                )
+                .await
+                .unwrap()
+        );
+
         // Open without external store handler again, should see the newly sync'd commit
         let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 6);

@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_index::pb as index_pb;
-use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, Query};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb as table_pb;
@@ -80,6 +80,22 @@ fn query_vector_from_ipc_bytes(bytes: &[u8]) -> Result<arrow_array::ArrayRef> {
     Ok(batches[0].column(0).clone())
 }
 
+fn approx_mode_to_proto(mode: ApproxMode) -> pb::VectorApproxMode {
+    match mode {
+        ApproxMode::Fast => pb::VectorApproxMode::Fast,
+        ApproxMode::Normal => pb::VectorApproxMode::Normal,
+        ApproxMode::Accurate => pb::VectorApproxMode::Accurate,
+    }
+}
+
+fn approx_mode_from_proto(value: i32) -> ApproxMode {
+    match pb::VectorApproxMode::try_from(value).unwrap_or(pb::VectorApproxMode::Normal) {
+        pb::VectorApproxMode::Fast => ApproxMode::Fast,
+        pb::VectorApproxMode::Normal => ApproxMode::Normal,
+        pb::VectorApproxMode::Accurate => ApproxMode::Accurate,
+    }
+}
+
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
     let query_vector_arrow_ipc = query_vector_to_ipc_bytes(query.key.as_ref())?;
 
@@ -101,6 +117,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         use_index: query.use_index,
         dist_q_c: Some(query.dist_q_c),
         query_parallelism: Some(query.query_parallelism),
+        approx_mode: approx_mode_to_proto(query.approx_mode) as i32,
     })
 }
 
@@ -130,6 +147,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         use_index: proto.use_index,
         query_parallelism: proto.query_parallelism.unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
+        approx_mode: approx_mode_from_proto(proto.approx_mode),
     })
 }
 
@@ -335,6 +353,7 @@ mod tests {
             use_index: true,
             query_parallelism: -1,
             dist_q_c: 0.42,
+            approx_mode: ApproxMode::Accurate,
         };
 
         let proto = query_to_proto(&query).unwrap();
@@ -352,6 +371,7 @@ mod tests {
         assert_eq!(query.use_index, back.use_index);
         assert_eq!(query.query_parallelism, back.query_parallelism);
         assert_eq!(query.dist_q_c, back.dist_q_c);
+        assert_eq!(query.approx_mode, back.approx_mode);
         assert_eq!(query.key.len(), back.key.len());
         assert_eq!(query.key.data_type(), back.key.data_type());
     }
@@ -373,12 +393,19 @@ mod tests {
             use_index: false,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
         };
 
         let proto = query_to_proto(&query).unwrap();
         let back = query_from_proto(proto).unwrap();
         assert!(back.metric_type.is_none());
         assert!(!back.use_index);
+        assert_eq!(back.approx_mode, ApproxMode::Normal);
+
+        let mut proto = query_to_proto(&query).unwrap();
+        proto.approx_mode = i32::MAX;
+        let back = query_from_proto(proto).unwrap();
+        assert_eq!(back.approx_mode, ApproxMode::Normal);
     }
 
     async fn make_vector_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
@@ -444,6 +471,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
         };
 
         let exec = ANNIvfPartitionExec::try_new(
@@ -491,6 +519,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
         };
 
         // Use a TestMemoryExec as a mock input child (provides the KNN_PARTITION_SCHEMA)
@@ -554,6 +583,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
         };
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             TestMemoryExec::try_new_exec(

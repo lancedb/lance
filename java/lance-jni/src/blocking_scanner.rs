@@ -30,6 +30,7 @@ use crate::{
     RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::IntoJava,
+    utils::parse_approx_mode,
 };
 
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
@@ -357,6 +358,9 @@ pub(crate) fn build_scanner_with_options<'a>(
             .call_method(&java_obj, "getQueryParallelism", "()I", &[])?
             .i()?;
         scanner.query_parallelism(query_parallelism);
+
+        let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
+        scanner.approx_mode(parse_approx_mode(&approx_mode_str)?);
         Ok(())
     })?;
 

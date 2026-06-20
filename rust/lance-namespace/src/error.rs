@@ -78,6 +78,10 @@ pub enum ErrorCode {
     TableSchemaValidationError = 20,
     /// Request was throttled due to rate limiting or too many concurrent operations
     Throttling = 21,
+    /// The specified table branch does not exist
+    TableBranchNotFound = 22,
+    /// A table branch with this name already exists
+    TableBranchAlreadyExists = 23,
 }
 
 impl ErrorCode {
@@ -113,6 +117,8 @@ impl ErrorCode {
             19 => Some(Self::InvalidTableState),
             20 => Some(Self::TableSchemaValidationError),
             21 => Some(Self::Throttling),
+            22 => Some(Self::TableBranchNotFound),
+            23 => Some(Self::TableBranchAlreadyExists),
             _ => None,
         }
     }
@@ -143,6 +149,8 @@ impl std::fmt::Display for ErrorCode {
             Self::InvalidTableState => "InvalidTableState",
             Self::TableSchemaValidationError => "TableSchemaValidationError",
             Self::Throttling => "Throttling",
+            Self::TableBranchNotFound => "TableBranchNotFound",
+            Self::TableBranchAlreadyExists => "TableBranchAlreadyExists",
         };
         write!(f, "{}", name)
     }
@@ -260,6 +268,14 @@ pub enum NamespaceError {
     /// Request was throttled due to rate limiting or too many concurrent operations.
     #[snafu(display("Throttling: {message}"))]
     Throttling { message: String },
+
+    /// The specified table branch does not exist.
+    #[snafu(display("Table branch not found: {message}"))]
+    TableBranchNotFound { message: String },
+
+    /// A table branch with this name already exists.
+    #[snafu(display("Table branch already exists: {message}"))]
+    TableBranchAlreadyExists { message: String },
 }
 
 impl NamespaceError {
@@ -291,7 +307,9 @@ impl NamespaceError {
             | Self::Internal { message }
             | Self::InvalidTableState { message }
             | Self::TableSchemaValidationError { message }
-            | Self::Throttling { message } => message,
+            | Self::Throttling { message }
+            | Self::TableBranchNotFound { message }
+            | Self::TableBranchAlreadyExists { message } => message,
         }
     }
 
@@ -322,6 +340,8 @@ impl NamespaceError {
             Self::InvalidTableState { .. } => ErrorCode::InvalidTableState,
             Self::TableSchemaValidationError { .. } => ErrorCode::TableSchemaValidationError,
             Self::Throttling { .. } => ErrorCode::Throttling,
+            Self::TableBranchNotFound { .. } => ErrorCode::TableBranchNotFound,
+            Self::TableBranchAlreadyExists { .. } => ErrorCode::TableBranchAlreadyExists,
         }
     }
 
@@ -355,6 +375,8 @@ impl NamespaceError {
                 Self::TableSchemaValidationError { message }
             }
             Some(ErrorCode::Throttling) => Self::Throttling { message },
+            Some(ErrorCode::TableBranchNotFound) => Self::TableBranchNotFound { message },
+            Some(ErrorCode::TableBranchAlreadyExists) => Self::TableBranchAlreadyExists { message },
             None => Self::Internal { message },
         }
     }
@@ -380,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_error_code_roundtrip() {
-        for code in 0..=21 {
+        for code in 0..=23 {
             let error_code = ErrorCode::from_u32(code).unwrap();
             assert_eq!(error_code.as_u32(), code);
         }

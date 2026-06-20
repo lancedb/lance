@@ -26,7 +26,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::ShardWriterConfig;
 use super::scanner::flushed_cache::open_flushed_dataset;
-use super::scanner::{FlushedMemTableCache, ShardSnapshot};
+use super::scanner::{DatasetCache, ShardSnapshot};
 use super::write::MemIndexConfig;
 use super::write::ShardWriter;
 
@@ -500,7 +500,7 @@ pub trait DatasetMemWalExt {
     async fn prewarm_mem_wal(
         &self,
         _snapshots: &[ShardSnapshot],
-        _cache: Option<&Arc<FlushedMemTableCache>>,
+        _cache: Option<&Arc<dyn DatasetCache>>,
     ) -> Result<()> {
         Ok(())
     }
@@ -586,7 +586,7 @@ impl DatasetMemWalExt for Dataset {
     async fn prewarm_mem_wal(
         &self,
         snapshots: &[ShardSnapshot],
-        cache: Option<&Arc<FlushedMemTableCache>>,
+        cache: Option<&Arc<dyn DatasetCache>>,
     ) -> Result<()> {
         let session = self.session();
         // Resolve flushed paths exactly as the LSM collector does, so the
@@ -601,7 +601,8 @@ impl DatasetMemWalExt for Dataset {
                 snapshot.flushed_generations.iter().map(move |flushed| {
                     let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, flushed.path);
                     async move {
-                        let dataset = open_flushed_dataset(&path, Some(session), cache).await?;
+                        let dataset =
+                            open_flushed_dataset(&path, Some(session), cache, None).await?;
                         prewarm_all_indexes(&dataset).await
                     }
                 })
@@ -762,6 +763,7 @@ async fn load_vector_index_config(
 
 #[cfg(test)]
 mod tests {
+    use super::super::scanner::FlushedMemTableCache;
     use super::*;
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
@@ -831,7 +833,7 @@ mod tests {
             .with_current_generation(2)
             .with_flushed_generation(1, folder.to_string());
 
-        let cache = Arc::new(FlushedMemTableCache::new(4));
+        let cache: Arc<dyn DatasetCache> = Arc::new(FlushedMemTableCache::new(4));
         base.prewarm_mem_wal(std::slice::from_ref(&snapshot), Some(&cache))
             .await
             .expect("prewarm must open the generation and warm its index");

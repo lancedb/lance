@@ -78,8 +78,9 @@ use lance_index::{
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
-        DEFAULT_QUERY_PARALLELISM, Query as VectorQuery, hnsw::builder::HnswBuildParams,
-        ivf::IvfBuildParams, pq::PQBuildParams, sq::builder::SQBuildParams,
+        ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+        sq::builder::SQBuildParams,
     },
 };
 use lance_io::object_store::{
@@ -817,8 +818,14 @@ impl Dataset {
 
             // Set up commit handler only if namespace manages versioning
             if namespace_client_managed_versioning {
-                let external_store =
-                    LanceNamespaceExternalManifestStore::new(ns_client, tid.clone());
+                // The store derives the branch a request targets from the base
+                // path it is handed, resolved against the table root.
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    ns_client,
+                    tid.clone(),
+                    &uri,
+                )
+                .infer_error()?;
                 let commit_handler: Arc<dyn CommitHandler> =
                     Arc::new(ExternalManifestCommitHandler {
                         external_manifest_store: Arc::new(external_store),
@@ -1227,6 +1234,7 @@ impl Dataset {
                 use_index,
                 ef,
                 query_parallelism,
+                approx_mode,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
             let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
@@ -1293,6 +1301,7 @@ impl Dataset {
                         s = s.ef(ef);
                     }
                     s = s.query_parallelism(query_parallelism);
+                    s = s.approx_mode(approx_mode);
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);
@@ -2652,9 +2661,16 @@ impl Dataset {
                 && let (Some(ns_client), Some(tid)) = (namespace_client, table_id)
             {
                 // Create ExternalManifestCommitHandler from namespace client and table_id
-                // only when namespace manages versioning
+                // only when namespace manages versioning. The store derives the
+                // branch a request targets from the base path it is handed,
+                // resolved against the table root.
                 let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-                let external_store = LanceNamespaceExternalManifestStore::new(ns_client, tid);
+                let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                    ns_client,
+                    tid,
+                    &dest.table_root_uri()?,
+                )
+                .infer_error()?;
                 Some(Arc::new(ExternalManifestCommitHandler {
                     external_manifest_store: Arc::new(external_store),
                 }) as Arc<dyn CommitHandler>)
@@ -3412,6 +3428,188 @@ impl Dataset {
             self.ds.clone(),
         ))
     }
+
+    /// Perform pairwise hamming distance clustering on a partition of an IVF_FLAT index.
+    ///
+    /// This function loads a specific partition from an IVF_FLAT index on a hash column,
+    /// computes pairwise hamming distances between all hashes in the partition,
+    /// filters by threshold, and clusters the results using union-find.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the IVF_FLAT index on the hash column
+    /// partition_id : int
+    ///     The partition ID within the IVF_FLAT index
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (index_name, partition_id, hamming_threshold))]
+    fn hamming_clustering_for_ivf_partition(
+        &self,
+        py: Python<'_>,
+        index_name: &str,
+        partition_id: usize,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_ivf_partition;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_ivf_partition(
+                    ds,
+                    index_name,
+                    partition_id,
+                    hamming_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
+
+    /// Get partition information for an IVF_FLAT index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the IVF_FLAT index
+    ///
+    /// Returns
+    /// -------
+    /// List[dict]
+    ///     List of partition info dicts with 'partition_id' and 'size'
+    #[pyo3(signature = (index_name))]
+    fn get_ivf_partition_info(
+        &self,
+        py: Python<'_>,
+        index_name: &str,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        use lance::index::vector::hamming::get_ivf_partition_info;
+
+        let ds = self.ds.as_ref();
+        let result = rt()
+            .block_on(Some(py), get_ivf_partition_info(ds, index_name))?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let partitions: PyResult<Vec<_>> = result
+            .iter()
+            .map(|p| {
+                let dict = PyDict::new(py);
+                dict.set_item("partition_id", p.partition_id)?;
+                dict.set_item("size", p.size)?;
+                Ok(dict.into())
+            })
+            .collect();
+
+        partitions
+    }
+
+    /// Perform pairwise hamming distance clustering on sampled rows from a dataset.
+    ///
+    /// This function samples N rows randomly from the dataset, extracts hashes,
+    /// computes pairwise hamming distances, and clusters the results.
+    /// It's useful for benchmarking and testing without requiring an IVF index.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    /// sample_size : int, optional
+    ///     Number of rows to sample (if None or >= total rows, uses all rows)
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (column, sample_size, hamming_threshold))]
+    fn hamming_clustering_for_sample(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        sample_size: Option<usize>,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_sample;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_sample(ds, column, sample_size, hamming_threshold),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
+
+    /// Perform pairwise hamming distance clustering on a contiguous range of rows from a fragment.
+    ///
+    /// This function reads a contiguous range of rows from a specific fragment,
+    /// extracts hashes, computes pairwise hamming distances, and clusters the results.
+    /// Unlike sampling, this reads sequential rows which is useful for distributed
+    /// processing where each worker handles a specific range of a fragment.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    /// fragment_id : int
+    ///     The fragment ID to read from
+    /// start_row : int
+    ///     The starting row offset within the fragment
+    /// num_rows : int
+    ///     Number of rows to read from the start position
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (column, fragment_id, start_row, num_rows, hamming_threshold))]
+    fn hamming_clustering_for_range(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        fragment_id: usize,
+        start_row: usize,
+        num_rows: usize,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_range;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_range(
+                    ds,
+                    column,
+                    fragment_id,
+                    start_row,
+                    num_rows,
+                    hamming_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
 }
 
 #[pyclass(name = "SqlQuery", module = "_lib", subclass, skip_from_py_object)]
@@ -3609,6 +3807,15 @@ impl PyWriteDest {
         match self {
             Self::Dataset(ds) => WriteDestination::Dataset(ds.ds.clone()),
             Self::Uri(uri) => WriteDestination::Uri(uri),
+        }
+    }
+
+    /// The table root uri of this destination (a branch dataset resolves to
+    /// its main location). Used to root the namespace manifest store.
+    pub fn table_root_uri(&self) -> PyResult<String> {
+        match self {
+            Self::Dataset(ds) => Ok(ds.ds.branch_location().find_main().infer_error()?.uri),
+            Self::Uri(uri) => Ok(uri.to_string()),
         }
     }
 }
@@ -3966,7 +4173,7 @@ pub fn write_dataset(
     dest: PyWriteDest,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
-    let params = get_write_params(options)?;
+    let params = get_write_params(options, &dest.table_root_uri()?)?;
     let py = options.py();
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
@@ -4035,8 +4242,13 @@ fn get_dict_opt<'py, D: FromPyObjectOwned<'py>>(
         .transpose()
 }
 
+/// `table_uri` is the destination table's root uri; it roots the namespace
+/// manifest store when `namespace_client_managed_versioning` is requested.
 #[allow(deprecated)]
-pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WriteParams>> {
+pub fn get_write_params(
+    options: &Bound<'_, PyDict>,
+    table_uri: &str,
+) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
@@ -4206,9 +4418,15 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             && let (Some(ns_client), Some(table_id)) =
                 (namespace_client_opt.as_ref(), table_id_opt.as_ref())
         {
+            // The store derives the branch a request targets from the base path
+            // it is handed, resolved against the table root.
             let ns_client = extract_namespace_arc(options.py(), ns_client)?;
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(ns_client, table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                ns_client,
+                table_id.clone(),
+                table_uri,
+            )
+            .infer_error()?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -4706,6 +4924,7 @@ type VectorQueryParams = (
     bool,
     Option<usize>,
     i32,
+    ApproxMode,
 );
 
 fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
@@ -4724,6 +4943,23 @@ fn vector_query_query_parallelism_from_dict(dict: &Bound<'_, PyDict>) -> PyResul
         extract_query_parallelism(&query_parallelism)
     } else {
         Ok(DEFAULT_QUERY_PARALLELISM)
+    }
+}
+
+fn vector_query_approx_mode_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<ApproxMode> {
+    if let Some(approx_mode) = dict.get_item("approx_mode")?
+        && !approx_mode.is_none()
+    {
+        match approx_mode.to_string().to_lowercase().as_str() {
+            "fast" => Ok(ApproxMode::Fast),
+            "normal" => Ok(ApproxMode::Normal),
+            "accurate" => Ok(ApproxMode::Accurate),
+            value => Err(PyValueError::new_err(format!(
+                "approx_mode must be one of 'fast', 'normal', or 'accurate', got '{value}'"
+            ))),
+        }
+    } else {
+        Ok(ApproxMode::Normal)
     }
 }
 
@@ -4833,6 +5069,7 @@ fn vector_query_params_from_dict(
     };
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
+    let approx_mode = vector_query_approx_mode_from_dict(dict)?;
 
     Ok((
         column,
@@ -4845,6 +5082,7 @@ fn vector_query_params_from_dict(
         use_index,
         ef,
         query_parallelism,
+        approx_mode,
     ))
 }
 
@@ -4881,6 +5119,7 @@ impl PySearchFilter {
             use_index,
             ef,
             query_parallelism,
+            approx_mode,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
@@ -4899,6 +5138,7 @@ impl PySearchFilter {
             use_index,
             query_parallelism,
             dist_q_c: 0.0,
+            approx_mode,
         };
 
         Ok(Self {

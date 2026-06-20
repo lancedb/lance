@@ -736,6 +736,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
+            // Skip docs the fragment-reuse remap deleted. They are tombstoned
+            // in the DocSet (slot kept so posting-list doc_ids stay aligned)
+            // and must not surface in results.
+            if docs_has_row_ids && row_id == RowAddress::TOMBSTONE_ROW {
+                if self.operator == Operator::Or {
+                    self.push_back_leads(doc.doc_id() + 1);
+                }
+                continue;
+            }
             if docs_has_row_ids && !mask.selected(row_id) {
                 if self.operator == Operator::Or {
                     self.push_back_leads(doc.doc_id() + 1);
@@ -767,14 +776,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.score(doc_length)
             };
 
-            let freqs = self.iter_term_freqs().collect();
             if candidates.len() < limit {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 let kth = candidates.peek().unwrap().0.0.score.0;
@@ -819,11 +829,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
 
         // we need to map the row ids to doc ids, and sort them,
-        // because WAND PostingIterator can't go back to the previous doc id
+        // because WAND PostingIterator can't go back to the previous doc id.
+        // A list column maps one row id to several doc ids, so expand every
+        // document the row owns — keying on a single doc id would drop matches
+        // at non-last list positions (lancedb#3352).
         let doc_ids = row_ids
-            .filter_map(|row_addr| {
+            .flat_map(|row_addr| {
                 let row_id: u64 = row_addr.into();
-                self.docs.doc_id(row_id).map(|doc_id| (doc_id, row_id))
+                self.docs
+                    .doc_ids(row_id)
+                    .map(move |doc_id| (doc_id, row_id))
             })
             .sorted_unstable()
             .collect::<Vec<_>>();
@@ -885,15 +900,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             self.collect_tail_matches(doc_id);
             let score = self.score(doc_length);
-            let freqs = self.iter_term_freqs().collect();
 
             if candidates.len() < limit {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 let kth = candidates.peek().unwrap().0.0.score.0;
@@ -967,41 +983,37 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             }
 
-            let Some(doc) = self.lead.first().and_then(|posting| posting.doc()) else {
+            let Some(first_doc) = self.lead.first().and_then(|posting| posting.doc()) else {
                 self.push_back_leads(target + 1);
                 continue;
             };
-            let doc_length = match &doc {
+            let doc_length = match &first_doc {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
-            let mut lead_score = self
-                .lead
-                .iter()
-                .filter_map(|posting| {
-                    posting.doc().map(|lead_doc| {
-                        posting.score(&self.scorer, lead_doc.frequency(), doc_length)
-                    })
-                })
-                .sum::<f32>();
+            let mut lead_score = 0.0;
+            if let Some(first_posting) = self.lead.first() {
+                lead_score += first_posting.score(&self.scorer, first_doc.frequency(), doc_length);
+            }
+            for posting in self.lead.iter().skip(1) {
+                if let Some(lead_doc) = posting.doc() {
+                    lead_score += posting.score(&self.scorer, lead_doc.frequency(), doc_length);
+                }
+            }
 
             while lead_score <= self.threshold {
                 if lead_score + self.tail_max_score <= self.threshold {
-                    self.push_back_leads(doc.doc_id() + 1);
+                    self.push_back_leads(first_doc.doc_id() + 1);
                     break;
                 }
                 if !self.advance_tail_top(target, doc_length, &mut lead_score) {
-                    self.push_back_leads(doc.doc_id() + 1);
+                    self.push_back_leads(first_doc.doc_id() + 1);
                     break;
                 }
             }
 
             if !self.lead.is_empty() {
-                return Ok(self
-                    .lead
-                    .first()
-                    .and_then(|posting| posting.doc())
-                    .map(|doc| (doc, lead_score)));
+                return Ok(Some((first_doc, lead_score)));
             }
         }
 
@@ -1392,10 +1404,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         };
         self.tail_max_score -= upper_bound;
         posting.next(target);
-        match posting.doc().map(|doc| doc.doc_id()) {
-            Some(doc_id) if doc_id == target => {
-                let frequency = posting.doc().expect("posting must exist").frequency();
-                *lead_score += posting.score(&self.scorer, frequency, doc_length);
+        match posting.doc() {
+            Some(doc) if doc.doc_id() == target => {
+                *lead_score += posting.score(&self.scorer, doc.frequency(), doc_length);
                 self.lead.push(posting);
             }
             Some(_) => self.push_head(posting),
@@ -1418,14 +1429,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         for tail_posting in tail.into_vec() {
             let mut posting = tail_posting.posting;
             posting.next(target);
-            match posting.doc().map(|doc| doc.doc_id()) {
-                Some(doc_id) if doc_id == target => {
+            match posting.doc() {
+                Some(doc) if doc.doc_id() == target => {
                     if let (Some(doc_length), Some(score)) = (doc_length, score.as_deref_mut()) {
-                        let frequency = posting
-                            .doc()
-                            .expect("posting moved to target should have doc")
-                            .frequency();
-                        *score += posting.score(&self.scorer, frequency, doc_length);
+                        *score += posting.score(&self.scorer, doc.frequency(), doc_length);
                     }
                     self.lead.push(posting)
                 }
@@ -2209,6 +2216,74 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(matched, vec![2]);
+    }
+
+    #[test]
+    fn test_doc_ids_resolves_every_document_a_row_owns() {
+        // A list<string> column indexes each element as its own document, so
+        // one row id owns several doc ids. row 100 -> {0, 1}, row 101 -> {2}.
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        assert_eq!(docs.doc_ids(100).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(docs.doc_ids(101).collect::<Vec<_>>(), vec![2]);
+        assert!(docs.doc_ids(999).next().is_none());
+
+        // legacy shape (row id == doc id) still resolves to a single document.
+        let mut legacy = DocSet::default();
+        legacy.append(7, 1);
+        assert_eq!(legacy.doc_ids(7).collect::<Vec<_>>(), vec![7]);
+        assert!(legacy.doc_ids(8).next().is_none());
+    }
+
+    #[rstest]
+    fn test_flat_search_finds_list_row_with_match_at_non_last_position(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        // row 100 owns two element-documents (doc 0, doc 1) that share its row
+        // id; row 101 owns doc 2. The query term lives only in doc 0 — the
+        // *non-last* element of row 100. Resolving the row to a single doc id
+        // would evaluate doc 1, miss the term, and drop the row (lancedb#3352).
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(vec![0], 1.0, None, is_compressed),
+            docs.len(),
+        );
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            vec![posting].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        wand.threshold = 0.5;
+
+        let selected = vec![RowAddress::from(100_u64)];
+        let result = wand
+            .flat_search(
+                &FtsSearchParams::default(),
+                Box::new(selected.into_iter()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        // flat_search resolves the prefilter against the DocSet, so the single
+        // match comes back as a concrete RowId(100) rather than a deferred
+        // Pending addr. Asserting on the whole result avoids a never-taken
+        // match arm that would otherwise read as uncovered.
+        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
+        assert!(
+            matches!(addrs.as_slice(), [CandidateAddr::RowId(100)]),
+            "expected exactly row 100, got {addrs:?}"
+        );
     }
 
     #[test]

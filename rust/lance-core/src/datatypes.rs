@@ -25,6 +25,7 @@ pub use field::{
 pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
     escape_field_path_for_project, format_field_path, parse_field_path,
+    validate_fixed_size_list_dimensions,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {

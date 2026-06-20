@@ -151,26 +151,11 @@ impl ZoneMapIndex {
         Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
     }
 
-    fn finite_value_may_be_in_zone(value: &ScalarValue, zone: &ZoneMapStatistics) -> bool {
-        if !Self::zone_has_finite_min(zone) || value < &zone.min {
-            return false;
-        }
-
-        if Self::scalar_is_nan(&zone.max) {
-            // A NaN max means this zone had both NaNs and finite values.  The
-            // finite max is not persisted, so keep the zone as a false positive
-            // instead of using total ordering to prune it.
-            return true;
-        }
-
-        !zone.max.is_null() && value <= &zone.max
-    }
-
     /// Evaluates whether a zone could potentially contain values matching the query.
     ///
-    /// NaN query values use the explicit `nan_count`.  When the stored max is
-    /// NaN we do not treat it as a finite upper bound; that representation means
-    /// the zone had finite values plus NaNs, and the finite max was not persisted.
+    /// NaN query values use the explicit `nan_count`. For finite query values,
+    /// `ScalarValue` total ordering keeps finite values below a stored NaN max,
+    /// so zones with finite values plus NaNs remain conservative false positives.
     fn evaluate_zone_against_query(
         &self,
         zone: &ZoneMapStatistics,
@@ -206,7 +191,7 @@ impl ZoneMapIndex {
                     return Ok(false);
                 }
 
-                Ok(Self::finite_value_may_be_in_zone(target, zone))
+                Ok(target >= &zone.min && target <= &zone.max)
             }
             SargableQuery::Range(start, end) => {
                 // Zone overlaps with query range if there's any intersection between
@@ -336,22 +321,28 @@ impl ZoneMapIndex {
                             ScalarValue::Float16(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_finite_min(zone) {
+                                    false
                                 } else {
-                                    Self::finite_value_may_be_in_zone(value, zone)
+                                    value >= &zone.min && value <= &zone.max
                                 }
                             }
                             ScalarValue::Float32(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_finite_min(zone) {
+                                    false
                                 } else {
-                                    Self::finite_value_may_be_in_zone(value, zone)
+                                    value >= &zone.min && value <= &zone.max
                                 }
                             }
                             ScalarValue::Float64(Some(f)) => {
                                 if f.is_nan() {
                                     zone.nan_count > 0
+                                } else if !Self::zone_has_finite_min(zone) {
+                                    false
                                 } else {
-                                    Self::finite_value_may_be_in_zone(value, zone)
+                                    value >= &zone.min && value <= &zone.max
                                 }
                             }
                             _ => {
@@ -1437,6 +1428,17 @@ mod tests {
                 i
             );
         }
+
+        let zone = &index.zones[0];
+        assert!(matches!(
+            zone.max,
+            ScalarValue::Float32(Some(value)) if value.is_nan()
+        ));
+        let finite_target = ScalarValue::Float32(Some(1000.0));
+        assert!(
+            finite_target >= zone.min && finite_target <= zone.max,
+            "ScalarValue total ordering keeps finite values below NaN max"
+        );
 
         // Test search for NaN values using Equals with NaN
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(f32::NAN)));

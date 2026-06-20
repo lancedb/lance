@@ -18,8 +18,9 @@ use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
-use lance_arrow::ipc::{read_len_prefixed_bytes_at, write_len_prefixed_bytes};
-use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::{Error, ROW_ID, Result};
@@ -532,27 +533,30 @@ impl LabelListIndexState {
 }
 
 impl CacheCodecImpl for LabelListIndexState {
+    const TYPE_ID: &'static str = "lance.scalar.LabelListIndexState";
+    const CURRENT_VERSION: u32 = 1;
+
     /// Wire format:
     /// ```text
-    /// [u64 list_nulls_len][list_nulls bytes]
-    /// [bitmap state bytes (self-delimiting)]
+    /// RAW_BLOB : list_nulls (roaring tree map, portable encoding)
+    /// <nested BitmapIndexState body (self-delimiting)>
     /// ```
-    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let mut nulls_bytes = Vec::with_capacity(self.list_nulls.serialized_size());
         self.list_nulls.serialize_into(&mut nulls_bytes)?;
-        write_len_prefixed_bytes(writer, &nulls_bytes)?;
-        self.bitmap_state.serialize(writer)?;
+        w.write_raw(&nulls_bytes)?;
+        // The bitmap state writes its own self-delimiting body inline.
+        self.bitmap_state.serialize(w)?;
         Ok(())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
-        let mut offset = 0;
-        let nulls_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let nulls_bytes = r.read_raw()?;
         let list_nulls = Arc::new(RowAddrTreeMap::deserialize_from(nulls_bytes.as_ref())?);
         // The bitmap state is self-delimiting (length-prefixed null map +
-        // Arrow IPC stream with EOS marker), so we can hand the remaining
-        // tail to it directly.
-        let bitmap_state = BitmapIndexState::deserialize(&data.slice(offset..))?;
+        // Arrow IPC stream with EOS marker); it continues reading the body
+        // from where the null map left off.
+        let bitmap_state = BitmapIndexState::deserialize(r)?;
         Ok(Self {
             bitmap_state,
             list_nulls,
@@ -726,5 +730,93 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use datafusion_common::ScalarValue;
+    use lance_core::cache::CacheCodec;
+    use lance_core::utils::address::RowAddress;
+
+    use super::super::bitmap::BitmapIndexState;
+    use super::super::btree::OrderableScalarValue;
+    use super::*;
+
+    fn sample_state() -> LabelListIndexState {
+        let mut index_map = BTreeMap::new();
+        for k in 0..32i32 {
+            index_map.insert(
+                OrderableScalarValue(ScalarValue::Int32(Some(k))),
+                k as usize,
+            );
+        }
+        let mut bitmap_nulls = RowAddrTreeMap::new();
+        bitmap_nulls.insert(RowAddress::new_from_parts(0, 3).into());
+        let bitmap_state =
+            BitmapIndexState::new_for_test(index_map, bitmap_nulls, DataType::Int32).unwrap();
+
+        let mut list_nulls = RowAddrTreeMap::new();
+        list_nulls.insert(RowAddress::new_from_parts(0, 9).into());
+        LabelListIndexState {
+            bitmap_state,
+            list_nulls: Arc::new(list_nulls),
+        }
+    }
+
+    #[test]
+    fn test_label_list_state_codec_roundtrip() {
+        let state = sample_state();
+        let mut buf = Vec::new();
+        state
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        let data = Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, LabelListIndexState::CURRENT_VERSION);
+        let restored = LabelListIndexState::deserialize(&mut reader).unwrap();
+
+        assert_eq!(&*restored.list_nulls, &*state.list_nulls);
+        assert_eq!(
+            restored.bitmap_state.lookup_batch(),
+            state.bitmap_state.lookup_batch()
+        );
+        assert_eq!(
+            restored.bitmap_state.null_map(),
+            state.bitmap_state.null_map()
+        );
+    }
+
+    /// The nested bitmap lookup batch must decode zero-copy through the full
+    /// envelope, proving the leading `list_nulls` RAW_BLOB does not knock the
+    /// nested IPC section off its 64-byte boundary.
+    #[test]
+    fn test_label_list_nested_lookup_is_zero_copy() {
+        const ALIGN: usize = 64;
+        let codec = CacheCodec::from_impl::<LabelListIndexState>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample_state());
+        let mut buf = Vec::new();
+        codec.serialize(&any, &mut buf).unwrap();
+
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).hit().unwrap();
+        let restored = restored.downcast::<LabelListIndexState>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.bitmap_state.lookup_batch().columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "nested bitmap lookup buffer was realigned — misaligned IPC section",
+                );
+            }
+        }
     }
 }

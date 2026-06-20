@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::cache::{CacheBackend, LanceCache};
+use lance_core::cache::{CacheBackend, CacheKeyIterator, LanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
@@ -209,6 +209,44 @@ impl Session {
     pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.index_cache.0.stats().await
     }
+
+    /// Return an iterator over keys currently held by the index cache.
+    ///
+    /// Returns `None` when the index cache backend does not support key
+    /// inventory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::session::Session;
+    /// # async fn example() {
+    /// let session = Session::default();
+    /// let keys = session.index_cache_keys().await;
+    /// assert!(keys.is_some());
+    /// # }
+    /// ```
+    pub async fn index_cache_keys(&self) -> Option<CacheKeyIterator<'_>> {
+        self.index_cache.0.keys().await
+    }
+
+    /// Return an iterator over keys currently held by the metadata cache.
+    ///
+    /// Returns `None` when the metadata cache backend does not support key
+    /// inventory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::session::Session;
+    /// # async fn example() {
+    /// let session = Session::default();
+    /// let keys = session.metadata_cache_keys().await;
+    /// assert!(keys.is_some());
+    /// # }
+    /// ```
+    pub async fn metadata_cache_keys(&self) -> Option<CacheKeyIterator<'_>> {
+        self.metadata_cache.0.keys().await
+    }
 }
 
 impl Default for Session {
@@ -224,9 +262,22 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::cache::UnsizedCacheKey;
+    use lance_core::cache::{CacheKey, UnsizedCacheKey};
     use lance_index::vector::VectorIndex;
     use std::borrow::Cow;
+
+    struct TestKey(&'static str);
+    impl CacheKey for TestKey {
+        type ValueType = Vec<i32>;
+
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
+        }
+
+        fn type_name() -> &'static str {
+            "TestVec"
+        }
+    }
 
     struct TestUnsizedKey(&'static str);
     impl UnsizedCacheKey for TestUnsizedKey {
@@ -250,5 +301,42 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_cache_keys() {
+        let session = Session::new(10_000, 10_000, Default::default());
+
+        session
+            .index_cache
+            .insert_with_key(&TestKey("index-key"), Arc::new(vec![1]))
+            .await;
+        session
+            .metadata_cache
+            .0
+            .insert_with_key(&TestKey("metadata-key"), Arc::new(vec![2]))
+            .await;
+
+        let index_keys = session
+            .index_cache_keys()
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(index_keys.len(), 1);
+        assert_eq!(index_keys[0].prefix(), "");
+        assert_eq!(index_keys[0].key(), "index-key");
+        assert_eq!(index_keys[0].type_name(), "TestVec");
+
+        let metadata_keys = session
+            .metadata_cache_keys()
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(metadata_keys.len(), 1);
+        assert_eq!(metadata_keys[0].prefix(), "");
+        assert_eq!(metadata_keys[0].key(), "metadata-key");
+        assert_eq!(metadata_keys[0].type_name(), "TestVec");
+
+        assert_ne!(index_keys, metadata_keys);
     }
 }
