@@ -1047,8 +1047,11 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     ) -> Result<SearchResult>;
 
     /// Like [`Self::search`] but with a best-effort `limit` hint: when `limit` is `Some(n)`
-    /// an index may stop after finding `n` matches (it may still return more). Only push a
-    /// limit for a single positive lookup. The default ignores it and calls [`Self::search`].
+    /// an index may stop after finding `n` matching rows (it may still return more). The hint
+    /// applies to positive lookups that keep matches as-is (equality, range, `IsIn`); negating
+    /// or combining operators ignore it. The caller must also discard null rows, since an index
+    /// may skip null tracking when a limit is set. The default ignores the hint and calls
+    /// [`Self::search`].
     ///
     /// ```
     /// # use lance_core::Result;

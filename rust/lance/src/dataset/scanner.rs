@@ -4107,6 +4107,10 @@ impl Scanner {
     ///   those re-filters rows later and could drop matches.
     /// - The relevant fragments have no deletions. Deleted rows are pruned after the index
     ///   search, so stopping early could leave fewer than `limit` live rows.
+    /// - The scan is not restricted to a fragment subset (`with_fragments`). The index search
+    ///   runs over the whole dataset, and the fragment restriction is applied afterwards, so
+    ///   an early stop could return `limit` matches that all fall outside the subset and leave
+    ///   fewer than `limit` rows once it is applied.
     ///
     /// Returns `None` when no limit can be pushed.
     fn index_search_limit(
@@ -4119,7 +4123,10 @@ impl Scanner {
             return None;
         }
         // Ordered scans return storage-order matches, while a B-tree stops in index-value order.
+        // A fragment subset is restricted only after the (global) index search, so an early stop
+        // could leave fewer than `limit` rows once the restriction is applied.
         if self.ordered
+            || self.fragments.is_some()
             || self.ordering.is_some()
             || self.nearest.is_some()
             || self.full_text_query.is_some()
@@ -5898,8 +5905,14 @@ mod test {
         assert_eq!(ids, &(10..20).collect::<Vec<_>>());
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_limit_pushed_into_scalar_index() {
+    async fn test_limit_pushed_into_scalar_index(
+        // Legacy storage routes through `scalar_indexed_scan` (MaterializeIndexExec), Stable
+        // through `new_filtered_read` (ScalarIndexExec); both push the limit via the same gate.
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // A scalar-index limit can be pushed only for an unordered scan, since the B-tree stops in index-value order while an ordered scan returns storage-order matches.
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -5914,7 +5927,13 @@ mod test {
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
         dataset
             .create_index(
                 &["id"],
@@ -5927,12 +5946,12 @@ mod test {
             .unwrap();
 
         let limit = 100i64;
-        let scan_ids = |dataset: Arc<Dataset>, ordered: bool| async move {
+        let scan_ids = |dataset: Arc<Dataset>, ordered: bool, offset: Option<i64>| async move {
             let mut scan = dataset.scan();
             scan.filter("id >= 5")
                 .unwrap()
                 .scan_in_order(ordered)
-                .limit(Some(limit), None)
+                .limit(Some(limit), offset)
                 .unwrap();
             let batch = scan.try_into_batch().await.unwrap();
             batch
@@ -5944,7 +5963,7 @@ mod test {
         };
 
         // Ordered scan (the default): limit not pushed, so the first matches are the largest ids (descending storage).
-        let ids = scan_ids(Arc::new(dataset.clone()), true).await;
+        let ids = scan_ids(Arc::new(dataset.clone()), true, None).await;
         assert_eq!(ids.len(), limit as usize);
         assert!(
             ids.iter().all(|&id| id >= num_rows - limit as i32),
@@ -5953,20 +5972,105 @@ mod test {
         );
 
         // Unordered scan: limit pushed into the index, but still exactly `limit` matching rows.
-        let ids = scan_ids(Arc::new(dataset.clone()), false).await;
+        let ids = scan_ids(Arc::new(dataset.clone()), false, None).await;
         assert_eq!(ids.len(), limit as usize);
         assert!(
             ids.iter().all(|&id| id >= 5),
             "every returned row must satisfy the filter"
         );
 
+        // With an offset the pushed limit must cover `limit + offset` rows, otherwise the
+        // downstream skip would leave fewer than `limit`. This guards the `saturating_add(offset)`.
+        let ids = scan_ids(Arc::new(dataset.clone()), false, Some(50)).await;
+        assert_eq!(
+            ids.len(),
+            limit as usize,
+            "offset must not reduce the returned row count"
+        );
+        assert!(ids.iter().all(|&id| id >= 5));
+
         // With deletions the limit must not be pushed even when unordered, since deleted rows are pruned after the index search.
         dataset.delete("id >= 5 AND id < 10000").await.unwrap();
-        let ids = scan_ids(Arc::new(dataset), false).await;
+        let ids = scan_ids(Arc::new(dataset), false, None).await;
         assert_eq!(ids.len(), limit as usize);
         assert!(
             ids.iter().all(|&id| id >= 10000),
             "deleted rows must not be returned"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_limit_not_pushed_with_fragment_subset(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        // The scalar-index search runs over the whole dataset; a `with_fragments` subset is
+        // applied only afterwards. If the limit were pushed, an unordered scan restricted to a
+        // fragment whose ids sort *last* would early-stop on matches in the other fragment and
+        // return too few (here zero) rows. The limit must therefore not be pushed for a subset.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        // Two fragments with ascending ids (index order == storage order): frag 0 holds the
+        // smallest ids, so the first matches in index order all live outside the second fragment.
+        let num_rows = 20_000i32;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 10_000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let fragments = dataset.fragments().as_ref().clone();
+        assert_eq!(fragments.len(), 2, "expected two fragments");
+        // Restrict to the second fragment (the largest ids).
+        let second_fragment = fragments[1].clone();
+
+        let limit = 100i64;
+        let mut scan = dataset.scan();
+        scan.with_fragments(vec![second_fragment])
+            .filter("id >= 0")
+            .unwrap()
+            .scan_in_order(false)
+            .limit(Some(limit), None)
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+
+        assert_eq!(
+            ids.len(),
+            limit as usize,
+            "a fragment-subset scan must still return `limit` rows"
+        );
+        assert!(
+            ids.iter().all(|&id| id >= 10_000),
+            "must only return rows from the requested fragment"
         );
     }
 

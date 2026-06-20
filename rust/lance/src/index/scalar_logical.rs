@@ -539,6 +539,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_btree_segment_search_limited_across_segments() {
+        // `search_limited` forwards the limit to every segment and combines the results, so the
+        // combined result must still hold at least `limit` matches across the segments.
+        let test_dir = TempStrDir::default();
+        let dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_limited".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_btree_limited", "value", segments)
+            .await
+            .unwrap();
+
+        let logical = open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_btree_limited",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        // All 64 rows match the unbounded range; with a limit the combined result across the
+        // four segments must still satisfy at least `limit` matches.
+        let query = SargableQuery::Range(Bound::Unbounded, Bound::Unbounded);
+        let limit = 10usize;
+        let result = logical
+            .search_limited(&query, &NoOpMetricsCollector, Some(limit))
+            .await
+            .unwrap();
+        let row_addrs = match result {
+            SearchResult::Exact(row_addrs) | SearchResult::AtLeast(row_addrs) => row_addrs,
+            other => panic!("unexpected result variant from limited search: {:?}", other),
+        };
+        let count = row_addrs.true_rows().row_addrs().unwrap().count();
+        assert!(
+            count >= limit,
+            "limited search must return at least {limit} matches, got {count}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_bitmap_segments_commit_and_query_as_logical_index() {
         let test_dir = TempStrDir::default();
         let dataset = lance_datagen::gen_batch()

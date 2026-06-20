@@ -2168,6 +2168,9 @@ impl BTreeIndex {
         // could refine that classification (see #6802).
         //
         // A `limit` implies a single positive lookup, so skip null tracking to stop early.
+        // Correctness then relies on the caller discarding nulls: every `search_limited`
+        // path goes through `evaluate_limited` -> `drop_nulls`, so the untracked null rows
+        // are dropped anyway. A future caller that keeps nulls must not pass a limit here.
         if limit.is_none() && !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
             for &page_id in self
