@@ -147,23 +147,36 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   }
 
   /**
-   * Populate a caller-provided {@link ArrowArrayStream} with this scan's results, using the C Data
-   * Interface release callback to return ownership.
+   * Export this scan's results into a caller-owned Arrow C stream identified by its memory address,
+   * using the Arrow C Data Interface release callback to transfer ownership.
    *
-   * <p>Unlike {@link #scanBatches()}, no Java Arrow {@link ArrowReader} is created: the caller
-   * supplies a stream that they allocated (typically from their own {@link
-   * org.apache.arrow.memory.BufferAllocator}), and Lance writes the C struct directly into it. This
-   * lets a downstream consumer drive the read loop with their own Arrow runtime, which is required
-   * when the caller and Lance are loaded by different classloaders / different Arrow versions.
+   * <p>This method intentionally takes a raw {@code streamAddress} (an {@code ArrowArrayStream}
+   * memory address) rather than a Java {@link ArrowArrayStream} object. A typed parameter would be
+   * an {@code org.apache.arrow.c.ArrowArrayStream} loaded by <em>Lance's</em> classloader / Arrow
+   * version; a caller running a different Arrow version (or under a different classloader, e.g.
+   * Spark + a native engine bundling its own Arrow) cannot construct that exact type and would hit
+   * a {@code ClassCastException}/{@code NoSuchMethodError} at the very boundary this method exists
+   * to cross. The C Data Interface ABI is stable across Arrow versions, so passing the C struct's
+   * address keeps the two sides fully decoupled: the caller allocates the stream with <em>its
+   * own</em> Arrow runtime and only the {@code long} address crosses into Lance. See gluten#12263
+   * for the cross-Arrow-version integration that motivated this.
    *
-   * <p>The caller owns the stream and is responsible for closing it. The release callback installed
-   * on the C struct routes back through Lance's native side.
+   * <p>Unlike {@link #scanBatches()}, no Java Arrow {@link ArrowReader} is created on Lance's side:
+   * Lance writes the C struct directly at {@code streamAddress} and the caller drives the read loop
+   * with its own Arrow runtime.
    *
-   * <p>Example:
+   * <p>The {@code streamAddress} must point to a freshly-allocated, empty {@code ArrowArrayStream}
+   * (its {@code release} callback must be null). Exporting into a stream that already holds a
+   * producer is rejected with an {@link IllegalArgumentException}, because overwriting the struct
+   * would drop the existing {@code release} callback and leak the first producer. The caller owns
+   * the stream and is responsible for closing it; the release callback installed by this call
+   * routes back through Lance's native side.
+   *
+   * <p>Example (caller on its own Arrow version / allocator):
    *
    * <pre>{@code
    * try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(callerAllocator)) {
-   *   scanner.exportArrowStream(stream);
+   *   scanner.exportArrowStream(stream.memoryAddress());
    *   try (ArrowReader reader = Data.importArrayStream(callerAllocator, stream)) {
    *     while (reader.loadNextBatch()) {
    *       VectorSchemaRoot batch = reader.getVectorSchemaRoot();
@@ -173,14 +186,15 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    * }
    * }</pre>
    *
-   * @param stream the caller-allocated stream to populate
+   * @param streamAddress the memory address of a freshly-allocated, empty {@code ArrowArrayStream}
+   *     to populate
+   * @throws IllegalArgumentException if the scanner is closed or the stream is already populated
    * @throws IOException if the native scan fails to start
    */
-  public void exportArrowStream(ArrowArrayStream stream) throws IOException {
-    Preconditions.checkNotNull(stream);
+  public void exportArrowStream(long streamAddress) throws IOException {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeScannerHandle != 0, "Scanner is closed");
-      openStream(stream.memoryAddress());
+      openStream(streamAddress);
     }
   }
 

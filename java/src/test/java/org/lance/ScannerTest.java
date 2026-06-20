@@ -51,6 +51,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScannerTest {
@@ -160,9 +161,41 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * Reads every batch from a caller-owned C stream populated by {@link
+   * LanceScanner#exportArrowStream(long)} and returns the {@code id} values in stream order.
+   *
+   * <p>Asserts the projected schema is exactly {@code id: int32} and that no batch exceeds {@code
+   * maxBatchRows}, but does not assume any particular batch count or that batches are full — batch
+   * size is a scanner hint, not a guarantee, so over-asserting on it makes the test brittle.
+   */
+  private static List<Integer> drainIdStream(
+      BufferAllocator allocator, ArrowArrayStream stream, int maxBatchRows) throws IOException {
+    List<Integer> ids = new ArrayList<>();
+    try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
+      VectorSchemaRoot root = reader.getVectorSchemaRoot();
+      while (reader.loadNextBatch()) {
+        List<FieldVector> fieldVectors = root.getFieldVectors();
+        assertEquals(1, fieldVectors.size());
+        FieldVector fieldVector = fieldVectors.get(0);
+        assertEquals("id", fieldVector.getField().getName());
+        assertEquals(ArrowType.ArrowTypeID.Int, fieldVector.getField().getType().getTypeID());
+        int rowsInBatch = fieldVector.getValueCount();
+        assertTrue(
+            rowsInBatch <= maxBatchRows,
+            "batch of " + rowsInBatch + " rows exceeded requested batch size " + maxBatchRows);
+        IntVector vector = (IntVector) fieldVector;
+        for (int i = 0; i < rowsInBatch; i++) {
+          ids.add(vector.get(i));
+        }
+      }
+    }
+    return ids;
+  }
+
   @Test
-  void testDatasetScannerExportArrowStream(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("dataset_scanner_export_stream").toString();
+  void testExportArrowStream(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_basic").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
@@ -176,30 +209,227 @@ public class ScannerTest {
                     .batchSize(batchRows)
                     .columns(Arrays.asList("id"))
                     .build())) {
-          // Caller allocates the C stream from their own allocator; the scanner only fills the
-          // C struct. This is the path callers loaded by a different classloader use to avoid
-          // sharing Java Arrow vector classes with Lance.
+          // The caller allocates the C stream from its own allocator and passes only the memory
+          // address; the scanner fills the C struct in place. This is the cross-Arrow-version /
+          // cross-classloader boundary the API exists to serve.
           try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
-            scanner.exportArrowStream(stream);
-            try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
-              VectorSchemaRoot root = reader.getVectorSchemaRoot();
-              int index = 0;
-              while (reader.loadNextBatch()) {
-                List<FieldVector> fieldVectors = root.getFieldVectors();
-                assertEquals(1, fieldVectors.size());
-                FieldVector fieldVector = fieldVectors.get(0);
-                assertEquals(
-                    ArrowType.ArrowTypeID.Int, fieldVector.getField().getType().getTypeID());
-                assertEquals(batchRows, fieldVector.getValueCount());
-                IntVector vector = (IntVector) fieldVector;
-                for (int i = 0; i < batchRows; i++) {
-                  assertEquals(index, vector.get(i));
-                  index++;
-                }
-              }
-              assertEquals(totalRows, index);
+            scanner.exportArrowStream(stream.memoryAddress());
+            List<Integer> ids = drainIdStream(allocator, stream, batchRows);
+            assertEquals(totalRows, ids.size());
+            for (int i = 0; i < totalRows; i++) {
+              assertEquals(i, ids.get(i));
             }
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamMultipleFragments(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_multi_fragment").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 40;
+      // maxRowsPerFile < totalRows forces multiple fragments (4 fragments of 10 rows).
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(totalRows, 10);
+      assertEquals(4, fragments.size());
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        int batchRows = 7; // deliberately not a divisor of any fragment size
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(batchRows)
+                    .columns(Arrays.asList("id"))
+                    .build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream.memoryAddress());
+            List<Integer> ids = drainIdStream(allocator, stream, batchRows);
+            assertEquals(totalRows, ids.size());
+            Collections.sort(ids);
+            for (int i = 0; i < totalRows; i++) {
+              assertEquals(i, ids.get(i));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamWithFilter(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_filter").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(50)
+                    .columns(Arrays.asList("id"))
+                    .filter("id < 20")
+                    .build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream.memoryAddress());
+            List<Integer> ids = drainIdStream(allocator, stream, 50);
+            assertEquals(20, ids.size());
+            Collections.sort(ids);
+            for (int i = 0; i < 20; i++) {
+              assertEquals(i, ids.get(i));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamWithLimitOffset(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_limit_offset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(50)
+                    .columns(Arrays.asList("id"))
+                    .limit(5)
+                    .offset(10)
+                    .build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream.memoryAddress());
+            List<Integer> ids = drainIdStream(allocator, stream, 50);
+            assertEquals(Arrays.asList(10, 11, 12, 13, 14), ids);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamProjectsRequestedColumnsOnly(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_projection").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        // Project only "name"; the exported stream's schema must contain exactly that column.
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().columns(Arrays.asList("name")).build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream.memoryAddress());
+            try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              assertEquals(1, root.getSchema().getFields().size());
+              assertEquals("name", root.getSchema().getFields().get(0).getName());
+              int rows = 0;
+              while (reader.loadNextBatch()) {
+                rows += root.getRowCount();
+              }
+              assertEquals(10, rows);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamEmptyResult(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_empty").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder().columns(Arrays.asList("id")).filter("id < 0").build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream.memoryAddress());
+            List<Integer> ids = drainIdStream(allocator, stream, 1024);
+            assertTrue(ids.isEmpty());
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamRejectsPopulatedStream(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_reject_populated").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().columns(Arrays.asList("id")).build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            // First export populates the stream and installs a release callback.
+            scanner.exportArrowStream(stream.memoryAddress());
+            // Exporting again into the same (already-populated) stream must be rejected rather
+            // than silently overwriting and leaking the first producer's release callback.
+            IllegalArgumentException ex =
+                assertThrows(
+                    IllegalArgumentException.class,
+                    () -> scanner.exportArrowStream(stream.memoryAddress()));
+            assertTrue(ex.getMessage().toLowerCase().contains("already populated"));
+            // The first producer is still intact and drainable.
+            try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
+              int rows = 0;
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              while (reader.loadNextBatch()) {
+                rows += root.getRowCount();
+              }
+              assertEquals(40, rows);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamRejectsNullAddress(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_reject_null").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().columns(Arrays.asList("id")).build())) {
+          assertThrows(IllegalArgumentException.class, () -> scanner.exportArrowStream(0L));
+        }
+      }
+    }
+  }
+
+  @Test
+  void testExportArrowStreamRejectsClosedScanner(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_reject_closed").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().columns(Arrays.asList("id")).build());
+        scanner.close();
+        try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> scanner.exportArrowStream(stream.memoryAddress()));
         }
       }
     }
