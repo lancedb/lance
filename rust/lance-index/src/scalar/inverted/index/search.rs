@@ -490,22 +490,36 @@ impl InvertedIndex {
         // metadata pull and keeps scoring aligned with the rewrite.
         let impact_scorer = Arc::new(scorer.clone());
 
-        let limit = params.limit.unwrap_or(usize::MAX);
-        if limit == 0 {
+        let requested_limit = params.limit.unwrap_or(usize::MAX);
+        if requested_limit == 0 {
             return Ok(Vec::new());
         }
+        let should_deduplicate_rows =
+            self.params.json_tokenizer_mode == Some(JsonTokenizerMode::FlattenedSubDocs);
+        let search_limit = if should_deduplicate_rows {
+            usize::MAX
+        } else {
+            requested_limit
+        };
+        let search_params = if should_deduplicate_rows {
+            let mut params = params.as_ref().clone();
+            params.limit = None;
+            Arc::new(params)
+        } else {
+            params.clone()
+        };
         let mask = prefilter.mask();
-        if self.is_legacy() {
+        let documents = if self.is_legacy() {
             let (row_ids, scores) = self
                 .bm25_search_legacy(
                     tokens,
-                    params,
+                    search_params,
                     operator,
                     mask,
                     metrics,
                     scorer,
                     impact_scorer,
-                    limit,
+                    search_limit,
                 )
                 .await?;
             Ok(row_ids
@@ -516,16 +530,21 @@ impl InvertedIndex {
         } else {
             self.bm25_search_modern(ModernSearchRequest {
                 tokens,
-                params,
+                params: search_params,
                 operator,
                 mask,
                 metrics,
                 scorer,
                 impact_scorer,
-                limit,
+                limit: search_limit,
                 initial_score_floor,
             })
             .await
+        }?;
+        if should_deduplicate_rows {
+            Ok(deduplicate_scored_documents(documents, requested_limit))
+        } else {
+            Ok(documents)
         }
     }
 
@@ -1066,4 +1085,32 @@ impl InvertedIndex {
         }
         Ok(resolved_documents)
     }
+}
+
+fn deduplicate_scored_documents(documents: Vec<ScoredDoc>, limit: usize) -> Vec<ScoredDoc> {
+    let mut scores_by_row_id: HashMap<u64, f32> = HashMap::with_capacity(documents.len());
+    for document in documents {
+        let score = document.score.0;
+        scores_by_row_id
+            .entry(document.row_id)
+            .and_modify(|existing| {
+                if score > *existing {
+                    *existing = score;
+                }
+            })
+            .or_insert(score);
+    }
+
+    let mut scored_documents = scores_by_row_id
+        .into_iter()
+        .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+        .collect::<Vec<_>>();
+    scored_documents.sort_unstable_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.row_id.cmp(&right.row_id))
+    });
+    scored_documents.truncate(scored_documents.len().min(limit));
+    scored_documents
 }
