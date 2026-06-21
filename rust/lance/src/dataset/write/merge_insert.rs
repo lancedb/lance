@@ -5616,26 +5616,28 @@ mod tests {
         .unwrap();
     }
 
-    /// Regression test for the join build-side orientation at scale.
+    /// Regression test for the join build-side orientation with a large target.
     ///
-    /// When the target exceeds DataFusion's hash-join collect threshold
-    /// (`hash_join_single_partition_threshold_rows`, 128K), the join is planned
-    /// as `mode=Partitioned`, and the build (left) side is hashed in memory per
-    /// partition. `create_plan` must keep the small source on the build side and
-    /// stream the large target as the probe side; otherwise the entire target is
-    /// materialized per partition, which can exhaust memory on large tables.
+    /// `create_plan` must keep the small source on the hash join's build side
+    /// and stream the large target as the probe side; otherwise the entire
+    /// target is materialized in the hash table, which can exhaust memory on
+    /// large tables.
     ///
     /// The toy-sized plan-snapshot tests above cannot catch a regression here:
-    /// at small scale the join is `mode=CollectLeft` and the optimizer freely
-    /// swaps the sides, so they would still pass with the operands reversed.
-    /// This test exercises the production-representative `Partitioned` plan and
-    /// asserts the target (`LanceRead`) is the right/probe input.
+    /// with a tiny target the optimizer freely swaps the build/probe sides, so
+    /// they would still pass with the operands reversed. This test uses a target
+    /// larger than DataFusion's collect threshold
+    /// (`hash_join_single_partition_threshold_rows`, 128K) so the swap logic
+    /// does not pull the target onto the build side, and asserts the target
+    /// (`LanceRead`) is the probe (right) input. It checks the orientation, not
+    /// the partition mode, so it is independent of the host core count (which
+    /// determines `CollectLeft` vs `Partitioned`).
     #[tokio::test]
     async fn test_plan_keeps_target_on_probe_side_at_scale() {
-        use datafusion::physical_plan::{displayable, joins::HashJoinExec, joins::PartitionMode};
+        use datafusion::physical_plan::{displayable, joins::HashJoinExec};
 
-        // Target with > 128K rows so the target cannot be collected and the
-        // optimizer plans a Partitioned (not CollectLeft) hash join.
+        // Target with > 128K rows so the optimizer's collect/swap logic does not
+        // pull the target onto the build side.
         let data = lance_datagen::gen_batch()
             .with_seed(Seed::from(1))
             .col("value", array::step::<UInt32Type>())
@@ -5681,15 +5683,15 @@ mod tests {
             .downcast_ref::<HashJoinExec>()
             .expect("HashJoinExec");
 
-        // At this scale the join must be Partitioned, not CollectLeft.
-        assert_eq!(
-            hash_join.partition_mode(),
-            &PartitionMode::Partitioned,
-            "expected a Partitioned hash join at scale; plan was:\n{rendered}"
-        );
-
         // The target scan must be the right (probe) input, not the left (build)
         // input — that is the whole point of building source.join(target).
+        //
+        // This holds regardless of partition mode: with a large target neither
+        // `CollectLeft` (when DataFusion's target_partitions is 1) nor
+        // `Partitioned` (the multi-core default) swaps the target onto the build
+        // side, because the source stream reports no statistics for
+        // `should_swap_join_order` to act on. We assert the orientation rather
+        // than the mode so the test does not depend on the host core count.
         let right_has_lance_scan =
             format!("{}", displayable(hash_join.right().as_ref()).indent(true))
                 .contains("LanceRead");
