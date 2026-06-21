@@ -172,6 +172,14 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
    * the stream and is responsible for closing it; the release callback installed by this call
    * routes back through Lance's native side.
    *
+   * <p>The provided stream must not be shared across concurrent exports. An {@code
+   * ArrowArrayStream} is a plain C struct in caller-owned memory with no internal synchronization,
+   * so a single stream must be exported into, then drained, by one thread at a time. The
+   * already-populated check above guards the sequential "export twice" mistake, but it cannot make
+   * two concurrent exports into the same struct safe — that is a caller-side data race on
+   * caller-owned memory, the same contract as Arrow's C Data Interface itself. Use a separate
+   * stream per concurrent export.
+   *
    * <p>Example (caller on its own Arrow version / allocator):
    *
    * <pre>{@code

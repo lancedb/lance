@@ -41,6 +41,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -162,29 +163,34 @@ public class ScannerTest {
   }
 
   /**
-   * Reads every batch from a caller-owned C stream populated by {@link
-   * LanceScanner#exportArrowStream(long)} and returns the {@code id} values in stream order.
+   * Imports a caller-owned C stream populated by {@link LanceScanner#exportArrowStream(long)} and
+   * returns the {@code id} values in the order the stream produced them.
    *
-   * <p>Asserts the projected schema is exactly {@code id: int32} and that no batch exceeds {@code
-   * maxBatchRows}, but does not assume any particular batch count or that batches are full — batch
-   * size is a scanner hint, not a guarantee, so over-asserting on it makes the test brittle.
+   * <p>The projected schema is asserted to be exactly a single {@code id: int32} field, and the
+   * assertion is made on the imported reader <em>before</em> the first {@code loadNextBatch()} call
+   * so that it still runs for an empty (zero-batch) result — a regression that exported the wrong
+   * schema for an empty scan would otherwise slip through. See {@code
+   * org.apache.arrow.vector.ipc.ArrowReader#getVectorSchemaRoot()}, which exposes the schema as
+   * soon as the stream is imported.
+   *
+   * <p>This helper intentionally makes <em>no</em> assertion about per-batch row counts. The
+   * scanner's {@code batchSize} is only a hint unless {@code strictBatchSize(true)} is set, so the
+   * number of batches and the rows per batch are not part of the contract being tested here; that
+   * dimension is covered separately by {@link #testExportArrowStreamStrictBatchSize}. Row ordering
+   * and exact values are asserted by the callers against the returned list.
    */
-  private static List<Integer> drainIdStream(
-      BufferAllocator allocator, ArrowArrayStream stream, int maxBatchRows) throws IOException {
+  private static List<Integer> drainIdStream(BufferAllocator allocator, ArrowArrayStream stream)
+      throws IOException {
     List<Integer> ids = new ArrayList<>();
     try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
       VectorSchemaRoot root = reader.getVectorSchemaRoot();
+      List<Field> fields = root.getSchema().getFields();
+      assertEquals(1, fields.size());
+      assertEquals("id", fields.get(0).getName());
+      assertEquals(ArrowType.ArrowTypeID.Int, fields.get(0).getType().getTypeID());
       while (reader.loadNextBatch()) {
-        List<FieldVector> fieldVectors = root.getFieldVectors();
-        assertEquals(1, fieldVectors.size());
-        FieldVector fieldVector = fieldVectors.get(0);
-        assertEquals("id", fieldVector.getField().getName());
-        assertEquals(ArrowType.ArrowTypeID.Int, fieldVector.getField().getType().getTypeID());
-        int rowsInBatch = fieldVector.getValueCount();
-        assertTrue(
-            rowsInBatch <= maxBatchRows,
-            "batch of " + rowsInBatch + " rows exceeded requested batch size " + maxBatchRows);
-        IntVector vector = (IntVector) fieldVector;
+        IntVector vector = (IntVector) root.getVector("id");
+        int rowsInBatch = vector.getValueCount();
         for (int i = 0; i < rowsInBatch; i++) {
           ids.add(vector.get(i));
         }
@@ -193,6 +199,12 @@ public class ScannerTest {
     return ids;
   }
 
+  /**
+   * Happy path: a single-fragment ordered scan exported through a caller-owned C stream returns
+   * every row exactly once, in scan order. The caller allocates the {@link ArrowArrayStream} from
+   * its own allocator and passes only the memory address; the scanner fills the C struct in place.
+   * This is the cross-Arrow-version / cross-classloader boundary the API exists to serve.
+   */
   @Test
   void testExportArrowStream(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_basic").toString();
@@ -209,12 +221,11 @@ public class ScannerTest {
                     .batchSize(batchRows)
                     .columns(Arrays.asList("id"))
                     .build())) {
-          // The caller allocates the C stream from its own allocator and passes only the memory
-          // address; the scanner fills the C struct in place. This is the cross-Arrow-version /
-          // cross-classloader boundary the API exists to serve.
           try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
             scanner.exportArrowStream(stream.memoryAddress());
-            List<Integer> ids = drainIdStream(allocator, stream, batchRows);
+            // SimpleTestDataset writes id = 0..totalRows-1; an ordered scan must return them in
+            // exactly that sequence, so assert the exact ordering (no sort).
+            List<Integer> ids = drainIdStream(allocator, stream);
             assertEquals(totalRows, ids.size());
             for (int i = 0; i < totalRows; i++) {
               assertEquals(i, ids.get(i));
@@ -225,6 +236,16 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * A scan that spans multiple fragments is exported as a single C stream that concatenates the
+   * fragments in fragment order. {@code createNewFragment(40, 10)} produces 4 fragments of 10 rows
+   * (ids 0-9, 10-19, 20-29, 30-39), and an ordered scan must return 0..39 in exactly that order.
+   *
+   * <p>The expected ids are asserted in stream order without sorting: sorting would mask a
+   * regression that returned fragments out of order, which is exactly the kind of bug this test
+   * exists to catch. A non-divisor batch size (7) is used so batch boundaries do not line up with
+   * fragment boundaries, exercising the stream's batch stitching across fragments.
+   */
   @Test
   void testExportArrowStreamMultipleFragments(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_multi_fragment").toString();
@@ -247,11 +268,11 @@ public class ScannerTest {
                     .build())) {
           try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
             scanner.exportArrowStream(stream.memoryAddress());
-            List<Integer> ids = drainIdStream(allocator, stream, batchRows);
+            List<Integer> ids = drainIdStream(allocator, stream);
             assertEquals(totalRows, ids.size());
-            Collections.sort(ids);
+            // Assert exact scan order (no sort) so out-of-order fragments would fail.
             for (int i = 0; i < totalRows; i++) {
-              assertEquals(i, ids.get(i));
+              assertEquals(i, ids.get(i), "row " + i + " out of expected scan order");
             }
           }
         }
@@ -259,6 +280,11 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * A pushed-down filter is honored by the exported stream: only matching rows cross the C-data
+   * boundary. {@code id < 20} over ids 0..39 must yield exactly 0..19 in order. Asserted in scan
+   * order without sorting so a filter/ordering regression cannot hide behind a sort.
+   */
   @Test
   void testExportArrowStreamWithFilter(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_filter").toString();
@@ -276,9 +302,8 @@ public class ScannerTest {
                     .build())) {
           try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
             scanner.exportArrowStream(stream.memoryAddress());
-            List<Integer> ids = drainIdStream(allocator, stream, 50);
+            List<Integer> ids = drainIdStream(allocator, stream);
             assertEquals(20, ids.size());
-            Collections.sort(ids);
             for (int i = 0; i < 20; i++) {
               assertEquals(i, ids.get(i));
             }
@@ -288,6 +313,11 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * Pushed-down limit and offset are honored by the exported stream. Over ids 0..39, {@code
+   * offset(10).limit(5)} must yield exactly [10, 11, 12, 13, 14] in order — asserted as an exact
+   * ordered list so both the window bounds and the ordering are checked.
+   */
   @Test
   void testExportArrowStreamWithLimitOffset(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_limit_offset").toString();
@@ -306,7 +336,7 @@ public class ScannerTest {
                     .build())) {
           try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
             scanner.exportArrowStream(stream.memoryAddress());
-            List<Integer> ids = drainIdStream(allocator, stream, 50);
+            List<Integer> ids = drainIdStream(allocator, stream);
             assertEquals(Arrays.asList(10, 11, 12, 13, 14), ids);
           }
         }
@@ -314,6 +344,12 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * Column projection is reflected in the exported stream's schema. {@code SimpleTestDataset} has
+   * columns {@code (id, name)}; projecting only {@code name} must produce a stream whose schema is
+   * exactly that one column. The schema is checked on the imported reader before draining, and the
+   * full row count is verified after.
+   */
   @Test
   void testExportArrowStreamProjectsRequestedColumnsOnly(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_projection").toString();
@@ -343,6 +379,13 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * A scan that matches no rows ({@code id < 0}) still exports a valid, well-formed stream that
+   * yields zero rows. {@link #drainIdStream} asserts the projected schema ({@code id: int32}) on
+   * the imported reader before any {@code loadNextBatch()}, so this case also guards the empty-scan
+   * schema — a regression that exported a wrong or absent schema for zero-row results would fail
+   * here even though no batch is ever produced.
+   */
   @Test
   void testExportArrowStreamEmptyResult(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_empty").toString();
@@ -356,7 +399,7 @@ public class ScannerTest {
                 new ScanOptions.Builder().columns(Arrays.asList("id")).filter("id < 0").build())) {
           try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
             scanner.exportArrowStream(stream.memoryAddress());
-            List<Integer> ids = drainIdStream(allocator, stream, 1024);
+            List<Integer> ids = drainIdStream(allocator, stream);
             assertTrue(ids.isEmpty());
           }
         }
@@ -364,6 +407,17 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * Guards against the sequential "export twice into the same stream" mistake. After the first
+   * export installs a producer (non-null {@code release} callback), a second export into the same
+   * stream must be rejected with {@link IllegalArgumentException} rather than overwriting the C
+   * struct in place — overwriting would drop the first producer's release callback and leak it.
+   *
+   * <p>The test also verifies the rejection is non-destructive: the first producer is still intact
+   * and fully drainable (all 40 rows) after the rejected second call. This is the single-threaded
+   * misuse case; concurrent exports into one caller-owned stream are the caller's responsibility,
+   * as documented on {@link LanceScanner#exportArrowStream(long)}.
+   */
   @Test
   void testExportArrowStreamRejectsPopulatedStream(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_reject_populated").toString();
@@ -399,6 +453,10 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * A null (0) stream address is rejected with {@link IllegalArgumentException} before any native
+   * dereference, so a caller mistake cannot turn into a native null-pointer write.
+   */
   @Test
   void testExportArrowStreamRejectsNullAddress(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_reject_null").toString();
@@ -415,6 +473,11 @@ public class ScannerTest {
     }
   }
 
+  /**
+   * Exporting from a closed scanner is rejected with {@link IllegalArgumentException} (the native
+   * scanner handle is zero after {@code close()}), rather than dereferencing a freed handle. The
+   * scanner is closed explicitly here, so it is intentionally not in a try-with-resources.
+   */
   @Test
   void testExportArrowStreamRejectsClosedScanner(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("export_stream_reject_closed").toString();
@@ -430,6 +493,114 @@ public class ScannerTest {
           assertThrows(
               IllegalArgumentException.class,
               () -> scanner.exportArrowStream(stream.memoryAddress()));
+        }
+      }
+    }
+  }
+
+  /**
+   * Null values survive the C-data export round-trip. {@code writeSortByDataset} writes 10 rows
+   * (insertion order) in which {@code id} is null at rows 2 and 5 and {@code name} is null at rows
+   * 0 and 6. An unordered scan returns rows in insertion order, so the exported stream must
+   * reproduce both the non-null values and the null positions exactly — null/validity bitmaps are a
+   * common casualty of an incorrect C-data export, so this guards them explicitly.
+   */
+  @Test
+  void testExportArrowStreamPreservesNulls(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_nulls").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.writeSortByDataset(1)) {
+        // Insertion order, row -> (id, name):
+        //   0 -> (0,    null)   3 -> (2,  "P2")   6 -> (3,  null)   9 -> (5, "P5")
+        //   1 -> (1,  "P0")     4 -> (2,  "P3")   7 -> (4,  "P4")
+        //   2 -> (null,"P1")    5 -> (null,"P3")  8 -> (4,  "P5")
+        Integer[] expectedIds = {0, 1, null, 2, 2, null, 3, 4, 4, 5};
+        String[] expectedNames = {null, "P0", "P1", "P2", "P3", "P3", null, "P4", "P5", "P5"};
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder().columns(Arrays.asList("id", "name")).build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream.memoryAddress());
+            try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              assertEquals(2, root.getSchema().getFields().size());
+              int row = 0;
+              while (reader.loadNextBatch()) {
+                IntVector idVector = (IntVector) root.getVector("id");
+                VarCharVector nameVector = (VarCharVector) root.getVector("name");
+                for (int i = 0; i < root.getRowCount(); i++, row++) {
+                  if (expectedIds[row] == null) {
+                    assertTrue(idVector.isNull(i), "id should be null at row " + row);
+                  } else {
+                    assertEquals(
+                        expectedIds[row].intValue(), idVector.get(i), "id mismatch at row " + row);
+                  }
+                  if (expectedNames[row] == null) {
+                    assertTrue(nameVector.isNull(i), "name should be null at row " + row);
+                  } else {
+                    assertEquals(
+                        expectedNames[row],
+                        new String(nameVector.get(i), StandardCharsets.UTF_8),
+                        "name mismatch at row " + row);
+                  }
+                }
+              }
+              assertEquals(expectedIds.length, row);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * With {@code strictBatchSize(true)}, the exported stream must split into batches no larger than
+   * the requested batch size, and still reproduce every row in order. This is the one place the
+   * per-batch size is part of the contract; the other export tests deliberately leave batch sizing
+   * unasserted because it is only a hint by default. Mirrors {@link #testStrictBatchSize} but over
+   * the C-data export path. A batch size of 10 over 25 rows yields batches of at most 10.
+   */
+  @Test
+  void testExportArrowStreamStrictBatchSize(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("export_stream_strict_batch").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 25;
+      int batchSize = 10;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(batchSize)
+                    .strictBatchSize(true)
+                    .columns(Arrays.asList("id"))
+                    .build())) {
+          try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+            scanner.exportArrowStream(stream.memoryAddress());
+            try (ArrowReader reader = Data.importArrayStream(allocator, stream)) {
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              List<Integer> ids = new ArrayList<>();
+              while (reader.loadNextBatch()) {
+                int rowsInBatch = root.getRowCount();
+                assertTrue(
+                    rowsInBatch <= batchSize,
+                    "strict: batch of " + rowsInBatch + " should be <= " + batchSize);
+                IntVector idVector = (IntVector) root.getVector("id");
+                for (int i = 0; i < rowsInBatch; i++) {
+                  ids.add(idVector.get(i));
+                }
+              }
+              assertEquals(totalRows, ids.size());
+              for (int i = 0; i < totalRows; i++) {
+                assertEquals(i, ids.get(i));
+              }
+            }
+          }
         }
       }
     }
