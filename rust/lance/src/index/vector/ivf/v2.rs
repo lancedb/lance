@@ -1288,10 +1288,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
-    }
-
     async fn prewarm(&self) -> Result<()> {
         futures::stream::iter(0..self.ivf.num_partitions())
             .map(Ok)

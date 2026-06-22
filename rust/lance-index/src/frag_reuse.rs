@@ -34,12 +34,6 @@ impl Index for FragReuseIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "FragReuseIndex is not a vector index".into(),
-        ))
-    }
-
     fn statistics(&self) -> Result<serde_json::Value> {
         let stats = FragReuseStatistics {
             num_versions: self.details.versions.len(),

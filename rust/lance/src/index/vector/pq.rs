@@ -180,10 +180,6 @@ impl Index for PQIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
-    }
-
     fn index_type(&self) -> IndexType {
         IndexType::Vector
     }

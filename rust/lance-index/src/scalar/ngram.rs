@@ -24,7 +24,6 @@ use crate::scalar::registry::{
     VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
@@ -395,12 +394,6 @@ impl Index for NGramIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "NGramIndex is not a vector index".into(),
-        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {

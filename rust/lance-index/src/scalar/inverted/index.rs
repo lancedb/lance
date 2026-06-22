@@ -9,7 +9,7 @@ use std::{
     collections::BinaryHeap,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     time::Instant,
 };
@@ -207,6 +207,7 @@ impl FromStr for InvertedListFormatVersion {
 #[derive(Debug)]
 struct PartitionCandidates {
     tokens_by_position: Vec<String>,
+    grouped_expansions: Vec<GroupedExpansionTerms>,
     candidates: Vec<DocCandidate>,
 }
 
@@ -214,8 +215,71 @@ impl PartitionCandidates {
     fn empty() -> Self {
         Self {
             tokens_by_position: Vec::new(),
+            grouped_expansions: Vec::new(),
             candidates: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct LoadedPostings {
+    postings: Vec<PostingIterator>,
+    grouped_expansions: Vec<GroupedExpansionTerms>,
+}
+
+impl LoadedPostings {
+    fn empty() -> Self {
+        Self {
+            postings: Vec::new(),
+            grouped_expansions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GroupedExpansionTerms {
+    position: u32,
+    terms: Vec<ExpansionTermFreqs>,
+}
+
+fn grouped_rescore_wand_limit(
+    limit: Option<usize>,
+    grouped_expansions: &[GroupedExpansionTerms],
+) -> Option<usize> {
+    let limit = limit?;
+    // Grouped fuzzy AND rescoring needs a small candidate cushion because WAND
+    // ranks by the unioned group posting first and the exact expansion IDF later.
+    let expansion_terms = grouped_expansions
+        .iter()
+        .map(|group| group.terms.len())
+        .sum::<usize>()
+        .max(1);
+    Some(limit.saturating_mul(expansion_terms))
+}
+
+#[derive(Debug)]
+struct ExpansionTermFreqs {
+    token: String,
+    freqs_by_posting_doc_id: Vec<(u64, u32)>,
+}
+
+impl ExpansionTermFreqs {
+    fn new(token: String, posting: &PostingList) -> Self {
+        let freqs_by_posting_doc_id = posting
+            .iter()
+            .map(|(posting_doc_id, freq, _)| (posting_doc_id, freq))
+            .collect();
+        Self {
+            token,
+            freqs_by_posting_doc_id,
+        }
+    }
+
+    fn frequency(&self, posting_doc_id: u64) -> Option<u32> {
+        self.freqs_by_posting_doc_id
+            .binary_search_by_key(&posting_doc_id, |(doc_id, _)| *doc_id)
+            .ok()
+            .map(|idx| self.freqs_by_posting_doc_id[idx].1)
     }
 }
 
@@ -653,9 +717,10 @@ impl InvertedIndex {
             let expanded = partition.expand_fuzzy(tokens, params)?;
             for idx in 0..expanded.len() {
                 let token = expanded.get_token(idx);
-                if seen.insert(token.to_string()) {
+                let position = expanded.position(idx);
+                if seen.insert((token.to_string(), position)) {
                     expanded_tokens.push(token.to_string());
-                    expanded_positions.push(expanded.position(idx));
+                    expanded_positions.push(position);
                 }
             }
         }
@@ -717,9 +782,18 @@ impl InvertedIndex {
                 let metrics = metrics.clone();
                 let shared_threshold = shared_threshold.clone();
                 async move {
-                    let postings = part
-                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                    let loaded_postings = part
+                        .load_posting_lists(
+                            tokens.as_ref(),
+                            params.as_ref(),
+                            operator,
+                            metrics.as_ref(),
+                        )
                         .await?;
+                    let LoadedPostings {
+                        postings,
+                        grouped_expansions,
+                    } = loaded_postings;
                     if postings.is_empty() {
                         // No hits in this partition; its DocSet stays
                         // unloaded, so we never pay the per-doc
@@ -741,22 +815,38 @@ impl InvertedIndex {
                     let mask = mask.clone();
                     let metrics = metrics.clone();
                     let part_for_wand = part.clone();
-                    let mut partition_result = spawn_cpu(move || {
+                    let has_grouped_expansions = !grouped_expansions.is_empty();
+                    let wand_params = if has_grouped_expansions {
+                        let mut rescoring_params = params.as_ref().clone();
+                        rescoring_params.limit =
+                            grouped_rescore_wand_limit(params.limit, &grouped_expansions);
+                        Arc::new(rescoring_params)
+                    } else {
+                        params.clone()
+                    };
+                    let partition_threshold = if has_grouped_expansions {
+                        Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                    } else {
+                        shared_threshold
+                    };
+                    let candidates = spawn_cpu(move || {
                         let candidates = part_for_wand.bm25_search(
                             docs_for_wand.as_ref(),
-                            params.as_ref(),
+                            wand_params.as_ref(),
                             operator,
                             mask,
                             postings,
                             metrics.as_ref(),
-                            shared_threshold,
+                            partition_threshold,
                         )?;
-                        std::result::Result::<_, Error>::Ok(PartitionCandidates {
-                            tokens_by_position,
-                            candidates,
-                        })
+                        std::result::Result::<_, Error>::Ok(candidates)
                     })
                     .await?;
+                    let mut partition_result = PartitionCandidates {
+                        tokens_by_position,
+                        grouped_expansions,
+                        candidates,
+                    };
                     resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
                         .await?;
                     Result::Ok(partition_result)
@@ -769,8 +859,17 @@ impl InvertedIndex {
             if res.candidates.is_empty() {
                 continue;
             }
-            let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
-            for token in &res.tokens_by_position {
+            let PartitionCandidates {
+                tokens_by_position,
+                grouped_expansions,
+                candidates: part_candidates,
+            } = res;
+            let grouped_positions = grouped_expansions
+                .iter()
+                .map(|group| group.position)
+                .collect::<HashSet<_>>();
+            let mut idf_by_position = Vec::with_capacity(tokens_by_position.len());
+            for token in &tokens_by_position {
                 let idf_weight = match idf_cache.get(token) {
                     Some(weight) => *weight,
                     None => {
@@ -783,9 +882,10 @@ impl InvertedIndex {
             }
             for DocCandidate {
                 addr,
+                posting_doc_id,
                 freqs,
                 doc_length,
-            } in res.candidates
+            } in part_candidates
             {
                 // resolve_deferred_candidates ran upstream, so every
                 // candidate carries a real row_id at this point.
@@ -799,9 +899,28 @@ impl InvertedIndex {
                 };
                 let mut score = 0.0;
                 for (term_index, freq) in freqs.into_iter() {
+                    if grouped_positions.contains(&term_index) {
+                        continue;
+                    }
                     debug_assert!((term_index as usize) < idf_by_position.len());
                     score +=
                         idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
+                }
+                for group in &grouped_expansions {
+                    for term in &group.terms {
+                        let Some(freq) = term.frequency(posting_doc_id) else {
+                            continue;
+                        };
+                        let idf_weight = match idf_cache.get(&term.token) {
+                            Some(weight) => *weight,
+                            None => {
+                                let weight = scorer.query_weight(&term.token);
+                                idf_cache.insert(term.token.clone(), weight);
+                                weight
+                            }
+                        };
+                        score += idf_weight * scorer.doc_weight(freq, doc_length);
+                    }
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -984,12 +1103,6 @@ impl Index for InvertedIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::invalid_input(
-            "inverted index cannot be cast to vector index",
-        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -1297,7 +1410,14 @@ impl InvertedPartition {
 
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
-        for token in tokens {
+        let mut new_positions = Vec::with_capacity(new_tokens.capacity());
+        let mut seen = HashSet::new();
+        for token_idx in 0..tokens.len() {
+            if new_tokens.len() >= params.max_expansions {
+                break;
+            }
+            let token = tokens.get_token(token_idx);
+            let position = tokens.position(token_idx);
             let fuzziness = match params.fuzziness {
                 Some(fuzziness) => fuzziness,
                 None => MatchQuery::auto_fuzziness(token),
@@ -1307,16 +1427,27 @@ impl InvertedPartition {
 
             let base_len = tokens.token_type().prefix_len(token) as u32;
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
+                let mut expanded = Vec::new();
+                let remaining = params.max_expansions - new_tokens.len();
                 match base_len + params.prefix_length {
-                    0 => take_fst_keys(map.search(lev), &mut new_tokens, params.max_expansions),
+                    0 => take_fst_keys(map.search(lev), &mut expanded, remaining),
                     prefix_length => {
                         let prefix = &token[..min(prefix_length as usize, token.len())];
                         let prefix = fst::automaton::Str::new(prefix).starts_with();
                         take_fst_keys(
                             map.search(lev.intersection(prefix)),
-                            &mut new_tokens,
-                            params.max_expansions,
+                            &mut expanded,
+                            remaining,
                         )
+                    }
+                }
+                for token in expanded {
+                    if seen.insert((token.clone(), position)) {
+                        new_tokens.push(token);
+                        new_positions.push(position);
+                        if new_tokens.len() >= params.max_expansions {
+                            break;
+                        }
                     }
                 }
             } else {
@@ -1325,21 +1456,121 @@ impl InvertedPartition {
                 ));
             }
         }
-        Ok(Tokens::new(new_tokens, tokens.token_type().clone()))
+        Ok(Tokens::with_positions(
+            new_tokens,
+            new_positions,
+            tokens.token_type().clone(),
+        ))
+    }
+
+    fn union_plain_posting_lists(postings: Vec<PostingList>) -> Result<PostingList> {
+        let mut freqs_by_row_id = BTreeMap::new();
+        for posting in postings {
+            for (row_id, freq, _) in posting.iter() {
+                let entry = freqs_by_row_id.entry(row_id).or_insert(0u32);
+                *entry = entry.checked_add(freq).ok_or_else(|| {
+                    Error::index(format!("posting frequency overflow for row id {}", row_id))
+                })?;
+            }
+        }
+        let mut row_ids = Vec::with_capacity(freqs_by_row_id.len());
+        let mut frequencies = Vec::with_capacity(freqs_by_row_id.len());
+        for (row_id, freq) in freqs_by_row_id {
+            row_ids.push(row_id);
+            frequencies.push(freq as f32);
+        }
+        Ok(PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(row_ids),
+            ScalarBuffer::from(frequencies),
+            None,
+            None,
+        )))
+    }
+
+    fn union_compressed_posting_lists(
+        postings: Vec<PostingList>,
+        docs: &DocSet,
+    ) -> Result<PostingList> {
+        let mut freqs_by_doc_id = BTreeMap::new();
+        for posting in postings {
+            for (doc_id, freq, _) in posting.iter() {
+                let doc_id = u32::try_from(doc_id).map_err(|_| {
+                    Error::index(format!(
+                        "compressed posting doc id {} exceeds u32::MAX",
+                        doc_id
+                    ))
+                })?;
+                let entry = freqs_by_doc_id.entry(doc_id).or_insert(0u32);
+                *entry = entry.checked_add(freq).ok_or_else(|| {
+                    Error::index(format!("posting frequency overflow for doc id {}", doc_id))
+                })?;
+            }
+        }
+        if freqs_by_doc_id.is_empty() {
+            return Ok(PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(Vec::<u64>::new()),
+                ScalarBuffer::from(Vec::<f32>::new()),
+                None,
+                None,
+            )));
+        }
+
+        let mut builder = PostingListBuilder::new(false);
+        let mut doc_ids = Vec::with_capacity(freqs_by_doc_id.len());
+        let mut frequencies = Vec::with_capacity(freqs_by_doc_id.len());
+        for (doc_id, freq) in freqs_by_doc_id {
+            builder.add(doc_id, PositionRecorder::Count(freq));
+            doc_ids.push(doc_id);
+            frequencies.push(freq);
+        }
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), frequencies.iter());
+        let batch = builder.to_batch(block_max_scores)?;
+        let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
+        let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+        PostingList::from_batch(&batch, Some(max_score), Some(length))
+    }
+
+    fn union_posting_lists(postings: Vec<PostingList>, docs: &DocSet) -> Result<PostingList> {
+        let has_plain = postings
+            .iter()
+            .any(|posting| matches!(posting, PostingList::Plain(_)));
+        let has_compressed = postings
+            .iter()
+            .any(|posting| matches!(posting, PostingList::Compressed(_)));
+        match (has_plain, has_compressed) {
+            (true, true) => Err(Error::index(
+                "cannot union mixed plain and compressed posting lists".to_owned(),
+            )),
+            (true, false) => Self::union_plain_posting_lists(postings),
+            (false, true) => Self::union_compressed_posting_lists(postings, docs),
+            (false, false) => Ok(PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(Vec::<u64>::new()),
+                ScalarBuffer::from(Vec::<f32>::new()),
+                None,
+                None,
+            ))),
+        }
     }
 
     // search the documents that contain the query
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    pub async fn load_posting_lists(
+    async fn load_posting_lists(
         &self,
         tokens: &Tokens,
         params: &FtsSearchParams,
+        operator: Operator,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<PostingIterator>> {
+    ) -> Result<LoadedPostings> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
+        let is_and_query = operator == Operator::And;
+        let required_positions = (is_and_query || is_phrase_query).then(|| {
+            (0..tokens.len())
+                .map(|index| tokens.position(index))
+                .collect::<HashSet<_>>()
+        });
         let tokens = match is_fuzzy {
             true => self.expand_fuzzy(tokens, params)?,
             false => tokens.clone(),
@@ -1348,45 +1579,146 @@ impl InvertedPartition {
             .map(|index| tokens.position(index))
             .collect::<Vec<_>>();
         let mut token_ids = Vec::with_capacity(tokens.len());
+        let mut matched_positions = HashSet::new();
         for (index, token) in tokens.into_iter().enumerate() {
             let token_id = self.map(&token);
             if let Some(token_id) = token_id {
-                token_ids.push((token_id, token, token_positions[index]));
-            } else if is_phrase_query {
-                // if the token is not found, we can't do phrase query
-                return Ok(Vec::new());
+                let position = token_positions[index];
+                matched_positions.insert(position);
+                token_ids.push((token_id, token, position));
+            } else if is_phrase_query || is_and_query {
+                // if the token is not found, we can't do phrase or AND query
+                return Ok(LoadedPostings::empty());
             }
         }
         if token_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LoadedPostings::empty());
         }
+        if let Some(required_positions) = required_positions
+            && !required_positions.is_subset(&matched_positions)
+        {
+            return Ok(LoadedPostings::empty());
+        }
+
+        let is_fuzzy_and_query = is_fuzzy && is_and_query && !is_phrase_query;
         if !is_phrase_query {
-            token_ids.sort_unstable_by_key(|(token_id, _, _)| *token_id);
-            token_ids.dedup_by_key(|(token_id, _, _)| *token_id);
+            if is_fuzzy_and_query {
+                token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
+                token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
+            } else {
+                token_ids.sort_unstable_by_key(|(token_id, _, _)| *token_id);
+                token_ids.dedup_by_key(|(token_id, _, _)| *token_id);
+            }
         }
 
         let num_docs = self.docs.len();
-        stream::iter(token_ids)
+        let loaded_postings = stream::iter(token_ids)
             .map(|(token_id, token, position)| async move {
                 let posting = self
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
                     .await?;
 
-                let query_weight = idf(posting.len(), num_docs);
-
-                Result::Ok(PostingIterator::with_query_weight(
-                    token,
-                    token_id,
-                    position,
-                    query_weight,
-                    posting,
-                    num_docs,
-                ))
+                Result::Ok((token_id, token, position, posting))
             })
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
-            .await
+            .await?;
+
+        if (is_and_query || is_phrase_query)
+            && !is_fuzzy_and_query
+            && loaded_postings
+                .iter()
+                .any(|(_, _, _, posting)| posting.is_empty())
+        {
+            return Ok(LoadedPostings::empty());
+        }
+
+        if !is_fuzzy_and_query {
+            return Ok(LoadedPostings {
+                postings: loaded_postings
+                    .into_iter()
+                    .map(|(token_id, token, position, posting)| {
+                        let query_weight = idf(posting.len(), num_docs);
+                        PostingIterator::with_query_weight(
+                            token,
+                            token_id,
+                            position,
+                            query_weight,
+                            posting,
+                            num_docs,
+                        )
+                    })
+                    .collect(),
+                grouped_expansions: Vec::new(),
+            });
+        }
+
+        let needs_union = loaded_postings
+            .windows(2)
+            .any(|window| window[0].2 == window[1].2);
+        let docs_for_union = if needs_union {
+            Some(self.docs.ensure_num_tokens_loaded().await?)
+        } else {
+            None
+        };
+
+        // WAND's AND mode treats every iterator as required, so expansions from
+        // one original query position must be merged before scoring.
+        let mut grouped_postings = Vec::new();
+        let mut grouped_expansions = Vec::new();
+        let mut iter = loaded_postings.into_iter().peekable();
+        while let Some((token_id, token, position, posting)) = iter.next() {
+            let mut group = vec![(token_id, token, posting)];
+            while matches!(iter.peek(), Some((_, _, next_position, _)) if *next_position == position)
+            {
+                let (token_id, token, _, posting) = iter.next().expect("peeked item must exist");
+                group.push((token_id, token, posting));
+            }
+
+            let (token_id, token, posting) = if group.len() == 1 {
+                group.pop().expect("single-item group must exist")
+            } else {
+                let token_id = group[0].0;
+                let token = group[0].1.clone();
+                grouped_expansions.push(GroupedExpansionTerms {
+                    position,
+                    terms: group
+                        .iter()
+                        .map(|(_, token, posting)| ExpansionTermFreqs::new(token.clone(), posting))
+                        .collect(),
+                });
+                let postings = group
+                    .into_iter()
+                    .map(|(_, _, posting)| posting)
+                    .collect::<Vec<_>>();
+                let posting = Self::union_posting_lists(
+                    postings,
+                    docs_for_union
+                        .as_deref()
+                        .expect("union docs must be loaded for grouped fuzzy AND"),
+                )?;
+                (token_id, token, posting)
+            };
+            if posting.is_empty() {
+                return Ok(LoadedPostings::empty());
+            }
+
+            let query_weight = idf(posting.len(), num_docs);
+            grouped_postings.push(PostingIterator::with_query_weight(
+                token,
+                token_id,
+                position,
+                query_weight,
+                posting,
+                num_docs,
+            ));
+        }
+
+        Ok(LoadedPostings {
+            postings: grouped_postings,
+            grouped_expansions,
+        })
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -5295,7 +5627,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
 
-    use crate::metrics::NoOpMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::prefilter::NoFilter;
     use crate::scalar::ScalarIndex;
     use crate::scalar::inverted::builder::{
@@ -5313,6 +5645,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
@@ -7204,6 +7537,421 @@ mod tests {
                 expected_idf
             );
         }
+    }
+
+    async fn write_test_metadata(
+        store: &Arc<LanceIndexStore>,
+        partition_ids: Vec<u64>,
+        params: InvertedIndexParams,
+    ) {
+        let metadata = HashMap::from([
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&partition_ids).unwrap(),
+            ),
+            ("params".to_owned(), serde_json::to_string(&params).unwrap()),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_and_query_returns_empty_when_exact_term_missing() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("alpha".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.docs.append(100, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(
+            vec!["alpha".to_owned(), "missing".to_owned()],
+            DocType::Text,
+        ));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (and_row_ids, _) = index
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::And,
+                prefilter.clone(),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            and_row_ids.is_empty(),
+            "AND must not match when any required term is missing"
+        );
+
+        let (or_row_ids, _) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            or_row_ids,
+            vec![100],
+            "OR should still match the present term"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_and_query_skips_partition_missing_required_term() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("alpha".to_owned());
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder0.docs.append(100, 1);
+        builder0.write(store.as_ref()).await.unwrap();
+
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("alpha".to_owned());
+        builder1.tokens.add("beta".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.posting_lists[1].add(0, PositionRecorder::Count(1));
+        builder1.docs.append(200, 2);
+        builder1.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            DocType::Text,
+        ));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let (mut row_ids, _) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        row_ids.sort_unstable();
+        assert_eq!(
+            row_ids,
+            vec![200],
+            "partition missing beta must not contribute alpha-only hits"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_and_groups_expansions_by_original_position() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("alpha".to_owned());
+        builder.tokens.add("alphi".to_owned());
+        builder.tokens.add("beta".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(1, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(1, PositionRecorder::Count(1));
+        builder.docs.append(100, 2);
+        builder.docs.append(101, 2);
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_fuzziness(Some(1)),
+        );
+
+        let missing_position_tokens = Arc::new(Tokens::new(
+            vec!["betx".to_owned(), "zzzzz".to_owned()],
+            DocType::Text,
+        ));
+        let (missing_and_row_ids, _) = index
+            .bm25_search(
+                missing_position_tokens.clone(),
+                params.clone(),
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            missing_and_row_ids.is_empty(),
+            "fuzzy AND must require at least one expansion for every original position"
+        );
+
+        let (mut or_row_ids, _) = index
+            .bm25_search(
+                missing_position_tokens,
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        or_row_ids.sort_unstable();
+        assert_eq!(
+            or_row_ids,
+            vec![100, 101],
+            "OR should still match present fuzzy expansions"
+        );
+
+        let grouped_tokens = Arc::new(Tokens::new(
+            vec!["alphx".to_owned(), "betx".to_owned()],
+            DocType::Text,
+        ));
+        let (mut grouped_row_ids, _) = index
+            .bm25_search(
+                grouped_tokens,
+                params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        grouped_row_ids.sort_unstable();
+        assert_eq!(
+            grouped_row_ids,
+            vec![100, 101],
+            "each original fuzzy position should match any one of its expansions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for token in ["alpha", "alphi", "beta", "beti"] {
+            builder.tokens.add(token.to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+        }
+        for token_id in 0..4 {
+            builder.posting_lists[token_id].add(token_id as u32, PositionRecorder::Count(1));
+            builder.docs.append(100 + token_id as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let partition = index.partitions[0].clone();
+        let params = FtsSearchParams::new()
+            .with_fuzziness(Some(1))
+            .with_max_expansions(3);
+        let tokens = Tokens::new(vec!["alphx".to_owned(), "betx".to_owned()], DocType::Text);
+
+        let expanded = partition.expand_fuzzy(&tokens, &params).unwrap();
+        let expanded_terms = (0..expanded.len())
+            .map(|idx| (expanded.get_token(idx).to_owned(), expanded.position(idx)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            expanded_terms,
+            vec![
+                ("alpha".to_owned(), 0),
+                ("alphi".to_owned(), 0),
+                ("beta".to_owned(), 1),
+            ],
+            "max_expansions should cap the whole fuzzy query, not each token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("alpha".to_owned());
+        builder.tokens.add("alphi".to_owned());
+        builder.tokens.add("beta".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[0].add(2, PositionRecorder::Count(1));
+        builder.posting_lists[0].add(3, PositionRecorder::Count(1));
+        builder.posting_lists[0].add(4, PositionRecorder::Count(1));
+        builder.posting_lists[0].add(5, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(1, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(1, PositionRecorder::Count(1));
+        builder.docs.append(100, 2);
+        builder.docs.append(101, 2);
+        builder.docs.append(102, 1);
+        builder.docs.append(103, 1);
+        builder.docs.append(104, 1);
+        builder.docs.append(105, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(
+            vec!["alphx".to_owned(), "betx".to_owned()],
+            DocType::Text,
+        ));
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(1))
+                .with_fuzziness(Some(1)),
+        );
+        let (row_ids, _scores) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            row_ids,
+            vec![101],
+            "the rare matched expansion should outrank the common expansion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_and_grouped_rescore_keeps_wand_limit_bounded() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_docs = BLOCK_SIZE * 2 + 4;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("alpha".to_owned());
+        builder.tokens.add("alphi".to_owned());
+        builder.tokens.add("beta".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(1, PositionRecorder::Count(1));
+        for doc_id in 0..num_docs {
+            builder.posting_lists[2].add(doc_id as u32, PositionRecorder::Count(1));
+            if doc_id >= 2 {
+                builder.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
+            }
+            let num_tokens = if doc_id < 2 { 2 } else { 100 };
+            builder.docs.append(100 + doc_id as u64, num_tokens);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(
+            vec!["alphx".to_owned(), "betx".to_owned()],
+            DocType::Text,
+        ));
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(1))
+                .with_fuzziness(Some(1)),
+        );
+        let metrics = Arc::new(LocalMetricsCollector::default());
+        let (row_ids, _scores) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::And,
+                Arc::new(NoFilter),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            row_ids,
+            vec![101],
+            "final rescoring should still rank by the matched expansion"
+        );
+        let comparisons = metrics.comparisons.load(Ordering::Relaxed);
+        assert!(
+            comparisons < num_docs,
+            "grouped fuzzy AND should not clear the WAND top-k bound and scan every candidate; comparisons={comparisons}, num_docs={num_docs}"
+        );
     }
 
     #[tokio::test]

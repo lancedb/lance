@@ -448,6 +448,9 @@ pub enum CandidateAddr {
 #[derive(Debug)]
 pub struct DocCandidate {
     pub addr: CandidateAddr,
+    /// The document key used by the posting lists: doc_id for compressed
+    /// postings, row_id for legacy plain postings.
+    pub posting_doc_id: u64,
     /// (term_index, freq)
     pub freqs: Vec<(u32, u32)>,
     pub doc_length: u32,
@@ -726,6 +729,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             // Either a real row_id (so we can run the mask check
             // inline) or the doc_id widened to u64 (deferred path;
             // the outer caller will resolve it post-wand).
+            let posting_doc_id = doc.doc_id();
             let row_id = match &doc {
                 DocInfo::Raw(doc) => {
                     if docs_has_row_ids {
@@ -778,7 +782,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             if candidates.len() < limit {
                 let freqs = self.iter_term_freqs().collect();
-                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_id, score),
+                    freqs,
+                    doc_length,
+                    posting_doc_id,
+                )));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
@@ -786,7 +795,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
-                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_id, score),
+                    freqs,
+                    doc_length,
+                    posting_doc_id,
+                )));
                 let kth = candidates.peek().unwrap().0.0.score.0;
                 self.update_threshold(kth, params.wand_factor);
             }
@@ -809,11 +823,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
         };
         Ok(candidates
             .into_iter()
-            .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                addr: to_addr(doc.row_id),
-                freqs,
-                doc_length,
-            })
+            .map(
+                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                    addr: to_addr(doc.row_id),
+                    posting_doc_id,
+                    freqs,
+                    doc_length,
+                },
+            )
             .collect())
     }
 
@@ -903,7 +920,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             if candidates.len() < limit {
                 let freqs = self.iter_term_freqs().collect();
-                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_id, score),
+                    freqs,
+                    doc_length,
+                    doc_id,
+                )));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
@@ -911,7 +933,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
-                candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
+                candidates.push(Reverse((
+                    ScoredDoc::new(row_id, score),
+                    freqs,
+                    doc_length,
+                    doc_id,
+                )));
                 let kth = candidates.peek().unwrap().0.0.score.0;
                 self.update_threshold(kth, params.wand_factor);
             }
@@ -924,11 +951,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // every candidate already has a real row_id.
         Ok(candidates
             .into_iter()
-            .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                addr: CandidateAddr::RowId(doc.row_id),
-                freqs,
-                doc_length,
-            })
+            .map(
+                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                    addr: CandidateAddr::RowId(doc.row_id),
+                    posting_doc_id,
+                    freqs,
+                    doc_length,
+                },
+            )
             .collect())
     }
 
