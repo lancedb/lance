@@ -242,6 +242,21 @@ struct GroupedExpansionTerms {
     terms: Vec<ExpansionTermFreqs>,
 }
 
+fn grouped_rescore_wand_limit(
+    limit: Option<usize>,
+    grouped_expansions: &[GroupedExpansionTerms],
+) -> Option<usize> {
+    let limit = limit?;
+    // Grouped fuzzy AND rescoring needs a small candidate cushion because WAND
+    // ranks by the unioned group posting first and the exact expansion IDF later.
+    let expansion_terms = grouped_expansions
+        .iter()
+        .map(|group| group.terms.len())
+        .sum::<usize>()
+        .max(1);
+    Some(limit.saturating_mul(expansion_terms))
+}
+
 #[derive(Debug)]
 struct ExpansionTermFreqs {
     token: String,
@@ -802,9 +817,10 @@ impl InvertedIndex {
                     let part_for_wand = part.clone();
                     let has_grouped_expansions = !grouped_expansions.is_empty();
                     let wand_params = if has_grouped_expansions {
-                        let mut unbounded_params = params.as_ref().clone();
-                        unbounded_params.limit = None;
-                        Arc::new(unbounded_params)
+                        let mut rescoring_params = params.as_ref().clone();
+                        rescoring_params.limit =
+                            grouped_rescore_wand_limit(params.limit, &grouped_expansions);
+                        Arc::new(rescoring_params)
                     } else {
                         params.clone()
                     };
@@ -1403,6 +1419,9 @@ impl InvertedPartition {
         let mut new_positions = Vec::with_capacity(new_tokens.capacity());
         let mut seen = HashSet::new();
         for token_idx in 0..tokens.len() {
+            if new_tokens.len() >= params.max_expansions {
+                break;
+            }
             let token = tokens.get_token(token_idx);
             let position = tokens.position(token_idx);
             let fuzziness = match params.fuzziness {
@@ -1415,15 +1434,16 @@ impl InvertedPartition {
             let base_len = tokens.token_type().prefix_len(token) as u32;
             if let TokenMap::Fst(ref map) = self.tokens.tokens {
                 let mut expanded = Vec::new();
+                let remaining = params.max_expansions - new_tokens.len();
                 match base_len + params.prefix_length {
-                    0 => take_fst_keys(map.search(lev), &mut expanded, params.max_expansions),
+                    0 => take_fst_keys(map.search(lev), &mut expanded, remaining),
                     prefix_length => {
                         let prefix = &token[..min(prefix_length as usize, token.len())];
                         let prefix = fst::automaton::Str::new(prefix).starts_with();
                         take_fst_keys(
                             map.search(lev.intersection(prefix)),
                             &mut expanded,
-                            params.max_expansions,
+                            remaining,
                         )
                     }
                 }
@@ -1431,6 +1451,9 @@ impl InvertedPartition {
                     if seen.insert((token.clone(), position)) {
                         new_tokens.push(token);
                         new_positions.push(position);
+                        if new_tokens.len() >= params.max_expansions {
+                            break;
+                        }
                     }
                 }
             } else {
@@ -5610,7 +5633,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
 
-    use crate::metrics::NoOpMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::prefilter::NoFilter;
     use crate::scalar::ScalarIndex;
     use crate::scalar::inverted::builder::{
@@ -5628,6 +5651,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
@@ -7754,6 +7778,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for token in ["alpha", "alphi", "beta", "beti"] {
+            builder.tokens.add(token.to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+        }
+        for token_id in 0..4 {
+            builder.posting_lists[token_id].add(token_id as u32, PositionRecorder::Count(1));
+            builder.docs.append(100 + token_id as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let partition = index.partitions[0].clone();
+        let params = FtsSearchParams::new()
+            .with_fuzziness(Some(1))
+            .with_max_expansions(3);
+        let tokens = Tokens::new(vec!["alphx".to_owned(), "betx".to_owned()], DocType::Text);
+
+        let expanded = partition.expand_fuzzy(&tokens, &params).unwrap();
+        let expanded_terms = (0..expanded.len())
+            .map(|idx| (expanded.get_token(idx).to_owned(), expanded.position(idx)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            expanded_terms,
+            vec![
+                ("alpha".to_owned(), 0),
+                ("alphi".to_owned(), 0),
+                ("beta".to_owned(), 1),
+            ],
+            "max_expansions should cap the whole fuzzy query, not each token"
+        );
+    }
+
+    #[tokio::test]
     async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
@@ -7816,6 +7887,76 @@ mod tests {
             row_ids,
             vec![101],
             "the rare matched expansion should outrank the common expansion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_and_grouped_rescore_keeps_wand_limit_bounded() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_docs = BLOCK_SIZE * 2 + 4;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("alpha".to_owned());
+        builder.tokens.add("alphi".to_owned());
+        builder.tokens.add("beta".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(1, PositionRecorder::Count(1));
+        for doc_id in 0..num_docs {
+            builder.posting_lists[2].add(doc_id as u32, PositionRecorder::Count(1));
+            if doc_id >= 2 {
+                builder.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
+            }
+            let num_tokens = if doc_id < 2 { 2 } else { 100 };
+            builder.docs.append(100 + doc_id as u64, num_tokens);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(
+            vec!["alphx".to_owned(), "betx".to_owned()],
+            DocType::Text,
+        ));
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(1))
+                .with_fuzziness(Some(1)),
+        );
+        let metrics = Arc::new(LocalMetricsCollector::default());
+        let (row_ids, _scores) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::And,
+                Arc::new(NoFilter),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            row_ids,
+            vec![101],
+            "final rescoring should still rank by the matched expansion"
+        );
+        let comparisons = metrics.comparisons.load(Ordering::Relaxed);
+        assert!(
+            comparisons < num_docs,
+            "grouped fuzzy AND should not clear the WAND top-k bound and scan every candidate; comparisons={comparisons}, num_docs={num_docs}"
         );
     }
 
