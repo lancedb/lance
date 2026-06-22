@@ -573,7 +573,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 builder
                     .batch_readahead(get_num_compute_intensive_cpus())
                     .project(&[self.column.as_str()])?
-                    .with_row_id();
+                    .with_row_id()
+                    .scan_in_order(false)
+                    .fragment_readahead(0);
 
                 // Apply fragment filter for distributed indexing
                 if let Some(fragment_ids) = &self.fragment_filter {

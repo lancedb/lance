@@ -1494,6 +1494,8 @@ async fn scan_index_field_stream(
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
     scanner.with_row_id();
+    scanner.scan_in_order(false);
+    scanner.fragment_readahead(0);
     scanner.try_into_stream().await
 }
 
