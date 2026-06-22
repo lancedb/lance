@@ -57,9 +57,10 @@ public class FragmentUpdateResult {
   }
 
   /**
-   * @deprecated Use {@link #getUpdatedRowOffsetBytes()} instead. This method expands serialized
-   *     RoaringBitmap bytes to a {@code long[]} via JNI and is retained for backward compatibility
-   *     with callers compiled against the #6650 API.
+   * @deprecated Use {@link #create(FragmentMetadata, long[], byte[])} instead. This constructor
+   *     encodes the expanded {@code long[]} offsets into portable RoaringBitmap bytes via JNI and
+   *     is retained for backward compatibility with callers compiled against the prior long[]-based
+   *     API.
    */
   @Deprecated
   public FragmentUpdateResult(
