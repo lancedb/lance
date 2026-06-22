@@ -471,6 +471,15 @@ impl KNNVectorDistanceExec {
         results: &[BatchKnnCandidate],
         field_name: &str,
     ) -> DataFusionResult<ArrayRef> {
+        Self::take_slim_batch_field_if_present(results, field_name)?.ok_or_else(|| {
+            DataFusionError::Internal(format!("column '{field_name}' missing from slim batch"))
+        })
+    }
+
+    fn take_slim_batch_field_if_present(
+        results: &[BatchKnnCandidate],
+        field_name: &str,
+    ) -> DataFusionResult<Option<ArrayRef>> {
         use std::collections::HashMap;
 
         type SlimBatchGroup = (Arc<RecordBatch>, Vec<(usize, u32)>);
@@ -501,12 +510,20 @@ impl KNNVectorDistanceExec {
                 .map_err(|e| {
                     DataFusionError::ArrowError(Box::new(e), Some("take top-k rows".to_string()))
                 })?;
-            let column = taken.column_by_name(field_name).ok_or_else(|| {
-                DataFusionError::Internal(format!("column '{field_name}' missing from slim batch"))
-            })?;
+            let Some(column) = taken.column_by_name(field_name) else {
+                continue;
+            };
             for (offset, (result_index, _)) in entries.iter().enumerate() {
                 ordered[*result_index] = Some(column.slice(offset, 1));
             }
+        }
+        if ordered.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if ordered.iter().any(Option::is_none) {
+            return Err(DataFusionError::Internal(format!(
+                "column '{field_name}' inconsistently present in slim batches"
+            )));
         }
 
         let row_arrays: Vec<&dyn Array> = ordered
@@ -520,12 +537,14 @@ impl KNNVectorDistanceExec {
             .collect();
         arrow::compute::concat(&row_arrays)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            .map(Some)
     }
 
     fn build_struct_column_for_path(
         field: &Field,
         path: &[String],
         leaf_column: ArrayRef,
+        slim_column: Option<&dyn Array>,
     ) -> DataFusionResult<ArrayRef> {
         if path.is_empty() {
             return Ok(leaf_column);
@@ -537,18 +556,39 @@ impl KNNVectorDistanceExec {
                 path.join(".")
             )));
         };
+        let slim_struct = slim_column
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "batch KNN expected slim column '{}' to be a struct while rebuilding nested vector path '{}'",
+                            field.name(),
+                            path.join(".")
+                        ))
+                    })
+            })
+            .transpose()?;
         let mut columns = Vec::with_capacity(children.len());
         for child in children.iter() {
             if child.name() == &path[0] {
                 if path.len() == 1 {
                     columns.push(leaf_column.clone());
                 } else {
+                    let child_slim_column = slim_struct
+                        .and_then(|struct_array| struct_array.column_by_name(child.name()));
                     columns.push(Self::build_struct_column_for_path(
                         child,
                         &path[1..],
                         leaf_column.clone(),
+                        child_slim_column.map(|column| column.as_ref()),
                     )?);
                 }
+            } else if let Some(column) =
+                slim_struct.and_then(|struct_array| struct_array.column_by_name(child.name()))
+            {
+                columns.push(column.clone());
             } else {
                 columns.push(arrow_array::new_null_array(
                     child.data_type(),
@@ -556,8 +596,12 @@ impl KNNVectorDistanceExec {
                 ));
             }
         }
-        let struct_array = arrow_array::StructArray::try_new(children.clone(), columns, None)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let struct_array = arrow_array::StructArray::try_new(
+            children.clone(),
+            columns,
+            slim_struct.and_then(|struct_array| struct_array.nulls().cloned()),
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         Ok(Arc::new(struct_array))
     }
 
@@ -586,7 +630,13 @@ impl KNNVectorDistanceExec {
         if field_path.len() <= 1 {
             Ok(leaf_column)
         } else {
-            Self::build_struct_column_for_path(field, &field_path[1..], leaf_column)
+            let slim_column = Self::take_slim_batch_field_if_present(results, field.name())?;
+            Self::build_struct_column_for_path(
+                field,
+                &field_path[1..],
+                leaf_column,
+                slim_column.as_deref(),
+            )
         }
     }
 
@@ -3147,6 +3197,80 @@ mod tests {
         let payload = slim.column_by_name("payload").unwrap().as_struct();
         assert!(payload.column_by_name("vec.with.dot").is_none());
         assert!(payload.column_by_name("tag").is_some());
+    }
+
+    #[test]
+    fn test_assemble_batch_output_retained_nested_vector_keeps_sibling_values() {
+        let vec_field = ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        );
+        let tag_field = ArrowField::new("tag", DataType::Utf8, true);
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone(), tag_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![payload_field, ROW_ID_FIELD.clone()]));
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..12).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let tags = StringArray::from(vec!["a", "b", "c"]);
+        let payload = StructArray::from(vec![
+            (Arc::new(vec_field), Arc::new(vectors) as ArrayRef),
+            (Arc::new(tag_field), Arc::new(tags) as ArrayRef),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(payload) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![10, 11, 12])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let slim_batch = Arc::new(
+            KNNVectorDistanceExec::remove_vector_from_batch(&batch, "payload.vec").unwrap(),
+        );
+        let vectors = KNNVectorDistanceExec::resolve_vector_column(&batch, "payload.vec").unwrap();
+        let results = [2, 0]
+            .into_iter()
+            .map(|row_index| BatchKnnCandidate {
+                query_index: 0,
+                distance: row_index as f32,
+                row_id: 10 + row_index as u64,
+                extra: BatchKnnExtra::WithSlimBatch {
+                    slim_batch: Arc::clone(&slim_batch),
+                    row_index,
+                    vector_row: Some(
+                        KNNVectorDistanceExec::take_vector_row(vectors.as_ref(), row_index)
+                            .unwrap(),
+                    ),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let output = KNNVectorDistanceExec::assemble_batch_output(
+            &results,
+            schema.as_ref(),
+            "payload.vec",
+            true,
+        )
+        .unwrap();
+
+        let payload = output.column_by_name("payload").unwrap().as_struct();
+        let tags = payload.column_by_name("tag").unwrap().as_string::<i32>();
+        assert!(tags.is_valid(0));
+        assert!(tags.is_valid(1));
+        assert_eq!(tags.value(0), "c");
+        assert_eq!(tags.value(1), "a");
+        let vectors = payload.column_by_name("vec").unwrap();
+        assert_eq!(vectors.len(), 2);
     }
 
     #[tokio::test]
