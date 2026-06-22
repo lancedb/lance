@@ -222,7 +222,7 @@ impl PartitionCandidates {
 }
 
 #[derive(Debug)]
-pub(crate) struct LoadedPostings {
+struct LoadedPostings {
     postings: Vec<PostingIterator>,
     grouped_expansions: Vec<GroupedExpansionTerms>,
 }
@@ -1539,7 +1539,7 @@ impl InvertedPartition {
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    pub(crate) async fn load_posting_lists(
+    async fn load_posting_lists(
         &self,
         tokens: &Tokens,
         params: &FtsSearchParams,
