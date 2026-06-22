@@ -299,7 +299,7 @@ pub(super) async fn build_scalar_index(
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
     let trainer = plugin.basic_trainer().ok_or_else(|| {
         Error::invalid_input_source(
-            format!("The '{}' index type does not support training", params.index_type).into(),
+            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
         )
     })?;
     let training_request =
@@ -361,7 +361,7 @@ pub(super) async fn build_bitmap_index_segment(
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
     let trainer = plugin.basic_trainer().ok_or_else(|| {
         Error::invalid_input_source(
-            format!("The '{}' index type does not support training", params.index_type).into(),
+            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
         )
     })?;
     let training_request =

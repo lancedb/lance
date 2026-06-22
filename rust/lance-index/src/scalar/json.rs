@@ -686,7 +686,7 @@ impl BasicTrainer for JsonIndexPlugin {
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
         let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
-                format!("The '{}' index type does not support training", params.target_index_type).into(),
+                format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.target_index_type).into(),
             )
         })?;
         let target_request = target_trainer.new_training_request(
@@ -725,7 +725,7 @@ impl BasicTrainer for JsonIndexPlugin {
         // Create a new training request with the inferred type
         let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
-                format!("The '{}' index type does not support training", request.parameters.target_index_type).into(),
+                format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", request.parameters.target_index_type).into(),
             )
         })?;
         let target_request = target_trainer.new_training_request(
