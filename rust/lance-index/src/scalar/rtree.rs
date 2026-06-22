@@ -6,7 +6,7 @@ use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, TrainsOnColumnStream,
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, BasicTrainer,
 };
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
@@ -908,7 +908,7 @@ impl RTreeIndexPlugin {
 }
 
 #[async_trait]
-impl TrainsOnColumnStream for RTreeIndexPlugin {
+impl BasicTrainer for RTreeIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -966,7 +966,7 @@ impl TrainsOnColumnStream for RTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for RTreeIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

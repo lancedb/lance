@@ -119,7 +119,7 @@ use crate::{
     scalar::{
         CreatedIndex, ScalarIndex,
         expression::{FtsQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, TrainsOnColumnStream},
+        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, BasicTrainer},
     },
 };
 
@@ -194,7 +194,7 @@ impl TrainingRequest for InvertedIndexTrainingRequest {
 }
 
 #[async_trait]
-impl TrainsOnColumnStream for InvertedIndexPlugin {
+impl BasicTrainer for InvertedIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -254,7 +254,7 @@ impl TrainsOnColumnStream for InvertedIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for InvertedIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

@@ -49,7 +49,7 @@ use crate::{
         expression::SargableQueryParser,
         registry::{
             ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            TrainsOnColumnStream, VALUE_COLUMN_NAME,
+            BasicTrainer, VALUE_COLUMN_NAME,
         },
     },
 };
@@ -1708,7 +1708,7 @@ pub async fn merge_bitmap_indices(
 }
 
 #[async_trait]
-impl TrainsOnColumnStream for BitmapIndexPlugin {
+impl BasicTrainer for BitmapIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1772,7 +1772,7 @@ impl TrainsOnColumnStream for BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

@@ -9,7 +9,7 @@
 
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, TrainsOnColumnStream,
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, BasicTrainer,
 };
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
@@ -988,7 +988,7 @@ impl BloomFilterIndexPlugin {
 }
 
 #[async_trait]
-impl TrainsOnColumnStream for BloomFilterIndexPlugin {
+impl BasicTrainer for BloomFilterIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1075,7 +1075,7 @@ impl TrainsOnColumnStream for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

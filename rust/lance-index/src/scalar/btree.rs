@@ -23,7 +23,7 @@ use crate::{
     scalar::{
         CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, TrainsOnColumnStream, VALUE_COLUMN_NAME},
+        registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, BasicTrainer, VALUE_COLUMN_NAME},
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
@@ -3196,7 +3196,7 @@ impl TrainingRequest for BTreeTrainingRequest {
 pub struct BTreeIndexPlugin;
 
 #[async_trait]
-impl TrainsOnColumnStream for BTreeIndexPlugin {
+impl BasicTrainer for BTreeIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -3260,7 +3260,7 @@ impl TrainsOnColumnStream for BTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

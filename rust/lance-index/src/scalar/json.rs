@@ -39,7 +39,7 @@ use crate::{
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, TrainsOnColumnStream, VALUE_COLUMN_NAME},
+        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, BasicTrainer, VALUE_COLUMN_NAME},
     },
 };
 
@@ -666,7 +666,7 @@ impl JsonIndexPlugin {
 }
 
 #[async_trait]
-impl TrainsOnColumnStream for JsonIndexPlugin {
+impl BasicTrainer for JsonIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -761,7 +761,7 @@ impl TrainsOnColumnStream for JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

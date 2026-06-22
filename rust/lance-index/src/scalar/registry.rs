@@ -60,9 +60,9 @@ impl TrainingCriteria {
 
 /// A trait object for plugin-specific training parameters and data requirements.
 ///
-/// Returned by [`TrainsOnColumnStream::new_training_request`]. The caller uses
+/// Returned by [`BasicTrainer::new_training_request`]. The caller uses
 /// [`criteria`](Self::criteria) to prepare the training data stream, then passes
-/// the request back to [`TrainsOnColumnStream::train_index`], which may downcast
+/// the request back to [`BasicTrainer::train_index`], which may downcast
 /// it to the plugin-specific concrete type to recover parsed parameters.
 pub trait TrainingRequest: std::any::Any + Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -101,13 +101,14 @@ impl TrainingRequest for DefaultTrainingRequest {
 /// Any scalar index plugin that builds from a column data stream should implement
 /// this trait.
 #[async_trait]
-pub trait TrainsOnColumnStream: Send + Sync {
+pub trait BasicTrainer: Send + Sync {
     /// Creates a new training request from the given parameters.
     ///
     /// The returned request specifies the criteria the training data must satisfy.
     /// It is the caller's responsibility to prepare data that meets those criteria
     /// before calling [`train_index`](Self::train_index).
-    fn new_training_request(&self, params: &str, field: &Field) -> Result<Box<dyn TrainingRequest>>;
+    fn new_training_request(&self, params: &str, field: &Field)
+    -> Result<Box<dyn TrainingRequest>>;
 
     /// Train a new index from a prepared data stream.
     ///
@@ -131,11 +132,27 @@ pub trait TrainsOnColumnStream: Send + Sync {
 /// A trait for scalar index plugins
 #[async_trait]
 pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
-    /// Returns this plugin's [`TrainsOnColumnStream`] implementation, if any.
+    /// Returns this plugin's [`BasicTrainer`] implementation, if any.
     ///
-    /// Plugins that support training on a stream of column data should override
-    /// this to return `Some(self)`.
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    /// Training an index can be a complex process.  For example, a btree index might
+    /// be trained using a distributed shuffler on a distributed OLAP system such as
+    /// Spark or Ray.  A vector index can be trained by sampling the column to create
+    /// a kmenas model and then streaming the vectors to assign partitions.  Encapsulating
+    /// the entire set of possible approches is beyond what this trait can model.
+    ///
+    /// However, in many cases, an index can be trained on a (potentially sorted) stream
+    /// of column data.  There is also significant utility in being able to provide users
+    /// with a simple generic "create an index" API.
+    ///
+    /// This method is a compromise.  Indexes that support training on a stream of column
+    /// data should override this to return `Some(self)`.  Indexes that need their own
+    /// individualized training approaches should return `None` and provide their own
+    /// methods for training.
+    ///
+    /// An index can even take both approaches.  Providing a simple (but maybe less
+    /// efficient) stream-based trainer while also providing more specialized index
+    /// creation methods elsewhere.
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         None
     }
 

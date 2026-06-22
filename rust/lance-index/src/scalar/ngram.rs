@@ -21,7 +21,7 @@ use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    TrainsOnColumnStream, VALUE_COLUMN_NAME,
+    BasicTrainer, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -1279,7 +1279,7 @@ impl NGramIndexPlugin {
 }
 
 #[async_trait]
-impl TrainsOnColumnStream for NGramIndexPlugin {
+impl BasicTrainer for NGramIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -1323,7 +1323,7 @@ impl TrainsOnColumnStream for NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

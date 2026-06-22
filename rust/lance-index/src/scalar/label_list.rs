@@ -40,7 +40,7 @@ use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    TrainsOnColumnStream, VALUE_COLUMN_NAME,
+    BasicTrainer, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -664,7 +664,7 @@ impl CacheKey for LabelListIndexStateKey {
 pub struct LabelListIndexPlugin;
 
 #[async_trait]
-impl TrainsOnColumnStream for LabelListIndexPlugin {
+impl BasicTrainer for LabelListIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -744,7 +744,7 @@ impl TrainsOnColumnStream for LabelListIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

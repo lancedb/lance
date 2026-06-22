@@ -42,7 +42,7 @@ use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    TrainsOnColumnStream, VALUE_COLUMN_NAME,
+    BasicTrainer, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
@@ -2433,7 +2433,7 @@ async fn write_empty_fmindex_partition(store: &dyn IndexStore) -> Result<IndexFi
 pub struct FMIndexPlugin;
 
 #[async_trait]
-impl TrainsOnColumnStream for FMIndexPlugin {
+impl BasicTrainer for FMIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -2471,7 +2471,7 @@ impl TrainsOnColumnStream for FMIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 
@@ -2529,7 +2529,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;
-    use crate::scalar::registry::TrainsOnColumnStream;
+    use crate::scalar::registry::BasicTrainer;
 
     #[derive(Debug, Clone)]
     struct FailNewFileStore {
