@@ -3745,14 +3745,18 @@ impl CompressedPostingList {
     }
 
     pub(crate) fn block_idx_for_doc(&self, current_block_idx: usize, doc_id: u32) -> usize {
+        const LINEAR_PROBE_BLOCKS: usize = 8;
+
         let num_blocks = self.blocks.len();
-        if current_block_idx + 1 >= num_blocks
-            || self.block_least_doc_id(current_block_idx + 1) > doc_id
-        {
-            return current_block_idx;
+        let mut block_idx = current_block_idx;
+        for _ in 0..LINEAR_PROBE_BLOCKS {
+            if block_idx + 1 >= num_blocks || self.block_least_doc_id(block_idx + 1) > doc_id {
+                return block_idx;
+            }
+            block_idx += 1;
         }
 
-        let mut lo = current_block_idx + 1;
+        let mut lo = block_idx + 1;
         let mut hi = num_blocks;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;

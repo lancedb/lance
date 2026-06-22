@@ -2103,7 +2103,7 @@ mod tests {
 
     #[test]
     fn compressed_posting_next_skips_to_target_block() {
-        let doc_ids = (0..(BLOCK_SIZE * 4 + 17))
+        let doc_ids = (0..(BLOCK_SIZE * 32 + 17))
             .map(|doc_id| (doc_id as u32) * 3)
             .collect::<Vec<_>>();
         let posting = generate_posting_list(doc_ids, 1.0, None, true);
@@ -2122,6 +2122,11 @@ mod tests {
         let doc = iter.doc().expect("iterator must not move backwards");
         assert_eq!(doc.doc_id(), (BLOCK_SIZE as u64 * 3 * 3) + 9);
         assert_eq!(iter.block_idx, 3);
+
+        iter.next((BLOCK_SIZE as u64 * 25 * 3) + 7);
+        let doc = iter.doc().expect("distant target doc should exist");
+        assert_eq!(doc.doc_id(), (BLOCK_SIZE as u64 * 25 * 3) + 9);
+        assert_eq!(iter.block_idx, 25);
     }
 
     #[rstest]
