@@ -29,9 +29,7 @@ use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
-};
+use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
@@ -660,10 +658,10 @@ pub struct ScalarIndexInfo {
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
-    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
         self.indexed_columns
             .get(col)
-            .map(|(ty, parser)| (ty, parser.as_ref() as &dyn ScalarQueryParser))
+            .map(|(ty, parser)| (ty, parser.as_ref()))
     }
 
     fn fragment_bitmap(&self, column: &str, index_name: &str) -> Option<RoaringBitmap> {

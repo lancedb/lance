@@ -463,6 +463,27 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def hamming_clustering_for_ivf_partition(
+        self,
+        index_name: str,
+        partition_id: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def get_ivf_partition_info(self, index_name: str) -> List[dict]: ...
+    def hamming_clustering_for_sample(
+        self,
+        column: str,
+        sample_size: Optional[int],
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def hamming_clustering_for_range(
+        self,
+        column: str,
+        fragment_id: int,
+        start_row: int,
+        num_rows: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...

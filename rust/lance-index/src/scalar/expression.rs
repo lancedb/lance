@@ -179,6 +179,18 @@ impl MultiQueryParser {
     pub fn add(&mut self, other: Box<dyn ScalarQueryParser>) {
         self.parsers.push(other);
     }
+
+    /// Pick the first underlying parser whose `is_valid_reference` accepts `expr`.
+    pub fn select(
+        &self,
+        expr: &Expr,
+        data_type: &DataType,
+    ) -> Option<(&dyn ScalarQueryParser, DataType)> {
+        self.parsers.iter().find_map(|p| {
+            p.is_valid_reference(expr, data_type)
+                .map(|dt| (p.as_ref(), dt))
+        })
+    }
 }
 
 impl ScalarQueryParser for MultiQueryParser {
@@ -1585,8 +1597,8 @@ fn maybe_indexed_column<'b>(
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions
     if let Some(nested_path) = extract_nested_column_path(expr)
-        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
-        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+        && let Some((data_type, multi)) = index_info.get_index(&nested_path)
+        && let Some((parser, data_type)) = multi.select(expr, data_type)
     {
         return Some((nested_path, data_type, parser));
     }
@@ -1594,12 +1606,9 @@ fn maybe_indexed_column<'b>(
     match expr {
         Expr::Column(col) => {
             let col = col.name.as_str();
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col.to_string(), data_type, parser))
-            } else {
-                None
-            }
+            let (data_type, multi) = index_info.get_index(col)?;
+            let (parser, data_type) = multi.select(expr, data_type)?;
+            Some((col.to_string(), data_type, parser))
         }
         Expr::ScalarFunction(udf) => {
             if udf.args.is_empty() {
@@ -1607,12 +1616,9 @@ fn maybe_indexed_column<'b>(
             }
             // For non-get_field functions, fall back to old behavior
             let col = maybe_column(&udf.args[0])?;
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col.to_string(), data_type, parser))
-            } else {
-                None
-            }
+            let (data_type, multi) = index_info.get_index(col)?;
+            let (parser, data_type) = multi.select(expr, data_type)?;
+            Some((col.to_string(), data_type, parser))
         }
         _ => None,
     }
@@ -1977,7 +1983,7 @@ fn visit_node(
 pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
     /// as well as a query parser that can parse queries for that column
-    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)>;
 
     /// The set of fragments covered by `(column, index_name)`.
     ///
@@ -2159,11 +2165,18 @@ mod tests {
 
     struct ColInfo {
         data_type: DataType,
-        parser: Box<dyn ScalarQueryParser>,
+        parser: Box<MultiQueryParser>,
     }
 
     impl ColInfo {
         fn new(data_type: DataType, parser: Box<dyn ScalarQueryParser>) -> Self {
+            Self {
+                data_type,
+                parser: Box::new(MultiQueryParser::single(parser)),
+            }
+        }
+
+        fn with_multi(data_type: DataType, parser: Box<MultiQueryParser>) -> Self {
             Self { data_type, parser }
         }
     }
@@ -2185,7 +2198,7 @@ mod tests {
     }
 
     impl IndexInformationProvider for MockIndexInfoProvider {
-        fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+        fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
             self.indexed_columns
                 .get(col)
                 .map(|col_info| (&col_info.data_type, col_info.parser.as_ref()))
@@ -3353,5 +3366,76 @@ mod tests {
         assert!(round_tripped.is_at_most());
         assert_eq!(round_tripped.upper, RowAddrMask::from_allowed(upper_addrs));
         assert_eq!(round_tripped_frags, fragments_covered);
+    }
+
+    /// Regression test: when two JSON indices target different paths on the same
+    /// column, a query against one path must be routed to its own index instead
+    /// of being intercepted by whichever parser was registered first.
+    #[test]
+    fn test_multi_json_indices_route_by_path() {
+        // Build a MultiQueryParser containing two JSON sub-parsers: one for
+        // path "$.a" and one for path "$.b".
+        let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
+            "$.a".to_string(),
+            Box::new(SargableQueryParser::new(
+                "json_a_idx".to_string(),
+                "Json".to_string(),
+                false,
+            )),
+        )));
+        multi.add(Box::new(JsonQueryParser::new(
+            "$.b".to_string(),
+            Box::new(SargableQueryParser::new(
+                "json_b_idx".to_string(),
+                "Json".to_string(),
+                false,
+            )),
+        )));
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "json",
+            ColInfo::with_multi(DataType::LargeBinary, Box::new(multi)),
+        )]);
+
+        // Query against path "$.b" must hit the "$.b" index.
+        let expected_b = IndexedExpression::index_query(
+            "json".to_string(),
+            "json_b_idx".to_string(),
+            "Json".to_string(),
+            Arc::new(JsonQuery::new(
+                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "foo".to_string(),
+                )))),
+                "$.b".to_string(),
+            )),
+        );
+        check(
+            &index_info,
+            "json_extract(json, '$.b') = 'foo'",
+            Some(expected_b),
+            false,
+        );
+
+        // Query against path "$.a" must hit the "$.a" index.
+        let expected_a = IndexedExpression::index_query(
+            "json".to_string(),
+            "json_a_idx".to_string(),
+            "Json".to_string(),
+            Arc::new(JsonQuery::new(
+                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "foo".to_string(),
+                )))),
+                "$.a".to_string(),
+            )),
+        );
+        check(
+            &index_info,
+            "json_extract(json, '$.a') = 'foo'",
+            Some(expected_a),
+            false,
+        );
+
+        // Query against an unindexed path must not bind to either index.
+        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
     }
 }

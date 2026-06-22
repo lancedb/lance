@@ -300,5 +300,9 @@ harness = false
 name = "concurrent_append"
 harness = false
 
+[[bench]]
+name = "hamming"
+harness = false
+
 [lints]
 workspace = true

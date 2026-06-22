@@ -31,8 +31,8 @@ use lance_index::scalar::{
 };
 use uuid::Uuid;
 
-use super::data_source::{LsmDataSource, LsmGeneration};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration};
+use super::flushed_cache::{DatasetCache, open_flushed_dataset};
 use crate::dataset::mem_wal::index::encode_pk_tuple;
 use crate::dataset::mem_wal::util::PK_INDEX_DIR;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -157,12 +157,15 @@ type ShardGenSets = HashMap<Uuid, Vec<(LsmGeneration, GenMembership)>>;
 pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
     // per-shard, so supersession is within-shard only).
     let mut by_shard: ShardGenSets = HashMap::new();
     let mut has_base = false;
+    // Flushed PK-BTree opens are cold S3 reads; overlap them with
+    // `try_join_all`. Order is irrelevant — gens are sorted per-shard below.
+    let mut flushed_loads = Vec::new();
     for source in sources {
         match source {
             LsmDataSource::BaseTable { .. } => has_base = true,
@@ -184,14 +187,17 @@ pub async fn compute_source_block_lists(
                 shard_id,
                 generation,
                 ..
-            } => {
+            } => flushed_loads.push(async move {
                 let index = open_pk_index(path, session, flushed_cache).await?;
-                by_shard
-                    .entry(*shard_id)
-                    .or_default()
-                    .push((*generation, GenMembership::OnDisk(index)));
-            }
+                Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
+            }),
         }
+    }
+    for (shard_id, generation, membership) in futures::future::try_join_all(flushed_loads).await? {
+        by_shard
+            .entry(shard_id)
+            .or_default()
+            .push((generation, membership));
     }
 
     let mut blocked: SourceBlockLists = HashMap::new();
@@ -223,29 +229,91 @@ pub async fn compute_source_block_lists(
 /// reader can test any PK against these (via [`GenMembership::contains`]) to
 /// decide whether the fresh tier shadows it. The base source, if present, is
 /// skipped (it is what gets shadowed).
+///
+/// When `watermarks` carries a watermark for a source's shard, membership is
+/// bounded to it (see [`FreshTierWatermark`]): higher generations are excluded,
+/// the active generation is bounded to its first `active_batch_count` batches,
+/// and lower generations (frozen and flushed) are immutable and included whole.
+/// A shard absent from `watermarks` (or `watermarks == None`) uses the live tier.
 pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<GenMembership>> {
-    let mut memberships = Vec::new();
+    // Membership per source, in source order (`None` = skipped). Flushed
+    // PK-BTree opens are cold S3 reads, so collect them tagged with their slot
+    // and overlap with `try_join_all` rather than opening one at a time.
+    let mut slots: Vec<Option<GenMembership>> = Vec::with_capacity(sources.len());
+    let mut flushed_loads = Vec::new();
     for source in sources {
-        let membership = match source {
-            LsmDataSource::BaseTable { .. } => continue,
+        match source {
+            LsmDataSource::BaseTable { .. } => slots.push(None),
             LsmDataSource::ActiveMemTable {
                 batch_store,
                 index_store,
+                shard_id,
+                generation,
                 ..
-            } => in_memory_membership(batch_store, index_store),
-            LsmDataSource::FlushedMemTable { path, .. } => {
-                GenMembership::OnDisk(open_pk_index(path, session, flushed_cache).await?)
+            } => {
+                let membership = match watermarks.and_then(|m| m.get(shard_id)) {
+                    None => Some(in_memory_membership(batch_store, index_store)),
+                    Some(watermark) => {
+                        let g = generation.as_u64();
+                        if g > watermark.active_generation {
+                            // Rolled in after the snapshot; the arm never saw it.
+                            None
+                        } else if g == watermark.active_generation {
+                            // Bound the active generation to the batches the arm saw.
+                            Some(bounded_in_memory_membership(
+                                batch_store,
+                                index_store,
+                                watermark.active_batch_count,
+                            ))
+                        } else {
+                            // Lower (frozen) generations are immutable — include all.
+                            Some(in_memory_membership(batch_store, index_store))
+                        }
+                    }
+                };
+                slots.push(membership);
             }
-        };
-        if !membership.is_empty() {
-            memberships.push(membership);
+            LsmDataSource::FlushedMemTable {
+                path,
+                shard_id,
+                generation,
+                ..
+            } => {
+                // A generation at or above the active one was flushed after the
+                // snapshot; exclude it. Lower generations are immutable. The
+                // `==` case is the active generation flushed between the two
+                // reads: excluding the flushed copy loses nothing, since its
+                // rows are already captured by the in-memory arm above (bounded
+                // to `active_batch_count`).
+                let flushed_after_snapshot = watermarks
+                    .and_then(|m| m.get(shard_id))
+                    .is_some_and(|watermark| generation.as_u64() >= watermark.active_generation);
+                if flushed_after_snapshot {
+                    slots.push(None);
+                } else {
+                    let slot = slots.len();
+                    slots.push(None);
+                    flushed_loads.push(async move {
+                        let index = open_pk_index(path, session, flushed_cache).await?;
+                        Ok::<_, Error>((slot, GenMembership::OnDisk(index)))
+                    });
+                }
+            }
         }
     }
-    Ok(memberships)
+    for (slot, membership) in futures::future::try_join_all(flushed_loads).await? {
+        slots[slot] = Some(membership);
+    }
+    Ok(slots
+        .into_iter()
+        .flatten()
+        .filter(|membership| !membership.is_empty())
+        .collect())
 }
 
 /// Cross-source membership of an in-memory (active / frozen) memtable: a
@@ -257,6 +325,26 @@ fn in_memory_membership(
     index_store: &Arc<IndexStore>,
 ) -> GenMembership {
     let max_visible_row = batch_store.max_visible_row(index_store.max_visible_batch_position());
+    GenMembership::InMemory {
+        index_store: index_store.clone(),
+        max_visible_row,
+    }
+}
+
+/// As-of variant of [`in_memory_membership`] for the active generation under a
+/// watermark: bounds visibility to the first `batch_count` batches — those a
+/// prior scan observed before the memtable grew. A later append lands at a
+/// higher row position and is excluded by the probe, so it can't shadow a base
+/// row whose replacement the scan never delivered. `batch_count == 0` leaves the
+/// membership empty.
+fn bounded_in_memory_membership(
+    batch_store: &Arc<BatchStore>,
+    index_store: &Arc<IndexStore>,
+    batch_count: u64,
+) -> GenMembership {
+    let max_visible_row = batch_count
+        .checked_sub(1)
+        .and_then(|last_batch| batch_store.max_visible_row(last_batch as usize));
     GenMembership::InMemory {
         index_store: index_store.clone(),
         max_visible_row,
@@ -291,9 +379,9 @@ fn path_cache_uuid(path: &str) -> Uuid {
 async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
-    flushed_cache: Option<&Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let dataset = open_flushed_dataset(path, session, flushed_cache).await?;
+    let dataset = open_flushed_dataset(path, session, flushed_cache, None).await?;
     // Namespace the session index cache by the (immutable) flushed path so this
     // sidecar's pages live alongside every other index instead of a bespoke
     // cache. `fri_uuid` is None — flushed generations carry no fragment-reuse.
@@ -446,7 +534,9 @@ mod tests {
             active_source(shard, 1, &[3]),
         ];
 
-        let memberships = fresh_tier_block_list(&sources, None, None).await.unwrap();
+        let memberships = fresh_tier_block_list(&sources, None, None, None)
+            .await
+            .unwrap();
 
         // One membership per generation; together they cover pk=1,2,3 (not 4).
         assert_eq!(memberships.len(), 2);
@@ -592,5 +682,143 @@ mod tests {
             !blocks(g1_block, 1).await,
             "a not-yet-visible newer write must not shadow an older visible copy"
         );
+    }
+
+    /// A fresh-tier watermark bounds the active generation to the first
+    /// `active_batch_count` batches — those the arm observed before the memtable
+    /// grew. A later append is invisible, so a base row is never dropped without
+    /// the arm having delivered its replacement.
+    #[tokio::test]
+    async fn fresh_tier_watermark_bounds_active_memtable_by_batch_count() {
+        use crate::dataset::mem_wal::scanner::data_source::FreshTierWatermark;
+        use std::collections::HashMap;
+
+        let shard = Uuid::new_v4();
+        // Three single-row batches: pk=1 at batch 0, pk=2 at batch 1, pk=3 at
+        // batch 2 (appended after the arm).
+        let sources = vec![active_source(shard, 1, &[1, 2, 3])];
+
+        // Watermark at 2 batches of gen 1: pk=1,2 are members; pk=3 (batch 2) is not.
+        let watermarks: HashMap<Uuid, FreshTierWatermark> = [(
+            shard,
+            FreshTierWatermark {
+                active_generation: 1,
+                active_batch_count: 2,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let sets = fresh_tier_block_list(&sources, None, None, Some(&watermarks))
+            .await
+            .unwrap();
+        assert!(blocks(&sets, 1).await);
+        assert!(blocks(&sets, 2).await);
+        assert!(!blocks(&sets, 3).await);
+
+        // No watermark → live tier: all three are members.
+        let sets = fresh_tier_block_list(&sources, None, None, None)
+            .await
+            .unwrap();
+        for id in [1, 2, 3] {
+            assert!(blocks(&sets, id).await);
+        }
+    }
+
+    /// A generation above the active one rolled in after the snapshot and is
+    /// excluded whole; a lower one is immutable (frozen) and included whole
+    /// regardless of the active batch count.
+    #[tokio::test]
+    async fn fresh_tier_watermark_excludes_newer_gen_includes_lower_gen() {
+        use crate::dataset::mem_wal::scanner::data_source::FreshTierWatermark;
+        use std::collections::HashMap;
+
+        let shard = Uuid::new_v4();
+        // gen 3 newer (after snapshot), gen 2 == active (bounded to 1 batch),
+        // gen 1 lower/immutable (whole). Each id is its own batch.
+        let sources = vec![
+            active_source(shard, 3, &[100]),
+            active_source(shard, 2, &[20, 21]),
+            active_source(shard, 1, &[1, 2]),
+        ];
+
+        let watermarks: HashMap<Uuid, FreshTierWatermark> = [(
+            shard,
+            FreshTierWatermark {
+                active_generation: 2,
+                active_batch_count: 1,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let sets = fresh_tier_block_list(&sources, None, None, Some(&watermarks))
+            .await
+            .unwrap();
+        assert!(blocks(&sets, 1).await); // gen 1, whole
+        assert!(blocks(&sets, 2).await); // gen 1, whole
+        assert!(blocks(&sets, 20).await); // gen 2, batch 0
+        assert!(!blocks(&sets, 21).await); // gen 2, batch 1 — past the watermark
+        assert!(!blocks(&sets, 100).await); // gen 3 — after the snapshot
+    }
+
+    /// A flushed generation at or above the active generation was produced by a
+    /// flush after the snapshot and is excluded; one strictly below it is
+    /// immutable and included.
+    #[tokio::test]
+    async fn fresh_tier_watermark_excludes_flushed_at_or_above_active() {
+        use crate::dataset::mem_wal::scanner::data_source::FreshTierWatermark;
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::RecordBatchIterator;
+        use std::collections::HashMap;
+
+        // A flushed generation 2 holding pk=5, staged as a flushed dataset with
+        // its standalone PK sidecar (what the on-disk membership probes).
+        let flushed_batch = id_batch(&[5]);
+        let schema = flushed_batch.schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = format!("{}/gen2", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(flushed_batch.clone())], schema.clone());
+        Dataset::write(reader, &path, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        write_pk_sidecar(&path, &[flushed_batch], &["id"])
+            .await
+            .unwrap();
+
+        let shard = Uuid::new_v4();
+        let sources = vec![LsmDataSource::FlushedMemTable {
+            path,
+            shard_id: shard,
+            generation: LsmGeneration::memtable(2),
+        }];
+
+        // active_generation 2 (gen 2 flushed at/after the snapshot): excluded.
+        let at: HashMap<Uuid, FreshTierWatermark> = [(
+            shard,
+            FreshTierWatermark {
+                active_generation: 2,
+                active_batch_count: u64::MAX,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let sets = fresh_tier_block_list(&sources, None, None, Some(&at))
+            .await
+            .unwrap();
+        assert!(!blocks(&sets, 5).await);
+
+        // active_generation 3 (gen 2 strictly below, immutable): included.
+        let above: HashMap<Uuid, FreshTierWatermark> = [(
+            shard,
+            FreshTierWatermark {
+                active_generation: 3,
+                active_batch_count: u64::MAX,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let sets = fresh_tier_block_list(&sources, None, None, Some(&above))
+            .await
+            .unwrap();
+        assert!(blocks(&sets, 5).await);
     }
 }

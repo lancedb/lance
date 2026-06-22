@@ -871,6 +871,51 @@ def test_fts_custom_stop_words(tmp_path):
     assert len(results["_rowid"].to_pylist()) == 1
 
 
+def test_fts_stop_words_respect_language_for_simple_tokenizer(tmp_path):
+    data = pa.table({"text": ["the lance data", "的 lance data"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="simple",
+        stem=False,
+    )
+
+    results = ds.to_table(full_text_query="the", with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(full_text_query="的", with_row_id=True)
+    assert results["text"].to_pylist() == ["的 lance data"]
+
+
+def test_fts_icu_stop_words_are_all_or_none(tmp_path):
+    data = pa.table({"text": ["the 的 lance data", "useful data"]})
+    ds = lance.write_dataset(data, tmp_path / "enabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=True,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="lance", with_row_id=True).num_rows == 1
+
+    ds = lance.write_dataset(data, tmp_path / "disabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 1
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 1
+
+
 def test_rowid_order(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     results = dataset.scanner(

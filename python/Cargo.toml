@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "8.0.0-beta.18"
+version = "8.1.0-beta.0"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -60,7 +60,7 @@ prost = "0.14.1"
 prost-types = "0.14.1"
 pyo3 = { version = "0.28", features = [
     "extension-module",
-    "abi3-py39",
+    "abi3-py310",
     "py-clone",
     "chrono",
 ] }
