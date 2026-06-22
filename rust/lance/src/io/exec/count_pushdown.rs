@@ -146,10 +146,6 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         return Ok(None);
     };
 
-    // Stable-row-id mode is handled inside `CountFromMaskExec::do_execute`,
-    // which builds the count universe in stable-id space (matching the
-    // prefilter and deletion masks) rather than row-address space.
-
     let options = filtered_read.options();
     // A refine filter is a residual the index couldn't fully evaluate — it
     // needs column data to apply, which we can't.
