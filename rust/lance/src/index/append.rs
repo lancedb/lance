@@ -108,47 +108,6 @@ async fn live_row_ids(
     })
 }
 
-/// Open the selected inverted (FTS) segments and merge `new_data` into them
-/// through the segment-merge primitive, which materializes each old partition
-/// and applies `old_data_filter` (dropping stale rows -- e.g. updated rows under
-/// stable row ids). The fast `ScalarIndex::update` path only references old
-/// partitions by id and cannot honor a row-level `RowIds` filter, so it must not
-/// be used when old rows need to be removed.
-async fn open_and_merge_inverted_segments(
-    dataset: &Dataset,
-    field_path: &str,
-    segments: &[&IndexMetadata],
-    new_data: datafusion::execution::SendableRecordBatchStream,
-    new_store: &LanceIndexStore,
-    old_data_filter: Option<OldIndexDataFilter>,
-) -> Result<CreatedIndex> {
-    let mut source_indices = Vec::with_capacity(segments.len());
-    for &segment in segments {
-        let scalar_index = dataset
-            .open_scalar_index(field_path, &segment.uuid, &NoOpMetricsCollector)
-            .await?;
-        let inverted = scalar_index
-            .as_any()
-            .downcast_ref::<InvertedIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "Inverted merge: expected inverted segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        source_indices.push(Arc::new(inverted.clone()));
-    }
-    InvertedIndex::merge_segments(
-        &source_indices,
-        new_data,
-        new_store,
-        old_data_filter,
-        Arc::new(NoopIndexBuildProgress),
-    )
-    .await
-}
-
 /// Build the [`OldIndexDataFilter`] that must be applied to existing index
 /// rows when their owning fragments have been pruned by compaction or
 /// deletions.
@@ -369,17 +328,9 @@ async fn merge_scalar_indices<'a>(
                 )
                 .await?
             }
-            IndexType::Inverted => {
-                open_and_merge_inverted_segments(
-                    dataset.as_ref(),
-                    field_path,
-                    selected_old_indices,
-                    new_data_stream,
-                    &new_store,
-                    old_data_filter,
-                )
-                .await?
-            }
+            // NOTE: IndexType::Inverted never reaches here -- it is handled by the
+            // dedicated arm in merge_indices_with_unindexed_frags before this
+            // function is called.
             _ => {
                 let old_data_filter = build_old_data_filter(
                     dataset.as_ref(),
