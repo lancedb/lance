@@ -53,6 +53,10 @@ fn mat_mul_atb(a: &[f64], m: usize, n: usize) -> Vec<f64> {
     c
 }
 
+fn mat_vec_mul(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
+    (0..m).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum()).collect();
+}
+
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let ata = mat_mul_atb(a, m, n);
     let (eigenvalues, v) = jacobi_eigen(&ata, n);
@@ -73,4 +77,16 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         .map(|&i| if eigenvalues[i] > 0.0 { eigenvalues[i].sqrt() } else { 0.0 })
         .collect();
 
+    let mut u_cols: Vec<Vec<f64>> = Vec::with_capacity(m);
+    for index in 0..k {
+        let ei = order[index];
+        let vi: Vec<f64> = (0..n).map(|r| v[r * n + ei]).collect();
+        let av = mat_vec_mul(a, &vi, m, n);
+        if sigma[index] > EPS * 10.0 {
+            u_cols.push(av.iter().map(|&x| x / sigma[index]).collect());
+        } else {
+            sigma[index] = 0.0;
+            u_cols.push(vec![0.0; m]);
+        }
+    }
 }
