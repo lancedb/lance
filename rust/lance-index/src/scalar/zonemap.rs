@@ -16,7 +16,7 @@ use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, BasicTrainer,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,

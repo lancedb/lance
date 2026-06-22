@@ -48,8 +48,8 @@ use crate::{
         CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            BasicTrainer, VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
         },
     },
 };

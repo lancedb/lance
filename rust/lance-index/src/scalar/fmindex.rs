@@ -41,8 +41,8 @@ use crate::metrics::MetricsCollector;
 use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    BasicTrainer, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,

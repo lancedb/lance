@@ -6,7 +6,7 @@ use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, BasicTrainer,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{

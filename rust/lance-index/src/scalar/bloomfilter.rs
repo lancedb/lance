@@ -9,7 +9,7 @@
 
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, BasicTrainer,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,

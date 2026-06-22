@@ -138,7 +138,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// be trained using a shuffler from a distributed OLAP system such as
     /// Spark or Ray.  A vector index can be trained by sampling the column to create
     /// a kmeans model and then streaming the vectors to assign partitions.  Encapsulating
-    /// the entire set of possible approches is beyond what this trait can model.
+    /// the entire set of possible approaches is beyond what this trait can model.
     /// This is especially true because this is a low-level crate with no concept of a table
     /// or a dataset.
     ///

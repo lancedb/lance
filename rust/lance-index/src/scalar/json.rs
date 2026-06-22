@@ -39,7 +39,9 @@ use crate::{
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, BasicTrainer, VALUE_COLUMN_NAME},
+        registry::{
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME,
+        },
     },
 };
 

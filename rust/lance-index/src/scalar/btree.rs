@@ -23,7 +23,9 @@ use crate::{
     scalar::{
         CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingOrdering, TrainingRequest, BasicTrainer, VALUE_COLUMN_NAME},
+        registry::{
+            BasicTrainer, ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
+        },
     },
 };
 use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};

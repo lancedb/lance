@@ -119,7 +119,9 @@ use crate::{
     scalar::{
         CreatedIndex, ScalarIndex,
         expression::{FtsQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, BasicTrainer},
+        registry::{
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+        },
     },
 };
 
