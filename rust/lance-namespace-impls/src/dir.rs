@@ -1215,6 +1215,33 @@ impl DirectoryNamespace {
             .uri)
     }
 
+    /// Resolve a branch's storage URI **without** requiring the branch to
+    /// already be registered in BranchContents.
+    ///
+    /// `create_table_version` needs this: lance creates a branch by committing
+    /// the branch's first (shallow-clone) version *before* it records the
+    /// branch's BranchContents (see `Dataset::create_branch`). At that first
+    /// commit the branch does not yet "exist", so the validating
+    /// [`Self::resolve_branch_location`] rejects it as `TableNotFound` — and the
+    /// external-manifest commit handler maps any such error to a bogus
+    /// `CommitConflict` that surfaces as "Dataset already exists". A branch's
+    /// on-storage location is purely `<root>/tree/<branch>` and is computable
+    /// from the main dataset without opening the (not-yet-existent) branch
+    /// chain. Read paths keep using [`Self::resolve_branch_location`] so a
+    /// branch that was never registered still reads as absent.
+    async fn resolve_branch_location_unchecked(
+        &self,
+        table_uri: &str,
+        branch: &str,
+    ) -> Result<String> {
+        let main = self.configured_builder(table_uri).load().await.map_err(|e| {
+            lance_core::Error::from(NamespaceError::TableNotFound {
+                message: format!("table at '{}' not found: {}", table_uri, e),
+            })
+        })?;
+        Ok(main.branch_location().find_branch(Some(branch))?.uri)
+    }
+
     fn validate_dir_only_properties(
         properties: Option<&HashMap<String, String>>,
         operation: &str,
@@ -2917,7 +2944,11 @@ impl LanceNamespace for DirectoryNamespace {
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let table_uri = match branch {
-            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            // Use the unchecked resolver: this is the write path that creates a
+            // branch's first version, which runs before the branch's
+            // BranchContents is recorded. Validating existence here would reject
+            // the very commit that creates the branch.
+            Some(b) => self.resolve_branch_location_unchecked(&table_uri, b).await?,
             None => table_uri,
         };
 
@@ -6005,6 +6036,50 @@ mod tests {
             .checkout_version(Ref::Version(Some("exp".to_string()), Some(999)))
             .await;
         assert!(err.is_err(), "a version missing from the branch must error");
+    }
+
+    /// Forking a branch on a namespace-managed (external-manifest) dataset must
+    /// succeed. Regression test for the bug where `create_branch`'s first
+    /// (shallow-clone) commit is registered via `create_table_version` *before*
+    /// the branch's BranchContents exists: the validating branch resolver
+    /// returned `TableNotFound`, which the external-manifest commit handler then
+    /// mislabeled as a `CommitConflict` ("Dataset already exists"). Every prior
+    /// branch test opened the dataset with a plain `Dataset::open` (no namespace
+    /// handler), so none exercised this path.
+    #[tokio::test]
+    async fn test_create_branch_on_managed_dataset_succeeds() {
+        use lance::dataset::refs::Ref;
+
+        let temp = TempStdDir::default();
+        let namespace = Arc::new(
+            DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
+                .manifest_enabled(true)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let ns: Arc<dyn LanceNamespace> = namespace.clone();
+        let table_id = vec!["t".to_string()];
+
+        // Managed dataset: carries the ExternalManifestCommitHandler, so its
+        // commits route through the namespace's create_table_version (the
+        // phalanx path). main is at v2 after this helper.
+        let mut managed = create_managed_table(&ns, &table_id).await;
+
+        // Fork a branch off main's latest version. This is the operation that
+        // failed before the fix.
+        managed
+            .create_branch("exp", Ref::Version(None, None), None)
+            .await
+            .expect("create_branch on a namespace-managed dataset should succeed");
+
+        let branches = managed.list_branches().await.unwrap();
+        assert!(
+            branches.contains_key("exp"),
+            "branch 'exp' should be registered, got: {:?}",
+            branches.keys().collect::<Vec<_>>()
+        );
     }
 
     /// CommitBuilder must honor an explicitly supplied commit handler for a
